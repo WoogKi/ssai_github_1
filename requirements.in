@@ -1,0 +1,20 @@
+# === Core App ===
+streamlit>=1.34        # UI 프레임워크
+openai>=1.0            # from openai import OpenAI 사용
+
+# === Data / File IO ===
+pandas>=2.2            # 데이터프레임
+PyPDF2>=3.0            # PDF 파싱
+python-docx>=1.1       # import docx (python-docx 패키지)
+
+# === Database ===
+SQLAlchemy>=2.0        # pandas + SQLAlchemy 경로로 read_sql 사용
+pyodbc>=5.1            # ODBC 드라이버 파이썬 바인딩
+
+# === Environment & Utils ===
+python-dotenv>=1.0     # .env 로드
+
+# ---- 선택(필요 시 주석 해제) ----
+# pillow>=10            # 이미지 썸네일 등 필요할 때
+# tenacity>=8           # 재시도 로직이 필요할 때
+# rich>=13              # 예쁜 콘솔 로그 출력

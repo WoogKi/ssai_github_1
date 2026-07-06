@@ -1,0 +1,6 @@
+﻿greenlet==3.2.4
+pyodbc==5.2.0
+setuptools==80.9.0
+SQLAlchemy==2.0.43
+typing_extensions==4.15.0
+wheel==0.45.1

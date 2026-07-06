@@ -1,0 +1,157 @@
+﻿# =========================================================
+# SSAI / SIMS AI .gitignore
+# =========================================================
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python build/test/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Streamlit
+.streamlit/secrets.toml
+.streamlit/cache/
+.cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.sample
+*.key
+*.pem
+*.crt
+*.pfx
+
+# Logs
+logs/
+*.log
+
+# Runtime data
+data/
+uploads/
+downloads/
+reports/
+temp/
+tmp/
+backup/
+backups/
+_backup_stage_*/
+_sims_backup_stage_*/
+
+# SSAI local storage
+SSAI_TEST_DATA/
+C_SSAI_TEST_DATA/
+D_SSAI_DATA/
+company_*/
+chat/
+
+# Generated exports / backups
+*.zip
+*.bak
+*.tmp
+*.csv
+*.xlsx
+*.xls
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# LM Studio / local model cache hints
+*.gguf
+*.safetensors
+models/
+
+# Backup / patch files
+*.bak_*
+*.old
+*.orig
+*.diff
+patches/
+ssai_patch_*/
+
+# Legacy / experimental root scripts
+Lmstudio_chatbot*.py
+Lmstudio_main*.py
+Lmstudio_SSAI_chat_main__OLD.py
+main.py
+MSSqlConnectTest*.py
+Time_Requests.py
+
+# Local chat history / test logs
+chat_log_*.json
+chat_rooms.json
+chat_rooms/
+
+# Project tree snapshots
+project_tree*.txt
+
+# Old zip / manual backup folders
+Zip_FIle/
+Zip_File/
+
+# Korean/local manual backup notes
+백업만들기.txt
+
+# Local old memo
+20250930.txt
+
+# =========================================================
+# Selective Git policy after Phase 3
+# =========================================================
+
+# docs: do not add whole docs folder
+docs/*
+!docs/phase3/
+!docs/phase3/**
+
+# app root: do not add old/test/root files blindly
+app/*.STABLE.py
+app/python_test.py
+app/draw_architecture.py
+app/project_structure.dot
+app/SSAI_SIMSv2_*.md
+
+# tablelayout: avoid heavy/private documents by default
+tablelayout/*.docx
+tablelayout/*.pdf
+tablelayout/*.xlsx
+tablelayout/*.xls
+
+# root legacy/test files
+20250930.txt
+Lmstudio_chatbot*.py
+Lmstudio_main*.py
+Lmstudio_SSAI_chat_main__OLD.py
+main.py
+MSSqlConnectTest*.py
+Time_Requests.py
+project_tree*.txt
+chat_log_*.json
+chat_rooms.json
+chat_rooms/
+Zip_FIle/
+Zip_File/
+
+# App local env sample may contain local server information
+app/.env.sample
