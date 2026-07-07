@@ -1,0 +1,24 @@
+﻿{
+  "python.defaultInterpreterPath": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}"
+  ],
+  "python.analysis.typeCheckingMode": "basic",
+  "terminal.integrated.defaultProfile.windows": "PowerShell",
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "**/.mypy_cache": true,
+    "**/*.pyc": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/venv": true,
+    "**/__pycache__": true,
+    "**/.git": true,
+    "**/logs": true,
+    "**/uploads": true,
+    "**/backup": true,
+    "**/backups": true
+  }
+}
