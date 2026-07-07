@@ -871,7 +871,10 @@ def get_sales_trend_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
 
     return get_sales_trend_detail_df(params)
 
-def get_sales_trend_summary_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def get_sales_trend_summary_df(
+    params: Optional[Dict[str, Any]] = None,
+    raw_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """
     품목별 매출 추세 요약표.
     기존 get_sales_trend_df() 결과를 제품 1줄 단위로 재집계한다.
@@ -886,7 +889,7 @@ def get_sales_trend_summary_df(params: Optional[Dict[str, Any]] = None) -> pd.Da
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
-    raw = get_sales_trend_df(params)
+    raw = raw_df if raw_df is not None else get_sales_trend_df(params)
     if raw is None or raw.empty:
         return pd.DataFrame()
 
@@ -1282,7 +1285,7 @@ def get_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str,
     df = _ensure_analysis_seq_column(df, mode="product")
 
     try:
-        summary_for_counts = get_sales_trend_summary_df(params)
+        summary_for_counts = get_sales_trend_summary_df(params, raw_df=df)
         trend_judge_counts = _trend_judge_counts(summary_for_counts)
 
         trend_judge_filter = _normalize_trend_judge_filter(params.get("trend_judge"))
@@ -1546,7 +1549,7 @@ def get_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> D
 
     # meta는 원자료 기준으로 계산해야 총매출/총수량이 정확하다.
     raw_df = get_sales_trend_df(params)
-    summary_df = get_sales_trend_summary_df(params)
+    summary_df = get_sales_trend_summary_df(params, raw_df=raw_df)
 
     # 전체 추세판정 분포는 필터 전 요약표 기준
     trend_counts = _trend_judge_counts(summary_df)
