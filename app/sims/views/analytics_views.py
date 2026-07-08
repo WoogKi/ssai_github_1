@@ -118,6 +118,34 @@ def _select_code_option(label: str, gcode: str, key: str) -> dict[str, str]:
 
     return {"code": "", "name": "", "label": "전체"}
 
+
+def _select_code_options(label: str, gcode: str, key: str) -> list[dict[str, str]]:
+    opts = _load_code_options(gcode)
+    selectable = [x for x in opts if str(x.get("code") or "").strip()]
+    labels = [x["label"] for x in selectable]
+
+    selected_labels = st.multiselect(
+        label,
+        labels,
+        default=[],
+        key=key,
+    )
+
+    selected = [opt for opt in selectable if opt["label"] in set(selected_labels)]
+    return selected
+
+
+def _selected_codes(options: list[dict[str, str]]) -> list[str]:
+    return [str(x.get("code") or "").strip() for x in options if str(x.get("code") or "").strip()]
+
+
+def _selected_names(options: list[dict[str, str]]) -> list[str]:
+    return [str(x.get("name") or "").strip() for x in options if str(x.get("name") or "").strip()]
+
+
+def _join_selected_names(options: list[dict[str, str]]) -> str:
+    return ", ".join(_selected_names(options))
+
 # 날짜 값을 입력받아 YYYYMMDD 형식의 문자열로 반환하는 함수입니다. 입력값이 날짜 객체인 경우 strftime을 사용하여 변환하고, 그렇지 않은 경우 입력값에서 숫자만 추출하여 8자리 이상이면 앞 8자리까지 반환합니다. 유효한 날짜 형식이 아닌 경우 빈 문자열을 반환합니다.
 # 예를 들어 입력값이 datetime.date(2025, 1, 1)이라면 "20250101"을 반환하고, 입력값이 "2025-01-01"이라면 "20250101"을 반환하며, 입력값이 "2025/01/01"이라면 "20250101"을 반환합니다. 입력값이 "invalid date"라면 ""를 반환합니다.
 
@@ -378,10 +406,21 @@ def _build_sales_trend_query_condition(params: Dict[str, Any], meta: Dict[str, A
         bits.append(f"제조사명 {params.get('product_ven_nm')}")
     if _clean_text(params.get("product_group_nm")):
         bits.append(f"제품그룹명 {params.get('product_group_nm')}")
-    if _clean_text(params.get("product_di_nm")):
+    product_di_names = params.get("product_di_nm_list")
+    if isinstance(product_di_names, list) and product_di_names:
+        bits.append(f"제품구분명 {', '.join(str(x) for x in product_di_names if str(x).strip())}")
+    elif _clean_text(params.get("product_di_nm")):
         bits.append(f"제품구분명 {params.get('product_di_nm')}")
-    if _clean_text(params.get("product_class_nm")):
+    product_class_names = params.get("product_class_nm_list")
+    if isinstance(product_class_names, list) and product_class_names:
+        bits.append(f"제품분류명 {', '.join(str(x) for x in product_class_names if str(x).strip())}")
+    elif _clean_text(params.get("product_class_nm")):
         bits.append(f"제품분류명 {params.get('product_class_nm')}")
+    stock_names = params.get("stock_nm_list")
+    if isinstance(stock_names, list) and stock_names:
+        bits.append(f"재고위치 {', '.join(str(x) for x in stock_names if str(x).strip())}")
+    elif _clean_text(params.get("stock_nm")):
+        bits.append(f"재고위치 {params.get('stock_nm')}")
     if _clean_text(params.get("ven_nm")):
         bits.append(f"거래처명 {params.get('ven_nm')}")
     if _clean_text(params.get("buy_nm")):
@@ -458,6 +497,18 @@ def _build_sales_trend_display_params(params: Dict[str, Any], meta: Dict[str, An
         v = _clean_text(params.get(key))
         if v:
             out[label] = v
+
+    list_mapping = [
+        ("product_di_nm_list", "제품구분명"),
+        ("product_class_nm_list", "제품분류명"),
+        ("stock_nm_list", "재고위치"),
+    ]
+    for key, label in list_mapping:
+        vals = params.get(key)
+        if isinstance(vals, list):
+            text = ", ".join(str(x).strip() for x in vals if str(x).strip())
+            if text:
+                out[label] = text
 
     return out
 
@@ -669,7 +720,7 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
                 key=f"__analytics_sales_trend_product_ven_nm__{ns}",
             )
 
-        c7, c8, c9 = st.columns(3)
+        c7, c8, c9, c10 = st.columns(4)
         with c7:
             product_group_opt = _select_code_option(
                 "제품그룹명",
@@ -677,54 +728,60 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
                 key=f"__analytics_sales_trend_product_group__{ns}",
             )
         with c8:
-            product_di_opt = _select_code_option(
+            product_di_opts = _select_code_options(
                 "제품구분명",
                 "0004",
                 key=f"__analytics_sales_trend_product_di__{ns}",
             )
         with c9:
-            product_class_opt = _select_code_option(
+            product_class_opts = _select_code_options(
                 "제품분류명",
                 "0028",
                 key=f"__analytics_sales_trend_product_class__{ns}",
             )
-
-        c10, c11, c12 = st.columns(3)
         with c10:
+            stock_opts = _select_code_options(
+                "재고위치",
+                "0018",
+                key=f"__analytics_sales_trend_stock__{ns}",
+            )
+
+        c11, c12, c13 = st.columns(3)
+        with c11:
             ven_nm = st.text_input(
                 "거래처명",
                 value="",
                 key=f"__analytics_sales_trend_ven_nm__{ns}",
             )
-        with c11:
+        with c12:
             buy_nm = st.text_input(
                 "매입처명",
                 value="",
                 key=f"__analytics_sales_trend_buy_nm__{ns}",
             )
-        with c12:
+        with c13:
             sales_man_nm = st.text_input(
                 "영업사원명",
                 value="",
                 key=f"__analytics_sales_trend_sales_man_nm__{ns}",
             )
 
-        c13, c14, c15 = st.columns(3)
-        with c13:
+        c14, c15, c16 = st.columns(3)
+        with c14:
             sido_nm = st.text_input(
                 "시도명",
                 value="",
                 key=f"__analytics_sales_trend_sido_nm__{ns}",
                 placeholder="예: 서울",
             )
-        with c14:
+        with c15:
             gugun_nm = st.text_input(
                 "시구군명",
                 value="",
                 key=f"__analytics_sales_trend_gugun_nm__{ns}",
                 placeholder="예: 강남",
             )
-        with c15:
+        with c16:
             road_nm = st.text_input(
                 "도로명",
                 value="",
@@ -767,10 +824,18 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
 
         "product_group": product_group_opt.get("code", ""),
         "product_group_nm": product_group_opt.get("name", ""),
-        "product_di": product_di_opt.get("code", ""),
-        "product_di_nm": product_di_opt.get("name", ""),
-        "product_class": product_class_opt.get("code", ""),
-        "product_class_nm": product_class_opt.get("name", ""),
+        "product_di": "",
+        "product_di_nm": "",
+        "product_di_list": _selected_codes(product_di_opts),
+        "product_di_nm_list": _selected_names(product_di_opts),
+        "product_class": "",
+        "product_class_nm": "",
+        "product_class_list": _selected_codes(product_class_opts),
+        "product_class_nm_list": _selected_names(product_class_opts),
+        "stock_cd": "",
+        "stock_nm": "",
+        "stock_cd_list": _selected_codes(stock_opts),
+        "stock_nm_list": _selected_names(stock_opts),
 
         "ven_nm": _clean_text(ven_nm),
         "buy_nm": _clean_text(buy_nm),
@@ -923,7 +988,7 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
             )
 
 
-        c8, c9, c10 = st.columns(3)
+        c8, c9, c10, c11 = st.columns(4)
         with c8:
             product_group_opt = _select_code_option(
                 "제품그룹명",
@@ -931,55 +996,61 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
                 key=f"__analytics_sales_trend_summary_product_group__{ns}",
             )
         with c9:
-            product_di_opt = _select_code_option(
+            product_di_opts = _select_code_options(
                 "제품구분명",
                 "0004",
                 key=f"__analytics_sales_trend_summary_product_di__{ns}",
             )
         with c10:
-            product_class_opt = _select_code_option(
+            product_class_opts = _select_code_options(
                 "제품분류명",
                 "0028",
                 key=f"__analytics_sales_trend_summary_product_class__{ns}",
             )
-
-
-        c11, c12, c13 = st.columns(3)
         with c11:
+            stock_opts = _select_code_options(
+                "재고위치",
+                "0018",
+                key=f"__analytics_sales_trend_summary_stock__{ns}",
+            )
+
+
+        c12, c13, c14 = st.columns(3)
+        with c12:
             ven_nm = st.text_input(
                 "거래처명",
                 value="",
                 key=f"__analytics_sales_trend_summary_ven_nm__{ns}",
             )
-        with c12:
+        with c13:
             buy_nm = st.text_input(
                 "매입처명",
                 value="",
                 key=f"__analytics_sales_trend_summary_buy_nm__{ns}",
             )
-        with c13:
+        with c14:
             sales_man_nm = st.text_input(
                 "영업사원명",
                 value="",
                 key=f"__analytics_sales_trend_summary_sales_man_nm__{ns}",
             )
 
-        c14, c15, c16 = st.columns(3)
-        with c14:
+        c15, c16, c17 = st.columns(3)
+        with c15:
             sido_nm = st.text_input(
                 "시도명",
                 value="",
                 key=f"__analytics_sales_trend_summary_sido_nm__{ns}",
                 placeholder="예: 서울",
             )
-        with c15:
+        with c16:
             gugun_nm = st.text_input(
                 "시구군명",
                 value="",
                 key=f"__analytics_sales_trend_summary_gugun_nm__{ns}",
                 placeholder="예: 강남",
             )
-        with c16:
+        with c17:
             road_nm = st.text_input(
                 "도로명",
                 value="",
@@ -1021,10 +1092,18 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
 
         "product_group": product_group_opt.get("code", ""),
         "product_group_nm": product_group_opt.get("name", ""),
-        "product_di": product_di_opt.get("code", ""),
-        "product_di_nm": product_di_opt.get("name", ""),
-        "product_class": product_class_opt.get("code", ""),
-        "product_class_nm": product_class_opt.get("name", ""),
+        "product_di": "",
+        "product_di_nm": "",
+        "product_di_list": _selected_codes(product_di_opts),
+        "product_di_nm_list": _selected_names(product_di_opts),
+        "product_class": "",
+        "product_class_nm": "",
+        "product_class_list": _selected_codes(product_class_opts),
+        "product_class_nm_list": _selected_names(product_class_opts),
+        "stock_cd": "",
+        "stock_nm": "",
+        "stock_cd_list": _selected_codes(stock_opts),
+        "stock_nm_list": _selected_names(stock_opts),
 
         "ven_nm": _clean_text(ven_nm),
         "buy_nm": _clean_text(buy_nm),
@@ -1169,7 +1248,7 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
                 key=f"__analytics_sales_forecast_product_ven_nm__{ns}",
             )
 
-        c8, c9, c10 = st.columns(3)
+        c8, c9, c10, c11 = st.columns(4)
         with c8:
             product_group_opt = _select_code_option(
                 "제품그룹명",
@@ -1177,54 +1256,60 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
                 key=f"__analytics_sales_forecast_product_group__{ns}",
             )
         with c9:
-            product_di_opt = _select_code_option(
+            product_di_opts = _select_code_options(
                 "제품구분명",
                 "0004",
                 key=f"__analytics_sales_forecast_product_di__{ns}",
             )
         with c10:
-            product_class_opt = _select_code_option(
+            product_class_opts = _select_code_options(
                 "제품분류명",
                 "0028",
                 key=f"__analytics_sales_forecast_product_class__{ns}",
             )
-
-        c11, c12, c13 = st.columns(3)
         with c11:
+            stock_opts = _select_code_options(
+                "재고위치",
+                "0018",
+                key=f"__analytics_sales_forecast_stock__{ns}",
+            )
+
+        c12, c13, c14 = st.columns(3)
+        with c12:
             ven_nm = st.text_input(
                 "거래처명",
                 value="",
                 key=f"__analytics_sales_forecast_ven_nm__{ns}",
             )
-        with c12:
+        with c13:
             buy_nm = st.text_input(
                 "매입처명",
                 value="",
                 key=f"__analytics_sales_forecast_buy_nm__{ns}",
             )
-        with c13:
+        with c14:
             sales_man_nm = st.text_input(
                 "영업사원명",
                 value="",
                 key=f"__analytics_sales_forecast_sales_man_nm__{ns}",
             )
 
-        c14, c15, c16 = st.columns(3)
-        with c14:
+        c15, c16, c17 = st.columns(3)
+        with c15:
             sido_nm = st.text_input(
                 "시도명",
                 value="",
                 key=f"__analytics_sales_forecast_sido_nm__{ns}",
                 placeholder="예: 서울",
             )
-        with c15:
+        with c16:
             gugun_nm = st.text_input(
                 "시구군명",
                 value="",
                 key=f"__analytics_sales_forecast_gugun_nm__{ns}",
                 placeholder="예: 강남",
             )
-        with c16:
+        with c17:
             road_nm = st.text_input(
                 "도로명",
                 value="",
@@ -1263,10 +1348,18 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
         "product_ven_nm": _clean_text(product_ven_nm),
         "product_group": product_group_opt.get("code", ""),
         "product_group_nm": product_group_opt.get("name", ""),
-        "product_di": product_di_opt.get("code", ""),
-        "product_di_nm": product_di_opt.get("name", ""),
-        "product_class": product_class_opt.get("code", ""),
-        "product_class_nm": product_class_opt.get("name", ""),
+        "product_di": "",
+        "product_di_nm": "",
+        "product_di_list": _selected_codes(product_di_opts),
+        "product_di_nm_list": _selected_names(product_di_opts),
+        "product_class": "",
+        "product_class_nm": "",
+        "product_class_list": _selected_codes(product_class_opts),
+        "product_class_nm_list": _selected_names(product_class_opts),
+        "stock_cd": "",
+        "stock_nm": "",
+        "stock_cd_list": _selected_codes(stock_opts),
+        "stock_nm_list": _selected_names(stock_opts),
         "ven_nm": _clean_text(ven_nm),
         "buy_nm": _clean_text(buy_nm),
         "sales_man_nm": _clean_text(sales_man_nm),
@@ -1378,7 +1471,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         with c8:
             product_ven_nm = st.text_input("제조사명", value="", key=f"__analytics_stock_shortage_product_ven_nm__{ns}")
 
-        c9, c10, c11 = st.columns(3)
+        c9, c10, c11, c12 = st.columns(4)
         with c9:
             product_group_opt = _select_code_option(
                 "제품그룹명",
@@ -1386,24 +1479,30 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
                 key=f"__analytics_stock_shortage_product_group__{ns}",
             )
         with c10:
-            product_di_opt = _select_code_option(
+            product_di_opts = _select_code_options(
                 "제품구분명",
                 "0004",
                 key=f"__analytics_stock_shortage_product_di__{ns}",
             )
         with c11:
-            product_class_opt = _select_code_option(
+            product_class_opts = _select_code_options(
                 "제품분류명",
                 "0028",
                 key=f"__analytics_stock_shortage_product_class__{ns}",
             )
-
-        c12, c13, c14 = st.columns(3)
         with c12:
-            ven_nm = st.text_input("거래처명", value="", key=f"__analytics_stock_shortage_ven_nm__{ns}")
+            stock_opts = _select_code_options(
+                "재고위치",
+                "0018",
+                key=f"__analytics_stock_shortage_stock__{ns}",
+            )
+
+        c13, c14, c15 = st.columns(3)
         with c13:
-            buy_nm = st.text_input("매입처명", value="", key=f"__analytics_stock_shortage_buy_nm__{ns}")
+            ven_nm = st.text_input("거래처명", value="", key=f"__analytics_stock_shortage_ven_nm__{ns}")
         with c14:
+            buy_nm = st.text_input("매입처명", value="", key=f"__analytics_stock_shortage_buy_nm__{ns}")
+        with c15:
             sales_man_nm = st.text_input("영업사원명", value="", key=f"__analytics_stock_shortage_sales_man_nm__{ns}")
 
         submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
@@ -1443,10 +1542,18 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         "product_ven_nm": _clean_text(product_ven_nm),
         "product_group": product_group_opt.get("code", ""),
         "product_group_nm": product_group_opt.get("name", ""),
-        "product_di": product_di_opt.get("code", ""),
-        "product_di_nm": product_di_opt.get("name", ""),
-        "product_class": product_class_opt.get("code", ""),
-        "product_class_nm": product_class_opt.get("name", ""),
+        "product_di": "",
+        "product_di_nm": "",
+        "product_di_list": _selected_codes(product_di_opts),
+        "product_di_nm_list": _selected_names(product_di_opts),
+        "product_class": "",
+        "product_class_nm": "",
+        "product_class_list": _selected_codes(product_class_opts),
+        "product_class_nm_list": _selected_names(product_class_opts),
+        "stock_cd": "",
+        "stock_nm": "",
+        "stock_cd_list": _selected_codes(stock_opts),
+        "stock_nm_list": _selected_names(stock_opts),
         "ven_nm": _clean_text(ven_nm),
         "buy_nm": _clean_text(buy_nm),
         "sales_man_nm": _clean_text(sales_man_nm),

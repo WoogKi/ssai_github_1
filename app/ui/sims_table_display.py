@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Tuple
+from decimal import Decimal
 import inspect
 import logging
 
@@ -27,6 +28,100 @@ def _clean_text(value: Any) -> str:
     except Exception:
         pass
     return str(value or "").strip()
+
+
+def _is_numeric_display_name(col: Any) -> bool:
+    s = _clean_text(col)
+    numeric_words = (
+        "장부재고평가단가",
+        "실재고평가단가",
+        "현재재고수량",
+        "예상기준월수량",
+        "재고커버월수",
+        "매출수량",
+        "매출금액",
+        "공급가액",
+        "세액",
+        "합계금액",
+        "단가",
+        "평가금액",
+        "재고금액",
+        "수량",
+        "금액",
+        "평가단가",
+        "커버월수",
+    )
+    return any(w in s for w in numeric_words)
+
+
+def _normalize_display_scalar(value: Any) -> Any:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+    if isinstance(value, bytearray):
+        try:
+            return bytes(value).decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+    if isinstance(value, Decimal):
+        try:
+            if value == value.to_integral_value():
+                return int(value)
+        except Exception:
+            pass
+        return float(value)
+    return value
+
+
+def normalize_display_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a display-only DataFrame that is safer for Streamlit/Arrow conversion.
+    The source DataFrame is not mutated.
+    """
+    if not isinstance(df, pd.DataFrame):
+        return df
+
+    out = df.copy()
+    for col in list(out.columns):
+        try:
+            sr = out[col]
+        except Exception:
+            continue
+
+        if _is_numeric_display_name(col):
+            out[col] = pd.to_numeric(sr, errors="coerce")
+            continue
+
+        if pd.api.types.is_object_dtype(sr) or pd.api.types.is_string_dtype(sr):
+            cleaned = sr.map(_normalize_display_scalar)
+            sample = cleaned.dropna().head(80).tolist()
+            mixed_binary_or_decimal = any(
+                isinstance(v, (bytes, bytearray, Decimal)) for v in sample
+            )
+            mixed_types = {
+                type(v)
+                for v in sample
+                if v is not None and not isinstance(v, str)
+            }
+            if mixed_binary_or_decimal or len(mixed_types) > 1:
+                out[col] = cleaned.map(lambda v: "" if v is None else str(v))
+            else:
+                out[col] = cleaned
+
+    return out
+
+
+def _make_arrow_safe_df(df: pd.DataFrame) -> pd.DataFrame:
+    return normalize_display_df_for_streamlit(df)
 
 
 def _has_korean(text: str) -> bool:
@@ -603,7 +698,7 @@ def build_sims_table_display_config(
     if not isinstance(df, pd.DataFrame):
         return df, {}, min_width, min_height
 
-    view_df = df.copy()
+    view_df = normalize_display_df_for_streamlit(df)
 
     if add_row_no:
         view_df = ensure_row_no(view_df, col_name=row_no_name)
