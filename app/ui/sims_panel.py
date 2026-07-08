@@ -334,7 +334,7 @@ def _fast_column_config(df: pd.DataFrame) -> dict:
 
 def _render_fast_dataframe(df: pd.DataFrame, *, height: int = 520) -> None:
     """빠른 표 렌더링."""
-    view_df = _fast_display_df(df)
+    view_df = normalize_display_df_for_streamlit(_fast_display_df(df))
     cfg = _fast_column_config(view_df)
 
     st.dataframe(
@@ -921,7 +921,10 @@ from app.ui.chat_middleware import (
     _expected_analysis_row_count,
     _get_full_download_df_for_sims_item,
 )
-from app.ui.sims_table_display import build_sims_table_display_config
+from app.ui.sims_table_display import (
+    build_sims_table_display_config,
+    normalize_display_df_for_streamlit,
+)
 
 from app.ui.ssai_login import require_permission
 
@@ -1706,6 +1709,8 @@ def _apply_panel_display_limit_to_payload(payload: Dict[str, Any], title: str = 
                 payload["df_display"] = df_disp
             else:
                 return
+        df_disp = normalize_display_df_for_streamlit(df_disp)
+        payload["df_display"] = df_disp
 
         if not isinstance(df_full, pd.DataFrame) or df_full.empty:
             df_full = df_disp.copy()
@@ -1732,6 +1737,7 @@ def _apply_panel_display_limit_to_payload(payload: Dict[str, Any], title: str = 
             payload=payload,
             title=title,
         )
+        limited = normalize_display_df_for_streamlit(limited)
 
         payload["df_display"] = limited
         payload["columns"] = list(limited.columns)
@@ -1923,7 +1929,7 @@ def _stash_panel_table_for_current_followup(payload: Dict[str, Any], action: str
                     display_rows_i = int(len(df_disp)) if isinstance(df_disp, pd.DataFrame) else 0
                     full_rows_i = int(len(df_full)) if isinstance(df_full, pd.DataFrame) else 0
 
-                    meta["row_count"] = display_rows_i
+                    meta["row_count"] = full_rows_i
                     meta["display_row_count"] = display_rows_i
                     meta["row_count_total"] = full_rows_i
                     meta["download_row_count"] = full_rows_i
@@ -3891,4 +3897,3 @@ def _force_open_sims_toggles() -> None:
     log.debug("[panel.main] _force_open_sims_toggles() called")
 
 
-        

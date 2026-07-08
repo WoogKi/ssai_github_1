@@ -22,7 +22,10 @@ from app.sims.views.rddbc_io_shared import (
     _build_io_display_styler,
 )
 
-from app.ui.sims_table_display import build_sims_table_display_config
+from app.ui.sims_table_display import (
+    build_sims_table_display_config,
+    normalize_display_df_for_streamlit,
+)
 
 import datetime as dt
 import time
@@ -1145,6 +1148,50 @@ SIMS_CTX_MAX_ROWS = int(os.getenv("SIMS_CTX_MAX_ROWS", "300"))  # LLM 컨텍스�
 #   메인(UI)에서 지정한 컨테이너(anchor) 내부로 결과를 렌더링할 수 있게 한다.
 # - 앵커가 없으면 기존처럼 현재 위치에 렌더링(하위호환).
 # ---------------------------------------------------------------------
+def _chat_display_max_rows(default: int = 200) -> int:
+    return max(0, _get_int_env("SIMS_CHAT_DISPLAY_MAX_ROWS", default))
+
+
+def _limit_chat_display_df(df: pd.DataFrame, *, limit: int | None = None) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return df
+
+    out = normalize_display_df_for_streamlit(df)
+    row_limit = _chat_display_max_rows() if limit is None else int(limit or 0)
+    if row_limit > 0 and len(out) > row_limit:
+        return out.head(row_limit).copy()
+    return out
+
+
+def _apply_chat_display_limit_to_payload(payload: Dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    df_full = payload.get("df")
+    df_display = payload.get("df_display")
+    if not isinstance(df_display, pd.DataFrame):
+        if isinstance(payload.get("data"), pd.DataFrame):
+            df_display = payload.get("data")
+        elif isinstance(df_full, pd.DataFrame):
+            df_display = df_full
+
+    if not isinstance(df_display, pd.DataFrame):
+        return
+
+    limited = _limit_chat_display_df(df_display)
+    payload["df_display"] = limited
+    payload["data"] = limited
+    payload["columns"] = list(limited.columns)
+    payload["records"] = limited.to_dict(orient="records")
+
+    meta = payload.setdefault("meta", {})
+    full_rows = int(len(df_full)) if isinstance(df_full, pd.DataFrame) else int(len(df_display))
+    meta["display_row_count"] = int(len(limited))
+    meta.setdefault("row_count", full_rows)
+    meta.setdefault("row_count_total", full_rows)
+    meta.setdefault("download_row_count", full_rows)
+
+
 def set_chat_render_anchor(anchor) -> None:
     """SIMS 결과 렌더링을 고정할 컨테이너(예: st.container())를 지정."""
     try:
@@ -1286,6 +1333,7 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
 
             if not isinstance(df_disp, pd.DataFrame) or df_disp.empty:
                 df_disp = df_full
+            df_disp = _limit_chat_display_df(df_disp)
 
             sample_df = df_disp
             if SIMS_CTX_MAX_ROWS and len(sample_df) > SIMS_CTX_MAX_ROWS:
@@ -1294,7 +1342,7 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
             meta = payload.get("meta") or {}
             payload["type"] = "table"
             payload["title"] = title
-            payload["data"] = sample_df
+            payload["data"] = df_disp
             payload["meta"] = meta
             payload["df"] = df_full          # ★ 컨텍스트용으로 계속 유지
             payload["df_display"] = df_disp  # ★ 화면/컨텍스트 공용
@@ -1304,6 +1352,9 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
             except Exception:
                 row_count = len(df_full)
             meta.setdefault("row_count", row_count)
+            meta["display_row_count"] = int(len(df_disp))
+            meta.setdefault("row_count_total", row_count)
+            meta.setdefault("download_row_count", row_count)
             meta.setdefault("columns", [str(c) for c in sample_df.columns])
             meta.setdefault("source", "SIMS")
             if payload.get("action"):
@@ -6185,6 +6236,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 except Exception:
                     data = None
 
+    if isinstance(data, pd.DataFrame):
+        data = normalize_display_df_for_streamlit(data)
+
     role = (item.get("role") or "assistant").lower()
     if role not in ("assistant", "user"):
         role = "assistant"
@@ -7028,5 +7082,3 @@ __all__ = [
     "render_sims_chat_item",
     "clear_product_candidate_tables_from_chat",
 ]
-
-

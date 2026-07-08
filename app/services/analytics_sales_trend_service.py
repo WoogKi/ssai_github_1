@@ -49,6 +49,38 @@ def _sum_numeric(df: pd.DataFrame, col: str) -> float:
         return 0.0
     return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
 
+
+def _normalize_analytics_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    numeric_words = (
+        "장부재고평가단가",
+        "실재고평가단가",
+        "현재재고수량",
+        "예상기준월수량",
+        "재고커버월수",
+        "매출수량",
+        "매출금액",
+        "공급가액",
+        "세액",
+        "합계금액",
+        "단가",
+        "평가금액",
+        "재고금액",
+        "수량",
+        "금액",
+        "평가단가",
+        "커버월수",
+    )
+
+    out = df.copy()
+    for col in out.columns:
+        s = str(col or "")
+        if any(w in s for w in numeric_words):
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+    return out
+
 def _ensure_analysis_seq_column(
     df: pd.DataFrame,
     *,
@@ -233,6 +265,38 @@ def _add_filter(clauses: list[str], condition: str) -> None:
         clauses.append(condition.strip())
 
 
+def _clean_list_param(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_values = [value]
+    elif isinstance(value, (list, tuple, set)):
+        raw_values = list(value)
+    else:
+        return []
+    return [str(v).strip() for v in raw_values if str(v).strip()]
+
+
+def _add_in_filter(
+    clauses: list[str],
+    params: Dict[str, Any],
+    field_sql: str,
+    key_prefix: str,
+    values: list[str],
+) -> bool:
+    clean_values = _clean_list_param(values)
+    if not clean_values:
+        return False
+
+    names: list[str] = []
+    for i, value in enumerate(clean_values):
+        key = f"{key_prefix}_in_{i}"
+        params[key] = value
+        names.append(f"%({key})s")
+    _add_filter(clauses, f"{field_sql} IN ({', '.join(names)})")
+    return True
+
+
 def _build_filters(params: Dict[str, Any]) -> str:
     clauses: list[str] = []
 
@@ -308,13 +372,29 @@ def _build_filters(params: Dict[str, Any]) -> str:
         params["product_group_nm_like"] = like_value(params.get("product_group_nm"))
         _add_filter(clauses, "Physic_Group_Nm.Rd01_Hnm LIKE %(product_group_nm_like)s")
 
-    if clean_text(params.get("product_di")):
+    if _add_in_filter(
+        clauses,
+        params,
+        "Physic_Cd.Rd04_Physic_Di",
+        "product_di",
+        _clean_list_param(params.get("product_di_list")),
+    ):
+        pass
+    elif clean_text(params.get("product_di")):
         _add_filter(clauses, "Physic_Cd.Rd04_Physic_Di = %(product_di)s")
     elif like_value(params.get("product_di_nm")):
         params["product_di_nm_like"] = like_value(params.get("product_di_nm"))
         _add_filter(clauses, "Physic_Di_Nm.Rd01_Hnm LIKE %(product_di_nm_like)s")
 
-    if clean_text(params.get("product_class")):
+    if _add_in_filter(
+        clauses,
+        params,
+        "Physic_Cd.Rd04_Physic_Gu",
+        "product_class",
+        _clean_list_param(params.get("product_class_list")),
+    ):
+        pass
+    elif clean_text(params.get("product_class")):
         _add_filter(clauses, "Physic_Cd.Rd04_Physic_Gu = %(product_class)s")
     elif like_value(params.get("product_class_nm")):
         params["product_class_nm_like"] = like_value(params.get("product_class_nm"))
@@ -322,7 +402,15 @@ def _build_filters(params: Dict[str, Any]) -> str:
 
 
     # 재고위치
-    if clean_text(params.get("stock_cd")):
+    if _add_in_filter(
+        clauses,
+        params,
+        "Out_Put.Rd12_Stock_Cd",
+        "stock_cd",
+        _clean_list_param(params.get("stock_cd_list")),
+    ):
+        pass
+    elif clean_text(params.get("stock_cd")):
         _add_filter(clauses, "Out_Put.Rd12_Stock_Cd = %(stock_cd)s")
 
     if like_value(params.get("stock_nm")):
@@ -473,19 +561,43 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
         params["product_group_nm_like"] = like_value(params.get("product_group_nm"))
         _add_filter(clauses, "Physic_Group_Nm.Rd01_Hnm LIKE %(product_group_nm_like)s")
 
-    if clean_text(params.get("product_di")):
+    if _add_in_filter(
+        clauses,
+        params,
+        "Physic_Cd.Rd04_Physic_Di",
+        "product_di_monthly",
+        _clean_list_param(params.get("product_di_list")),
+    ):
+        pass
+    elif clean_text(params.get("product_di")):
         _add_filter(clauses, "Physic_Cd.Rd04_Physic_Di = %(product_di)s")
     elif like_value(params.get("product_di_nm")):
         params["product_di_nm_like"] = like_value(params.get("product_di_nm"))
         _add_filter(clauses, "Physic_Di_Nm.Rd01_Hnm LIKE %(product_di_nm_like)s")
 
-    if clean_text(params.get("product_class")):
+    if _add_in_filter(
+        clauses,
+        params,
+        "Physic_Cd.Rd04_Physic_Gu",
+        "product_class_monthly",
+        _clean_list_param(params.get("product_class_list")),
+    ):
+        pass
+    elif clean_text(params.get("product_class")):
         _add_filter(clauses, "Physic_Cd.Rd04_Physic_Gu = %(product_class)s")
     elif like_value(params.get("product_class_nm")):
         params["product_class_nm_like"] = like_value(params.get("product_class_nm"))
         _add_filter(clauses, "Physic_Gu_Nm.Rd01_Hnm LIKE %(product_class_nm_like)s")
 
-    if clean_text(params.get("stock_cd")):
+    if _add_in_filter(
+        clauses,
+        params,
+        f"{a}.{p}_Stock_Cd",
+        "stock_cd_monthly",
+        _clean_list_param(params.get("stock_cd_list")),
+    ):
+        pass
+    elif clean_text(params.get("stock_cd")):
         _add_filter(clauses, f"{a}.{p}_Stock_Cd = %(stock_cd)s")
 
     if like_value(params.get("stock_nm")):
@@ -647,6 +759,7 @@ ORDER BY
         df = pd.DataFrame()
 
     df = _add_trend_columns(df)
+    df = _normalize_analytics_numeric_columns(df)
     return df
 
 
@@ -857,6 +970,7 @@ ORDER BY
         df = pd.DataFrame()
 
     df = _add_trend_columns(df)
+    df = _normalize_analytics_numeric_columns(df)
     return df
 
 def get_sales_trend_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
@@ -1119,7 +1233,7 @@ def get_sales_trend_summary_df(
     else:
         out = out.sort_values(["제품코드"]).reset_index(drop=True)
 
-    return out
+    return _normalize_analytics_numeric_columns(out)
 
 def _parse_yyyymm(value: Any) -> str:
     s = _digits_only(value)
@@ -1889,7 +2003,7 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
 
     out.insert(0, "순번", range(1, len(out) + 1))
 
-    return out
+    return _normalize_analytics_numeric_columns(out)
 
 
 def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -2506,7 +2620,7 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     out.attrs["stock_cutoff_month"] = stock_cutoff_month
     out.attrs["stock_mode"] = stock_mode
 
-    return out
+    return _normalize_analytics_numeric_columns(out)
 
 
 def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
