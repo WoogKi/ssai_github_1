@@ -232,22 +232,44 @@ from app.ui.ssai_admin import (
 # =========================================================
 # 4-0) 전역 CSS: SIMS popover / expander UI 스타일 보정
 # =========================================================
-if not st.session_state.get("__base_css_loaded"):
-    st.markdown("""
-    <style>
-      /* SIMS 팝오버 본문 최소 폭 확장 */
-      [data-testid="stPopover"] [data-testid="stPopoverBody"] { min-width: 640px; }
+def _inject_base_css_once() -> None:
+    """Streamlit 전역 CSS를 1회만 주입한다.
 
-      /* expander 제목 줄 간격 보정 */
-      details[open] > summary { line-height: 1.1; }
+    st.markdown(..., unsafe_allow_html=True) 방식은 일부 HTTPS/IIS 경유
+    초기 렌더링에서 <style>...</style> 문자열이 화면에 노출되는 경우가 있어
+    st.html() 우선, 미지원 버전은 st.markdown()으로 fallback 한다.
+    """
+    if st.session_state.get("__base_css_loaded"):
+        return
 
-      /* 패널 내부 여백/버튼 정렬 보정 */
-      [data-testid="stPopoverBody"] > div {
-          padding: 0.75rem 1rem !important;
-      }
-    </style>
-    """, unsafe_allow_html=True)
+    css = """
+<style>
+/* SIMS 팝오버 본문 최소 폭 확장 */
+[data-testid="stPopover"] [data-testid="stPopoverBody"] {
+    min-width: 640px;
+}
+
+/* expander 제목 줄 간격 보정 */
+details[open] > summary {
+    line-height: 1.1;
+}
+
+/* 패널 내부 여백/버튼 정렬 보정 */
+[data-testid="stPopoverBody"] > div {
+    padding: 0.75rem 1rem !important;
+}
+</style>
+"""
+
+    if hasattr(st, "html"):
+        st.html(css)
+    else:
+        st.markdown(css, unsafe_allow_html=True)
+
     st.session_state["__base_css_loaded"] = True
+
+
+_inject_base_css_once()
 
 #
 # =========================================================
