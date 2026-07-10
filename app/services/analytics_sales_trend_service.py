@@ -2265,6 +2265,11 @@ def _stock_current_monthly_spec(stock_mode: str) -> Dict[str, str]:
         "source_label": "장부재고월집계(Rddbc220) 누계",
     }
 
+def _chunks(values: list[str], size: int):
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
 def _load_product_current_stock(
     product_codes: list[str],
     *,
@@ -2276,78 +2281,76 @@ def _load_product_current_stock(
     """
     품목별 재고부족현황의 현재고를 월집계 누계로 가져온다.
 
-    수량:
-      입고수량 + 입고할증수량 - 출고수량 - 출고할증수량
-
-    금액:
-      현재재고수량 × 평가단가
-
-    평가단가:
-      1순위: 월집계 입고공급가액 / 월집계 입고수량
-      2순위: 제품마스터 단가 fallback
-
-    주의:
-      출고공급가액/출고세액은 매출 거래금액 성격이므로
-      현재재고금액 계산에서 차감하지 않는다.
+    SQL Server parameter limit을 피하기 위해 product code를 batch로 나누되,
+    전체 product code를 조회한다.
     """
+    t0 = time.perf_counter()
     codes = [str(x or "").strip() for x in product_codes if str(x or "").strip()]
     codes = sorted(set(codes))
 
-    if not codes:
-        return pd.DataFrame()
-
-    codes = codes[:2000]
-
     spec = _stock_current_monthly_spec(stock_mode)
     table = spec["table"]
-    p = spec["prefix"]
+    pfx = spec["prefix"]
     qty_col = spec["qty_col"]
     amt_col = spec["amt_col"]
     unit_col = spec["unit_col"]
     fallback_unit_col = spec["fallback_unit_col"]
-    if str(stock_mode or "").strip() == "real":
-        in_qty_expr = (
-            f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)"
-            f" + CAST(ISNULL(M.{p}_In_Oquantity, 0) AS FLOAT)"
-        )
-        out_qty_expr = (
-            f"CAST(ISNULL(M.{p}_Out_Quantity, 0) AS FLOAT)"
-            f" + CAST(ISNULL(M.{p}_Out_Oquantity, 0) AS FLOAT)"
-        )
-    else:
-        in_qty_expr = f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)"
-        out_qty_expr = f"CAST(ISNULL(M.{p}_Out_Quantity, 0) AS FLOAT)"
-
     stock_month_to = _normalize_month(month_to) or pd.Timestamp.today().strftime("%Y%m")
 
-    bind_params: Dict[str, Any] = {
-        "stock_month_to": stock_month_to,
-    }
-    placeholders = []
+    def _with_stock_attrs(df: pd.DataFrame, *, batches: int, elapsed: float) -> pd.DataFrame:
+        df.attrs["stock_source_table"] = spec["source_table"]
+        df.attrs["stock_source_label"] = spec["source_label"]
+        df.attrs["stock_cutoff_month"] = stock_month_to
+        df.attrs["stock_query_codes"] = len(codes)
+        df.attrs["stock_query_batches"] = batches
+        df.attrs["stock_query_elapsed_sec"] = elapsed
+        return df
 
-    for i, cd in enumerate(codes):
-        key = f"cd{i}"
-        bind_params[key] = cd
-        placeholders.append(f"%({key})s")
+    if not codes:
+        return _with_stock_attrs(pd.DataFrame(), batches=0, elapsed=0.0)
 
-    stock_filter_sql = ""
+    if str(stock_mode or "").strip() == "real":
+        in_qty_expr = (
+            f"CAST(ISNULL(M.{pfx}_In_Quantity, 0) AS FLOAT)"
+            f" + CAST(ISNULL(M.{pfx}_In_Oquantity, 0) AS FLOAT)"
+        )
+        out_qty_expr = (
+            f"CAST(ISNULL(M.{pfx}_Out_Quantity, 0) AS FLOAT)"
+            f" + CAST(ISNULL(M.{pfx}_Out_Oquantity, 0) AS FLOAT)"
+        )
+    else:
+        in_qty_expr = f"CAST(ISNULL(M.{pfx}_In_Quantity, 0) AS FLOAT)"
+        out_qty_expr = f"CAST(ISNULL(M.{pfx}_Out_Quantity, 0) AS FLOAT)"
+
     stock_codes = _clean_list_param(stock_cd_list)
     if not stock_codes and clean_text(stock_cd):
         stock_codes = [clean_text(stock_cd)]
-    if stock_codes:
-        stock_names: list[str] = []
-        for i, cd in enumerate(stock_codes):
-            key = f"stock_cd_{i}"
-            bind_params[key] = cd
-            stock_names.append(f"%({key})s")
-        stock_filter_sql = (
-            f"\n      AND LTRIM(RTRIM(M.{p}_Stock_Cd)) IN ({', '.join(stock_names)})"
-        )
+    stock_codes = [clean_text(x) for x in stock_codes if clean_text(x)]
 
-    sql = f"""
+    def _query_batch(batch_codes: list[str]) -> pd.DataFrame:
+        bind_params: Dict[str, Any] = {
+            "stock_month_to": stock_month_to,
+        }
+        placeholders: list[str] = []
+
+        for i, cd in enumerate(batch_codes):
+            key = f"cd{i}"
+            bind_params[key] = cd
+            placeholders.append(f"%({key})s")
+
+        stock_filter_sql = ""
+        if stock_codes:
+            stock_names: list[str] = []
+            for i, cd in enumerate(stock_codes):
+                key = f"stock_cd_{i}"
+                bind_params[key] = cd
+                stock_names.append(f"%({key})s")
+            stock_filter_sql = f"\n      AND M.{pfx}_Stock_Cd IN ({', '.join(stock_names)})"
+
+        sql = f"""
 WITH StockAgg AS (
     SELECT
-        LTRIM(RTRIM(M.{p}_Physic_Cd)) AS [제품코드],
+        M.{pfx}_Physic_Cd AS [제품코드_RAW],
 
         SUM(
             {in_qty_expr}
@@ -2363,20 +2366,20 @@ WITH StockAgg AS (
         ) AS [현재재고수량원본],
 
         SUM(
-            CAST(ISNULL(M.{p}_In_Supply_Price, 0) AS FLOAT)
+            CAST(ISNULL(M.{pfx}_In_Supply_Price, 0) AS FLOAT)
         ) AS [입고공급가액합계]
 
     FROM {table} AS M WITH (NOLOCK)
 
-    WHERE LTRIM(RTRIM(M.{p}_Physic_Cd)) IN ({",".join(placeholders)})
-      AND LEFT(LTRIM(RTRIM(M.{p}_Stock_YyMm)), 6) <= %(stock_month_to)s
+    WHERE M.{pfx}_Physic_Cd IN ({",".join(placeholders)})
+      AND M.{pfx}_Stock_YyMm <= %(stock_month_to)s
       {stock_filter_sql}
 
     GROUP BY
-        LTRIM(RTRIM(M.{p}_Physic_Cd))
+        M.{pfx}_Physic_Cd
 )
 SELECT
-    S.[제품코드],
+    LTRIM(RTRIM(S.[제품코드_RAW])) AS [제품코드],
 
     CAST(ISNULL(S.[현재재고수량원본], 0) AS FLOAT) AS [{qty_col}],
 
@@ -2403,17 +2406,52 @@ SELECT
 FROM StockAgg AS S
 
 LEFT JOIN dbo.Rddbc040 AS P WITH (NOLOCK)
-    ON S.[제품코드] = LTRIM(RTRIM(P.Rd04_Physic_Cd))
+    ON S.[제품코드_RAW] = P.Rd04_Physic_Cd
+OPTION (RECOMPILE)
 """
 
-    stock_df = query_to_df(sql, bind_params)
-    if stock_df is None:
+        batch_df = query_to_df(sql, bind_params)
+        if batch_df is None:
+            return pd.DataFrame()
+        return batch_df
+
+    chunk_size = 1800
+    batches = list(_chunks(codes, chunk_size))
+    frames: list[pd.DataFrame] = []
+
+    for batch in batches:
+        batch_df = _query_batch(batch)
+        if batch_df is not None and not batch_df.empty:
+            frames.append(batch_df)
+
+    if frames:
+        stock_df = pd.concat(frames, ignore_index=True)
+    else:
         stock_df = pd.DataFrame()
 
-    if not stock_df.empty:
-        stock_df.attrs["stock_source_table"] = spec["source_table"]
-        stock_df.attrs["stock_source_label"] = spec["source_label"]
-        stock_df.attrs["stock_cutoff_month"] = stock_month_to
+    product_col = "제품코드"
+    if not stock_df.empty and product_col in stock_df.columns:
+        dup_count = int(stock_df[product_col].fillna("").astype(str).str.strip().duplicated().sum())
+        if dup_count:
+            log.warning(
+                "[analytics.stock.load.duplicate_product_code] duplicates=%s codes=%s batches=%s",
+                dup_count,
+                len(codes),
+                len(batches),
+            )
+
+    elapsed = time.perf_counter() - t0
+    stock_df = _with_stock_attrs(stock_df, batches=len(batches), elapsed=elapsed)
+    log.info(
+        "[analytics.stock.load.perf] codes=%s batches=%s rows=%s elapsed=%.3fs stock_mode=%s stock_cutoff_month=%s stock_cd_count=%s",
+        len(codes),
+        len(batches),
+        len(stock_df),
+        elapsed,
+        stock_mode,
+        stock_month_to,
+        len(stock_codes),
+    )
 
     return stock_df
 
