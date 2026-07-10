@@ -30,8 +30,32 @@ def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _is_explicit_code_display_name(col: Any) -> bool:
+    s = _clean_text(col)
+    s_lower = s.lower()
+    code_words = (
+        "제품코드",
+        "제조사코드",
+        "거래처코드",
+        "매입처코드",
+        "재고적용처코드",
+        "보험코드",
+        "표준코드",
+        "바코드",
+        "stock_cd",
+        "buy_cd",
+        "physic_cd",
+        "ven_cd",
+        "_cd",
+        "코드",
+    )
+    return any(w in s or w in s_lower for w in code_words)
+
+
 def _is_numeric_display_name(col: Any) -> bool:
     s = _clean_text(col)
+    if _is_explicit_code_display_name(s):
+        return False
     numeric_words = (
         "장부재고평가단가",
         "실재고평가단가",
@@ -82,6 +106,42 @@ def _normalize_display_scalar(value: Any) -> Any:
     return value
 
 
+def _format_display_yyyymm(value: Any) -> Any:
+    if value is None:
+        return value
+    try:
+        if pd.isna(value):
+            return value
+    except Exception:
+        pass
+    s = str(value).strip()
+    if not s:
+        return value
+    if len(s) >= 2 and s.endswith(".0"):
+        s = s[:-2]
+    if len(s) == 6 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}"
+    return s
+
+
+def _format_display_yyyymmdd(value: Any) -> Any:
+    if value is None:
+        return value
+    try:
+        if pd.isna(value):
+            return value
+    except Exception:
+        pass
+    s = str(value).strip()
+    if not s:
+        return value
+    if len(s) >= 2 and s.endswith(".0"):
+        s = s[:-2]
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    return s
+
+
 def normalize_display_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
     """
     Return a display-only DataFrame that is safer for Streamlit/Arrow conversion.
@@ -95,6 +155,14 @@ def normalize_display_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
         try:
             sr = out[col]
         except Exception:
+            continue
+
+        col_name = _clean_text(col)
+        if col_name == "기준월":
+            out[col] = sr.map(_format_display_yyyymm)
+            continue
+        if "일자" in col_name or "날짜" in col_name:
+            out[col] = sr.map(_format_display_yyyymmdd)
             continue
 
         if _is_numeric_display_name(col):
@@ -209,6 +277,9 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
     )
     if any(w in s for w in force_numeric_words):
         return True
+
+    if _is_explicit_code_display_name(s):
+        return False
 
     # 명칭/구분/판정/기준/자료원 계열은 숫자처럼 보여도 문자 표시
     text_words = [
@@ -623,11 +694,15 @@ def _default_pinned_cols(
         add_first_existing("기준월", "년월", "월")
         add_first_existing("제품코드", "상품코드", "품목코드")
         add_first_existing("제품명", "상품명", "품목명")
+        add_first_existing("규격", "규격명")
         add_first_existing("제조사명", "제약사명", "매입처명")
         add_first_existing("추세판정", "예상등급", "부족등급", "판정결과")
 
+        desired_max_pinned = 5 if "기준월" in cols else 4
         if max_pinned_cols is None:
-            max_pinned_cols = 5
+            max_pinned_cols = desired_max_pinned
+        else:
+            max_pinned_cols = min(int(max_pinned_cols), desired_max_pinned)
 
         return pins[:max(1, int(max_pinned_cols))]
     

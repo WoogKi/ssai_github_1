@@ -18,6 +18,7 @@ from app.db.mssql_client import read_df
 
 import streamlit as st
 
+from app.sims.views.rddbc_io_shared import _week_label_52
 from app.services.analytics_sales_trend_service import (
     get_sales_trend_result,
     get_sales_trend_summary_result,
@@ -26,6 +27,20 @@ from app.services.analytics_sales_trend_service import (
 )
 
 log = logging.getLogger("ssai")
+
+
+SHORTAGE_GRADE_OPTIONS = [
+    "전체",
+    "재고없음",
+    "1개월내 부족",
+    "2개월내 부족주의",
+    "2개월내 부족",
+    "3개월내 부족주의",
+    "3개월내 부족",
+    "정상",
+    "수요관찰",
+    "재고없음/수요없음",
+]
 
 
 def _ns() -> str:
@@ -174,6 +189,18 @@ def _default_start_date() -> dt.date:
 # 오늘 날짜 객체를 반환하는 함수입니다. 예를 들어 오늘이 2025년 8월 15일이라면 datetime.date(2025, 8, 15)을 반환합니다.
 def _default_end_date() -> dt.date:
     return dt.date.today()
+
+
+def _render_date_input_with_week(label: str, value: dt.date, key: str) -> dt.date:
+    d = st.date_input(
+        label,
+        value=value,
+        format="YYYY-MM-DD",
+        key=key,
+    )
+    st.caption(_week_label_52(d))
+    return d
+
 
 # 숫자 값을 입력받아 천 단위 구분 쉼표가 있는 문자열로 반환하는 함수입니다. 입력값이 정수인 경우 쉼표를 추가하여 반환하고, 실수인 경우 소수점 둘째 자리까지 표시하여 쉼표를 추가하여 반환합니다. 입력값이 숫자가 아닌 경우 "0"을 반환합니다.
 # 예를 들어 입력값이 1234567이라면 "1,234,567"을 반환하고, 입력값이 12345.6789이라면 "12,345.68"을 반환하며, 입력값이 "not a number"라면 "0"을 반환합니다.
@@ -435,6 +462,8 @@ def _build_sales_trend_query_condition(params: Dict[str, Any], meta: Dict[str, A
         bits.append(f"도로명 {params.get('road_nm')}")
     if _clean_text(params.get("trend_judge")):
         bits.append(f"추세판정 {params.get('trend_judge')}")
+    if _clean_text(params.get("shortage_grade")):
+        bits.append(f"부족등급 {params.get('shortage_grade')}")
 
     # top은 내부 조회 상한/표시 정책용 값이므로 조회조건 문구에는 노출하지 않는다.
     return " / ".join(bits)
@@ -490,6 +519,7 @@ def _build_sales_trend_display_params(params: Dict[str, Any], meta: Dict[str, An
         ("gugun_nm", "시구군명"),
         ("road_nm", "도로명"),
         ("trend_judge", "추세판정"),        
+        ("shortage_grade", "부족등급"),
         ("top", "Top"),
     ]
 
@@ -676,29 +706,25 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
             )
 
         with c2:
-            date_from = st.date_input(
+            date_from = _render_date_input_with_week(
                 "시작일자",
-                value=_default_start_date(),
-                key=f"__analytics_sales_trend_date_from__{ns}",
+                _default_start_date(),
+                f"__analytics_sales_trend_date_from__{ns}",
             )
         with c3:
-            date_to = st.date_input(
+            date_to = _render_date_input_with_week(
                 "종료일자",
-                value=_default_end_date(),
-                key=f"__analytics_sales_trend_date_to__{ns}",
+                _default_end_date(),
+                f"__analytics_sales_trend_date_to__{ns}",
             )
         with c4:
-            # Top N 입력칸은 제거하고 기존 공통 env 기준을 사용한다.
-            top = _analytics_max_rows()
-
-        c_judge1, c_judge2, c_judge3 = st.columns(3)
-        with c_judge1:
             trend_judge = st.selectbox(
                 "추세판정",
                 ["전체", "감소", "안정", "증가", "신규/증가", "자료부족", "반품주의"],
                 index=0,
                 key=f"__analytics_sales_trend_judge__{ns}",
             )
+        top = _analytics_max_rows()
 
         c4, c5, c6 = st.columns(3)
         with c4:
@@ -942,29 +968,25 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
                 key=f"__analytics_sales_trend_summary_source__{ns}",
             )
         with c2:
-            date_from = st.date_input(
+            date_from = _render_date_input_with_week(
                 "시작일자",
-                value=_default_start_date(),
-                key=f"__analytics_sales_trend_summary_date_from__{ns}",
+                _default_start_date(),
+                f"__analytics_sales_trend_summary_date_from__{ns}",
             )
         with c3:
-            date_to = st.date_input(
+            date_to = _render_date_input_with_week(
                 "종료일자",
-                value=_default_end_date(),
-                key=f"__analytics_sales_trend_summary_date_to__{ns}",
+                _default_end_date(),
+                f"__analytics_sales_trend_summary_date_to__{ns}",
             )
         with c4:
-            # Top N 입력칸은 제거하고 기존 공통 env 기준을 사용한다.
-            top = _analytics_max_rows()
-
-        c_judge1, c_judge2, c_judge3 = st.columns(3)
-        with c_judge1:
             trend_judge = st.selectbox(
                 "추세판정",
                 ["전체", "감소", "안정", "증가", "신규/증가", "자료부족", "반품주의"],
                 index=0,
                 key=f"__analytics_sales_trend_summary_judge__{ns}",
             )
+        top = _analytics_max_rows()
 
 
         c5, c6, c7 = st.columns(3)
@@ -1204,29 +1226,25 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
                 key=f"__analytics_sales_forecast_source__{ns}",
             )
         with c2:
-            date_from = st.date_input(
+            date_from = _render_date_input_with_week(
                 "시작일자",
-                value=_default_start_date(),
-                key=f"__analytics_sales_forecast_date_from__{ns}",
+                _default_start_date(),
+                f"__analytics_sales_forecast_date_from__{ns}",
             )
         with c3:
-            date_to = st.date_input(
+            date_to = _render_date_input_with_week(
                 "종료일자",
-                value=_default_end_date(),
-                key=f"__analytics_sales_forecast_date_to__{ns}",
+                _default_end_date(),
+                f"__analytics_sales_forecast_date_to__{ns}",
             )
         with c4:
-            # Top N 입력칸은 제거하고 기존 공통 env 기준을 사용한다.
-            top = _analytics_max_rows()
-
-        c_judge1, c_judge2, c_judge3 = st.columns(3)
-        with c_judge1:
             trend_judge = st.selectbox(
                 "추세판정",
                 ["전체", "감소", "안정", "증가", "신규/증가", "자료부족", "반품주의"],
                 index=0,
                 key=f"__analytics_sales_forecast_judge__{ns}",
             )
+        top = _analytics_max_rows()
 
         c5, c6, c7 = st.columns(3)
         with c5:
@@ -1432,7 +1450,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
     ):
 
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4 = st.columns(4)
         with c1:
             source_label = st.selectbox(
                 "분석자료원",
@@ -1441,29 +1459,34 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
                 key=f"__analytics_stock_shortage_source__{ns}",
             )
         with c2:
+            date_from = _render_date_input_with_week(
+                "시작일자",
+                _default_start_date(),
+                f"__analytics_stock_shortage_date_from__{ns}",
+            )
+        with c3:
+            date_to = _render_date_input_with_week(
+                "종료일자",
+                _default_end_date(),
+                f"__analytics_stock_shortage_date_to__{ns}",
+            )
+        with c4:
+            shortage_grade = st.selectbox(
+                "부족등급",
+                SHORTAGE_GRADE_OPTIONS,
+                index=0,
+                key=f"__analytics_stock_shortage_grade__{ns}",
+            )
+        top = _analytics_max_rows()
+
+        c_stock, c6, c7, c8 = st.columns(4)
+        with c_stock:
             stock_label = st.selectbox(
                 "재고기준",
                 ["장부재고", "실재고"],
                 index=0,
                 key=f"__analytics_stock_shortage_stock_mode__{ns}",
             )
-        with c3:
-            date_from = st.date_input(
-                "시작일자",
-                value=_default_start_date(),
-                key=f"__analytics_stock_shortage_date_from__{ns}",
-            )
-        with c4:
-            date_to = st.date_input(
-                "종료일자",
-                value=_default_end_date(),
-                key=f"__analytics_stock_shortage_date_to__{ns}",
-            )
-        with c5:
-            # Top N 입력칸은 제거하고 기존 공통 env 기준을 사용한다.
-            top = _analytics_max_rows()
-
-        c6, c7, c8 = st.columns(3)
         with c6:
             physic_cd = st.text_input("제품코드", value="", key=f"__analytics_stock_shortage_physic_cd__{ns}")
         with c7:
@@ -1557,6 +1580,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         "ven_nm": _clean_text(ven_nm),
         "buy_nm": _clean_text(buy_nm),
         "sales_man_nm": _clean_text(sales_man_nm),
+        "shortage_grade": "" if shortage_grade == "전체" else shortage_grade,
         "top": int(top),
     }
 

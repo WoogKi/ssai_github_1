@@ -84,6 +84,7 @@ def _is_code_col_name(col: str) -> bool:
 
 def _is_numeric_col(df: pd.DataFrame, col: str) -> bool:
     s = str(col or "").strip()
+    s_lower = s.lower()
 
     if s == "순번":
         return True
@@ -195,18 +196,25 @@ def _is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
     - 이름/명칭/일자/등급도 숫자 처리 제외.
     """
     s = str(col or "").strip()
+    s_lower = s.lower()
 
     if s == "순번":
         return True
 
     exclude_words = [
         "코드",
+        "stock_cd",
+        "buy_cd",
+        "physic_cd",
+        "ven_cd",
+        "_cd",
         "ID",
         "번호",
         "일자",
         "날짜",
         "일시",
         "시간",
+        "기준월",
         "명",
         "이름",
         "재고기준",
@@ -216,7 +224,7 @@ def _is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
         "부족등급",
         "예상기준",
     ]
-    if any(w in s for w in exclude_words):
+    if any(w in s or w in s_lower for w in exclude_words):
         return False
 
     include_words = [
@@ -332,18 +340,47 @@ def _fast_column_config(df: pd.DataFrame) -> dict:
     return cfg
 
 
-def _render_fast_dataframe(df: pd.DataFrame, *, height: int = 520) -> None:
+def _render_fast_dataframe(
+    df: pd.DataFrame,
+    *,
+    height: int = 520,
+    action_name: str = "",
+    meta: Dict[str, Any] | None = None,
+) -> None:
     """빠른 표 렌더링."""
     view_df = normalize_display_df_for_streamlit(_fast_display_df(df))
-    cfg = _fast_column_config(view_df)
-
-    st.dataframe(
-        view_df,
-        use_container_width=True,
-        hide_index=True,
-        height=height,
-        column_config=cfg if cfg else None,
-    )
+    try:
+        view_df, column_config, _table_width, table_height = build_sims_table_display_config(
+            view_df,
+            action_name=action_name,
+            meta=meta or {},
+            add_row_no=False,
+            row_no_name="순번",
+            enable_pinning=True,
+            max_pinned_cols=5,
+            min_width=720,
+            max_width=2600,
+            min_height=170,
+            max_height=height,
+            row_height=32,
+        )
+        st.dataframe(
+            view_df,
+            use_container_width=True,
+            hide_index=True,
+            height=table_height,
+            column_config=column_config if column_config else None,
+        )
+    except Exception:
+        log.exception("[panel] fast common table render failed")
+        cfg = _fast_column_config(view_df)
+        st.dataframe(
+            view_df,
+            use_container_width=True,
+            hide_index=True,
+            height=height,
+            column_config=cfg if cfg else None,
+        )
 
 def _prepare_io_table_df(df: pd.DataFrame) -> pd.DataFrame:
     out = _trim_object_columns(df)
@@ -537,12 +574,18 @@ def _analytics_number_decimals(col: str) -> int | None:
     None이면 숫자 포맷 대상 아님.
     """
     c = str(col or "").strip()
+    c_lower = c.lower()
     if not c:
         return None
 
     # 문자/코드성 컬럼 제외
     exclude_words = [
         "코드",
+        "stock_cd",
+        "buy_cd",
+        "physic_cd",
+        "ven_cd",
+        "_cd",
         "명",
         "기준월",
         "재고기준",
@@ -552,7 +595,7 @@ def _analytics_number_decimals(col: str) -> int | None:
         "부족등급",
         "예상기준",
     ]
-    if any(w in c for w in exclude_words):
+    if any(w in c or w in c_lower for w in exclude_words):
         return None
 
     # 소수 2자리 계열
@@ -3231,7 +3274,12 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
 
                     if _is_large_table_for_fast_render(view_df):
                         st.caption("빠른 표 모드: 분석/KPI 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
-                        _render_fast_dataframe(view_df, height=520)
+                        _render_fast_dataframe(
+                            view_df,
+                            height=520,
+                            action_name=action,
+                            meta=meta,
+                        )
 
                     else:
                         styled = _style_sales_trend_rows(view_df)
@@ -3255,7 +3303,12 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                 else:
                     if _is_large_table_for_fast_render(view_df):
                         st.caption("빠른 표 모드: 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
-                        _render_fast_dataframe(view_df, height=420)
+                        _render_fast_dataframe(
+                            view_df,
+                            height=420,
+                            action_name=action,
+                            meta=meta,
+                        )
                     else:
                         st.dataframe(
                             view_df,
@@ -3895,5 +3948,3 @@ def _force_open_sims_toggles() -> None:
     """
     _ensure_sims_state()
     log.debug("[panel.main] _force_open_sims_toggles() called")
-
-

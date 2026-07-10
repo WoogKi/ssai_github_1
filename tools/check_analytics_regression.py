@@ -80,6 +80,8 @@ class ServiceCase:
     require_seq_column: bool = True
     require_summary_md: bool = True
     require_message: bool = True
+    allow_zero_rows: bool = False
+    check_code_columns: bool = True
 
 
 @dataclass
@@ -92,6 +94,7 @@ class NlqCase:
     expected_condition_tokens: tuple[str, ...] = ()
     require_summary_md: bool = True
     require_message: bool = True
+    allow_empty_meta_counts: bool = False
 
 def _ok(name: str, detail: str = "") -> CheckResult:
     return CheckResult(name=name, ok=True, detail=detail)
@@ -157,6 +160,47 @@ def _payload_columns(payload: dict[str, Any]) -> list[str]:
         return [str(c) for c in records[0].keys()]
 
     return []
+
+
+def _payload_df(payload: dict[str, Any]) -> Any:
+    try:
+        import pandas as pd
+        for key in ("df", "df_display"):
+            obj = payload.get(key)
+            if isinstance(obj, pd.DataFrame):
+                return obj
+    except Exception:
+        pass
+    return None
+
+
+def _code_column_dtype_problem(payload: dict[str, Any]) -> str:
+    try:
+        import pandas as pd
+    except Exception:
+        return ""
+
+    df = _payload_df(payload)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return ""
+
+    code_cols = [
+        "제품코드",
+        "제조사코드",
+        "거래처코드",
+        "매입처코드",
+        "재고적용처코드",
+        "보험코드",
+        "표준코드",
+        "바코드",
+    ]
+    bad_cols = [
+        col for col in code_cols
+        if col in df.columns and pd.api.types.is_numeric_dtype(df[col])
+    ]
+    if bad_cols:
+        return f"코드 컬럼이 numeric dtype으로 변환됨: {bad_cols!r}"
+    return ""
 
 
 def _payload_row_count(payload: dict[str, Any]) -> int:
@@ -365,6 +409,59 @@ def _service_cases() -> list[ServiceCase]:
             expected_condition_tokens=common_condition_tokens,
             require_seq_column=True,
         ),
+        ServiceCase(
+            name="품목별 매출 추세 분석 - 추세판정 필터",
+            function_name="get_sales_trend_result",
+            params={
+                **common_params,
+                "trend_judge": "감소",
+            },
+            expected_title_contains="품목별 매출 추세",
+            expected_meta_key="trend_judge_counts",
+            expected_analysis_type="sales_trend",
+            expected_condition_tokens=common_condition_tokens + ("추세판정", "감소"),
+            allow_zero_rows=True,
+        ),
+        ServiceCase(
+            name="품목별 매출 추세 요약표 - 추세판정 필터",
+            function_name="get_sales_trend_summary_result",
+            params={
+                **common_params,
+                "trend_judge": "증가",
+            },
+            expected_title_contains="품목별 매출 추세 요약표",
+            expected_meta_key="trend_judge_counts",
+            expected_analysis_type="sales_trend",
+            expected_condition_tokens=common_condition_tokens + ("추세판정", "증가"),
+            allow_zero_rows=True,
+        ),
+        ServiceCase(
+            name="품목별 매출 예상 - 추세판정 필터",
+            function_name="get_sales_forecast_result",
+            params={
+                **common_params,
+                "trend_judge": "반품주의",
+            },
+            expected_title_contains="품목별 매출 예상",
+            expected_meta_key="forecast_grade_counts",
+            expected_analysis_type="sales_forecast",
+            expected_condition_tokens=common_condition_tokens + ("추세판정", "반품주의"),
+            allow_zero_rows=True,
+        ),
+        ServiceCase(
+            name="품목별 재고부족현황 - 부족등급 필터",
+            function_name="get_stock_shortage_result",
+            params={
+                **common_params,
+                "stock_mode": "book",
+                "shortage_grade": "정상",
+            },
+            expected_title_contains="품목별 재고부족현황",
+            expected_meta_key="shortage_grade_counts",
+            expected_analysis_type="stock_shortage",
+            expected_condition_tokens=common_condition_tokens + ("부족등급", "정상"),
+            allow_zero_rows=True,
+        ),
     ]
 
 def _evaluate_service_payload(case: ServiceCase, payload: Any) -> CheckResult:
@@ -385,18 +482,27 @@ def _evaluate_service_payload(case: ServiceCase, payload: Any) -> CheckResult:
         )
 
     row_count = _payload_row_count(payload)
-    if row_count <= 0:
+    if row_count <= 0 and not case.allow_zero_rows:
         return _fail(name, f"row_count가 0 이하: rows={row_count}, title={title!r}, type={ptype!r}")
 
     cols = _payload_columns(payload)
 
-    if case.require_seq_column and "순번" not in cols:
+    if row_count > 0 and case.require_seq_column and "순번" not in cols:
         return _fail(name, f"'순번' 컬럼 없음. columns={cols[:20]}")
 
-    if case.expected_meta_key:
+    if row_count > 0 and case.expected_meta_key:
         val = meta.get(case.expected_meta_key)
         if not isinstance(val, dict) or not val:
             return _fail(name, f"meta[{case.expected_meta_key!r}] 없음 또는 빈값: {val!r}")
+        if case.expected_meta_key == "shortage_grade_counts":
+            try:
+                if sum(int(v or 0) for v in val.values()) != row_count:
+                    return _fail(
+                        name,
+                        f"shortage_grade_counts 합계 불일치: counts={val!r}, rows={row_count}",
+                    )
+            except Exception:
+                return _fail(name, f"shortage_grade_counts 값 변환 실패: {val!r}")
 
     if case.expected_analysis_type:
         got_analysis_type = str(meta.get("analysis_type") or "").strip()
@@ -419,6 +525,11 @@ def _evaluate_service_payload(case: ServiceCase, payload: Any) -> CheckResult:
                 f"condition_text={_condition_text_from_payload(payload)!r}"
             ),
         )
+
+    if row_count > 0 and case.check_code_columns:
+        code_problem = _code_column_dtype_problem(payload)
+        if code_problem:
+            return _fail(name, code_problem)
 
     summary_md = str(meta.get("summary_md") or "").strip()
     message = str(payload.get("message") or "").strip()
@@ -564,6 +675,15 @@ def _nlq_cases() -> list[NlqCase]:
             expected_condition_tokens=base_tokens + ("장부재고",),
         ),
         NlqCase(
+            "품목별 재고부족현황 2025년 장부재고 기준 부족등급 정상 조회",
+            "품목별 재고부족현황",
+            expected_analysis_type="stock_shortage",
+            expected_meta_key="shortage_grade_counts",
+            expected_params={"stock_mode": "book", "shortage_grade": "정상"},
+            expected_condition_tokens=base_tokens + ("장부재고", "부족등급", "정상"),
+            allow_empty_meta_counts=True,
+        ),
+        NlqCase(
             "품목별 매출 추세 2025년 감소 조회",
             "품목별 매출 추세 분석",
             expected_analysis_type="sales_trend",
@@ -619,7 +739,7 @@ def _evaluate_nlq_case(case: NlqCase, handled: bool, payload: dict[str, Any] | N
 
     if case.expected_meta_key:
         val = meta.get(case.expected_meta_key)
-        if not isinstance(val, dict) or not val:
+        if not isinstance(val, dict) or (not val and not case.allow_empty_meta_counts):
             return _fail(name, f"meta[{case.expected_meta_key!r}] 없음 또는 빈값: {val!r}")
 
     if case.expected_analysis_type:

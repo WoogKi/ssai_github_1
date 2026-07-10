@@ -1088,6 +1088,28 @@ def _extract_analytics_trend_judge(txt: str) -> str:
 
     return ""
 
+
+def _extract_analytics_shortage_grade(txt: str) -> str:
+    t = str(txt or "").replace(" ", "")
+
+    grade_patterns = [
+        ("재고없음/수요없음", ("재고없음/수요없음", "재고없고수요없음", "수요없고재고없음")),
+        ("1개월내 부족", ("1개월내부족", "1개월부족")),
+        ("2개월내 부족주의", ("2개월내부족주의", "2개월부족주의")),
+        ("2개월내 부족", ("2개월내부족", "2개월부족")),
+        ("3개월내 부족주의", ("3개월내부족주의", "3개월부족주의")),
+        ("3개월내 부족", ("3개월내부족", "3개월부족")),
+        ("수요관찰", ("수요관찰",)),
+        ("재고없음", ("재고없음", "재고없어", "재고없는")),
+        ("정상", ("정상",)),
+    ]
+
+    for grade, patterns in grade_patterns:
+        if any(p in t for p in patterns):
+            return grade
+    return ""
+
+
 def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     try:
         from app.services.io_nlq import extract_params
@@ -1101,8 +1123,13 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     params = _apply_analytics_source_params(params, txt, action)
 
     trend_judge = _extract_analytics_trend_judge(txt)
-    if trend_judge:
+    if trend_judge and action != "품목별 재고부족현황":
         params["trend_judge"] = trend_judge
+
+    if action == "품목별 재고부족현황":
+        shortage_grade = _extract_analytics_shortage_grade(txt)
+        if shortage_grade:
+            params["shortage_grade"] = shortage_grade
 
     params["top"] = _extract_analytics_top(txt)
 
@@ -4605,7 +4632,6 @@ def try_handle_nlq(
         logger.exception("[nlq.router] failed to import/handle codes handler")
 
     return False
-
 
 
 

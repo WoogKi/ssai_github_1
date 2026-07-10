@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import calendar
 import logging
+import time
 from typing import Any, Dict, Optional
 
 import pandas as pd
@@ -54,6 +55,22 @@ def _normalize_analytics_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df
 
+    code_words = (
+        "제품코드",
+        "제조사코드",
+        "거래처코드",
+        "매입처코드",
+        "재고적용처코드",
+        "보험코드",
+        "표준코드",
+        "바코드",
+        "stock_cd",
+        "buy_cd",
+        "physic_cd",
+        "ven_cd",
+        "_cd",
+        "코드",
+    )
     numeric_words = (
         "장부재고평가단가",
         "실재고평가단가",
@@ -77,6 +94,10 @@ def _normalize_analytics_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     for col in out.columns:
         s = str(col or "")
+        s_lower = s.lower()
+        if any(w in s or w in s_lower for w in code_words):
+            out[col] = out[col].map(lambda v: "" if pd.isna(v) else str(v).strip())
+            continue
         if any(w in s for w in numeric_words):
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
     return out
@@ -2249,6 +2270,8 @@ def _load_product_current_stock(
     *,
     stock_mode: str,
     month_to: str,
+    stock_cd_list: Any = None,
+    stock_cd: Any = None,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황의 현재고를 월집계 누계로 가져온다.
@@ -2282,6 +2305,18 @@ def _load_product_current_stock(
     amt_col = spec["amt_col"]
     unit_col = spec["unit_col"]
     fallback_unit_col = spec["fallback_unit_col"]
+    if str(stock_mode or "").strip() == "real":
+        in_qty_expr = (
+            f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)"
+            f" + CAST(ISNULL(M.{p}_In_Oquantity, 0) AS FLOAT)"
+        )
+        out_qty_expr = (
+            f"CAST(ISNULL(M.{p}_Out_Quantity, 0) AS FLOAT)"
+            f" + CAST(ISNULL(M.{p}_Out_Oquantity, 0) AS FLOAT)"
+        )
+    else:
+        in_qty_expr = f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)"
+        out_qty_expr = f"CAST(ISNULL(M.{p}_Out_Quantity, 0) AS FLOAT)"
 
     stock_month_to = _normalize_month(month_to) or pd.Timestamp.today().strftime("%Y%m")
 
@@ -2295,26 +2330,36 @@ def _load_product_current_stock(
         bind_params[key] = cd
         placeholders.append(f"%({key})s")
 
+    stock_filter_sql = ""
+    stock_codes = _clean_list_param(stock_cd_list)
+    if not stock_codes and clean_text(stock_cd):
+        stock_codes = [clean_text(stock_cd)]
+    if stock_codes:
+        stock_names: list[str] = []
+        for i, cd in enumerate(stock_codes):
+            key = f"stock_cd_{i}"
+            bind_params[key] = cd
+            stock_names.append(f"%({key})s")
+        stock_filter_sql = (
+            f"\n      AND LTRIM(RTRIM(M.{p}_Stock_Cd)) IN ({', '.join(stock_names)})"
+        )
+
     sql = f"""
 WITH StockAgg AS (
     SELECT
         LTRIM(RTRIM(M.{p}_Physic_Cd)) AS [제품코드],
 
         SUM(
-            CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)
-          + CAST(ISNULL(M.{p}_In_Oquantity, 0) AS FLOAT)
+            {in_qty_expr}
         ) AS [입고총수량],
 
         SUM(
-            CAST(ISNULL(M.{p}_Out_Quantity, 0) AS FLOAT)
-          + CAST(ISNULL(M.{p}_Out_Oquantity, 0) AS FLOAT)
+            {out_qty_expr}
         ) AS [출고총수량],
 
         SUM(
-            CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)
-          + CAST(ISNULL(M.{p}_In_Oquantity, 0) AS FLOAT)
-          - CAST(ISNULL(M.{p}_Out_Quantity, 0) AS FLOAT)
-          - CAST(ISNULL(M.{p}_Out_Oquantity, 0) AS FLOAT)
+            {in_qty_expr}
+          - {out_qty_expr}
         ) AS [현재재고수량원본],
 
         SUM(
@@ -2325,6 +2370,7 @@ WITH StockAgg AS (
 
     WHERE LTRIM(RTRIM(M.{p}_Physic_Cd)) IN ({",".join(placeholders)})
       AND LEFT(LTRIM(RTRIM(M.{p}_Stock_YyMm)), 6) <= %(stock_month_to)s
+      {stock_filter_sql}
 
     GROUP BY
         LTRIM(RTRIM(M.{p}_Physic_Cd))
@@ -2395,12 +2441,19 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     """
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
+    t0 = time.perf_counter()
 
     stock_mode = str(params.get("stock_mode") or "book").strip()
     stock_label = _stock_mode_label(stock_mode)
 
     base = get_sales_forecast_df(params)
+    t_base = time.perf_counter()
     if base is None or base.empty:
+        log.info(
+            "[analytics.stock_shortage.perf] base_empty elapsed=%.3fs params=%r",
+            t_base - t0,
+            params,
+        )
         return pd.DataFrame()
 
     out = base.copy()
@@ -2417,7 +2470,10 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
         product_codes,
         stock_mode=stock_mode,
         month_to=stock_cutoff_month,
+        stock_cd_list=params.get("stock_cd_list"),
+        stock_cd=params.get("stock_cd"),
     )
+    t_stock = time.perf_counter()
 
     if stock_df is None or stock_df.empty:
         out["장부재고수량"] = 0
@@ -2524,6 +2580,14 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
 
     out["부족등급"] = out.apply(_stock_shortage_grade, axis=1)
 
+    shortage_grade_filter = clean_text(
+        params.get("shortage_grade") or params.get("shortage_grade_filter")
+    )
+    if shortage_grade_filter and shortage_grade_filter != "전체":
+        out = out[
+            out["부족등급"].fillna("").astype(str).str.strip() == shortage_grade_filter
+        ].copy()
+
     # 표시/다운로드용 소수점 정리
     # - 재고부족현황 원본표에서 평균/예상/커버/필요/부족 수량이
     #   12.333333333 처럼 길게 보이지 않도록 2자리로 정리한다.
@@ -2620,6 +2684,20 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     out.attrs["stock_cutoff_month"] = stock_cutoff_month
     out.attrs["stock_mode"] = stock_mode
 
+    t_done = time.perf_counter()
+    log.info(
+        "[analytics.stock_shortage.perf] base_rows=%s stock_rows=%s out_rows=%s base=%.3fs stock=%.3fs build=%.3fs total=%.3fs stock_mode=%s stock_cutoff_month=%s",
+        len(base),
+        0 if stock_df is None else len(stock_df),
+        len(out),
+        t_base - t0,
+        t_stock - t_base,
+        t_done - t_stock,
+        t_done - t0,
+        stock_mode,
+        stock_cutoff_month,
+    )
+
     return _normalize_analytics_numeric_columns(out)
 
 
@@ -2630,9 +2708,12 @@ def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
             "row_count_total": 0,
             "product_count": 0,
             "sum_current_stock_qty": 0,
+            "sum_current_stock_amt": 0,
             "sum_shortage_1m_qty": 0,
+            "sum_shortage_2m_qty": 0,
             "sum_shortage_3m_qty": 0,
             "shortage_item_count": 0,
+            "shortage_grade_counts": {},
         }
 
     out = df.copy()
@@ -2659,6 +2740,7 @@ def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
         "sum_shortage_3m_qty": _sum_numeric(out, "3개월부족수량"),
 
         "shortage_item_count": shortage_item_count,
+        "shortage_grade_counts": _shortage_grade_counts(out),
     }
 
 
@@ -2678,6 +2760,15 @@ def get_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
     query_summary = _fmt_analytics_query_summary(params, source_label)
     if stock_label:
         query_summary = (f"{query_summary} / 재고기준 {stock_label}" if query_summary else f"재고기준 {stock_label}")
+    shortage_grade_filter = clean_text(
+        params.get("shortage_grade") or params.get("shortage_grade_filter")
+    )
+    if shortage_grade_filter and shortage_grade_filter != "전체":
+        query_summary = (
+            f"{query_summary} / 부족등급 {shortage_grade_filter}"
+            if query_summary
+            else f"부족등급 {shortage_grade_filter}"
+        )
 
     if row_count == 0:
         return {

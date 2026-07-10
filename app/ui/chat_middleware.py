@@ -321,6 +321,7 @@ _SENSITIVE_COLUMN_TOKENS = (
 
 def _is_sensitive_column(col: object) -> bool:
     s = str(col or "").strip()
+    s_lower = s.lower()
     if not s:
         return False
     if s in _SENSITIVE_COLUMN_EXACT:
@@ -537,12 +538,18 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
     - 이름/명칭/일자/등급도 문자 유지
     """
     s = str(col or "").strip()
+    s_lower = s.lower()
 
     if s in {"순번", "조회순번"}:
         return True
 
     exclude_words = [
         "코드",
+        "stock_cd",
+        "buy_cd",
+        "physic_cd",
+        "ven_cd",
+        "_cd",
         "ID",
         "번호",
         "일자",
@@ -558,7 +565,7 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
         "부족등급",
         "예상기준",
     ]
-    if any(w in s for w in exclude_words):
+    if any(w in s or w in s_lower for w in exclude_words):
         return False
 
     include_words = [
@@ -712,7 +719,7 @@ def _render_chat_fast_dataframe(
     분석/KPI 큰 표도 공용 column_config를 사용해서
     좌측 고정 칼럼/컬럼폭/숫자 표시를 유지한다.
     """
-    view_df = _chat_fast_display_df(df)
+    view_df = normalize_display_df_for_streamlit(_chat_fast_display_df(df))
 
     try:
         view_df, column_config, table_width, table_height = build_sims_table_display_config(
@@ -6846,7 +6853,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         if "순번" not in render_df.columns and "조회순번" not in render_df.columns:
                             render_df.insert(0, "순번", range(1, len(render_df) + 1))
 
-                        if _chat_is_large_table_for_fast_render(render_df):
+                        is_large_analysis_table = _chat_is_large_table_for_fast_render(render_df)
+                        if is_large_analysis_table:
                             st.caption("빠른 표 모드: 채팅 분석/KPI 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
 
                         # 분석/KPI 표는 좌측 고정 컬럼이 우선이다.
@@ -6854,21 +6862,69 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         # 기본 렌더도 공용 DataFrame renderer로 통일한다.
                         # 단, 분석/KPI 원표는 이미 서비스에서 순번/요약 컬럼을 구성하므로
                         # IO 전용 display_df 변환을 다시 적용하지 않는다. (요약표/컬럼 차이 방지)
-                        _render_chat_fast_dataframe(
-                            render_df.copy(),
-                            height=520,
-                            action_name=action_name,
-                            meta=meta,
-                        )
+                        if is_large_analysis_table:
+                            _render_chat_fast_dataframe(
+                                render_df.copy(),
+                                height=520,
+                                action_name=action_name,
+                                meta=meta,
+                            )
+                        else:
+                            view_df, column_config, table_width, table_height = build_sims_table_display_config(
+                                normalize_display_df_for_streamlit(render_df.copy()),
+                                action_name=action_name,
+                                meta=meta,
+                                add_row_no=False,
+                                row_no_name="순번",
+                                enable_pinning=True,
+                                max_pinned_cols=5,
+                                min_width=720,
+                                max_width=1650,
+                                min_height=170,
+                                max_height=520,
+                                row_height=32,
+                            )
+                            view_df = _chat_clean_display_none_values(view_df)
+                            column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
+                            st.dataframe(
+                                view_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=table_height,
+                                column_config=column_config if column_config else None,
+                            )
 
                     except Exception:
                         log.exception("[chat] analysis table fast/styler render failed")
-                        st.dataframe(
-                            data,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=520,
-                        )
+                        try:
+                            fallback_df, column_config, _table_width, table_height = build_sims_table_display_config(
+                                normalize_display_df_for_streamlit(data.copy()),
+                                action_name=action_name,
+                                meta=meta,
+                                add_row_no=False,
+                                row_no_name="순번",
+                                enable_pinning=True,
+                                max_pinned_cols=5,
+                                min_width=720,
+                                max_width=1650,
+                                min_height=170,
+                                max_height=520,
+                                row_height=32,
+                            )
+                            st.dataframe(
+                                fallback_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=table_height,
+                                column_config=column_config if column_config else None,
+                            )
+                        except Exception:
+                            st.dataframe(
+                                normalize_display_df_for_streamlit(data),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=520,
+                            )
 
                 else:
                     try:
