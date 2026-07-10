@@ -635,7 +635,375 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
 
     return ("\n      AND " + "\n      AND ".join(clauses)) if clauses else ""
 
+
+_MONTHLY_FAST_MASTER_FILTER_KEYS = (
+    "physic_nm",
+    "product_ven_cd",
+    "product_ven_nm",
+    "product_group",
+    "product_group_nm",
+    "product_di",
+    "product_di_nm",
+    "product_di_list",
+    "product_class",
+    "product_class_nm",
+    "product_class_list",
+    "buy_nm",
+    "ven_nm",
+    "real_ven_nm",
+)
+
+
+def _monthly_fast_path_reason(params: Dict[str, Any], source_mode: str) -> str:
+    if source_mode not in {"monthly_book", "monthly_real"}:
+        return "source_mode"
+
+    if not clean_text(params.get("month_from")) and not clean_text(params.get("date_from")):
+        return "missing_month_from"
+    if not clean_text(params.get("month_to")) and not clean_text(params.get("date_to")):
+        return "missing_month_to"
+
+    for key in _MONTHLY_FAST_MASTER_FILTER_KEYS:
+        if key.endswith("_list"):
+            if _clean_list_param(params.get(key)):
+                return "master_code_filter"
+        elif like_value(params.get(key)) or clean_text(params.get(key)):
+            return "master_name_filter"
+
+    stock_codes = _clean_list_param(params.get("stock_cd_list"))
+    if not stock_codes and clean_text(params.get("stock_cd")):
+        stock_codes = [clean_text(params.get("stock_cd"))]
+    if like_value(params.get("stock_nm")) and not stock_codes:
+        return "stock_name_filter"
+
+    return ""
+
+
+def _can_use_monthly_fast_path(params: Dict[str, Any], source_mode: str) -> bool:
+    return _monthly_fast_path_reason(params, source_mode) == ""
+
+
+def _chunk_values(values: list[str], size: int = 1800):
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+def _load_monthly_product_master_for_codes(product_codes: list[str]) -> pd.DataFrame:
+    codes = sorted({clean_text(x) for x in product_codes if clean_text(x)})
+    columns = [
+        "제품코드",
+        "제품명",
+        "규격",
+        "제조사코드",
+        "제조사명",
+        "제품그룹명",
+        "제품구분명",
+        "제품분류명",
+    ]
+    if not codes:
+        return pd.DataFrame(columns=columns)
+
+    frames: list[pd.DataFrame] = []
+    for batch_idx, batch in enumerate(_chunk_values(codes)):
+        bind_params: Dict[str, Any] = {}
+        placeholders: list[str] = []
+        for i, cd in enumerate(batch):
+            key = f"physic_cd_{batch_idx}_{i}"
+            bind_params[key] = cd
+            placeholders.append(f"%({key})s")
+
+        sql = f"""
+SELECT
+    P.Rd04_Physic_Cd AS [제품코드],
+    P.Rd04_Physic_Nm AS [제품명],
+    P.Rd04_Standard AS [규격],
+    P.Rd04_Ven_Cd AS [제조사코드],
+    Make_Ven.Rd03_Ven_Nm AS [제조사명],
+    Physic_Group_Nm.Rd01_Hnm AS [제품그룹명],
+    Physic_Di_Nm.Rd01_Hnm AS [제품구분명],
+    Physic_Gu_Nm.Rd01_Hnm AS [제품분류명]
+FROM dbo.Rddbc040 AS P WITH (NOLOCK)
+LEFT JOIN dbo.Rddbc030 AS Make_Ven WITH (NOLOCK)
+    ON P.Rd04_Ven_Cd = Make_Ven.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc010 AS Physic_Group_Nm WITH (NOLOCK)
+    ON Physic_Group_Nm.Rd01_Gcode = P.Rd04_Physic_Group_Gcode
+   AND Physic_Group_Nm.Rd01_Tcode = P.Rd04_Physic_Group
+LEFT JOIN dbo.Rddbc010 AS Physic_Di_Nm WITH (NOLOCK)
+    ON Physic_Di_Nm.Rd01_Gcode = P.Rd04_Physic_Di_Gcode
+   AND Physic_Di_Nm.Rd01_Tcode = P.Rd04_Physic_Di
+LEFT JOIN dbo.Rddbc010 AS Physic_Gu_Nm WITH (NOLOCK)
+    ON Physic_Gu_Nm.Rd01_Gcode = P.Rd04_Physic_Gu_Gcode
+   AND Physic_Gu_Nm.Rd01_Tcode = P.Rd04_Physic_Gu
+WHERE P.Rd04_Physic_Cd IN ({",".join(placeholders)})
+"""
+        df = query_to_df(sql, bind_params)
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=columns)
+
+    out = pd.concat(frames, ignore_index=True)
+    out["제품코드"] = out["제품코드"].fillna("").astype(str).str.strip()
+    return out.drop_duplicates(subset=["제품코드"], keep="first")
+
+
+def _load_monthly_vendor_names_for_codes(vendor_codes: list[str]) -> pd.DataFrame:
+    codes = sorted({clean_text(x) for x in vendor_codes if clean_text(x)})
+    columns = ["거래처코드", "거래처명"]
+    if not codes:
+        return pd.DataFrame(columns=columns)
+
+    frames: list[pd.DataFrame] = []
+    for batch_idx, batch in enumerate(_chunk_values(codes)):
+        bind_params: Dict[str, Any] = {}
+        placeholders: list[str] = []
+        for i, cd in enumerate(batch):
+            key = f"ven_cd_{batch_idx}_{i}"
+            bind_params[key] = cd
+            placeholders.append(f"%({key})s")
+
+        sql = f"""
+SELECT
+    V.Rd03_Ven_Cd AS [거래처코드],
+    V.Rd03_Ven_Nm AS [거래처명]
+FROM dbo.Rddbc030 AS V WITH (NOLOCK)
+WHERE V.Rd03_Ven_Cd IN ({",".join(placeholders)})
+"""
+        df = query_to_df(sql, bind_params)
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        return pd.DataFrame(columns=columns)
+
+    out = pd.concat(frames, ignore_index=True)
+    out["거래처코드"] = out["거래처코드"].fillna("").astype(str).str.strip()
+    return out.drop_duplicates(subset=["거래처코드"], keep="first")
+
+
+def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> tuple[str, Dict[str, Any]]:
+    clauses: list[str] = []
+    bind_params = dict(params)
+    p = spec["prefix"]
+
+    if clean_text(bind_params.get("month_from")):
+        _add_filter(clauses, f"M.{p}_Stock_YyMm >= %(month_from)s")
+    if clean_text(bind_params.get("month_to")):
+        _add_filter(clauses, f"M.{p}_Stock_YyMm <= %(month_to)s")
+
+    _add_filter(clauses, f"LEFT(M.{p}_Io_Gu, 1) IN ({spec['out_prefixes']})")
+
+    if clean_text(bind_params.get("physic_cd")):
+        _add_filter(clauses, f"M.{p}_Physic_Cd = %(physic_cd)s")
+
+    stock_codes = _clean_list_param(bind_params.get("stock_cd_list"))
+    if stock_codes:
+        names: list[str] = []
+        for i, cd in enumerate(stock_codes):
+            key = f"fast_stock_cd_{i}"
+            bind_params[key] = clean_text(cd)
+            names.append(f"%({key})s")
+        _add_filter(clauses, f"M.{p}_Stock_Cd IN ({','.join(names)})")
+    elif clean_text(bind_params.get("stock_cd")):
+        bind_params["stock_cd"] = clean_text(bind_params.get("stock_cd"))
+        _add_filter(clauses, f"M.{p}_Stock_Cd = %(stock_cd)s")
+
+    if clean_text(bind_params.get("buy_cd")):
+        _add_filter(clauses, f"M.{p}_Ven_Cd = %(buy_cd)s")
+
+    return ("\n  AND " + "\n  AND ".join(clauses)) if clauses else "", bind_params
+
+
+def _get_sales_trend_monthly_df_fast(params: Optional[Dict[str, Any]] = None, source_mode: str = "monthly_book") -> pd.DataFrame:
+    t0 = time.perf_counter()
+    params = coalesce_params(params)
+    params = _apply_month_or_date_params(params)
+
+    spec = _monthly_spec(source_mode)
+    p = spec["prefix"]
+    where_sql, bind_params = _build_monthly_fast_where(params, spec)
+
+    sql = f"""
+SELECT
+    LEFT(M.{p}_Stock_YyMm, 6) AS [기준월],
+    M.{p}_Physic_Cd AS [제품코드],
+    M.{p}_Ven_Cd AS [매입처코드],
+    M.{p}_Stock_Apply_Cd AS [재고적용처코드],
+
+    SUM(
+        CASE
+            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
+            THEN -1 * COALESCE(M.{p}_Out_Quantity, 0)
+            ELSE COALESCE(M.{p}_Out_Quantity, 0)
+        END
+    ) AS [출고수량],
+
+    SUM(
+        CASE
+            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
+            THEN -1 * COALESCE(M.{p}_Out_Oquantity, 0)
+            ELSE COALESCE(M.{p}_Out_Oquantity, 0)
+        END
+    ) AS [출고할증수량],
+
+    SUM(
+        CASE
+            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
+            THEN -1 * COALESCE(M.{p}_Out_Supply_Price, 0)
+            ELSE COALESCE(M.{p}_Out_Supply_Price, 0)
+        END
+    ) AS [매출공급가액],
+
+    SUM(
+        CASE
+            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
+            THEN -1 * COALESCE(M.{p}_Out_Tax_Price, 0)
+            ELSE COALESCE(M.{p}_Out_Tax_Price, 0)
+        END
+    ) AS [매출세액],
+
+    SUM(
+        CASE
+            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
+            THEN -1 * (
+                COALESCE(M.{p}_Out_Supply_Price, 0)
+                + COALESCE(M.{p}_Out_Tax_Price, 0)
+            )
+            ELSE (
+                COALESCE(M.{p}_Out_Supply_Price, 0)
+                + COALESCE(M.{p}_Out_Tax_Price, 0)
+            )
+        END
+    ) AS [매출합계],
+
+    COUNT(*) AS [집계건수],
+    COUNT(DISTINCT M.{p}_Ven_Cd) AS [매입처수],
+    '{spec["title"]}' AS [분석자료원]
+
+FROM {spec["table"]} AS M WITH (NOLOCK)
+
+WHERE 1 = 1
+{where_sql}
+
+GROUP BY
+    LEFT(M.{p}_Stock_YyMm, 6),
+    M.{p}_Physic_Cd,
+    M.{p}_Ven_Cd,
+    M.{p}_Stock_Apply_Cd
+
+ORDER BY
+    M.{p}_Physic_Cd,
+    LEFT(M.{p}_Stock_YyMm, 6),
+    M.{p}_Ven_Cd
+OPTION (RECOMPILE)
+"""
+
+    raw_df = query_to_df(sql, bind_params)
+    t_monthly = time.perf_counter()
+    if raw_df is None:
+        raw_df = pd.DataFrame()
+
+    product_code_count = int(raw_df["제품코드"].nunique()) if "제품코드" in raw_df.columns else 0
+    vendor_codes: set[str] = set()
+    if "매입처코드" in raw_df.columns:
+        vendor_codes.update(raw_df["매입처코드"].fillna("").astype(str).str.strip().tolist())
+    if "재고적용처코드" in raw_df.columns:
+        vendor_codes.update(raw_df["재고적용처코드"].fillna("").astype(str).str.strip().tolist())
+    vendor_codes.discard("")
+
+    product_df = _load_monthly_product_master_for_codes(
+        raw_df["제품코드"].fillna("").astype(str).str.strip().tolist()
+        if "제품코드" in raw_df.columns
+        else []
+    )
+    t_product = time.perf_counter()
+
+    vendor_df = _load_monthly_vendor_names_for_codes(list(vendor_codes))
+    t_vendor = time.perf_counter()
+
+    merged = raw_df.copy()
+    if product_df is not None and not product_df.empty:
+        merged["제품코드"] = merged["제품코드"].fillna("").astype(str).str.strip()
+        merged = merged.merge(product_df, on="제품코드", how="left")
+    if vendor_df is not None and not vendor_df.empty:
+        for col in ["매입처코드", "재고적용처코드"]:
+            if col in merged.columns:
+                merged[col] = merged[col].fillna("").astype(str).str.strip()
+        merged = merged.merge(
+            vendor_df.rename(columns={"거래처코드": "매입처코드", "거래처명": "매입처명"}),
+            on="매입처코드",
+            how="left",
+        )
+        merged = merged.merge(
+            vendor_df.rename(columns={"거래처코드": "재고적용처코드", "거래처명": "재고적용처명"}),
+            on="재고적용처코드",
+            how="left",
+        )
+
+    final_cols = [
+        "기준월",
+        "제품코드",
+        "제품명",
+        "규격",
+        "제조사코드",
+        "제조사명",
+        "제품그룹명",
+        "제품구분명",
+        "제품분류명",
+        "매입처코드",
+        "매입처명",
+        "재고적용처코드",
+        "재고적용처명",
+        "출고수량",
+        "출고할증수량",
+        "매출공급가액",
+        "매출세액",
+        "매출합계",
+        "집계건수",
+        "매입처수",
+        "분석자료원",
+    ]
+    for col in final_cols:
+        if col not in merged.columns:
+            merged[col] = ""
+    merged = merged[final_cols]
+    t_merge = time.perf_counter()
+
+    df = _add_trend_columns(merged)
+    df = _normalize_analytics_numeric_columns(df)
+    t_done = time.perf_counter()
+    log.info(
+        "[analytics.sales_trend.fast_path] enabled=True source_mode=%s raw_rows=%s product_codes=%s vendor_codes=%s monthly_sql=%.3fs product_master=%.3fs vendor_master=%.3fs merge=%.3fs total=%.3fs",
+        source_mode,
+        0 if raw_df is None else len(raw_df),
+        product_code_count,
+        len(vendor_codes),
+        t_monthly - t0,
+        t_product - t_monthly,
+        t_vendor - t_product,
+        t_merge - t_vendor,
+        t_done - t0,
+    )
+    return df
+
+
 def get_sales_trend_monthly_df(params: Optional[Dict[str, Any]] = None, source_mode: str = "monthly_book") -> pd.DataFrame:
+    params = coalesce_params(params)
+    params = _apply_month_or_date_params(params)
+    reason = _monthly_fast_path_reason(params, source_mode)
+    if not reason:
+        return _get_sales_trend_monthly_df_fast(params, source_mode=source_mode)
+
+    log.info(
+        "[analytics.sales_trend.fast_path] enabled=False reason=%s source_mode=%s",
+        reason,
+        source_mode,
+    )
+    return _get_sales_trend_monthly_df_legacy(params, source_mode=source_mode)
+
+
+def _get_sales_trend_monthly_df_legacy(params: Optional[Dict[str, Any]] = None, source_mode: str = "monthly_book") -> pd.DataFrame:
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
