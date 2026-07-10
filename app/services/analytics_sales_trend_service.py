@@ -995,6 +995,7 @@ ORDER BY
     return df
 
 def get_sales_trend_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    t0 = time.perf_counter()
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
@@ -1002,9 +1003,17 @@ def get_sales_trend_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     params["resolved_source_mode"] = source_mode
 
     if source_mode in {"monthly_book", "monthly_real"}:
-        return get_sales_trend_monthly_df(params, source_mode=source_mode)
+        df = get_sales_trend_monthly_df(params, source_mode=source_mode)
+    else:
+        df = get_sales_trend_detail_df(params)
 
-    return get_sales_trend_detail_df(params)
+    log.info(
+        "[analytics.sales_trend.perf] source_mode=%s rows=%s elapsed=%.3fs",
+        source_mode,
+        0 if df is None else len(df),
+        time.perf_counter() - t0,
+    )
+    return df
 
 def get_sales_trend_summary_df(
     params: Optional[Dict[str, Any]] = None,
@@ -1021,11 +1030,19 @@ def get_sales_trend_summary_df(
     요약표 단위:
       - 제품코드 + 제품명 + 규격 + 제조사명 + 제품그룹/구분/분류
     """
+    t0 = time.perf_counter()
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
     raw = raw_df if raw_df is not None else get_sales_trend_df(params)
+    t_raw = time.perf_counter()
     if raw is None or raw.empty:
+        log.info(
+            "[analytics.sales_trend_summary.perf] raw_rows=%s out_rows=0 months=0 raw=%.3fs group=0.000s pivot_sales=0.000s pivot_qty=0.000s merge=0.000s calc=0.000s sort=0.000s total=%.3fs",
+            0 if raw is None else len(raw),
+            t_raw - t0,
+            time.perf_counter() - t0,
+        )
         return pd.DataFrame()
 
     df = raw.copy()
@@ -1102,6 +1119,7 @@ def get_sales_trend_summary_df(
             .rename(columns={count_col: count_label})
         )
         base = base.merge(cnt, on=product_cols, how="left")
+    t_group = time.perf_counter()
 
     # 월별 매출/수량 pivot
     pivot_sales = (
@@ -1115,6 +1133,8 @@ def get_sales_trend_summary_df(
         .reset_index()
     )
 
+    t_pivot_sales = time.perf_counter()
+
     pivot_qty = (
         df.pivot_table(
             index=product_cols,
@@ -1125,6 +1145,8 @@ def get_sales_trend_summary_df(
         )
         .reset_index()
     )
+
+    t_pivot_qty = time.perf_counter()
 
     # 누락월 0 채우기
     for m in months:
@@ -1145,6 +1167,7 @@ def get_sales_trend_summary_df(
 
     out = base.merge(pivot_sales, on=product_cols, how="left")
     out = out.merge(pivot_qty, on=product_cols, how="left")
+    t_merge = time.perf_counter()
 
     # 월별 컬럼 NaN 보정
     month_sales_cols = [f"{_fmt_yyyymm_col(m)} 매출" for m in months]
@@ -1207,6 +1230,7 @@ def get_sales_trend_summary_df(
 
     if "_has_negative_month" in out.columns:
         out = out.drop(columns=["_has_negative_month"])
+    t_calc = time.perf_counter()
 
     # 컬럼 순서
     front_cols = [c for c in [
@@ -1254,7 +1278,23 @@ def get_sales_trend_summary_df(
     else:
         out = out.sort_values(["제품코드"]).reset_index(drop=True)
 
-    return _normalize_analytics_numeric_columns(out)
+    out = _normalize_analytics_numeric_columns(out)
+    t_sort = time.perf_counter()
+    log.info(
+        "[analytics.sales_trend_summary.perf] raw_rows=%s out_rows=%s months=%s raw=%.3fs group=%.3fs pivot_sales=%.3fs pivot_qty=%.3fs merge=%.3fs calc=%.3fs sort=%.3fs total=%.3fs",
+        len(raw),
+        len(out),
+        len(months),
+        t_raw - t0,
+        t_group - t_raw,
+        t_pivot_sales - t_group,
+        t_pivot_qty - t_pivot_sales,
+        t_merge - t_pivot_qty,
+        t_calc - t_merge,
+        t_sort - t_calc,
+        t_sort - t0,
+    )
+    return out
 
 def _parse_yyyymm(value: Any) -> str:
     s = _digits_only(value)
@@ -1917,11 +1957,18 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     품목별 매출 예상.
     품목별 매출 추세 요약표를 기반으로 예상값을 계산한다.
     """
+    t0 = time.perf_counter()
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
     df = get_sales_trend_summary_df(params)
+    t_summary = time.perf_counter()
     if df is None or df.empty:
+        log.info(
+            "[analytics.sales_forecast.perf] rows=0 summary=%.3fs numeric=0.000s calc=0.000s finish=0.000s total=%.3fs",
+            t_summary - t0,
+            time.perf_counter() - t0,
+        )
         return pd.DataFrame()
 
     out = df.copy()
@@ -1939,6 +1986,7 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     for c in required_num_cols:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    t_numeric = time.perf_counter()
 
     forecast_rows = []
 
@@ -1967,6 +2015,7 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
 
     forecast_df = pd.DataFrame(forecast_rows)
     out = pd.concat([out.reset_index(drop=True), forecast_df], axis=1)
+    t_calc = time.perf_counter()
 
     front_cols = [c for c in [
         "제품코드",
@@ -2024,7 +2073,18 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
 
     out.insert(0, "순번", range(1, len(out) + 1))
 
-    return _normalize_analytics_numeric_columns(out)
+    out = _normalize_analytics_numeric_columns(out)
+    t_finish = time.perf_counter()
+    log.info(
+        "[analytics.sales_forecast.perf] rows=%s summary=%.3fs numeric=%.3fs calc=%.3fs finish=%.3fs total=%.3fs",
+        len(out),
+        t_summary - t0,
+        t_numeric - t_summary,
+        t_calc - t_numeric,
+        t_finish - t_calc,
+        t_finish - t0,
+    )
+    return out
 
 
 def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
