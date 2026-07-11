@@ -179,8 +179,8 @@ def _main_columns_first(out: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFram
 # ---------------------------------------------------------------------
 _COMMON_FILTER_DETAIL_WORDS = (
     "상세", "상세히", "상세하게", "상세표",
-    "목록", "리스트", "표", "보여", "보여줘", "보여주세요",
-    "조회", "검색", "찾아", "찾아줘", "필터", "추출", "걸러",
+    "목록", "리스트", "보여", "보여줘", "보여주세요",
+    "조회", "검색", "찾아", "찾아줘", "필터", "추출", "걸러", "만",
 )
 
 _COMMON_FILTER_VALUE_SUFFIXES = (
@@ -198,12 +198,30 @@ _COMMON_FILTER_SKIP_COLUMNS = {
 }
 
 
+def _normalize_common_filter_query(query: str) -> str:
+    t = str(query or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"현\s*제\s*표", "현재표", t)
+    t = re.sub(r"현재\s*표", "현재표", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _common_filter_body(query: str) -> str:
+    compact_query = _compact(_normalize_common_filter_query(query))
+    for anchor in ("현재표", "현재조회결과", "현재결과"):
+        compact_query = compact_query.replace(anchor, "")
+    return compact_query
+
+
 def _has_common_filter_intent(query: str) -> bool:
-    compact_query = _compact(query)
-    if "현재표" not in compact_query and "현재표" not in str(query or ""):
+    normalized = _normalize_common_filter_query(query)
+    compact_query = _compact(normalized)
+    if not any(anchor in compact_query for anchor in ("현재표", "현재조회결과", "현재결과")):
         # dispatcher가 현재표 질문만 태우지만, 방어적으로 앵커를 확인한다.
         return False
-    return any(w in compact_query for w in _COMMON_FILTER_DETAIL_WORDS)
+    body = _common_filter_body(normalized)
+    return any(w in body for w in _COMMON_FILTER_DETAIL_WORDS)
 
 
 def _column_filter_aliases(col: str) -> list[str]:
@@ -226,6 +244,12 @@ def _column_filter_aliases(col: str) -> list[str]:
 
     # 코드 컬럼은 값 필터 대상이 될 수 있으므로 '코드' 제거 alias는 만들지 않는다.
     # '제품명'의 alias '제품'은 너무 넓지만, 현재표 필터 질문에서는 유용하다.
+    if raw in {"제품명", "품목명", "상품명"}:
+        _add("제품")
+        _add("품목")
+        _add("상품")
+    if raw == "규격":
+        _add("제품규격")
 
     # 숫자 조건에서는 사용자가 "현재재고수량" 대신 "재고수량"처럼
     # 업무식 짧은 명칭을 쓰는 경우가 많다. 단, 너무 과한 alias는 오탐을 만들 수 있으므로
@@ -529,6 +553,57 @@ def _display_filter_value(value: str) -> str:
     return str(value or "").strip() or "(빈값)"
 
 
+def _available_common_filter_columns(df: pd.DataFrame, limit: int = 40) -> list[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+
+    available: list[str] = []
+    for col in [str(c) for c in df.columns]:
+        if col in _COMMON_FILTER_SKIP_COLUMNS:
+            continue
+        if col not in available:
+            available.append(col)
+        if len(available) >= limit:
+            break
+    return available
+
+
+def _extract_common_filter_candidate(query: str) -> str:
+    if not _has_common_filter_intent(query):
+        return ""
+
+    body = _common_filter_body(query)
+    if not body:
+        return ""
+
+    for suffix in sorted(_COMMON_FILTER_VALUE_SUFFIXES + _COMMON_FILTER_DETAIL_WORDS, key=len, reverse=True):
+        sx = _norm_col_name(suffix)
+        if sx and body.endswith(sx):
+            body = body[: -len(sx)].strip()
+
+    known_names = (
+        "제조사명", "제조사",
+        "제품그룹명", "제품그룹",
+        "제품구분명", "제품구분",
+        "제품분류명", "제품분류",
+        "매입처명", "매입처",
+        "거래처명", "거래처",
+        "재고적용처명", "재고적용처",
+        "재고위치명", "재고위치",
+        "매출구분명", "매출구분",
+        "제품코드", "품목코드", "제조사코드", "거래처코드",
+        "제품명", "품목명", "상품명", "제품", "품목", "상품",
+        "규격",
+    )
+    for name in known_names:
+        n = _norm_col_name(name)
+        if n and body.startswith(n):
+            return name
+
+    m = re.match(r"([가-힣A-Za-z0-9_]+)", body)
+    return m.group(1) if m else ""
+
+
 def _add_seq_column(out: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(out, pd.DataFrame):
         return out
@@ -656,6 +731,31 @@ def handle_common_column_filter_followup(
     # 2) 문자/코드값 포함 필터: 현재표 제조사명 한미 상세히 보여줘
     col, value_norm = _find_common_column_filter(df, t)
     if not col or col not in df.columns or not value_norm:
+        if callable(push_notice) and _has_common_filter_intent(t):
+            candidate = _extract_common_filter_candidate(t)
+            if candidate:
+                available = _available_common_filter_columns(df)
+                available_text = ", ".join(available)
+                try:
+                    log.info(
+                        "[chat.followup_table] current table filter column not found query=%r candidate=%r available=%r",
+                        t,
+                        candidate,
+                        available_text,
+                    )
+                except Exception:
+                    pass
+                return bool(push_notice(
+                    title=f"현재표 {candidate} 상세표 불가",
+                    action=f"현재표 {candidate} 상세표 불가",
+                    message=(
+                        f"현재표에는 '{candidate}' 컬럼이 없어 상세표를 만들 수 없습니다.\n"
+                        "현재표에서 가능한 컬럼은 다음과 같습니다:\n"
+                        f"{available_text or '(확인 가능한 컬럼 없음)'}"
+                    ),
+                    query_summary=f"현재표 / {candidate} 상세표 불가 / 컬럼 없음",
+                    source_query=t,
+                ))
         return False
 
     try:
@@ -673,12 +773,25 @@ def handle_common_column_filter_followup(
     filtered_rows = int(len(filtered))
 
     if filtered_rows <= 0:
+        try:
+            log.info(
+                "[chat.followup_table] current table filter no rows query=%r column=%r value=%r source_rows=%s",
+                t,
+                col,
+                value_label,
+                len(df),
+            )
+        except Exception:
+            pass
         if not callable(push_notice):
             return False
         return bool(push_notice(
             title=f"현재표 {col} {value_label} 자료 없음",
             action=f"현재표 {col} {value_label} 자료 없음",
-            message=f"현재표에서 {col} 컬럼에 '{value_label}' 값이 포함된 자료가 없습니다.",
+            message=(
+                f"현재표에서 {col}에 '{value_label}'이 포함된 행을 찾지 못했습니다.\n"
+                "다른 검색어로 다시 시도해 주세요."
+            ),
             query_summary=f"현재표 / {col}={value_label} / 전체 {len(df):,}건 중 0건",
             source_query=t,
         ))
@@ -687,24 +800,21 @@ def handle_common_column_filter_followup(
     out = filtered.copy()
     if has_top and top_n:
         out = out.head(int(top_n)).copy()
-    out = _add_seq_column(out)
 
     title = (
         f"현재표 {col} {value_label} TOP {top_n}"
         if has_top
-        else f"현재표 {col} {value_label} 목록"
+        else f"현재표 {col} '{value_label}' 상세표"
     )
 
     try:
         log.info(
-            "[chat.followup_table] common column filter built source_action=%r col=%r value=%r source_rows=%s filtered_rows=%s rows=%s table_key=%s",
-            source_action,
+            "[chat.followup_table] current table filter detail detected query=%r column=%r value=%r source_rows=%s matched_rows=%s",
+            t,
             col,
             value_label,
             len(df),
             filtered_rows,
-            len(out),
-            table_key,
         )
     except Exception:
         pass

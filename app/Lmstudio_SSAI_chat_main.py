@@ -2929,7 +2929,8 @@ def _current_table_should_block_llm_fallback(text: str) -> bool:
         return True
 
     hard_keywords = (
-        "목록", "상세", "상세표", "표", "테이블", "TOP", "top", "상위",
+        "목록", "리스트", "상세", "상세표", "보여", "보여줘", "필터", "만",
+        "표", "테이블", "TOP", "top", "상위",
         "월별", "일자별", "날짜별", "요일별",
         "거래처별", "제품별", "품목별", "매입처별", "매출처별", "제조사별", "재고위치별",
         "이상", "이하", "초과", "미만", "같음", "동일", "=",
@@ -3592,7 +3593,13 @@ def _try_handle_current_table_dataframe_followup(
             "표로",
             "표 ",
             "상세표",
+            "상세",
             "목록",
+            "리스트",
+            "보여",
+            "보여줘",
+            "필터",
+            "만",
             "TOP",
             "top",
             "상위",
@@ -8145,32 +8152,28 @@ with st.container():
                 or "SIMS 결과"
             )
 
+            # 저장된 SIMS 표도 chat_middleware의 기존 렌더러로 다시 그린다.
+            # 그래야 조회조건/헤더/summary_md/음수 빨간색/부족등급 굵게/다운로드/LLM 버튼이 유지된다.
+            # df가 없으면 chat_middleware가 meta 기반 만료 요약 카드로 fallback한다.
+            table_item = dict(m)
+            table_item["type"] = "table"
+            table_item["role"] = "assistant"
             if df is not None:
-                # 저장된 SIMS 표도 chat_middleware의 기존 렌더러로 다시 그린다.
-                # 그래야 조회조건/헤더/summary_md/음수 빨간색/부족등급 굵게/다운로드/LLM 버튼이 유지된다.
-                table_item = dict(m)
-                table_item["type"] = "table"
-                table_item["role"] = "assistant"
                 table_item["data"] = df
-                table_item["meta"] = meta
-                table_item["title"] = title_text
-                table_item["action"] = (
-                    m.get("action")
-                    or meta.get("action")
-                    or table_item["title"]
-                )
-                table_item["params"] = (
-                    m.get("params")
-                    or meta.get("params")
-                    or {}
-                )
+            table_item["meta"] = meta
+            table_item["title"] = title_text
+            table_item["action"] = (
+                m.get("action")
+                or meta.get("action")
+                or table_item["title"]
+            )
+            table_item["params"] = (
+                m.get("params")
+                or meta.get("params")
+                or {}
+            )
 
-                render_sims_chat_item(table_item)
-
-            else:
-                with st.chat_message("assistant"):
-                    st.markdown(m.get("content") or "📊 SIMS 결과")
-                    st.info("표 데이터가 세션에서 만료되었습니다. 같은 조회를 다시 실행해 주세요.")
+            render_sims_chat_item(table_item)
 
             return True
 
@@ -8211,6 +8214,13 @@ with st.container():
 
     # (A) 이번 rerun에서 점프할 앵커(검색 패널에서 set) 한 번만 소비
     _jump_to = st.session_state.pop("__scroll_to_msg", None)
+
+    # 이번 화면 렌더 사이클에서 SIMS 결과 카드는 1회만 그린다.
+    # history/pending/immediate render가 같은 table_key를 동시에 잡아도 중복 출력하지 않기 위한 set.
+    try:
+        st.session_state["__chat_rendered_sims_keys_this_run"] = set()
+    except Exception:
+        pass
 
     # 이번 rerun에서 history 영역에 이미 렌더되는 메시지 ID.
     # render_pending_chat_items()에서 같은 SIMS 표를 한 번 더 그리지 않도록 사용한다.

@@ -270,6 +270,25 @@ def handle_current_table_followup_by_action(
 
     label = _current_followup_kind_label(kind, source_action)
 
+    # "현재표 <컬럼명> <값> 상세히" 형태는 action별 미지원 안내보다 먼저
+    # 실제 현재표 df.columns 기반 공통 필터 상세표로 처리한다.
+    try:
+        if handle_common_column_filter_followup(
+            df=df,
+            query=query,
+            top_n=top_n,
+            table_key=table_key,
+            source_action=source_action,
+            helpers=helpers,
+            log=log,
+        ):
+            return True
+    except Exception:
+        try:
+            log.exception("[chat.followup_table] common column filter failed kind=%s", kind)
+        except Exception:
+            pass
+
     try:
         handled = bool(
             handler(

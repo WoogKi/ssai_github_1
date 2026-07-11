@@ -6244,6 +6244,283 @@ def _clear_other_sims_table_render_cache(current_table_key: str) -> None:
         log.exception("[chat] clear old sims render cache failed")
 
 
+def _lookup_sims_table_payload_for_render(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> tuple[Any, str]:
+    """
+    저장된 SIMS 표 메시지를 다시 렌더할 때 DataFrame payload를 찾는다.
+
+    순서:
+    1. 메시지 자체 data/df/df_display
+    2. session_state 표시/다운로드 cache
+    3. 현재표 followup source key
+    4. records/columns fallback
+    """
+    data = item.get("data")
+    if isinstance(data, pd.DataFrame):
+        return data, "item.data"
+
+    for key_name in ("df_display", "df"):
+        cand = item.get(key_name)
+        if isinstance(cand, pd.DataFrame):
+            return cand, f"item.{key_name}"
+
+    table_key = str((meta or {}).get("table_key") or item.get("table_key") or "").strip()
+    download_key = str((meta or {}).get("download_table_key") or "").strip()
+    source_key = str(
+        (meta or {}).get("source_table_key")
+        or (meta or {}).get("source_key")
+        or ""
+    ).strip()
+
+    ss = st.session_state
+    search_keys: list[tuple[str, str]] = []
+    for label, key in (
+        ("table_key", table_key),
+        ("download_table_key", download_key),
+        ("source_key", source_key),
+    ):
+        if key and (label, key) not in search_keys:
+            search_keys.append((label, key))
+
+    stores = (
+        ("sims_tables", ss.get("sims_tables")),
+        ("sims_export_tables", ss.get("sims_export_tables")),
+        ("__sims_export_tables_by_key", ss.get("__sims_export_tables_by_key")),
+    )
+
+    for key_label, key in search_keys:
+        for store_name, store in stores:
+            try:
+                if isinstance(store, dict):
+                    cand = store.get(key)
+                    if isinstance(cand, pd.DataFrame):
+                        return cand, f"{store_name}.{key_label}"
+            except Exception:
+                continue
+
+    try:
+        recs = item.get("records")
+        cols = item.get("columns")
+        if recs is not None and cols is not None:
+            return pd.DataFrame.from_records(recs, columns=cols), "item.records"
+    except Exception:
+        pass
+
+    try:
+        recs = (meta or {}).get("records") or (meta or {}).get("df")
+        cols = (meta or {}).get("columns")
+        if recs is not None and cols is not None:
+            return pd.DataFrame.from_records(recs, columns=cols), "meta.records"
+    except Exception:
+        pass
+
+    return None, ""
+
+
+def _sims_table_meta_row_count(meta: Dict[str, Any], data: Any = None) -> tuple[int, int, int]:
+    full_rows = _safe_int_for_download(
+        meta.get("download_row_count")
+        or meta.get("row_count_total_for_followup")
+        or meta.get("row_count_total")
+        or meta.get("row_count_loaded")
+        or meta.get("row_count")
+        or meta.get("rows")
+        or (len(data) if isinstance(data, pd.DataFrame) else 0),
+        0,
+    )
+    display_rows = _safe_int_for_download(
+        meta.get("display_row_count")
+        or meta.get("display_rows")
+        or (len(data) if isinstance(data, pd.DataFrame) else full_rows)
+        or 0,
+        0,
+    )
+    expected_rows = _safe_int_for_download(
+        meta.get("expected_rows")
+        or meta.get("db_total_count")
+        or meta.get("total_count")
+        or full_rows,
+        0,
+    )
+    return full_rows, display_rows, expected_rows
+
+
+def _sims_render_dedupe_key(item: Dict[str, Any], meta: Dict[str, Any], data: Any = None) -> str:
+    """한 rerun 화면 안에서 같은 SIMS 결과 카드가 두 번 그려지는 것을 막기 위한 key."""
+    if not isinstance(item, dict):
+        return ""
+
+    item_type = str(item.get("type") or "").strip().lower()
+    is_sims_like = (
+        item_type in {"table", "text", "object"}
+        and (
+            bool(meta.get("kind") == "table")
+            or bool(meta.get("source") == "SIMS")
+            or bool(meta.get("analytics"))
+            or bool(meta.get("current_table_followup"))
+            or bool(item.get("action"))
+            or bool(item.get("title"))
+        )
+    )
+    if not is_sims_like:
+        return ""
+
+    msg_id = str(item.get("id") or meta.get("id") or "").strip()
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    if msg_id:
+        return f"id:{msg_id}"
+    if table_key:
+        return f"table:{table_key}"
+
+    action = str(item.get("action") or meta.get("action") or item.get("title") or "").strip()
+    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(meta, data)
+    created_at = str(
+        meta.get("created_at")
+        or item.get("time")
+        or meta.get("time")
+        or meta.get("ts")
+        or meta.get("timestamp")
+        or ""
+    ).strip()
+    sig = str(meta.get("sig") or item.get("sig") or "").strip()
+    return f"sig:{sig}:{action}:{full_rows}:{display_rows}:{expected_rows}:{created_at}"
+
+
+def _should_render_sims_message_once(item: Dict[str, Any], meta: Dict[str, Any], data: Any = None) -> bool:
+    key = _sims_render_dedupe_key(item, meta, data)
+    if not key:
+        return True
+
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    action = str(item.get("action") or meta.get("action") or item.get("title") or "").strip()
+    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(meta, data)
+    created_at = str(
+        meta.get("created_at")
+        or item.get("time")
+        or meta.get("time")
+        or meta.get("ts")
+        or meta.get("timestamp")
+        or ""
+    ).strip()
+    sig = str(meta.get("sig") or item.get("sig") or "").strip()
+
+    candidate_keys = [key]
+    if table_key:
+        candidate_keys.append(f"table:{table_key}")
+    if action:
+        candidate_keys.append(f"shape:{sig}:{action}:{full_rows}:{display_rows}:{expected_rows}:{created_at}")
+
+    ss = st.session_state
+    rendered = ss.setdefault("__chat_rendered_sims_keys_this_run", set())
+    if not isinstance(rendered, set):
+        rendered = set(rendered or [])
+        ss["__chat_rendered_sims_keys_this_run"] = rendered
+
+    matched_key = next((k for k in candidate_keys if k in rendered), "")
+    if matched_key:
+        try:
+            log.info(
+                "[chat.render.dedupe] skip duplicate sims message key=%s action=%s table_key=%s",
+                matched_key,
+                action,
+                table_key,
+            )
+        except Exception:
+            pass
+        return False
+
+    for k in candidate_keys:
+        if k:
+            rendered.add(k)
+    try:
+        log.info(
+            "[chat.render.dedupe] render sims message key=%s action=%s table_key=%s",
+            key,
+            action,
+            table_key,
+        )
+    except Exception:
+        pass
+    return True
+
+
+def _render_expired_sims_table_fallback(item: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    """DataFrame payload가 사라진 과거 SIMS 표를 요약 카드로 렌더한다."""
+    action_name = str(
+        item.get("action")
+        or meta.get("action")
+        or item.get("title")
+        or item.get("content")
+        or "SIMS 결과"
+    ).strip() or "SIMS 결과"
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    source_key = str(meta.get("source_table_key") or meta.get("source_key") or "").strip()
+    result_time_text = _sims_result_datetime_text(item, meta)
+    cond_text = _build_query_condition_text(item)
+    if not cond_text:
+        query_summary = str(meta.get("query_summary") or "").strip()
+        if query_summary:
+            cond_text = f"조회조건: {query_summary}"
+    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(meta)
+
+    st.markdown(f"---\n##### {action_name}")
+    if result_time_text:
+        time_label = "처리시각" if bool(meta.get("current_table_followup")) else "조회시각"
+        st.caption(f"{time_label}: {result_time_text}")
+    else:
+        st.caption("조회시각: 저장된 메타에 시간 정보가 없습니다.")
+
+    if cond_text:
+        st.caption(cond_text)
+
+    row_bits: list[str] = []
+    if expected_rows and expected_rows != full_rows:
+        row_bits.append(f"expected_rows={expected_rows:,}")
+    if full_rows:
+        row_bits.append(f"rows={full_rows:,}")
+    if display_rows:
+        row_bits.append(f"display_rows={display_rows:,}")
+    if row_bits:
+        st.caption(" / ".join(row_bits))
+
+    key_bits = []
+    if table_key:
+        key_bits.append(f"table_key={table_key}")
+    if source_key:
+        key_bits.append(f"source_key={source_key}")
+    source_action = str(meta.get("source_action") or meta.get("source_table_action") or "").strip()
+    if source_action:
+        key_bits.append(f"source_action={source_action}")
+    if key_bits:
+        st.caption(" / ".join(key_bits))
+
+    st.info(
+        "표 데이터는 현재 세션에서 만료되어 다시 펼칠 수 없습니다.\n\n"
+        "단, 당시 조회 요약은 아래에 남아 있습니다.\n"
+        "필요하면 같은 조회를 다시 실행해 주세요."
+    )
+
+    summary_md = meta.get("summary_md") or meta.get("summary") or ""
+    if isinstance(summary_md, str) and summary_md.strip():
+        _render_chat_summary_expander(summary_md, cond_text)
+
+    try:
+        log.info(
+            "[chat.table.render] payload expired fallback table_key=%s action=%s has_meta=%s",
+            table_key,
+            action_name,
+            bool(meta),
+        )
+        log.info(
+            "[chat.table.render] expired table did not clear current source table_key=%s",
+            table_key,
+        )
+    except Exception:
+        pass
+
+
 # 채팅 아이템 본문 렌더링. anchor/busy 체크 후 렌더링.
 # anchor가 있으면 그 안에 렌더링하고, busy 플래그로 중복 렌더링 방지.
 def _render_chat_item_body(item: Dict[str, Any]) -> None:
@@ -6281,27 +6558,28 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
     title = item.get("title") or ""
     meta = item.get("meta") or {}
     data = item.get("data")
+
+    if not _should_render_sims_message_once(item, meta, data):
+        return
+
     # 저장된 히스토리(DF 제거)에서도 표를 다시 그릴 수 있게 records/columns 지원
 
     if t == "table" and not isinstance(data, pd.DataFrame):
-        # 1) session_state table_key 우선 복구
-        try:
-            table_key = (meta or {}).get("table_key")
-            if table_key and isinstance(st.session_state.get("sims_tables"), dict):
-                data = st.session_state["sims_tables"].get(table_key)
-        except Exception:
-            data = None
-
-        # 2) records/columns 복구
-        if not isinstance(data, pd.DataFrame):
-            recs = item.get("records")
-
-            cols = item.get("columns")
-            if recs is not None and cols is not None:
-                try:
-                    data = pd.DataFrame.from_records(recs, columns=cols)
-                except Exception:
-                    data = None
+        data, _payload_source = _lookup_sims_table_payload_for_render(item, meta)
+        if isinstance(data, pd.DataFrame):
+            try:
+                log.info(
+                    "[chat.table.render] payload found table_key=%s action=%s rows=%s",
+                    str(meta.get("table_key") or item.get("table_key") or ""),
+                    str(item.get("action") or meta.get("action") or title or ""),
+                    len(data),
+                )
+            except Exception:
+                pass
+        else:
+            with st.chat_message((item.get("role") or "assistant").lower() if (item.get("role") or "assistant").lower() in ("assistant", "user") else "assistant"):
+                _render_expired_sims_table_fallback(item, meta)
+            return
 
     if isinstance(data, pd.DataFrame):
         data = normalize_display_df_for_streamlit(data)
