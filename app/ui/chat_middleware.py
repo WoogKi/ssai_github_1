@@ -451,6 +451,77 @@ def _chat_is_large_table_for_fast_render(df: pd.DataFrame) -> bool:
     threshold = int(os.getenv("SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD", os.getenv("SIMS_FAST_TABLE_CELL_THRESHOLD", "6000")))
     return cells >= threshold
 
+
+def _chat_is_nlq_table_meta(meta: Dict[str, Any] | None) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    return bool(
+        meta.get("nlq")
+        or meta.get("analysis_nlq")
+        or meta.get("master_nlq")
+        or meta.get("io_nlq")
+        or meta.get("nlq_query")
+    )
+
+
+def _chat_log_nlq_table_render(
+    *,
+    action_name: str,
+    table_key: str,
+    rows: int,
+    cols: int,
+    fast: bool,
+) -> None:
+    try:
+        log.info(
+            "[chat.nlq.table] render action=%s rows=%s table_key=%s small=%s fast=%s",
+            action_name,
+            rows,
+            table_key,
+            not fast,
+            fast,
+        )
+        if fast:
+            log.info(
+                "[chat.nlq.table] fast table mode action=%s rows=%s cols=%s cells=%s",
+                action_name,
+                rows,
+                cols,
+                rows * cols,
+            )
+        else:
+            log.info(
+                "[chat.nlq.table] small table style enabled action=%s rows=%s cols=%s",
+                action_name,
+                rows,
+                cols,
+            )
+    except Exception:
+        pass
+
+
+def _render_nlq_table_meta_caption(meta: Dict[str, Any]) -> None:
+    if not _chat_is_nlq_table_meta(meta):
+        return
+
+    try:
+        nlq_query = str(
+            meta.get("nlq_query")
+            or meta.get("question")
+            or meta.get("user_query")
+            or ""
+        ).strip()
+        table_key = str(meta.get("table_key") or "").strip()
+
+        if nlq_query:
+            st.caption(f"NLQ 질문: {nlq_query}")
+        if table_key:
+            st.caption(f"table_key: {table_key}")
+            st.caption("현재표 후속질문 가능")
+    except Exception:
+        pass
+
+
 def _chat_clean_display_none_values(df: pd.DataFrame) -> pd.DataFrame:
     """
     채팅 표 화면 표시용 None/NaN 정리.
@@ -5157,6 +5228,12 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                         len(df_display_for_ui),
                         action_name,
                     )
+                    if _chat_is_nlq_table_meta(meta):
+                        log.info(
+                            "[chat.nlq.table] stash export table_key=%s rows=%s",
+                            table_key,
+                            len(df_full_for_export),
+                        )
                 else:
                     meta["download_row_count"] = int(len(df_display_for_ui))
                     meta.setdefault("display_row_count", int(len(df_display_for_ui)))
@@ -5243,6 +5320,19 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 )
                 meta.setdefault("row_count", int(len(df_full_for_export) if isinstance(df_full_for_export, pd.DataFrame) else len(df_display_for_ui)))
                 meta.setdefault("column_count", int(len(df_display_for_ui.columns)))
+
+                if _chat_is_nlq_table_meta(meta):
+                    try:
+                        source_key_now = str(ss.get("__sims_current_table_source_key") or "").strip()
+                        if source_key_now == str(table_key):
+                            log.info(
+                                "[chat.nlq.table] promoted current source action=%s table_key=%s rows=%s",
+                                action_name,
+                                table_key,
+                                int(meta.get("download_row_count") or meta.get("row_count") or len(df_display_for_ui)),
+                            )
+                    except Exception:
+                        pass
 
                 payload["meta"] = meta
                 payload.setdefault("content", payload.get("title") or f"📊 {action_name}")
@@ -6776,6 +6866,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
         if cond_text:
             st.caption(cond_text)
 
+        _render_nlq_table_meta_caption(meta)
+
         if bool(meta.get("candidate_table")):
             # 제품수불현황 후보표 안내
             guide_text = (
@@ -7035,6 +7127,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             render_cache = _get_sims_table_render_cache()
 
             action_name = str(item.get("action") or meta.get("action") or title or "").strip()
+            is_nlq_table = _chat_is_nlq_table_meta(meta)
+            nlq_table_key = str(meta.get("table_key") or item.get("table_key") or item.get("id") or "").strip()
 
             # 후보 선택표는 실제 제품수불현황 표가 아니다.
             # 후보표는 6컬럼 정도의 선택용 목록이므로 전체 폭을 채우지 않고 compact하게 렌더한다.
@@ -7148,6 +7242,21 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
             if is_io_table:
                 try:
+                    if is_nlq_table and _chat_is_large_table_for_fast_render(data):
+                        _chat_log_nlq_table_render(
+                            action_name=action_name,
+                            table_key=nlq_table_key,
+                            rows=int(len(data)),
+                            cols=int(len(data.columns)),
+                            fast=True,
+                        )
+                        _render_chat_fast_dataframe(
+                            data.copy(),
+                            height=520,
+                            action_name=action_name,
+                            meta=meta,
+                        )
+                        raise StopIteration
                     # IO/NLQ 기본표도 sims_table_display.py 공용 설정을 사용한다.
                     # 목적:
                     # - 좌측 고정 pinned 적용
@@ -7183,14 +7292,42 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         True,
                     )
 
-                    st.dataframe(
-                        view_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        height=table_height,
-                        column_config=column_config if column_config else None,
-                    )
+                    if is_nlq_table:
+                        _chat_log_nlq_table_render(
+                            action_name=action_name,
+                            table_key=nlq_table_key,
+                            rows=int(len(view_df)),
+                            cols=int(len(view_df.columns)),
+                            fast=False,
+                        )
 
+                    rendered_with_style = False
+                    if is_nlq_table:
+                        try:
+                            styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
+                            styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
+                            st.dataframe(
+                                styled_view,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=table_height,
+                                column_config=column_config if column_config else None,
+                            )
+                            rendered_with_style = True
+                        except Exception:
+                            log.debug("[chat] nlq io small table styler skipped", exc_info=True)
+
+                    if not rendered_with_style:
+                        st.dataframe(
+                            view_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=table_height,
+                            column_config=column_config if column_config else None,
+                        )
+
+                except StopIteration:
+                    pass
                 except Exception:
                     log.exception("[chat] io common table render failed")
                     try:
@@ -7221,6 +7358,14 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             render_df.insert(0, "순번", range(1, len(render_df) + 1))
 
                         is_large_analysis_table = _chat_is_large_table_for_fast_render(render_df)
+                        if is_nlq_table:
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(render_df)),
+                                cols=int(len(render_df.columns)),
+                                fast=bool(is_large_analysis_table),
+                            )
                         if is_large_analysis_table:
                             st.caption("빠른 표 모드: 채팅 분석/KPI 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
 
@@ -7307,6 +7452,22 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                 else:
                     try:
+                        if is_nlq_table and _chat_is_large_table_for_fast_render(view_df):
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(view_df)),
+                                cols=int(len(view_df.columns)),
+                                fast=True,
+                            )
+                            _render_chat_fast_dataframe(
+                                view_df.copy(),
+                                height=520,
+                                action_name=action_name,
+                                meta=meta,
+                            )
+                            raise StopIteration
+
                         view_df, column_config, table_width, table_height = build_sims_table_display_config(
                             view_df,
                             action_name=action_name,
@@ -7335,14 +7496,42 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             True,
                         )
 
-                        st.dataframe(
-                            view_df,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=table_height,
-                            column_config=column_config if column_config else None,
-                        )
+                        if is_nlq_table:
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(view_df)),
+                                cols=int(len(view_df.columns)),
+                                fast=False,
+                            )
 
+                        rendered_with_style = False
+                        if is_nlq_table:
+                            try:
+                                styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
+                                styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
+                                st.dataframe(
+                                    styled_view,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=table_height,
+                                    column_config=column_config if column_config else None,
+                                )
+                                rendered_with_style = True
+                            except Exception:
+                                log.debug("[chat] nlq common small table styler skipped", exc_info=True)
+
+                        if not rendered_with_style:
+                            st.dataframe(
+                                view_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=table_height,
+                                column_config=column_config if column_config else None,
+                            )
+
+                    except StopIteration:
+                        pass
                     except Exception:
                         log.exception("[chat] common table render failed")
                         fallback_df = data.copy()
