@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+import difflib
 import re
 import pandas as pd
 
@@ -39,7 +40,7 @@ def _ak_valid_name_mask(s: pd.Series) -> pd.Series:
     name = s.fillna("").astype(str).str.strip()
     bad = (
         name.eq("")
-        | name.str.contains(r"^(합계|총계|소계|전체|TOTAL)$", case=False, regex=True, na=False)
+        | name.str.contains(r"^(?:합계|총계|소계|전체|TOTAL)$", case=False, regex=True, na=False)
     )
     return ~bad
 
@@ -669,6 +670,152 @@ def _ak_shortage_group_summary(
     return grouped.rename(columns={group_cols[-1]: group_label})
 
 
+def normalize_current_table_query(text: str) -> str:
+    """현재표 후속질문에서 공백/접두어/요청 동사를 제거한 비교용 문자열."""
+    q = re.sub(r"\s+", "", str(text or "").strip())
+    for token in ("현제표의", "현제표에서", "현제표", "현제의", "현제에서", "현제"):
+        q = q.replace(token, "현재표" if token == "현제표" else "")
+    for token in ("현재표의", "현재표에서", "현재표", "현재의", "현재에서", "현재"):
+        q = q.replace(token, "")
+    for token in ("만들어줘", "보여줘", "해줘", "해주세요", "결과", "표"):
+        q = q.replace(token, "")
+    return q
+
+
+def extract_groupby_candidate(text: str) -> str:
+    """
+    "OO별 분석", "OO명별 분석", "OO 명 별 분석" 형태에서 OO 후보를 추출한다.
+
+    단순 "제품별/품목별"은 기존 제품별 상세/Top 경로를 유지해야 하므로 제외하고,
+    "제품명별/품목명별/제품코드별"처럼 실제 컬럼명이 명시된 경우만 공통 컬럼 분석 후보로 본다.
+    """
+    q = normalize_current_table_query(text)
+    if not q or "별" not in q:
+        return ""
+
+    q = re.sub(r"(분석|집계|요약|매출|현황|목록|TOP\d*|Top\d*|top\d*)+$", "", q)
+    match = re.search(r"(.+?)(명별|코드별|별)$", q)
+    if not match:
+        return ""
+
+    candidate = str(match.group(1) or "").strip()
+    suffix = str(match.group(2) or "")
+    if not candidate:
+        return ""
+
+    if suffix == "명별" and not candidate.endswith("명"):
+        candidate = f"{candidate}명"
+    elif suffix == "코드별" and not candidate.endswith("코드"):
+        candidate = f"{candidate}코드"
+
+    # "현재표 제품별 분석", "현재표 품목별 분석"은 기존 제품별 분석 경로가 담당한다.
+    if suffix == "별" and candidate in {"제품", "품목", "상품"}:
+        return ""
+
+    return candidate
+
+
+def _ak_norm_col_name(value: Any) -> str:
+    return re.sub(r"[\s_\-./()]+", "", str(value or "").strip()).lower()
+
+
+def _ak_is_measure_like_col(col: str | None) -> bool:
+    s = str(col or "").strip()
+    if not s:
+        return True
+    if s == "순번":
+        return True
+    measure_words = (
+        "수량", "금액", "공급가액", "세액", "합계", "평균", "단가", "율", "증감률",
+        "커버", "부족수량", "필요수량", "건수", "품목수", "거래처수", "매입처수",
+        "출고수", "매출액", "재고금액", "평가금액",
+    )
+    return any(w in s for w in measure_words)
+
+
+def _ak_available_dimension_columns(df: pd.DataFrame) -> list[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+
+    priority_words = (
+        "명", "구분", "분류", "그룹", "등급", "상태", "판정", "위치", "처",
+        "제조사", "거래처", "매입처", "재고적용처", "창고", "지역",
+    )
+    out: list[str] = []
+    for col in [str(c).strip() for c in df.columns]:
+        if not col or col in out:
+            continue
+        if _ak_is_measure_like_col(col):
+            continue
+        if "코드" in col and not col.endswith("명"):
+            continue
+        if _ak_is_dimension_col(col) or any(w in col for w in priority_words):
+            out.append(col)
+    return out
+
+
+def find_similar_column(candidate: str, columns) -> str | None:
+    """질문에서 추출한 OO 후보를 실제 현재표 컬럼 목록에서 찾는다."""
+    cand = str(candidate or "").strip()
+    if not cand:
+        return None
+
+    cols = [str(c).strip() for c in columns if str(c).strip()]
+    if not cols:
+        return None
+
+    wants_code = "코드" in cand
+    usable_cols = [
+        c for c in cols
+        if not _ak_is_measure_like_col(c)
+        and (wants_code or "코드" not in c)
+        and (_ak_is_dimension_col(c) or any(w in c for w in ("명", "구분", "분류", "그룹", "등급", "상태", "판정", "위치", "처", "창고")))
+    ]
+
+    norm_cand = _ak_norm_col_name(cand)
+    norm_to_col = {_ak_norm_col_name(c): c for c in usable_cols}
+    if norm_cand in norm_to_col:
+        return norm_to_col[norm_cand]
+
+    aliases = {
+        "제조사": ("제조사명", "제조사"),
+        "제조사명": ("제조사명", "제조사"),
+        "제품그룹": ("제품그룹명", "제품그룹"),
+        "제품그룹명": ("제품그룹명", "제품그룹"),
+        "제품구분": ("제품구분명", "제품구분"),
+        "제품구분명": ("제품구분명", "제품구분"),
+        "제품분류": ("제품분류명", "제품분류"),
+        "제품분류명": ("제품분류명", "제품분류"),
+        "매입처": ("매입처명", "매입처"),
+        "매입처명": ("매입처명", "매입처"),
+        "재고적용처": ("재고적용처명", "재고적용처"),
+        "재고적용처명": ("재고적용처명", "재고적용처"),
+        "거래처": ("거래처명", "거래처", "매출처명", "매입처명", "재고적용처명"),
+        "거래처명": ("거래처명", "거래처", "매출처명", "매입처명", "재고적용처명"),
+        "매출구분": ("매출구분명", "매출구분"),
+        "매출구분명": ("매출구분명", "매출구분"),
+        "제품명": ("제품명", "품목명", "상품명"),
+        "품목명": ("품목명", "제품명", "상품명"),
+        "재고위치": ("재고위치", "재고위치명", "재고기준", "창고명"),
+        "재고위치명": ("재고위치명", "재고위치", "재고기준", "창고명"),
+    }
+    for alias in aliases.get(cand, ()):
+        hit = norm_to_col.get(_ak_norm_col_name(alias))
+        if hit:
+            return hit
+
+    for col in usable_cols:
+        n = _ak_norm_col_name(col)
+        if norm_cand and (norm_cand in n or n in norm_cand):
+            return col
+
+    close = difflib.get_close_matches(norm_cand, list(norm_to_col.keys()), n=1, cutoff=0.88)
+    if close:
+        return norm_to_col[close[0]]
+
+    return None
+
+
 def handle_analytics_kpi_followup(
     *,
     df: pd.DataFrame,
@@ -702,16 +849,7 @@ def handle_analytics_kpi_followup(
     col_names = [str(c).strip() for c in df.columns]
 
     def available_dimension_labels() -> list[str]:
-        candidates = [
-            "제조사명",
-            "제품그룹명",
-            "제품구분명",
-            "제품분류명",
-            "매입처명",
-            "재고적용처명",
-            "거래처명",
-        ]
-        return [c for c in candidates if c in df.columns]
+        return _ak_available_dimension_columns(df)
 
     def unsupported_dimension_notice(request_label: str) -> bool:
         available = available_dimension_labels()
@@ -872,8 +1010,9 @@ def handle_analytics_kpi_followup(
         "매출구분명별",
     )
     is_dimension_query = any(w in t or w in compact for w in dimension_query_words)
+    groupby_candidate = extract_groupby_candidate(t)
 
-    if not product_col and not month_col and not is_dimension_query:
+    if not product_col and not month_col and not is_dimension_query and not groupby_candidate:
         return push_notice(
             title="현재표 분석/KPI 후속분석 불가",
             action="현재표 분석/KPI 후속분석 불가",
@@ -900,7 +1039,7 @@ def handle_analytics_kpi_followup(
         name = s.fillna("").astype(str).str.strip()
         bad = (
             name.eq("")
-            | name.str.contains(r"^(합계|총계|소계|전체|TOTAL)$", case=False, regex=True, na=False)
+            | name.str.contains(r"^(?:합계|총계|소계|전체|TOTAL)$", case=False, regex=True, na=False)
         )
         return ~bad
 
@@ -998,6 +1137,69 @@ def handle_analytics_kpi_followup(
         and not is_shortage_source
         and "부족" not in compact
     )
+
+    if groupby_candidate:
+        attr_col = find_similar_column(groupby_candidate, df.columns)
+        if attr_col:
+            has_group_top = _ak_has_top(t)
+            if is_shortage_source:
+                out = _ak_shortage_group_summary(
+                    df=df,
+                    group_cols=[attr_col],
+                    group_label=attr_col,
+                    top_n=top_n if has_group_top else 0,
+                    has_top=has_group_top,
+                    to_num=to_num,
+                    product_col=product_code_col,
+                )
+                subject = "재고부족"
+            else:
+                out = _ak_forecast_group_summary(
+                    df=df,
+                    group_cols=[attr_col],
+                    group_label=attr_col,
+                    top_n=top_n if has_group_top else 0,
+                    has_top=has_group_top,
+                    to_num=to_num,
+                    product_col=product_code_col,
+                )
+                subject = "매출"
+
+            title = f"현재표 {attr_col}별 {subject} 분석"
+
+            try:
+                log.info(
+                    "[chat.followup_table] current table column group detected query=%r candidate=%r attr=%r source_rows=%s",
+                    t,
+                    groupby_candidate,
+                    attr_col,
+                    len(df),
+                )
+            except Exception:
+                pass
+
+            return push_table(
+                title=title,
+                action=title,
+                df=out,
+                query_summary=f"현재표 / {attr_col}별 {subject} 분석 / 전체 {len(df):,}건 기준",
+                source_query=t,
+                source_table_key=table_key,
+                source_rows=len(df),
+                display_limit=top_n if has_group_top else None,
+            )
+
+        available = _ak_available_dimension_columns(df)
+        try:
+            log.info(
+                "[chat.followup_table] current table column group not found query=%r candidate=%r available=%r",
+                t,
+                groupby_candidate,
+                ",".join(available[:40]),
+            )
+        except Exception:
+            pass
+        return unsupported_dimension_notice(groupby_candidate)
 
     if is_forecast_source:
         wants_forecast_product = (

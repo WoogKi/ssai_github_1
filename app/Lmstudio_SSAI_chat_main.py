@@ -2781,6 +2781,26 @@ def _normalize_implicit_analytics_current_followup(text: str) -> str:
     return f"현재표 {t}"
 
 
+def _normalize_current_table_followup_input(text: str) -> str:
+    """
+    현재표 후속질문 라우팅용 정규화.
+
+    - 사용자가 자주 입력하는 "현제표" 오타를 "현재표"와 동일하게 본다.
+    - "제품그룹명 별 분석"처럼 조사 주변에 공백이 있어도
+      dispatcher/analytics_kpi의 기존 "제품그룹명별 분석" 엔진을 타게 한다.
+    """
+    t = str(text or "").strip()
+    if not t:
+        return t
+
+    t = re.sub(r"현\s*제\s*표", "현재표", t)
+    t = re.sub(r"현재\s*표", "현재표", t)
+    t = re.sub(r"명\s+별", "명별", t)
+    t = re.sub(r"코드\s+별", "코드별", t)
+    t = re.sub(r"\s+별", "별", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def _current_table_norm_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -2900,8 +2920,12 @@ def _current_table_should_block_llm_fallback(text: str) -> bool:
     - handler가 처리하지 못하면 명확한 안내를 반환하고 LLM 분석으로 넘기지 않는다.
     - "분석해줘/요약해줘/의미 설명" 같은 서술형 질문만 LLM fallback 허용 후보가 된다.
     """
-    compact = re.sub(r"\s+", "", str(text or ""))
+    normalized = _normalize_current_table_followup_input(text)
+    compact = re.sub(r"\s+", "", str(normalized or ""))
     if not compact:
+        return True
+
+    if "현재표" in compact and "별" in compact and any(w in compact for w in ("분석", "집계", "요약")):
         return True
 
     hard_keywords = (
@@ -3538,7 +3562,7 @@ def _try_handle_current_table_dataframe_followup(
     """
     '현재표 ... 표로 만들어줘' 계열을 LLM 답변이 아니라 실제 pandas 표로 생성한다.
     """
-    t = str(text or "").strip()
+    t = _normalize_current_table_followup_input(text)
     compact = t.replace(" ", "")
 
     if not t:
@@ -7757,7 +7781,8 @@ if user_input and user_input.strip():
 
     deferred_current_followup = False    
 
-    compact_current = re.sub(r"\s+", "", str(user_input or ""))
+    current_table_followup_input = _normalize_current_table_followup_input(user_input)
+    compact_current = re.sub(r"\s+", "", str(current_table_followup_input or ""))
 
     # ✅ 분석/KPI 명시 조회는 최근 SIMS 결과가 있어도 LLM 후속질문으로 보내지 않는다.
     # 예:
@@ -7831,7 +7856,7 @@ if user_input and user_input.strip():
         # - 현재표 거래처별 매출 TOP 20 표로 만들어줘
         try:
             handled = _try_handle_current_table_dataframe_followup(
-                user_input,
+                current_table_followup_input,
                 room=current_room,
                 make_ts=make_ts,
                 next_seq=_next_seq,
@@ -7848,14 +7873,14 @@ if user_input and user_input.strip():
             # 따라서 여기서 바로 LLM fallback으로 보내지 말고,
             # panel render 이후 한 번 더 현재표 후속분석을 재시도한다.
             st.session_state["__deferred_current_table_followup"] = {
-                "user_input": user_input,
+                "user_input": current_table_followup_input,
                 "ts": time.time(),
                 "retry": 0,
             }
             deferred_current_followup = True
             log.debug(
                 "[chat.followup_table] defer current-table followup until after panel render: %r",
-                user_input[:80],
+                current_table_followup_input[:80],
             )            
 
         elif (
