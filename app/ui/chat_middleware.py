@@ -406,6 +406,10 @@ def _chat_grade_cell_style(value: Any) -> str:
         return "color:#475569; font-weight:800;"
     if v == "신규확인":
         return "color:#6d28d9; font-weight:800;"
+    if any(token in v for token in ("부족", "위험", "주의")):
+        return "color:#be123c; font-weight:800;"
+    if any(token in v for token in ("정상", "충분", "양호")):
+        return "color:#166534; font-weight:800;"
 
     return ""
 # 분석/KPI 등급 컬럼이 있는 DataFrame 스타일러에 스타일을 적용하는 함수
@@ -421,7 +425,7 @@ def _apply_chat_analysis_grade_style(styler, df: pd.DataFrame):
 
     style_df = pd.DataFrame("", index=df.index, columns=df.columns)
 
-    for grade_col in ["추세판정", "예상등급", "부족등급"]:
+    for grade_col in ["추세판정", "예상등급", "부족등급", "재고부족", "재고등급", "판정", "판정결과"]:
         if grade_col not in df.columns:
             continue
 
@@ -462,6 +466,38 @@ def _chat_is_nlq_table_meta(meta: Dict[str, Any] | None) -> bool:
         or meta.get("io_nlq")
         or meta.get("nlq_query")
     )
+
+
+def _chat_is_stock_io_action(action_name: str) -> bool:
+    s = str(action_name or "").strip()
+    return any(w in s for w in ("제품수불현황", "제품재고현황", "제품수불", "제품재고"))
+
+
+def _chat_log_stock_table_render(
+    *,
+    action_name: str,
+    rows: int,
+    cols: int,
+    fast: bool,
+) -> None:
+    try:
+        if fast:
+            log.info(
+                "[stock.table] fast table mode action=%s rows=%s cols=%s cells=%s",
+                action_name,
+                rows,
+                cols,
+                rows * cols,
+            )
+        else:
+            log.info(
+                "[stock.table] small table style enabled action=%s rows=%s cols=%s",
+                action_name,
+                rows,
+                cols,
+            )
+    except Exception:
+        pass
 
 
 def _chat_log_nlq_table_render(
@@ -5334,6 +5370,19 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     except Exception:
                         pass
 
+                if _chat_is_stock_io_action(action_name):
+                    try:
+                        source_key_now = str(ss.get("__sims_current_table_source_key") or "").strip()
+                        if source_key_now == str(table_key):
+                            log.info(
+                                "[stock.table] promoted current source action=%s table_key=%s rows=%s",
+                                action_name,
+                                table_key,
+                                int(meta.get("download_row_count") or meta.get("row_count") or len(df_display_for_ui)),
+                            )
+                    except Exception:
+                        pass
+
                 payload["meta"] = meta
                 payload.setdefault("content", payload.get("title") or f"📊 {action_name}")
 
@@ -7128,6 +7177,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
             action_name = str(item.get("action") or meta.get("action") or title or "").strip()
             is_nlq_table = _chat_is_nlq_table_meta(meta)
+            is_stock_io_table = _chat_is_stock_io_action(action_name)
             nlq_table_key = str(meta.get("table_key") or item.get("table_key") or item.get("id") or "").strip()
 
             # 후보 선택표는 실제 제품수불현황 표가 아니다.
@@ -7242,14 +7292,22 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
             if is_io_table:
                 try:
-                    if is_nlq_table and _chat_is_large_table_for_fast_render(data):
-                        _chat_log_nlq_table_render(
-                            action_name=action_name,
-                            table_key=nlq_table_key,
-                            rows=int(len(data)),
-                            cols=int(len(data.columns)),
-                            fast=True,
-                        )
+                    if (is_nlq_table or is_stock_io_table) and _chat_is_large_table_for_fast_render(data):
+                        if is_stock_io_table:
+                            _chat_log_stock_table_render(
+                                action_name=action_name,
+                                rows=int(len(data)),
+                                cols=int(len(data.columns)),
+                                fast=True,
+                            )
+                        if is_nlq_table:
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(data)),
+                                cols=int(len(data.columns)),
+                                fast=True,
+                            )
                         _render_chat_fast_dataframe(
                             data.copy(),
                             height=520,
@@ -7300,9 +7358,16 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             cols=int(len(view_df.columns)),
                             fast=False,
                         )
+                    if is_stock_io_table:
+                        _chat_log_stock_table_render(
+                            action_name=action_name,
+                            rows=int(len(view_df)),
+                            cols=int(len(view_df.columns)),
+                            fast=False,
+                        )
 
                     rendered_with_style = False
-                    if is_nlq_table:
+                    if is_nlq_table or is_stock_io_table:
                         try:
                             styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
                             styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
@@ -7315,7 +7380,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             )
                             rendered_with_style = True
                         except Exception:
-                            log.debug("[chat] nlq io small table styler skipped", exc_info=True)
+                            log.debug("[chat] io small table styler skipped", exc_info=True)
 
                     if not rendered_with_style:
                         st.dataframe(
