@@ -6975,13 +6975,25 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             )
                             view_df = _chat_clean_display_none_values(view_df)
                             column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
-                            st.dataframe(
-                                view_df,
-                                use_container_width=True,
-                                hide_index=True,
-                                height=table_height,
-                                column_config=column_config if column_config else None,
-                            )
+                            try:
+                                styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
+                                styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
+                                st.dataframe(
+                                    styled_view,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=table_height,
+                                    column_config=column_config if column_config else None,
+                                )
+                            except Exception:
+                                log.debug("[chat] small analysis table styler skipped", exc_info=True)
+                                st.dataframe(
+                                    view_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=table_height,
+                                    column_config=column_config if column_config else None,
+                                )
 
                     except Exception:
                         log.exception("[chat] analysis table fast/styler render failed")
