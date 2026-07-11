@@ -701,6 +701,36 @@ def handle_analytics_kpi_followup(
 
     col_names = [str(c).strip() for c in df.columns]
 
+    def available_dimension_labels() -> list[str]:
+        candidates = [
+            "제조사명",
+            "제품그룹명",
+            "제품구분명",
+            "제품분류명",
+            "매입처명",
+            "재고적용처명",
+            "거래처명",
+        ]
+        return [c for c in candidates if c in df.columns]
+
+    def unsupported_dimension_notice(request_label: str) -> bool:
+        available = available_dimension_labels()
+        if available:
+            available_text = "\n".join(f"- {c}" for c in available)
+        else:
+            available_text = ", ".join(col_names[:45]) or "표시 가능한 구분 컬럼 없음"
+        return push_notice(
+            title=f"현재표 {request_label}별 분석 불가",
+            action=f"현재표 {request_label}별 분석 불가",
+            message=(
+                f"현재표에 \"{request_label}\" 컬럼이 없어 {request_label}별 분석을 만들 수 없습니다.\n\n"
+                "현재표에서 가능한 구분은 다음과 같습니다:\n"
+                f"{available_text}"
+            ),
+            query_summary=f"현재표 / {request_label}별 분석 불가 / 전체 {len(df):,}건 기준",
+            source_query=t,
+        )
+
     month_col = find_col(
         df,
         exact=("기준월", "년월", "월", "매출월"),
@@ -825,7 +855,25 @@ def handle_analytics_kpi_followup(
         exclude_any=("품목수", "거래처수", "매입처수"),
     )
 
-    if not product_col and not month_col:
+    dimension_query_words = (
+        "제품그룹별",
+        "제품그룹명별",
+        "제품구분별",
+        "제품구분명별",
+        "제품분류별",
+        "제품분류명별",
+        "제조사별",
+        "제조사명별",
+        "매입처별",
+        "매입처명별",
+        "재고적용처별",
+        "재고적용처명별",
+        "매출구분별",
+        "매출구분명별",
+    )
+    is_dimension_query = any(w in t or w in compact for w in dimension_query_words)
+
+    if not product_col and not month_col and not is_dimension_query:
         return push_notice(
             title="현재표 분석/KPI 후속분석 불가",
             action="현재표 분석/KPI 후속분석 불가",
@@ -1792,15 +1840,29 @@ def handle_analytics_kpi_followup(
             source_query=t,
         )
 
-    # 제품 속성별 분석: 제품그룹별 / 제품구분별 / 제품분류별
+    if any(w in t or w in compact for w in ("매출구분별", "매출구분명별", "매출구분")):
+        sales_type_col = find_col(
+            df,
+            exact=("매출구분", "매출구분명"),
+            include_any=("매출구분",),
+            exclude_any=("코드", "번호"),
+        )
+        if not sales_type_col:
+            return unsupported_dimension_notice("매출구분")
+
+    # 제품/거래처 속성별 분석: 제품그룹별 / 제품구분별 / 제품분류별 / 제조사별 / 매입처별 / 재고적용처별
     product_attr_specs = [
-        ("제품그룹별", "제품그룹명", ("제품그룹명", "제품그룹")),
-        ("제품구분별", "제품구분명", ("제품구분명", "제품구분")),
-        ("제품분류별", "제품분류명", ("제품분류명", "제품분류")),
+        (("제품그룹별", "제품그룹명별"), "제품그룹명", ("제품그룹명", "제품그룹")),
+        (("제품구분별", "제품구분명별"), "제품구분명", ("제품구분명", "제품구분")),
+        (("제품분류별", "제품분류명별"), "제품분류명", ("제품분류명", "제품분류")),
+        (("제조사별", "제조사명별"), "제조사명", ("제조사명", "제조사")),
+        (("매입처별", "매입처명별"), "매입처명", ("매입처명", "매입처")),
+        (("재고적용처별", "재고적용처명별"), "재고적용처명", ("재고적용처명", "재고적용처")),
     ]
 
-    for trigger, label, exact_cols in product_attr_specs:
-        if trigger in t or trigger in compact:
+    for triggers, label, exact_cols in product_attr_specs:
+        trigger = triggers[0]
+        if any(x in t or x in compact for x in triggers):
             group_col = find_col(
                 df,
                 exact=exact_cols,
@@ -1809,16 +1871,7 @@ def handle_analytics_kpi_followup(
             )
 
             if not group_col:
-                return push_notice(
-                    title=f"현재표 {trigger} 분석 불가",
-                    action=f"현재표 {trigger} 분석 불가",
-                    message=(
-                        f"현재표에서 {label} 컬럼을 찾지 못했습니다.\n\n"
-                        f"현재표 주요 컬럼: {', '.join(col_names[:45])}"
-                    ),
-                    query_summary=f"현재표 / {trigger} 분석 불가 / 전체 {len(df):,}건 기준",
-                    source_query=t,
-                )
+                return unsupported_dimension_notice(label)
 
             out = _ak_forecast_group_summary(
                 df=df,
@@ -1855,7 +1908,22 @@ def handle_analytics_kpi_followup(
     # 2) 제품별/품목별 TOP N
     is_product_attr_query = any(
         w in compact
-        for w in ("제품그룹별", "제품구분별", "제품분류별")
+        for w in (
+            "제품그룹별",
+            "제품그룹명별",
+            "제품구분별",
+            "제품구분명별",
+            "제품분류별",
+            "제품분류명별",
+            "제조사별",
+            "제조사명별",
+            "매입처별",
+            "매입처명별",
+            "재고적용처별",
+            "재고적용처명별",
+            "매출구분별",
+            "매출구분명별",
+        )
     )
 
     wants_product_top = (

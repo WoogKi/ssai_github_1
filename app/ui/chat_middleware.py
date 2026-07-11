@@ -4302,6 +4302,54 @@ def _is_sims_table_history_item(item: Any) -> bool:
         or bool(meta.get("table_key"))
     )
 
+
+def _coerce_sims_display_time(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{2}:\d{2}:\d{2}", text):
+        return text
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%H:%M:%S")
+    except Exception:
+        pass
+    m = re.search(r"(\d{2}:\d{2}:\d{2})", text)
+    return m.group(1) if m else text[:8]
+
+
+def _coerce_sims_result_datetime(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    m = re.search(
+        r"(\d{4})[-/.]?(\d{2})[-/.]?(\d{2})[ T]+(\d{2}):(\d{2}):(\d{2})",
+        text,
+    )
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)}"
+
+    return ""
+
+
+def _sims_result_datetime_text(item: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    for value in (
+        meta.get("created_at"),
+        item.get("time"),
+        meta.get("time"),
+        meta.get("ts"),
+        meta.get("timestamp"),
+    ):
+        text = _coerce_sims_result_datetime(value)
+        if text:
+            return text
+    return ""
+
 # SIMS 표 유지 정책
 # - reference: 사용자가 계속 보면서 판단해야 하는 기준표
 # - drilldown : 기준표를 보면서 추가 확인하는 보조조회표
@@ -5258,11 +5306,23 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
     # 4-2) 최소 필드 보강(정렬/렌더)
     if isinstance(payload, dict):
         payload.setdefault('role', 'assistant')
-        payload.setdefault('time', dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        now_dt = dt.datetime.now()
+        payload.setdefault('time', now_dt.strftime('%Y-%m-%d %H:%M:%S'))
         if payload.get('seq') is None:
             ss.setdefault('__seq', 0)
             ss['__seq'] += 1
             payload['seq'] = ss['__seq']
+        try:
+            meta_for_display = dict(payload.get("meta") or {})
+            created_at = str(meta_for_display.get("created_at") or "").strip()
+            if not created_at:
+                created_at = now_dt.isoformat(timespec="seconds")
+            meta_for_display["created_at"] = created_at
+            meta_for_display.setdefault("display_time", _coerce_sims_display_time(created_at) or now_dt.strftime("%H:%M:%S"))
+            meta_for_display.setdefault("result_seq", int(ss.get("__sims_push_count", 0)) + 1)
+            payload["meta"] = meta_for_display
+        except Exception:
+            log.exception("[chat.sims.push] failed to attach display meta")
 
     # 5) 인박스에 넣고 drain
     ss.setdefault("__chat_inbox", [])
@@ -6279,45 +6339,74 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
         if is_sims_table_or_text:
 
-            result_badge = "현재표 결과표" if bool(meta.get("current_table_followup")) else "조회표"
             header_title = action_name_for_header or str(title or "결과").strip() or "결과"
+            is_current_followup = bool(meta.get("current_table_followup"))
+            result_time_text = _sims_result_datetime_text(item, meta)
 
-            st.markdown(f"---\n##### 📋 {result_badge} — {header_title}")
+            st.markdown(f"---\n##### {header_title}")
 
             try:
-                db_total_rows = int(
+                db_total_rows = _safe_int_for_download(
                     meta.get("db_total_count")
                     or meta.get("total_count")
                     or meta.get("matched_row_count")
                     or meta.get("matched_total_count")
-                    or 0
+                    or 0,
+                    0,
                 )
 
-                header_loaded_rows = int(
+                header_loaded_rows = _safe_int_for_download(
                     meta.get("download_row_count")
                     or meta.get("row_count_loaded")
                     or meta.get("row_count_total")
                     or meta.get("row_count")
                     or (len(data) if isinstance(data, pd.DataFrame) else 0)
-                    or 0
+                    or 0,
+                    0,
                 )
 
-                header_display_rows = int(
+                header_display_rows = _safe_int_for_download(
                     meta.get("display_row_count")
                     or (len(data) if isinstance(data, pd.DataFrame) else header_loaded_rows)
-                    or 0
+                    or 0,
+                    0,
                 )
+
+                if is_current_followup:
+                    source_action = str(
+                        meta.get("source_action")
+                        or meta.get("source_table_action")
+                        or meta.get("source_title")
+                        or ""
+                    ).strip()
+                    source_rows = _safe_int_for_download(
+                        meta.get("source_rows")
+                        or meta.get("source_row_count")
+                        or meta.get("row_count_total_for_followup")
+                        or 0,
+                        0,
+                    )
+                    if source_action or source_rows:
+                        source_text = source_action or "원본 현재표"
+                        if source_rows:
+                            st.caption(f"원본: {source_text} / {source_rows:,}건")
+                        else:
+                            st.caption(f"원본: {source_text}")
 
                 if db_total_rows and header_loaded_rows and db_total_rows > header_loaded_rows:
                     st.caption(
-                        f"조회결과: 조건 전체 {db_total_rows:,}건 중 {header_loaded_rows:,}건 조회, "
+                        f"결과: 조건 전체 {db_total_rows:,}건 중 {header_loaded_rows:,}건 조회, "
                         f"화면 {header_display_rows:,}건 표시"
                     )
                 elif header_loaded_rows > 0:
                     if header_display_rows and header_display_rows < header_loaded_rows:
-                        st.caption(f"조회결과: 조회 {header_loaded_rows:,}건 중 화면 {header_display_rows:,}건 표시")
+                        st.caption(f"결과: 조회 {header_loaded_rows:,}건 중 화면 {header_display_rows:,}건 표시")
                     else:
-                        st.caption(f"조회결과: {header_loaded_rows:,}건")
+                        st.caption(f"결과: {header_loaded_rows:,}건")
+
+                if result_time_text:
+                    time_label = "처리시각" if is_current_followup else "조회시각"
+                    st.caption(f"{time_label}: {result_time_text}")
             except Exception:
                 pass
 
@@ -6380,7 +6469,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 or meta.get("timestamp")
                 or ""
             )
-            if ts:
+            if ts and not _sims_result_datetime_text(item, meta):
                 st.caption(str(ts))
 
             return
