@@ -54,8 +54,43 @@ def _is_explicit_code_display_name(col: Any) -> bool:
 
 def _is_numeric_display_name(col: Any) -> bool:
     s = _clean_text(col)
+
     if _is_explicit_code_display_name(s):
         return False
+
+    # 분석/KPI 명시 숫자 컬럼
+    # payload가 JSON/records에서 복원되어 object 문자열이 되어도
+    # 화면 렌더 전에 숫자형으로 복구한다.
+    explicit_numeric_cols = {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "평균공급단가",
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
+    }
+
+    if s in explicit_numeric_cols:
+        return True
+
     numeric_words = (
         "장부재고평가단가",
         "실재고평가단가",
@@ -262,6 +297,36 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
     if _is_row_no_col(s):
         return True
 
+    explicit_numeric_cols = {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "평균공급단가",
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
+        "부족예상금액",
+    }
+    if s in explicit_numeric_cols:
+        return True
+
     # 재고부족/예상 관련 수량 컬럼은 이름에 '기준'이 들어가도 숫자 컬럼이다.
     force_numeric_words = (
         "예상기준월수량",
@@ -373,6 +438,7 @@ def _numeric_display_kind(col: Any) -> str:
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
+        "부족예상금액",
     }
     if s in int_money_cols:
         return "int"
@@ -381,6 +447,13 @@ def _numeric_display_kind(col: Any) -> str:
         "최근3개월평균매출",
         "최근6개월평균매출",
         "평균공급단가",
+        "완료월평균출고수량",
+        "최근3개월평균출고수량",
+        "최근6개월평균출고수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+        "예상월말재고수량",
+        "부족예상수량",
     }
     if s in decimal_money_cols:
         return "decimal2"
@@ -390,6 +463,14 @@ def _numeric_display_kind(col: Any) -> str:
         "최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
     }
     if s in percent_cols:
         return "percent2"

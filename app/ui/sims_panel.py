@@ -97,6 +97,24 @@ def _is_numeric_col(df: pd.DataFrame, col: str) -> bool:
     if any(k in s for k in ["명", "이름", "코드", "ID", "번호", "적용처"]):
         return False
 
+    if s in {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+    }:
+        return True
+
     # 3) 실제 dtype 이 숫자면 숫자
     if pd.api.types.is_numeric_dtype(df[col]):
         return True
@@ -106,7 +124,20 @@ def _is_numeric_col(df: pd.DataFrame, col: str) -> bool:
 
 def _is_decimal_col_name(col: str) -> bool:
     s = str(col or "").strip()
-    if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+    if s in {
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
+    }:
         return True
     if s in {
         "완료월총매출",
@@ -305,6 +336,7 @@ def _fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
             "다음월예상매출",
             "3개월예상매출",
             "6개월예상매출",
+            "부족예상금액",
             "완료월수",
             "매출발생월수",
             "매입처수",
@@ -315,11 +347,26 @@ def _fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
             "최근3개월증감률",
             "적용증감률",
             "월시점 증감률",
+            "월시점 적용증감률",
+            "월시점 달성률",
+            "최근3개월수량증감률",
+            "수요증감률",
+            "수요적용증감률",
+            "평가월 수요진척률",
+            "당월 출고진척률",
+            "당월 재고충족률",
         }
         decimal_cols = {
             "최근3개월평균매출",
             "최근6개월평균매출",
             "평균공급단가",
+            "완료월평균출고수량",
+            "최근3개월평균출고수량",
+            "최근6개월평균출고수량",
+            "당월 예상출고수량",
+            "당월 잔여예상출고수량",
+            "예상월말재고수량",
+            "부족예상수량",
         }
 
         if s in percent_cols:
@@ -360,7 +407,20 @@ def _fast_column_config(df: pd.DataFrame) -> dict:
         if not _is_fast_numeric_column(df, col):
             continue
 
-        if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+        if s in {
+            "당월 진척률",
+            "최근3개월증감률",
+            "적용증감률",
+            "월시점 증감률",
+            "월시점 적용증감률",
+            "월시점 달성률",
+            "최근3개월수량증감률",
+            "수요증감률",
+            "수요적용증감률",
+            "평가월 수요진척률",
+            "당월 출고진척률",
+            "당월 재고충족률",
+        }:
             cfg[col] = st.column_config.NumberColumn(
                 s,
                 format="%.2f%%",
@@ -642,6 +702,7 @@ def _analytics_number_decimals(col: str) -> int | None:
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
+        "부족예상금액",
         "완료월수",
         "매출발생월수",
         "매입처수",
@@ -654,6 +715,13 @@ def _analytics_number_decimals(col: str) -> int | None:
         "최근3개월평균매출",
         "최근6개월평균매출",
         "평균공급단가",
+        "완료월평균출고수량",
+        "최근3개월평균출고수량",
+        "최근6개월평균출고수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+        "예상월말재고수량",
+        "부족예상수량",
     }
     if c in decimal_cols:
         return 2
@@ -663,6 +731,14 @@ def _analytics_number_decimals(col: str) -> int | None:
         "최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
     }
     if c in percent_cols:
         return 2
@@ -2629,13 +2705,29 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
 
         c5, c6, c7, c8 = st.columns(4)
         with c5:
-            st.warning(f"1개월부족수량 : {_fmt_header_num(meta.get('sum_shortage_1m_qty'), '개')}")
+            st.info(f"평가월 예상수요 : {_fmt_header_num(meta.get('sum_current_month_expected_out_qty'), '개')}")
         with c6:
-            st.warning(f"2개월부족수량 : {_fmt_header_num(meta.get('sum_shortage_2m_qty'), '개')}")
+            st.info(f"평가월 실제수요 : {_fmt_header_num(meta.get('sum_current_month_out_qty'), '개')}")
         with c7:
-            st.warning(f"3개월부족수량 : {_fmt_header_num(meta.get('sum_shortage_3m_qty'), '개')}")
+            st.warning(f"평가월 잔여예상수요 : {_fmt_header_num(meta.get('sum_current_month_remaining_out_qty'), '개')}")
         with c8:
+            st.success(f"평가월 수요진척률 : {_fmt_header_num(meta.get('current_month_demand_progress_pct'), '%', decimals=2)}")
+
+        c9, c10, c11, c12 = st.columns(4)
+        with c9:
+            st.warning(f"부족예상수량 : {_fmt_header_num(meta.get('sum_expected_shortage_qty'), '개')}")
+        with c10:
+            st.warning(f"부족예상금액 : {_fmt_header_num(meta.get('sum_expected_shortage_amt'), '원')}")
+        with c11:
+            st.info(f"재고충족률 : {_fmt_header_num(meta.get('overall_stock_fill_rate'), '%', decimals=2)}")
+        with c12:
             st.info(f"재고기준 : {str(meta.get('stock_label') or '-')}")
+
+        st.caption(
+            f"자료원: {meta.get('source_label') or '-'} / "
+            f"현재고원천: {meta.get('stock_source_label') or meta.get('stock_label') or '-'} / "
+            f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+        )
 
         counts = meta.get("shortage_grade_counts") or {}
         if isinstance(counts, dict) and counts:
@@ -3353,7 +3445,20 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                             width=width_px,
                         )
 
-                    if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+                    if s in {
+                        "당월 진척률",
+                        "최근3개월증감률",
+                        "적용증감률",
+                        "월시점 증감률",
+                        "월시점 적용증감률",
+                        "월시점 달성률",
+                        "최근3개월수량증감률",
+                        "수요증감률",
+                        "수요적용증감률",
+                        "평가월 수요진척률",
+                        "당월 출고진척률",
+                        "당월 재고충족률",
+                    }:
                         return st.column_config.NumberColumn(
                             s,
                             format="%.2f%%",
@@ -3425,10 +3530,9 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                         )
 
                     else:
-                        styled = _style_sales_trend_rows(view_df)
                         try:
                             st.dataframe(
-                                styled,
+                                view_df,
                                 width=table_width,
                                 hide_index=True,
                                 height=520,
@@ -4078,13 +4182,34 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
+        "부족예상금액",
     }
     decimal_money_cols = {
         "최근3개월평균매출",
         "최근6개월평균매출",
         "평균공급단가",
+        "완료월평균출고수량",
+        "최근3개월평균출고수량",
+        "최근6개월평균출고수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+        "예상월말재고수량",
+        "부족예상수량",
     }
-    percent_cols = {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}
+    percent_cols = {
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
+    }
 
     try:
         if engine == "xlsxwriter":

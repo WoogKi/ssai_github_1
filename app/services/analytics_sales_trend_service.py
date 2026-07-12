@@ -39,10 +39,77 @@ STOCK_MODE_LABELS = {
     "real": "실재고",
 }
 
+SALES_TREND_PUBLIC_COLUMNS = [
+    "기준월",
+    "제품코드",
+    "제품명",
+    "규격",
+    "제조사코드",
+    "제조사명",
+    "제품그룹명",
+    "제품구분명",
+    "제품분류명",
+    "매입처코드",
+    "매입처명",
+    "재고적용처코드",
+    "재고적용처명",
+    "출고수량",
+    "출고할증수량",
+    "매출공급가액",
+    "매출세액",
+    "매출합계",
+    "집계건수",
+    "매입처수",
+    "분석자료원",
+    "기간구분",
+    "전월대비수량",
+    "전월대비매출",
+    "최근3개월평균매출",
+    "최근6개월평균매출",
+    "월시점 완료월수",
+    "월시점 완료월평균매출",
+    "월시점 최근3개월평균매출",
+    "월시점 최근6개월평균매출",
+    "월시점 증감률",
+    "월시점 추세판정",
+    "월시점 판정결과",
+    "월시점 실제매출",
+    "월시점 예상기준",
+    "월시점 적용증감률",
+    "월시점 예상매출",
+    "월시점 예상대비차이",
+    "월시점 잔여예상",
+    "월시점 달성률",
+    "추세판정",
+    "판정결과",
+]
+
 
 def _source_label(source_mode: Any) -> str:
     key = str(source_mode or "").strip()
     return SOURCE_LABELS.get(key, key)
+
+
+def _effective_source_label(source_mode: Any, df: Any = None) -> str:
+    if isinstance(df, pd.DataFrame) and bool(df.attrs.get("mixed_current_month_detail")):
+        completed = str(df.attrs.get("source_label_completed") or _source_label(source_mode))
+        current = str(df.attrs.get("source_label_current") or "출고상세(Rddbc120)")
+        return f"완료월: {completed} / 당월: {current}"
+    return _source_label(source_mode)
+
+
+def _finalize_sales_trend_public_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    attrs = dict(getattr(df, "attrs", {}) or {})
+    out = df.copy()
+    for col in SALES_TREND_PUBLIC_COLUMNS:
+        if col not in out.columns:
+            out[col] = ""
+    out = out[SALES_TREND_PUBLIC_COLUMNS].copy()
+    out.attrs.update(attrs)
+    return out
 
 
 def _sum_numeric(df: pd.DataFrame, col: str) -> float:
@@ -94,6 +161,12 @@ def _normalize_analytics_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
         "예상매출",
         "잔여예상",
         "진척률",
+        "증감률",
+        "달성률",
+        "완료월평균매출",
+        "완료월총매출",
+        "실제매출",
+        "예상대비차이",
         "완료월수",
     )
 
@@ -231,6 +304,80 @@ def _last_day_yyyymm(yyyymm: str) -> str:
     m = int(yyyymm[4:6])
     last = calendar.monthrange(y, m)[1]
     return f"{yyyymm}{last:02d}"
+
+
+def _prev_yyyymm(yyyymm: str) -> str:
+    month = _normalize_month(yyyymm)
+    if not month:
+        return ""
+    y = int(month[:4])
+    m = int(month[4:6])
+    if m == 1:
+        return f"{y - 1}12"
+    return f"{y}{m - 1:02d}"
+
+
+def _is_mid_month_date(date_value: Any) -> bool:
+    date_to = _normalize_date_to(date_value)
+    if not date_to:
+        return False
+    return date_to != _last_day_yyyymm(date_to[:6])
+
+
+def _policy_today_yyyymmdd(params: Optional[Dict[str, Any]] = None) -> str:
+    params = params or {}
+    for key in ("policy_date", "as_of_date", "today"):
+        value = _normalize_date_to(params.get(key))
+        if value:
+            return value
+    try:
+        return pd.Timestamp.today().strftime("%Y%m%d")
+    except Exception:
+        return dt.datetime.now().strftime("%Y%m%d")
+
+
+def _resolve_period_source_policy(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    params = params or {}
+    today = _policy_today_yyyymmdd(params)
+    requested_date_to = _normalize_date_to(params.get("date_to")) or today
+    effective_date_to = min(requested_date_to, today)
+    effective_month_to = effective_date_to[:6]
+    is_past = requested_date_to < today
+    is_month_end = effective_date_to == _last_day_yyyymm(effective_month_to)
+    use_hybrid = bool(is_past and not is_month_end)
+    if not is_past:
+        evaluation_mode = "current_monthly"
+    elif is_month_end:
+        evaluation_mode = "historical_month_end"
+    else:
+        evaluation_mode = "historical_midmonth"
+    month_from = _normalize_month(params.get("month_from"))
+    basis_months = [
+        m for m in _iter_yyyymm(month_from, effective_month_to)
+        if m and m < effective_month_to
+    ] if month_from and effective_month_to else []
+    return {
+        "today": today,
+        "requested_date_to": requested_date_to,
+        "effective_date_to": effective_date_to,
+        "effective_month_to": effective_month_to,
+        "evaluation_month": effective_month_to,
+        "basis_months": basis_months,
+        "evaluation_mode": evaluation_mode,
+        "is_month_end": is_month_end,
+        "use_hybrid": use_hybrid,
+        "use_hybrid_detail": use_hybrid,
+        "use_monthly_only": not use_hybrid,
+    }
+
+
+def _apply_period_source_policy_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(params or {})
+    policy = _resolve_period_source_policy(out)
+    out["date_to"] = policy["effective_date_to"]
+    out["month_to"] = policy["effective_month_to"]
+    out["_period_source_policy"] = policy
+    return out
 
 
 def _normalize_month(value: Any) -> str:
@@ -1158,6 +1305,118 @@ ORDER BY
     return df
 
 
+def _build_sales_month_workforward_metrics(df: pd.DataFrame, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    if df is None or df.empty or "제품코드" not in df.columns or "기준월" not in df.columns:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["기준월"] = work["기준월"].map(_parse_yyyymm)
+    for col in ["출고수량", "매출합계"]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+        else:
+            work[col] = 0
+
+    monthly = (
+        work.groupby(["제품코드", "기준월"], dropna=False, as_index=False)[["출고수량", "매출합계"]]
+        .sum()
+        .sort_values(["제품코드", "기준월"])
+        .reset_index(drop=True)
+    )
+
+    months = sorted({_parse_yyyymm(v) for v in monthly["기준월"].dropna().tolist()})
+    completed_months, current_month, future_months = _split_sales_period_months(months, params)
+    completed_set = set(completed_months)
+    future_set = set(future_months)
+
+    def _period_label(value: Any) -> str:
+        m = _parse_yyyymm(value)
+        if m in completed_set:
+            return "완료월"
+        if current_month and m == current_month:
+            return "당월진행"
+        if m in future_set:
+            return "미래월"
+        return "완료월"
+
+    monthly_grp = monthly.groupby("제품코드", dropna=False)
+    monthly["기간구분"] = monthly["기준월"].map(_period_label)
+    monthly["전월대비수량"] = monthly_grp["출고수량"].diff().fillna(0)
+    monthly["전월대비매출"] = monthly_grp["매출합계"].diff().fillna(0)
+    monthly["_이전월매출"] = monthly_grp["매출합계"].shift(1)
+    monthly["월시점 완료월수"] = monthly_grp.cumcount()
+    monthly["월시점 완료월총매출"] = monthly_grp["매출합계"].cumsum().shift(1)
+    monthly["월시점 완료월총매출"] = monthly["월시점 완료월총매출"].where(monthly["월시점 완료월수"] > 0, 0).fillna(0)
+    monthly["월시점 완료월평균매출"] = (
+        monthly["월시점 완료월총매출"] / monthly["월시점 완료월수"].replace(0, 1)
+    ).where(monthly["월시점 완료월수"] > 0, 0)
+    prev_nonzero_sales = monthly["_이전월매출"].fillna(0).ne(0).astype(int)
+    monthly["월시점 매출발생월수"] = (
+        prev_nonzero_sales.groupby(monthly["제품코드"], dropna=False).cumsum()
+    )
+    monthly["월시점 최근3개월평균매출"] = (
+        monthly.groupby("제품코드", dropna=False)["_이전월매출"]
+        .rolling(3, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+        .fillna(0)
+    )
+    monthly["월시점 최근6개월평균매출"] = (
+        monthly.groupby("제품코드", dropna=False)["_이전월매출"]
+        .rolling(6, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+        .fillna(0)
+    )
+    monthly["최근3개월평균매출"] = monthly["월시점 최근3개월평균매출"]
+    monthly["최근6개월평균매출"] = monthly["월시점 최근6개월평균매출"]
+    monthly["월시점 증감률"] = [
+        _pct_change(r3, r6)
+        for r3, r6 in zip(monthly["월시점 최근3개월평균매출"].tolist(), monthly["월시점 최근6개월평균매출"].tolist())
+    ]
+    prev_negative_seen = (
+        monthly.assign(_neg=monthly["매출합계"].lt(0))
+        .groupby("제품코드", dropna=False)["_neg"]
+        .cummax()
+        .shift(1)
+    )
+    monthly["_누계반품월여부"] = prev_negative_seen.eq(True) & monthly["월시점 완료월수"].gt(0)
+    monthly["월시점 추세판정"] = monthly.apply(lambda r: _month_point_trend_judge(r), axis=1)
+    monthly["월시점 판정결과"] = monthly["월시점 추세판정"]
+    monthly["추세판정"] = monthly["월시점 추세판정"]
+    monthly["판정결과"] = monthly["월시점 판정결과"]
+    monthly["월시점 실제매출"] = monthly["매출합계"]
+
+    projection_src = pd.DataFrame({
+        "완료월총매출": monthly["월시점 완료월총매출"],
+        "완료월수": monthly["월시점 완료월수"],
+        "완료월평균매출": monthly["월시점 완료월평균매출"],
+        "월평균매출": monthly["월시점 완료월평균매출"],
+        "최근3개월평균매출": monthly["월시점 최근3개월평균매출"],
+        "최근6개월평균매출": monthly["월시점 최근6개월평균매출"],
+        "최근3개월증감률": monthly["월시점 증감률"],
+        "매출발생월수": monthly["월시점 매출발생월수"],
+        "추세판정": monthly["월시점 추세판정"],
+    })
+    projection = projection_src.apply(lambda r: _forecast_projection_from_row(r), axis=1, result_type="expand")
+    if not projection.empty:
+        projection.columns = ["월시점 예상기준", "월시점 적용증감률", "월시점 예상매출"]
+        monthly["월시점 예상기준"] = projection["월시점 예상기준"]
+        monthly["월시점 적용증감률"] = projection["월시점 적용증감률"]
+        monthly["월시점 예상매출"] = projection["월시점 예상매출"]
+    else:
+        monthly["월시점 예상기준"] = "자료부족"
+        monthly["월시점 적용증감률"] = 0
+        monthly["월시점 예상매출"] = 0
+    monthly["월시점 예상대비차이"] = monthly["월시점 실제매출"] - monthly["월시점 예상매출"]
+    monthly["월시점 잔여예상"] = (monthly["월시점 예상매출"] - monthly["월시점 실제매출"]).clip(lower=0)
+    monthly["월시점 달성률"] = [
+        (actual / expected * 100) if abs(float(expected or 0)) >= 1e-12 else 0
+        for actual, expected in zip(monthly["월시점 실제매출"].tolist(), monthly["월시점 예상매출"].tolist())
+    ]
+    return monthly.drop(columns=[c for c in ["_이전월매출", "_누계반품월여부"] if c in monthly.columns])
+
+
 def _add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
@@ -1179,92 +1438,41 @@ def _add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "제품코드" not in out.columns or "기준월" not in out.columns:
         return out
 
+    out["기준월"] = out["기준월"].map(_parse_yyyymm)
     out = out.sort_values(["제품코드", "기준월"]).reset_index(drop=True)
-    months = sorted({_parse_yyyymm(v) for v in out["기준월"].dropna().tolist()})
-    completed_months, current_month, future_months = _split_sales_period_months(months)
-    completed_set = set(completed_months)
-    future_set = set(future_months)
-
-    def _period_label(value: Any) -> str:
-        m = _parse_yyyymm(value)
-        if m in completed_set:
-            return "완료월"
-        if current_month and m == current_month:
-            return "당월진행"
-        if m in future_set:
-            return "미래월"
-        return "완료월"
-
-    out["기간구분"] = out["기준월"].map(_period_label)
-
-    metric_cols = [c for c in ["출고수량", "매출합계"] if c in out.columns]
-    if metric_cols:
-        monthly = (
-            out.groupby(["제품코드", "기준월"], dropna=False, as_index=False)[metric_cols]
-            .sum()
-            .sort_values(["제품코드", "기준월"])
-            .reset_index(drop=True)
+    monthly = _build_sales_month_workforward_metrics(out)
+    derived_cols = [
+        "기간구분",
+        "전월대비수량",
+        "전월대비매출",
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "월시점 완료월수",
+        "월시점 완료월평균매출",
+        "월시점 최근3개월평균매출",
+        "월시점 최근6개월평균매출",
+        "월시점 증감률",
+        "월시점 추세판정",
+        "월시점 판정결과",
+        "월시점 실제매출",
+        "월시점 예상기준",
+        "월시점 적용증감률",
+        "월시점 예상매출",
+        "월시점 예상대비차이",
+        "월시점 잔여예상",
+        "월시점 달성률",
+        "추세판정",
+        "판정결과",
+    ]
+    out = out.drop(columns=[c for c in derived_cols if c in out.columns])
+    if not monthly.empty:
+        monthly_for_merge = monthly[["제품코드", "기준월"] + [c for c in derived_cols if c in monthly.columns]].copy()
+        out = out.merge(
+            monthly_for_merge,
+            on=["제품코드", "기준월"],
+            how="left",
+            validate="many_to_one",
         )
-        monthly_grp = monthly.groupby("제품코드", dropna=False)
-
-        derived_cols: list[str] = []
-        if "출고수량" in monthly.columns:
-            monthly["전월대비수량"] = monthly_grp["출고수량"].diff().fillna(0)
-            derived_cols.append("전월대비수량")
-
-        if "매출합계" in monthly.columns:
-            monthly["전월대비매출"] = monthly_grp["매출합계"].diff().fillna(0)
-            monthly["최근3개월평균매출"] = (
-                monthly_grp["매출합계"]
-                .rolling(3, min_periods=1)
-                .mean()
-                .reset_index(level=0, drop=True)
-            )
-            monthly["최근6개월평균매출"] = (
-                monthly_grp["매출합계"]
-                .rolling(6, min_periods=1)
-                .mean()
-                .reset_index(level=0, drop=True)
-            )
-            monthly["월시점 증감률"] = monthly.apply(
-                lambda r: _pct_change(
-                    float(r.get("최근3개월평균매출") or 0),
-                    float(r.get("최근6개월평균매출") or 0),
-                ),
-                axis=1,
-            )
-            monthly["_월순번"] = monthly_grp.cumcount() + 1
-            monthly["_누계매출"] = monthly_grp["매출합계"].cumsum()
-            monthly["_누계반품월여부"] = (
-                monthly.assign(_neg=monthly["매출합계"].lt(0))
-                .groupby("제품코드", dropna=False)["_neg"]
-                .cummax()
-            )
-            monthly["기간구분"] = monthly["기준월"].map(_period_label)
-            monthly["월시점 추세판정"] = monthly.apply(
-                lambda r: _month_point_trend_judge(r),
-                axis=1,
-            )
-            monthly["월시점 판정결과"] = monthly["월시점 추세판정"]
-            monthly["추세판정"] = monthly["월시점 추세판정"]
-            monthly["판정결과"] = monthly["월시점 판정결과"]
-            derived_cols.extend([
-                "전월대비매출",
-                "최근3개월평균매출",
-                "최근6개월평균매출",
-                "월시점 증감률",
-                "월시점 추세판정",
-                "월시점 판정결과",
-                "추세판정",
-                "판정결과",
-            ])
-
-        if derived_cols:
-            out = out.merge(
-                monthly[["제품코드", "기준월"] + derived_cols],
-                on=["제품코드", "기준월"],
-                how="left",
-            )
 
     if "매출공급가액" in out.columns and "출고수량" in out.columns:
         out["평균공급단가"] = out.apply(
@@ -1278,20 +1486,14 @@ def _add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _month_point_trend_judge(row: pd.Series) -> str:
-    period = str(row.get("기간구분") or "").strip()
-    if period == "당월진행":
-        return "당월진행"
-    if period == "미래월":
-        return "미래월"
-
-    month_pos = int(float(row.get("_월순번") or 0))
-    if month_pos < 6:
+    completed_count = int(float(row.get("월시점 완료월수") or 0))
+    if completed_count <= 0:
         return "자료부족"
 
     return _trend_judge(
-        float(row.get("_누계매출") or 0),
-        float(row.get("최근3개월평균매출") or 0),
-        float(row.get("최근6개월평균매출") or 0),
+        float(row.get("월시점 완료월총매출") or 0),
+        float(row.get("월시점 최근3개월평균매출") or 0),
+        float(row.get("월시점 최근6개월평균매출") or 0),
         bool(row.get("_누계반품월여부")),
     )
 
@@ -1319,6 +1521,9 @@ SELECT
 
     Out_Put.Rd12_Ven_Cd AS 거래처코드,
     Ven_Cd.Rd03_Ven_Nm AS 거래처명,
+
+    Out_Put.Rd12_In_Ven_Cd AS 매입처코드,
+    In_Ven_Cd.Rd03_Ven_Nm AS 매입처명,
 
     Road1.Rd021_Sido AS 시도명,
     Road1.Rd021_Gugun AS 시구군명,
@@ -1433,6 +1638,9 @@ GROUP BY
     Out_Put.Rd12_Ven_Cd,
     Ven_Cd.Rd03_Ven_Nm,
 
+    Out_Put.Rd12_In_Ven_Cd,
+    In_Ven_Cd.Rd03_Ven_Nm,
+
     Road1.Rd021_Sido,
     Road1.Rd021_Gugun,
     Road1.Rd021_DongNm
@@ -1452,16 +1660,83 @@ ORDER BY
     df = _normalize_analytics_numeric_columns(df)
     return df
 
+
+def _apply_monthly_current_detail_mix(
+    monthly_df: pd.DataFrame,
+    params: Dict[str, Any],
+    *,
+    source_mode: str,
+    source_policy: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    """
+    월중 종료일 조회에서 완료월은 월집계, 종료월은 출고상세로 교체한다.
+
+    월집계의 종료월 행과 상세 종료월 행을 더하면 중복 집계되므로,
+    종료월 월집계 행은 제거하고 Rddbc120의 1일~date_to 집계만 붙인다.
+    """
+    if monthly_df is None or monthly_df.empty:
+        return monthly_df
+
+    policy = source_policy or params.get("_period_source_policy") or _resolve_period_source_policy(params)
+    if not policy.get("use_hybrid"):
+        return monthly_df
+
+    date_to = str(policy.get("effective_date_to") or "")
+    if not date_to:
+        return monthly_df
+
+    end_month = date_to[:6]
+    detail_params = dict(params)
+    detail_params["source_mode"] = "detail"
+    detail_params["date_from"] = f"{end_month}01"
+    detail_params["date_to"] = date_to
+    detail_params["month_from"] = end_month
+    detail_params["month_to"] = end_month
+    detail_df = get_sales_trend_detail_df(detail_params)
+
+    work = monthly_df.copy()
+    if "기준월" in work.columns:
+        work["_기준월_정규화"] = work["기준월"].map(_parse_yyyymm)
+        work = work[work["_기준월_정규화"] != end_month].drop(columns=["_기준월_정규화"])
+
+    if detail_df is not None and not detail_df.empty:
+        detail_df = detail_df.copy()
+        detail_df["분석자료원"] = "출고상세(Rddbc120)"
+        for col in work.columns:
+            if col not in detail_df.columns:
+                detail_df[col] = ""
+        for col in detail_df.columns:
+            if col not in work.columns:
+                work[col] = ""
+        mixed = pd.concat([work, detail_df[work.columns]], ignore_index=True, sort=False)
+    else:
+        mixed = work
+
+    if mixed.empty:
+        return mixed
+
+    mixed = _add_trend_columns(mixed)
+    mixed = _normalize_analytics_numeric_columns(mixed)
+    mixed.attrs.update(monthly_df.attrs)
+    mixed.attrs["mixed_current_month_detail"] = True
+    mixed.attrs["mixed_current_month"] = end_month
+    mixed.attrs["source_label_completed"] = _source_label(source_mode)
+    mixed.attrs["source_label_current"] = "출고상세(Rddbc120)"
+    return mixed
+
 def get_sales_trend_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     t0 = time.perf_counter()
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
+    params = _apply_period_source_policy_params(params)
+    source_policy = params.get("_period_source_policy") or {}
 
     source_mode = _resolve_source_mode(params)
     params["resolved_source_mode"] = source_mode
 
     if source_mode in {"monthly_book", "monthly_real"}:
         df = get_sales_trend_monthly_df(params, source_mode=source_mode)
+        df = _apply_monthly_current_detail_mix(df, params, source_mode=source_mode, source_policy=source_policy)
     else:
         df = get_sales_trend_detail_df(params)
 
@@ -1471,7 +1746,7 @@ def get_sales_trend_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
         0 if df is None else len(df),
         time.perf_counter() - t0,
     )
-    return df
+    return _finalize_sales_trend_public_df(df)
 
 def get_sales_trend_summary_df(
     params: Optional[Dict[str, Any]] = None,
@@ -1491,6 +1766,7 @@ def get_sales_trend_summary_df(
     t0 = time.perf_counter()
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
+    params = _apply_period_source_policy_params(params)
 
     raw = raw_df if raw_df is not None else get_sales_trend_df(params)
     t_raw = time.perf_counter()
@@ -1539,6 +1815,26 @@ def get_sales_trend_summary_df(
         agg_dict["출고건수"] = "sum"
     if "집계건수" in df.columns:
         agg_dict["집계건수"] = "sum"
+
+    # 월집계 + 당월 상세 혼합 시 숫자 컬럼의 str/int 혼합 방지
+    # agg_dict에서 합산하는 모든 컬럼을 groupby 전에 숫자형으로 통일한다.
+    for col, agg_func in agg_dict.items():
+        if agg_func != "sum" or col not in df.columns:
+            continue
+
+        raw_series = df[col]
+
+        if not pd.api.types.is_numeric_dtype(raw_series):
+            raw_series = (
+                raw_series.astype(str)
+                .str.replace(",", "", regex=False)
+                .str.strip()
+            )
+
+        df[col] = pd.to_numeric(
+            raw_series,
+            errors="coerce",
+        ).fillna(0)
 
     base = (
         df.groupby(product_cols, dropna=False)
@@ -1630,7 +1926,7 @@ def get_sales_trend_summary_df(
     # 월별 컬럼 NaN 보정
     month_sales_cols = [f"{_fmt_yyyymm_col(m)} 매출" for m in months]
     month_qty_cols = [f"{_fmt_yyyymm_col(m)} 수량" for m in months]
-    completed_months, current_month, future_months = _split_sales_period_months(months)
+    completed_months, current_month, future_months = _split_sales_period_months(months, params)
     completed_sales_cols = [
         f"{_fmt_yyyymm_col(m)} 매출"
         for m in completed_months
@@ -1727,6 +2023,48 @@ def get_sales_trend_summary_df(
         out["_당월적용증감률"] = 0
         out["당월 예상매출"] = 0
 
+    monthly_workforward = _build_sales_month_workforward_metrics(df, params)
+    if current_month and not monthly_workforward.empty:
+        eval_monthly = monthly_workforward[monthly_workforward["기준월"].astype(str) == current_month].copy()
+        if not eval_monthly.empty:
+            eval_cols = [
+                "제품코드",
+                "월시점 완료월총매출",
+                "월시점 완료월수",
+                "월시점 완료월평균매출",
+                "월시점 매출발생월수",
+                "월시점 최근3개월평균매출",
+                "월시점 최근6개월평균매출",
+                "월시점 증감률",
+                "월시점 추세판정",
+                "월시점 실제매출",
+                "월시점 예상매출",
+                "월시점 잔여예상",
+                "월시점 달성률",
+            ]
+            eval_monthly = eval_monthly[[c for c in eval_cols if c in eval_monthly.columns]].drop_duplicates("제품코드")
+            out = out.merge(eval_monthly, on="제품코드", how="left")
+            override_pairs = {
+                "월시점 완료월총매출": "완료월총매출",
+                "월시점 완료월수": "완료월수",
+                "월시점 완료월평균매출": "완료월평균매출",
+                "월시점 매출발생월수": "매출발생월수",
+                "월시점 최근3개월평균매출": "최근3개월평균매출",
+                "월시점 최근6개월평균매출": "최근6개월평균매출",
+                "월시점 증감률": "최근3개월증감률",
+                "월시점 추세판정": "추세판정",
+                "월시점 실제매출": "당월 현재매출",
+                "월시점 예상매출": "당월 예상매출",
+                "월시점 잔여예상": "당월 잔여예상",
+                "월시점 달성률": "당월 진척률",
+            }
+            for src, dst in override_pairs.items():
+                if src in out.columns:
+                    out[dst] = out[src]
+            if "완료월평균매출" in out.columns:
+                out["월평균매출"] = out["완료월평균매출"]
+            out = out.drop(columns=[c for c in override_pairs if c in out.columns])
+
     out["당월 잔여예상"] = (out["당월 예상매출"] - out["당월 현재매출"]).clip(lower=0)
     out["당월 진척률"] = out.apply(
         lambda r: (
@@ -1800,6 +2138,7 @@ def get_sales_trend_summary_df(
         out = out.sort_values(["제품코드"]).reset_index(drop=True)
 
     out = _normalize_analytics_numeric_columns(out)
+    out.attrs.update(getattr(raw, "attrs", {}))
     t_sort = time.perf_counter()
     log.info(
         "[analytics.sales_trend_summary.perf] raw_rows=%s out_rows=%s months=%s raw=%.3fs group=%.3fs pivot_sales=%.3fs pivot_qty=%.3fs merge=%.3fs calc=%.3fs sort=%.3fs total=%.3fs",
@@ -1879,7 +2218,7 @@ def _current_yyyymm() -> str:
         return dt.datetime.now().strftime("%Y%m")
 
 
-def _split_sales_period_months(months: list[str]) -> tuple[list[str], str, list[str]]:
+def _split_sales_period_months(months: list[str], params: Optional[Dict[str, Any]] = None) -> tuple[list[str], str, list[str]]:
     """
     조회월을 완료월/진행 중인 당월/미래월로 분리한다.
 
@@ -1892,13 +2231,18 @@ def _split_sales_period_months(months: list[str]) -> tuple[list[str], str, list[
     if not clean_months:
         return [], "", []
 
-    current_month = _current_yyyymm()
-    if max(clean_months) < current_month:
+    if params is not None:
+        policy = _resolve_period_source_policy(params)
+        evaluation_month = str(policy.get("evaluation_month") or "")
+    else:
+        evaluation_month = _current_yyyymm()
+
+    if not evaluation_month:
         return clean_months, "", []
 
-    completed = [m for m in clean_months if m < current_month]
-    current = current_month if current_month in clean_months else ""
-    future = [m for m in clean_months if m > current_month]
+    completed = [m for m in clean_months if m < evaluation_month]
+    current = evaluation_month if evaluation_month in clean_months else ""
+    future = [m for m in clean_months if m > evaluation_month]
     return completed, current, future
 
 
@@ -2121,7 +2465,7 @@ def get_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str,
     log.info("[analytics.sales_trend] rows=%s params=%r", row_count, params)
 
     source_mode = _resolve_source_mode(params)
-    source_label = _source_label(source_mode)
+    source_label = _effective_source_label(source_mode, df)
     query_summary = _fmt_analytics_query_summary(params, source_label)
     trend_judge_filter = _normalize_trend_judge_filter(params.get("trend_judge"))    
 
@@ -2341,7 +2685,7 @@ def get_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> D
     log.info("[analytics.sales_trend_summary] rows=%s params=%r", row_count, params)
 
     source_mode = _resolve_source_mode(params)
-    source_label = _source_label(source_mode)
+    source_label = _effective_source_label(source_mode, raw_df)
     query_summary = _fmt_analytics_query_summary(params, source_label)
 
     if row_count == 0:
@@ -2704,6 +3048,7 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     out.insert(0, "순번", range(1, len(out) + 1))
 
     out = _normalize_analytics_numeric_columns(out)
+    out.attrs.update(getattr(df, "attrs", {}))
     t_finish = time.perf_counter()
     log.info(
         "[analytics.sales_forecast.perf] rows=%s summary=%.3fs numeric=%.3fs calc=%.3fs finish=%.3fs total=%.3fs",
@@ -2729,7 +3074,7 @@ def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
         df = pd.DataFrame()
 
     source_mode = _resolve_source_mode(params)
-    source_label = _source_label(source_mode)
+    source_label = _effective_source_label(source_mode, df)
     trend_judge_filter = _normalize_trend_judge_filter(params.get("trend_judge"))
     query_summary = _fmt_analytics_query_summary(params, source_label)
 
@@ -2897,6 +3242,19 @@ def _stock_shortage_grade(row: pd.Series) -> str:
 
     return "정상"
 
+def _stock_shortage_current_judge(row: pd.Series) -> str:
+    shortage_qty = _safe_float(row.get("부족예상수량"))
+    remaining_qty = _safe_float(row.get("당월 잔여예상출고수량"))
+    fill_rate = _safe_float(row.get("당월 재고충족률"))
+
+    if shortage_qty > 0:
+        return "부족"
+    if remaining_qty <= 0:
+        return "수요없음"
+    if fill_rate < 120:
+        return "주의"
+    return "적정"
+
 def _shortage_grade_counts(df: pd.DataFrame) -> Dict[str, int]:
     return _count_text_values(df, "부족등급")
 
@@ -2956,9 +3314,199 @@ def _stock_current_monthly_spec(stock_mode: str) -> Dict[str, str]:
         "source_label": "장부재고월집계(Rddbc220) 누계",
     }
 
+
+def _stock_shortage_source_labels(
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    stock_mode: str = "book",
+) -> Dict[str, Any]:
+    policy = _resolve_period_source_policy(params)
+    monthly_source = (
+        "월집계-실재고(Rddbc210)"
+        if str(stock_mode or "").strip() == "real"
+        else "월집계-장부재고(Rddbc220)"
+    )
+    monthly_stock_source = (
+        "실재고월집계(Rddbc210) 누계"
+        if str(stock_mode or "").strip() == "real"
+        else "장부재고월집계(Rddbc220) 누계"
+    )
+
+    if bool(policy.get("use_hybrid_detail")):
+        display_source = (
+            f"완료월: {monthly_source} / "
+            "평가월: 출고상세(Rddbc120) / "
+            "현재재고: 전월말+입출고상세"
+        )
+        stock_source = "전월말재고 + 평가월 입고상세(Rddbc110) - 출고상세(Rddbc120)"
+    else:
+        display_source = monthly_source
+        stock_source = monthly_stock_source
+
+    return {
+        "display_source": display_source,
+        "stock_source": stock_source,
+        "monthly_source": monthly_source,
+        "monthly_stock_source": monthly_stock_source,
+        **policy,
+    }
+
+
+STOCK_SHORTAGE_INTERNAL_COLUMNS = {
+    "당월입고수량",
+    "당월출고수량",
+    "당월재고증감수량",
+    "제품코드_RAW",
+    "입고총수량",
+    "출고총수량",
+    "현재재고수량원본",
+    "입고공급가액합계",
+    "거래처코드",
+    "거래처명",
+    "시도명",
+    "시구군명",
+    "법정읍면동명",
+    "출고건수",
+}
+
+
+def _finalize_stock_shortage_public_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    attrs = dict(getattr(df, "attrs", {}) or {})
+    drop_cols = [
+        c for c in df.columns
+        if str(c or "").endswith(("_x", "_y"))
+        or str(c or "").strip() in STOCK_SHORTAGE_INTERNAL_COLUMNS
+    ]
+    out = df.drop(columns=drop_cols, errors="ignore").copy()
+    out.attrs.update(attrs)
+    return out
+
 def _chunks(values: list[str], size: int):
     for i in range(0, len(values), size):
         yield values[i:i + size]
+
+
+def _load_product_current_month_stock_movements(
+    product_codes: list[str],
+    *,
+    stock_mode: str,
+    date_to: str,
+    stock_cd_list: Any = None,
+    stock_cd: Any = None,
+) -> pd.DataFrame:
+    codes = sorted({str(x or "").strip() for x in product_codes if str(x or "").strip()})
+    columns = ["제품코드", "당월입고수량", "당월출고수량", "당월재고증감수량"]
+    if not codes:
+        return pd.DataFrame(columns=columns)
+
+    date_to = _normalize_date_to(date_to)
+    if not date_to:
+        return pd.DataFrame(columns=columns)
+    date_from = f"{date_to[:6]}01"
+
+    real_mode = str(stock_mode or "").strip() == "real"
+    in_date_field = "T.Rd11_In_YyMmDd" if real_mode else "T.Rd11_Trans_YyMmDd"
+    out_date_field = "T.Rd12_Out_YyMmDd" if real_mode else "T.Rd12_Trans_YyMmDd"
+    in_qty_expr = (
+        "CAST(ISNULL(T.Rd11_Quantity, 0) AS FLOAT) + CAST(ISNULL(T.Rd11_Oquantity, 0) AS FLOAT)"
+        if real_mode
+        else "CAST(ISNULL(T.Rd11_Quantity, 0) AS FLOAT)"
+    )
+    out_qty_expr = (
+        "CAST(ISNULL(T.Rd12_Quantity, 0) AS FLOAT) + CAST(ISNULL(T.Rd12_Oquantity, 0) AS FLOAT)"
+        if real_mode
+        else "CAST(ISNULL(T.Rd12_Quantity, 0) AS FLOAT)"
+    )
+    in_exclude = ("2",) if real_mode else ("3",)
+    out_exclude = ("7",) if real_mode else ("8",)
+
+    stock_codes = _clean_list_param(stock_cd_list)
+    if not stock_codes and clean_text(stock_cd):
+        stock_codes = [clean_text(stock_cd)]
+
+    def _stock_filter(field: str, bind_params: Dict[str, Any], prefix: str) -> str:
+        if not stock_codes:
+            return ""
+        names: list[str] = []
+        for i, cd in enumerate(stock_codes):
+            key = f"{prefix}_stock_cd_{i}"
+            bind_params[key] = clean_text(cd)
+            names.append(f"%({key})s")
+        return f"\n      AND {field} IN ({', '.join(names)})"
+
+    def _query_batch(batch_codes: list[str]) -> pd.DataFrame:
+        bind_params: Dict[str, Any] = {
+            "date_from": date_from,
+            "date_to": date_to,
+        }
+        placeholders: list[str] = []
+        for i, cd in enumerate(batch_codes):
+            key = f"cd{i}"
+            bind_params[key] = cd
+            placeholders.append(f"%({key})s")
+
+        in_stock_filter = _stock_filter("T.Rd11_Stock_Cd", bind_params, "in")
+        out_stock_filter = _stock_filter("T.Rd12_Stock_Cd", bind_params, "out")
+        in_exclude_sql = ", ".join(f"'{x}'" for x in in_exclude)
+        out_exclude_sql = ", ".join(f"'{x}'" for x in out_exclude)
+
+        sql = f"""
+WITH InAgg AS (
+    SELECT
+        LTRIM(RTRIM(T.Rd11_Physic_Cd)) AS [제품코드],
+        SUM({in_qty_expr}) AS [당월입고수량]
+    FROM dbo.Rddbc110 AS T WITH (NOLOCK)
+    WHERE T.Rd11_Physic_Cd IN ({",".join(placeholders)})
+      AND NULLIF(LTRIM(RTRIM({in_date_field})), '') IS NOT NULL
+      AND {in_date_field} >= %(date_from)s
+      AND {in_date_field} <= %(date_to)s
+      AND LEFT(LTRIM(RTRIM(T.Rd11_Io_Gu)), 1) NOT IN ({in_exclude_sql})
+      {in_stock_filter}
+    GROUP BY LTRIM(RTRIM(T.Rd11_Physic_Cd))
+),
+OutAgg AS (
+    SELECT
+        LTRIM(RTRIM(T.Rd12_Physic_Cd)) AS [제품코드],
+        SUM({out_qty_expr}) AS [당월출고수량]
+    FROM dbo.Rddbc120 AS T WITH (NOLOCK)
+    WHERE T.Rd12_Physic_Cd IN ({",".join(placeholders)})
+      AND NULLIF(LTRIM(RTRIM({out_date_field})), '') IS NOT NULL
+      AND {out_date_field} >= %(date_from)s
+      AND {out_date_field} <= %(date_to)s
+      AND LEFT(LTRIM(RTRIM(T.Rd12_Io_Gu)), 1) NOT IN ({out_exclude_sql})
+      {out_stock_filter}
+    GROUP BY LTRIM(RTRIM(T.Rd12_Physic_Cd))
+)
+SELECT
+    COALESCE(I.[제품코드], O.[제품코드]) AS [제품코드],
+    CAST(ISNULL(I.[당월입고수량], 0) AS FLOAT) AS [당월입고수량],
+    CAST(ISNULL(O.[당월출고수량], 0) AS FLOAT) AS [당월출고수량],
+    CAST(ISNULL(I.[당월입고수량], 0) - ISNULL(O.[당월출고수량], 0) AS FLOAT) AS [당월재고증감수량]
+FROM InAgg AS I
+FULL OUTER JOIN OutAgg AS O
+    ON I.[제품코드] = O.[제품코드]
+"""
+        df = query_to_df(sql, bind_params)
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame(columns=columns)
+
+    frames: list[pd.DataFrame] = []
+    for batch in _chunks(codes, 1800):
+        df = _query_batch(batch)
+        if df is not None and not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame(columns=columns)
+    out = pd.concat(frames, ignore_index=True)
+    for c in columns:
+        if c not in out.columns:
+            out[c] = 0 if c != "제품코드" else ""
+    out["제품코드"] = out["제품코드"].fillna("").astype(str).str.strip()
+    for c in ["당월입고수량", "당월출고수량", "당월재고증감수량"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    return out.groupby("제품코드", as_index=False)[["당월입고수량", "당월출고수량", "당월재고증감수량"]].sum()
 
 
 def _load_product_current_stock(
@@ -2966,6 +3514,8 @@ def _load_product_current_stock(
     *,
     stock_mode: str,
     month_to: str,
+    date_to: Any = None,
+    policy_date: Any = None,
     stock_cd_list: Any = None,
     stock_cd: Any = None,
 ) -> pd.DataFrame:
@@ -2986,12 +3536,22 @@ def _load_product_current_stock(
     amt_col = spec["amt_col"]
     unit_col = spec["unit_col"]
     fallback_unit_col = spec["fallback_unit_col"]
-    stock_month_to = _normalize_month(month_to) or pd.Timestamp.today().strftime("%Y%m")
+    source_policy = _resolve_period_source_policy({"date_to": date_to, "policy_date": policy_date})
+    stock_month_to = _normalize_month(month_to) or source_policy["effective_month_to"]
+    detail_date_to = str(source_policy.get("effective_date_to") or "")
+    use_mid_month_detail = bool(source_policy.get("use_hybrid"))
+    monthly_stock_month_to = _prev_yyyymm(detail_date_to[:6]) if use_mid_month_detail else stock_month_to
+    if not monthly_stock_month_to:
+        monthly_stock_month_to = stock_month_to
 
     def _with_stock_attrs(df: pd.DataFrame, *, batches: int, elapsed: float) -> pd.DataFrame:
         df.attrs["stock_source_table"] = spec["source_table"]
-        df.attrs["stock_source_label"] = spec["source_label"]
-        df.attrs["stock_cutoff_month"] = stock_month_to
+        df.attrs["stock_source_label"] = (
+            f"전월말 {spec['source_label']} + 당월 입출고상세"
+            if use_mid_month_detail
+            else spec["source_label"]
+        )
+        df.attrs["stock_cutoff_month"] = detail_date_to if use_mid_month_detail else stock_month_to
         df.attrs["stock_query_codes"] = len(codes)
         df.attrs["stock_query_batches"] = batches
         df.attrs["stock_query_elapsed_sec"] = elapsed
@@ -3020,7 +3580,7 @@ def _load_product_current_stock(
 
     def _query_batch(batch_codes: list[str]) -> pd.DataFrame:
         bind_params: Dict[str, Any] = {
-            "stock_month_to": stock_month_to,
+            "stock_month_to": monthly_stock_month_to,
         }
         placeholders: list[str] = []
 
@@ -3120,6 +3680,29 @@ OPTION (RECOMPILE)
     else:
         stock_df = pd.DataFrame()
 
+    if use_mid_month_detail:
+        movement_df = _load_product_current_month_stock_movements(
+            codes,
+            stock_mode=stock_mode,
+            date_to=detail_date_to,
+            stock_cd_list=stock_cd_list,
+            stock_cd=stock_cd,
+        )
+        if movement_df is not None and not movement_df.empty:
+            if stock_df is None or stock_df.empty:
+                stock_df = movement_df[["제품코드"]].copy()
+                stock_df[qty_col] = 0
+                stock_df[unit_col] = 0
+                stock_df[amt_col] = 0
+            stock_df["제품코드"] = stock_df["제품코드"].fillna("").astype(str).str.strip()
+            stock_df = stock_df.merge(movement_df, on="제품코드", how="outer")
+            for c in [qty_col, unit_col, amt_col, "당월입고수량", "당월출고수량", "당월재고증감수량"]:
+                if c not in stock_df.columns:
+                    stock_df[c] = 0
+                stock_df[c] = pd.to_numeric(stock_df[c], errors="coerce").fillna(0)
+            stock_df[qty_col] = stock_df[qty_col] + stock_df["당월재고증감수량"]
+            stock_df[amt_col] = stock_df[qty_col] * stock_df[unit_col]
+
     product_col = "제품코드"
     if not stock_df.empty and product_col in stock_df.columns:
         dup_count = int(stock_df[product_col].fillna("").astype(str).str.strip().duplicated().sum())
@@ -3140,7 +3723,7 @@ OPTION (RECOMPILE)
         len(stock_df),
         elapsed,
         stock_mode,
-        stock_month_to,
+        detail_date_to if use_mid_month_detail else stock_month_to,
         len(stock_codes),
     )
 
@@ -3159,6 +3742,104 @@ def _month_qty_columns(df: pd.DataFrame) -> list[str]:
     return sorted(cols)
 
 
+def _build_qty_workforward_metrics_from_wide(
+    df: pd.DataFrame,
+    qty_month_pairs: list[tuple[str, str]],
+    params: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
+    if df is None or df.empty or "제품코드" not in df.columns or not qty_month_pairs:
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    for month, col in qty_month_pairs:
+        if col not in df.columns:
+            continue
+        part = df[["제품코드", col]].copy()
+        part["기준월"] = month
+        part["수요수량"] = pd.to_numeric(part[col], errors="coerce").fillna(0)
+        frames.append(part[["제품코드", "기준월", "수요수량"]])
+
+    if not frames:
+        return pd.DataFrame()
+
+    monthly = (
+        pd.concat(frames, ignore_index=True)
+        .groupby(["제품코드", "기준월"], dropna=False, as_index=False)["수요수량"]
+        .sum()
+        .sort_values(["제품코드", "기준월"])
+        .reset_index(drop=True)
+    )
+    months = sorted({_parse_yyyymm(v) for v in monthly["기준월"].dropna().tolist()})
+    _completed_months, evaluation_month, _future_months = _split_sales_period_months(months, params)
+
+    grp = monthly.groupby("제품코드", dropna=False)
+    monthly["_이전월수요"] = grp["수요수량"].shift(1)
+    monthly["평가월 이전 완료월수"] = grp.cumcount()
+    monthly["완료월총수요수량"] = grp["수요수량"].cumsum().shift(1)
+    monthly["완료월총수요수량"] = monthly["완료월총수요수량"].where(monthly["평가월 이전 완료월수"] > 0, 0).fillna(0)
+    monthly["완료월평균수요수량"] = (
+        monthly["완료월총수요수량"] / monthly["평가월 이전 완료월수"].replace(0, 1)
+    ).where(monthly["평가월 이전 완료월수"] > 0, 0)
+    monthly["최근3개월평균수요수량"] = (
+        monthly.groupby("제품코드", dropna=False)["_이전월수요"]
+        .rolling(3, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+        .fillna(0)
+    )
+    monthly["최근6개월평균수요수량"] = (
+        monthly.groupby("제품코드", dropna=False)["_이전월수요"]
+        .rolling(6, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+        .fillna(0)
+    )
+    monthly["수요증감률"] = [
+        _pct_change(r3, r6)
+        for r3, r6 in zip(monthly["최근3개월평균수요수량"].tolist(), monthly["최근6개월평균수요수량"].tolist())
+    ]
+    projection_src = pd.DataFrame({
+        "완료월총매출": monthly["완료월총수요수량"],
+        "완료월수": monthly["평가월 이전 완료월수"],
+        "완료월평균매출": monthly["완료월평균수요수량"],
+        "월평균매출": monthly["완료월평균수요수량"],
+        "최근3개월평균매출": monthly["최근3개월평균수요수량"],
+        "최근6개월평균매출": monthly["최근6개월평균수요수량"],
+        "최근3개월증감률": monthly["수요증감률"],
+        "매출발생월수": monthly["평가월 이전 완료월수"],
+        "추세판정": "",
+    })
+    projection = projection_src.apply(lambda r: _forecast_projection_from_row(r), axis=1, result_type="expand")
+    if not projection.empty:
+        projection.columns = ["수요예상기준", "수요적용증감률", "평가월 예상수요수량"]
+        monthly["수요예상기준"] = projection["수요예상기준"].replace({
+            "최근3개월평균매출": "최근3개월평균수요수량",
+            "최근6개월평균매출": "최근6개월평균수요수량",
+            "완료월평균매출": "완료월평균수요수량",
+            "월평균매출": "완료월평균수요수량",
+            "자료부족": "비교자료부족",
+        })
+        monthly["수요적용증감률"] = projection["수요적용증감률"]
+        monthly["평가월 예상수요수량"] = projection["평가월 예상수요수량"]
+    else:
+        monthly["수요예상기준"] = "비교자료부족"
+        monthly["수요적용증감률"] = 0
+        monthly["평가월 예상수요수량"] = 0
+    monthly["예상기준월수량"] = projection_src.apply(lambda r: _forecast_base_and_label(r)[0], axis=1)
+    monthly.loc[monthly["평가월 이전 완료월수"] <= 0, "평가월 예상수요수량"] = 0
+    monthly.loc[monthly["평가월 이전 완료월수"] <= 0, "예상기준월수량"] = 0
+    monthly["평가월 실제수요수량"] = monthly["수요수량"]
+    monthly["평가월 잔여예상수요수량"] = (monthly["평가월 예상수요수량"] - monthly["평가월 실제수요수량"]).clip(lower=0)
+    monthly["평가월 수요진척률"] = [
+        (actual / expected * 100) if abs(float(expected or 0)) >= 1e-12 else 0
+        for actual, expected in zip(monthly["평가월 실제수요수량"].tolist(), monthly["평가월 예상수요수량"].tolist())
+    ]
+
+    if evaluation_month:
+        monthly = monthly[monthly["기준월"].astype(str) == evaluation_month].copy()
+    return monthly.drop(columns=[c for c in ["_이전월수요"] if c in monthly.columns])
+
+
 def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     """
     품목별 재고부족현황 1차.
@@ -3170,10 +3851,12 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     """
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
+    params = _apply_period_source_policy_params(params)
     t0 = time.perf_counter()
 
     stock_mode = str(params.get("stock_mode") or "book").strip()
     stock_label = _stock_mode_label(stock_mode)
+    source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
 
     base = get_sales_forecast_df(params)
     t_base = time.perf_counter()
@@ -3199,6 +3882,8 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
         product_codes,
         stock_mode=stock_mode,
         month_to=stock_cutoff_month,
+        date_to=params.get("date_to"),
+        policy_date=params.get("policy_date") or params.get("as_of_date") or params.get("today"),
         stock_cd_list=params.get("stock_cd_list"),
         stock_cd=params.get("stock_cd"),
     )
@@ -3232,52 +3917,81 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
 
     qty_cols = _month_qty_columns(out)
-
-    if qty_cols:
-        recent3_qty_cols = qty_cols[-3:]
-        recent6_qty_cols = qty_cols[-6:]
-
-        out["최근3개월평균수량"] = out[recent3_qty_cols].apply(
-            lambda r: float(pd.to_numeric(r, errors="coerce").fillna(0).sum()) / max(len(recent3_qty_cols), 1),
-            axis=1,
+    qty_month_pairs: list[tuple[str, str]] = []
+    for c in qty_cols:
+        label = str(c or "").strip()
+        month = _parse_yyyymm(label[:7])
+        if month:
+            qty_month_pairs.append((month, c))
+    qty_month_pairs = sorted(qty_month_pairs, key=lambda x: x[0])
+    months = [m for m, _c in qty_month_pairs]
+    qty_workforward = _build_qty_workforward_metrics_from_wide(out, qty_month_pairs, params)
+    if qty_workforward is not None and not qty_workforward.empty:
+        qty_cols_for_merge = [
+            "제품코드",
+            "평가월 이전 완료월수",
+            "완료월총수요수량",
+            "완료월평균수요수량",
+            "최근3개월평균수요수량",
+            "최근6개월평균수요수량",
+            "수요증감률",
+            "수요적용증감률",
+            "수요예상기준",
+            "예상기준월수량",
+            "평가월 예상수요수량",
+            "평가월 실제수요수량",
+            "평가월 잔여예상수요수량",
+            "평가월 수요진척률",
+        ]
+        out = out.merge(
+            qty_workforward[[c for c in qty_cols_for_merge if c in qty_workforward.columns]].drop_duplicates("제품코드"),
+            on="제품코드",
+            how="left",
+            validate="one_to_one",
         )
-        out["최근6개월평균수량"] = out[recent6_qty_cols].apply(
-            lambda r: float(pd.to_numeric(r, errors="coerce").fillna(0).sum()) / max(len(recent6_qty_cols), 1),
-            axis=1,
-        )
-    else:
-        out["최근3개월평균수량"] = 0
-        out["최근6개월평균수량"] = 0
-
-    if "총출고수량" in out.columns and "분석월수" in out.columns:
-        pass
-
-    # 예측 기준 수량: 최근3개월 → 최근6개월 → 총출고수량/분석월수 순
-    total_qty = pd.to_numeric(out.get("총출고수량", 0), errors="coerce").fillna(0)
-    month_count = max(int(params.get("analysis_month_count") or 0), 0)
-
-    if month_count <= 0:
-        month_count = max(len(qty_cols), 1)
-
-    out["월평균출고수량"] = total_qty / max(month_count, 1)
-
-    out["예상기준월수량"] = out.apply(
-        lambda r: (
-            _safe_float(r.get("최근3개월평균수량"))
-            if _safe_float(r.get("최근3개월평균수량")) > 0
-            else _safe_float(r.get("최근6개월평균수량"))
-            if _safe_float(r.get("최근6개월평균수량")) > 0
-            else _safe_float(r.get("월평균출고수량"))
-        ),
-        axis=1,
-    )
+    for c in [
+        "평가월 이전 완료월수",
+        "완료월총수요수량",
+        "완료월평균수요수량",
+        "최근3개월평균수요수량",
+        "최근6개월평균수요수량",
+        "수요증감률",
+        "수요적용증감률",
+        "예상기준월수량",
+        "평가월 예상수요수량",
+        "평가월 실제수요수량",
+        "평가월 잔여예상수요수량",
+        "평가월 수요진척률",
+    ]:
+        if c not in out.columns:
+            out[c] = 0
+        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    if "수요예상기준" not in out.columns:
+        out["수요예상기준"] = "비교자료부족"
+    out["완료월수"] = out["평가월 이전 완료월수"]
+    out["완료월총출고수량"] = out["완료월총수요수량"]
+    out["완료월평균출고수량"] = out["완료월평균수요수량"]
+    out["월평균출고수량"] = out["완료월평균출고수량"]
+    out["최근3개월평균수량"] = out["최근3개월평균수요수량"]
+    out["최근6개월평균수량"] = out["최근6개월평균수요수량"]
+    out["최근3개월평균출고수량"] = out["최근3개월평균수요수량"]
+    out["최근6개월평균출고수량"] = out["최근6개월평균수요수량"]
+    out["최근3개월수량증감률"] = out["수요증감률"]
+    out["당월 현재출고수량"] = out["평가월 실제수요수량"]
+    out["당월 예상출고수량"] = out["평가월 예상수요수량"]
+    out["당월 잔여예상출고수량"] = out["평가월 잔여예상수요수량"]
+    out["당월 출고진척률"] = out["평가월 수요진척률"]
 
     stock_qty_col = _stock_qty_col(stock_mode)
     stock_amt_col = _stock_amt_col(stock_mode)
+    stock_unit_col = "실재고평가단가" if stock_mode == "real" else "장부재고평가단가"
 
     out["재고기준"] = stock_label
     out["현재재고수량"] = pd.to_numeric(out[stock_qty_col], errors="coerce").fillna(0)
     out["현재재고금액"] = pd.to_numeric(out[stock_amt_col], errors="coerce").fillna(0)
+    if stock_unit_col not in out.columns:
+        out[stock_unit_col] = 0
+    out["재고평가단가"] = pd.to_numeric(out[stock_unit_col], errors="coerce").fillna(0)
 
     out["1개월필요수량"] = out["예상기준월수량"]
     out["2개월필요수량"] = out["예상기준월수량"] * 2
@@ -3309,6 +4023,18 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
 
     out["부족등급"] = out.apply(_stock_shortage_grade, axis=1)
 
+    remaining_out_qty = pd.to_numeric(out["당월 잔여예상출고수량"], errors="coerce").fillna(0)
+    current_stock_qty = pd.to_numeric(out["현재재고수량"], errors="coerce").fillna(0)
+    unit_price = pd.to_numeric(out["재고평가단가"], errors="coerce").fillna(0)
+    out["예상월말재고수량"] = current_stock_qty - remaining_out_qty
+    out["부족예상수량"] = (remaining_out_qty - current_stock_qty).clip(lower=0)
+    out["부족예상금액"] = out["부족예상수량"] * unit_price.clip(lower=0)
+    out["당월 재고충족률"] = [
+        (max(float(stock), 0.0) / float(remain) * 100) if float(remain or 0) > 0 else 100.0
+        for stock, remain in zip(current_stock_qty.tolist(), remaining_out_qty.tolist())
+    ]
+    out["재고부족판정"] = out.apply(_stock_shortage_current_judge, axis=1)
+
     shortage_grade_filter = clean_text(
         params.get("shortage_grade") or params.get("shortage_grade_filter")
     )
@@ -3323,8 +4049,27 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     shortage_decimal_cols = [
         "최근3개월평균수량",
         "최근6개월평균수량",
+        "최근3개월평균출고수량",
+        "최근6개월평균출고수량",
         "월평균출고수량",
+        "완료월총출고수량",
+        "완료월평균출고수량",
+        "완료월총수요수량",
+        "완료월평균수요수량",
+        "최근3개월평균수요수량",
+        "최근6개월평균수요수량",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 예상수요수량",
+        "평가월 실제수요수량",
+        "평가월 잔여예상수요수량",
+        "평가월 수요진척률",
         "예상기준월수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+        "예상월말재고수량",
+        "부족예상수량",
+        "부족예상금액",
         "재고커버월수",
         "1개월필요수량",
         "2개월필요수량",
@@ -3343,15 +4088,39 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
         "제품명",
         "규격",
         "제조사명",
+        "매입처명",
         "제품그룹명",
         "제품구분명",
         "제품분류명",
         "재고기준",
 
+        "완료월평균출고수량",
+        "최근3개월평균수요수량",
+        "최근6개월평균수요수량",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 예상수요수량",
+        "평가월 실제수요수량",
+        "평가월 잔여예상수요수량",
+        "당월 현재출고수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+        "당월 출고진척률",
         "현재재고수량",
+        "재고평가단가",
+        "예상월말재고수량",
+        "부족예상수량",
+        "부족예상금액",
+        "당월 재고충족률",
+        "재고부족판정",
         "현재재고금액",
         "장부재고평가단가",
         "실재고평가단가",
+        "완료월수",
+        "완료월총출고수량",
+        "최근3개월평균출고수량",
+        "최근6개월평균출고수량",
+        "최근3개월수량증감률",
         "최근3개월평균수량",
 
         "최근6개월평균수량",
@@ -3385,33 +4154,36 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     rest_cols = [c for c in out.columns if c not in front_cols + monthly_cols]
     out = out[front_cols + monthly_cols + rest_cols]
 
-    # 부족 우선 정렬
-    grade_order = {
-        "재고없음": 1,
-        "1개월내 부족": 2,
-        "2개월내 부족주의": 3,
-        "3개월내 부족주의": 4,
-        "3개월내 부족": 4,
-        "정상": 8,
-        "수요관찰": 9,
-        "재고없음/수요없음": 10,
-    }
-
-    out["_부족정렬"] = out["부족등급"].map(lambda x: grade_order.get(str(x), 99))
     out = out.sort_values(
-        ["_부족정렬", "3개월부족수량", "재고커버월수", "제품코드"],
-        ascending=[True, False, True, True],
-    ).drop(columns=["_부족정렬"]).reset_index(drop=True)
+        ["부족예상금액", "부족예상수량", "당월 재고충족률", "제품코드"],
+        ascending=[False, False, True, True],
+    ).reset_index(drop=True)
 
     if "순번" in out.columns:
         out = out.drop(columns=["순번"])
 
     out.insert(0, "순번", range(1, len(out) + 1))
 
+    out["분석자료원"] = source_labels["display_source"]
+    out["현재고원천"] = source_labels["stock_source"]
+
+    out = _finalize_stock_shortage_public_df(out)
+
     out.attrs["stock_source_table"] = stock_spec.get("source_table")
-    out.attrs["stock_source_label"] = stock_spec.get("source_label")
+    out.attrs["stock_source_label"] = source_labels["stock_source"]
+    out.attrs["display_source_label"] = source_labels["display_source"]
+    out.attrs["evaluation_mode"] = source_labels.get("evaluation_mode")
+    out.attrs["use_hybrid_detail"] = bool(source_labels.get("use_hybrid_detail"))
     out.attrs["stock_cutoff_month"] = stock_cutoff_month
     out.attrs["stock_mode"] = stock_mode
+
+    log.info(
+        "[analytics.stock_shortage.source] evaluation_mode=%s use_hybrid_detail=%s display_source=%s stock_source=%s",
+        source_labels.get("evaluation_mode"),
+        bool(source_labels.get("use_hybrid_detail")),
+        source_labels["display_source"],
+        source_labels["stock_source"],
+    )
 
     t_done = time.perf_counter()
     log.info(
@@ -3438,17 +4210,27 @@ def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
             "product_count": 0,
             "sum_current_stock_qty": 0,
             "sum_current_stock_amt": 0,
+            "sum_completed_month_avg_out_qty": 0,
+            "sum_current_month_out_qty": 0,
+            "sum_current_month_expected_out_qty": 0,
+            "sum_current_month_remaining_out_qty": 0,
+            "current_month_demand_progress_pct": 0,
+            "sum_expected_shortage_qty": 0,
+            "sum_expected_shortage_amt": 0,
+            "overall_stock_fill_rate": 100,
             "sum_shortage_1m_qty": 0,
             "sum_shortage_2m_qty": 0,
             "sum_shortage_3m_qty": 0,
             "shortage_item_count": 0,
             "shortage_grade_counts": {},
+            "stock_shortage_judge_counts": {},
         }
 
     out = df.copy()
 
-    shortage_item_count = 0
-    if "부족등급" in out.columns:
+    if "재고부족판정" in out.columns:
+        shortage_item_count = int((out["재고부족판정"].fillna("").astype(str) == "부족").sum())
+    elif "부족등급" in out.columns:
         shortage_item_count = int(
             out["부족등급"]
             .fillna("")
@@ -3456,6 +4238,26 @@ def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
             .isin(["재고없음", "1개월내 부족", "2개월내 부족주의", "3개월내 부족주의", "3개월내 부족"])
             .sum()
         )
+    else:
+        shortage_item_count = 0
+
+    expected_total = _sum_numeric(out, "당월 예상출고수량")
+    actual_total = _sum_numeric(out, "당월 현재출고수량")
+    demand_progress_pct = (actual_total / expected_total * 100) if expected_total > 0 else 0.0
+
+    remaining_total = _sum_numeric(out, "당월 잔여예상출고수량")
+    current_stock_positive_total = 0.0
+    if "현재재고수량" in out.columns:
+        current_stock_positive_total = float(pd.to_numeric(out["현재재고수량"], errors="coerce").fillna(0).clip(lower=0).sum())
+    overall_fill_rate = (
+        current_stock_positive_total / remaining_total * 100
+        if remaining_total > 0
+        else 100.0
+    )
+
+    shortage_by_current_policy = _sum_numeric(out, "부족예상수량")
+    if shortage_by_current_policy > 0 and "부족예상수량" in out.columns:
+        shortage_item_count = int((pd.to_numeric(out["부족예상수량"], errors="coerce").fillna(0) > 0).sum())
 
     return {
         "row_count": int(len(out)),
@@ -3464,12 +4266,25 @@ def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
         
         "sum_current_stock_qty": _sum_numeric(out, "현재재고수량"),
         "sum_current_stock_amt": _sum_numeric(out, "현재재고금액"),
+        "sum_completed_month_avg_out_qty": _sum_numeric(out, "완료월평균출고수량"),
+        "sum_current_month_out_qty": _sum_numeric(out, "당월 현재출고수량"),
+        "sum_current_month_expected_out_qty": _sum_numeric(out, "당월 예상출고수량"),
+        "sum_current_month_remaining_out_qty": _sum_numeric(out, "당월 잔여예상출고수량"),
+        "sum_eval_actual_demand_qty": actual_total,
+        "sum_eval_expected_demand_qty": expected_total,
+        "sum_eval_remaining_demand_qty": remaining_total,
+        "current_month_demand_progress_pct": demand_progress_pct,
+        "eval_demand_progress_pct": demand_progress_pct,
+        "sum_expected_shortage_qty": _sum_numeric(out, "부족예상수량"),
+        "sum_expected_shortage_amt": _sum_numeric(out, "부족예상금액"),
+        "overall_stock_fill_rate": overall_fill_rate,
         "sum_shortage_1m_qty": _sum_numeric(out, "1개월부족수량"),
         "sum_shortage_2m_qty": _sum_numeric(out, "2개월부족수량"),
         "sum_shortage_3m_qty": _sum_numeric(out, "3개월부족수량"),
 
         "shortage_item_count": shortage_item_count,
         "shortage_grade_counts": _shortage_grade_counts(out),
+        "stock_shortage_judge_counts": _count_text_values(out, "재고부족판정"),
     }
 
 
@@ -3482,10 +4297,11 @@ def get_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
 
     log.info("[analytics.stock_shortage] rows=%s params=%r", row_count, params)
 
-    source_mode = _resolve_source_mode(params)
-    source_label = _source_label(source_mode)
     stock_mode = str(params.get("stock_mode") or "book").strip()
     stock_label = _stock_mode_label(stock_mode)
+    stock_source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
+    source_mode = _resolve_source_mode(params)
+    source_label = str(getattr(df, "attrs", {}).get("display_source_label") or stock_source_labels["display_source"])
     query_summary = _fmt_analytics_query_summary(params, source_label)
     if stock_label:
         query_summary = (f"{query_summary} / 재고기준 {stock_label}" if query_summary else f"재고기준 {stock_label}")
@@ -3519,7 +4335,12 @@ def get_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
                 "source_label": source_label,
                 "stock_mode": stock_mode,
                 "stock_label": stock_label,
+                "stock_source_label": stock_source_labels["stock_source"],
+                "display_source_label": stock_source_labels["display_source"],
+                "evaluation_mode": stock_source_labels.get("evaluation_mode"),
+                "use_hybrid_detail": bool(stock_source_labels.get("use_hybrid_detail")),
                 "shortage_grade_counts": {},
+                "stock_shortage_judge_counts": {},
                 "query_summary": query_summary,
                 "condition": query_summary,
                 "summary_md": (
@@ -3544,7 +4365,8 @@ def get_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
     meta.update(_stock_shortage_meta_from_df(df))
 
     stock_source_table = df.attrs.get("stock_source_table", "")
-    stock_source_label = df.attrs.get("stock_source_label", "")
+    stock_source_label = df.attrs.get("stock_source_label", "") or stock_source_labels["stock_source"]
+    display_source_label = df.attrs.get("display_source_label", "") or stock_source_labels["display_source"]
     stock_cutoff_month = df.attrs.get("stock_cutoff_month", "")
 
     meta.update({
@@ -3554,13 +4376,16 @@ def get_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
         "analysis_type": "stock_shortage",
         "summary_type": "product_stock_shortage",
         "source_mode": source_mode,
-        "source_label": source_label,
+        "source_label": display_source_label,
         "stock_mode": stock_mode,
         "stock_label": stock_label,
         "shortage_grade_counts": grade_counts,
 
         "stock_source_table": stock_source_table,
         "stock_source_label": stock_source_label,
+        "display_source_label": display_source_label,
+        "evaluation_mode": df.attrs.get("evaluation_mode") or stock_source_labels.get("evaluation_mode"),
+        "use_hybrid_detail": bool(df.attrs.get("use_hybrid_detail") or stock_source_labels.get("use_hybrid_detail")),
         "stock_cutoff_month": stock_cutoff_month,
         "query_summary": query_summary,
         "condition": query_summary,
@@ -3569,10 +4394,16 @@ def get_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
             f"조회조건 {query_summary} / "
             f"재고부족요약: "
             f"품목수 {_fmt_num_for_summary(row_count)} / "
+            f"완료월평균출고수량 {_fmt_num_for_summary(meta.get('sum_completed_month_avg_out_qty'))} / "
+            f"평가월실제수요 {_fmt_num_for_summary(meta.get('sum_current_month_out_qty'))} / "
+            f"평가월예상수요 {_fmt_num_for_summary(meta.get('sum_current_month_expected_out_qty'))} / "
+            f"평가월잔여예상수요 {_fmt_num_for_summary(meta.get('sum_current_month_remaining_out_qty'))} / "
+            f"평가월수요진척률 {_fmt_num_for_summary(meta.get('current_month_demand_progress_pct'))}% / "
             f"현재재고수량 {_fmt_num_for_summary(meta.get('sum_current_stock_qty'))} / "
-            f"1개월부족수량 {_fmt_num_for_summary(meta.get('sum_shortage_1m_qty'))} / "
-            f"3개월부족수량 {_fmt_num_for_summary(meta.get('sum_shortage_3m_qty'))} / "
-            f"자료원 {source_label} / "
+            f"부족예상수량 {_fmt_num_for_summary(meta.get('sum_expected_shortage_qty'))} / "
+            f"부족예상금액 {_fmt_num_for_summary(meta.get('sum_expected_shortage_amt'))} / "
+            f"전체재고충족률 {_fmt_num_for_summary(meta.get('overall_stock_fill_rate'))}% / "
+            f"자료원 {display_source_label} / "
             f"재고기준 {stock_label} / "
             f"현재고원천 {stock_source_label or stock_label} / "
             f"현재고기준월 {stock_cutoff_month}"

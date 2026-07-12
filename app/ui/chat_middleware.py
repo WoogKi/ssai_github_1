@@ -32,6 +32,57 @@ import time
 
 log = logging.getLogger("ssai")
 
+_FAST_TABLE_INT_KPI_COLS = {
+    "완료월총매출",
+    "월평균매출",
+    "완료월평균매출",
+    "당월 현재매출",
+    "당월 예상매출",
+    "당월 잔여예상",
+    "다음월예상매출",
+    "3개월예상매출",
+    "6개월예상매출",
+    "부족예상금액",
+    "완료월수",
+    "매출발생월수",
+    "매입처수",
+    "총집계건수",
+}
+
+_FAST_TABLE_DECIMAL_KPI_COLS = {
+    "최근3개월평균매출",
+    "최근6개월평균매출",
+    "평균공급단가",
+    "완료월평균출고수량",
+    "최근3개월평균출고수량",
+    "최근6개월평균출고수량",
+    "당월 예상출고수량",
+    "당월 잔여예상출고수량",
+    "예상월말재고수량",
+    "부족예상수량",
+}
+
+_FAST_TABLE_PERCENT_KPI_COLS = {
+    "당월 진척률",
+    "최근3개월증감률",
+    "적용증감률",
+    "월시점 증감률",
+    "월시점 적용증감률",
+    "월시점 달성률",
+    "최근3개월수량증감률",
+    "수요증감률",
+    "수요적용증감률",
+    "평가월 수요진척률",
+    "당월 출고진척률",
+    "당월 재고충족률",
+}
+
+_FAST_TABLE_NUMERIC_KPI_COLS = (
+    _FAST_TABLE_INT_KPI_COLS
+    | _FAST_TABLE_DECIMAL_KPI_COLS
+    | _FAST_TABLE_PERCENT_KPI_COLS
+)
+
 
 def _safe_log_value(value: Any, limit: int = 120) -> str:
     try:
@@ -303,13 +354,34 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
+        "부족예상금액",
     }
     decimal_money_cols = {
         "최근3개월평균매출",
         "최근6개월평균매출",
         "평균공급단가",
+        "완료월평균출고수량",
+        "최근3개월평균출고수량",
+        "최근6개월평균출고수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+        "예상월말재고수량",
+        "부족예상수량",
     }
-    percent_cols = {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}
+    percent_cols = {
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
+    }
 
     try:
         workbook = getattr(writer, "book", None)
@@ -490,9 +562,11 @@ def _apply_chat_analysis_grade_style(styler, df: pd.DataFrame):
                 style_df.loc[idx, grade_col] = extra
 
     try:
-        return styler.apply(lambda _: style_df, axis=None)
+        styler = styler.apply(lambda _: style_df, axis=None)
     except Exception:
-        return styler
+        pass
+
+    return styler
 
 
 # 채팅 표에서 Styler 대신 빠른 st.dataframe 렌더를 쓸지 판단하는 함수
@@ -635,7 +709,7 @@ def _chat_clean_display_none_values(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in out.columns:
         try:
-            if str(col).strip() == "순번":
+            if str(col).strip() == "순번" or str(col).strip() in _FAST_TABLE_NUMERIC_KPI_COLS:
                 continue
 
             s = out[col].astype("object")
@@ -680,6 +754,9 @@ def _chat_drop_number_config_for_blank_numeric_cols(
         if not has_blank:
             continue
 
+        if str(col or "").strip() in _FAST_TABLE_NUMERIC_KPI_COLS:
+            continue
+
         try:
             is_numeric_like = _chat_is_fast_numeric_column(df, col)
         except Exception:
@@ -703,6 +780,9 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
     s_lower = s.lower()
 
     if s in {"순번", "조회순번"}:
+        return True
+
+    if s in _FAST_TABLE_NUMERIC_KPI_COLS:
         return True
 
     exclude_words = [
@@ -795,39 +875,12 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
                 errors="coerce",
             )
 
-            int_cols = {
-                "완료월총매출",
-                "월평균매출",
-                "완료월평균매출",
-                "당월 현재매출",
-                "당월 예상매출",
-                "당월 잔여예상",
-                "다음월예상매출",
-                "3개월예상매출",
-                "6개월예상매출",
-                "완료월수",
-                "매출발생월수",
-                "매입처수",
-                "총집계건수",
-            }
-            percent_cols = {
-                "당월 진척률",
-                "최근3개월증감률",
-                "적용증감률",
-                "월시점 증감률",
-            }
-            decimal_cols = {
-                "최근3개월평균매출",
-                "최근6개월평균매출",
-                "평균공급단가",
-            }
-
-            if s in percent_cols:
-                converted = num.astype("object")
-            elif s in decimal_cols:
-                converted = num.round(2).astype("object")
+            if s in _FAST_TABLE_PERCENT_KPI_COLS:
+                converted = num
+            elif s in _FAST_TABLE_DECIMAL_KPI_COLS:
+                converted = num.round(2)
             elif (
-                s in int_cols
+                s in _FAST_TABLE_INT_KPI_COLS
                 or s in {"순번", "조회순번"}
                 or s.endswith("건수")
                 or "품목수" in s
@@ -840,11 +893,13 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
                 or "세액" in s
                 or "가격" in s
             ):
-                converted = num.round(0).astype("object")
+                converted = num.round(0)
             else:
                 converted = num.round(2).astype("object")
 
-            converted.loc[blank_mask] = ""
+            if blank_mask.any() and s not in _FAST_TABLE_NUMERIC_KPI_COLS:
+                converted = converted.astype("object")
+                converted.loc[blank_mask] = ""
 
             out[col] = converted
 
@@ -872,7 +927,7 @@ def _chat_fast_column_config(df: pd.DataFrame) -> dict:
         except Exception:
             pass
 
-        if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+        if s in _FAST_TABLE_PERCENT_KPI_COLS:
             cfg[col] = st.column_config.NumberColumn(
                 s,
                 format="%.2f%%",
@@ -1178,22 +1233,38 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
 
         c5, c6, c7, c8 = st.columns(4)
         with c5:
-            _chat_metric_card("1개월부족수량", meta.get("sum_shortage_1m_qty"), "개", bg="#fff1f2", border="#fecdd3")
+            _chat_metric_card("평가월 예상수요", meta.get("sum_current_month_expected_out_qty"), "개", bg="#f5f3ff", border="#ddd6fe", decimals=2)
         with c6:
-            _chat_metric_card("2개월부족수량", meta.get("sum_shortage_2m_qty"), "개", bg="#fff7ed", border="#fed7aa")
+            _chat_metric_card("평가월 실제수요", meta.get("sum_current_month_out_qty"), "개", bg="#eff6ff", border="#bfdbfe", decimals=2)
         with c7:
-            _chat_metric_card("3개월부족수량", meta.get("sum_shortage_3m_qty"), "개", bg="#fff7ed", border="#fed7aa")
+            _chat_metric_card("평가월 잔여예상수요", meta.get("sum_current_month_remaining_out_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
         with c8:
+            _chat_metric_card("평가월 수요진척률", meta.get("current_month_demand_progress_pct"), "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+        c9, c10, c11, c12 = st.columns(4)
+        with c9:
+            _chat_metric_card("부족예상수량", meta.get("sum_expected_shortage_qty"), "개", bg="#fff1f2", border="#fecdd3", decimals=2)
+        with c10:
+            _chat_metric_card("부족예상금액", meta.get("sum_expected_shortage_amt"), "원", bg="#fff1f2", border="#fecdd3")
+        with c11:
+            _chat_metric_card("재고충족률", meta.get("overall_stock_fill_rate"), "%", bg="#f8fafc", border="#dbe4ee", decimals=2)
+        with c12:
             _chat_metric_card("재고기준", meta.get("stock_label") or meta.get("stock_mode"), "", bg="#f5f3ff", border="#ddd6fe")
 
+        c13, c14, c15 = st.columns(3)
+        with c13:
+            _chat_metric_card("1개월부족수량", meta.get("sum_shortage_1m_qty"), "개", bg="#fff1f2", border="#fecdd3", decimals=2)
+        with c14:
+            _chat_metric_card("2개월부족수량", meta.get("sum_shortage_2m_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
+        with c15:
+            _chat_metric_card("3개월부족수량", meta.get("sum_shortage_3m_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
+
         stock_source_label = str(meta.get("stock_source_label") or "")
-        c9, c10, c11 = st.columns(3)
-        with c9:
-            _chat_metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
-        with c10:
-            _chat_metric_card("현재고원천", stock_source_label or meta.get("stock_label"), "", bg="#f8fafc", border="#dbe4ee")
-        with c11:
-            _chat_metric_card("조회건수", meta.get("row_count_total") or meta.get("row_count"), "건", bg="#f8fafc", border="#dbe4ee")
+        st.caption(
+            f"자료원: {source_label} / 현재고원천: {stock_source_label or meta.get('stock_label') or ''} / "
+            f"현재고기준월: {meta.get('stock_cutoff_month') or ''} / "
+            f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+        )
 
         _render_chat_count_card_group(
             "부족등급별 제품수",
@@ -7600,10 +7671,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             view_df = _chat_clean_display_none_values(view_df)
                             column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
                             try:
-                                styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
-                                styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
                                 st.dataframe(
-                                    styled_view,
+                                    view_df,
                                     use_container_width=True,
                                     hide_index=True,
                                     height=table_height,

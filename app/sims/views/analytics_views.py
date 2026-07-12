@@ -696,36 +696,52 @@ def _render_stock_shortage_panel_header(meta: Dict[str, Any], query_condition: s
 
     c5, c6, c7, c8 = st.columns(4)
     with c5:
-        _metric_card("1개월부족수량", meta.get("sum_shortage_1m_qty"), "개", bg="#fff1f2", border="#fecdd3")
+        _metric_card("평가월 예상수요", meta.get("sum_current_month_expected_out_qty"), "개", bg="#f5f3ff", border="#ddd6fe", decimals=2)
     with c6:
-        _metric_card("2개월부족수량", meta.get("sum_shortage_2m_qty"), "개", bg="#fff7ed", border="#fed7aa")
+        _metric_card("평가월 실제수요", meta.get("sum_current_month_out_qty"), "개", bg="#eff6ff", border="#bfdbfe", decimals=2)
     with c7:
-        _metric_card("3개월부족수량", meta.get("sum_shortage_3m_qty"), "개", bg="#fff7ed", border="#fed7aa")
+        _metric_card("평가월 잔여예상수요", meta.get("sum_current_month_remaining_out_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
     with c8:
+        _metric_card("평가월 수요진척률", meta.get("current_month_demand_progress_pct"), "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+    c9, c10, c11, c12 = st.columns(4)
+    with c9:
+        _metric_card("부족예상수량", meta.get("sum_expected_shortage_qty"), "개", bg="#fff1f2", border="#fecdd3", decimals=2)
+    with c10:
+        _metric_card("부족예상금액", meta.get("sum_expected_shortage_amt"), "원", bg="#fff1f2", border="#fecdd3")
+    with c11:
+        _metric_card("재고충족률", meta.get("overall_stock_fill_rate"), "%", bg="#f8fafc", border="#dbe4ee", decimals=2)
+    with c12:
         _metric_card("재고기준", stock_label, "", bg="#f5f3ff", border="#ddd6fe")
 
     stock_source_label = str(meta.get("stock_source_label") or "")
 
-    c9, c10, c11 = st.columns(3)
-    with c9:
-        _metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
-    with c10:
-        _metric_card("현재고원천", stock_source_label or stock_label, "", bg="#f8fafc", border="#dbe4ee")
-    with c11:
-        _metric_card("조회건수", meta.get("row_count_total") or meta.get("row_count"), "건", bg="#f8fafc", border="#dbe4ee")
+    c13, c14, c15 = st.columns(3)
+    with c13:
+        _metric_card("1개월부족수량", meta.get("sum_shortage_1m_qty"), "개", bg="#fff1f2", border="#fecdd3", decimals=2)
+    with c14:
+        _metric_card("2개월부족수량", meta.get("sum_shortage_2m_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
+    with c15:
+        _metric_card("3개월부족수량", meta.get("sum_shortage_3m_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
+
+    try:
+        row_count_text = f"{int(meta.get('row_count_total') or meta.get('row_count') or 0):,}"
+    except Exception:
+        row_count_text = str(meta.get("row_count_total") or meta.get("row_count") or 0)
+    st.caption(
+        f"자료원: {source_label} / 현재고원천: {stock_source_label or stock_label} / "
+        f"현재고기준월: {meta.get('stock_cutoff_month') or ''} / "
+        f"조회건수: {row_count_text}건"
+    )
 
     _render_count_card_group(
-        "부족등급별 제품수",
-        meta.get("shortage_grade_counts") or {},
+        "재고부족판정별 제품수",
+        meta.get("stock_shortage_judge_counts") or meta.get("shortage_grade_counts") or {},
         [
-            "재고없음",
-            "1개월내 부족",
-            "2개월내 부족주의",
-            "3개월내 부족주의",
-            "3개월내 부족",
-            "정상",
-            "수요관찰",
-            "재고없음/수요없음",
+            "부족",
+            "주의",
+            "적정",
+            "수요없음",
             "미분류",
         ],
         _color_for_shortage,
