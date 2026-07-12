@@ -106,6 +106,22 @@ def _is_numeric_col(df: pd.DataFrame, col: str) -> bool:
 
 def _is_decimal_col_name(col: str) -> bool:
     s = str(col or "").strip()
+    if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+        return True
+    if s in {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+    }:
+        return False
+    if s in {"최근3개월평균매출", "최근6개월평균매출", "평균공급단가"}:
+        return True
     return any(k in s for k in ["단가", "DC율", "할인율", "보험약가", "보험가"])
 
 
@@ -279,8 +295,40 @@ def _fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
             errors="coerce",
         )
 
-        if (
-            s in {"순번", "조회순번"}
+        int_cols = {
+            "완료월총매출",
+            "월평균매출",
+            "완료월평균매출",
+            "당월 현재매출",
+            "당월 예상매출",
+            "당월 잔여예상",
+            "다음월예상매출",
+            "3개월예상매출",
+            "6개월예상매출",
+            "완료월수",
+            "매출발생월수",
+            "매입처수",
+            "총집계건수",
+        }
+        percent_cols = {
+            "당월 진척률",
+            "최근3개월증감률",
+            "적용증감률",
+            "월시점 증감률",
+        }
+        decimal_cols = {
+            "최근3개월평균매출",
+            "최근6개월평균매출",
+            "평균공급단가",
+        }
+
+        if s in percent_cols:
+            out[col] = num
+        elif s in decimal_cols:
+            out[col] = num.round(2)
+        elif (
+            s in int_cols
+            or s in {"순번", "조회순번"}
             or s.endswith("건수")
             or "품목수" in s
             or "거래처수" in s
@@ -312,7 +360,13 @@ def _fast_column_config(df: pd.DataFrame) -> dict:
         if not _is_fast_numeric_column(df, col):
             continue
 
-        if (
+        if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+            cfg[col] = st.column_config.NumberColumn(
+                s,
+                format="%.2f%%",
+                step=0.01,
+            )
+        elif (
             s in {"순번", "조회순번"}
             or s.endswith("건수")
             or "품목수" in s
@@ -577,6 +631,41 @@ def _analytics_number_decimals(col: str) -> int | None:
     c_lower = c.lower()
     if not c:
         return None
+
+    int_cols = {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+        "완료월수",
+        "매출발생월수",
+        "매입처수",
+        "총집계건수",
+    }
+    if c in int_cols:
+        return 0
+
+    decimal_cols = {
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "평균공급단가",
+    }
+    if c in decimal_cols:
+        return 2
+
+    percent_cols = {
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+    }
+    if c in percent_cols:
+        return 2
 
     # 문자/코드성 컬럼 제외
     exclude_words = [
@@ -2487,12 +2576,17 @@ def _render_inventory_summary(payload: Dict[str, Any], df_disp: pd.DataFrame) ->
     st.caption(f"집계건수: {max(detail_count, 0):,}건  ·  마지막 행은 합계입니다.")
 
 
-def _fmt_header_num(value: Any, unit: str = "") -> str:
+def _fmt_header_num(value: Any, unit: str = "", *, decimals: int | None = None) -> str:
+    if decimals is None and unit == "원":
+        decimals = 0
+
     n = _parse_number_for_style(value)
     if n is None:
         text = str(value or "").strip()
     else:
-        if abs(n - int(n)) < 1e-9:
+        if decimals is not None:
+            text = f"{n:,.{decimals}f}"
+        elif abs(n - int(n)) < 1e-9:
             text = f"{int(n):,}"
         else:
             text = f"{n:,.2f}".rstrip("0").rstrip(".")
@@ -2562,16 +2656,36 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
         return
 
     if analysis_type == "sales_forecast":
-        st.markdown("### 매출예상요약")
+        current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
+        current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
+        current_progress = meta.get("current_month_progress_pct")
+        if current_progress is None:
+            current_progress = (current_sales / current_expected * 100) if abs(current_expected) >= 1e-12 else 0
 
-        c1, c2, c3, c4 = st.columns(4)
+        st.markdown("### 당월 매출예상 요약")
+
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            st.info(f"총매출액 : {_fmt_header_num(meta.get('sum_sales_amt'), '원')}")
+            st.info(f"완료월평균매출 : {_fmt_header_num(meta.get('avg_completed_month_sales_amt'), '원')}")
         with c2:
-            st.warning(f"다음월예상매출 : {_fmt_header_num(meta.get('sum_next_month_forecast_amt'), '원')}")
+            st.info(f"당월 현재매출 : {_fmt_header_num(meta.get('sum_current_month_sales_amt'), '원')}")
         with c3:
-            st.warning(f"3개월예상매출 : {_fmt_header_num(meta.get('sum_3month_forecast_amt'), '원')}")
+            st.warning(f"당월 예상매출 : {_fmt_header_num(meta.get('sum_current_month_expected_amt'), '원')}")
         with c4:
+            st.warning(f"당월 잔여예상 : {_fmt_header_num(meta.get('sum_current_month_remaining_expected_amt'), '원')}")
+        with c5:
+            st.success(f"당월 진척률 : {_fmt_header_num(current_progress, '%', decimals=2)}")
+
+        st.markdown("### 중장기 예상")
+
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            st.info(f"총매출액 : {_fmt_header_num(meta.get('sum_sales_amt'), '원')}")
+        with f2:
+            st.warning(f"다음월예상매출 : {_fmt_header_num(meta.get('sum_next_month_forecast_amt'), '원')}")
+        with f3:
+            st.warning(f"3개월예상매출 : {_fmt_header_num(meta.get('sum_3month_forecast_amt'), '원')}")
+        with f4:
             st.warning(f"6개월예상매출 : {_fmt_header_num(meta.get('sum_6month_forecast_amt'), '원')}")
 
         counts = meta.get("forecast_grade_counts") or {}
@@ -2596,6 +2710,27 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
             st.info(f"품목수 : {_fmt_header_num(meta.get('product_count'), '개')}")
         with c4:
             st.info(f"분석월수 : {_fmt_header_num(meta.get('month_count'), '개월')}")
+
+        current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
+        current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
+        current_progress = meta.get("current_month_progress_pct")
+        if current_progress is None:
+            current_progress = (current_sales / current_expected * 100) if abs(current_expected) >= 1e-12 else 0
+
+        st.markdown("### 당월 진행 요약")
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        with p1:
+            st.info(f"완료월수 : {_fmt_header_num(meta.get('completed_month_count'), '개월')}")
+        with p2:
+            st.info(f"완료월평균매출 : {_fmt_header_num(meta.get('avg_completed_month_sales_amt'), '원')}")
+        with p3:
+            st.info(f"당월 현재매출 : {_fmt_header_num(meta.get('sum_current_month_sales_amt'), '원')}")
+        with p4:
+            st.warning(f"당월 예상매출 : {_fmt_header_num(meta.get('sum_current_month_expected_amt'), '원')}")
+        with p5:
+            st.warning(f"당월 잔여예상 : {_fmt_header_num(meta.get('sum_current_month_remaining_expected_amt'), '원')}")
+        with p6:
+            st.success(f"당월 진척률 : {_fmt_header_num(current_progress, '%', decimals=2)}")
 
 # ==========================================================
 # 🧩 현재표 source 정리
@@ -3215,6 +3350,14 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                             s,
                             format="localized",
                             step=0.001,
+                            width=width_px,
+                        )
+
+                    if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+                        return st.column_config.NumberColumn(
+                            s,
+                            format="%.2f%%",
+                            step=0.01,
                             width=width_px,
                         )
 
@@ -3920,7 +4063,66 @@ def _xlsx_bytes(df: pd.DataFrame) -> Optional[bytes]:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine=engine) as w:
         df.to_excel(w, index=False, sheet_name="SIMS")
+        _apply_sims_excel_number_formats(w, df, "SIMS", engine)
     return buf.getvalue()
+
+
+def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: str, engine: str) -> None:
+    money_cols = {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+    }
+    decimal_money_cols = {
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "평균공급단가",
+    }
+    percent_cols = {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}
+
+    try:
+        if engine == "xlsxwriter":
+            workbook = writer.book
+            worksheet = writer.sheets.get(sheet_name)
+            if worksheet is None:
+                return
+            money_fmt = workbook.add_format({"num_format": "#,##0"})
+            pct_fmt = workbook.add_format({"num_format": "0.00\\%"})
+            for idx, col in enumerate(df.columns):
+                name = str(col or "").strip()
+                if name in money_cols:
+                    worksheet.set_column(idx, idx, None, money_fmt)
+                elif name in decimal_money_cols:
+                    dec_fmt = workbook.add_format({"num_format": "#,##0.00"})
+                    worksheet.set_column(idx, idx, None, dec_fmt)
+                elif name in percent_cols:
+                    worksheet.set_column(idx, idx, None, pct_fmt)
+            return
+
+        if engine == "openpyxl":
+            worksheet = writer.sheets.get(sheet_name)
+            if worksheet is None:
+                return
+            for idx, col in enumerate(df.columns, start=1):
+                name = str(col or "").strip()
+                if name in money_cols:
+                    fmt = "#,##0"
+                elif name in decimal_money_cols:
+                    fmt = "#,##0.00"
+                elif name in percent_cols:
+                    fmt = "0.00\\%"
+                else:
+                    continue
+                for row in range(2, len(df) + 2):
+                    worksheet.cell(row=row, column=idx).number_format = fmt
+    except Exception:
+        log.exception("[panel] apply excel number formats failed")
 
 # ==========================================================
 # (선택) 사이드·상태 제어 보조 함수 — 필요 시 호출

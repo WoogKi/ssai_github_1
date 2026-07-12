@@ -363,6 +363,37 @@ def _numeric_display_kind(col: Any) -> str:
     if _is_row_no_col(s):
         return "int"
 
+    int_money_cols = {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+    }
+    if s in int_money_cols:
+        return "int"
+
+    decimal_money_cols = {
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "평균공급단가",
+    }
+    if s in decimal_money_cols:
+        return "decimal2"
+
+    percent_cols = {
+        "당월 진척률",
+        "최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+    }
+    if s in percent_cols:
+        return "percent2"
+
     # 소수점 2자리 우선 판정
     decimal_words = [
         "평균",
@@ -544,6 +575,13 @@ def _make_column_config(
                 **kwargs,
                 format="localized",
                 step=1,
+            )
+
+        if kind == "percent2":
+            return st.column_config.NumberColumn(
+                **kwargs,
+                format="%.2f%%",
+                step=0.01,
             )
 
         return st.column_config.NumberColumn(

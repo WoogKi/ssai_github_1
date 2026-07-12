@@ -213,11 +213,14 @@ def _fmt_num(value: Any) -> str:
     except Exception:
         return "0"
 
-def _metric_value(value: Any, unit: str = "") -> str:
+def _metric_value(value: Any, unit: str = "", *, decimals: int | None = None) -> str:
     """
     숫자는 천단위 포맷, 문자는 그대로 표시.
     예: 112,080원 / 17개 / 5개월 / 월집계-장부재고(Rddbc220)
     """
+    if decimals is None and unit == "원":
+        decimals = 0
+
     if value is None:
         text = ""
     elif isinstance(value, str):
@@ -227,14 +230,22 @@ def _metric_value(value: Any, unit: str = "") -> str:
         else:
             try:
                 n = float(s.replace(",", ""))
-                if n.is_integer():
+                if decimals is not None:
+                    text = f"{n:,.{decimals}f}"
+                elif n.is_integer():
                     text = f"{int(n):,}"
                 else:
                     text = f"{n:,.2f}"
             except Exception:
                 text = s
     else:
-        text = _fmt_num(value)
+        if decimals is not None:
+            try:
+                text = f"{float(value or 0):,.{decimals}f}"
+            except Exception:
+                text = "0"
+        else:
+            text = _fmt_num(value)
 
     if not text:
         text = "-"
@@ -244,12 +255,12 @@ def _metric_value(value: Any, unit: str = "") -> str:
 
     return text
 
-def _metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee") -> None:
+def _metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee", decimals: int | None = None) -> None:
     """
     요약 헤더용 카드.
     한 줄 표시: 총매출액 : 112,080원
     """
-    value_text = _metric_value(value, unit)
+    value_text = _metric_value(value, unit, decimals=decimals)
 
     html = (
         f'<div style="background:{bg}; border:1px solid {border}; border-radius:10px; '
@@ -553,23 +564,43 @@ def _render_sales_trend_panel_header(meta: Dict[str, Any], query_condition: str)
 
     source_label = str(meta.get("source_label") or _source_mode_label(meta.get("source_mode") or ""))
 
+    current_progress = meta.get("current_month_progress_pct")
+    if current_progress is None:
+        current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
+        current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
+        current_progress = (current_sales / current_expected * 100) if abs(current_expected) >= 1e-12 else 0
+
     if query_condition:
         st.caption(f"조회조건: {query_condition}")
 
     if is_forecast:
-        st.markdown("### 매출예상요약")
+        st.markdown("### 당월 매출예상 요약")
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            _metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+            _metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
         with c2:
-            _metric_card("다음월예상매출", meta.get("sum_next_month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            _metric_card("당월 현재매출", meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
         with c3:
-            _metric_card("3개월예상매출", meta.get("sum_3month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            _metric_card("당월 예상매출", meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
         with c4:
+            _metric_card("당월 잔여예상", meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with c5:
+            _metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+        st.markdown("### 중장기 예상")
+
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            _metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with f2:
+            _metric_card("다음월예상매출", meta.get("sum_next_month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with f3:
+            _metric_card("3개월예상매출", meta.get("sum_3month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with f4:
             _metric_card("6개월예상매출", meta.get("sum_6month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
 
-        c5, c6, c7, c8, c9 = st.columns(5)
+        c5, c6, c7, c8, c9, c10 = st.columns(6)
         with c5:
             _metric_card("출고수량", meta.get("sum_qty"), "개", bg="#f0fdf4", border="#bbf7d0")
         with c6:
@@ -579,6 +610,8 @@ def _render_sales_trend_panel_header(meta: Dict[str, Any], query_condition: str)
         with c8:
             _metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
         with c9:
+            _metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+        with c10:
             _metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
 
     else:
@@ -594,7 +627,7 @@ def _render_sales_trend_panel_header(meta: Dict[str, Any], query_condition: str)
         with c4:
             _metric_card("출고수량", meta.get("sum_qty"), "개", bg="#f0fdf4", border="#bbf7d0")
 
-        c5, c6, c7, c8 = st.columns(4)
+        c5, c6, c7, c8, c9 = st.columns(5)
         with c5:
             _metric_card("품목수", meta.get("product_count"), "개", bg="#eff6ff", border="#bfdbfe")
         with c6:
@@ -602,7 +635,26 @@ def _render_sales_trend_panel_header(meta: Dict[str, Any], query_condition: str)
         with c7:
             _metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
         with c8:
+            _metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+        with c9:
             _metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
+
+    if not is_forecast:
+        st.markdown("### 당월 진행 요약")
+
+        c10, c11, c12, c13, c14, c15 = st.columns(6)
+        with c10:
+            _metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+        with c11:
+            _metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c12:
+            _metric_card("당월 현재매출", meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c13:
+            _metric_card("당월 예상매출", meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with c14:
+            _metric_card("당월 잔여예상", meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with c15:
+            _metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
 
     trend_counts = meta.get("trend_judge_counts") or {}
     _render_count_card_group(

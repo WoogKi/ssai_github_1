@@ -292,6 +292,61 @@ def _sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: str) -> None:
+    money_cols = {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+    }
+    decimal_money_cols = {
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "평균공급단가",
+    }
+    percent_cols = {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}
+
+    try:
+        workbook = getattr(writer, "book", None)
+        worksheet = writer.sheets.get(sheet_name)
+        if worksheet is None:
+            return
+
+        if workbook is not None and hasattr(workbook, "add_format"):
+            money_fmt = workbook.add_format({"num_format": "#,##0"})
+            pct_fmt = workbook.add_format({"num_format": "0.00\\%"})
+            for idx, col in enumerate(df.columns):
+                name = str(col or "").strip()
+                if name in money_cols:
+                    worksheet.set_column(idx, idx, None, money_fmt)
+                elif name in decimal_money_cols:
+                    dec_fmt = workbook.add_format({"num_format": "#,##0.00"})
+                    worksheet.set_column(idx, idx, None, dec_fmt)
+                elif name in percent_cols:
+                    worksheet.set_column(idx, idx, None, pct_fmt)
+            return
+
+        for idx, col in enumerate(df.columns, start=1):
+            name = str(col or "").strip()
+            if name in money_cols:
+                fmt = "#,##0"
+            elif name in decimal_money_cols:
+                fmt = "#,##0.00"
+            elif name in percent_cols:
+                fmt = "0.00\\%"
+            else:
+                continue
+            for row in range(2, len(df) + 2):
+                worksheet.cell(row=row, column=idx).number_format = fmt
+    except Exception:
+        log.exception("[chat] apply excel number formats failed")
+
+
 # ---------------------------------------------------------------------
 # Security: 표/다운로드/LLM 컨텍스트 민감 컬럼 방어막
 # ---------------------------------------------------------------------
@@ -740,8 +795,40 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
                 errors="coerce",
             )
 
-            if (
-                s in {"순번", "조회순번"}
+            int_cols = {
+                "완료월총매출",
+                "월평균매출",
+                "완료월평균매출",
+                "당월 현재매출",
+                "당월 예상매출",
+                "당월 잔여예상",
+                "다음월예상매출",
+                "3개월예상매출",
+                "6개월예상매출",
+                "완료월수",
+                "매출발생월수",
+                "매입처수",
+                "총집계건수",
+            }
+            percent_cols = {
+                "당월 진척률",
+                "최근3개월증감률",
+                "적용증감률",
+                "월시점 증감률",
+            }
+            decimal_cols = {
+                "최근3개월평균매출",
+                "최근6개월평균매출",
+                "평균공급단가",
+            }
+
+            if s in percent_cols:
+                converted = num.astype("object")
+            elif s in decimal_cols:
+                converted = num.round(2).astype("object")
+            elif (
+                s in int_cols
+                or s in {"순번", "조회순번"}
                 or s.endswith("건수")
                 or "품목수" in s
                 or "거래처수" in s
@@ -785,7 +872,13 @@ def _chat_fast_column_config(df: pd.DataFrame) -> dict:
         except Exception:
             pass
 
-        if (
+        if s in {"당월 진척률", "최근3개월증감률", "적용증감률", "월시점 증감률"}:
+            cfg[col] = st.column_config.NumberColumn(
+                s,
+                format="%.2f%%",
+                step=0.01,
+            )
+        elif (
             s in {"순번", "조회순번"}
             or s.endswith("건수")
             or "품목수" in s
@@ -940,12 +1033,17 @@ def _apply_chat_table_profile(df: pd.DataFrame, meta: Dict[str, Any]) -> tuple[p
 
 # 분석/KPI 등급 컬럼 숫자 포맷팅 함수
 # - 숫자 값에서 단위(원/개/건/개월/%)를 제거하고, 천 단위 구분 쉼표와 소수점 2자리까지 포맷팅한다.
-def _chat_header_num(value: Any, unit: str = "") -> str:
+def _chat_header_num(value: Any, unit: str = "", *, decimals: int | None = None) -> str:
+    if decimals is None and unit == "원":
+        decimals = 0
+
     n = _chat_parse_num(value)
     if n is None:
         text = str(value or "").strip()
     else:
-        if abs(n - int(n)) < 1e-9:
+        if decimals is not None:
+            text = f"{n:,.{decimals}f}"
+        elif abs(n - int(n)) < 1e-9:
             text = f"{int(n):,}"
         else:
             text = f"{n:,.2f}".rstrip("0").rstrip(".")
@@ -958,14 +1056,14 @@ def _chat_header_num(value: Any, unit: str = "") -> str:
 # 분석 결과 헤더를 렌더링하는 함수
 # - meta에서 분석 유형(analysis_type)과 관련 통계를 읽어서, 적절한 제목과 주요 지표들을 화면 상단에 렌더링한다.
 # - 이 함수는 채팅 답변의 본문을 렌더링하기 전에 호출하는 것을 권장한다.
-def _chat_metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee") -> None:
+def _chat_metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee", decimals: int | None = None) -> None:
     """
     채팅창 SIMS 분석/KPI 요약 카드.
 
     패널에서 쓰던 상세 요약 카드 UX를 채팅창으로 옮긴 버전이다.
     패널은 입력 전용으로 두고, 결과 요약은 채팅 메시지 안에서만 렌더한다.
     """
-    value_text = _chat_header_num(value, unit)
+    value_text = _chat_header_num(value, unit, decimals=decimals)
 
     html = (
         f'<div style="background:{bg}; border:1px solid {border}; border-radius:10px; '
@@ -1116,17 +1214,37 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
         return
 
     if analysis_type in {"sales_forecast", "sales_trend"} or is_forecast:
-        if is_forecast:
-            st.markdown("### 매출예상요약")
+        current_progress = meta.get("current_month_progress_pct")
+        if current_progress is None:
+            current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
+            current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
+            current_progress = (current_sales / current_expected * 100) if abs(current_expected) >= 1e-12 else 0
 
-            c1, c2, c3, c4 = st.columns(4)
+        if is_forecast:
+            st.markdown("### 당월 매출예상 요약")
+
+            c1, c2, c3, c4, c5 = st.columns(5)
             with c1:
-                _chat_metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+                _chat_metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
             with c2:
-                _chat_metric_card("다음월예상매출", meta.get("sum_next_month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+                _chat_metric_card("당월 현재매출", meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
             with c3:
-                _chat_metric_card("3개월예상매출", meta.get("sum_3month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+                _chat_metric_card("당월 예상매출", meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
             with c4:
+                _chat_metric_card("당월 잔여예상", meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with c5:
+                _chat_metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+            st.markdown("### 중장기 예상")
+
+            f1, f2, f3, f4 = st.columns(4)
+            with f1:
+                _chat_metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+            with f2:
+                _chat_metric_card("다음월예상매출", meta.get("sum_next_month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with f3:
+                _chat_metric_card("3개월예상매출", meta.get("sum_3month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with f4:
                 _chat_metric_card("6개월예상매출", meta.get("sum_6month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
 
             c5, c6, c7, c8, c9 = st.columns(5)
@@ -1162,6 +1280,22 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
                 _chat_metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
             with c8:
                 _chat_metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
+
+            st.markdown("### 당월 진행 요약")
+
+            p1, p2, p3, p4, p5, p6 = st.columns(6)
+            with p1:
+                _chat_metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+            with p2:
+                _chat_metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+            with p3:
+                _chat_metric_card("당월 현재매출", meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+            with p4:
+                _chat_metric_card("당월 예상매출", meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with p5:
+                _chat_metric_card("당월 잔여예상", meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with p6:
+                _chat_metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
 
         _render_chat_count_card_group(
             "추세판정별 제품수",
@@ -3348,6 +3482,7 @@ def _make_table_downloads(df: pd.DataFrame) -> Tuple[io.BytesIO, io.BytesIO]:
 
     with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="SIMS")
+        _apply_sims_excel_number_formats(writer, df, "SIMS")
     xlsx_buf.seek(0)
     return csv_buf, xlsx_buf
 
@@ -4258,6 +4393,7 @@ def _render_sims_result_actions_lazy(
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
             excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
+            _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
         excel_bytes = bio.getvalue()
 
         ss[bytes_key] = {

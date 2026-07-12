@@ -89,6 +89,12 @@ def _normalize_analytics_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
         "금액",
         "평가단가",
         "커버월수",
+        "평균매출",
+        "현재매출",
+        "예상매출",
+        "잔여예상",
+        "진척률",
+        "완료월수",
     )
 
     out = df.copy()
@@ -1174,26 +1180,91 @@ def _add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     out = out.sort_values(["제품코드", "기준월"]).reset_index(drop=True)
+    months = sorted({_parse_yyyymm(v) for v in out["기준월"].dropna().tolist()})
+    completed_months, current_month, future_months = _split_sales_period_months(months)
+    completed_set = set(completed_months)
+    future_set = set(future_months)
 
-    grp = out.groupby("제품코드", dropna=False)
+    def _period_label(value: Any) -> str:
+        m = _parse_yyyymm(value)
+        if m in completed_set:
+            return "완료월"
+        if current_month and m == current_month:
+            return "당월진행"
+        if m in future_set:
+            return "미래월"
+        return "완료월"
 
-    if "출고수량" in out.columns:
-        out["전월대비수량"] = grp["출고수량"].diff().fillna(0)
+    out["기간구분"] = out["기준월"].map(_period_label)
 
-    if "매출합계" in out.columns:
-        out["전월대비매출"] = grp["매출합계"].diff().fillna(0)
-        out["최근3개월평균매출"] = (
-            grp["매출합계"]
-            .rolling(3, min_periods=1)
-            .mean()
-            .reset_index(level=0, drop=True)
+    metric_cols = [c for c in ["출고수량", "매출합계"] if c in out.columns]
+    if metric_cols:
+        monthly = (
+            out.groupby(["제품코드", "기준월"], dropna=False, as_index=False)[metric_cols]
+            .sum()
+            .sort_values(["제품코드", "기준월"])
+            .reset_index(drop=True)
         )
-        out["최근6개월평균매출"] = (
-            grp["매출합계"]
-            .rolling(6, min_periods=1)
-            .mean()
-            .reset_index(level=0, drop=True)
-        )
+        monthly_grp = monthly.groupby("제품코드", dropna=False)
+
+        derived_cols: list[str] = []
+        if "출고수량" in monthly.columns:
+            monthly["전월대비수량"] = monthly_grp["출고수량"].diff().fillna(0)
+            derived_cols.append("전월대비수량")
+
+        if "매출합계" in monthly.columns:
+            monthly["전월대비매출"] = monthly_grp["매출합계"].diff().fillna(0)
+            monthly["최근3개월평균매출"] = (
+                monthly_grp["매출합계"]
+                .rolling(3, min_periods=1)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+            monthly["최근6개월평균매출"] = (
+                monthly_grp["매출합계"]
+                .rolling(6, min_periods=1)
+                .mean()
+                .reset_index(level=0, drop=True)
+            )
+            monthly["월시점 증감률"] = monthly.apply(
+                lambda r: _pct_change(
+                    float(r.get("최근3개월평균매출") or 0),
+                    float(r.get("최근6개월평균매출") or 0),
+                ),
+                axis=1,
+            )
+            monthly["_월순번"] = monthly_grp.cumcount() + 1
+            monthly["_누계매출"] = monthly_grp["매출합계"].cumsum()
+            monthly["_누계반품월여부"] = (
+                monthly.assign(_neg=monthly["매출합계"].lt(0))
+                .groupby("제품코드", dropna=False)["_neg"]
+                .cummax()
+            )
+            monthly["기간구분"] = monthly["기준월"].map(_period_label)
+            monthly["월시점 추세판정"] = monthly.apply(
+                lambda r: _month_point_trend_judge(r),
+                axis=1,
+            )
+            monthly["월시점 판정결과"] = monthly["월시점 추세판정"]
+            monthly["추세판정"] = monthly["월시점 추세판정"]
+            monthly["판정결과"] = monthly["월시점 판정결과"]
+            derived_cols.extend([
+                "전월대비매출",
+                "최근3개월평균매출",
+                "최근6개월평균매출",
+                "월시점 증감률",
+                "월시점 추세판정",
+                "월시점 판정결과",
+                "추세판정",
+                "판정결과",
+            ])
+
+        if derived_cols:
+            out = out.merge(
+                monthly[["제품코드", "기준월"] + derived_cols],
+                on=["제품코드", "기준월"],
+                how="left",
+            )
 
     if "매출공급가액" in out.columns and "출고수량" in out.columns:
         out["평균공급단가"] = out.apply(
@@ -1204,6 +1275,25 @@ def _add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return out
+
+
+def _month_point_trend_judge(row: pd.Series) -> str:
+    period = str(row.get("기간구분") or "").strip()
+    if period == "당월진행":
+        return "당월진행"
+    if period == "미래월":
+        return "미래월"
+
+    month_pos = int(float(row.get("_월순번") or 0))
+    if month_pos < 6:
+        return "자료부족"
+
+    return _trend_judge(
+        float(row.get("_누계매출") or 0),
+        float(row.get("최근3개월평균매출") or 0),
+        float(row.get("최근6개월평균매출") or 0),
+        bool(row.get("_누계반품월여부")),
+    )
 
 
 def get_sales_trend_detail_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
@@ -1540,6 +1630,13 @@ def get_sales_trend_summary_df(
     # 월별 컬럼 NaN 보정
     month_sales_cols = [f"{_fmt_yyyymm_col(m)} 매출" for m in months]
     month_qty_cols = [f"{_fmt_yyyymm_col(m)} 수량" for m in months]
+    completed_months, current_month, future_months = _split_sales_period_months(months)
+    completed_sales_cols = [
+        f"{_fmt_yyyymm_col(m)} 매출"
+        for m in completed_months
+        if f"{_fmt_yyyymm_col(m)} 매출" in out.columns
+    ]
+    current_sales_col = f"{_fmt_yyyymm_col(current_month)} 매출" if current_month else ""
 
     for c in month_sales_cols + month_qty_cols:
         if c in out.columns:
@@ -1551,12 +1648,28 @@ def get_sales_trend_summary_df(
     if "총매출액" not in out.columns:
         out["총매출액"] = 0
 
-    out["월평균매출"] = pd.to_numeric(out["총매출액"], errors="coerce").fillna(0) / month_count
+    completed_month_count = len(completed_sales_cols)
+    if completed_sales_cols:
+        completed_total_sales = out[completed_sales_cols].sum(axis=1)
+    else:
+        completed_total_sales = pd.Series(0, index=out.index, dtype="float64")
+
+    out["완료월총매출"] = completed_total_sales
+    out["완료월수"] = completed_month_count
+    out["완료월평균매출"] = completed_total_sales / max(completed_month_count, 1)
+    out["월평균매출"] = out["완료월평균매출"]
+
+    if current_sales_col and current_sales_col in out.columns:
+        current_sales = pd.to_numeric(out[current_sales_col], errors="coerce").fillna(0)
+    else:
+        current_sales = pd.Series(0, index=out.index, dtype="float64")
+
+    out["당월 현재매출"] = current_sales
 
     # 기간 중 실제 매출이 발생한 월수
     # 예측등급에서 자료부족/감소예상을 구분하는 기준으로 사용한다.
-    if month_sales_cols:
-        out["매출발생월수"] = out[month_sales_cols].apply(
+    if completed_sales_cols:
+        out["매출발생월수"] = out[completed_sales_cols].apply(
             lambda r: int((pd.to_numeric(r, errors="coerce").fillna(0) != 0).sum()),
             axis=1,
         )
@@ -1564,8 +1677,8 @@ def get_sales_trend_summary_df(
         out["매출발생월수"] = 0
 
 
-    recent3_cols = month_sales_cols[-3:] if month_sales_cols else []
-    recent6_cols = month_sales_cols[-6:] if month_sales_cols else []
+    recent3_cols = completed_sales_cols[-3:] if completed_sales_cols else []
+    recent6_cols = completed_sales_cols[-6:] if completed_sales_cols else []
 
     if recent3_cols:
         out["최근3개월평균매출"] = out[recent3_cols].sum(axis=1) / len(recent3_cols)
@@ -1583,12 +1696,12 @@ def get_sales_trend_summary_df(
     )
 
     out["_has_negative_month"] = False
-    if month_sales_cols:
-        out["_has_negative_month"] = out[month_sales_cols].lt(0).any(axis=1)
+    if completed_sales_cols:
+        out["_has_negative_month"] = out[completed_sales_cols].lt(0).any(axis=1)
 
     out["추세판정"] = out.apply(
         lambda r: _trend_judge(
-            float(r.get("총매출액") or 0),
+            float(completed_total_sales.loc[r.name] if r.name in completed_total_sales.index else 0),
             float(r.get("최근3개월평균매출") or 0),
             float(r.get("최근6개월평균매출") or 0),
             bool(r.get("_has_negative_month")),
@@ -1598,6 +1711,39 @@ def get_sales_trend_summary_df(
 
     if "_has_negative_month" in out.columns:
         out = out.drop(columns=["_has_negative_month"])
+
+    forecast_projection = out.apply(
+        lambda r: _forecast_projection_from_row(r),
+        axis=1,
+        result_type="expand",
+    )
+    if not forecast_projection.empty:
+        forecast_projection.columns = ["_당월예상기준", "_당월적용증감률", "_당월예상매출"]
+        out["_당월예상기준"] = forecast_projection["_당월예상기준"]
+        out["_당월적용증감률"] = forecast_projection["_당월적용증감률"]
+        out["당월 예상매출"] = forecast_projection["_당월예상매출"] if current_month else 0
+    else:
+        out["_당월예상기준"] = "자료부족"
+        out["_당월적용증감률"] = 0
+        out["당월 예상매출"] = 0
+
+    out["당월 잔여예상"] = (out["당월 예상매출"] - out["당월 현재매출"]).clip(lower=0)
+    out["당월 진척률"] = out.apply(
+        lambda r: (
+            float(r.get("당월 현재매출") or 0) / float(r.get("당월 예상매출") or 0) * 100
+            if abs(float(r.get("당월 예상매출") or 0)) >= 1e-12
+            else 0
+        ),
+        axis=1,
+    )
+
+    round_cols = ["완료월총매출", "월평균매출", "완료월평균매출", "당월 현재매출", "당월 예상매출", "당월 잔여예상"]
+    for c in round_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0)
+    out = out.drop(
+        columns=[c for c in ["_당월예상기준", "_당월적용증감률", "_당월예상매출"] if c in out.columns]
+    )
     t_calc = time.perf_counter()
 
     # 컬럼 순서
@@ -1615,7 +1761,14 @@ def get_sales_trend_summary_df(
         "총매출공급가액",
         "총매출세액",
         "총매출액",
+        "완료월총매출",
         "월평균매출",
+        "완료월수",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "당월 진척률",
         "매출발생월수",
         "최근3개월평균매출",
         "최근6개월평균매출",
@@ -1719,6 +1872,36 @@ def _month_list_for_summary(params: Dict[str, Any], df: pd.DataFrame) -> list[st
     return []
 
 
+def _current_yyyymm() -> str:
+    try:
+        return pd.Timestamp.today().strftime("%Y%m")
+    except Exception:
+        return dt.datetime.now().strftime("%Y%m")
+
+
+def _split_sales_period_months(months: list[str]) -> tuple[list[str], str, list[str]]:
+    """
+    조회월을 완료월/진행 중인 당월/미래월로 분리한다.
+
+    - 조회 종료월이 과거이면 모든 조회월을 완료월로 본다.
+    - 현재월은 완료월 평균/추세 계산에서 제외한다.
+    - 미래월도 평균/추세 계산에서 제외한다.
+    """
+    clean_months = [_parse_yyyymm(m) for m in months]
+    clean_months = [m for m in clean_months if len(m) == 6]
+    if not clean_months:
+        return [], "", []
+
+    current_month = _current_yyyymm()
+    if max(clean_months) < current_month:
+        return clean_months, "", []
+
+    completed = [m for m in clean_months if m < current_month]
+    current = current_month if current_month in clean_months else ""
+    future = [m for m in clean_months if m > current_month]
+    return completed, current, future
+
+
 def _trend_judge(total_sales: float, recent3: float, recent6: float, has_negative_month: bool) -> str:
     """
     품목별 추세판정.
@@ -1819,6 +2002,54 @@ def _summary_meta(df: pd.DataFrame) -> Dict[str, Any]:
         ),
         "customer_count_label": customer_label,
         "month_count": int(out["기준월"].nunique()) if "기준월" in out.columns else 0,
+    }
+
+
+def _period_policy_meta_from_summary_df(df: pd.DataFrame) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {
+            "completed_month_count": 0,
+            "sum_completed_month_sales_amt": 0,
+            "avg_completed_month_sales_amt": 0,
+            "sum_current_month_sales_amt": 0,
+            "sum_current_month_expected_amt": 0,
+            "sum_current_month_remaining_expected_amt": 0,
+            "current_month_progress_pct": 0,
+        }
+
+    out = df.copy()
+
+    def _sum(col: str) -> float:
+        if col not in out.columns:
+            return 0.0
+        return float(pd.to_numeric(out[col], errors="coerce").fillna(0).sum())
+
+    completed_month_count = 0
+    if "완료월수" in out.columns:
+        try:
+            completed_month_count = int(pd.to_numeric(out["완료월수"], errors="coerce").fillna(0).max())
+        except Exception:
+            completed_month_count = 0
+
+    sum_completed_sales = _sum("완료월총매출")
+    sum_current_sales = _sum("당월 현재매출")
+    sum_current_expected = _sum("당월 예상매출")
+    current_progress = (
+        sum_current_sales / sum_current_expected * 100
+        if abs(sum_current_expected) >= 1e-12
+        else 0
+    )
+
+    return {
+        "completed_month_count": completed_month_count,
+        "sum_completed_month_sales_amt": sum_completed_sales,
+        "avg_completed_month_sales_amt": (
+            sum_completed_sales / completed_month_count if completed_month_count > 0 else 0
+        ),
+        "sum_current_month_sales_amt": sum_current_sales,
+        "sum_current_month_expected_amt": sum_current_expected,
+        "sum_current_month_remaining_expected_amt": _sum("당월 잔여예상"),
+        "current_month_progress_pct": current_progress,
     }
 
 
@@ -1937,6 +2168,7 @@ def get_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str,
 
     meta = dict(payload.get("meta") or {})
     meta.update(_summary_meta(df))
+    meta.update(_period_policy_meta_from_summary_df(summary_for_counts))
 
     meta.update({
         "analytics": True,
@@ -2149,6 +2381,7 @@ def get_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> D
 
     meta = dict(payload.get("meta") or {})
     meta.update(_summary_meta(raw_for_meta))
+    meta.update(_period_policy_meta_from_summary_df(summary_df))
 
     meta.update({
         "row_count": int(row_count),
@@ -2198,16 +2431,20 @@ def _forecast_base_and_label(row: pd.Series) -> tuple[float, str]:
     우선순위:
     1. 최근3개월평균매출
     2. 최근6개월평균매출
-    3. 월평균매출
+    3. 완료월평균매출
+    4. 월평균매출
     """
     recent3 = _safe_float(row.get("최근3개월평균매출"))
     recent6 = _safe_float(row.get("최근6개월평균매출"))
+    completed_avg = _safe_float(row.get("완료월평균매출"))
     avg = _safe_float(row.get("월평균매출"))
 
     if recent3 > 0:
         return recent3, "최근3개월평균매출"
     if recent6 > 0:
         return recent6, "최근6개월평균매출"
+    if completed_avg > 0:
+        return completed_avg, "완료월평균매출"
     if avg > 0:
         return avg, "월평균매출"
 
@@ -2223,8 +2460,10 @@ def _forecast_grade(row: pd.Series) -> str:
     """
     judge = str(row.get("추세판정") or "").strip()
 
-    total_sales = _safe_float(row.get("총매출액"))
-    avg_sales = _safe_float(row.get("월평균매출"))
+    total_sales = _safe_float(row.get("완료월총매출"))
+    if total_sales <= 0:
+        total_sales = _safe_float(row.get("총매출액"))
+    avg_sales = _safe_float(row.get("완료월평균매출")) or _safe_float(row.get("월평균매출"))
     recent3 = _safe_float(row.get("최근3개월평균매출"))
     recent6 = _safe_float(row.get("최근6개월평균매출"))
     rate = _safe_float(row.get("최근3개월증감률"))
@@ -2264,6 +2503,22 @@ def _forecast_grade(row: pd.Series) -> str:
             return "감소예상"
 
     return "안정예상"
+
+
+def _forecast_projection_from_row(row: pd.Series) -> tuple[str, float, float]:
+    base, base_label = _forecast_base_and_label(row)
+
+    raw_rate = _safe_float(row.get("최근3개월증감률")) / 100.0
+    safe_rate = _clamp(raw_rate, -0.30, 0.30)
+    adjusted_rate = safe_rate * 0.5
+
+    grade = _forecast_grade(row)
+    if grade in {"반품주의", "자료부족"}:
+        next_month = max(base, 0)
+    else:
+        next_month = max(base * (1.0 + adjusted_rate), 0)
+
+    return base_label, adjusted_rate * 100, next_month
 
 
 def _forecast_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
@@ -2343,7 +2598,14 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
 
     required_num_cols = [
         "총매출액",
+        "완료월총매출",
         "월평균매출",
+        "완료월수",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "당월 진척률",
         "매출발생월수",
         "최근3개월평균매출",
         "최근6개월평균매출",
@@ -2359,22 +2621,12 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     forecast_rows = []
 
     for _, row in out.iterrows():
-        base, base_label = _forecast_base_and_label(row)
-
-        raw_rate = _safe_float(row.get("최근3개월증감률")) / 100.0
-        safe_rate = _clamp(raw_rate, -0.30, 0.30)
-        adjusted_rate = safe_rate * 0.5
-
+        base_label, adjusted_rate_pct, next_month = _forecast_projection_from_row(row)
         grade = _forecast_grade(row)
-
-        if grade in {"반품주의", "자료부족"}:
-            next_month = max(base, 0)
-        else:
-            next_month = max(base * (1.0 + adjusted_rate), 0)
 
         forecast_rows.append({
             "예상기준": base_label,
-            "적용증감률": adjusted_rate * 100,
+            "적용증감률": adjusted_rate_pct,
             "다음월예상매출": next_month,
             "3개월예상매출": next_month * 3,
             "6개월예상매출": next_month * 6,
@@ -2383,6 +2635,9 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
 
     forecast_df = pd.DataFrame(forecast_rows)
     out = pd.concat([out.reset_index(drop=True), forecast_df], axis=1)
+    for c in ["다음월예상매출", "3개월예상매출", "6개월예상매출"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0)
     t_calc = time.perf_counter()
 
     front_cols = [c for c in [
@@ -2399,7 +2654,14 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
         "총매출공급가액",
         "총매출세액",
         "총매출액",
+        "완료월총매출",
         "월평균매출",
+        "완료월수",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "당월 진척률",
         "매출발생월수",
         "최근3개월평균매출",
         "최근6개월평균매출",
@@ -2537,6 +2799,7 @@ def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
 
     meta = dict(payload.get("meta") or {})
     meta.update(_forecast_meta_from_df(df))
+    meta.update(_period_policy_meta_from_summary_df(df))
 
     meta.update({
         "row_count": int(row_count),

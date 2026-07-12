@@ -34,6 +34,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+import pandas as pd
+
 
 # ---------------------------------------------------------------------
 # Project root 보정
@@ -346,6 +348,207 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("analytics action resolver", "_resolve_analytics_action 없음"))
     except Exception as e:
         results.append(_fail("analytics action resolver", f"{type(e).__name__}: {e}"))
+
+    try:
+        old_current_yyyymm = getattr(mod, "_current_yyyymm", None)
+        setattr(mod, "_current_yyyymm", lambda: "202607")
+
+        def _row(month: str, amt: int, qty: int = 1, product_code: str = "0001", buy_cd: str = "B1") -> dict[str, Any]:
+            return {"기준월": month, "제품코드": product_code, "제품명": "테스트", "규격": "EA", "제조사코드": "M1", "제조사명": "제조사", "제품그룹명": "G", "제품구분명": "D", "제품분류명": "C", "매입처코드": buy_cd, "출고수량": qty, "출고할증수량": 0, "매출공급가액": amt, "매출세액": 0, "매출합계": amt, "집계건수": 1}
+
+        raw_df = pd.DataFrame(
+            [
+                _row("202601", 100),
+                _row("202602", 100),
+                _row("202603", 100),
+                _row("202604", 200),
+                _row("202605", 200),
+                _row("202606", 200),
+                _row("202607", 300),
+                _row("202608", 999),
+            ]
+        )
+        summary_df = mod.get_sales_trend_summary_df(
+            {
+                "month_from": "202601",
+                "month_to": "202608",
+                "date_from": "20260101",
+                "date_to": "20260831",
+                "source_mode": "monthly_book",
+            },
+            raw_df=raw_df,
+        )
+        row = summary_df.iloc[0].to_dict()
+
+        expected = {
+            "완료월수": 6,
+            "완료월총매출": 900,
+            "완료월평균매출": 150,
+            "월평균매출": 150,
+            "최근3개월평균매출": 200,
+            "최근6개월평균매출": 150,
+            "최근3개월증감률": 33.3333333333,
+            "당월 현재매출": 300,
+            "당월 예상매출": 230,
+            "당월 잔여예상": 0,
+            "당월 진척률": 130.4347826087,
+        }
+        mismatches = []
+        for key, exp in expected.items():
+            got = float(row.get(key) or 0)
+            if abs(got - float(exp)) > 1e-6:
+                mismatches.append(f"{key}: expected={exp}, got={got}")
+
+        if mismatches:
+            results.append(_fail("sales period policy current/future exclusion", "; ".join(mismatches)))
+        else:
+            meta = mod._forecast_meta_from_df(summary_df)
+            period_meta = mod._period_policy_meta_from_summary_df(summary_df)
+            if int(meta.get("month_count") or 0) != 8 or int(period_meta.get("completed_month_count") or 0) != 6:
+                results.append(_fail("sales period policy month counters", f"month_count={meta.get('month_count')}, completed={period_meta.get('completed_month_count')}"))
+            elif str(row.get("추세판정") or "") != "증가":
+                results.append(_fail("sales period policy trend judge", f"expected='증가', got={row.get('추세판정')!r}"))
+            else:
+                results.append(_ok("sales period policy current/future exclusion", "current=202607 and future=202608 excluded; forecast rate applied"))
+
+        trend_df = mod._add_trend_columns(raw_df)
+        period_values = dict(zip(trend_df["기준월"], trend_df["기간구분"]))
+        rolling_values = dict(zip(trend_df["기준월"], trend_df["최근3개월평균매출"]))
+        rolling_ok = (
+            abs(float(rolling_values.get("202604") or 0) - 133.3333333333) < 1e-6
+            and abs(float(rolling_values.get("202607") or 0) - 233.3333333333) < 1e-6
+            and len(set(round(float(v), 6) for v in rolling_values.values())) > 1
+        )
+        period_ok = (
+            period_values.get("202606") == "완료월"
+            and period_values.get("202607") == "당월진행"
+            and period_values.get("202608") == "미래월"
+        )
+        if rolling_ok and period_ok:
+            results.append(_ok("sales trend detail period labels and rolling averages", "period labels set; row-wise rolling averages preserved"))
+        else:
+            results.append(_fail("sales trend detail period labels and rolling averages", f"periods={period_values}, rolling={rolling_values}"))
+
+        duplicate_vendor_df = pd.DataFrame(
+            [
+                _row("202601", 200_000_000, 500, "00439", "B1"),
+                _row("202601", 270_721_841, 500, "00439", "B2"),
+                _row("202602", 100_000_000, 300, "00439", "B1"),
+                _row("202602", 210_956_793, 458, "00439", "B2"),
+                _row("202603", 284_213_860, 750, "00439", "B1"),
+                _row("202604", 402_633_120, 770, "00439", "B1"),
+                _row("202605", 420_000_000, 780, "00439", "B1"),
+                _row("202606", 449_938_280, 790, "00439", "B1"),
+                _row("202607", 200_886_348, 800, "00439", "B1"),
+            ]
+        )
+        duplicate_trend = mod._add_trend_columns(duplicate_vendor_df)
+        feb_rows = duplicate_trend[duplicate_trend["기준월"] == "202602"]
+        jun_row = duplicate_trend[duplicate_trend["기준월"] == "202606"].iloc[0]
+        jul_row = duplicate_trend[duplicate_trend["기준월"] == "202607"].iloc[0]
+        duplicate_checks = [
+            ("2026-02 전월대비매출", set(feb_rows["전월대비매출"].round(2).tolist()), {-159_765_048.0}),
+            ("2026-02 전월대비수량", set(feb_rows["전월대비수량"].round(2).tolist()), {-242.0}),
+            ("2026-02 최근3개월평균매출", set(feb_rows["최근3개월평균매출"].round(2).tolist()), {390_839_317.0}),
+        ]
+        duplicate_mismatches = []
+        for label, got, exp in duplicate_checks:
+            if got != exp:
+                duplicate_mismatches.append(f"{label}: expected={exp}, got={got}")
+        expected_points = {
+            "2026-06 최근3개월평균매출": (jun_row.get("최근3개월평균매출"), 424_190_466.67),
+            "2026-06 최근6개월평균매출": (jun_row.get("최근6개월평균매출"), 389_743_982.33),
+            "2026-07 최근3개월평균매출": (jul_row.get("최근3개월평균매출"), 356_941_542.67),
+            "2026-07 최근6개월평균매출": (jul_row.get("최근6개월평균매출"), 344_771_400.17),
+        }
+        for label, (got, exp) in expected_points.items():
+            if abs(float(got or 0) - exp) > 0.01:
+                duplicate_mismatches.append(f"{label}: expected={exp}, got={got}")
+        if duplicate_mismatches:
+            results.append(_fail("sales trend detail monthly aggregate metrics", "; ".join(duplicate_mismatches)))
+        else:
+            results.append(_ok("sales trend detail monthly aggregate metrics", "duplicate vendor rows share product-month metrics"))
+
+        month_point_mismatches = []
+        required_month_cols = ["월시점 증감률", "월시점 추세판정", "월시점 판정결과", "추세판정", "판정결과"]
+        for c in required_month_cols:
+            if c not in duplicate_trend.columns:
+                month_point_mismatches.append(f"missing column {c}")
+        if not month_point_mismatches:
+            feb_judges = set(feb_rows["월시점 추세판정"].astype(str).tolist())
+            feb_compat_judges = set(feb_rows["추세판정"].astype(str).tolist())
+            if len(feb_judges) != 1 or feb_judges != feb_compat_judges:
+                month_point_mismatches.append(f"202602 duplicate rows judge mismatch: {feb_judges}, compat={feb_compat_judges}")
+            if str(jun_row.get("월시점 추세판정") or "") != "안정":
+                month_point_mismatches.append(f"202606 expected 안정, got={jun_row.get('월시점 추세판정')!r}")
+            if str(jul_row.get("월시점 추세판정") or "") != "당월진행":
+                month_point_mismatches.append(f"202607 expected 당월진행, got={jul_row.get('월시점 추세판정')!r}")
+            if str(jul_row.get("기간구분") or "") != "당월진행":
+                month_point_mismatches.append(f"202607 period expected 당월진행, got={jul_row.get('기간구분')!r}")
+            judge_seq = duplicate_trend.drop_duplicates(["제품코드", "기준월"])["월시점 추세판정"].astype(str).tolist()
+            if len(set(judge_seq)) <= 1:
+                month_point_mismatches.append(f"monthly judges appear copied: {judge_seq}")
+        if month_point_mismatches:
+            results.append(_fail("sales trend detail month-point judge", "; ".join(month_point_mismatches)))
+        else:
+            results.append(_ok("sales trend detail month-point judge", "monthly point-in-time judges are merged per product-month"))
+
+        product_00439_summary = mod.get_sales_trend_summary_df(
+            {
+                "month_from": "202601",
+                "month_to": "202607",
+                "date_from": "20260101",
+                "date_to": "20260731",
+                "source_mode": "monthly_book",
+            },
+            raw_df=duplicate_vendor_df,
+        )
+        row_00439 = product_00439_summary.iloc[0].to_dict()
+        meta_00439 = mod._period_policy_meta_from_summary_df(product_00439_summary)
+        display_mismatches = []
+        expected_00439 = {
+            "완료월평균매출": 389_743_982,
+            "당월 현재매출": 200_886_348,
+            "당월 예상매출": 442_935_939,
+            "당월 잔여예상": 242_049_591,
+            "당월 진척률": 45.3522419545,
+        }
+        for key, exp in expected_00439.items():
+            got = float(row_00439.get(key) or 0)
+            if abs(got - exp) > 0.02:
+                display_mismatches.append(f"{key}: expected={exp}, got={got}")
+        progress_value = row_00439.get("당월 진척률")
+        if int(float(progress_value or 0)) == float(progress_value or 0):
+            display_mismatches.append(f"당월 진척률 lost decimal precision: {progress_value}")
+        if f"{float(progress_value or 0):.2f}%" != "45.35%":
+            display_mismatches.append(f"당월 진척률 display expected 45.35%, got={float(progress_value or 0):.2f}%")
+        if any(c.startswith("_당월") for c in product_00439_summary.columns):
+            display_mismatches.append("internal _당월 columns exposed in summary")
+        if round(float(meta_00439.get("avg_completed_month_sales_amt") or 0)) != 389_743_982:
+            display_mismatches.append(f"meta avg_completed_month_sales_amt={meta_00439.get('avg_completed_month_sales_amt')}")
+        if display_mismatches:
+            results.append(_fail("sales forecast current month display summary", "; ".join(display_mismatches)))
+        else:
+            results.append(_ok("sales forecast current month display summary", "00439 current-month display values match expected"))
+
+        past_df = pd.DataFrame([_row("202501", 10), _row("202502", 20), _row("202503", 30)])
+        past_summary = mod.get_sales_trend_summary_df(
+            {"month_from": "202501", "month_to": "202503", "date_from": "20250101", "date_to": "20250331", "source_mode": "monthly_book"},
+            raw_df=past_df,
+        )
+        past_row = past_summary.iloc[0].to_dict()
+        if float(past_row.get("완료월수") or 0) == 3 and float(past_row.get("당월 현재매출") or 0) == 0:
+            results.append(_ok("sales period policy past range completed", "past month_to treats all query months as completed"))
+        else:
+            results.append(_fail("sales period policy past range completed", f"row={past_row}"))
+    except Exception as e:
+        results.append(_fail("sales period policy current/future exclusion", f"{type(e).__name__}: {e}"))
+    finally:
+        try:
+            if old_current_yyyymm is not None:
+                setattr(mod, "_current_yyyymm", old_current_yyyymm)
+        except Exception:
+            pass
 
     return results
 
