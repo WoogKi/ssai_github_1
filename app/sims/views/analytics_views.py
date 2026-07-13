@@ -29,6 +29,9 @@ from app.services.analytics_manufacturer_sales_trend_service import (
     get_manufacturer_sales_trend_result,
     get_manufacturer_sales_trend_summary_result,
 )
+from app.services.analytics_customer_sales_forecast_service import (
+    get_customer_sales_forecast_result,
+)
 
 log = logging.getLogger("ssai")
 
@@ -527,6 +530,7 @@ def _build_sales_trend_display_params(params: Dict[str, Any], meta: Dict[str, An
         ("product_group_nm", "제품그룹명"),
         ("product_di_nm", "제품구분명"),
         ("product_class_nm", "제품분류명"),
+        ("ven_cd", "매출처코드"),
         ("ven_nm", "거래처명"),
         ("buy_nm", "매입처명"),
         ("sales_man_nm", "영업사원명"),
@@ -534,6 +538,7 @@ def _build_sales_trend_display_params(params: Dict[str, Any], meta: Dict[str, An
         ("gugun_nm", "시구군명"),
         ("road_nm", "도로명"),
         ("trend_judge", "추세판정"),        
+        ("forecast_grade", "예상등급"),
         ("shortage_grade", "부족등급"),
         ("top", "Top"),
     ]
@@ -837,6 +842,67 @@ def _render_manufacturer_sales_trend_panel_header(meta: Dict[str, Any], query_co
 
 def _render_manufacturer_sales_trend_summary_panel_header(meta: Dict[str, Any], query_condition: str) -> None:
     _render_manufacturer_sales_summary_header(meta, query_condition)
+
+
+def _render_customer_sales_forecast_panel_header(meta: Dict[str, Any], query_condition: str) -> None:
+    if not isinstance(meta, dict):
+        meta = {}
+    if query_condition:
+        st.caption(f"조회조건: {query_condition}")
+
+    current_progress = meta.get("current_month_progress_pct")
+    if current_progress is None:
+        expected = float(meta.get("sum_current_month_expected_amt") or 0)
+        actual = float(meta.get("sum_current_month_sales_amt") or 0)
+        current_progress = (actual / expected * 100) if abs(expected) >= 1e-12 else 0
+
+    st.markdown(f"### {meta.get('current_progress_title') or '당월 매출예상 요약'}")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        _metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with c2:
+        _metric_card(str(meta.get("current_sales_label") or "당월 현재매출"), meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with c3:
+        _metric_card(str(meta.get("current_expected_label") or "당월 예상매출"), meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+    with c4:
+        _metric_card(str(meta.get("current_remaining_label") or "당월 잔여예상"), meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+    with c5:
+        _metric_card(str(meta.get("current_progress_label") or "당월 진척률"), current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+    st.markdown("### 중장기 예상")
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        _metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with f2:
+        _metric_card("다음월예상매출", meta.get("sum_next_month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+    with f3:
+        _metric_card("3개월예상매출", meta.get("sum_3month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+    with f4:
+        _metric_card("6개월예상매출", meta.get("sum_6month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+
+    c6, c7, c8, c9 = st.columns(4)
+    with c6:
+        _metric_card("매출처수", meta.get("customer_count"), "개", bg="#eff6ff", border="#bfdbfe")
+    with c7:
+        _metric_card("영업사원수", meta.get("salesperson_count"), "명", bg="#eff6ff", border="#bfdbfe")
+    with c8:
+        _metric_card("지역수", meta.get("region_count"), "개", bg="#eff6ff", border="#bfdbfe")
+    with c9:
+        _metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+    _metric_card("자료원", meta.get("source_label") or "-", "", bg="#f8fafc", border="#dbe4ee")
+
+    _render_count_card_group(
+        "추세판정별 매출처수",
+        meta.get("trend_judge_counts") or {},
+        ["증가", "감소", "안정", "자료부족"],
+        _color_for_trend,
+    )
+    _render_count_card_group(
+        "예상등급별 매출처수",
+        meta.get("forecast_grade_counts") or {},
+        ["상승예상", "감소예상", "안정예상", "신규확인", "반품주의", "자료부족", "미분류"],
+        _color_for_forecast,
+    )
 
 
 def render_sales_trend_analysis() -> Dict[str, Any]:
@@ -1592,6 +1658,160 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
                 "analysis_type": "sales_forecast",
                 "sales_trend_summary": True,
                 "summary_type": "product_forecast",
+            },
+        }
+
+
+def render_customer_sales_forecast_analysis() -> Dict[str, Any]:
+    st.subheader("매출처별 매출 예상")
+    st.caption("Rddbc130 출고 거래명세서 원장매출을 기준으로 매출처별 다음월/3개월/6개월 예상 매출을 계산합니다.")
+
+    ns = _ns()
+
+    with st.form(
+        key=f"__analytics_customer_sales_forecast_form__{ns}",
+        clear_on_submit=False,
+        enter_to_submit=False,
+    ):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            date_from = _render_date_input_with_week(
+                "시작일자",
+                _default_start_date(),
+                f"__analytics_customer_sales_forecast_date_from__{ns}",
+            )
+        with c2:
+            date_to = _render_date_input_with_week(
+                "종료일자",
+                _default_end_date(),
+                f"__analytics_customer_sales_forecast_date_to__{ns}",
+            )
+        with c3:
+            trend_judge = st.selectbox(
+                "추세판정",
+                ["전체", "감소", "안정", "증가", "자료부족", "반품주의", "신규/증가"],
+                index=0,
+                key=f"__analytics_customer_sales_forecast_judge__{ns}",
+            )
+
+        top = _analytics_max_rows()
+
+        c4, c5, c6, c7 = st.columns(4)
+        with c4:
+            ven_cd = st.text_input(
+                "매출처코드",
+                value="",
+                key=f"__analytics_customer_sales_forecast_ven_cd__{ns}",
+            )
+        with c5:
+            ven_nm = st.text_input(
+                "매출처명",
+                value="",
+                key=f"__analytics_customer_sales_forecast_ven_nm__{ns}",
+            )
+        with c6:
+            sales_man_nm = st.text_input(
+                "영업사원명",
+                value="",
+                key=f"__analytics_customer_sales_forecast_sales_man_nm__{ns}",
+            )
+        with c7:
+            forecast_grade = st.selectbox(
+                "예상등급",
+                ["전체", "상승예상", "감소예상", "안정예상", "신규확인", "반품주의", "자료부족"],
+                index=0,
+                key=f"__analytics_customer_sales_forecast_grade__{ns}",
+            )
+
+        c8, c9, c10 = st.columns(3)
+        with c8:
+            sido_nm = st.text_input(
+                "시도명",
+                value="",
+                key=f"__analytics_customer_sales_forecast_sido_nm__{ns}",
+                placeholder="예: 서울",
+            )
+        with c9:
+            gugun_nm = st.text_input(
+                "시구군명",
+                value="",
+                key=f"__analytics_customer_sales_forecast_gugun_nm__{ns}",
+                placeholder="예: 강남",
+            )
+        with c10:
+            road_nm = st.text_input(
+                "도로명",
+                value="",
+                key=f"__analytics_customer_sales_forecast_road_nm__{ns}",
+                placeholder="예: 테헤란로",
+            )
+
+        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+
+    if not submitted:
+        return {
+            "final": False,
+            "type": "text",
+            "title": "매출처별 매출 예상",
+            "data": "[조회] 버튼을 눌러 실행하세요.",
+        }
+
+    date_from_text = _date_to_yyyymmdd(date_from)
+    date_to_text = _date_to_yyyymmdd(date_to)
+    params = {
+        "source_mode": "customer_monthly",
+        "date_from": date_from_text,
+        "date_to": date_to_text,
+        "month_from": _date_to_yyyymm(date_from),
+        "month_to": _date_to_yyyymm(date_to),
+        "ven_cd": _clean_text(ven_cd),
+        "ven_nm": _clean_text(ven_nm),
+        "sales_man_nm": _clean_text(sales_man_nm),
+        "sido_nm": _clean_text(sido_nm),
+        "gugun_nm": _clean_text(gugun_nm),
+        "road_nm": _clean_text(road_nm),
+        "trend_judge": "" if trend_judge == "전체" else trend_judge,
+        "forecast_grade": "" if forecast_grade == "전체" else forecast_grade,
+        "top": int(top),
+    }
+
+    try:
+        result = get_customer_sales_forecast_result(params)
+        meta = dict(result.get("meta") or {})
+        meta.setdefault("analytics", True)
+        meta.setdefault("analysis_type", "customer_sales_forecast")
+        meta.setdefault("summary_type", "customer_forecast")
+        meta.setdefault("group_type", "customer")
+        query_condition = _build_sales_trend_query_condition(params, meta)
+        if query_condition:
+            meta["query_summary"] = query_condition
+            meta["condition"] = query_condition
+        result["params_raw"] = params
+        result["params"] = _build_sales_trend_display_params(params, meta)
+        result["meta"] = meta
+        if (
+            _render_inline_analysis_header_enabled()
+            and int(meta.get("row_count_total") or meta.get("row_count") or 0) > 0
+        ):
+            _render_customer_sales_forecast_panel_header(meta, query_condition)
+        return result
+    except Exception as e:
+        log.exception("[analytics.views] customer sales forecast failed")
+        return {
+            "final": True,
+            "type": "text",
+            "title": "매출처별 매출 예상 오류",
+            "action": "매출처별 매출 예상",
+            "params": _build_sales_trend_display_params(params, {}),
+            "params_raw": params,
+            "data": str(e),
+            "message": str(e),
+            "meta": {
+                "row_count": 0,
+                "row_count_total": 0,
+                "analytics": True,
+                "analysis_type": "customer_sales_forecast",
+                "summary_type": "customer_forecast",
             },
         }
 

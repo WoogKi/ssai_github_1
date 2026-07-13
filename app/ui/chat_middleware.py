@@ -537,11 +537,12 @@ def _chat_is_analysis_payload(item: Dict[str, Any], meta: Dict[str, Any], title:
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "매출처별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
         or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
@@ -1271,7 +1272,7 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
 
     analysis_type = str(meta.get("analysis_type") or "").strip()
     summary_type = str(meta.get("summary_type") or "").strip()
-    is_forecast = analysis_type == "sales_forecast" or summary_type == "product_forecast"
+    is_forecast = analysis_type in {"sales_forecast", "customer_sales_forecast"} or summary_type in {"product_forecast", "customer_forecast"}
     source_label = str(meta.get("source_label") or _chat_source_mode_label(meta.get("source_mode") or ""))
 
     if analysis_type == "stock_shortage":
@@ -1406,7 +1407,7 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
         )
         return
 
-    if analysis_type in {"sales_forecast", "sales_trend"} or is_forecast:
+    if analysis_type in {"sales_forecast", "customer_sales_forecast", "sales_trend"} or is_forecast:
         current_progress = meta.get("current_month_progress_pct")
         if current_progress is None:
             current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
@@ -1414,19 +1415,19 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
             current_progress = (current_sales / current_expected * 100) if abs(current_expected) >= 1e-12 else 0
 
         if is_forecast:
-            st.markdown("### 당월 매출예상 요약")
+            st.markdown(f"### {meta.get('current_progress_title') or '당월 매출예상 요약'}")
 
             c1, c2, c3, c4, c5 = st.columns(5)
             with c1:
                 _chat_metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
             with c2:
-                _chat_metric_card("당월 현재매출", meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+                _chat_metric_card(str(meta.get("current_sales_label") or "당월 현재매출"), meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
             with c3:
-                _chat_metric_card("당월 예상매출", meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+                _chat_metric_card(str(meta.get("current_expected_label") or "당월 예상매출"), meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
             with c4:
-                _chat_metric_card("당월 잔여예상", meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+                _chat_metric_card(str(meta.get("current_remaining_label") or "당월 잔여예상"), meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
             with c5:
-                _chat_metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+                _chat_metric_card(str(meta.get("current_progress_label") or "당월 진척률"), current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
 
             st.markdown("### 중장기 예상")
 
@@ -1440,17 +1441,29 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
             with f4:
                 _chat_metric_card("6개월예상매출", meta.get("sum_6month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
 
-            c5, c6, c7, c8, c9 = st.columns(5)
-            with c5:
-                _chat_metric_card("출고수량", meta.get("sum_qty"), "개", bg="#f0fdf4", border="#bbf7d0")
-            with c6:
-                _chat_metric_card("품목수", meta.get("product_count"), "개", bg="#eff6ff", border="#bfdbfe")
-            with c7:
-                _chat_metric_card(str(meta.get("customer_count_label") or "거래처수"), meta.get("customer_count"), "개", bg="#eff6ff", border="#bfdbfe")
-            with c8:
-                _chat_metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
-            with c9:
+            if analysis_type == "customer_sales_forecast" or summary_type == "customer_forecast":
+                c5, c6, c7, c8 = st.columns(4)
+                with c5:
+                    _chat_metric_card("매출처수", meta.get("customer_count"), "개", bg="#eff6ff", border="#bfdbfe")
+                with c6:
+                    _chat_metric_card("영업사원수", meta.get("salesperson_count"), "명", bg="#eff6ff", border="#bfdbfe")
+                with c7:
+                    _chat_metric_card("지역수", meta.get("region_count"), "개", bg="#eff6ff", border="#bfdbfe")
+                with c8:
+                    _chat_metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
                 _chat_metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
+            else:
+                c5, c6, c7, c8, c9 = st.columns(5)
+                with c5:
+                    _chat_metric_card("출고수량", meta.get("sum_qty"), "개", bg="#f0fdf4", border="#bbf7d0")
+                with c6:
+                    _chat_metric_card("품목수", meta.get("product_count"), "개", bg="#eff6ff", border="#bfdbfe")
+                with c7:
+                    _chat_metric_card(str(meta.get("customer_count_label") or "거래처수"), meta.get("customer_count"), "개", bg="#eff6ff", border="#bfdbfe")
+                with c8:
+                    _chat_metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+                with c9:
+                    _chat_metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
         else:
             st.markdown("### 매출추세요약")
 
@@ -1491,13 +1504,13 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
                 _chat_metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
 
         _render_chat_count_card_group(
-            "추세판정별 제품수",
+            "추세판정별 매출처수" if (analysis_type == "customer_sales_forecast" or summary_type == "customer_forecast") else "추세판정별 제품수",
             meta.get("trend_judge_counts") or {},
             ["증가", "감소", "안정", "반품주의", "신규/증가", "자료부족", "미분류"],
             _chat_color_for_trend,
         )
         _render_chat_count_card_group(
-            "예상등급별 제품수",
+            "예상등급별 매출처수" if (analysis_type == "customer_sales_forecast" or summary_type == "customer_forecast") else "예상등급별 제품수",
             meta.get("forecast_grade_counts") or {},
             ["상승예상", "감소예상", "안정예상", "신규확인", "반품주의", "자료부족", "미분류"],
             _chat_color_for_forecast,
@@ -2481,6 +2494,25 @@ def _sims_business_terms(action_name: str) -> dict:
     """
     action = str(action_name or "")
 
+    if "매출처별 매출 예상" in action:
+        return {
+            "flow_label": "매출처별 매출 예상",
+            "amount_label": "매출액",
+            "vendor_label": "매출처",
+            "qty_label": "수량",
+            "amount_priority": (
+                "총매출액",
+                "당월 현재매출",
+                "평가월 매출",
+                "당월 예상매출",
+                "평가월 예상매출",
+                "다음월예상매출",
+                "총매출공급가액",
+            ),
+            "avoid_words": ["수량", "제품", "제조사"],
+            "preferred_words": ["매출처", "총매출액", "당월 현재매출", "평가월 매출", "예상매출"],
+        }
+
     if "제품수불현황" in action or "제품수불" in action:
         return {
             "flow_label": "제품수불",
@@ -2677,6 +2709,7 @@ def _build_sims_sales_time_profile(df: pd.DataFrame, terms: dict | None = None) 
     terms = terms or {}
     amount_label = str(terms.get("amount_label") or "금액")
     qty_label = str(terms.get("qty_label") or "수량")
+    amount_priority = tuple(str(x) for x in (terms.get("amount_priority") or ()) if str(x or "").strip())
 
     date_col = _sims_ctx_find_col(
         df,
@@ -2685,12 +2718,14 @@ def _build_sims_sales_time_profile(df: pd.DataFrame, terms: dict | None = None) 
         exclude_any=("등록", "수정", "보험", "유효", "마감"),
     )
 
-    amount_col = _sims_ctx_find_col(
-        df,
-        exact=("합계금액", "매출금액", "출고금액", "입고금액", "공급가액", "입고공급가액", "출고공급가액"),
-        include_any=("합계금액", "매출", "출고금액", "입고금액", "공급가액"),
-        exclude_any=("단가", "율", "세액"),
-    )
+    amount_col = _sims_ctx_find_col(df, exact=amount_priority) if amount_priority else None
+    if not amount_col:
+        amount_col = _sims_ctx_find_col(
+            df,
+            exact=("합계금액", "매출금액", "출고금액", "입고금액", "공급가액", "입고공급가액", "출고공급가액"),
+            include_any=("합계금액", "매출", "출고금액", "입고금액", "공급가액"),
+            exclude_any=("순번", "코드", "ID", "건수", "월수", "단가", "율", "세액"),
+        )
 
     qty_col = _sims_ctx_find_col(
         df,
@@ -2846,13 +2881,16 @@ def _build_sims_sales_group_profile(df: pd.DataFrame, terms: dict | None = None)
     amount_label = str(terms.get("amount_label") or "금액")
     qty_label = str(terms.get("qty_label") or "수량")
     vendor_label = str(terms.get("vendor_label") or "거래처")
+    amount_priority = tuple(str(x) for x in (terms.get("amount_priority") or ()) if str(x or "").strip())
 
-    amount_col = _sims_ctx_find_col(
-        df,
-        exact=("합계금액", "매출금액", "출고금액", "입고금액", "공급가액", "입고공급가액", "출고공급가액"),
-        include_any=("합계금액", "매출", "출고금액", "입고금액", "공급가액"),
-        exclude_any=("단가", "율", "세액"),
-    )
+    amount_col = _sims_ctx_find_col(df, exact=amount_priority) if amount_priority else None
+    if not amount_col:
+        amount_col = _sims_ctx_find_col(
+            df,
+            exact=("합계금액", "매출금액", "출고금액", "입고금액", "공급가액", "입고공급가액", "출고공급가액"),
+            include_any=("합계금액", "매출", "출고금액", "입고금액", "공급가액"),
+            exclude_any=("순번", "코드", "ID", "건수", "월수", "단가", "율", "세액"),
+        )
     qty_col = _sims_ctx_find_col(
         df,
         exact=("수량", "출고수량", "입고수량", "매출수량"),
@@ -4793,6 +4831,7 @@ REFERENCE_TABLE_ACTIONS = {
     "품목별 매출 추세 분석",
     "품목별 매출 추세 요약표",
     "품목별 매출 예상",
+    "매출처별 매출 예상",
     "제약사별 매출 추세 분석",
     "제약사별 매출 추세 분석 요약표",
     "품목별 재고부족현황",
@@ -4833,7 +4872,7 @@ def _sims_table_role_from_action(action_name: Any, meta: Optional[Dict[str, Any]
     if (
         action in REFERENCE_TABLE_ACTIONS
         or "제품재고장" in action
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
         or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     ):
         return "reference"
@@ -6224,6 +6263,7 @@ def _is_sales_trend_action(action_name: str) -> bool:
         "품목별 매출 추세 분석",
         "품목별 매출 추세 요약표",
         "품목별 매출 예상",
+        "매출처별 매출 예상",
         "제약사별 매출 추세 분석",
         "제약사별 매출 추세 분석 요약표",
         "품목별 재고부족현황",
@@ -7230,7 +7270,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
         is_monthly_stock = _is_monthly_stock_action(action_name)
         is_sales_trend = (
             _is_sales_trend_action(action_name)
-            or meta.get("analysis_type") in {"sales_trend", "sales_forecast", "stock_shortage"}
+            or meta.get("analysis_type") in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage"}
             or meta.get("summary_type") in {"product_summary", "product_forecast", "product_stock_shortage"}
         )
 

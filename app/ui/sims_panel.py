@@ -602,6 +602,7 @@ def _is_sales_trend_payload(payload: Dict[str, Any], action: str, title: str) ->
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "매출처별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황"
@@ -610,11 +611,12 @@ def _is_sales_trend_payload(payload: Dict[str, Any], action: str, title: str) ->
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "매출처별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황"
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
         or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
@@ -1014,13 +1016,14 @@ def _is_sales_trend_summary_payload(payload: Dict[str, Any], action: str, title:
         action_text in {
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "매출처별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표", "품목별 재고부족현황"}
+        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "매출처별 매출 예상", "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표", "품목별 재고부족현황"}
         or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
-        or analysis_type in {"sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or analysis_type in {"sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
     )
 
 def _blank_same_as_previous(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -1215,6 +1218,7 @@ _CATEGORIES: Dict[str, Dict[str, Any]] = {
             "품목별 매출 추세 분석": analytics_views.render_sales_trend_analysis,
             "품목별 매출 추세 요약표": analytics_views.render_sales_trend_summary_analysis,
             "품목별 매출 예상": analytics_views.render_sales_forecast_analysis,
+            "매출처별 매출 예상": analytics_views.render_customer_sales_forecast_analysis,
             "품목별 재고부족현황": analytics_views.render_stock_shortage_analysis,
         }
     },
@@ -2850,26 +2854,26 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
         )
         return
 
-    if analysis_type == "sales_forecast":
+    if analysis_type in {"sales_forecast", "customer_sales_forecast"}:
         current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
         current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
         current_progress = meta.get("current_month_progress_pct")
         if current_progress is None:
             current_progress = (current_sales / current_expected * 100) if abs(current_expected) >= 1e-12 else 0
 
-        st.markdown("### 당월 매출예상 요약")
+        st.markdown(f"### {meta.get('current_progress_title') or '당월 매출예상 요약'}")
 
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             st.info(f"완료월평균매출 : {_fmt_header_num(meta.get('avg_completed_month_sales_amt'), '원')}")
         with c2:
-            st.info(f"당월 현재매출 : {_fmt_header_num(meta.get('sum_current_month_sales_amt'), '원')}")
+            st.info(f"{meta.get('current_sales_label') or '당월 현재매출'} : {_fmt_header_num(meta.get('sum_current_month_sales_amt'), '원')}")
         with c3:
-            st.warning(f"당월 예상매출 : {_fmt_header_num(meta.get('sum_current_month_expected_amt'), '원')}")
+            st.warning(f"{meta.get('current_expected_label') or '당월 예상매출'} : {_fmt_header_num(meta.get('sum_current_month_expected_amt'), '원')}")
         with c4:
-            st.warning(f"당월 잔여예상 : {_fmt_header_num(meta.get('sum_current_month_remaining_expected_amt'), '원')}")
+            st.warning(f"{meta.get('current_remaining_label') or '당월 잔여예상'} : {_fmt_header_num(meta.get('sum_current_month_remaining_expected_amt'), '원')}")
         with c5:
-            st.success(f"당월 진척률 : {_fmt_header_num(current_progress, '%', decimals=2)}")
+            st.success(f"{meta.get('current_progress_label') or '당월 진척률'} : {_fmt_header_num(current_progress, '%', decimals=2)}")
 
         st.markdown("### 중장기 예상")
 
@@ -2883,13 +2887,25 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
         with f4:
             st.warning(f"6개월예상매출 : {_fmt_header_num(meta.get('sum_6month_forecast_amt'), '원')}")
 
+        if analysis_type == "customer_sales_forecast":
+            s1, s2, s3, s4 = st.columns(4)
+            with s1:
+                st.info(f"매출처수 : {_fmt_header_num(meta.get('customer_count'), '개')}")
+            with s2:
+                st.info(f"영업사원수 : {_fmt_header_num(meta.get('salesperson_count'), '명')}")
+            with s3:
+                st.info(f"지역수 : {_fmt_header_num(meta.get('region_count'), '개')}")
+            with s4:
+                st.info(f"분석월수 : {_fmt_header_num(meta.get('month_count'), '개월')}")
+            st.info(f"자료원 : {meta.get('source_label') or '-'}")
+
         counts = meta.get("forecast_grade_counts") or {}
         if isinstance(counts, dict) and counts:
             order = ["상승예상", "감소예상", "안정예상", "신규확인", "반품주의", "자료부족"]
             keys = [k for k in order if k in counts]
             keys += [k for k in counts.keys() if k not in keys]
             line = " / ".join(f"{k} {_fmt_header_num(counts.get(k), '개')}" for k in keys)
-            st.caption(f"예상등급별 제품수: {line}")
+            st.caption(f"예상등급별 {'매출처수' if analysis_type == 'customer_sales_forecast' else '제품수'}: {line}")
 
         return
 

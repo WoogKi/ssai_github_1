@@ -694,6 +694,18 @@ _ANALYTICS_ACTION_SPECS = (
         ),
     },
     {
+        "action": "매출처별 매출 예상",
+        "service": "get_customer_sales_forecast_result",
+        "phrases": (
+            "매출처별 매출 예상",
+            "매출처별 매출예상",
+            "거래처별 매출 예상",
+            "거래처별 매출예상",
+            "고객별 매출 예상",
+            "고객별 매출예상",
+        ),
+    },
+    {
         "action": "품목별 매출 예상",
         "service": "get_sales_forecast_result",
         "phrases": (
@@ -1194,6 +1206,9 @@ def _get_analytics_handler(action: str):
             get_manufacturer_sales_trend_result,
             get_manufacturer_sales_trend_summary_result,
         )
+        from app.services.analytics_customer_sales_forecast_service import (
+            get_customer_sales_forecast_result,
+        )
     except Exception:
         raise
 
@@ -1201,6 +1216,7 @@ def _get_analytics_handler(action: str):
         "품목별 매출 추세 분석": get_sales_trend_result,
         "품목별 매출 추세 요약표": get_sales_trend_summary_result,
         "품목별 매출 예상": get_sales_forecast_result,
+        "매출처별 매출 예상": get_customer_sales_forecast_result,
         "제약사별 매출 추세 분석": get_manufacturer_sales_trend_result,
         "제약사별 매출 추세 분석 요약표": get_manufacturer_sales_trend_summary_result,
         "품목별 재고부족현황": get_stock_shortage_result,
