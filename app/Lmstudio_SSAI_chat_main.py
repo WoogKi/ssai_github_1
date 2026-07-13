@@ -232,22 +232,44 @@ from app.ui.ssai_admin import (
 # =========================================================
 # 4-0) 전역 CSS: SIMS popover / expander UI 스타일 보정
 # =========================================================
-if not st.session_state.get("__base_css_loaded"):
-    st.markdown("""
-    <style>
-      /* SIMS 팝오버 본문 최소 폭 확장 */
-      [data-testid="stPopover"] [data-testid="stPopoverBody"] { min-width: 640px; }
+def _inject_base_css_once() -> None:
+    """Streamlit 전역 CSS를 1회만 주입한다.
 
-      /* expander 제목 줄 간격 보정 */
-      details[open] > summary { line-height: 1.1; }
+    st.markdown(..., unsafe_allow_html=True) 방식은 일부 HTTPS/IIS 경유
+    초기 렌더링에서 <style>...</style> 문자열이 화면에 노출되는 경우가 있어
+    st.html() 우선, 미지원 버전은 st.markdown()으로 fallback 한다.
+    """
+    if st.session_state.get("__base_css_loaded"):
+        return
 
-      /* 패널 내부 여백/버튼 정렬 보정 */
-      [data-testid="stPopoverBody"] > div {
-          padding: 0.75rem 1rem !important;
-      }
-    </style>
-    """, unsafe_allow_html=True)
+    css = """
+<style>
+/* SIMS 팝오버 본문 최소 폭 확장 */
+[data-testid="stPopover"] [data-testid="stPopoverBody"] {
+    min-width: 640px;
+}
+
+/* expander 제목 줄 간격 보정 */
+details[open] > summary {
+    line-height: 1.1;
+}
+
+/* 패널 내부 여백/버튼 정렬 보정 */
+[data-testid="stPopoverBody"] > div {
+    padding: 0.75rem 1rem !important;
+}
+</style>
+"""
+
+    if hasattr(st, "html"):
+        st.html(css)
+    else:
+        st.markdown(css, unsafe_allow_html=True)
+
     st.session_state["__base_css_loaded"] = True
+
+
+_inject_base_css_once()
 
 #
 # =========================================================
@@ -2759,6 +2781,26 @@ def _normalize_implicit_analytics_current_followup(text: str) -> str:
     return f"현재표 {t}"
 
 
+def _normalize_current_table_followup_input(text: str) -> str:
+    """
+    현재표 후속질문 라우팅용 정규화.
+
+    - 사용자가 자주 입력하는 "현제표" 오타를 "현재표"와 동일하게 본다.
+    - "제품그룹명 별 분석"처럼 조사 주변에 공백이 있어도
+      dispatcher/analytics_kpi의 기존 "제품그룹명별 분석" 엔진을 타게 한다.
+    """
+    t = str(text or "").strip()
+    if not t:
+        return t
+
+    t = re.sub(r"현\s*제\s*표", "현재표", t)
+    t = re.sub(r"현재\s*표", "현재표", t)
+    t = re.sub(r"명\s+별", "명별", t)
+    t = re.sub(r"코드\s+별", "코드별", t)
+    t = re.sub(r"\s+별", "별", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def _current_table_norm_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -2878,12 +2920,17 @@ def _current_table_should_block_llm_fallback(text: str) -> bool:
     - handler가 처리하지 못하면 명확한 안내를 반환하고 LLM 분석으로 넘기지 않는다.
     - "분석해줘/요약해줘/의미 설명" 같은 서술형 질문만 LLM fallback 허용 후보가 된다.
     """
-    compact = re.sub(r"\s+", "", str(text or ""))
+    normalized = _normalize_current_table_followup_input(text)
+    compact = re.sub(r"\s+", "", str(normalized or ""))
     if not compact:
         return True
 
+    if "현재표" in compact and "별" in compact and any(w in compact for w in ("분석", "집계", "요약")):
+        return True
+
     hard_keywords = (
-        "목록", "상세", "상세표", "표", "테이블", "TOP", "top", "상위",
+        "목록", "리스트", "상세", "상세표", "보여", "보여줘", "필터", "만",
+        "표", "테이블", "TOP", "top", "상위",
         "월별", "일자별", "날짜별", "요일별",
         "거래처별", "제품별", "품목별", "매입처별", "매출처별", "제조사별", "재고위치별",
         "이상", "이하", "초과", "미만", "같음", "동일", "=",
@@ -3068,6 +3115,7 @@ def _current_table_push_table(
     source_table_key: str = "",
     source_rows: int | None = None,
     display_limit: int | None = None,
+    extra_meta: dict | None = None,
 ) -> bool:
         
     from app.ui.chat_middleware import push_sims_result_to_chat
@@ -3165,6 +3213,8 @@ def _current_table_push_table(
             "table_profile": "current_table_followup",
         },
     }
+    if isinstance(extra_meta, dict) and extra_meta:
+        payload["meta"].update(extra_meta)
 
     push_sims_result_to_chat(payload, action)
     return True
@@ -3516,7 +3566,7 @@ def _try_handle_current_table_dataframe_followup(
     """
     '현재표 ... 표로 만들어줘' 계열을 LLM 답변이 아니라 실제 pandas 표로 생성한다.
     """
-    t = str(text or "").strip()
+    t = _normalize_current_table_followup_input(text)
     compact = t.replace(" ", "")
 
     if not t:
@@ -3546,7 +3596,13 @@ def _try_handle_current_table_dataframe_followup(
             "표로",
             "표 ",
             "상세표",
+            "상세",
             "목록",
+            "리스트",
+            "보여",
+            "보여줘",
+            "필터",
+            "만",
             "TOP",
             "top",
             "상위",
@@ -7735,7 +7791,8 @@ if user_input and user_input.strip():
 
     deferred_current_followup = False    
 
-    compact_current = re.sub(r"\s+", "", str(user_input or ""))
+    current_table_followup_input = _normalize_current_table_followup_input(user_input)
+    compact_current = re.sub(r"\s+", "", str(current_table_followup_input or ""))
 
     # ✅ 분석/KPI 명시 조회는 최근 SIMS 결과가 있어도 LLM 후속질문으로 보내지 않는다.
     # 예:
@@ -7809,7 +7866,7 @@ if user_input and user_input.strip():
         # - 현재표 거래처별 매출 TOP 20 표로 만들어줘
         try:
             handled = _try_handle_current_table_dataframe_followup(
-                user_input,
+                current_table_followup_input,
                 room=current_room,
                 make_ts=make_ts,
                 next_seq=_next_seq,
@@ -7826,14 +7883,14 @@ if user_input and user_input.strip():
             # 따라서 여기서 바로 LLM fallback으로 보내지 말고,
             # panel render 이후 한 번 더 현재표 후속분석을 재시도한다.
             st.session_state["__deferred_current_table_followup"] = {
-                "user_input": user_input,
+                "user_input": current_table_followup_input,
                 "ts": time.time(),
                 "retry": 0,
             }
             deferred_current_followup = True
             log.debug(
                 "[chat.followup_table] defer current-table followup until after panel render: %r",
-                user_input[:80],
+                current_table_followup_input[:80],
             )            
 
         elif (
@@ -8098,32 +8155,28 @@ with st.container():
                 or "SIMS 결과"
             )
 
+            # 저장된 SIMS 표도 chat_middleware의 기존 렌더러로 다시 그린다.
+            # 그래야 조회조건/헤더/summary_md/음수 빨간색/부족등급 굵게/다운로드/LLM 버튼이 유지된다.
+            # df가 없으면 chat_middleware가 meta 기반 만료 요약 카드로 fallback한다.
+            table_item = dict(m)
+            table_item["type"] = "table"
+            table_item["role"] = "assistant"
             if df is not None:
-                # 저장된 SIMS 표도 chat_middleware의 기존 렌더러로 다시 그린다.
-                # 그래야 조회조건/헤더/summary_md/음수 빨간색/부족등급 굵게/다운로드/LLM 버튼이 유지된다.
-                table_item = dict(m)
-                table_item["type"] = "table"
-                table_item["role"] = "assistant"
                 table_item["data"] = df
-                table_item["meta"] = meta
-                table_item["title"] = title_text
-                table_item["action"] = (
-                    m.get("action")
-                    or meta.get("action")
-                    or table_item["title"]
-                )
-                table_item["params"] = (
-                    m.get("params")
-                    or meta.get("params")
-                    or {}
-                )
+            table_item["meta"] = meta
+            table_item["title"] = title_text
+            table_item["action"] = (
+                m.get("action")
+                or meta.get("action")
+                or table_item["title"]
+            )
+            table_item["params"] = (
+                m.get("params")
+                or meta.get("params")
+                or {}
+            )
 
-                render_sims_chat_item(table_item)
-
-            else:
-                with st.chat_message("assistant"):
-                    st.markdown(m.get("content") or "📊 SIMS 결과")
-                    st.info("표 데이터가 세션에서 만료되었습니다. 같은 조회를 다시 실행해 주세요.")
+            render_sims_chat_item(table_item)
 
             return True
 
@@ -8164,6 +8217,13 @@ with st.container():
 
     # (A) 이번 rerun에서 점프할 앵커(검색 패널에서 set) 한 번만 소비
     _jump_to = st.session_state.pop("__scroll_to_msg", None)
+
+    # 이번 화면 렌더 사이클에서 SIMS 결과 카드는 1회만 그린다.
+    # history/pending/immediate render가 같은 table_key를 동시에 잡아도 중복 출력하지 않기 위한 set.
+    try:
+        st.session_state["__chat_rendered_sims_keys_this_run"] = set()
+    except Exception:
+        pass
 
     # 이번 rerun에서 history 영역에 이미 렌더되는 메시지 ID.
     # render_pending_chat_items()에서 같은 SIMS 표를 한 번 더 그리지 않도록 사용한다.

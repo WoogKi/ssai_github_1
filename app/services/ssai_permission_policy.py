@@ -86,6 +86,8 @@ ACTION_PERMISSION_MAP: dict[str, str] = {
     # 분석/KPI
     "품목별 매출 추세 분석": "KPI_READ",
     "품목별 매출 추세 요약표": "KPI_READ",
+    "제약사별 매출 추세 분석": "KPI_READ",
+    "제약사별 매출 추세 분석 요약표": "KPI_READ",
     "품목별 매출 예상": "KPI_READ",
     "품목별 재고부족현황": "KPI_READ",
 }

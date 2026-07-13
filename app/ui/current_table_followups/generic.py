@@ -179,8 +179,8 @@ def _main_columns_first(out: pd.DataFrame, cols: tuple[str, ...]) -> pd.DataFram
 # ---------------------------------------------------------------------
 _COMMON_FILTER_DETAIL_WORDS = (
     "상세", "상세히", "상세하게", "상세표",
-    "목록", "리스트", "표", "보여", "보여줘", "보여주세요",
-    "조회", "검색", "찾아", "찾아줘", "필터", "추출", "걸러",
+    "목록", "리스트", "보여", "보여줘", "보여주세요",
+    "조회", "검색", "찾아", "찾아줘", "필터", "추출", "걸러", "만",
 )
 
 _COMMON_FILTER_VALUE_SUFFIXES = (
@@ -198,12 +198,35 @@ _COMMON_FILTER_SKIP_COLUMNS = {
 }
 
 
+def _normalize_common_filter_query(query: str) -> str:
+    t = str(query or "").strip()
+    if not t:
+        return ""
+    t = re.sub(r"현\s*제\s*표", "현재표", t)
+    t = re.sub(r"현재\s*표", "현재표", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _common_filter_body(query: str) -> str:
+    compact_query = _compact(_normalize_common_filter_query(query))
+    for anchor in ("현재표", "현재조회결과", "현재결과"):
+        compact_query = compact_query.replace(anchor, "")
+    return compact_query
+
+
 def _has_common_filter_intent(query: str) -> bool:
-    compact_query = _compact(query)
-    if "현재표" not in compact_query and "현재표" not in str(query or ""):
+    normalized = _normalize_common_filter_query(query)
+    compact_query = _compact(normalized)
+    if not any(anchor in compact_query for anchor in ("현재표", "현재조회결과", "현재결과")):
         # dispatcher가 현재표 질문만 태우지만, 방어적으로 앵커를 확인한다.
         return False
-    return any(w in compact_query for w in _COMMON_FILTER_DETAIL_WORDS)
+    body = _common_filter_body(normalized)
+    if any(w in body for w in _COMMON_FILTER_DETAIL_WORDS):
+        return True
+    return bool(re.search(r"\d", body)) and any(
+        w in body
+        for w in ("이상", "이하", "초과", "미만", "같다", "동일", "다르다", ">=", "<=", ">", "<", "==", "!=")
+    )
 
 
 def _column_filter_aliases(col: str) -> list[str]:
@@ -226,6 +249,25 @@ def _column_filter_aliases(col: str) -> list[str]:
 
     # 코드 컬럼은 값 필터 대상이 될 수 있으므로 '코드' 제거 alias는 만들지 않는다.
     # '제품명'의 alias '제품'은 너무 넓지만, 현재표 필터 질문에서는 유용하다.
+    if raw in {"제품명", "품목명", "상품명"}:
+        _add("제품")
+        _add("품목")
+        _add("상품")
+    if raw == "규격":
+        _add("제품규격")
+
+    alias_map = {
+        "제약사명": ("제약사", "제조사", "제조사명"),
+        "제조사명": ("제조사", "제약사", "제약사명"),
+        "추세판정": ("판정", "추세", "추세판정"),
+        "분석자료원": ("자료원", "분석자료원"),
+        "기간구분": ("기간", "기간구분"),
+        "당월 진척률": ("당월진척률", "진척률"),
+        "평가월 진척률": ("평가월진척률", "달성률", "진척률"),
+        "총매출액": ("매출액", "총매출", "매출"),
+    }
+    for extra in alias_map.get(raw, ()):
+        _add(extra)
 
     # 숫자 조건에서는 사용자가 "현재재고수량" 대신 "재고수량"처럼
     # 업무식 짧은 명칭을 쓰는 경우가 많다. 단, 너무 과한 alias는 오탐을 만들 수 있으므로
@@ -346,6 +388,9 @@ def _common_numeric_filter_op(text: str) -> tuple[str, float, str, str]:
     if any(w in compact for w in ("미만", "보다작", "<")):
         return "<", threshold, "미만", threshold_label
 
+    if any(w in compact for w in ("다르다", "다른", "!=", "<>")):
+        return "!=", threshold, "다름", threshold_label
+
     if any(w in compact for w in ("같은", "같음", "동일", "인것", "인거", "=", "==")):
         return "==", threshold, "같음", threshold_label
 
@@ -434,6 +479,8 @@ def _apply_numeric_mask(nums: pd.Series, op: str, threshold: float) -> pd.Series
         return nums < threshold
     if op == "==":
         return nums == threshold
+    if op == "!=":
+        return nums != threshold
     return pd.Series([False] * len(nums), index=nums.index, dtype="bool")
 
 
@@ -529,6 +576,57 @@ def _display_filter_value(value: str) -> str:
     return str(value or "").strip() or "(빈값)"
 
 
+def _available_common_filter_columns(df: pd.DataFrame, limit: int = 40) -> list[str]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+
+    available: list[str] = []
+    for col in [str(c) for c in df.columns]:
+        if col in _COMMON_FILTER_SKIP_COLUMNS:
+            continue
+        if col not in available:
+            available.append(col)
+        if len(available) >= limit:
+            break
+    return available
+
+
+def _extract_common_filter_candidate(query: str) -> str:
+    if not _has_common_filter_intent(query):
+        return ""
+
+    body = _common_filter_body(query)
+    if not body:
+        return ""
+
+    for suffix in sorted(_COMMON_FILTER_VALUE_SUFFIXES + _COMMON_FILTER_DETAIL_WORDS, key=len, reverse=True):
+        sx = _norm_col_name(suffix)
+        if sx and body.endswith(sx):
+            body = body[: -len(sx)].strip()
+
+    known_names = (
+        "제조사명", "제조사",
+        "제품그룹명", "제품그룹",
+        "제품구분명", "제품구분",
+        "제품분류명", "제품분류",
+        "매입처명", "매입처",
+        "거래처명", "거래처",
+        "재고적용처명", "재고적용처",
+        "재고위치명", "재고위치",
+        "매출구분명", "매출구분",
+        "제품코드", "품목코드", "제조사코드", "거래처코드",
+        "제품명", "품목명", "상품명", "제품", "품목", "상품",
+        "규격",
+    )
+    for name in known_names:
+        n = _norm_col_name(name)
+        if n and body.startswith(n):
+            return name
+
+    m = re.match(r"([가-힣A-Za-z0-9_]+)", body)
+    return m.group(1) if m else ""
+
+
 def _add_seq_column(out: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(out, pd.DataFrame):
         return out
@@ -537,6 +635,271 @@ def _add_seq_column(out: pd.DataFrame) -> pd.DataFrame:
         out = out.drop(columns=["순번"])
     out.insert(0, "순번", range(1, len(out) + 1))
     return out
+
+
+# ---------------------------------------------------------------------
+# 현재표 공통 컬럼 집계
+# ---------------------------------------------------------------------
+_COMMON_GROUP_WORDS = ("별", "기준", "집계", "분석", "현황", "요약")
+_COMMON_GROUP_SUM_INCLUDE = (
+    "공급가액",
+    "세액",
+    "총매출액",
+    "매출액",
+    "금액",
+    "수량",
+    "집계건수",
+    "출고건수",
+    "예상매출",
+    "잔여예상",
+)
+_COMMON_GROUP_SUM_EXCLUDE = (
+    "진척률",
+    "달성률",
+    "증감률",
+    "평균",
+    "단가",
+    "완료월수",
+    "커버월수",
+    "비율",
+)
+
+
+def _normalize_common_group_query(query: str) -> str:
+    t = _normalize_common_filter_query(query)
+    return re.sub(r"\s+", "", t)
+
+
+def _has_common_group_intent(query: str) -> bool:
+    compact = _normalize_common_group_query(query)
+    if not any(anchor in compact for anchor in ("현재표", "현재조회결과", "현재결과")):
+        return False
+    body = _common_filter_body(query)
+    return any(w in body for w in ("별", "집계", "분석", "현황", "요약"))
+
+
+def _group_aliases(col: str) -> list[str]:
+    aliases = _column_filter_aliases(col)
+    raw = str(col or "").strip()
+    extra = {
+        "제약사명": ("제약사", "제조사", "제조사명"),
+        "제조사명": ("제조사", "제약사", "제약사명"),
+        "추세판정": ("추세", "판정", "추세판정"),
+        "분석자료원": ("자료원",),
+        "기간구분": ("기간",),
+    }.get(raw, ())
+    for v in extra:
+        n = _norm_col_name(v)
+        if n and n not in aliases:
+            aliases.append(n)
+    return aliases
+
+
+def _strip_group_words(value: str) -> str:
+    out = _norm_col_name(value)
+    for w in _COMMON_GROUP_WORDS:
+        out = out.replace(_norm_col_name(w), "")
+    return out
+
+
+def _find_common_group_column(df: pd.DataFrame, query: str) -> str:
+    if not isinstance(df, pd.DataFrame) or df.empty or not _has_common_group_intent(query):
+        return ""
+
+    compact = _normalize_common_group_query(query)
+    body = _common_filter_body(query)
+    body_norm = _norm_col_name(body)
+    body_stripped = _strip_group_words(body)
+    candidates: list[tuple[int, int, str]] = []
+
+    for col in [str(c) for c in df.columns]:
+        if col in _COMMON_FILTER_SKIP_COLUMNS:
+            continue
+        aliases = _group_aliases(col)
+        col_norm = _norm_col_name(col)
+        if body_norm == col_norm or body_stripped == col_norm:
+            candidates.append((10_000, len(col_norm), col))
+            continue
+        for alias in aliases:
+            if not alias:
+                continue
+            if alias in compact or alias in body_norm or alias == body_stripped:
+                candidates.append((compact.find(alias) if alias in compact else 9999, len(alias), col))
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: (x[1], -x[0]), reverse=True)
+    return candidates[0][2]
+
+
+def _is_sum_candidate_column(col: str) -> bool:
+    s = str(col or "").strip()
+    if not s or s == "순번":
+        return False
+    if any(w in s for w in _COMMON_GROUP_SUM_EXCLUDE):
+        return False
+    return any(w in s for w in _COMMON_GROUP_SUM_INCLUDE)
+
+
+def _distinct_label_for_group(df: pd.DataFrame) -> tuple[str, str]:
+    for col, label in [
+        ("제약사명", "제약사수"),
+        ("제조사명", "제조사수"),
+        ("제품명", "제품수"),
+        ("제품코드", "제품수"),
+        ("거래처명", "거래처수"),
+        ("매입처명", "매입처수"),
+    ]:
+        if col in df.columns:
+            return col, label
+    return "", "고유값수"
+
+
+def _trend_sort_key(value: Any) -> int:
+    order = {
+        "증가": 1,
+        "신규/증가": 2,
+        "안정": 3,
+        "감소": 4,
+        "반품주의": 5,
+        "자료부족": 6,
+        "비교자료 부족": 6,
+        "미분류": 6,
+        "(미지정)": 6,
+    }
+    return order.get(str(value or "").strip(), 99)
+
+
+def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    work = df.copy()
+    work[group_col] = work[group_col].map(_clean_group_value)
+    if group_col == "추세판정":
+        work[group_col] = work[group_col].replace({"(미지정)": "자료부족", "": "자료부족"})
+
+    g = work.groupby(group_col, dropna=False)
+    out = pd.DataFrame({group_col: g.size().index.astype(str), "행수": g.size().values})
+
+    distinct_col, distinct_label = _distinct_label_for_group(work)
+    if distinct_col and distinct_col in work.columns:
+        out[distinct_label] = g[distinct_col].nunique(dropna=True).values
+        total_basis = max(int(work[distinct_col].nunique(dropna=True)), 1)
+        ratio_basis = out[distinct_label]
+    else:
+        out[distinct_label] = out["행수"]
+        total_basis = max(int(len(work)), 1)
+        ratio_basis = out["행수"]
+    out["비율"] = pd.to_numeric(ratio_basis, errors="coerce").fillna(0) / total_basis * 100
+
+    sum_cols: list[str] = []
+    for col in [str(c) for c in work.columns]:
+        if col == group_col or col in out.columns or col in _COMMON_FILTER_SKIP_COLUMNS:
+            continue
+        if not _is_sum_candidate_column(col):
+            continue
+        nums = _to_numeric_for_common_filter(work[col])
+        if nums.notna().sum() <= 0:
+            continue
+        work[f"__sum_{len(sum_cols)}"] = nums
+        out[col] = g[f"__sum_{len(sum_cols)}"].sum().values
+        sum_cols.append(col)
+
+    progress_pairs = [
+        ("당월 현재매출", "당월 예상매출", "당월 진척률"),
+        ("평가월 매출", "평가월 예상매출", "평가월 진척률"),
+        ("월시점 실제매출", "월시점 예상매출", "월시점 달성률"),
+    ]
+    for actual_col, expected_col, progress_col in progress_pairs:
+        if actual_col in work.columns and expected_col in work.columns:
+            work["__actual_for_progress"] = _to_numeric_for_common_filter(work[actual_col])
+            work["__expected_for_progress"] = _to_numeric_for_common_filter(work[expected_col])
+            actual_sum = g["__actual_for_progress"].sum()
+            expected_sum = g["__expected_for_progress"].sum()
+            progress = actual_sum.divide(expected_sum.where(expected_sum != 0)).mul(100).fillna(0)
+            out[progress_col] = out[group_col].map(progress.to_dict()).fillna(0).astype(float)
+            break
+
+    front = ["순번", group_col, distinct_label, "행수", "비율"]
+    preferred = [
+        "총매출공급가액",
+        "총매출세액",
+        "총매출액",
+        "완료월총매출",
+        "당월 현재매출",
+        "평가월 매출",
+        "당월 예상매출",
+        "평가월 예상매출",
+        "당월 잔여예상",
+        "평가월 잔여예상",
+        "당월 진척률",
+        "평가월 진척률",
+    ]
+    if group_col == "추세판정":
+        out["_sort"] = out[group_col].map(_trend_sort_key)
+        out = out.sort_values(["_sort", group_col], ascending=[True, True]).drop(columns=["_sort"])
+    else:
+        out = out.sort_values([distinct_label, "행수", group_col], ascending=[False, False, True])
+    out = _add_seq_column(out)
+    order = [c for c in front if c in out.columns] + [c for c in preferred if c in out.columns and c not in front]
+    rest = [c for c in out.columns if c not in order]
+    return out.loc[:, order + rest]
+
+
+def handle_common_column_group_followup(
+    *,
+    df: pd.DataFrame,
+    query: str,
+    top_n: int,
+    table_key: str,
+    source_action: str,
+    helpers: dict[str, Callable[..., Any]],
+    log: Any,
+) -> bool:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+
+    t = str(query or "").strip()
+    group_col = _find_common_group_column(df, t)
+    if not group_col:
+        return False
+
+    push_table = helpers.get("push_table")
+    if not callable(push_table):
+        return False
+
+    out = _build_common_group_summary(df, group_col)
+    has_top = any(w in _compact(t) for w in ("TOP", "top", "상위"))
+    if has_top and top_n:
+        out = out.head(int(top_n)).copy()
+        out = _add_seq_column(out)
+
+    title = f"현재표 {group_col}별 집계"
+    try:
+        log.info(
+            "[chat.followup.generic_group] query=%r source_action=%r group_column=%r source_rows=%s result_rows=%s table_key=%s",
+            t,
+            source_action,
+            group_col,
+            len(df),
+            len(out),
+            table_key,
+        )
+    except Exception:
+        pass
+
+    return bool(push_table(
+        title=title,
+        action=title,
+        df=out,
+        query_summary=f"현재표 / {group_col}별 집계 / 전체 {len(df):,}건 기준",
+        source_query=t,
+        source_table_key=table_key,
+        source_rows=len(df),
+        display_limit=top_n if has_top else None,
+        extra_meta={
+            "group_column": group_col,
+            "source_row_count": int(len(df)),
+        },
+    ))
 
 
 def handle_common_column_filter_followup(
@@ -629,6 +992,17 @@ def handle_common_column_filter_followup(
 
         try:
             log.info(
+                "[chat.followup.generic_filter] query=%r source_action=%r filter_column=%r operator=%s filter_value=%s source_rows=%s result_rows=%s table_key=%s",
+                t,
+                source_action,
+                num_col,
+                op,
+                threshold_label,
+                len(df),
+                filtered_rows,
+                table_key,
+            )
+            log.info(
                 "[chat.followup_table] common numeric filter built source_action=%r col=%r op=%s threshold=%s source_rows=%s filtered_rows=%s rows=%s table_key=%s",
                 source_action,
                 num_col,
@@ -651,11 +1025,42 @@ def handle_common_column_filter_followup(
             source_table_key=table_key,
             source_rows=len(df),
             display_limit=top_n if has_top else None,
+            extra_meta={
+                "filter_column": num_col,
+                "filter_operator": op,
+                "filter_value": threshold_label,
+                "source_row_count": int(len(df)),
+            },
         ))
 
     # 2) 문자/코드값 포함 필터: 현재표 제조사명 한미 상세히 보여줘
     col, value_norm = _find_common_column_filter(df, t)
     if not col or col not in df.columns or not value_norm:
+        if callable(push_notice) and _has_common_filter_intent(t):
+            candidate = _extract_common_filter_candidate(t)
+            if candidate:
+                available = _available_common_filter_columns(df)
+                available_text = ", ".join(available)
+                try:
+                    log.info(
+                        "[chat.followup_table] current table filter column not found query=%r candidate=%r available=%r",
+                        t,
+                        candidate,
+                        available_text,
+                    )
+                except Exception:
+                    pass
+                return bool(push_notice(
+                    title=f"현재표 {candidate} 상세표 불가",
+                    action=f"현재표 {candidate} 상세표 불가",
+                    message=(
+                        f"현재표에는 '{candidate}' 컬럼이 없어 상세표를 만들 수 없습니다.\n"
+                        "현재표에서 가능한 컬럼은 다음과 같습니다:\n"
+                        f"{available_text or '(확인 가능한 컬럼 없음)'}"
+                    ),
+                    query_summary=f"현재표 / {candidate} 상세표 불가 / 컬럼 없음",
+                    source_query=t,
+                ))
         return False
 
     try:
@@ -673,12 +1078,25 @@ def handle_common_column_filter_followup(
     filtered_rows = int(len(filtered))
 
     if filtered_rows <= 0:
+        try:
+            log.info(
+                "[chat.followup_table] current table filter no rows query=%r column=%r value=%r source_rows=%s",
+                t,
+                col,
+                value_label,
+                len(df),
+            )
+        except Exception:
+            pass
         if not callable(push_notice):
             return False
         return bool(push_notice(
             title=f"현재표 {col} {value_label} 자료 없음",
             action=f"현재표 {col} {value_label} 자료 없음",
-            message=f"현재표에서 {col} 컬럼에 '{value_label}' 값이 포함된 자료가 없습니다.",
+            message=(
+                f"현재표에서 {col}에 '{value_label}'이 포함된 행을 찾지 못했습니다.\n"
+                "다른 검색어로 다시 시도해 주세요."
+            ),
             query_summary=f"현재표 / {col}={value_label} / 전체 {len(df):,}건 중 0건",
             source_query=t,
         ))
@@ -687,24 +1105,32 @@ def handle_common_column_filter_followup(
     out = filtered.copy()
     if has_top and top_n:
         out = out.head(int(top_n)).copy()
-    out = _add_seq_column(out)
 
     title = (
         f"현재표 {col} {value_label} TOP {top_n}"
         if has_top
-        else f"현재표 {col} {value_label} 목록"
+        else f"현재표 {col} '{value_label}' 상세표"
     )
 
     try:
         log.info(
-            "[chat.followup_table] common column filter built source_action=%r col=%r value=%r source_rows=%s filtered_rows=%s rows=%s table_key=%s",
+            "[chat.followup.generic_filter] query=%r source_action=%r filter_column=%r operator=%s filter_value=%r source_rows=%s result_rows=%s table_key=%s",
+            t,
             source_action,
+            col,
+            "contains",
+            value_label,
+            len(df),
+            filtered_rows,
+            table_key,
+        )
+        log.info(
+            "[chat.followup_table] current table filter detail detected query=%r column=%r value=%r source_rows=%s matched_rows=%s",
+            t,
             col,
             value_label,
             len(df),
             filtered_rows,
-            len(out),
-            table_key,
         )
     except Exception:
         pass
@@ -718,6 +1144,12 @@ def handle_common_column_filter_followup(
         source_table_key=table_key,
         source_rows=len(df),
         display_limit=top_n if has_top else None,
+        extra_meta={
+            "filter_column": col,
+            "filter_operator": "contains",
+            "filter_value": value_label,
+            "source_row_count": int(len(df)),
+        },
     ))
 
 

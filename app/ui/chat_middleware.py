@@ -22,12 +22,79 @@ from app.sims.views.rddbc_io_shared import (
     _build_io_display_styler,
 )
 
-from app.ui.sims_table_display import build_sims_table_display_config
+from app.ui.sims_table_display import (
+    build_sims_table_display_config,
+    log_sims_table_mode,
+    log_sims_table_render,
+    normalize_display_df_for_streamlit,
+)
 
 import datetime as dt
 import time
 
 log = logging.getLogger("ssai")
+
+_FAST_TABLE_INT_KPI_COLS = {
+    "완료월총매출",
+    "월평균매출",
+    "완료월평균매출",
+    "당월 현재매출",
+    "당월 예상매출",
+    "당월 잔여예상",
+    "전월대비매출",
+    "총매출공급가액",
+    "매출공급가액",
+    "매출세액",
+    "매출합계",
+    "평가월 현재매출",
+    "평가월 예상매출",
+    "평가월 잔여예상",
+    "다음월예상매출",
+    "3개월예상매출",
+    "6개월예상매출",
+    "부족예상금액",
+    "완료월수",
+    "매출발생월수",
+    "매입처수",
+    "총집계건수",
+}
+
+_FAST_TABLE_DECIMAL_KPI_COLS = {
+    "최근3개월평균매출",
+    "최근6개월평균매출",
+    "평균공급단가",
+    "완료월평균출고수량",
+    "최근3개월평균출고수량",
+    "최근6개월평균출고수량",
+    "당월 예상출고수량",
+    "당월 잔여예상출고수량",
+    "예상월말재고수량",
+    "부족예상수량",
+}
+
+_FAST_TABLE_PERCENT_KPI_COLS = {
+    "당월 진척률",
+    "평가월 진척률",
+    "전월대비매출증감률",
+    "최근3개월증감률",
+    "월시점 최근3개월증감률",
+    "적용증감률",
+    "월시점 증감률",
+    "월시점 적용증감률",
+    "월시점 달성률",
+    "최근3개월수량증감률",
+    "수요증감률",
+    "수요적용증감률",
+    "평가월 수요진척률",
+    "당월 출고진척률",
+    "당월 재고충족률",
+}
+
+_FAST_TABLE_NUMERIC_KPI_COLS = (
+    _FAST_TABLE_INT_KPI_COLS
+    | _FAST_TABLE_DECIMAL_KPI_COLS
+    | _FAST_TABLE_PERCENT_KPI_COLS
+)
 
 
 def _safe_log_value(value: Any, limit: int = 120) -> str:
@@ -289,6 +356,123 @@ def _sanitize_dataframe_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: str) -> None:
+    money_cols = {
+        "완료월총매출",
+        "월평균매출",
+        "완료월평균매출",
+        "당월 현재매출",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "전월대비매출",
+        "총매출공급가액",
+        "매출공급가액",
+        "매출세액",
+        "매출합계",
+        "평가월 현재매출",
+        "평가월 예상매출",
+        "평가월 잔여예상",
+        "다음월예상매출",
+        "3개월예상매출",
+        "6개월예상매출",
+        "부족예상금액",
+    }
+    decimal_money_cols = {
+        "최근3개월평균매출",
+        "최근6개월평균매출",
+        "평균공급단가",
+        "완료월평균출고수량",
+        "최근3개월평균출고수량",
+        "최근6개월평균출고수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+        "예상월말재고수량",
+        "부족예상수량",
+    }
+    percent_cols = {
+        "당월 진척률",
+        "평가월 진척률",
+        "전월대비매출증감률",
+        "최근3개월증감률",
+        "월시점 최근3개월증감률",
+        "적용증감률",
+        "월시점 증감률",
+        "월시점 적용증감률",
+        "월시점 달성률",
+        "최근3개월수량증감률",
+        "수요증감률",
+        "수요적용증감률",
+        "평가월 수요진척률",
+        "당월 출고진척률",
+        "당월 재고충족률",
+    }
+
+    try:
+        workbook = getattr(writer, "book", None)
+        worksheet = writer.sheets.get(sheet_name)
+        if worksheet is None:
+            return
+
+        if workbook is not None and hasattr(workbook, "add_format"):
+            money_fmt = workbook.add_format({"num_format": "#,##0"})
+            pct_fmt = workbook.add_format({"num_format": "0.00\\%"})
+            header_fmt = workbook.add_format({"bold": True, "bg_color": "#E5E7EB", "border": 1})
+            try:
+                worksheet.freeze_panes(1, 0)
+                if len(df.columns) > 0:
+                    worksheet.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
+                for idx, col in enumerate(df.columns):
+                    worksheet.write(0, idx, col, header_fmt)
+            except Exception:
+                pass
+            for idx, col in enumerate(df.columns):
+                name = str(col or "").strip()
+                width = 24 if name in {"제약사명", "분석자료원"} else None
+                if name in money_cols:
+                    worksheet.set_column(idx, idx, width, money_fmt)
+                elif name in decimal_money_cols:
+                    dec_fmt = workbook.add_format({"num_format": "#,##0.00"})
+                    worksheet.set_column(idx, idx, width, dec_fmt)
+                elif name in percent_cols:
+                    worksheet.set_column(idx, idx, width, pct_fmt)
+                elif width:
+                    worksheet.set_column(idx, idx, width)
+            return
+
+        try:
+            from openpyxl.styles import Font, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+            worksheet.freeze_panes = "A2"
+            if len(df.columns) > 0:
+                worksheet.auto_filter.ref = worksheet.dimensions
+            header_fill = PatternFill("solid", fgColor="E5E7EB")
+            thin = Side(style="thin", color="D1D5DB")
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+                cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+            for idx, col in enumerate(df.columns, start=1):
+                if str(col or "").strip() in {"제약사명", "분석자료원"}:
+                    worksheet.column_dimensions[get_column_letter(idx)].width = 24
+        except Exception:
+            pass
+
+        for idx, col in enumerate(df.columns, start=1):
+            name = str(col or "").strip()
+            if name in money_cols:
+                fmt = "#,##0"
+            elif name in decimal_money_cols:
+                fmt = "#,##0.00"
+            elif name in percent_cols:
+                fmt = "0.00\\%"
+            else:
+                continue
+            for row in range(2, len(df) + 2):
+                worksheet.cell(row=row, column=idx).number_format = fmt
+    except Exception:
+        log.exception("[chat] apply excel number formats failed")
+
+
 # ---------------------------------------------------------------------
 # Security: 표/다운로드/LLM 컨텍스트 민감 컬럼 방어막
 # ---------------------------------------------------------------------
@@ -318,6 +502,7 @@ _SENSITIVE_COLUMN_TOKENS = (
 
 def _is_sensitive_column(col: object) -> bool:
     s = str(col or "").strip()
+    s_lower = s.lower()
     if not s:
         return False
     if s in _SENSITIVE_COLUMN_EXACT:
@@ -352,10 +537,12 @@ def _chat_is_analysis_payload(item: Dict[str, Any], meta: Dict[str, Any], title:
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "제약사별 매출 추세 분석",
+            "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage"}
+        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
 
@@ -402,6 +589,10 @@ def _chat_grade_cell_style(value: Any) -> str:
         return "color:#475569; font-weight:800;"
     if v == "신규확인":
         return "color:#6d28d9; font-weight:800;"
+    if any(token in v for token in ("부족", "위험", "주의")):
+        return "color:#be123c; font-weight:800;"
+    if any(token in v for token in ("정상", "충분", "양호")):
+        return "color:#166534; font-weight:800;"
 
     return ""
 # 분석/KPI 등급 컬럼이 있는 DataFrame 스타일러에 스타일을 적용하는 함수
@@ -417,7 +608,7 @@ def _apply_chat_analysis_grade_style(styler, df: pd.DataFrame):
 
     style_df = pd.DataFrame("", index=df.index, columns=df.columns)
 
-    for grade_col in ["추세판정", "예상등급", "부족등급"]:
+    for grade_col in ["추세판정", "예상등급", "부족등급", "재고부족", "재고등급", "판정", "판정결과"]:
         if grade_col not in df.columns:
             continue
 
@@ -427,9 +618,11 @@ def _apply_chat_analysis_grade_style(styler, df: pd.DataFrame):
                 style_df.loc[idx, grade_col] = extra
 
     try:
-        return styler.apply(lambda _: style_df, axis=None)
+        styler = styler.apply(lambda _: style_df, axis=None)
     except Exception:
-        return styler
+        pass
+
+    return styler
 
 
 # 채팅 표에서 Styler 대신 빠른 st.dataframe 렌더를 쓸지 판단하는 함수
@@ -446,6 +639,109 @@ def _chat_is_large_table_for_fast_render(df: pd.DataFrame) -> bool:
 
     threshold = int(os.getenv("SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD", os.getenv("SIMS_FAST_TABLE_CELL_THRESHOLD", "6000")))
     return cells >= threshold
+
+
+def _chat_is_nlq_table_meta(meta: Dict[str, Any] | None) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    return bool(
+        meta.get("nlq")
+        or meta.get("analysis_nlq")
+        or meta.get("master_nlq")
+        or meta.get("io_nlq")
+        or meta.get("nlq_query")
+    )
+
+
+def _chat_is_stock_io_action(action_name: str) -> bool:
+    s = str(action_name or "").strip()
+    return any(w in s for w in ("제품수불현황", "제품재고현황", "제품수불", "제품재고"))
+
+
+def _chat_log_stock_table_render(
+    *,
+    action_name: str,
+    rows: int,
+    cols: int,
+    fast: bool,
+) -> None:
+    try:
+        if fast:
+            log.info(
+                "[stock.table] fast table mode action=%s rows=%s cols=%s cells=%s",
+                action_name,
+                rows,
+                cols,
+                rows * cols,
+            )
+        else:
+            log.info(
+                "[stock.table] small table style enabled action=%s rows=%s cols=%s",
+                action_name,
+                rows,
+                cols,
+            )
+    except Exception:
+        pass
+
+
+def _chat_log_nlq_table_render(
+    *,
+    action_name: str,
+    table_key: str,
+    rows: int,
+    cols: int,
+    fast: bool,
+) -> None:
+    try:
+        log.info(
+            "[chat.nlq.table] render action=%s rows=%s table_key=%s small=%s fast=%s",
+            action_name,
+            rows,
+            table_key,
+            not fast,
+            fast,
+        )
+        if fast:
+            log.info(
+                "[chat.nlq.table] fast table mode action=%s rows=%s cols=%s cells=%s",
+                action_name,
+                rows,
+                cols,
+                rows * cols,
+            )
+        else:
+            log.info(
+                "[chat.nlq.table] small table style enabled action=%s rows=%s cols=%s",
+                action_name,
+                rows,
+                cols,
+            )
+    except Exception:
+        pass
+
+
+def _render_nlq_table_meta_caption(meta: Dict[str, Any]) -> None:
+    if not _chat_is_nlq_table_meta(meta):
+        return
+
+    try:
+        nlq_query = str(
+            meta.get("nlq_query")
+            or meta.get("question")
+            or meta.get("user_query")
+            or ""
+        ).strip()
+        table_key = str(meta.get("table_key") or "").strip()
+
+        if nlq_query:
+            st.caption(f"NLQ 질문: {nlq_query}")
+        if table_key:
+            st.caption(f"table_key: {table_key}")
+            st.caption("현재표 후속질문 가능")
+    except Exception:
+        pass
+
 
 def _chat_clean_display_none_values(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -469,7 +765,7 @@ def _chat_clean_display_none_values(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in out.columns:
         try:
-            if str(col).strip() == "순번":
+            if str(col).strip() == "순번" or str(col).strip() in _FAST_TABLE_NUMERIC_KPI_COLS:
                 continue
 
             s = out[col].astype("object")
@@ -514,6 +810,9 @@ def _chat_drop_number_config_for_blank_numeric_cols(
         if not has_blank:
             continue
 
+        if str(col or "").strip() in _FAST_TABLE_NUMERIC_KPI_COLS:
+            continue
+
         try:
             is_numeric_like = _chat_is_fast_numeric_column(df, col)
         except Exception:
@@ -534,12 +833,21 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
     - 이름/명칭/일자/등급도 문자 유지
     """
     s = str(col or "").strip()
+    s_lower = s.lower()
 
     if s in {"순번", "조회순번"}:
         return True
 
+    if s in _FAST_TABLE_NUMERIC_KPI_COLS:
+        return True
+
     exclude_words = [
         "코드",
+        "stock_cd",
+        "buy_cd",
+        "physic_cd",
+        "ven_cd",
+        "_cd",
         "ID",
         "번호",
         "일자",
@@ -555,7 +863,7 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
         "부족등급",
         "예상기준",
     ]
-    if any(w in s for w in exclude_words):
+    if any(w in s or w in s_lower for w in exclude_words):
         return False
 
     include_words = [
@@ -623,8 +931,13 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
                 errors="coerce",
             )
 
-            if (
-                s in {"순번", "조회순번"}
+            if s in _FAST_TABLE_PERCENT_KPI_COLS:
+                converted = num
+            elif s in _FAST_TABLE_DECIMAL_KPI_COLS:
+                converted = num.round(2)
+            elif (
+                s in _FAST_TABLE_INT_KPI_COLS
+                or s in {"순번", "조회순번"}
                 or s.endswith("건수")
                 or "품목수" in s
                 or "거래처수" in s
@@ -636,11 +949,13 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
                 or "세액" in s
                 or "가격" in s
             ):
-                converted = num.round(0).astype("object")
+                converted = num.round(0)
             else:
                 converted = num.round(2).astype("object")
 
-            converted.loc[blank_mask] = ""
+            if blank_mask.any() and s not in _FAST_TABLE_NUMERIC_KPI_COLS:
+                converted = converted.astype("object")
+                converted.loc[blank_mask] = ""
 
             out[col] = converted
 
@@ -668,7 +983,13 @@ def _chat_fast_column_config(df: pd.DataFrame) -> dict:
         except Exception:
             pass
 
-        if (
+        if s in _FAST_TABLE_PERCENT_KPI_COLS:
+            cfg[col] = st.column_config.NumberColumn(
+                s,
+                format="%.2f%%",
+                step=0.01,
+            )
+        elif (
             s in {"순번", "조회순번"}
             or s.endswith("건수")
             or "품목수" in s
@@ -709,7 +1030,7 @@ def _render_chat_fast_dataframe(
     분석/KPI 큰 표도 공용 column_config를 사용해서
     좌측 고정 칼럼/컬럼폭/숫자 표시를 유지한다.
     """
-    view_df = _chat_fast_display_df(df)
+    view_df = normalize_display_df_for_streamlit(_chat_fast_display_df(df))
 
     try:
         view_df, column_config, table_width, table_height = build_sims_table_display_config(
@@ -823,12 +1144,17 @@ def _apply_chat_table_profile(df: pd.DataFrame, meta: Dict[str, Any]) -> tuple[p
 
 # 분석/KPI 등급 컬럼 숫자 포맷팅 함수
 # - 숫자 값에서 단위(원/개/건/개월/%)를 제거하고, 천 단위 구분 쉼표와 소수점 2자리까지 포맷팅한다.
-def _chat_header_num(value: Any, unit: str = "") -> str:
+def _chat_header_num(value: Any, unit: str = "", *, decimals: int | None = None) -> str:
+    if decimals is None and unit == "원":
+        decimals = 0
+
     n = _chat_parse_num(value)
     if n is None:
         text = str(value or "").strip()
     else:
-        if abs(n - int(n)) < 1e-9:
+        if decimals is not None:
+            text = f"{n:,.{decimals}f}"
+        elif abs(n - int(n)) < 1e-9:
             text = f"{int(n):,}"
         else:
             text = f"{n:,.2f}".rstrip("0").rstrip(".")
@@ -841,14 +1167,14 @@ def _chat_header_num(value: Any, unit: str = "") -> str:
 # 분석 결과 헤더를 렌더링하는 함수
 # - meta에서 분석 유형(analysis_type)과 관련 통계를 읽어서, 적절한 제목과 주요 지표들을 화면 상단에 렌더링한다.
 # - 이 함수는 채팅 답변의 본문을 렌더링하기 전에 호출하는 것을 권장한다.
-def _chat_metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee") -> None:
+def _chat_metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee", decimals: int | None = None) -> None:
     """
     채팅창 SIMS 분석/KPI 요약 카드.
 
     패널에서 쓰던 상세 요약 카드 UX를 채팅창으로 옮긴 버전이다.
     패널은 입력 전용으로 두고, 결과 요약은 채팅 메시지 안에서만 렌더한다.
     """
-    value_text = _chat_header_num(value, unit)
+    value_text = _chat_header_num(value, unit, decimals=decimals)
 
     html = (
         f'<div style="background:{bg}; border:1px solid {border}; border-radius:10px; '
@@ -963,22 +1289,38 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
 
         c5, c6, c7, c8 = st.columns(4)
         with c5:
-            _chat_metric_card("1개월부족수량", meta.get("sum_shortage_1m_qty"), "개", bg="#fff1f2", border="#fecdd3")
+            _chat_metric_card("평가월 예상수요", meta.get("sum_current_month_expected_out_qty"), "개", bg="#f5f3ff", border="#ddd6fe", decimals=2)
         with c6:
-            _chat_metric_card("2개월부족수량", meta.get("sum_shortage_2m_qty"), "개", bg="#fff7ed", border="#fed7aa")
+            _chat_metric_card("평가월 실제수요", meta.get("sum_current_month_out_qty"), "개", bg="#eff6ff", border="#bfdbfe", decimals=2)
         with c7:
-            _chat_metric_card("3개월부족수량", meta.get("sum_shortage_3m_qty"), "개", bg="#fff7ed", border="#fed7aa")
+            _chat_metric_card("평가월 잔여예상수요", meta.get("sum_current_month_remaining_out_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
         with c8:
+            _chat_metric_card("평가월 수요진척률", meta.get("current_month_demand_progress_pct"), "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+        c9, c10, c11, c12 = st.columns(4)
+        with c9:
+            _chat_metric_card("부족예상수량", meta.get("sum_expected_shortage_qty"), "개", bg="#fff1f2", border="#fecdd3", decimals=2)
+        with c10:
+            _chat_metric_card("부족예상금액", meta.get("sum_expected_shortage_amt"), "원", bg="#fff1f2", border="#fecdd3")
+        with c11:
+            _chat_metric_card("재고충족률", meta.get("overall_stock_fill_rate"), "%", bg="#f8fafc", border="#dbe4ee", decimals=2)
+        with c12:
             _chat_metric_card("재고기준", meta.get("stock_label") or meta.get("stock_mode"), "", bg="#f5f3ff", border="#ddd6fe")
 
+        c13, c14, c15 = st.columns(3)
+        with c13:
+            _chat_metric_card("1개월부족수량", meta.get("sum_shortage_1m_qty"), "개", bg="#fff1f2", border="#fecdd3", decimals=2)
+        with c14:
+            _chat_metric_card("2개월부족수량", meta.get("sum_shortage_2m_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
+        with c15:
+            _chat_metric_card("3개월부족수량", meta.get("sum_shortage_3m_qty"), "개", bg="#fff7ed", border="#fed7aa", decimals=2)
+
         stock_source_label = str(meta.get("stock_source_label") or "")
-        c9, c10, c11 = st.columns(3)
-        with c9:
-            _chat_metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
-        with c10:
-            _chat_metric_card("현재고원천", stock_source_label or meta.get("stock_label"), "", bg="#f8fafc", border="#dbe4ee")
-        with c11:
-            _chat_metric_card("조회건수", meta.get("row_count_total") or meta.get("row_count"), "건", bg="#f8fafc", border="#dbe4ee")
+        st.caption(
+            f"자료원: {source_label} / 현재고원천: {stock_source_label or meta.get('stock_label') or ''} / "
+            f"현재고기준월: {meta.get('stock_cutoff_month') or ''} / "
+            f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+        )
 
         _render_chat_count_card_group(
             "부족등급별 제품수",
@@ -998,18 +1340,104 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
         )
         return
 
-    if analysis_type in {"sales_forecast", "sales_trend"} or is_forecast:
-        if is_forecast:
-            st.markdown("### 매출예상요약")
+    if analysis_type in {"manufacturer_sales_trend", "manufacturer_sales_trend_summary"} or summary_type in {"manufacturer_trend_detail", "manufacturer_trend_summary"}:
+        show_manufacturer_extended = analysis_type == "manufacturer_sales_trend_summary" or summary_type == "manufacturer_trend_summary"
+        st.markdown("### 매출추세요약")
+        if meta.get("period_caption"):
+            st.caption(str(meta.get("period_caption")))
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            _chat_metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c2:
+            _chat_metric_card("매출공급가액", meta.get("sum_supply_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c3:
+            _chat_metric_card("매출세액", meta.get("sum_tax_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c4:
+            _chat_metric_card("제약사수", meta.get("manufacturer_count") or meta.get("group_count"), "개", bg="#eff6ff", border="#bfdbfe")
 
-            c1, c2, c3, c4 = st.columns(4)
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            _chat_metric_card("제품수", meta.get("product_count"), "개", bg="#eff6ff", border="#bfdbfe")
+        with c6:
+            _chat_metric_card("매입처수", meta.get("buy_vendor_count") or meta.get("purchase_vendor_count"), "개", bg="#eff6ff", border="#bfdbfe")
+        with c7:
+            _chat_metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+        with c8:
+            _chat_metric_card("자료원", meta.get("source_label") or "-", "", bg="#f8fafc", border="#dbe4ee")
+
+        if not show_manufacturer_extended:
+            st.caption(
+                f"평가월: {meta.get('evaluation_month') or '-'} / "
+                f"자료원: {meta.get('source_label') or '-'} / "
+                f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+            )
+            return
+
+        st.markdown(f"### {meta.get('current_progress_title') or ('당월 진행 요약' if meta.get('evaluation_mode') == 'current_monthly' else '평가월 진행 요약')}")
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        with p1:
+            _chat_metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+        with p2:
+            _chat_metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with p3:
+            _chat_metric_card(str(meta.get("current_sales_label") or "당월 현재매출"), meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with p4:
+            _chat_metric_card(str(meta.get("current_expected_label") or "당월 예상매출"), meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with p5:
+            _chat_metric_card(str(meta.get("current_remaining_label") or "당월 잔여예상"), meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with p6:
+            _chat_metric_card(str(meta.get("current_progress_label") or "당월 진척률"), meta.get("current_month_progress_pct"), "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+        trend_counts = meta.get("trend_judge_counts") or {}
+        st.markdown("### 추세판정별 제약사수")
+        j1, j2, j3, j4 = st.columns(4)
+        with j1:
+            _chat_metric_card("증가", trend_counts.get("증가", 0), "개", bg="#ecfdf5", border="#bbf7d0")
+        with j2:
+            _chat_metric_card("감소", trend_counts.get("감소", 0), "개", bg="#fff1f2", border="#fecdd3")
+        with j3:
+            _chat_metric_card("안정", trend_counts.get("안정", 0), "개", bg="#eff6ff", border="#bfdbfe")
+        with j4:
+            _chat_metric_card("자료부족", trend_counts.get("자료부족", 0), "개", bg="#f8fafc", border="#dbe4ee")
+        st.caption(
+            f"평가월: {meta.get('evaluation_month') or '-'} / "
+            f"자료원: {meta.get('source_label') or '-'} / "
+            f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+        )
+        return
+
+    if analysis_type in {"sales_forecast", "sales_trend"} or is_forecast:
+        current_progress = meta.get("current_month_progress_pct")
+        if current_progress is None:
+            current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
+            current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
+            current_progress = (current_sales / current_expected * 100) if abs(current_expected) >= 1e-12 else 0
+
+        if is_forecast:
+            st.markdown("### 당월 매출예상 요약")
+
+            c1, c2, c3, c4, c5 = st.columns(5)
             with c1:
-                _chat_metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+                _chat_metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
             with c2:
-                _chat_metric_card("다음월예상매출", meta.get("sum_next_month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+                _chat_metric_card("당월 현재매출", meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
             with c3:
-                _chat_metric_card("3개월예상매출", meta.get("sum_3month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+                _chat_metric_card("당월 예상매출", meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
             with c4:
+                _chat_metric_card("당월 잔여예상", meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with c5:
+                _chat_metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+            st.markdown("### 중장기 예상")
+
+            f1, f2, f3, f4 = st.columns(4)
+            with f1:
+                _chat_metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+            with f2:
+                _chat_metric_card("다음월예상매출", meta.get("sum_next_month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with f3:
+                _chat_metric_card("3개월예상매출", meta.get("sum_3month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with f4:
                 _chat_metric_card("6개월예상매출", meta.get("sum_6month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
 
             c5, c6, c7, c8, c9 = st.columns(5)
@@ -1045,6 +1473,22 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
                 _chat_metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
             with c8:
                 _chat_metric_card("자료원", source_label, "", bg="#f8fafc", border="#dbe4ee")
+
+            st.markdown("### 당월 진행 요약")
+
+            p1, p2, p3, p4, p5, p6 = st.columns(6)
+            with p1:
+                _chat_metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+            with p2:
+                _chat_metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+            with p3:
+                _chat_metric_card("당월 현재매출", meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+            with p4:
+                _chat_metric_card("당월 예상매출", meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with p5:
+                _chat_metric_card("당월 잔여예상", meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+            with p6:
+                _chat_metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
 
         _render_chat_count_card_group(
             "추세판정별 제품수",
@@ -1145,6 +1589,50 @@ SIMS_CTX_MAX_ROWS = int(os.getenv("SIMS_CTX_MAX_ROWS", "300"))  # LLM 컨텍스�
 #   메인(UI)에서 지정한 컨테이너(anchor) 내부로 결과를 렌더링할 수 있게 한다.
 # - 앵커가 없으면 기존처럼 현재 위치에 렌더링(하위호환).
 # ---------------------------------------------------------------------
+def _chat_display_max_rows(default: int = 200) -> int:
+    return max(0, _get_int_env("SIMS_CHAT_DISPLAY_MAX_ROWS", default))
+
+
+def _limit_chat_display_df(df: pd.DataFrame, *, limit: int | None = None) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        return df
+
+    out = normalize_display_df_for_streamlit(df)
+    row_limit = _chat_display_max_rows() if limit is None else int(limit or 0)
+    if row_limit > 0 and len(out) > row_limit:
+        return out.head(row_limit).copy()
+    return out
+
+
+def _apply_chat_display_limit_to_payload(payload: Dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+
+    df_full = payload.get("df")
+    df_display = payload.get("df_display")
+    if not isinstance(df_display, pd.DataFrame):
+        if isinstance(payload.get("data"), pd.DataFrame):
+            df_display = payload.get("data")
+        elif isinstance(df_full, pd.DataFrame):
+            df_display = df_full
+
+    if not isinstance(df_display, pd.DataFrame):
+        return
+
+    limited = _limit_chat_display_df(df_display)
+    payload["df_display"] = limited
+    payload["data"] = limited
+    payload["columns"] = list(limited.columns)
+    payload["records"] = limited.to_dict(orient="records")
+
+    meta = payload.setdefault("meta", {})
+    full_rows = int(len(df_full)) if isinstance(df_full, pd.DataFrame) else int(len(df_display))
+    meta["display_row_count"] = int(len(limited))
+    meta.setdefault("row_count", full_rows)
+    meta.setdefault("row_count_total", full_rows)
+    meta.setdefault("download_row_count", full_rows)
+
+
 def set_chat_render_anchor(anchor) -> None:
     """SIMS 결과 렌더링을 고정할 컨테이너(예: st.container())를 지정."""
     try:
@@ -1286,6 +1774,7 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
 
             if not isinstance(df_disp, pd.DataFrame) or df_disp.empty:
                 df_disp = df_full
+            df_disp = _limit_chat_display_df(df_disp)
 
             sample_df = df_disp
             if SIMS_CTX_MAX_ROWS and len(sample_df) > SIMS_CTX_MAX_ROWS:
@@ -1294,7 +1783,7 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
             meta = payload.get("meta") or {}
             payload["type"] = "table"
             payload["title"] = title
-            payload["data"] = sample_df
+            payload["data"] = df_disp
             payload["meta"] = meta
             payload["df"] = df_full          # ★ 컨텍스트용으로 계속 유지
             payload["df_display"] = df_disp  # ★ 화면/컨텍스트 공용
@@ -1304,6 +1793,9 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
             except Exception:
                 row_count = len(df_full)
             meta.setdefault("row_count", row_count)
+            meta["display_row_count"] = int(len(df_disp))
+            meta.setdefault("row_count_total", row_count)
+            meta.setdefault("download_row_count", row_count)
             meta.setdefault("columns", [str(c) for c in sample_df.columns])
             meta.setdefault("source", "SIMS")
             if payload.get("action"):
@@ -3183,6 +3675,7 @@ def _make_table_downloads(df: pd.DataFrame) -> Tuple[io.BytesIO, io.BytesIO]:
 
     with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="SIMS")
+        _apply_sims_excel_number_formats(writer, df, "SIMS")
     xlsx_buf.seek(0)
     return csv_buf, xlsx_buf
 
@@ -4093,6 +4586,7 @@ def _render_sims_result_actions_lazy(
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
             excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
+            _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
         excel_bytes = bio.getvalue()
 
         ss[bytes_key] = {
@@ -4244,6 +4738,54 @@ def _is_sims_table_history_item(item: Any) -> bool:
         or bool(meta.get("table_key"))
     )
 
+
+def _coerce_sims_display_time(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{2}:\d{2}:\d{2}", text):
+        return text
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).strftime("%H:%M:%S")
+    except Exception:
+        pass
+    m = re.search(r"(\d{2}:\d{2}:\d{2})", text)
+    return m.group(1) if m else text[:8]
+
+
+def _coerce_sims_result_datetime(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    m = re.search(
+        r"(\d{4})[-/.]?(\d{2})[-/.]?(\d{2})[ T]+(\d{2}):(\d{2}):(\d{2})",
+        text,
+    )
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)} {m.group(4)}:{m.group(5)}:{m.group(6)}"
+
+    return ""
+
+
+def _sims_result_datetime_text(item: Dict[str, Any], meta: Dict[str, Any]) -> str:
+    for value in (
+        meta.get("created_at"),
+        item.get("time"),
+        meta.get("time"),
+        meta.get("ts"),
+        meta.get("timestamp"),
+    ):
+        text = _coerce_sims_result_datetime(value)
+        if text:
+            return text
+    return ""
+
 # SIMS 표 유지 정책
 # - reference: 사용자가 계속 보면서 판단해야 하는 기준표
 # - drilldown : 기준표를 보면서 추가 확인하는 보조조회표
@@ -4251,6 +4793,8 @@ REFERENCE_TABLE_ACTIONS = {
     "품목별 매출 추세 분석",
     "품목별 매출 추세 요약표",
     "품목별 매출 예상",
+    "제약사별 매출 추세 분석",
+    "제약사별 매출 추세 분석 요약표",
     "품목별 재고부족현황",
     "제품재고현황 조회",
     "제품재고장",
@@ -4289,8 +4833,8 @@ def _sims_table_role_from_action(action_name: Any, meta: Optional[Dict[str, Any]
     if (
         action in REFERENCE_TABLE_ACTIONS
         or "제품재고장" in action
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage"}
+        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     ):
         return "reference"
 
@@ -5051,6 +5595,12 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                         len(df_display_for_ui),
                         action_name,
                     )
+                    if _chat_is_nlq_table_meta(meta):
+                        log.info(
+                            "[chat.nlq.table] stash export table_key=%s rows=%s",
+                            table_key,
+                            len(df_full_for_export),
+                        )
                 else:
                     meta["download_row_count"] = int(len(df_display_for_ui))
                     meta.setdefault("display_row_count", int(len(df_display_for_ui)))
@@ -5138,6 +5688,32 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 meta.setdefault("row_count", int(len(df_full_for_export) if isinstance(df_full_for_export, pd.DataFrame) else len(df_display_for_ui)))
                 meta.setdefault("column_count", int(len(df_display_for_ui.columns)))
 
+                if _chat_is_nlq_table_meta(meta):
+                    try:
+                        source_key_now = str(ss.get("__sims_current_table_source_key") or "").strip()
+                        if source_key_now == str(table_key):
+                            log.info(
+                                "[chat.nlq.table] promoted current source action=%s table_key=%s rows=%s",
+                                action_name,
+                                table_key,
+                                int(meta.get("download_row_count") or meta.get("row_count") or len(df_display_for_ui)),
+                            )
+                    except Exception:
+                        pass
+
+                if _chat_is_stock_io_action(action_name):
+                    try:
+                        source_key_now = str(ss.get("__sims_current_table_source_key") or "").strip()
+                        if source_key_now == str(table_key):
+                            log.info(
+                                "[stock.table] promoted current source action=%s table_key=%s rows=%s",
+                                action_name,
+                                table_key,
+                                int(meta.get("download_row_count") or meta.get("row_count") or len(df_display_for_ui)),
+                            )
+                    except Exception:
+                        pass
+
                 payload["meta"] = meta
                 payload.setdefault("content", payload.get("title") or f"📊 {action_name}")
 
@@ -5200,11 +5776,23 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
     # 4-2) 최소 필드 보강(정렬/렌더)
     if isinstance(payload, dict):
         payload.setdefault('role', 'assistant')
-        payload.setdefault('time', dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        now_dt = dt.datetime.now()
+        payload.setdefault('time', now_dt.strftime('%Y-%m-%d %H:%M:%S'))
         if payload.get('seq') is None:
             ss.setdefault('__seq', 0)
             ss['__seq'] += 1
             payload['seq'] = ss['__seq']
+        try:
+            meta_for_display = dict(payload.get("meta") or {})
+            created_at = str(meta_for_display.get("created_at") or "").strip()
+            if not created_at:
+                created_at = now_dt.isoformat(timespec="seconds")
+            meta_for_display["created_at"] = created_at
+            meta_for_display.setdefault("display_time", _coerce_sims_display_time(created_at) or now_dt.strftime("%H:%M:%S"))
+            meta_for_display.setdefault("result_seq", int(ss.get("__sims_push_count", 0)) + 1)
+            payload["meta"] = meta_for_display
+        except Exception:
+            log.exception("[chat.sims.push] failed to attach display meta")
 
     # 5) 인박스에 넣고 drain
     ss.setdefault("__chat_inbox", [])
@@ -5636,6 +6224,8 @@ def _is_sales_trend_action(action_name: str) -> bool:
         "품목별 매출 추세 분석",
         "품목별 매출 추세 요약표",
         "품목별 매출 예상",
+        "제약사별 매출 추세 분석",
+        "제약사별 매출 추세 분석 요약표",
         "품목별 재고부족현황",
     }
 
@@ -6126,6 +6716,283 @@ def _clear_other_sims_table_render_cache(current_table_key: str) -> None:
         log.exception("[chat] clear old sims render cache failed")
 
 
+def _lookup_sims_table_payload_for_render(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> tuple[Any, str]:
+    """
+    저장된 SIMS 표 메시지를 다시 렌더할 때 DataFrame payload를 찾는다.
+
+    순서:
+    1. 메시지 자체 data/df/df_display
+    2. session_state 표시/다운로드 cache
+    3. 현재표 followup source key
+    4. records/columns fallback
+    """
+    data = item.get("data")
+    if isinstance(data, pd.DataFrame):
+        return data, "item.data"
+
+    for key_name in ("df_display", "df"):
+        cand = item.get(key_name)
+        if isinstance(cand, pd.DataFrame):
+            return cand, f"item.{key_name}"
+
+    table_key = str((meta or {}).get("table_key") or item.get("table_key") or "").strip()
+    download_key = str((meta or {}).get("download_table_key") or "").strip()
+    source_key = str(
+        (meta or {}).get("source_table_key")
+        or (meta or {}).get("source_key")
+        or ""
+    ).strip()
+
+    ss = st.session_state
+    search_keys: list[tuple[str, str]] = []
+    for label, key in (
+        ("table_key", table_key),
+        ("download_table_key", download_key),
+        ("source_key", source_key),
+    ):
+        if key and (label, key) not in search_keys:
+            search_keys.append((label, key))
+
+    stores = (
+        ("sims_tables", ss.get("sims_tables")),
+        ("sims_export_tables", ss.get("sims_export_tables")),
+        ("__sims_export_tables_by_key", ss.get("__sims_export_tables_by_key")),
+    )
+
+    for key_label, key in search_keys:
+        for store_name, store in stores:
+            try:
+                if isinstance(store, dict):
+                    cand = store.get(key)
+                    if isinstance(cand, pd.DataFrame):
+                        return cand, f"{store_name}.{key_label}"
+            except Exception:
+                continue
+
+    try:
+        recs = item.get("records")
+        cols = item.get("columns")
+        if recs is not None and cols is not None:
+            return pd.DataFrame.from_records(recs, columns=cols), "item.records"
+    except Exception:
+        pass
+
+    try:
+        recs = (meta or {}).get("records") or (meta or {}).get("df")
+        cols = (meta or {}).get("columns")
+        if recs is not None and cols is not None:
+            return pd.DataFrame.from_records(recs, columns=cols), "meta.records"
+    except Exception:
+        pass
+
+    return None, ""
+
+
+def _sims_table_meta_row_count(meta: Dict[str, Any], data: Any = None) -> tuple[int, int, int]:
+    full_rows = _safe_int_for_download(
+        meta.get("download_row_count")
+        or meta.get("row_count_total_for_followup")
+        or meta.get("row_count_total")
+        or meta.get("row_count_loaded")
+        or meta.get("row_count")
+        or meta.get("rows")
+        or (len(data) if isinstance(data, pd.DataFrame) else 0),
+        0,
+    )
+    display_rows = _safe_int_for_download(
+        meta.get("display_row_count")
+        or meta.get("display_rows")
+        or (len(data) if isinstance(data, pd.DataFrame) else full_rows)
+        or 0,
+        0,
+    )
+    expected_rows = _safe_int_for_download(
+        meta.get("expected_rows")
+        or meta.get("db_total_count")
+        or meta.get("total_count")
+        or full_rows,
+        0,
+    )
+    return full_rows, display_rows, expected_rows
+
+
+def _sims_render_dedupe_key(item: Dict[str, Any], meta: Dict[str, Any], data: Any = None) -> str:
+    """한 rerun 화면 안에서 같은 SIMS 결과 카드가 두 번 그려지는 것을 막기 위한 key."""
+    if not isinstance(item, dict):
+        return ""
+
+    item_type = str(item.get("type") or "").strip().lower()
+    is_sims_like = (
+        item_type in {"table", "text", "object"}
+        and (
+            bool(meta.get("kind") == "table")
+            or bool(meta.get("source") == "SIMS")
+            or bool(meta.get("analytics"))
+            or bool(meta.get("current_table_followup"))
+            or bool(item.get("action"))
+            or bool(item.get("title"))
+        )
+    )
+    if not is_sims_like:
+        return ""
+
+    msg_id = str(item.get("id") or meta.get("id") or "").strip()
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    if msg_id:
+        return f"id:{msg_id}"
+    if table_key:
+        return f"table:{table_key}"
+
+    action = str(item.get("action") or meta.get("action") or item.get("title") or "").strip()
+    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(meta, data)
+    created_at = str(
+        meta.get("created_at")
+        or item.get("time")
+        or meta.get("time")
+        or meta.get("ts")
+        or meta.get("timestamp")
+        or ""
+    ).strip()
+    sig = str(meta.get("sig") or item.get("sig") or "").strip()
+    return f"sig:{sig}:{action}:{full_rows}:{display_rows}:{expected_rows}:{created_at}"
+
+
+def _should_render_sims_message_once(item: Dict[str, Any], meta: Dict[str, Any], data: Any = None) -> bool:
+    key = _sims_render_dedupe_key(item, meta, data)
+    if not key:
+        return True
+
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    action = str(item.get("action") or meta.get("action") or item.get("title") or "").strip()
+    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(meta, data)
+    created_at = str(
+        meta.get("created_at")
+        or item.get("time")
+        or meta.get("time")
+        or meta.get("ts")
+        or meta.get("timestamp")
+        or ""
+    ).strip()
+    sig = str(meta.get("sig") or item.get("sig") or "").strip()
+
+    candidate_keys = [key]
+    if table_key:
+        candidate_keys.append(f"table:{table_key}")
+    if action:
+        candidate_keys.append(f"shape:{sig}:{action}:{full_rows}:{display_rows}:{expected_rows}:{created_at}")
+
+    ss = st.session_state
+    rendered = ss.setdefault("__chat_rendered_sims_keys_this_run", set())
+    if not isinstance(rendered, set):
+        rendered = set(rendered or [])
+        ss["__chat_rendered_sims_keys_this_run"] = rendered
+
+    matched_key = next((k for k in candidate_keys if k in rendered), "")
+    if matched_key:
+        try:
+            log.info(
+                "[chat.render.dedupe] skip duplicate sims message key=%s action=%s table_key=%s",
+                matched_key,
+                action,
+                table_key,
+            )
+        except Exception:
+            pass
+        return False
+
+    for k in candidate_keys:
+        if k:
+            rendered.add(k)
+    try:
+        log.info(
+            "[chat.render.dedupe] render sims message key=%s action=%s table_key=%s",
+            key,
+            action,
+            table_key,
+        )
+    except Exception:
+        pass
+    return True
+
+
+def _render_expired_sims_table_fallback(item: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    """DataFrame payload가 사라진 과거 SIMS 표를 요약 카드로 렌더한다."""
+    action_name = str(
+        item.get("action")
+        or meta.get("action")
+        or item.get("title")
+        or item.get("content")
+        or "SIMS 결과"
+    ).strip() or "SIMS 결과"
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    source_key = str(meta.get("source_table_key") or meta.get("source_key") or "").strip()
+    result_time_text = _sims_result_datetime_text(item, meta)
+    cond_text = _build_query_condition_text(item)
+    if not cond_text:
+        query_summary = str(meta.get("query_summary") or "").strip()
+        if query_summary:
+            cond_text = f"조회조건: {query_summary}"
+    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(meta)
+
+    st.markdown(f"---\n##### {action_name}")
+    if result_time_text:
+        time_label = "처리시각" if bool(meta.get("current_table_followup")) else "조회시각"
+        st.caption(f"{time_label}: {result_time_text}")
+    else:
+        st.caption("조회시각: 저장된 메타에 시간 정보가 없습니다.")
+
+    if cond_text:
+        st.caption(cond_text)
+
+    row_bits: list[str] = []
+    if expected_rows and expected_rows != full_rows:
+        row_bits.append(f"expected_rows={expected_rows:,}")
+    if full_rows:
+        row_bits.append(f"rows={full_rows:,}")
+    if display_rows:
+        row_bits.append(f"display_rows={display_rows:,}")
+    if row_bits:
+        st.caption(" / ".join(row_bits))
+
+    key_bits = []
+    if table_key:
+        key_bits.append(f"table_key={table_key}")
+    if source_key:
+        key_bits.append(f"source_key={source_key}")
+    source_action = str(meta.get("source_action") or meta.get("source_table_action") or "").strip()
+    if source_action:
+        key_bits.append(f"source_action={source_action}")
+    if key_bits:
+        st.caption(" / ".join(key_bits))
+
+    st.info(
+        "표 데이터는 현재 세션에서 만료되어 다시 펼칠 수 없습니다.\n\n"
+        "단, 당시 조회 요약은 아래에 남아 있습니다.\n"
+        "필요하면 같은 조회를 다시 실행해 주세요."
+    )
+
+    summary_md = meta.get("summary_md") or meta.get("summary") or ""
+    if isinstance(summary_md, str) and summary_md.strip():
+        _render_chat_summary_expander(summary_md, cond_text)
+
+    try:
+        log.info(
+            "[chat.table.render] payload expired fallback table_key=%s action=%s has_meta=%s",
+            table_key,
+            action_name,
+            bool(meta),
+        )
+        log.info(
+            "[chat.table.render] expired table did not clear current source table_key=%s",
+            table_key,
+        )
+    except Exception:
+        pass
+
+
 # 채팅 아이템 본문 렌더링. anchor/busy 체크 후 렌더링.
 # anchor가 있으면 그 안에 렌더링하고, busy 플래그로 중복 렌더링 방지.
 def _render_chat_item_body(item: Dict[str, Any]) -> None:
@@ -6163,27 +7030,31 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
     title = item.get("title") or ""
     meta = item.get("meta") or {}
     data = item.get("data")
+
+    if not _should_render_sims_message_once(item, meta, data):
+        return
+
     # 저장된 히스토리(DF 제거)에서도 표를 다시 그릴 수 있게 records/columns 지원
 
     if t == "table" and not isinstance(data, pd.DataFrame):
-        # 1) session_state table_key 우선 복구
-        try:
-            table_key = (meta or {}).get("table_key")
-            if table_key and isinstance(st.session_state.get("sims_tables"), dict):
-                data = st.session_state["sims_tables"].get(table_key)
-        except Exception:
-            data = None
+        data, _payload_source = _lookup_sims_table_payload_for_render(item, meta)
+        if isinstance(data, pd.DataFrame):
+            try:
+                log.info(
+                    "[chat.table.render] payload found table_key=%s action=%s rows=%s",
+                    str(meta.get("table_key") or item.get("table_key") or ""),
+                    str(item.get("action") or meta.get("action") or title or ""),
+                    len(data),
+                )
+            except Exception:
+                pass
+        else:
+            with st.chat_message((item.get("role") or "assistant").lower() if (item.get("role") or "assistant").lower() in ("assistant", "user") else "assistant"):
+                _render_expired_sims_table_fallback(item, meta)
+            return
 
-        # 2) records/columns 복구
-        if not isinstance(data, pd.DataFrame):
-            recs = item.get("records")
-
-            cols = item.get("columns")
-            if recs is not None and cols is not None:
-                try:
-                    data = pd.DataFrame.from_records(recs, columns=cols)
-                except Exception:
-                    data = None
+    if isinstance(data, pd.DataFrame):
+        data = normalize_display_df_for_streamlit(data)
 
     role = (item.get("role") or "assistant").lower()
     if role not in ("assistant", "user"):
@@ -6218,45 +7089,74 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
         if is_sims_table_or_text:
 
-            result_badge = "현재표 결과표" if bool(meta.get("current_table_followup")) else "조회표"
             header_title = action_name_for_header or str(title or "결과").strip() or "결과"
+            is_current_followup = bool(meta.get("current_table_followup"))
+            result_time_text = _sims_result_datetime_text(item, meta)
 
-            st.markdown(f"---\n##### 📋 {result_badge} — {header_title}")
+            st.markdown(f"---\n##### {header_title}")
 
             try:
-                db_total_rows = int(
+                db_total_rows = _safe_int_for_download(
                     meta.get("db_total_count")
                     or meta.get("total_count")
                     or meta.get("matched_row_count")
                     or meta.get("matched_total_count")
-                    or 0
+                    or 0,
+                    0,
                 )
 
-                header_loaded_rows = int(
+                header_loaded_rows = _safe_int_for_download(
                     meta.get("download_row_count")
                     or meta.get("row_count_loaded")
                     or meta.get("row_count_total")
                     or meta.get("row_count")
                     or (len(data) if isinstance(data, pd.DataFrame) else 0)
-                    or 0
+                    or 0,
+                    0,
                 )
 
-                header_display_rows = int(
+                header_display_rows = _safe_int_for_download(
                     meta.get("display_row_count")
                     or (len(data) if isinstance(data, pd.DataFrame) else header_loaded_rows)
-                    or 0
+                    or 0,
+                    0,
                 )
+
+                if is_current_followup:
+                    source_action = str(
+                        meta.get("source_action")
+                        or meta.get("source_table_action")
+                        or meta.get("source_title")
+                        or ""
+                    ).strip()
+                    source_rows = _safe_int_for_download(
+                        meta.get("source_rows")
+                        or meta.get("source_row_count")
+                        or meta.get("row_count_total_for_followup")
+                        or 0,
+                        0,
+                    )
+                    if source_action or source_rows:
+                        source_text = source_action or "원본 현재표"
+                        if source_rows:
+                            st.caption(f"원본: {source_text} / {source_rows:,}건")
+                        else:
+                            st.caption(f"원본: {source_text}")
 
                 if db_total_rows and header_loaded_rows and db_total_rows > header_loaded_rows:
                     st.caption(
-                        f"조회결과: 조건 전체 {db_total_rows:,}건 중 {header_loaded_rows:,}건 조회, "
+                        f"결과: 조건 전체 {db_total_rows:,}건 중 {header_loaded_rows:,}건 조회, "
                         f"화면 {header_display_rows:,}건 표시"
                     )
                 elif header_loaded_rows > 0:
                     if header_display_rows and header_display_rows < header_loaded_rows:
-                        st.caption(f"조회결과: 조회 {header_loaded_rows:,}건 중 화면 {header_display_rows:,}건 표시")
+                        st.caption(f"결과: 조회 {header_loaded_rows:,}건 중 화면 {header_display_rows:,}건 표시")
                     else:
-                        st.caption(f"조회결과: {header_loaded_rows:,}건")
+                        st.caption(f"결과: {header_loaded_rows:,}건")
+
+                if result_time_text:
+                    time_label = "처리시각" if is_current_followup else "조회시각"
+                    st.caption(f"{time_label}: {result_time_text}")
             except Exception:
                 pass
 
@@ -6319,7 +7219,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 or meta.get("timestamp")
                 or ""
             )
-            if ts:
+            if ts and not _sims_result_datetime_text(item, meta):
                 st.caption(str(ts))
 
             return
@@ -6347,6 +7247,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
         if cond_text:
             st.caption(cond_text)
+
+        _render_nlq_table_meta_caption(meta)
 
         if bool(meta.get("candidate_table")):
             # 제품수불현황 후보표 안내
@@ -6607,6 +7509,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             render_cache = _get_sims_table_render_cache()
 
             action_name = str(item.get("action") or meta.get("action") or title or "").strip()
+            is_nlq_table = _chat_is_nlq_table_meta(meta)
+            is_stock_io_table = _chat_is_stock_io_action(action_name)
+            nlq_table_key = str(meta.get("table_key") or item.get("table_key") or item.get("id") or "").strip()
 
             # 후보 선택표는 실제 제품수불현황 표가 아니다.
             # 후보표는 6컬럼 정도의 선택용 목록이므로 전체 폭을 채우지 않고 compact하게 렌더한다.
@@ -6720,6 +7625,29 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
             if is_io_table:
                 try:
+                    if (is_nlq_table or is_stock_io_table) and _chat_is_large_table_for_fast_render(data):
+                        if is_stock_io_table:
+                            _chat_log_stock_table_render(
+                                action_name=action_name,
+                                rows=int(len(data)),
+                                cols=int(len(data.columns)),
+                                fast=True,
+                            )
+                        if is_nlq_table:
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(data)),
+                                cols=int(len(data.columns)),
+                                fast=True,
+                            )
+                        _render_chat_fast_dataframe(
+                            data.copy(),
+                            height=520,
+                            action_name=action_name,
+                            meta=meta,
+                        )
+                        raise StopIteration
                     # IO/NLQ 기본표도 sims_table_display.py 공용 설정을 사용한다.
                     # 목적:
                     # - 좌측 고정 pinned 적용
@@ -6755,14 +7683,49 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         True,
                     )
 
-                    st.dataframe(
-                        view_df,
-                        use_container_width=True,
-                        hide_index=True,
-                        height=table_height,
-                        column_config=column_config if column_config else None,
-                    )
+                    if is_nlq_table:
+                        _chat_log_nlq_table_render(
+                            action_name=action_name,
+                            table_key=nlq_table_key,
+                            rows=int(len(view_df)),
+                            cols=int(len(view_df.columns)),
+                            fast=False,
+                        )
+                    if is_stock_io_table:
+                        _chat_log_stock_table_render(
+                            action_name=action_name,
+                            rows=int(len(view_df)),
+                            cols=int(len(view_df.columns)),
+                            fast=False,
+                        )
 
+                    rendered_with_style = False
+                    if is_nlq_table or is_stock_io_table:
+                        try:
+                            styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
+                            styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
+                            st.dataframe(
+                                styled_view,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=table_height,
+                                column_config=column_config if column_config else None,
+                            )
+                            rendered_with_style = True
+                        except Exception:
+                            log.debug("[chat] io small table styler skipped", exc_info=True)
+
+                    if not rendered_with_style:
+                        st.dataframe(
+                            view_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=table_height,
+                            column_config=column_config if column_config else None,
+                        )
+
+                except StopIteration:
+                    pass
                 except Exception:
                     log.exception("[chat] io common table render failed")
                     try:
@@ -6792,7 +7755,22 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         if "순번" not in render_df.columns and "조회순번" not in render_df.columns:
                             render_df.insert(0, "순번", range(1, len(render_df) + 1))
 
-                        if _chat_is_large_table_for_fast_render(render_df):
+                        table_render_path = str(st.session_state.get("__sims_table_render_path") or "chat")
+                        table_mode_info = {"mode": "fast" if _chat_is_large_table_for_fast_render(render_df) else "small"}
+                        try:
+                            table_mode_info = log_sims_table_mode(render_df, action=action_name, render_path=table_render_path)
+                        except Exception:
+                            log.debug("[sims.table_mode] chat log failed", exc_info=True)
+                        is_large_analysis_table = str(table_mode_info.get("mode") or "") == "fast"
+                        if is_nlq_table:
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(render_df)),
+                                cols=int(len(render_df.columns)),
+                                fast=bool(is_large_analysis_table),
+                            )
+                        if is_large_analysis_table:
                             st.caption("빠른 표 모드: 채팅 분석/KPI 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
 
                         # 분석/KPI 표는 좌측 고정 컬럼이 우선이다.
@@ -6800,24 +7778,120 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         # 기본 렌더도 공용 DataFrame renderer로 통일한다.
                         # 단, 분석/KPI 원표는 이미 서비스에서 순번/요약 컬럼을 구성하므로
                         # IO 전용 display_df 변환을 다시 적용하지 않는다. (요약표/컬럼 차이 방지)
-                        _render_chat_fast_dataframe(
-                            render_df.copy(),
-                            height=520,
-                            action_name=action_name,
-                            meta=meta,
-                        )
+                        if is_large_analysis_table:
+                            log_sims_table_render(
+                                render_df,
+                                action=action_name,
+                                render_path=table_render_path,
+                                mode="fast",
+                                renderer="_render_chat_fast_dataframe",
+                                height=520,
+                                visible_rows=min(int(len(render_df)), 300),
+                                width_mode="use_container_width",
+                                column_config_count=0,
+                            )
+                            _render_chat_fast_dataframe(
+                                render_df.copy(),
+                                height=520,
+                                action_name=action_name,
+                                meta=meta,
+                            )
+                        else:
+                            view_df, column_config, table_width, table_height = build_sims_table_display_config(
+                                normalize_display_df_for_streamlit(render_df.copy()),
+                                action_name=action_name,
+                                meta=meta,
+                                add_row_no=False,
+                                row_no_name="순번",
+                                enable_pinning=True,
+                                max_pinned_cols=5,
+                                min_width=720,
+                                max_width=1650,
+                                min_height=170,
+                                max_height=520,
+                                row_height=32,
+                            )
+                            view_df = _chat_clean_display_none_values(view_df)
+                            column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
+                            log_sims_table_render(
+                                view_df,
+                                action=action_name,
+                                render_path=table_render_path,
+                                mode="small",
+                                renderer="build_sims_table_display_config+st.dataframe",
+                                height=table_height,
+                                visible_rows=min(int(len(view_df)), max(int((int(table_height) - 48) / 32), 0)),
+                                width_mode="use_container_width",
+                                column_config_count=len(column_config or {}),
+                            )
+                            try:
+                                st.dataframe(
+                                    view_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=table_height,
+                                    column_config=column_config if column_config else None,
+                                )
+                            except Exception:
+                                log.debug("[chat] small analysis table styler skipped", exc_info=True)
+                                st.dataframe(
+                                    view_df,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=table_height,
+                                    column_config=column_config if column_config else None,
+                                )
 
                     except Exception:
                         log.exception("[chat] analysis table fast/styler render failed")
-                        st.dataframe(
-                            data,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=520,
-                        )
+                        try:
+                            fallback_df, column_config, _table_width, table_height = build_sims_table_display_config(
+                                normalize_display_df_for_streamlit(data.copy()),
+                                action_name=action_name,
+                                meta=meta,
+                                add_row_no=False,
+                                row_no_name="순번",
+                                enable_pinning=True,
+                                max_pinned_cols=5,
+                                min_width=720,
+                                max_width=1650,
+                                min_height=170,
+                                max_height=520,
+                                row_height=32,
+                            )
+                            st.dataframe(
+                                fallback_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=table_height,
+                                column_config=column_config if column_config else None,
+                            )
+                        except Exception:
+                            st.dataframe(
+                                normalize_display_df_for_streamlit(data),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=520,
+                            )
 
                 else:
                     try:
+                        if is_nlq_table and _chat_is_large_table_for_fast_render(view_df):
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(view_df)),
+                                cols=int(len(view_df.columns)),
+                                fast=True,
+                            )
+                            _render_chat_fast_dataframe(
+                                view_df.copy(),
+                                height=520,
+                                action_name=action_name,
+                                meta=meta,
+                            )
+                            raise StopIteration
+
                         view_df, column_config, table_width, table_height = build_sims_table_display_config(
                             view_df,
                             action_name=action_name,
@@ -6846,14 +7920,42 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             True,
                         )
 
-                        st.dataframe(
-                            view_df,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=table_height,
-                            column_config=column_config if column_config else None,
-                        )
+                        if is_nlq_table:
+                            _chat_log_nlq_table_render(
+                                action_name=action_name,
+                                table_key=nlq_table_key,
+                                rows=int(len(view_df)),
+                                cols=int(len(view_df.columns)),
+                                fast=False,
+                            )
 
+                        rendered_with_style = False
+                        if is_nlq_table:
+                            try:
+                                styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
+                                styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
+                                st.dataframe(
+                                    styled_view,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=table_height,
+                                    column_config=column_config if column_config else None,
+                                )
+                                rendered_with_style = True
+                            except Exception:
+                                log.debug("[chat] nlq common small table styler skipped", exc_info=True)
+
+                        if not rendered_with_style:
+                            st.dataframe(
+                                view_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=table_height,
+                                column_config=column_config if column_config else None,
+                            )
+
+                    except StopIteration:
+                        pass
                     except Exception:
                         log.exception("[chat] common table render failed")
                         fallback_df = data.copy()
@@ -7008,12 +8110,18 @@ def render_sims_chat_item(item: Dict[str, Any]) -> None:
     조회조건 / 헤더 / summary_md / 분석 스타일 / CSV / EXCEL / LLM 분석 버튼을 유지한다.
     """
     prev_force = bool(st.session_state.get("__chat_render_force_target", False))
+    prev_render_path = st.session_state.get("__sims_table_render_path")
     st.session_state["__chat_render_force_target"] = True
+    st.session_state["__sims_table_render_path"] = "history"
 
     try:
         _render_chat_item_body(item)
     finally:
         st.session_state["__chat_render_force_target"] = prev_force
+        if prev_render_path is None:
+            st.session_state.pop("__sims_table_render_path", None)
+        else:
+            st.session_state["__sims_table_render_path"] = prev_render_path
 
 
 __all__ = [
@@ -7028,5 +8136,3 @@ __all__ = [
     "render_sims_chat_item",
     "clear_product_candidate_tables_from_chat",
 ]
-
-
