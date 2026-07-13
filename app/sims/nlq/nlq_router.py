@@ -694,6 +694,30 @@ _ANALYTICS_ACTION_SPECS = (
         ),
     },
     {
+        "action": "영업사원별 매출 예상",
+        "service": "get_salesperson_sales_forecast_result",
+        "phrases": (
+            "영업사원별 매출 예상",
+            "영업사원별 매출예상",
+            "담당자별 매출 예상",
+            "담당자별 매출예상",
+            "사원별 다음달 매출 예상",
+            "사원별 매출 예상",
+        ),
+    },
+    {
+        "action": "지역별 매출 예상",
+        "service": "get_region_sales_forecast_result",
+        "phrases": (
+            "지역별 매출 예상",
+            "지역별 매출예상",
+            "시도별 매출 예상",
+            "시도별 매출예상",
+            "시군구별 매출 예상",
+            "시구군별 매출 예상",
+        ),
+    },
+    {
         "action": "매출처별 매출 예상",
         "service": "get_customer_sales_forecast_result",
         "phrases": (
@@ -1208,6 +1232,8 @@ def _get_analytics_handler(action: str):
         )
         from app.services.analytics_customer_sales_forecast_service import (
             get_customer_sales_forecast_result,
+            get_region_sales_forecast_result,
+            get_salesperson_sales_forecast_result,
         )
     except Exception:
         raise
@@ -1217,6 +1243,8 @@ def _get_analytics_handler(action: str):
         "품목별 매출 추세 요약표": get_sales_trend_summary_result,
         "품목별 매출 예상": get_sales_forecast_result,
         "매출처별 매출 예상": get_customer_sales_forecast_result,
+        "영업사원별 매출 예상": get_salesperson_sales_forecast_result,
+        "지역별 매출 예상": get_region_sales_forecast_result,
         "제약사별 매출 추세 분석": get_manufacturer_sales_trend_result,
         "제약사별 매출 추세 분석 요약표": get_manufacturer_sales_trend_summary_result,
         "품목별 재고부족현황": get_stock_shortage_result,

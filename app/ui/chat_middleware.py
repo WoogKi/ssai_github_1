@@ -538,11 +538,13 @@ def _chat_is_analysis_payload(item: Dict[str, Any], meta: Dict[str, Any], title:
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
             "매출처별 매출 예상",
+            "영업사원별 매출 예상",
+            "지역별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
         or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
@@ -1272,7 +1274,9 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
 
     analysis_type = str(meta.get("analysis_type") or "").strip()
     summary_type = str(meta.get("summary_type") or "").strip()
-    is_forecast = analysis_type in {"sales_forecast", "customer_sales_forecast"} or summary_type in {"product_forecast", "customer_forecast"}
+    customer_group_forecast_types = {"customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast"}
+    customer_group_summary_types = {"customer_forecast", "salesperson_forecast", "region_forecast"}
+    is_forecast = analysis_type in {"sales_forecast", *customer_group_forecast_types} or summary_type in {"product_forecast", *customer_group_summary_types}
     source_label = str(meta.get("source_label") or _chat_source_mode_label(meta.get("source_mode") or ""))
 
     if analysis_type == "stock_shortage":
@@ -1407,7 +1411,7 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
         )
         return
 
-    if analysis_type in {"sales_forecast", "customer_sales_forecast", "sales_trend"} or is_forecast:
+    if analysis_type in {"sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "sales_trend"} or is_forecast:
         current_progress = meta.get("current_month_progress_pct")
         if current_progress is None:
             current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
@@ -1441,7 +1445,7 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
             with f4:
                 _chat_metric_card("6개월예상매출", meta.get("sum_6month_forecast_amt"), "원", bg="#fff7ed", border="#fed7aa")
 
-            if analysis_type == "customer_sales_forecast" or summary_type == "customer_forecast":
+            if analysis_type in customer_group_forecast_types or summary_type in customer_group_summary_types:
                 c5, c6, c7, c8 = st.columns(4)
                 with c5:
                     _chat_metric_card("매출처수", meta.get("customer_count"), "개", bg="#eff6ff", border="#bfdbfe")
@@ -1504,13 +1508,13 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
                 _chat_metric_card("당월 진척률", current_progress, "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
 
         _render_chat_count_card_group(
-            "추세판정별 매출처수" if (analysis_type == "customer_sales_forecast" or summary_type == "customer_forecast") else "추세판정별 제품수",
+            "추세판정별 매출처수" if (analysis_type in customer_group_forecast_types or summary_type in customer_group_summary_types) else "추세판정별 제품수",
             meta.get("trend_judge_counts") or {},
             ["증가", "감소", "안정", "반품주의", "신규/증가", "자료부족", "미분류"],
             _chat_color_for_trend,
         )
         _render_chat_count_card_group(
-            "예상등급별 매출처수" if (analysis_type == "customer_sales_forecast" or summary_type == "customer_forecast") else "예상등급별 제품수",
+            "예상등급별 매출처수" if (analysis_type in customer_group_forecast_types or summary_type in customer_group_summary_types) else "예상등급별 제품수",
             meta.get("forecast_grade_counts") or {},
             ["상승예상", "감소예상", "안정예상", "신규확인", "반품주의", "자료부족", "미분류"],
             _chat_color_for_forecast,
@@ -2494,9 +2498,9 @@ def _sims_business_terms(action_name: str) -> dict:
     """
     action = str(action_name or "")
 
-    if "매출처별 매출 예상" in action:
+    if "매출처별 매출 예상" in action or "영업사원별 매출 예상" in action or "지역별 매출 예상" in action:
         return {
-            "flow_label": "매출처별 매출 예상",
+            "flow_label": action or "매출 예상",
             "amount_label": "매출액",
             "vendor_label": "매출처",
             "qty_label": "수량",
@@ -4832,6 +4836,8 @@ REFERENCE_TABLE_ACTIONS = {
     "품목별 매출 추세 요약표",
     "품목별 매출 예상",
     "매출처별 매출 예상",
+    "영업사원별 매출 예상",
+    "지역별 매출 예상",
     "제약사별 매출 추세 분석",
     "제약사별 매출 추세 분석 요약표",
     "품목별 재고부족현황",
@@ -4872,7 +4878,7 @@ def _sims_table_role_from_action(action_name: Any, meta: Optional[Dict[str, Any]
     if (
         action in REFERENCE_TABLE_ACTIONS
         or "제품재고장" in action
-        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
         or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     ):
         return "reference"
@@ -6264,6 +6270,8 @@ def _is_sales_trend_action(action_name: str) -> bool:
         "품목별 매출 추세 요약표",
         "품목별 매출 예상",
         "매출처별 매출 예상",
+        "영업사원별 매출 예상",
+        "지역별 매출 예상",
         "제약사별 매출 추세 분석",
         "제약사별 매출 추세 분석 요약표",
         "품목별 재고부족현황",
@@ -7270,7 +7278,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
         is_monthly_stock = _is_monthly_stock_action(action_name)
         is_sales_trend = (
             _is_sales_trend_action(action_name)
-            or meta.get("analysis_type") in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage"}
+            or meta.get("analysis_type") in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage"}
             or meta.get("summary_type") in {"product_summary", "product_forecast", "product_stock_shortage"}
         )
 

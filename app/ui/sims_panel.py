@@ -603,6 +603,8 @@ def _is_sales_trend_payload(payload: Dict[str, Any], action: str, title: str) ->
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
             "매출처별 매출 예상",
+            "영업사원별 매출 예상",
+            "지역별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황"
@@ -612,12 +614,14 @@ def _is_sales_trend_payload(payload: Dict[str, Any], action: str, title: str) ->
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
             "매출처별 매출 예상",
+            "영업사원별 매출 예상",
+            "지역별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황"
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "customer_forecast", "salesperson_forecast", "region_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
 def _pinned_text_column_config(label: str, width: int):
@@ -1017,13 +1021,15 @@ def _is_sales_trend_summary_payload(payload: Dict[str, Any], action: str, title:
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
             "매출처별 매출 예상",
+            "영업사원별 매출 예상",
+            "지역별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "매출처별 매출 예상", "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표", "품목별 재고부족현황"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
-        or analysis_type in {"sales_forecast", "customer_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "매출처별 매출 예상", "영업사원별 매출 예상", "지역별 매출 예상", "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표", "품목별 재고부족현황"}
+        or summary_type in {"product_summary", "product_forecast", "customer_forecast", "salesperson_forecast", "region_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
+        or analysis_type in {"sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
     )
 
 def _blank_same_as_previous(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -1219,6 +1225,8 @@ _CATEGORIES: Dict[str, Dict[str, Any]] = {
             "품목별 매출 추세 요약표": analytics_views.render_sales_trend_summary_analysis,
             "품목별 매출 예상": analytics_views.render_sales_forecast_analysis,
             "매출처별 매출 예상": analytics_views.render_customer_sales_forecast_analysis,
+            "영업사원별 매출 예상": analytics_views.render_salesperson_sales_forecast_analysis,
+            "지역별 매출 예상": analytics_views.render_region_sales_forecast_analysis,
             "품목별 재고부족현황": analytics_views.render_stock_shortage_analysis,
         }
     },
@@ -2414,7 +2422,15 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
 
     except Exception as e:
         st.error(f"실행 오류: {e}")
-        log.warning("sims_panel: view render error (category=%s, action=%s)", category, action)
+        log.exception(
+            "sims_panel: view render error (category=%s, action=%s, run_flag=%s, was_final=%s, form_id=%s, widget_ns=%s)",
+            category,
+            action,
+            ss.get("__sims_run_flag"),
+            ss.get("__sims_was_final"),
+            ss.get("__sims_form_id"),
+            ss.get("__sims_widget_ns"),
+        )
         return
 
     # payload 점검
@@ -2854,7 +2870,8 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
         )
         return
 
-    if analysis_type in {"sales_forecast", "customer_sales_forecast"}:
+    customer_group_forecast_types = {"customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast"}
+    if analysis_type in {"sales_forecast", *customer_group_forecast_types}:
         current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
         current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
         current_progress = meta.get("current_month_progress_pct")
@@ -2887,7 +2904,7 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
         with f4:
             st.warning(f"6개월예상매출 : {_fmt_header_num(meta.get('sum_6month_forecast_amt'), '원')}")
 
-        if analysis_type == "customer_sales_forecast":
+        if analysis_type in customer_group_forecast_types:
             s1, s2, s3, s4 = st.columns(4)
             with s1:
                 st.info(f"매출처수 : {_fmt_header_num(meta.get('customer_count'), '개')}")
@@ -2905,7 +2922,7 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
             keys = [k for k in order if k in counts]
             keys += [k for k in counts.keys() if k not in keys]
             line = " / ".join(f"{k} {_fmt_header_num(counts.get(k), '개')}" for k in keys)
-            st.caption(f"예상등급별 {'매출처수' if analysis_type == 'customer_sales_forecast' else '제품수'}: {line}")
+            st.caption(f"예상등급별 {'매출처수' if analysis_type in customer_group_forecast_types else '제품수'}: {line}")
 
         return
 

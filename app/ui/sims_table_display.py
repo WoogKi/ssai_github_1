@@ -905,6 +905,8 @@ def _default_pinned_cols(
                 "sales_trend",
                 "sales_forecast",
                 "customer_sales_forecast",
+                "salesperson_sales_forecast",
+                "region_sales_forecast",
                 "manufacturer_sales_trend",
                 "manufacturer_sales_trend_summary",
                 "stock_shortage",
@@ -917,7 +919,7 @@ def _default_pinned_cols(
                 "현재표",
             )
         )
-        or str(meta.get("analysis_type") or "").strip() in {"sales_trend", "sales_forecast", "customer_sales_forecast", "manufacturer_sales_trend", "manufacturer_sales_trend_summary", "stock_shortage"}
+        or str(meta.get("analysis_type") or "").strip() in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "manufacturer_sales_trend", "manufacturer_sales_trend_summary", "stock_shortage"}
         or str(meta.get("summary_type") or "").strip() in {
             "product_summary",
             "product_forecast",

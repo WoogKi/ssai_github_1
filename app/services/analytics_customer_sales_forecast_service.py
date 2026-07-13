@@ -65,6 +65,69 @@ CUSTOMER_FORECAST_COLUMNS = [
     "기간구분",
 ]
 
+SALESPERSON_FORECAST_COLUMNS = [
+    "순번",
+    "영업사원코드",
+    "담당영업사원명",
+    "매출처수",
+    "총매출공급가액",
+    "총매출세액",
+    "총매출액",
+    "완료월총매출",
+    "월평균매출",
+    "완료월수",
+    "완료월평균매출",
+    "당월 현재매출",
+    "당월 예상매출",
+    "당월 잔여예상",
+    "당월 진척률",
+    "매출발생월수",
+    "최근3개월평균매출",
+    "최근6개월평균매출",
+    "최근3개월증감률",
+    "추세판정",
+    "예상기준",
+    "적용증감률",
+    "다음월예상매출",
+    "3개월예상매출",
+    "6개월예상매출",
+    "예상등급",
+    "분석자료원",
+    "기간구분",
+]
+
+REGION_FORECAST_COLUMNS = [
+    "순번",
+    "시도명",
+    "시구군명",
+    "매출처수",
+    "영업사원수",
+    "총매출공급가액",
+    "총매출세액",
+    "총매출액",
+    "완료월총매출",
+    "월평균매출",
+    "완료월수",
+    "완료월평균매출",
+    "당월 현재매출",
+    "당월 예상매출",
+    "당월 잔여예상",
+    "당월 진척률",
+    "매출발생월수",
+    "최근3개월평균매출",
+    "최근6개월평균매출",
+    "최근3개월증감률",
+    "추세판정",
+    "예상기준",
+    "적용증감률",
+    "다음월예상매출",
+    "3개월예상매출",
+    "6개월예상매출",
+    "예상등급",
+    "분석자료원",
+    "기간구분",
+]
+
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
@@ -128,6 +191,10 @@ def _progress_labels(policy: Optional[Dict[str, Any]]) -> dict[str, str]:
 def _month_range(params: Dict[str, Any], policy: Dict[str, Any]) -> list[str]:
     month_from = _parse_yyyymm(params.get("month_from"))
     month_to = _parse_yyyymm(policy.get("effective_month_to") or params.get("month_to"))
+    if not month_from:
+        month_from = _parse_yyyymm(str(params.get("date_from") or "")[:6])
+    if not month_to:
+        month_to = _parse_yyyymm(str(policy.get("effective_date_to") or params.get("date_to") or "")[:6])
     if month_from and month_to:
         return _iter_yyyymm(month_from, month_to)
     return []
@@ -143,6 +210,9 @@ def _add_customer_filters(clauses: list[str], sql_params: Dict[str, Any], params
     if _clean_text(params.get("sales_man_nm")):
         clauses.append("SalesMan.Rd06_User_Nm LIKE %(sales_man_nm_like)s")
         sql_params["sales_man_nm_like"] = like_value(params.get("sales_man_nm"))
+    if _clean_text(params.get("sales_man_cd")):
+        clauses.append("V.Rd03_Sales_Man = %(sales_man_cd)s")
+        sql_params["sales_man_cd"] = _clean_text(params.get("sales_man_cd"))
     if _clean_text(params.get("sido_nm")):
         clauses.append("Road1.Rd021_Sido LIKE %(sido_nm_like)s")
         sql_params["sido_nm_like"] = like_value(params.get("sido_nm"))
@@ -169,13 +239,13 @@ def _load_rddbc130_monthly(params: Dict[str, Any], policy: Dict[str, Any]) -> pd
     )
     sql = """
 SELECT
-    LEFT(LTRIM(RTRIM(T.Rd13_Trans_YyMmDd)), 6) AS 기준월,
-    LTRIM(RTRIM(T.Rd13_Ven_Cd)) AS 매출처코드,
-    SUM(CAST(COALESCE(T.Rd13_Supply_Price, 0) AS float)) AS 매출공급가액,
-    SUM(CAST(COALESCE(T.Rd13_Tax_Price, 0) AS float)) AS 매출세액,
-    SUM(CAST(COALESCE(T.Rd13_Tot_Amt, COALESCE(T.Rd13_Supply_Price, 0) + COALESCE(T.Rd13_Tax_Price, 0), 0) AS float)) AS 매출합계,
-    SUM(CAST(COALESCE(T.Rd13_Supply_Price, 0) + COALESCE(T.Rd13_Tax_Price, 0) AS float)) AS 계산합계,
-    COUNT_BIG(*) AS 집계건수
+    LEFT(LTRIM(RTRIM(T.Rd13_Trans_YyMmDd)), 6) AS base_month,
+    LTRIM(RTRIM(T.Rd13_Ven_Cd)) AS customer_cd,
+    SUM(CAST(COALESCE(T.Rd13_Supply_Price, 0) AS float)) AS supply_amt,
+    SUM(CAST(COALESCE(T.Rd13_Tax_Price, 0) AS float)) AS tax_amt,
+    SUM(CAST(COALESCE(T.Rd13_Tot_Amt, COALESCE(T.Rd13_Supply_Price, 0) + COALESCE(T.Rd13_Tax_Price, 0), 0) AS float)) AS total_amt,
+    SUM(CAST(COALESCE(T.Rd13_Supply_Price, 0) + COALESCE(T.Rd13_Tax_Price, 0) AS float)) AS calc_total_amt,
+    COUNT_BIG(*) AS row_count
 FROM dbo.Rddbc130 AS T WITH (NOLOCK)
 WHERE T.Rd13_Trans_YyMmDd >= %(date_from)s
   AND T.Rd13_Trans_YyMmDd <= %(date_to)s
@@ -188,6 +258,17 @@ GROUP BY LEFT(LTRIM(RTRIM(T.Rd13_Trans_YyMmDd)), 6), LTRIM(RTRIM(T.Rd13_Ven_Cd))
     elapsed = time.perf_counter() - t0
     if not isinstance(df, pd.DataFrame):
         return pd.DataFrame()
+    df = df.rename(
+        columns={
+            "base_month": "기준월",
+            "customer_cd": "매출처코드",
+            "supply_amt": "매출공급가액",
+            "tax_amt": "매출세액",
+            "total_amt": "매출합계",
+            "calc_total_amt": "계산합계",
+            "row_count": "집계건수",
+        }
+    )
     raw_rows = int(pd.to_numeric(df.get("집계건수", 0), errors="coerce").fillna(0).sum()) if not df.empty else 0
     total_supply = float(pd.to_numeric(df.get("매출공급가액", 0), errors="coerce").fillna(0).sum()) if not df.empty else 0
     total_tax = float(pd.to_numeric(df.get("매출세액", 0), errors="coerce").fillna(0).sum()) if not df.empty else 0
@@ -236,13 +317,13 @@ def _load_customer_master(params: Dict[str, Any]) -> pd.DataFrame:
     where_sql = " AND ".join(clauses)
     sql = f"""
 SELECT
-    LTRIM(RTRIM(V.Rd03_Ven_Cd)) AS 매출처코드,
-    COALESCE(NULLIF(LTRIM(RTRIM(V.Rd03_Ven_Nm)), ''), '(미지정)') AS 매출처명,
-    LTRIM(RTRIM(COALESCE(V.Rd03_Sales_Man, ''))) AS 영업사원코드,
-    COALESCE(NULLIF(LTRIM(RTRIM(SalesMan.Rd06_User_Nm)), ''), '') AS 담당영업사원명,
-    COALESCE(NULLIF(LTRIM(RTRIM(Road1.Rd021_Sido)), ''), '') AS 시도명,
-    COALESCE(NULLIF(LTRIM(RTRIM(Road1.Rd021_Gugun)), ''), '') AS 시구군명,
-    COALESCE(NULLIF(LTRIM(RTRIM(Road1.Rd021_RoadNm)), ''), '') AS 도로명
+    LTRIM(RTRIM(V.Rd03_Ven_Cd)) AS customer_cd,
+    COALESCE(NULLIF(LTRIM(RTRIM(V.Rd03_Ven_Nm)), ''), '(미지정)') AS customer_nm,
+    LTRIM(RTRIM(COALESCE(V.Rd03_Sales_Man, ''))) AS sales_man_cd,
+    COALESCE(NULLIF(LTRIM(RTRIM(SalesMan.Rd06_User_Nm)), ''), '') AS sales_man_nm,
+    COALESCE(NULLIF(LTRIM(RTRIM(Road1.Rd021_Sido)), ''), '') AS sido_nm,
+    COALESCE(NULLIF(LTRIM(RTRIM(Road1.Rd021_Gugun)), ''), '') AS gugun_nm,
+    COALESCE(NULLIF(LTRIM(RTRIM(Road1.Rd021_RoadNm)), ''), '') AS road_nm
 FROM dbo.Rddbc030 AS V WITH (NOLOCK)
 LEFT JOIN dbo.Rddbc060 AS SalesMan WITH (NOLOCK)
     ON V.Rd03_Sales_Man = SalesMan.Rd06_User_Cd
@@ -252,6 +333,18 @@ LEFT JOIN dbo.Rddbc021 AS Road1 WITH (NOLOCK)
 WHERE {where_sql}
 """
     df = query_to_df(sql, sql_params)
+    if isinstance(df, pd.DataFrame):
+        df = df.rename(
+            columns={
+                "customer_cd": "매출처코드",
+                "customer_nm": "매출처명",
+                "sales_man_cd": "영업사원코드",
+                "sales_man_nm": "담당영업사원명",
+                "sido_nm": "시도명",
+                "gugun_nm": "시구군명",
+                "road_nm": "도로명",
+            }
+        )
     if isinstance(df, pd.DataFrame) and not df.empty:
         df = df.drop_duplicates("매출처코드", keep="first")
     log.info("[analytics.customer_sales_forecast.sql] source=Rddbc030 raw_rows=%s grouped_rows=%s elapsed=%.3fs", len(df) if isinstance(df, pd.DataFrame) else 0, len(df) if isinstance(df, pd.DataFrame) else 0, time.perf_counter() - t0)
@@ -288,8 +381,12 @@ def _combine_sources(params: Dict[str, Any], policy: Dict[str, Any]) -> pd.DataF
 
 
 def _build_workforward(monthly: pd.DataFrame, params: Dict[str, Any]) -> pd.DataFrame:
-    src = monthly[["매출처코드", "기준월", "매출합계"]].rename(
-        columns={"매출처코드": "제품코드"}
+    src = pd.DataFrame(
+        {
+            "제품코드": monthly["매출처코드"].astype(str),
+            "기준월": monthly["기준월"],
+            "매출합계": monthly["매출합계"],
+        }
     )
     metrics = _build_sales_month_workforward_metrics(src, params)
     return metrics.rename(
@@ -610,6 +707,403 @@ def get_customer_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> p
         time.perf_counter() - t0,
     )
     return out
+
+
+def _build_group_workforward(group_monthly: pd.DataFrame, group_id_col: str, params: Dict[str, Any]) -> pd.DataFrame:
+    src = pd.DataFrame(
+        {
+            "제품코드": group_monthly[group_id_col].astype(str),
+            "기준월": group_monthly["기준월"],
+            "매출합계": group_monthly["매출합계"],
+        }
+    )
+    metrics = _build_sales_month_workforward_metrics(src, params)
+    return metrics.rename(
+        columns={
+            "제품코드": group_id_col,
+            "월시점 예상매출": "당월 예상매출",
+            "월시점 잔여예상": "당월 잔여예상",
+            "월시점 달성률": "당월 진척률",
+        }
+    )
+
+
+def _group_config(group_type: str) -> Dict[str, Any]:
+    if group_type == "salesperson":
+        return {
+            "action": "영업사원별 매출 예상",
+            "analysis_type": "salesperson_sales_forecast",
+            "summary_type": "salesperson_forecast",
+            "group_id_col": "__group_id__",
+            "group_cols": ["영업사원코드", "담당영업사원명"],
+            "public_columns": SALESPERSON_FORECAST_COLUMNS,
+            "sort_cols": ["다음월예상매출", "총매출액", "담당영업사원명", "영업사원코드"],
+            "sort_ascending": [False, False, True, True],
+            "caption": "영업사원별",
+        }
+    if group_type == "region":
+        return {
+            "action": "지역별 매출 예상",
+            "analysis_type": "region_sales_forecast",
+            "summary_type": "region_forecast",
+            "group_id_col": "__group_id__",
+            "group_cols": ["시도명", "시구군명"],
+            "public_columns": REGION_FORECAST_COLUMNS,
+            "sort_cols": ["다음월예상매출", "총매출액", "시도명", "시구군명"],
+            "sort_ascending": [False, False, True, True],
+            "caption": "지역별",
+        }
+    raise ValueError(f"지원하지 않는 group_type입니다: {group_type}")
+
+
+def _prepare_customer_monthly_with_master(params: Dict[str, Any], policy: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[str, Any], float, float]:
+    source_t0 = time.perf_counter()
+    monthly = _combine_sources(params, policy)
+    source_stats = dict(getattr(monthly, "attrs", {}) or {})
+    source_elapsed = time.perf_counter() - source_t0
+    master_t0 = time.perf_counter()
+    master = _load_customer_master(params)
+    master_elapsed = time.perf_counter() - master_t0
+    if monthly.empty:
+        return pd.DataFrame(), source_stats, source_elapsed, master_elapsed
+    if not master.empty:
+        monthly = monthly.merge(master, on="매출처코드", how="inner" if _has_master_filter(params) else "left", validate="many_to_one")
+    elif _has_master_filter(params):
+        monthly = monthly.iloc[0:0].copy()
+    for c in ["매출처명", "영업사원코드", "담당영업사원명", "시도명", "시구군명", "도로명"]:
+        if c not in monthly.columns:
+            monthly[c] = ""
+        monthly[c] = monthly[c].fillna("").astype(str).str.strip()
+    return monthly, source_stats, source_elapsed, master_elapsed
+
+
+def _meta_from_group_df(df: pd.DataFrame, params: Dict[str, Any], policy: Dict[str, Any], months: list[str], group_type: str) -> Dict[str, Any]:
+    meta = _meta_from_df(df, params, policy, months)
+    attrs = getattr(df, "attrs", {}) or {}
+    if df is None or df.empty:
+        meta.update({"group_count": 0, "group_type": group_type})
+        return meta
+    meta["group_count"] = int(len(df))
+    meta["group_type"] = group_type
+    if attrs.get("customer_count") is not None:
+        meta["customer_count"] = int(attrs.get("customer_count") or 0)
+    if attrs.get("salesperson_count") is not None:
+        meta["salesperson_count"] = int(attrs.get("salesperson_count") or 0)
+    if attrs.get("region_count") is not None:
+        meta["region_count"] = int(attrs.get("region_count") or 0)
+    if group_type == "salesperson":
+        meta["salesperson_count"] = int(len(df))
+    elif group_type == "region":
+        meta["region_count"] = int(len(df))
+    for key in ("salesperson_distribution", "province_distribution", "region_distribution"):
+        if isinstance(attrs.get(key), dict):
+            meta[key] = attrs.get(key)
+    return meta
+
+
+def _count_nonempty_pairs(df: pd.DataFrame, col1: str, col2: str) -> int:
+    if df is None or df.empty or col1 not in df.columns or col2 not in df.columns:
+        return 0
+    s = (
+        df[[col1, col2]]
+        .fillna("")
+        .astype(str)
+        .apply(lambda r: " ".join(x.strip() for x in r if str(x).strip()).strip(), axis=1)
+    )
+    return int(s[s != ""].nunique())
+
+
+def get_group_sales_forecast_df(params: Optional[Dict[str, Any]] = None, *, group_type: str) -> pd.DataFrame:
+    t0 = time.perf_counter()
+    cfg = _group_config(group_type)
+    params = _apply_period_source_policy_params(_apply_month_or_date_params(coalesce_params(params)))
+    policy = _resolve_period_source_policy(params)
+    months = _month_range(params, policy)
+    monthly, source_stats, source_elapsed, master_elapsed = _prepare_customer_monthly_with_master(params, policy)
+    if monthly.empty:
+        return pd.DataFrame()
+
+    if group_type == "salesperson":
+        monthly["영업사원코드"] = monthly["영업사원코드"].replace("", "빈값")
+        monthly["담당영업사원명"] = monthly["담당영업사원명"].replace("", "미지정")
+        group_cols = ["영업사원코드", "담당영업사원명"]
+    else:
+        monthly["시도명"] = monthly["시도명"].replace("", "미지정")
+        monthly["시구군명"] = monthly["시구군명"].replace("", "미지정")
+        group_cols = ["시도명", "시구군명"]
+
+    group_id_col = cfg["group_id_col"]
+    monthly[group_id_col] = monthly[group_cols].astype(str).agg("||".join, axis=1)
+    group_elapsed_t0 = time.perf_counter()
+    group_monthly = (
+        monthly.groupby([group_id_col, "기준월"], as_index=False)
+        .agg(
+            매출공급가액=("매출공급가액", "sum"),
+            매출세액=("매출세액", "sum"),
+            매출합계=("매출합계", "sum"),
+            집계건수=("집계건수", "sum"),
+            매출처수=("매출처코드", "nunique"),
+            영업사원수=("담당영업사원명", lambda s: int(s.fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique())),
+        )
+    )
+    group_labels = monthly[[group_id_col] + group_cols].drop_duplicates(group_id_col)
+    if group_type == "salesperson":
+        region_counts = []
+        for gid, sub in monthly.groupby(group_id_col):
+            region_counts.append({group_id_col: gid, "지역수": _count_nonempty_pairs(sub, "시도명", "시구군명")})
+        extra_counts = monthly.groupby(group_id_col, as_index=False).agg(매출처수=("매출처코드", "nunique"))
+        extra_counts = extra_counts.merge(pd.DataFrame(region_counts), on=group_id_col, how="left")
+    else:
+        extra_counts = monthly.groupby(group_id_col, as_index=False).agg(
+            매출처수=("매출처코드", "nunique"),
+            영업사원수=("담당영업사원명", lambda s: int(s.fillna("").astype(str).str.strip().replace("", pd.NA).dropna().nunique())),
+        )
+    group_elapsed = time.perf_counter() - group_elapsed_t0
+
+    forecast_t0 = time.perf_counter()
+    customers = sorted(set(group_monthly[group_id_col].astype(str)))
+    grid = pd.MultiIndex.from_product([customers, months], names=[group_id_col, "기준월"]).to_frame(index=False)
+    group_monthly = grid.merge(group_monthly, on=[group_id_col, "기준월"], how="left")
+    for c in ["매출공급가액", "매출세액", "매출합계", "집계건수", "매출처수", "영업사원수"]:
+        group_monthly[c] = pd.to_numeric(group_monthly[c], errors="coerce").fillna(0) if c in group_monthly.columns else 0
+    group_monthly["분석자료원"] = SOURCE_LABEL
+    group_monthly["기간구분"] = _display_period_label(policy)
+    wf = _build_group_workforward(group_monthly, group_id_col, params)
+    evaluation_month = str(policy.get("evaluation_month") or (months[-1] if months else ""))
+    eval_wf = wf[wf["기준월"].astype(str) == evaluation_month].copy()
+
+    pivot = (
+        group_monthly.pivot_table(index=group_id_col, columns="기준월", values="매출합계", aggfunc="sum", fill_value=0)
+        .reset_index()
+    )
+    for m in months:
+        if m not in pivot.columns:
+            pivot[m] = 0
+    month_cols = [f"{_fmt_yyyymm_col(m)} 매출" for m in months]
+    pivot = pivot.rename(columns={m: f"{_fmt_yyyymm_col(m)} 매출" for m in months})
+    base = (
+        group_monthly.groupby(group_id_col, as_index=False)
+        .agg(
+            총매출공급가액=("매출공급가액", "sum"),
+            총매출세액=("매출세액", "sum"),
+            총매출액=("매출합계", "sum"),
+            분석자료원=("분석자료원", "first"),
+            기간구분=("기간구분", "first"),
+        )
+    )
+    out = base.merge(group_labels, on=group_id_col, how="left", validate="one_to_one")
+    out = out.merge(extra_counts, on=group_id_col, how="left", validate="one_to_one")
+    out = out.merge(pivot, on=group_id_col, how="left", validate="one_to_one")
+    completed, current_month, _future = _split_sales_period_months(months, params)
+    completed_cols = [f"{_fmt_yyyymm_col(m)} 매출" for m in completed if f"{_fmt_yyyymm_col(m)} 매출" in out.columns]
+    current_col = f"{_fmt_yyyymm_col(current_month)} 매출" if current_month else ""
+    for c in month_cols:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out["완료월총매출"] = out[completed_cols].sum(axis=1) if completed_cols else 0
+    out["월평균매출"] = out["총매출액"] / max(len(months), 1)
+    out["완료월수"] = len(completed_cols)
+    out["완료월평균매출"] = out["완료월총매출"] / max(len(completed_cols), 1)
+    out["당월 현재매출"] = pd.to_numeric(out[current_col], errors="coerce").fillna(0) if current_col in out.columns else 0
+    eval_cols = [
+        group_id_col,
+        "월시점 완료월수",
+        "월시점 완료월평균매출",
+        "월시점 최근3개월평균매출",
+        "월시점 최근6개월평균매출",
+        "월시점 증감률",
+        "추세판정",
+        "당월 예상매출",
+        "당월 잔여예상",
+        "당월 진척률",
+    ]
+    eval_keep = [c for c in eval_cols if c in eval_wf.columns]
+    out = out.merge(eval_wf[eval_keep].drop_duplicates(group_id_col), on=group_id_col, how="left", validate="one_to_one")
+    out["최근3개월평균매출"] = pd.to_numeric(out.get("월시점 최근3개월평균매출", 0), errors="coerce").fillna(0)
+    out["최근6개월평균매출"] = pd.to_numeric(out.get("월시점 최근6개월평균매출", 0), errors="coerce").fillna(0)
+    out["최근3개월증감률"] = pd.to_numeric(out.get("월시점 증감률", 0), errors="coerce").fillna(0)
+    out["매출발생월수"] = out[completed_cols].ne(0).sum(axis=1) if completed_cols else 0
+    for c in ["당월 예상매출", "당월 잔여예상", "당월 진척률"]:
+        out[c] = pd.to_numeric(out.get(c, 0), errors="coerce").fillna(0)
+    forecasts = []
+    for _, row in out.iterrows():
+        base_label, adjusted_rate_pct, next_month = _forecast_projection_from_row(row)
+        forecasts.append(
+            {
+                "예상기준": base_label,
+                "적용증감률": adjusted_rate_pct,
+                "다음월예상매출": round(next_month, 0),
+                "3개월예상매출": round(next_month * 3, 0),
+                "6개월예상매출": round(next_month * 6, 0),
+                "예상등급": _forecast_grade(row),
+            }
+        )
+    out = pd.concat([out.reset_index(drop=True), pd.DataFrame(forecasts)], axis=1)
+    forecast_elapsed = time.perf_counter() - forecast_t0
+
+    pre_trend_counts = _trend_counts(out)
+    pre_grade_counts = out["예상등급"].fillna("미분류").astype(str).value_counts().to_dict() if "예상등급" in out.columns else {}
+    trend_filter = _clean_text(params.get("trend_judge"))
+    grade_filter = _clean_text(params.get("forecast_grade"))
+    if trend_filter:
+        out = out[out["추세판정"].fillna("").astype(str).str.strip() == trend_filter].copy()
+    if grade_filter:
+        out = out[out["예상등급"].fillna("").astype(str).str.strip() == grade_filter].copy()
+    post_trend_counts = _trend_counts(out)
+    post_grade_counts = out["예상등급"].fillna("미분류").astype(str).value_counts().to_dict() if "예상등급" in out.columns else {}
+
+    selected_ids = set(out[group_id_col].astype(str)) if group_id_col in out.columns else set()
+    selected_monthly = monthly[monthly[group_id_col].astype(str).isin(selected_ids)].copy() if selected_ids else monthly.iloc[0:0].copy()
+    group_customer_count = int(selected_monthly["매출처코드"].nunique()) if "매출처코드" in selected_monthly.columns else 0
+    sales_s = selected_monthly["담당영업사원명"].fillna("").astype(str).str.strip() if "담당영업사원명" in selected_monthly.columns else pd.Series([], dtype="object")
+    sales_s = sales_s[sales_s != ""]
+    group_salesperson_distribution = {str(k): int(v) for k, v in sales_s.value_counts().items()}
+    province_s = selected_monthly["시도명"].fillna("").astype(str).str.strip() if "시도명" in selected_monthly.columns else pd.Series([], dtype="object")
+    province_s = province_s[province_s != ""]
+    group_province_distribution = {str(k): int(v) for k, v in province_s.value_counts().items()}
+    if {"시도명", "시구군명"}.issubset(selected_monthly.columns):
+        region_s = (
+            selected_monthly[["시도명", "시구군명"]]
+            .fillna("")
+            .astype(str)
+            .apply(lambda r: " ".join(x.strip() for x in r if str(x).strip()).strip(), axis=1)
+        )
+        region_s = region_s[region_s != ""]
+        group_region_distribution = {str(k): int(v) for k, v in region_s.value_counts().items()}
+    else:
+        group_region_distribution = {}
+
+    sort_cols = [c for c in cfg["sort_cols"] if c in out.columns]
+    sort_ascending = cfg["sort_ascending"][: len(sort_cols)]
+    if sort_cols:
+        out = out.sort_values(sort_cols, ascending=sort_ascending).reset_index(drop=True)
+    if "순번" in out.columns:
+        out = out.drop(columns=["순번"])
+    out.insert(0, "순번", range(1, len(out) + 1))
+    label_map = _eval_label_map(policy)
+    public_columns = [label_map.get(c, c) for c in cfg["public_columns"]]
+    for internal_col, public_col in label_map.items():
+        if public_col != internal_col and internal_col in out.columns:
+            out[public_col] = out[internal_col]
+            out = out.drop(columns=[internal_col])
+    for c in public_columns + month_cols:
+        if c not in out.columns:
+            out[c] = 0 if c.endswith(("매출", "예상", "수", "률", "액")) else ""
+    out = out[public_columns + [c for c in month_cols if c in out.columns]].copy()
+    out = _normalize_analytics_numeric_columns(out)
+    labels = _progress_labels(policy)
+    out.attrs.update(
+        {
+            "months": months,
+            "evaluation_mode": policy.get("evaluation_mode"),
+            "evaluation_month": policy.get("evaluation_month"),
+            "source_label": SOURCE_LABEL,
+            "display_period_label": _display_period_label(policy),
+            "pre_filter_trend_judge_counts": pre_trend_counts,
+            "post_filter_trend_judge_counts": post_trend_counts,
+            "pre_filter_forecast_grade_counts": pre_grade_counts,
+            "post_filter_forecast_grade_counts": post_grade_counts,
+            "current_progress_title": labels["title"],
+            "current_sales_label": labels["sales"],
+            "current_expected_label": labels["expected"],
+            "current_remaining_label": labels["remaining"],
+            "current_progress_label": labels["progress"],
+            "source_table": source_stats.get("source_table") or "Rddbc130",
+            "source_mode": source_stats.get("source_mode") or "transaction_statement",
+            "trans_di": source_stats.get("trans_di") or "3",
+            "date_from": source_stats.get("date_from") or params.get("date_from"),
+            "date_to": source_stats.get("date_to") or policy.get("effective_date_to") or params.get("date_to"),
+            "raw_rows": source_stats.get("raw_rows", 0),
+            "monthly_rows": source_stats.get("monthly_rows", 0),
+            "total_supply": source_stats.get("total_supply", 0),
+            "total_tax": source_stats.get("total_tax", 0),
+            "total_amount": source_stats.get("total_amount", 0),
+            "customer_count": group_customer_count,
+            "salesperson_count": len(group_salesperson_distribution),
+            "region_count": len(group_region_distribution),
+            "salesperson_distribution": group_salesperson_distribution,
+            "province_distribution": group_province_distribution,
+            "region_distribution": group_region_distribution,
+        }
+    )
+    finish_elapsed = time.perf_counter() - t0 - source_elapsed - master_elapsed - group_elapsed - forecast_elapsed
+    log.info(
+        "[analytics.group_sales_forecast.perf] group_type=%s monthly_rows=%s group_count=%s source_elapsed=%.3fs master_elapsed=%.3fs group_elapsed=%.3fs forecast_elapsed=%.3fs finish_elapsed=%.3fs total_elapsed=%.3fs",
+        group_type,
+        int(len(group_monthly)),
+        int(len(out)),
+        source_elapsed,
+        master_elapsed,
+        group_elapsed,
+        forecast_elapsed,
+        max(finish_elapsed, 0),
+        time.perf_counter() - t0,
+    )
+    return out
+
+
+def get_group_sales_forecast_result(params: Optional[Dict[str, Any]] = None, *, group_type: str) -> Dict[str, Any]:
+    cfg = _group_config(group_type)
+    params = _apply_month_or_date_params(coalesce_params(params))
+    df = get_group_sales_forecast_df(params, group_type=group_type)
+    rows = 0 if df is None else int(len(df))
+    attrs = getattr(df, "attrs", {}) or {}
+    source_label = str(attrs.get("source_label") or SOURCE_LABEL)
+    query_summary = _fmt_analytics_query_summary(params, source_label)
+    policy = _resolve_period_source_policy(_apply_period_source_policy_params(params.copy()))
+    meta = _meta_from_group_df(df, params, policy, list(attrs.get("months") or []), group_type)
+    meta.update(
+        {
+            "analytics": True,
+            "analysis_type": cfg["analysis_type"],
+            "summary_type": cfg["summary_type"],
+            "group_type": group_type,
+            "source_label": source_label,
+            "display_period_label": attrs.get("display_period_label"),
+            "query_summary": query_summary,
+            "condition": query_summary,
+            "pre_filter_trend_judge_counts": attrs.get("pre_filter_trend_judge_counts") or {},
+            "post_filter_trend_judge_counts": attrs.get("post_filter_trend_judge_counts") or {},
+            "pre_filter_forecast_grade_counts": attrs.get("pre_filter_forecast_grade_counts") or {},
+            "post_filter_forecast_grade_counts": attrs.get("post_filter_forecast_grade_counts") or {},
+            "summary_md": (
+                f"{cfg['action']}: 조회조건 {query_summary} / "
+                f"그룹수 {_fmt_num_for_summary(meta.get('group_count'))} / "
+                f"매출처수 {_fmt_num_for_summary(meta.get('customer_count'))} / "
+                f"{str(meta.get('current_sales_label') or '당월 현재매출').replace(' ', '')} {_fmt_num_for_summary(meta.get('sum_current_month_sales_amt'))} / "
+                f"다음월예상매출 {_fmt_num_for_summary(meta.get('sum_next_month_forecast_amt'))} / "
+                f"추세판정 {_fmt_counts_for_summary(meta.get('trend_judge_counts') or {})} / "
+                f"자료원 {source_label}"
+            ),
+        }
+    )
+    payload = build_result_payload(
+        table=TABLE,
+        title=cfg["action"],
+        action=cfg["action"],
+        params=params,
+        df=df,
+        message=f"{cfg['action']} {rows:,}건",
+    )
+    payload.setdefault("meta", {})
+    payload["meta"].update(meta)
+    return payload
+
+
+def get_salesperson_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    return get_group_sales_forecast_df(params, group_type="salesperson")
+
+
+def get_salesperson_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return get_group_sales_forecast_result(params, group_type="salesperson")
+
+
+def get_region_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    return get_group_sales_forecast_df(params, group_type="region")
+
+
+def get_region_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return get_group_sales_forecast_result(params, group_type="region")
 
 
 def get_customer_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

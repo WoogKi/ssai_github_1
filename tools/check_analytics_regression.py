@@ -337,6 +337,8 @@ def run_basic_checks() -> list[CheckResult]:
                 ("품목별 매출 추세 요약표 2025년 조회", "품목별 매출 추세 요약표"),
                 ("품목별 매출 예상 2025년 조회", "품목별 매출 예상"),
                 ("매출처별 매출 예상 2025년 조회", "매출처별 매출 예상"),
+                ("영업사원별 매출 예상 2025년 조회", "영업사원별 매출 예상"),
+                ("지역별 매출 예상 2025년 조회", "지역별 매출 예상"),
                 ("품목별 재고부족현황 2025년 조회", "품목별 재고부족현황"),
             ]
             for q, expected in tests:
@@ -1567,6 +1569,7 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
     try:
         customer_mod = importlib.import_module("app.services.analytics_customer_sales_forecast_service")
         chat_mod = importlib.import_module("app.ui.chat_middleware")
+        views_mod = importlib.import_module("app.sims.views.analytics_views")
     except Exception as e:
         return [_fail("customer sales forecast import", f"{type(e).__name__}: {e}")]
 
@@ -1645,6 +1648,12 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
         current_res = customer_mod.get_customer_sales_forecast_result(params_current)
         params_mid = {**params_current, "date_to": "20260702"}
         mid = customer_mod.get_customer_sales_forecast_df(params_mid)
+        current_salesperson = customer_mod.get_salesperson_sales_forecast_df(params_current)
+        current_region = customer_mod.get_region_sales_forecast_df(params_current)
+        current_salesperson_res = customer_mod.get_salesperson_sales_forecast_result(params_current)
+        current_region_res = customer_mod.get_region_sales_forecast_result(params_current)
+        mid_salesperson = customer_mod.get_salesperson_sales_forecast_df(params_mid)
+        mid_region = customer_mod.get_region_sales_forecast_df(params_mid)
         mismatches: list[str] = []
         required_cols = [
             "순번",
@@ -1666,8 +1675,41 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
         for c in required_cols:
             if c not in current.columns:
                 mismatches.append(f"missing current column {c}")
+        salesperson_required_cols = [
+            "순번",
+            "영업사원코드",
+            "담당영업사원명",
+            "매출처수",
+            "총매출액",
+            "당월 현재매출",
+            "당월 예상매출",
+            "예상등급",
+            "2026-07 매출",
+        ]
+        for c in salesperson_required_cols:
+            if c not in current_salesperson.columns:
+                mismatches.append(f"missing salesperson forecast column {c}")
+        region_required_cols = [
+            "순번",
+            "시도명",
+            "시구군명",
+            "매출처수",
+            "영업사원수",
+            "총매출액",
+            "당월 현재매출",
+            "당월 예상매출",
+            "예상등급",
+            "2026-07 매출",
+        ]
+        for c in region_required_cols:
+            if c not in current_region.columns:
+                mismatches.append(f"missing region forecast column {c}")
         if any(str(c).endswith(" 수량") or str(c) in {"제품코드", "제품명"} for c in current.columns):
             mismatches.append("customer forecast exposed product/qty columns")
+        if any(str(c).endswith(" 수량") or str(c) in {"제품코드", "제품명", "매출처코드", "매출처명"} for c in current_salesperson.columns):
+            mismatches.append("salesperson forecast exposed customer/product/qty columns")
+        if any(str(c).endswith(" 수량") or str(c) in {"제품코드", "제품명", "매출처코드", "매출처명"} for c in current_region.columns):
+            mismatches.append("region forecast exposed customer/product/qty columns")
         if calls["r130"] < 3:
             mismatches.append("Rddbc130 transaction statement loader should be used for every period")
         if any(start != "20260101" for start, _end, _mode in calls["date_ranges"]):
@@ -1686,6 +1728,24 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
             mismatches.append(f"midmonth evaluation sales expected Rddbc130 total 330 got={mid_row['평가월 매출']}")
         if abs(float(mid_row["평가월 예상매출"]) - float(row_50001["당월 예상매출"])) > 1e-9:
             mismatches.append("current and midmonth expected sales should match from completed months")
+        if "평가월 매출" not in mid_salesperson.columns or "당월 현재매출" in mid_salesperson.columns:
+            mismatches.append("salesperson historical midmonth label map failed")
+        if "평가월 매출" not in mid_region.columns or "당월 현재매출" in mid_region.columns:
+            mismatches.append("region historical midmonth label map failed")
+        total_customer = float(current["총매출액"].sum())
+        if abs(float(current_salesperson["총매출액"].sum()) - total_customer) > 1e-9:
+            mismatches.append("salesperson forecast total should match customer forecast total")
+        if abs(float(current_region["총매출액"].sum()) - total_customer) > 1e-9:
+            mismatches.append("region forecast total should match customer forecast total")
+        current_sales_customer = float(current["당월 현재매출"].sum())
+        if abs(float(current_salesperson["당월 현재매출"].sum()) - current_sales_customer) > 1e-9:
+            mismatches.append("salesperson current sales should match customer current sales")
+        if abs(float(current_region["당월 현재매출"].sum()) - current_sales_customer) > 1e-9:
+            mismatches.append("region current sales should match customer current sales")
+        if current_salesperson[["영업사원코드", "담당영업사원명"]].duplicated().any():
+            mismatches.append("salesperson forecast should keep one final row per salesperson")
+        if current_region[["시도명", "시구군명"]].duplicated().any():
+            mismatches.append("region forecast should keep one final row per region")
         meta = current_res.get("meta") or {}
         if meta.get("analysis_type") != "customer_sales_forecast" or meta.get("summary_type") != "customer_forecast":
             mismatches.append(f"unexpected result meta={meta}")
@@ -1711,6 +1771,16 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
             mismatches.append("forecast_grade_counts missing")
         if current["매출처코드"].duplicated().any():
             mismatches.append("customer forecast should keep one final row per customer")
+        sp_meta = current_salesperson_res.get("meta") or {}
+        if sp_meta.get("analysis_type") != "salesperson_sales_forecast" or sp_meta.get("summary_type") != "salesperson_forecast":
+            mismatches.append(f"unexpected salesperson meta={sp_meta}")
+        if not isinstance(sp_meta.get("salesperson_count"), int) or isinstance(sp_meta.get("salesperson_count"), dict):
+            mismatches.append(f"salesperson forecast salesperson_count should be int got={type(sp_meta.get('salesperson_count')).__name__}")
+        rg_meta = current_region_res.get("meta") or {}
+        if rg_meta.get("analysis_type") != "region_sales_forecast" or rg_meta.get("summary_type") != "region_forecast":
+            mismatches.append(f"unexpected region meta={rg_meta}")
+        if not isinstance(rg_meta.get("region_count"), int) or isinstance(rg_meta.get("region_count"), dict):
+            mismatches.append(f"region forecast region_count should be int got={type(rg_meta.get('region_count')).__name__}")
         llm_df = current.copy()
         llm_df.insert(1, "거래일자", "20260712")
         amount_profile = chat_mod._build_sims_sales_time_profile(  # noqa: SLF001
@@ -1721,6 +1791,51 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
             mismatches.append("customer forecast LLM amount_col must not be 매출처코드")
         if amount_profile.get("amount_col") != "총매출액":
             mismatches.append(f"customer forecast LLM amount_col expected 총매출액 got={amount_profile.get('amount_col')}")
+        sp_llm = current_salesperson.copy()
+        sp_llm.insert(1, "거래일자", "20260712")
+        sp_amount_profile = chat_mod._build_sims_sales_time_profile(  # noqa: SLF001
+            sp_llm,
+            chat_mod._sims_business_terms("영업사원별 매출 예상"),  # noqa: SLF001
+        )
+        if sp_amount_profile.get("amount_col") != "총매출액":
+            mismatches.append(f"salesperson forecast LLM amount_col expected 총매출액 got={sp_amount_profile.get('amount_col')}")
+        rg_llm = current_region.copy()
+        rg_llm.insert(1, "거래일자", "20260712")
+        rg_amount_profile = chat_mod._build_sims_sales_time_profile(  # noqa: SLF001
+            rg_llm,
+            chat_mod._sims_business_terms("지역별 매출 예상"),  # noqa: SLF001
+        )
+        if rg_amount_profile.get("amount_col") != "총매출액":
+            mismatches.append(f"region forecast LLM amount_col expected 총매출액 got={rg_amount_profile.get('amount_col')}")
+
+        old_form = getattr(views_mod, "_render_customer_sales_forecast_form", None)
+        old_st = getattr(views_mod, "st", None)
+
+        class _FakeSt:
+            @staticmethod
+            def subheader(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def caption(*_args, **_kwargs):
+                return None
+
+        try:
+            setattr(views_mod, "st", _FakeSt())
+            setattr(views_mod, "_render_customer_sales_forecast_form", lambda _action_key: (False, {}))
+            for fn_name, title in [
+                ("render_customer_sales_forecast_analysis", "매출처별 매출 예상"),
+                ("render_salesperson_sales_forecast_analysis", "영업사원별 매출 예상"),
+                ("render_region_sales_forecast_analysis", "지역별 매출 예상"),
+            ]:
+                payload = getattr(views_mod, fn_name)()
+                if not isinstance(payload, dict) or payload.get("final") is not False or payload.get("title") != title:
+                    mismatches.append(f"{fn_name} initial render contract failed payload={payload}")
+        finally:
+            if old_form is not None:
+                setattr(views_mod, "_render_customer_sales_forecast_form", old_form)
+            if old_st is not None:
+                setattr(views_mod, "st", old_st)
 
         filtered = customer_mod.get_customer_sales_forecast_df({**params_current, "sido_nm": "서울"})
         if set(filtered["매출처코드"].astype(str).tolist()) != {"50001"}:
