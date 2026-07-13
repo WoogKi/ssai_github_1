@@ -640,6 +640,8 @@ def _try_answer_ctx_meta_question(
 # - 품목별 매출 추세 요약표
 # - 품목별 매출 예상
 # - 품목별 재고부족현황
+# - 제약사별 매출 추세 분석
+# - 제약사별 매출 추세 분석 요약표
 # =============================================================================
 
 _ANALYTICS_ACTION_SPECS = (
@@ -657,6 +659,38 @@ _ANALYTICS_ACTION_SPECS = (
             "부족 현황",
             "재고부족",
             "재고 부족",
+        ),
+    },
+    {
+        "action": "제약사별 매출 추세 분석 요약표",
+        "service": "get_manufacturer_sales_trend_summary_result",
+        "phrases": (
+            "제약사별 매출 추세 분석 요약표",
+            "제약사별 매출추세 분석 요약표",
+            "제약사별 매출 추세 요약표",
+            "제약사별 매출추세 요약표",
+            "제약사별 매출 추세요약표",
+            "제약사별 매출추세요약표",
+            "제약사 매출 추세 요약표",
+            "제조사별 매출 추세 분석 요약표",
+            "제조사별 매출 추세 요약표",
+            "제조사별 매출추세요약표",
+        ),
+    },
+    {
+        "action": "제약사별 매출 추세 분석",
+        "service": "get_manufacturer_sales_trend_result",
+        "phrases": (
+            "제약사별 매출 추세 분석",
+            "제약사별 매출추세 분석",
+            "제약사별 매출 추세",
+            "제약사별 매출추세",
+            "제약사 매출 추세 분석",
+            "제약사 매출추세 분석",
+            "제조사별 매출 추세 분석",
+            "제조사별 매출추세 분석",
+            "제조사별 매출 추세",
+            "제조사별 매출추세",
         ),
     },
     {
@@ -718,6 +752,18 @@ _ANALYTICS_TAIL_PATTERNS = (
     r"\s*품목별\s*매출추세.*$",
     r"\s*품목별\s*매출\s*예상.*$",
     r"\s*품목별\s*매출예상.*$",
+    r"\s*제약사별\s*매출\s*추세\s*분석\s*요약표.*$",
+    r"\s*제약사별\s*매출추세\s*분석\s*요약표.*$",
+    r"\s*제약사별\s*매출\s*추세\s*요약표.*$",
+    r"\s*제약사별\s*매출추세\s*요약표.*$",
+    r"\s*제약사별\s*매출\s*추세.*$",
+    r"\s*제약사별\s*매출추세.*$",
+    r"\s*제조사별\s*매출\s*추세\s*분석\s*요약표.*$",
+    r"\s*제조사별\s*매출추세\s*분석\s*요약표.*$",
+    r"\s*제조사별\s*매출\s*추세\s*요약표.*$",
+    r"\s*제조사별\s*매출추세\s*요약표.*$",
+    r"\s*제조사별\s*매출\s*추세.*$",
+    r"\s*제조사별\s*매출추세.*$",
     r"\s*품목별\s*재고\s*부족\s*현황.*$",
     r"\s*품목별\s*재고부족현황.*$",
     r"\s*품목별\s*재고\s*부족.*$",
@@ -1144,6 +1190,10 @@ def _get_analytics_handler(action: str):
             get_sales_forecast_result,
             get_stock_shortage_result,
         )
+        from app.services.analytics_manufacturer_sales_trend_service import (
+            get_manufacturer_sales_trend_result,
+            get_manufacturer_sales_trend_summary_result,
+        )
     except Exception:
         raise
 
@@ -1151,6 +1201,8 @@ def _get_analytics_handler(action: str):
         "품목별 매출 추세 분석": get_sales_trend_result,
         "품목별 매출 추세 요약표": get_sales_trend_summary_result,
         "품목별 매출 예상": get_sales_forecast_result,
+        "제약사별 매출 추세 분석": get_manufacturer_sales_trend_result,
+        "제약사별 매출 추세 분석 요약표": get_manufacturer_sales_trend_summary_result,
         "품목별 재고부족현황": get_stock_shortage_result,
     }
 
@@ -4632,6 +4684,3 @@ def try_handle_nlq(
         logger.exception("[nlq.router] failed to import/handle codes handler")
 
     return False
-
-
-

@@ -15,6 +15,7 @@ import datetime as dt
 
 import streamlit as st
 import pandas as pd
+from app.ui.sims_table_display import log_sims_table_mode, log_sims_table_render
 
 log = logging.getLogger("ssai")
 
@@ -104,6 +105,16 @@ def _is_numeric_col(df: pd.DataFrame, col: str) -> bool:
         "당월 현재매출",
         "당월 예상매출",
         "당월 잔여예상",
+        "전월대비매출",
+        "총매출공급가액",
+        "매출공급가액",
+        "매출세액",
+        "매출합계",
+        "전월대비매출",
+        "총매출공급가액",
+        "매출공급가액",
+        "매출세액",
+        "매출합계",
         "최근3개월평균매출",
         "최근6개월평균매출",
         "당월 진척률",
@@ -333,6 +344,14 @@ def _fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
             "당월 현재매출",
             "당월 예상매출",
             "당월 잔여예상",
+            "전월대비매출",
+            "총매출공급가액",
+            "매출공급가액",
+            "매출세액",
+            "매출합계",
+            "평가월 현재매출",
+            "평가월 예상매출",
+            "평가월 잔여예상",
             "다음월예상매출",
             "3개월예상매출",
             "6개월예상매출",
@@ -344,7 +363,10 @@ def _fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
         }
         percent_cols = {
             "당월 진척률",
+            "평가월 진척률",
+            "전월대비매출증감률",
             "최근3개월증감률",
+            "월시점 최근3개월증감률",
             "적용증감률",
             "월시점 증감률",
             "월시점 적용증감률",
@@ -409,7 +431,10 @@ def _fast_column_config(df: pd.DataFrame) -> dict:
 
         if s in {
             "당월 진척률",
+            "평가월 진척률",
+            "전월대비매출증감률",
             "최근3개월증감률",
+            "월시점 최근3개월증감률",
             "적용증감률",
             "월시점 증감률",
             "월시점 적용증감률",
@@ -577,16 +602,20 @@ def _is_sales_trend_payload(payload: Dict[str, Any], action: str, title: str) ->
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "제약사별 매출 추세 분석",
+            "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황"
         }
         or title_text in {
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "제약사별 매출 추세 분석",
+            "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황"
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage"}
+        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
 def _pinned_text_column_config(label: str, width: int):
@@ -728,7 +757,10 @@ def _analytics_number_decimals(col: str) -> int | None:
 
     percent_cols = {
         "당월 진척률",
+        "평가월 진척률",
+        "전월대비매출증감률",
         "최근3개월증감률",
+        "월시점 최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
         "월시점 적용증감률",
@@ -982,11 +1014,13 @@ def _is_sales_trend_summary_payload(payload: Dict[str, Any], action: str, title:
         action_text in {
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "제약사별 매출 추세 분석",
+            "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "품목별 재고부족현황"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage"}
-        or analysis_type in {"sales_forecast", "stock_shortage"}
+        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표", "품목별 재고부족현황"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
+        or analysis_type in {"sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
     )
 
 def _blank_same_as_previous(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -1176,6 +1210,8 @@ _CATEGORIES: Dict[str, Dict[str, Any]] = {
     },
     "분석/KPI": {
         "actions": {
+            "제약사별 매출 추세 분석": analytics_views.render_manufacturer_sales_trend_analysis,
+            "제약사별 매출 추세 분석 요약표": analytics_views.render_manufacturer_sales_trend_summary_analysis,
             "품목별 매출 추세 분석": analytics_views.render_sales_trend_analysis,
             "품목별 매출 추세 요약표": analytics_views.render_sales_trend_summary_analysis,
             "품목별 매출 예상": analytics_views.render_sales_forecast_analysis,
@@ -2747,6 +2783,73 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
 
         return
 
+    if analysis_type in {"manufacturer_sales_trend", "manufacturer_sales_trend_summary"} or meta.get("summary_type") in {"manufacturer_trend_detail", "manufacturer_trend_summary"}:
+        show_manufacturer_extended = analysis_type == "manufacturer_sales_trend_summary" or meta.get("summary_type") == "manufacturer_trend_summary"
+        st.markdown("### 매출추세요약")
+        if meta.get("period_caption"):
+            st.caption(str(meta.get("period_caption")))
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.info(f"총매출액 : {_fmt_header_num(meta.get('sum_sales_amt'), '원')}")
+        with c2:
+            st.info(f"매출공급가액 : {_fmt_header_num(meta.get('sum_supply_amt'), '원')}")
+        with c3:
+            st.info(f"매출세액 : {_fmt_header_num(meta.get('sum_tax_amt'), '원')}")
+        with c4:
+            st.info(f"제약사수 : {_fmt_header_num(meta.get('manufacturer_count') or meta.get('group_count'), '개')}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            st.info(f"제품수 : {_fmt_header_num(meta.get('product_count'), '개')}")
+        with c6:
+            st.info(f"매입처수 : {_fmt_header_num(meta.get('buy_vendor_count') or meta.get('purchase_vendor_count'), '개')}")
+        with c7:
+            st.info(f"분석월수 : {_fmt_header_num(meta.get('month_count'), '개월')}")
+        with c8:
+            st.info(f"자료원 : {meta.get('source_label') or '-'}")
+
+        if not show_manufacturer_extended:
+            st.caption(
+                f"평가월: {meta.get('evaluation_month') or '-'} / "
+                f"자료원: {meta.get('source_label') or '-'} / "
+                f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+            )
+            return
+
+        st.markdown(f"### {meta.get('current_progress_title') or ('당월 진행 요약' if meta.get('evaluation_mode') == 'current_monthly' else '평가월 진행 요약')}")
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        with p1:
+            st.info(f"완료월수 : {_fmt_header_num(meta.get('completed_month_count'), '개월')}")
+        with p2:
+            st.info(f"완료월평균매출 : {_fmt_header_num(meta.get('avg_completed_month_sales_amt'), '원')}")
+        with p3:
+            st.info(f"{meta.get('current_sales_label') or '당월 현재매출'} : {_fmt_header_num(meta.get('sum_current_month_sales_amt'), '원')}")
+        with p4:
+            st.warning(f"{meta.get('current_expected_label') or '당월 예상매출'} : {_fmt_header_num(meta.get('sum_current_month_expected_amt'), '원')}")
+        with p5:
+            st.warning(f"{meta.get('current_remaining_label') or '당월 잔여예상'} : {_fmt_header_num(meta.get('sum_current_month_remaining_expected_amt'), '원')}")
+        with p6:
+            st.success(f"{meta.get('current_progress_label') or '당월 진척률'} : {_fmt_header_num(meta.get('current_month_progress_pct'), '%', decimals=2)}")
+
+        trend_counts = meta.get("trend_judge_counts") or {}
+        st.markdown("### 추세판정별 제약사수")
+        j1, j2, j3, j4 = st.columns(4)
+        with j1:
+            st.success(f"증가 : {_fmt_header_num(trend_counts.get('증가', 0), '개')}")
+        with j2:
+            st.warning(f"감소 : {_fmt_header_num(trend_counts.get('감소', 0), '개')}")
+        with j3:
+            st.info(f"안정 : {_fmt_header_num(trend_counts.get('안정', 0), '개')}")
+        with j4:
+            st.info(f"자료부족 : {_fmt_header_num(trend_counts.get('자료부족', 0), '개')}")
+
+        st.caption(
+            f"평가월: {meta.get('evaluation_month') or '-'} / "
+            f"자료원: {meta.get('source_label') or '-'} / "
+            f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+        )
+        return
+
     if analysis_type == "sales_forecast":
         current_expected = float(meta.get("sum_current_month_expected_amt") or 0)
         current_sales = float(meta.get("sum_current_month_sales_amt") or 0)
@@ -3520,8 +3623,24 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                 if is_sales_trend_payload:
                     _render_simple_analysis_header(payload)
 
-                    if _is_large_table_for_fast_render(view_df):
+                    table_mode_info = {"mode": "fast" if _is_large_table_for_fast_render(view_df) else "small"}
+                    try:
+                        table_mode_info = log_sims_table_mode(view_df, action=action, render_path="panel")
+                    except Exception:
+                        log.debug("[sims.table_mode] panel log failed", exc_info=True)
+                    if str(table_mode_info.get("mode") or "") == "fast":
                         st.caption("빠른 표 모드: 분석/KPI 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
+                        log_sims_table_render(
+                            view_df,
+                            action=action,
+                            render_path="panel",
+                            mode="fast",
+                            renderer="_render_fast_dataframe",
+                            height=520,
+                            visible_rows=min(int(len(view_df)), 300),
+                            width_mode="fast",
+                            column_config_count=0,
+                        )
                         _render_fast_dataframe(
                             view_df,
                             height=520,
@@ -3530,6 +3649,17 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                         )
 
                     else:
+                        log_sims_table_render(
+                            view_df,
+                            action=action,
+                            render_path="panel",
+                            mode="small",
+                            renderer="st.dataframe",
+                            height=520,
+                            visible_rows=min(int(len(view_df)), max(int((520 - 48) / 32), 0)),
+                            width_mode="width",
+                            column_config_count=len(column_config or {}),
+                        )
                         try:
                             st.dataframe(
                                 view_df,
@@ -4179,6 +4309,14 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
         "당월 현재매출",
         "당월 예상매출",
         "당월 잔여예상",
+        "전월대비매출",
+        "총매출공급가액",
+        "매출공급가액",
+        "매출세액",
+        "매출합계",
+        "평가월 현재매출",
+        "평가월 예상매출",
+        "평가월 잔여예상",
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
@@ -4198,7 +4336,10 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
     }
     percent_cols = {
         "당월 진척률",
+        "평가월 진척률",
+        "전월대비매출증감률",
         "최근3개월증감률",
+        "월시점 최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
         "월시점 적용증감률",
@@ -4219,21 +4360,50 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
                 return
             money_fmt = workbook.add_format({"num_format": "#,##0"})
             pct_fmt = workbook.add_format({"num_format": "0.00\\%"})
+            header_fmt = workbook.add_format({"bold": True, "bg_color": "#E5E7EB", "border": 1})
+            try:
+                worksheet.freeze_panes(1, 0)
+                if len(df.columns) > 0:
+                    worksheet.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
+                for idx, col in enumerate(df.columns):
+                    worksheet.write(0, idx, col, header_fmt)
+            except Exception:
+                pass
             for idx, col in enumerate(df.columns):
                 name = str(col or "").strip()
+                width = 24 if name in {"제약사명", "분석자료원"} else None
                 if name in money_cols:
-                    worksheet.set_column(idx, idx, None, money_fmt)
+                    worksheet.set_column(idx, idx, width, money_fmt)
                 elif name in decimal_money_cols:
                     dec_fmt = workbook.add_format({"num_format": "#,##0.00"})
-                    worksheet.set_column(idx, idx, None, dec_fmt)
+                    worksheet.set_column(idx, idx, width, dec_fmt)
                 elif name in percent_cols:
-                    worksheet.set_column(idx, idx, None, pct_fmt)
+                    worksheet.set_column(idx, idx, width, pct_fmt)
+                elif width:
+                    worksheet.set_column(idx, idx, width)
             return
 
         if engine == "openpyxl":
             worksheet = writer.sheets.get(sheet_name)
             if worksheet is None:
                 return
+            try:
+                from openpyxl.styles import Font, PatternFill, Border, Side
+                from openpyxl.utils import get_column_letter
+                worksheet.freeze_panes = "A2"
+                if len(df.columns) > 0:
+                    worksheet.auto_filter.ref = worksheet.dimensions
+                header_fill = PatternFill("solid", fgColor="E5E7EB")
+                thin = Side(style="thin", color="D1D5DB")
+                for cell in worksheet[1]:
+                    cell.font = Font(bold=True)
+                    cell.fill = header_fill
+                    cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+                for idx, col in enumerate(df.columns, start=1):
+                    if str(col or "").strip() in {"제약사명", "분석자료원"}:
+                        worksheet.column_dimensions[get_column_letter(idx)].width = 24
+            except Exception:
+                pass
             for idx, col in enumerate(df.columns, start=1):
                 name = str(col or "").strip()
                 if name in money_cols:

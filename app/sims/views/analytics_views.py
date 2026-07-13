@@ -25,6 +25,10 @@ from app.services.analytics_sales_trend_service import (
     get_sales_forecast_result,
     get_stock_shortage_result,
 )
+from app.services.analytics_manufacturer_sales_trend_service import (
+    get_manufacturer_sales_trend_result,
+    get_manufacturer_sales_trend_summary_result,
+)
 
 log = logging.getLogger("ssai")
 
@@ -746,6 +750,93 @@ def _render_stock_shortage_panel_header(meta: Dict[str, Any], query_condition: s
         ],
         _color_for_shortage,
     )
+
+
+def _manufacturer_progress_title(meta: Dict[str, Any]) -> str:
+    return str(meta.get("current_progress_title") or ("당월 진행 요약" if meta.get("evaluation_mode") == "current_monthly" else "평가월 진행 요약"))
+
+
+def _render_manufacturer_sales_summary_header(meta: Dict[str, Any], query_condition: str) -> None:
+    if not isinstance(meta, dict):
+        meta = {}
+    show_extended = (
+        meta.get("analysis_type") == "manufacturer_sales_trend_summary"
+        or meta.get("summary_type") == "manufacturer_trend_summary"
+    )
+    if query_condition:
+        st.caption(f"조회조건: {query_condition}")
+
+    st.markdown("### 매출추세요약")
+    if meta.get("period_caption"):
+        st.caption(str(meta.get("period_caption")))
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        _metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with c2:
+        _metric_card("매출공급가액", meta.get("sum_supply_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with c3:
+        _metric_card("매출세액", meta.get("sum_tax_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with c4:
+        _metric_card("제약사수", meta.get("manufacturer_count") or meta.get("group_count"), "개", bg="#eff6ff", border="#bfdbfe")
+
+    c5, c6, c7, c8 = st.columns(4)
+    with c5:
+        _metric_card("제품수", meta.get("product_count"), "개", bg="#eff6ff", border="#bfdbfe")
+    with c6:
+        _metric_card("매입처수", meta.get("buy_vendor_count") or meta.get("purchase_vendor_count"), "개", bg="#eff6ff", border="#bfdbfe")
+    with c7:
+        _metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+    with c8:
+        _metric_card("자료원", meta.get("source_label") or "-", "", bg="#f8fafc", border="#dbe4ee")
+
+    if not show_extended:
+        st.caption(
+            f"평가월: {meta.get('evaluation_month') or '-'} / "
+            f"자료원: {meta.get('source_label') or '-'} / "
+            f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+        )
+        return
+
+    st.markdown(f"### {_manufacturer_progress_title(meta)}")
+    p1, p2, p3, p4, p5, p6 = st.columns(6)
+    with p1:
+        _metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+    with p2:
+        _metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with p3:
+        _metric_card(str(meta.get("current_sales_label") or "당월 현재매출"), meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+    with p4:
+        _metric_card(str(meta.get("current_expected_label") or "당월 예상매출"), meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+    with p5:
+        _metric_card(str(meta.get("current_remaining_label") or "당월 잔여예상"), meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+    with p6:
+        _metric_card(str(meta.get("current_progress_label") or "당월 진척률"), meta.get("current_month_progress_pct"), "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+    trend_counts = meta.get("trend_judge_counts") or {}
+    st.markdown("### 추세판정별 제약사수")
+    j1, j2, j3, j4 = st.columns(4)
+    with j1:
+        _metric_card("증가", trend_counts.get("증가", 0), "개", bg="#ecfdf5", border="#bbf7d0")
+    with j2:
+        _metric_card("감소", trend_counts.get("감소", 0), "개", bg="#fff1f2", border="#fecdd3")
+    with j3:
+        _metric_card("안정", trend_counts.get("안정", 0), "개", bg="#eff6ff", border="#bfdbfe")
+    with j4:
+        _metric_card("자료부족", trend_counts.get("자료부족", 0), "개", bg="#f8fafc", border="#dbe4ee")
+
+    st.caption(
+        f"평가월: {meta.get('evaluation_month') or '-'} / "
+        f"자료원: {meta.get('source_label') or '-'} / "
+        f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+    )
+
+
+def _render_manufacturer_sales_trend_panel_header(meta: Dict[str, Any], query_condition: str) -> None:
+    _render_manufacturer_sales_summary_header(meta, query_condition)
+
+
+def _render_manufacturer_sales_trend_summary_panel_header(meta: Dict[str, Any], query_condition: str) -> None:
+    _render_manufacturer_sales_summary_header(meta, query_condition)
 
 
 def render_sales_trend_analysis() -> Dict[str, Any]:
@@ -1503,7 +1594,274 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
                 "summary_type": "product_forecast",
             },
         }
-    
+
+
+def _render_manufacturer_sales_trend_form(action_key: str) -> tuple[bool, Dict[str, Any]]:
+    ns = _ns()
+
+    with st.form(
+        key=f"__analytics_{action_key}_form__{ns}",
+        clear_on_submit=False,
+        enter_to_submit=False,
+    ):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            source_label = st.selectbox(
+                "분석자료원",
+                ["자동", "월집계-장부재고", "월집계-실재고", "출고상세"],
+                index=0,
+                key=f"__analytics_{action_key}_source__{ns}",
+            )
+        with c2:
+            date_from = _render_date_input_with_week(
+                "시작일자",
+                _default_start_date(),
+                f"__analytics_{action_key}_date_from__{ns}",
+            )
+        with c3:
+            date_to = _render_date_input_with_week(
+                "종료일자",
+                _default_end_date(),
+                f"__analytics_{action_key}_date_to__{ns}",
+            )
+        with c4:
+            trend_judge = st.selectbox(
+                "추세판정",
+                ["전체", "감소", "안정", "증가", "신규/증가", "자료부족", "반품주의"],
+                index=0,
+                key=f"__analytics_{action_key}_judge__{ns}",
+            )
+        top = _analytics_max_rows()
+
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            product_ven_nm = st.text_input(
+                "제조사명",
+                value="",
+                key=f"__analytics_{action_key}_product_ven_nm__{ns}",
+            )
+        with c6:
+            buy_nm = st.text_input(
+                "매입처명",
+                value="",
+                key=f"__analytics_{action_key}_buy_nm__{ns}",
+            )
+        with c7:
+            ven_nm = st.text_input(
+                "거래처명",
+                value="",
+                key=f"__analytics_{action_key}_ven_nm__{ns}",
+            )
+
+        c8, c9, c10, c11 = st.columns(4)
+        with c8:
+            product_group_opt = _select_code_option(
+                "제품그룹명",
+                "0013",
+                key=f"__analytics_{action_key}_product_group__{ns}",
+            )
+        with c9:
+            product_di_opts = _select_code_options(
+                "제품구분명",
+                "0004",
+                key=f"__analytics_{action_key}_product_di__{ns}",
+            )
+        with c10:
+            product_class_opts = _select_code_options(
+                "제품분류명",
+                "0028",
+                key=f"__analytics_{action_key}_product_class__{ns}",
+            )
+        with c11:
+            stock_opts = _select_code_options(
+                "재고위치",
+                "0018",
+                key=f"__analytics_{action_key}_stock__{ns}",
+            )
+
+        c12, c13, c14 = st.columns(3)
+        with c12:
+            sido_nm = st.text_input(
+                "시도명",
+                value="",
+                key=f"__analytics_{action_key}_sido_nm__{ns}",
+                placeholder="예: 서울",
+            )
+        with c13:
+            gugun_nm = st.text_input(
+                "시구군명",
+                value="",
+                key=f"__analytics_{action_key}_gugun_nm__{ns}",
+                placeholder="예: 강남",
+            )
+        with c14:
+            road_nm = st.text_input(
+                "도로명",
+                value="",
+                key=f"__analytics_{action_key}_road_nm__{ns}",
+                placeholder="예: 테헤란로",
+            )
+
+        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+
+    source_mode = {
+        "자동": "auto",
+        "월집계-장부재고": "monthly_book",
+        "월집계-실재고": "monthly_real",
+        "출고상세": "detail",
+    }.get(source_label, "auto")
+
+    date_from_text = _date_to_yyyymmdd(date_from)
+    date_to_text = _date_to_yyyymmdd(date_to)
+    params = {
+        "source_mode": source_mode,
+        "date_from": date_from_text,
+        "date_to": date_to_text,
+        "month_from": _date_to_yyyymm(date_from),
+        "month_to": _date_to_yyyymm(date_to),
+        "product_ven_nm": _clean_text(product_ven_nm),
+        "product_group": product_group_opt.get("code", ""),
+        "product_group_nm": product_group_opt.get("name", ""),
+        "product_di": "",
+        "product_di_nm": "",
+        "product_di_list": _selected_codes(product_di_opts),
+        "product_di_nm_list": _selected_names(product_di_opts),
+        "product_class": "",
+        "product_class_nm": "",
+        "product_class_list": _selected_codes(product_class_opts),
+        "product_class_nm_list": _selected_names(product_class_opts),
+        "stock_cd": "",
+        "stock_nm": "",
+        "stock_cd_list": _selected_codes(stock_opts),
+        "stock_nm_list": _selected_names(stock_opts),
+        "ven_nm": _clean_text(ven_nm),
+        "buy_nm": _clean_text(buy_nm),
+        "sido_nm": _clean_text(sido_nm),
+        "gugun_nm": _clean_text(gugun_nm),
+        "road_nm": _clean_text(road_nm),
+        "trend_judge": "" if trend_judge == "전체" else trend_judge,
+        "top": int(top),
+    }
+    return submitted, params
+
+
+def _finish_manufacturer_sales_trend_result(
+    result: Dict[str, Any],
+    params: Dict[str, Any],
+    *,
+    analysis_type: str,
+    summary_type: str,
+    header_func,
+) -> Dict[str, Any]:
+    meta = dict(result.get("meta") or {})
+    meta.setdefault("analytics", True)
+    meta.setdefault("analysis_type", analysis_type)
+    meta.setdefault("summary_type", summary_type)
+    meta.setdefault("group_type", "manufacturer")
+
+    query_condition = _build_sales_trend_query_condition(params, meta)
+    if query_condition:
+        meta["query_summary"] = query_condition
+        meta["condition"] = query_condition
+
+    result["params_raw"] = params
+    result["params"] = _build_sales_trend_display_params(params, meta)
+    result["meta"] = meta
+
+    if (
+        _render_inline_analysis_header_enabled()
+        and int(meta.get("row_count_total") or meta.get("row_count") or 0) > 0
+    ):
+        header_func(meta, query_condition)
+
+    return result
+
+
+def render_manufacturer_sales_trend_analysis() -> Dict[str, Any]:
+    st.subheader("제약사별 매출 추세 분석")
+    st.caption("월별 제품 매출 원자료를 제약사+월 단위로 집계하여 제약사별 매출 흐름과 월시점 추세를 분석합니다.")
+
+    submitted, params = _render_manufacturer_sales_trend_form("manufacturer_sales_trend")
+    if not submitted:
+        return {
+            "final": False,
+            "type": "text",
+            "title": "제약사별 매출 추세 분석",
+            "data": "[조회] 버튼을 눌러 실행하세요.",
+        }
+
+    try:
+        result = get_manufacturer_sales_trend_result(params)
+        return _finish_manufacturer_sales_trend_result(
+            result,
+            params,
+            analysis_type="manufacturer_sales_trend",
+            summary_type="manufacturer_trend_detail",
+            header_func=_render_manufacturer_sales_trend_panel_header,
+        )
+    except Exception as e:
+        log.exception("[analytics.views] manufacturer sales trend failed")
+        return {
+            "final": True,
+            "type": "text",
+            "title": "제약사별 매출 추세 분석 오류",
+            "action": "제약사별 매출 추세 분석",
+            "params": _build_sales_trend_display_params(params, {}),
+            "params_raw": params,
+            "data": str(e),
+            "message": str(e),
+            "meta": {
+                "row_count": 0,
+                "row_count_total": 0,
+                "analytics": True,
+                "analysis_type": "manufacturer_sales_trend",
+                "summary_type": "manufacturer_trend_detail",
+            },
+        }
+
+
+def render_manufacturer_sales_trend_summary_analysis() -> Dict[str, Any]:
+    st.subheader("제약사별 매출 추세 분석 요약표")
+    st.caption("제약사별 월 매출을 한 행으로 요약하고 월별 매출과 최종 추세판정을 표시합니다.")
+
+    submitted, params = _render_manufacturer_sales_trend_form("manufacturer_sales_trend_summary")
+    if not submitted:
+        return {
+            "final": False,
+            "type": "text",
+            "title": "제약사별 매출 추세 분석 요약표",
+            "data": "[조회] 버튼을 눌러 실행하세요.",
+        }
+
+    try:
+        result = get_manufacturer_sales_trend_summary_result(params)
+        return _finish_manufacturer_sales_trend_result(
+            result,
+            params,
+            analysis_type="manufacturer_sales_trend_summary",
+            summary_type="manufacturer_trend_summary",
+            header_func=_render_manufacturer_sales_trend_summary_panel_header,
+        )
+    except Exception as e:
+        log.exception("[analytics.views] manufacturer sales trend summary failed")
+        return {
+            "final": True,
+            "type": "text",
+            "title": "제약사별 매출 추세 분석 요약표 오류",
+            "action": "제약사별 매출 추세 분석 요약표",
+            "params": _build_sales_trend_display_params(params, {}),
+            "params_raw": params,
+            "data": str(e),
+            "message": str(e),
+            "meta": {
+                "row_count": 0,
+                "row_count_total": 0,
+                "analytics": True,
+                "analysis_type": "manufacturer_sales_trend_summary",
+                "summary_type": "manufacturer_trend_summary",
+            },
+        }
+
 
 def render_stock_shortage_analysis() -> Dict[str, Any]:
     st.subheader("품목별 재고부족현황")

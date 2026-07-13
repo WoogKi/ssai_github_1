@@ -19,6 +19,8 @@
 # 품목별매출추세분석         → analytics_kpi
 # 품목별매출추세요약표       → analytics_kpi
 # 품목별매출예상"            → analytics_kpi
+# 제약사별매출추세분석       → analytics_kpi
+# 제약사별매출추세분석요약표 → analytics_kpi
 # 목별재고부족현황"          → analytics_kpi
 # 현재표 generic/마스터류 후속분석 -> generic
 #
@@ -48,6 +50,7 @@ from app.ui.current_table_followups.analytics_kpi import handle_analytics_kpi_fo
 from app.ui.current_table_followups.generic import (
     handle_generic_followup,
     handle_common_column_filter_followup,
+    handle_common_column_group_followup,
 )
 
 
@@ -82,6 +85,10 @@ def detect_current_table_kind(source_action: str) -> str:
         "품목별매출추세분석" in s
         or "품목별매출추세요약표" in s
         or "품목별매출예상" in s
+        or "제약사별매출추세분석" in s
+        or "제약사별매출추세분석요약표" in s
+        or "제조사별매출추세분석" in s
+        or "제조사별매출추세분석요약표" in s
         or "품목별재고부족현황" in s
     ):
         return "analytics_kpi"
@@ -231,6 +238,26 @@ def handle_current_table_followup_by_action(
                 pass
 
         try:
+            handled = bool(
+                handle_common_column_group_followup(
+                    df=df,
+                    query=query,
+                    top_n=top_n,
+                    table_key=table_key,
+                    source_action=source_action,
+                    helpers=helpers,
+                    log=log,
+                )
+            )
+            if handled:
+                return True
+        except Exception:
+            try:
+                log.exception("[chat.followup_table] common column group failed")
+            except Exception:
+                pass
+
+        try:
             return bool(
                 handle_common_column_filter_followup(
                     df=df,
@@ -286,6 +313,26 @@ def handle_current_table_followup_by_action(
     except Exception:
         try:
             log.exception("[chat.followup_table] common column filter failed kind=%s", kind)
+        except Exception:
+            pass
+
+    # "현재표 추세판정 집계"처럼 현재 DataFrame의 실제 컬럼 기준으로
+    # 처리할 수 있는 그룹 요청은 분석/KPI 전용 handler의 제품/기준월 필수
+    # 안내보다 먼저 공통 집계로 처리한다.
+    try:
+        if handle_common_column_group_followup(
+            df=df,
+            query=query,
+            top_n=top_n,
+            table_key=table_key,
+            source_action=source_action,
+            helpers=helpers,
+            log=log,
+        ):
+            return True
+    except Exception:
+        try:
+            log.exception("[chat.followup_table] common column group failed kind=%s", kind)
         except Exception:
             pass
 

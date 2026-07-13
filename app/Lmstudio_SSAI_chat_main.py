@@ -3115,6 +3115,7 @@ def _current_table_push_table(
     source_table_key: str = "",
     source_rows: int | None = None,
     display_limit: int | None = None,
+    extra_meta: dict | None = None,
 ) -> bool:
         
     from app.ui.chat_middleware import push_sims_result_to_chat
@@ -3212,6 +3213,8 @@ def _current_table_push_table(
             "table_profile": "current_table_followup",
         },
     }
+    if isinstance(extra_meta, dict) and extra_meta:
+        payload["meta"].update(extra_meta)
 
     push_sims_result_to_chat(payload, action)
     return True

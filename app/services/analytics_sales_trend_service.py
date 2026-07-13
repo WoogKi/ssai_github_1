@@ -2653,6 +2653,13 @@ def _fmt_analytics_query_summary(params: Dict[str, Any], source_label: str = "")
     if source_label:
         bits.append(f"분석자료원 {source_label}")
 
+    if clean_text(params.get("sido_nm")):
+        bits.append(f"시도명 {params.get('sido_nm')}")
+    if clean_text(params.get("gugun_nm")):
+        bits.append(f"시구군명 {params.get('gugun_nm')}")
+    if clean_text(params.get("road_nm")):
+        bits.append(f"도로명 {params.get('road_nm')}")
+
     trend_judge = _normalize_trend_judge_filter(params.get("trend_judge"))
     if trend_judge:
         bits.append(f"추세판정 {trend_judge}")

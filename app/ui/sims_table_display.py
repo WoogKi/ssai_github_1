@@ -14,11 +14,106 @@ from typing import Any, Dict, Iterable, Tuple
 from decimal import Decimal
 import inspect
 import logging
+import os
 
 import pandas as pd
 import streamlit as st
 
 log = logging.getLogger("ssai")
+
+
+def resolve_sims_table_mode(
+    df: pd.DataFrame,
+    *,
+    action: Any = "",
+    render_path: str = "chat",
+) -> Dict[str, Any]:
+    rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    cols = int(len(df.columns)) if isinstance(df, pd.DataFrame) else 0
+    cells = rows * cols
+    path = str(render_path or "").strip().lower()
+    if path == "chat":
+        env_key = "SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD"
+        raw_value = os.getenv(env_key)
+        fallback_key = "SIMS_FAST_TABLE_CELL_THRESHOLD"
+        if raw_value is None:
+            raw_value = os.getenv(fallback_key, "6000")
+            used_key = fallback_key
+        else:
+            used_key = env_key
+    else:
+        used_key = "SIMS_FAST_TABLE_CELL_THRESHOLD"
+        raw_value = os.getenv(used_key, "6000")
+    try:
+        threshold = int(raw_value)
+    except Exception:
+        threshold = 6000
+    mode = "fast" if threshold > 0 and cells >= threshold else "small"
+    reason = "cells>=threshold" if mode == "fast" else "cells<threshold"
+    return {
+        "action": str(action or ""),
+        "render_path": path or "chat",
+        "rows": rows,
+        "cols": cols,
+        "cells": cells,
+        "env_key": used_key,
+        "env_value": raw_value,
+        "resolved_threshold": threshold,
+        "mode": mode,
+        "reason": reason,
+    }
+
+
+def log_sims_table_mode(df: pd.DataFrame, *, action: Any = "", render_path: str = "chat") -> Dict[str, Any]:
+    info = resolve_sims_table_mode(df, action=action, render_path=render_path)
+    log.info(
+        "[sims.table_mode] action=%s render_path=%s rows=%s cols=%s cells=%s env_key=%s env_value=%s resolved_threshold=%s mode=%s reason=%s",
+        info["action"],
+        info["render_path"],
+        info["rows"],
+        info["cols"],
+        info["cells"],
+        info["env_key"],
+        info["env_value"],
+        info["resolved_threshold"],
+        info["mode"],
+        info["reason"],
+    )
+    return info
+
+
+def log_sims_table_render(
+    df: pd.DataFrame,
+    *,
+    action: Any = "",
+    render_path: str = "chat",
+    mode: str = "",
+    renderer: str = "",
+    height: Any = "",
+    visible_rows: Any = "",
+    width_mode: str = "",
+    column_config_count: Any = "",
+) -> None:
+    rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    cols = int(len(df.columns)) if isinstance(df, pd.DataFrame) else 0
+    if visible_rows == "":
+        try:
+            visible_rows = min(rows, max(int((int(height) - 48) / 32), 0)) if height not in ("", None) else ""
+        except Exception:
+            visible_rows = ""
+    log.info(
+        "[sims.table_render] action=%s render_path=%s mode=%s renderer=%s height=%s visible_rows=%s width_mode=%s column_config_count=%s rows=%s cols=%s",
+        str(action or ""),
+        str(render_path or "chat"),
+        str(mode or ""),
+        str(renderer or ""),
+        height,
+        visible_rows,
+        str(width_mode or ""),
+        column_config_count,
+        rows,
+        cols,
+    )
 
 
 def _clean_text(value: Any) -> str:
@@ -68,6 +163,14 @@ def _is_numeric_display_name(col: Any) -> bool:
         "당월 현재매출",
         "당월 예상매출",
         "당월 잔여예상",
+        "전월대비매출",
+        "총매출공급가액",
+        "매출공급가액",
+        "매출세액",
+        "매출합계",
+        "평가월 현재매출",
+        "평가월 예상매출",
+        "평가월 잔여예상",
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
@@ -75,7 +178,10 @@ def _is_numeric_display_name(col: Any) -> bool:
         "최근6개월평균매출",
         "평균공급단가",
         "당월 진척률",
+        "평가월 진척률",
+        "전월대비매출증감률",
         "최근3개월증감률",
+        "월시점 최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
         "월시점 적용증감률",
@@ -304,6 +410,9 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         "당월 현재매출",
         "당월 예상매출",
         "당월 잔여예상",
+        "평가월 현재매출",
+        "평가월 예상매출",
+        "평가월 잔여예상",
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
@@ -311,6 +420,7 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         "최근6개월평균매출",
         "평균공급단가",
         "당월 진척률",
+        "평가월 진척률",
         "최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
@@ -460,6 +570,7 @@ def _numeric_display_kind(col: Any) -> str:
 
     percent_cols = {
         "당월 진척률",
+        "평가월 진척률",
         "최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
@@ -793,23 +904,30 @@ def _default_pinned_cols(
                 "재고부족",
                 "sales_trend",
                 "sales_forecast",
+                "manufacturer_sales_trend",
+                "manufacturer_sales_trend_summary",
                 "stock_shortage",
                 "product_summary",
                 "product_forecast",
+                "manufacturer_trend_detail",
+                "manufacturer_trend_summary",
                 "product_stock_shortage",
                 "current_table_followup",
                 "현재표",
             )
         )
-        or str(meta.get("analysis_type") or "").strip() in {"sales_trend", "sales_forecast", "stock_shortage"}
+        or str(meta.get("analysis_type") or "").strip() in {"sales_trend", "sales_forecast", "manufacturer_sales_trend", "manufacturer_sales_trend_summary", "stock_shortage"}
         or str(meta.get("summary_type") or "").strip() in {
             "product_summary",
             "product_forecast",
+            "manufacturer_trend_detail",
+            "manufacturer_trend_summary",
             "product_stock_shortage",
         }
     )
 
     if is_analysis_like:
+        add_first_existing("제약사명")
         add_first_existing("기준월", "년월", "월")
         add_first_existing("제품코드", "상품코드", "품목코드")
         add_first_existing("제품명", "상품명", "품목명")

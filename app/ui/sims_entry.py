@@ -125,6 +125,8 @@ def _panel_sidebar() -> Dict[str, str]:
 
     analytics_action_group_map = {
         "매출분석": [
+            "제약사별 매출 추세 분석",
+            "제약사별 매출 추세 분석 요약표",
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
         ],
@@ -381,4 +383,3 @@ __all__ = [
     "render_sims_main",
     "_hub_main",
 ]
- 

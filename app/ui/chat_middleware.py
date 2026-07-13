@@ -24,6 +24,8 @@ from app.sims.views.rddbc_io_shared import (
 
 from app.ui.sims_table_display import (
     build_sims_table_display_config,
+    log_sims_table_mode,
+    log_sims_table_render,
     normalize_display_df_for_streamlit,
 )
 
@@ -39,6 +41,14 @@ _FAST_TABLE_INT_KPI_COLS = {
     "당월 현재매출",
     "당월 예상매출",
     "당월 잔여예상",
+    "전월대비매출",
+    "총매출공급가액",
+    "매출공급가액",
+    "매출세액",
+    "매출합계",
+    "평가월 현재매출",
+    "평가월 예상매출",
+    "평가월 잔여예상",
     "다음월예상매출",
     "3개월예상매출",
     "6개월예상매출",
@@ -64,7 +74,10 @@ _FAST_TABLE_DECIMAL_KPI_COLS = {
 
 _FAST_TABLE_PERCENT_KPI_COLS = {
     "당월 진척률",
+    "평가월 진척률",
+    "전월대비매출증감률",
     "최근3개월증감률",
+    "월시점 최근3개월증감률",
     "적용증감률",
     "월시점 증감률",
     "월시점 적용증감률",
@@ -351,6 +364,14 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
         "당월 현재매출",
         "당월 예상매출",
         "당월 잔여예상",
+        "전월대비매출",
+        "총매출공급가액",
+        "매출공급가액",
+        "매출세액",
+        "매출합계",
+        "평가월 현재매출",
+        "평가월 예상매출",
+        "평가월 잔여예상",
         "다음월예상매출",
         "3개월예상매출",
         "6개월예상매출",
@@ -370,7 +391,10 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
     }
     percent_cols = {
         "당월 진척률",
+        "평가월 진척률",
+        "전월대비매출증감률",
         "최근3개월증감률",
+        "월시점 최근3개월증감률",
         "적용증감률",
         "월시점 증감률",
         "월시점 적용증감률",
@@ -392,16 +416,46 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
         if workbook is not None and hasattr(workbook, "add_format"):
             money_fmt = workbook.add_format({"num_format": "#,##0"})
             pct_fmt = workbook.add_format({"num_format": "0.00\\%"})
+            header_fmt = workbook.add_format({"bold": True, "bg_color": "#E5E7EB", "border": 1})
+            try:
+                worksheet.freeze_panes(1, 0)
+                if len(df.columns) > 0:
+                    worksheet.autofilter(0, 0, max(len(df), 1), len(df.columns) - 1)
+                for idx, col in enumerate(df.columns):
+                    worksheet.write(0, idx, col, header_fmt)
+            except Exception:
+                pass
             for idx, col in enumerate(df.columns):
                 name = str(col or "").strip()
+                width = 24 if name in {"제약사명", "분석자료원"} else None
                 if name in money_cols:
-                    worksheet.set_column(idx, idx, None, money_fmt)
+                    worksheet.set_column(idx, idx, width, money_fmt)
                 elif name in decimal_money_cols:
                     dec_fmt = workbook.add_format({"num_format": "#,##0.00"})
-                    worksheet.set_column(idx, idx, None, dec_fmt)
+                    worksheet.set_column(idx, idx, width, dec_fmt)
                 elif name in percent_cols:
-                    worksheet.set_column(idx, idx, None, pct_fmt)
+                    worksheet.set_column(idx, idx, width, pct_fmt)
+                elif width:
+                    worksheet.set_column(idx, idx, width)
             return
+
+        try:
+            from openpyxl.styles import Font, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+            worksheet.freeze_panes = "A2"
+            if len(df.columns) > 0:
+                worksheet.auto_filter.ref = worksheet.dimensions
+            header_fill = PatternFill("solid", fgColor="E5E7EB")
+            thin = Side(style="thin", color="D1D5DB")
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True)
+                cell.fill = header_fill
+                cell.border = Border(top=thin, left=thin, right=thin, bottom=thin)
+            for idx, col in enumerate(df.columns, start=1):
+                if str(col or "").strip() in {"제약사명", "분석자료원"}:
+                    worksheet.column_dimensions[get_column_letter(idx)].width = 24
+        except Exception:
+            pass
 
         for idx, col in enumerate(df.columns, start=1):
             name = str(col or "").strip()
@@ -483,10 +537,12 @@ def _chat_is_analysis_payload(item: Dict[str, Any], meta: Dict[str, Any], title:
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
             "품목별 매출 예상",
+            "제약사별 매출 추세 분석",
+            "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage"}
+        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
 
@@ -1281,6 +1337,72 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
                 "미분류",
             ],
             _chat_color_for_shortage,
+        )
+        return
+
+    if analysis_type in {"manufacturer_sales_trend", "manufacturer_sales_trend_summary"} or summary_type in {"manufacturer_trend_detail", "manufacturer_trend_summary"}:
+        show_manufacturer_extended = analysis_type == "manufacturer_sales_trend_summary" or summary_type == "manufacturer_trend_summary"
+        st.markdown("### 매출추세요약")
+        if meta.get("period_caption"):
+            st.caption(str(meta.get("period_caption")))
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            _chat_metric_card("총매출액", meta.get("sum_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c2:
+            _chat_metric_card("매출공급가액", meta.get("sum_supply_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c3:
+            _chat_metric_card("매출세액", meta.get("sum_tax_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with c4:
+            _chat_metric_card("제약사수", meta.get("manufacturer_count") or meta.get("group_count"), "개", bg="#eff6ff", border="#bfdbfe")
+
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            _chat_metric_card("제품수", meta.get("product_count"), "개", bg="#eff6ff", border="#bfdbfe")
+        with c6:
+            _chat_metric_card("매입처수", meta.get("buy_vendor_count") or meta.get("purchase_vendor_count"), "개", bg="#eff6ff", border="#bfdbfe")
+        with c7:
+            _chat_metric_card("분석월수", meta.get("month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+        with c8:
+            _chat_metric_card("자료원", meta.get("source_label") or "-", "", bg="#f8fafc", border="#dbe4ee")
+
+        if not show_manufacturer_extended:
+            st.caption(
+                f"평가월: {meta.get('evaluation_month') or '-'} / "
+                f"자료원: {meta.get('source_label') or '-'} / "
+                f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
+            )
+            return
+
+        st.markdown(f"### {meta.get('current_progress_title') or ('당월 진행 요약' if meta.get('evaluation_mode') == 'current_monthly' else '평가월 진행 요약')}")
+        p1, p2, p3, p4, p5, p6 = st.columns(6)
+        with p1:
+            _chat_metric_card("완료월수", meta.get("completed_month_count"), "개월", bg="#f5f3ff", border="#ddd6fe")
+        with p2:
+            _chat_metric_card("완료월평균매출", meta.get("avg_completed_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with p3:
+            _chat_metric_card(str(meta.get("current_sales_label") or "당월 현재매출"), meta.get("sum_current_month_sales_amt"), "원", bg="#f8fafc", border="#dbe4ee")
+        with p4:
+            _chat_metric_card(str(meta.get("current_expected_label") or "당월 예상매출"), meta.get("sum_current_month_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with p5:
+            _chat_metric_card(str(meta.get("current_remaining_label") or "당월 잔여예상"), meta.get("sum_current_month_remaining_expected_amt"), "원", bg="#fff7ed", border="#fed7aa")
+        with p6:
+            _chat_metric_card(str(meta.get("current_progress_label") or "당월 진척률"), meta.get("current_month_progress_pct"), "%", bg="#f0fdf4", border="#bbf7d0", decimals=2)
+
+        trend_counts = meta.get("trend_judge_counts") or {}
+        st.markdown("### 추세판정별 제약사수")
+        j1, j2, j3, j4 = st.columns(4)
+        with j1:
+            _chat_metric_card("증가", trend_counts.get("증가", 0), "개", bg="#ecfdf5", border="#bbf7d0")
+        with j2:
+            _chat_metric_card("감소", trend_counts.get("감소", 0), "개", bg="#fff1f2", border="#fecdd3")
+        with j3:
+            _chat_metric_card("안정", trend_counts.get("안정", 0), "개", bg="#eff6ff", border="#bfdbfe")
+        with j4:
+            _chat_metric_card("자료부족", trend_counts.get("자료부족", 0), "개", bg="#f8fafc", border="#dbe4ee")
+        st.caption(
+            f"평가월: {meta.get('evaluation_month') or '-'} / "
+            f"자료원: {meta.get('source_label') or '-'} / "
+            f"조회건수: {meta.get('row_count_total') or meta.get('row_count') or 0}건"
         )
         return
 
@@ -4671,6 +4793,8 @@ REFERENCE_TABLE_ACTIONS = {
     "품목별 매출 추세 분석",
     "품목별 매출 추세 요약표",
     "품목별 매출 예상",
+    "제약사별 매출 추세 분석",
+    "제약사별 매출 추세 분석 요약표",
     "품목별 재고부족현황",
     "제품재고현황 조회",
     "제품재고장",
@@ -4709,8 +4833,8 @@ def _sims_table_role_from_action(action_name: Any, meta: Optional[Dict[str, Any]
     if (
         action in REFERENCE_TABLE_ACTIONS
         or "제품재고장" in action
-        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage"}
+        or analysis_type in {"sales_trend", "sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     ):
         return "reference"
 
@@ -6100,6 +6224,8 @@ def _is_sales_trend_action(action_name: str) -> bool:
         "품목별 매출 추세 분석",
         "품목별 매출 추세 요약표",
         "품목별 매출 예상",
+        "제약사별 매출 추세 분석",
+        "제약사별 매출 추세 분석 요약표",
         "품목별 재고부족현황",
     }
 
@@ -7629,7 +7755,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         if "순번" not in render_df.columns and "조회순번" not in render_df.columns:
                             render_df.insert(0, "순번", range(1, len(render_df) + 1))
 
-                        is_large_analysis_table = _chat_is_large_table_for_fast_render(render_df)
+                        table_render_path = str(st.session_state.get("__sims_table_render_path") or "chat")
+                        table_mode_info = {"mode": "fast" if _chat_is_large_table_for_fast_render(render_df) else "small"}
+                        try:
+                            table_mode_info = log_sims_table_mode(render_df, action=action_name, render_path=table_render_path)
+                        except Exception:
+                            log.debug("[sims.table_mode] chat log failed", exc_info=True)
+                        is_large_analysis_table = str(table_mode_info.get("mode") or "") == "fast"
                         if is_nlq_table:
                             _chat_log_nlq_table_render(
                                 action_name=action_name,
@@ -7647,6 +7779,17 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         # 단, 분석/KPI 원표는 이미 서비스에서 순번/요약 컬럼을 구성하므로
                         # IO 전용 display_df 변환을 다시 적용하지 않는다. (요약표/컬럼 차이 방지)
                         if is_large_analysis_table:
+                            log_sims_table_render(
+                                render_df,
+                                action=action_name,
+                                render_path=table_render_path,
+                                mode="fast",
+                                renderer="_render_chat_fast_dataframe",
+                                height=520,
+                                visible_rows=min(int(len(render_df)), 300),
+                                width_mode="use_container_width",
+                                column_config_count=0,
+                            )
                             _render_chat_fast_dataframe(
                                 render_df.copy(),
                                 height=520,
@@ -7670,6 +7813,17 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             )
                             view_df = _chat_clean_display_none_values(view_df)
                             column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
+                            log_sims_table_render(
+                                view_df,
+                                action=action_name,
+                                render_path=table_render_path,
+                                mode="small",
+                                renderer="build_sims_table_display_config+st.dataframe",
+                                height=table_height,
+                                visible_rows=min(int(len(view_df)), max(int((int(table_height) - 48) / 32), 0)),
+                                width_mode="use_container_width",
+                                column_config_count=len(column_config or {}),
+                            )
                             try:
                                 st.dataframe(
                                     view_df,
@@ -7956,12 +8110,18 @@ def render_sims_chat_item(item: Dict[str, Any]) -> None:
     조회조건 / 헤더 / summary_md / 분석 스타일 / CSV / EXCEL / LLM 분석 버튼을 유지한다.
     """
     prev_force = bool(st.session_state.get("__chat_render_force_target", False))
+    prev_render_path = st.session_state.get("__sims_table_render_path")
     st.session_state["__chat_render_force_target"] = True
+    st.session_state["__sims_table_render_path"] = "history"
 
     try:
         _render_chat_item_body(item)
     finally:
         st.session_state["__chat_render_force_target"] = prev_force
+        if prev_render_path is None:
+            st.session_state.pop("__sims_table_render_path", None)
+        else:
+            st.session_state["__sims_table_render_path"] = prev_render_path
 
 
 __all__ = [

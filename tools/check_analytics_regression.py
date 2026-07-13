@@ -981,6 +981,582 @@ def run_basic_checks() -> list[CheckResult]:
         except Exception:
             pass
 
+    try:
+        import app.services.analytics_manufacturer_sales_trend_service as manufacturer_mod
+
+        def _manufacturer_raw(date_to: str = "20260712") -> pd.DataFrame:
+            july_a = 50 if str(date_to or "") >= "20260712" else 20
+            rows = []
+            for m, a1, a2, b in [
+                ("202601", 40, 60, 10),
+                ("202602", 40, 60, 20),
+                ("202603", 40, 60, 30),
+                ("202604", 40, 60, 40),
+                ("202605", 40, 60, 50),
+                ("202606", 40, 60, 60),
+                ("202607", 10, july_a - 10, 70),
+            ]:
+                rows.extend([
+                    {"기준월": m, "제품코드": "P1", "제품명": "A1", "규격": "", "제조사명": " 제약A ", "매출공급가액": a1, "매출합계": a1},
+                    {"기준월": m, "제품코드": "P2", "제품명": "A2", "규격": "", "제조사명": "제약A", "매출공급가액": a2, "매출합계": a2},
+                    {"기준월": m, "제품코드": "P3", "제품명": "B1", "규격": "", "제조사명": None, "매출공급가액": b, "매출합계": b},
+                ])
+            for m, amt in [
+                ("202601", 60_000_000),
+                ("202602", 50_000_000),
+                ("202603", 40_000_000),
+                ("202604", 30_000_000),
+                ("202605", 20_000_000),
+                ("202606", 10_000_000),
+                ("202607", 5_000_000),
+            ]:
+                rows.append({"기준월": m, "제품코드": "P5", "제품명": "D1", "규격": "", "제조사명": "감소D", "매출공급가액": amt, "매출합계": amt})
+            rows.append({"기준월": "202607", "제품코드": "P4", "제품명": "C1", "규격": "", "제조사명": "신규C", "매출공급가액": 30, "매출합계": 30})
+            df = pd.DataFrame(rows)
+            df.attrs["mixed_current_month_detail"] = str(date_to or "") < "20260712" and str(date_to or "")[:6] == "202607"
+            df.attrs["source_label_completed"] = "월집계-장부재고(Rddbc220)"
+            df.attrs["source_label_current"] = "출고상세(Rddbc120)"
+            return df
+
+        old_loader = getattr(manufacturer_mod, "get_sales_trend_df", None)
+        captured_manufacturer_params = []
+
+        def _manufacturer_loader(params):
+            captured_manufacturer_params.append(dict(params or {}))
+            return _manufacturer_raw(str((params or {}).get("date_to") or "20260712"))
+
+        setattr(manufacturer_mod, "get_sales_trend_df", _manufacturer_loader)
+        try:
+            params_current = {
+                "month_from": "202601",
+                "month_to": "202607",
+                "date_from": "20260101",
+                "date_to": "20260712",
+                "policy_date": "20260712",
+                "source_mode": "monthly_book",
+            }
+            params_mid = dict(params_current, date_to="20260702")
+            params_past_end = dict(params_current, month_to="202606", date_to="20260630")
+            detail = manufacturer_mod.get_manufacturer_sales_trend(params_current)
+            detail_mid = manufacturer_mod.get_manufacturer_sales_trend(params_mid)
+            detail_past = manufacturer_mod.get_manufacturer_sales_trend(params_past_end)
+            mismatches = []
+            if getattr(detail, "attrs", {}).get("evaluation_mode") != "current_monthly":
+                mismatches.append(f"current mode expected current_monthly got={getattr(detail, 'attrs', {}).get('evaluation_mode')}")
+            if getattr(detail_mid, "attrs", {}).get("evaluation_mode") != "historical_midmonth":
+                mismatches.append(f"mid mode expected historical_midmonth got={getattr(detail_mid, 'attrs', {}).get('evaluation_mode')}")
+            if getattr(detail_past, "attrs", {}).get("evaluation_mode") != "historical_month_end":
+                mismatches.append(f"past month-end mode expected historical_month_end got={getattr(detail_past, 'attrs', {}).get('evaluation_mode')}")
+            address_params = dict(params_current, sido_nm="서울", gugun_nm="강남", road_nm="테헤란로")
+            _ = manufacturer_mod.get_manufacturer_sales_trend(address_params)
+            last_params = captured_manufacturer_params[-1] if captured_manufacturer_params else {}
+            address_mismatches = []
+            for k, expected in {"sido_nm": "서울", "gugun_nm": "강남", "road_nm": "테헤란로"}.items():
+                if last_params.get(k) != expected:
+                    address_mismatches.append(f"manufacturer address param not forwarded {k}={last_params.get(k)!r}")
+            query_condition = manufacturer_mod._fmt_analytics_query_summary(address_params, "월집계-장부재고(Rddbc220)")
+            for expected in ["시도명 서울", "시구군명 강남", "도로명 테헤란로"]:
+                if expected not in query_condition:
+                    address_mismatches.append(f"manufacturer address query condition missing {expected}: {query_condition}")
+            if address_mismatches:
+                results.append(_fail("manufacturer sales trend address filters", "; ".join(address_mismatches)))
+            else:
+                results.append(_ok("manufacturer sales trend address filters", "sido/gugun/road params and query summary verified"))
+
+            if "제약사명" not in detail.columns:
+                mismatches.append("missing 제약사명")
+            forbidden_tokens = ["수량", "다음월예상매출", "예상등급"]
+            forbidden = [
+                c for c in detail.columns
+                if any(x in str(c) for x in forbidden_tokens)
+                or str(c).endswith(("_x", "_y"))
+                or str(c).startswith("_")
+                or c in {"제품코드", "제품명", "규격"}
+            ]
+            if forbidden:
+                mismatches.append(f"forbidden public columns={forbidden}")
+            required_detail_cols = [
+                "기준월",
+                "매출공급가액",
+                "최근3개월평균매출",
+                "월시점 실제매출",
+                "월시점 예상매출",
+                "월시점 달성률",
+                "월시점 예상기준",
+                "월시점 적용증감률",
+                "월시점 예상대비차이",
+                "월시점 잔여예상",
+                "월시점 추세판정",
+                "월시점 판정결과",
+                "판정결과",
+                "추세판정",
+            ]
+            for c in required_detail_cols:
+                if c not in detail.columns:
+                    mismatches.append(f"missing detail column {c}")
+            detail_analysis_block = [
+                "월시점 완료월수",
+                "월시점 완료월평균매출",
+                "월시점 최근3개월평균매출",
+                "월시점 최근6개월평균매출",
+                "월시점 증감률",
+                "월시점 추세판정",
+                "월시점 판정결과",
+                "월시점 실제매출",
+                "월시점 예상기준",
+                "월시점 적용증감률",
+                "월시점 예상매출",
+                "월시점 예상대비차이",
+                "월시점 잔여예상",
+                "월시점 달성률",
+                "추세판정",
+                "판정결과",
+            ]
+            detail_cols = list(detail.columns)
+            block_positions = [detail_cols.index(c) for c in detail_analysis_block if c in detail_cols]
+            if block_positions != sorted(block_positions) or len(block_positions) != len(detail_analysis_block):
+                mismatches.append("detail analysis block order mismatch")
+            non_zero_metric_sum = float(
+                detail[[c for c in ["월시점 실제매출", "월시점 예상매출", "월시점 달성률"] if c in detail.columns]]
+                .apply(pd.to_numeric, errors="coerce")
+                .fillna(0)
+                .abs()
+                .sum()
+                .sum()
+            )
+            if non_zero_metric_sum <= 0:
+                mismatches.append("detail month-point actual/expected/progress are all zero")
+            zero_check_cols = [
+                "매출공급가액",
+                "매출세액",
+                "매출합계",
+                "집계건수",
+                "월시점 실제매출",
+                "월시점 예상매출",
+                "월시점 예상대비차이",
+                "월시점 잔여예상",
+            ]
+            present_zero_cols = [c for c in zero_check_cols if c in detail.columns]
+            zero_rows = (
+                detail[present_zero_cols].apply(pd.to_numeric, errors="coerce").fillna(0).abs().sum(axis=1).eq(0).sum()
+                if present_zero_cols
+                else 0
+            )
+            if int(zero_rows) != 0:
+                mismatches.append(f"detail public zero rows should be removed rows={zero_rows}")
+            detail_key_counts = detail.groupby(["제약사명", "기준월"]).size()
+            if not detail_key_counts.empty and int(detail_key_counts.max()) != 1:
+                mismatches.append("detail should have one row per manufacturer-month")
+
+            raw_cur = _manufacturer_raw("20260712")
+            raw_sum = float(pd.to_numeric(raw_cur["매출공급가액"], errors="coerce").fillna(0).sum())
+            detail_sum = float(pd.to_numeric(detail["매출공급가액"], errors="coerce").fillna(0).sum())
+            if abs(raw_sum - detail_sum) > 1e-9:
+                mismatches.append(f"detail monthly sum mismatch raw={raw_sum}, detail={detail_sum}")
+            a_july = detail[(detail["제약사명"].astype(str) == "제약A") & (detail["기준월"].astype(str) == "202607")].iloc[0]
+            a_mid_july = detail_mid[(detail_mid["제약사명"].astype(str) == "제약A") & (detail_mid["기준월"].astype(str) == "202607")].iloc[0]
+            if float(a_july["매출공급가액"]) != 50:
+                mismatches.append(f"manufacturer detail should aggregate manufacturer-month sales expected=50 got={a_july['매출공급가액']}")
+            if float(a_mid_july["매출공급가액"]) == float(a_july["매출공급가액"]):
+                mismatches.append("midmonth/current manufacturer actual sales should differ")
+            sorted_check = detail.sort_values(["제약사명", "기준월"], ascending=[True, True]).reset_index(drop=True)
+            if list(detail[["제약사명", "기준월"]].itertuples(index=False, name=None)) != list(sorted_check[["제약사명", "기준월"]].itertuples(index=False, name=None)):
+                mismatches.append("detail final sort should be manufacturer asc + month asc")
+            expected_seq = list(range(1, len(detail) + 1))
+            if "순번" not in detail.columns or list(pd.to_numeric(detail["순번"], errors="coerce").fillna(0).astype(int)) != expected_seq:
+                mismatches.append("detail sequence should be reassigned after final sort")
+            if pd.isna(a_july.get("전월대비매출")):
+                mismatches.append("detail last month diff sales should use same formula, not NaN")
+            if pd.isna(a_july.get("전월대비매출증감률")):
+                mismatches.append("detail last month diff pct should use same formula, not NaN")
+            bad_period_values = {"당월진행", "current_monthly", "historical_midmonth", "historical_month_end"}
+            leaked_period = sorted(set(detail.get("기간구분", pd.Series(dtype=str)).astype(str)) & bad_period_values)
+            if leaked_period:
+                mismatches.append(f"detail public period leaked forbidden values={leaked_period}")
+            mid_period_values = set(detail_mid.get("기간구분", pd.Series(dtype=str)).astype(str))
+            if "부분월" not in mid_period_values:
+                mismatches.append(f"midmonth detail should expose 부분월 for final month values={sorted(mid_period_values)}")
+            blank_july = detail[(detail["제약사명"].astype(str) == "제약사 미지정") & (detail["기준월"].astype(str) == "202607")].iloc[0]
+            if float(blank_july["매출공급가액"]) != 70:
+                mismatches.append("blank manufacturer group not preserved in detail")
+            new_july = detail[(detail["제약사명"].astype(str) == "신규C") & (detail["기준월"].astype(str) == "202607")].iloc[0]
+            if str(new_july.get("추세판정") or "") != "자료부족":
+                mismatches.append(f"new manufacturer judge expected 자료부족 got={new_july.get('추세판정')}")
+
+            if mismatches:
+                results.append(_fail("manufacturer sales trend detail", "; ".join(mismatches)))
+            else:
+                results.append(_ok("manufacturer sales trend detail", "analysis block, zero-row removal, sort, and monthly sums verified"))
+
+            summary = manufacturer_mod.get_manufacturer_sales_trend_summary(params_current)
+            summary_mid = manufacturer_mod.get_manufacturer_sales_trend_summary(params_mid)
+            summary_past = manufacturer_mod.get_manufacturer_sales_trend_summary(params_past_end)
+            detail_res = manufacturer_mod.get_manufacturer_sales_trend_result(params_current)
+            res = manufacturer_mod.get_manufacturer_sales_trend_summary_result(params_current)
+            res_past = manufacturer_mod.get_manufacturer_sales_trend_summary_result(params_past_end)
+            mismatches = []
+            forbidden = [
+                c for c in summary.columns
+                if any(x in str(c) for x in forbidden_tokens)
+                or str(c).endswith(("_x", "_y"))
+                or str(c).startswith("_")
+                or c in {"제품코드", "제품명", "규격"}
+            ]
+            if forbidden:
+                mismatches.append(f"forbidden summary columns={forbidden}")
+            if not any(str(c).endswith(" 매출") and str(c)[:4].isdigit() for c in summary.columns):
+                mismatches.append("missing dynamic monthly sales columns")
+            required_summary_cols = [
+                "순번",
+                "제약사명",
+                "총매출공급가액",
+                "총매출세액",
+                "총매출액",
+                "완료월총매출",
+                "월평균매출",
+                "완료월수",
+                "완료월평균매출",
+                "당월 현재매출",
+                "당월 예상매출",
+                "당월 잔여예상",
+                "당월 진척률",
+                "매출발생월수",
+                "최근3개월평균매출",
+                "최근6개월평균매출",
+                "최근3개월증감률",
+                "추세판정",
+                "제품수",
+                "매입처수",
+                "총집계건수",
+                "분석자료원",
+                "기간구분",
+            ]
+            for c in required_summary_cols:
+                if c not in summary.columns:
+                    mismatches.append(f"missing summary column {c}")
+            summary_cols = list(summary.columns)
+            summary_positions = [summary_cols.index(c) for c in required_summary_cols if c in summary_cols]
+            if summary_positions != sorted(summary_positions) or len(summary_positions) != len(required_summary_cols):
+                mismatches.append("summary core column order mismatch")
+            if "평가월 매출" in summary.columns:
+                mismatches.append("current monthly summary should expose 당월 현재매출, not 평가월 매출")
+            for label, df_check in [("mid", summary_mid), ("past", summary_past)]:
+                for c in ["평가월 매출", "평가월 예상매출", "평가월 잔여예상", "평가월 진척률"]:
+                    if c not in df_check.columns:
+                        mismatches.append(f"{label} historical summary missing {c}")
+                if "당월 현재매출" in df_check.columns:
+                    mismatches.append(f"{label} historical summary should not expose 당월 현재매출")
+                if any(c in df_check.columns for c in ["당월 예상매출", "당월 잔여예상", "당월 진척률"]):
+                    mismatches.append(f"{label} historical summary should not expose 당월 expected/progress labels")
+            if any(str(c).endswith(" 수량") for c in summary.columns):
+                mismatches.append("summary should not expose monthly qty columns")
+            summary_sum = float(pd.to_numeric(summary["총매출공급가액"], errors="coerce").fillna(0).sum()) if "총매출공급가액" in summary.columns else -1
+            if abs(raw_sum - summary_sum) > 1e-9:
+                mismatches.append(f"summary total mismatch raw={raw_sum}, summary={summary_sum}")
+            names = set(summary["제약사명"].astype(str).tolist()) if "제약사명" in summary.columns else set()
+            if not {"제약A", "제약사 미지정"}.issubset(names):
+                mismatches.append(f"manufacturer universe not preserved names={sorted(names)}")
+            meta = res.get("meta") or {}
+            if meta.get("analysis_type") != "manufacturer_sales_trend_summary" or meta.get("summary_type") != "manufacturer_trend_summary":
+                mismatches.append(f"unexpected summary meta={meta}")
+            if meta.get("evaluation_mode") != "current_monthly":
+                mismatches.append(f"summary meta evaluation_mode expected current_monthly got={meta.get('evaluation_mode')}")
+            period_caption = str(meta.get("period_caption") or "")
+            if "당월 2026-07" not in period_caption or "current_monthly" in period_caption:
+                mismatches.append(f"current summary period caption unexpected={period_caption}")
+            mid_caption = str(getattr(summary_mid, "attrs", {}).get("period_caption") or "")
+            if "평가월 2026-07(07-02까지)" not in mid_caption or "당월" in mid_caption or "historical_midmonth" in mid_caption:
+                mismatches.append(f"mid summary period caption unexpected={mid_caption}")
+            past_caption = str(getattr(summary_past, "attrs", {}).get("period_caption") or "")
+            if "완료월 2026-01~2026-05" not in past_caption or "평가월 2026-06" not in past_caption or "historical_month_end" in past_caption:
+                mismatches.append(f"past summary period caption unexpected={past_caption}")
+            if "current_monthly" in set(summary.get("기간구분", pd.Series(dtype=str)).astype(str)):
+                mismatches.append("summary public period label leaked internal current_monthly")
+            a_summary = summary[summary["제약사명"].astype(str) == "제약A"].iloc[0]
+            a_summary_mid = summary_mid[summary_mid["제약사명"].astype(str) == "제약A"].iloc[0]
+            for c in ["완료월총매출", "완료월수", "완료월평균매출", "최근3개월평균매출", "최근6개월평균매출", "최근3개월증감률", "추세판정"]:
+                if str(c) == "추세판정":
+                    if str(a_summary[c]) != str(a_summary_mid[c]):
+                        mismatches.append(f"current/mid completed judge differs {a_summary[c]} vs {a_summary_mid[c]}")
+                elif abs(float(a_summary[c]) - float(a_summary_mid[c])) > 1e-9:
+                    mismatches.append(f"current/mid completed metric differs {c}: {a_summary[c]} vs {a_summary_mid[c]}")
+            if float(a_summary["당월 현재매출"]) == float(a_summary_mid["평가월 매출"]):
+                mismatches.append("current/mid current month sales should differ in summary")
+            if float(a_summary.get("당월 예상매출", 0)) <= 0:
+                mismatches.append("current summary expected sales should be populated")
+            if float(a_summary.get("당월 진척률", 0)) <= 0:
+                mismatches.append("current summary progress should be populated")
+            a_past = summary_past[summary_past["제약사명"].astype(str) == "제약A"].iloc[0]
+            if int(a_past["완료월수"]) != 5:
+                mismatches.append(f"past month-end completed month count expected=5 got={a_past['완료월수']}")
+            new_summary = summary[summary["제약사명"].astype(str) == "신규C"].iloc[0]
+            if str(new_summary.get("추세판정") or "") != "비교자료 부족":
+                mismatches.append(f"new manufacturer summary judge expected 비교자료 부족 got={new_summary.get('추세판정')}")
+            for m in ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07"]:
+                col = f"{m} 매출"
+                if col in summary.columns:
+                    detail_month = m.replace("-", "")
+                    dsum = float(pd.to_numeric(detail[detail["기준월"].astype(str) == detail_month]["매출공급가액"], errors="coerce").fillna(0).sum())
+                    ssum = float(pd.to_numeric(summary[col], errors="coerce").fillna(0).sum())
+                    if abs(dsum - ssum) > 1e-9:
+                        mismatches.append(f"detail/summary month sum mismatch {m}: detail={dsum}, summary={ssum}")
+            if abs(float(pd.to_numeric(summary["총매출공급가액"], errors="coerce").fillna(0).sum()) - detail_sum) > 1e-9:
+                mismatches.append("detail total and summary total differ under identical params")
+
+            try:
+                import os
+                from app.ui.sims_table_display import resolve_sims_table_mode
+                old_chat_env = os.environ.get("SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD")
+                old_panel_env = os.environ.get("SIMS_FAST_TABLE_CELL_THRESHOLD")
+                os.environ["SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD"] = "10"
+                os.environ["SIMS_FAST_TABLE_CELL_THRESHOLD"] = "10"
+                detail_chat_mode = resolve_sims_table_mode(detail, action="제약사별 매출 추세 분석", render_path="chat")
+                detail_panel_mode = resolve_sims_table_mode(detail, action="제약사별 매출 추세 분석", render_path="panel")
+                if detail_chat_mode.get("mode") != "fast" or detail_panel_mode.get("mode") != "fast":
+                    mismatches.append(f"detail table mode fast expected chat={detail_chat_mode} panel={detail_panel_mode}")
+                chat_mode = resolve_sims_table_mode(summary, action="제약사별 매출 추세 분석 요약표", render_path="chat")
+                panel_mode = resolve_sims_table_mode(summary, action="제약사별 매출 추세 분석 요약표", render_path="panel")
+                if chat_mode.get("mode") != "fast" or panel_mode.get("mode") != "fast":
+                    mismatches.append(f"table mode fast expected chat={chat_mode} panel={panel_mode}")
+                os.environ["SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD"] = "999999"
+                os.environ["SIMS_FAST_TABLE_CELL_THRESHOLD"] = "999999"
+                chat_small = resolve_sims_table_mode(summary, action="제약사별 매출 추세 분석 요약표", render_path="chat")
+                panel_small = resolve_sims_table_mode(summary, action="제약사별 매출 추세 분석 요약표", render_path="panel")
+                if chat_small.get("mode") != "small" or panel_small.get("mode") != "small":
+                    mismatches.append(f"table mode small expected chat={chat_small} panel={panel_small}")
+            finally:
+                if 'old_chat_env' in locals():
+                    if old_chat_env is None:
+                        os.environ.pop("SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD", None)
+                    else:
+                        os.environ["SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD"] = old_chat_env
+                if 'old_panel_env' in locals():
+                    if old_panel_env is None:
+                        os.environ.pop("SIMS_FAST_TABLE_CELL_THRESHOLD", None)
+                    else:
+                        os.environ["SIMS_FAST_TABLE_CELL_THRESHOLD"] = old_panel_env
+
+            def _manufacturer_bucket(value):
+                text = str(value or "").strip()
+                if text in {"증가", "신규/증가"}:
+                    return "증가"
+                if text == "감소":
+                    return "감소"
+                if text == "안정":
+                    return "안정"
+                return "자료부족"
+
+            def _expected_counts(frame):
+                counts = {"증가": 0, "감소": 0, "안정": 0, "자료부족": 0}
+                if frame is None or frame.empty:
+                    return counts
+                if "기준월" in frame.columns:
+                    work_counts = (
+                        frame.assign(_기준월_sort=frame["기준월"].astype(str))
+                        .sort_values(["제약사명", "_기준월_sort"])
+                        .drop_duplicates("제약사명", keep="last")
+                    )
+                else:
+                    work_counts = frame.drop_duplicates("제약사명", keep="last")
+                for value in work_counts.get("추세판정", pd.Series(dtype=object)).tolist():
+                    counts[_manufacturer_bucket(value)] += 1
+                return counts
+
+            header_mismatches = []
+            detail_meta = detail_res.get("meta") or {}
+            summary_meta = res.get("meta") or {}
+            past_meta = res_past.get("meta") or {}
+            expected_detail_counts = _expected_counts(detail)
+            expected_summary_counts = _expected_counts(summary)
+            for label, frame, meta_check, expected_counts in [
+                ("detail", detail, detail_meta, expected_detail_counts),
+                ("summary", summary, summary_meta, expected_summary_counts),
+            ]:
+                counts = meta_check.get("trend_judge_counts") or {}
+                four_total = sum(int(counts.get(k, 0) or 0) for k in ["증가", "감소", "안정", "자료부족"])
+                manufacturer_count = int(meta_check.get("manufacturer_count") or 0)
+                if four_total != manufacturer_count:
+                    header_mismatches.append(f"{label} judge count total {four_total} != manufacturer_count {manufacturer_count}")
+                for k in ["증가", "감소", "안정", "자료부족"]:
+                    if int(counts.get(k, 0) or 0) != int(expected_counts.get(k, 0) or 0):
+                        header_mismatches.append(f"{label} judge {k} expected={expected_counts.get(k)} got={counts.get(k)}")
+                if not isinstance(counts.get("자료부족", 0), int):
+                    header_mismatches.append(f"{label} 자료부족 count should be integer")
+
+            if detail_meta.get("current_progress_title") != "당월 진행 요약":
+                header_mismatches.append(f"detail current progress title unexpected={detail_meta.get('current_progress_title')}")
+            if summary_meta.get("current_progress_title") != "당월 진행 요약":
+                header_mismatches.append(f"summary current progress title unexpected={summary_meta.get('current_progress_title')}")
+            if past_meta.get("current_progress_title") != "평가월 진행 요약":
+                header_mismatches.append(f"past progress title unexpected={past_meta.get('current_progress_title')}")
+            for meta_label, meta_check in [("detail", detail_meta), ("summary", summary_meta), ("past", past_meta)]:
+                for key in [
+                    "completed_month_count",
+                    "avg_completed_month_sales_amt",
+                    "sum_current_month_sales_amt",
+                    "sum_current_month_expected_amt",
+                    "sum_current_month_remaining_expected_amt",
+                    "current_month_progress_pct",
+                ]:
+                    if key not in meta_check:
+                        header_mismatches.append(f"{meta_label} missing header meta {key}")
+
+            eval_month = str(detail_meta.get("evaluation_month") or "")
+            eval_rows = detail[detail["기준월"].astype(str) == eval_month] if eval_month and "기준월" in detail.columns else detail
+            actual_total = float(pd.to_numeric(eval_rows.get("월시점 실제매출", 0), errors="coerce").fillna(0).sum())
+            expected_total = float(pd.to_numeric(eval_rows.get("월시점 예상매출", 0), errors="coerce").fillna(0).sum())
+            expected_progress = (actual_total / expected_total * 100) if abs(expected_total) >= 1e-12 else 0
+            if abs(float(detail_meta.get("current_month_progress_pct") or 0) - expected_progress) > 1e-9:
+                header_mismatches.append("detail progress should use summed actual / summed expected")
+            summary_actual = float(pd.to_numeric(summary.get("당월 현재매출", 0), errors="coerce").fillna(0).sum())
+            summary_expected = float(pd.to_numeric(summary.get("당월 예상매출", 0), errors="coerce").fillna(0).sum())
+            summary_progress = (summary_actual / summary_expected * 100) if abs(summary_expected) >= 1e-12 else 0
+            if abs(float(summary_meta.get("current_month_progress_pct") or 0) - summary_progress) > 1e-9:
+                header_mismatches.append("summary progress should use summed actual / summed expected")
+
+            if header_mismatches:
+                results.append(_fail("manufacturer sales trend header summaries", "; ".join(header_mismatches)))
+            else:
+                results.append(_ok("manufacturer sales trend header summaries", "summary cards, progress totals, judge buckets, and table modes verified"))
+
+            try:
+                from app.ui.current_table_followups.action_dispatcher import handle_current_table_followup_by_action
+
+                pushed_tables = []
+                pushed_notices = []
+
+                def _test_find_col(frame, *, exact=(), include_any=(), exclude_any=()):
+                    cols = [str(c) for c in frame.columns]
+                    for name in exact:
+                        if name in cols:
+                            return name
+                    for col in cols:
+                        if include_any and not any(w in col for w in include_any):
+                            continue
+                        if exclude_any and any(w in col for w in exclude_any):
+                            continue
+                        return col
+                    return ""
+
+                def _test_to_num(sr):
+                    return pd.to_numeric(
+                        sr.fillna("").astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+                        errors="coerce",
+                    ).fillna(0)
+
+                def _test_push_table(**kwargs):
+                    pushed_tables.append(kwargs)
+                    return True
+
+                def _test_push_notice(**kwargs):
+                    pushed_notices.append(kwargs)
+                    return True
+
+                class _NoopLog:
+                    def info(self, *args, **kwargs):
+                        return None
+
+                    def exception(self, *args, **kwargs):
+                        return None
+
+                helpers = {
+                    "find_col": _test_find_col,
+                    "to_num": _test_to_num,
+                    "push_table": _test_push_table,
+                    "push_notice": _test_push_notice,
+                }
+
+                followup_mismatches = []
+                source_action = "제약사별 매출 추세 분석 요약표"
+                source_key = "test_manufacturer_summary"
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=summary,
+                    query="현재표 추세판정 집계",
+                    top_n=20,
+                    table_key=source_key,
+                    source_action=source_action,
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                if not handled or not pushed_tables:
+                    followup_mismatches.append("trend judge group should return table")
+                else:
+                    group_payload = pushed_tables[-1]
+                    group_df = group_payload.get("df")
+                    extra_meta = group_payload.get("extra_meta") or {}
+                    if extra_meta.get("group_column") != "추세판정":
+                        followup_mismatches.append(f"group column expected 추세판정 got={extra_meta.get('group_column')}")
+                    if not isinstance(group_df, pd.DataFrame) or group_df.empty:
+                        followup_mismatches.append("trend judge group dataframe empty")
+                    else:
+                        if "제약사수" not in group_df.columns:
+                            followup_mismatches.append("trend judge group missing 제약사수")
+                        elif int(pd.to_numeric(group_df["제약사수"], errors="coerce").fillna(0).sum()) != int(summary["제약사명"].nunique()):
+                            followup_mismatches.append("trend judge group manufacturer count sum mismatch")
+                        if "총매출액" in group_df.columns:
+                            grouped_total = float(pd.to_numeric(group_df["총매출액"], errors="coerce").fillna(0).sum())
+                            original_total = float(pd.to_numeric(summary["총매출액"], errors="coerce").fillna(0).sum())
+                            if abs(grouped_total - original_total) > 1e-9:
+                                followup_mismatches.append("trend judge group total sales sum mismatch")
+                        if "현재표 분석/KPI 후속분석 불가" in str(group_payload.get("title") or ""):
+                            followup_mismatches.append("trend judge group fell through to analytics kpi unsupported notice")
+
+                for query, expected_col in [
+                    ("현재표 추세판정 감소만 보여줘", "추세판정"),
+                    ("현재표 제약사명 제약A 상세", "제약사명"),
+                    ("현재표 당월 진척률 100 이상", "당월 진척률"),
+                    ("현재표 총매출액 1억 이상", "총매출액"),
+                ]:
+                    pushed_tables.clear()
+                    pushed_notices.clear()
+                    handled = handle_current_table_followup_by_action(
+                        df=summary,
+                        query=query,
+                        top_n=20,
+                        table_key=source_key,
+                        source_action=source_action,
+                        helpers=helpers,
+                        log=_NoopLog(),
+                    )
+                    if not handled or not pushed_tables:
+                        followup_mismatches.append(f"followup should return table query={query}")
+                        continue
+                    out_df = pushed_tables[-1].get("df")
+                    meta_extra = pushed_tables[-1].get("extra_meta") or {}
+                    if not isinstance(out_df, pd.DataFrame):
+                        followup_mismatches.append(f"followup output not dataframe query={query}")
+                        continue
+                    if expected_col not in out_df.columns:
+                        followup_mismatches.append(f"followup output missing original column {expected_col} query={query}")
+                    if "순번" not in out_df.columns:
+                        followup_mismatches.append(f"followup should regenerate sequence query={query}")
+                    if expected_col == "추세판정" and not out_df["추세판정"].astype(str).str.contains("감소").all():
+                        followup_mismatches.append("trend judge text filter contains non 감소 rows")
+                    if expected_col == "제약사명" and not out_df["제약사명"].astype(str).str.contains("제약A").all():
+                        followup_mismatches.append("manufacturer text filter contains non 제약A rows")
+                    if expected_col in {"당월 진척률", "총매출액"} and meta_extra.get("filter_column") != expected_col:
+                        followup_mismatches.append(f"numeric filter meta column mismatch query={query} meta={meta_extra}")
+
+                if followup_mismatches:
+                    results.append(_fail("current table generic group/filter followups", "; ".join(followup_mismatches)))
+                else:
+                    results.append(_ok("current table generic group/filter followups", "generic group, text filter, numeric filter, and analytics fallback blocking verified"))
+            except Exception as e:
+                results.append(_fail("current table generic group/filter followups", f"{type(e).__name__}: {e}"))
+
+            if mismatches:
+                results.append(_fail("manufacturer sales trend summary", "; ".join(mismatches)))
+            else:
+                results.append(_ok("manufacturer sales trend summary", "summary schema, monthly pivot, totals, universe, and meta verified"))
+        finally:
+            if old_loader is not None:
+                setattr(manufacturer_mod, "get_sales_trend_df", old_loader)
+    except Exception as e:
+        results.append(_fail("manufacturer sales trend", f"{type(e).__name__}: {e}"))
+
     return results
 
 
