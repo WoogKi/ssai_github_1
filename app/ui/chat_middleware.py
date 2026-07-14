@@ -533,6 +533,8 @@ def _chat_is_analysis_payload(item: Dict[str, Any], meta: Dict[str, Any], title:
     summary_type = str(meta.get("summary_type") or "").strip()
 
     return (
+        bool(meta.get("current_table_followup"))
+        or
         action_name in {
             "품목별 매출 추세 분석",
             "품목별 매출 추세 요약표",
@@ -543,9 +545,11 @@ def _chat_is_analysis_payload(item: Dict[str, Any], meta: Dict[str, Any], title:
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
+            "매입처별 재고부족 현황",
+            "매입처별 재고부족 현황",
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "supplier_stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "supplier_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
 
@@ -642,6 +646,20 @@ def _chat_is_large_table_for_fast_render(df: pd.DataFrame) -> bool:
 
     threshold = int(os.getenv("SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD", os.getenv("SIMS_FAST_TABLE_CELL_THRESHOLD", "6000")))
     return cells >= threshold
+
+
+def _chat_is_current_followup_fast_table(df: pd.DataFrame, meta: Dict[str, Any] | None = None) -> bool:
+    """현재표 후속 결과 전용 중간 크기 fast 기준."""
+    if not isinstance(meta, dict) or not bool(meta.get("current_table_followup")):
+        return False
+    if df is None or df.empty:
+        return False
+    try:
+        rows = int(len(df))
+        cols = int(len(df.columns))
+    except Exception:
+        return False
+    return rows >= 200 or (rows * cols) >= 5000
 
 
 def _chat_is_nlq_table_meta(meta: Dict[str, Any] | None) -> bool:
@@ -2498,6 +2516,31 @@ def _sims_business_terms(action_name: str) -> dict:
     """
     action = str(action_name or "")
 
+    if (
+        "매입처별 재고부족 현황" in action
+        or "매입처별 재고부족" in action
+        or "배정부족예상금액" in action
+        or "배정1개월부족금액" in action
+        or "매입처원본재고금액" in action
+    ):
+        return {
+            "flow_label": "매입처별 재고부족",
+            "amount_label": "배정부족예상금액",
+            "vendor_label": "매입처",
+            "qty_label": "부족수량",
+            "amount_priority": (
+                "배정부족예상금액",
+                "배정1개월부족금액",
+                "배정2개월부족금액",
+                "배정3개월부족금액",
+                "매입처원본재고금액",
+                "최근6완료월매입금액",
+                "전체완료월매입금액",
+            ),
+            "avoid_words": ["코드", "건수", "월수", "수량"],
+            "preferred_words": ["배정부족예상금액", "부족금액", "매입처", "재고금액"],
+        }
+
     if "매출처별 매출 예상" in action or "영업사원별 매출 예상" in action or "지역별 매출 예상" in action:
         return {
             "flow_label": action or "매출 예상",
@@ -3092,7 +3135,7 @@ def _build_sims_analysis_context_from_df(
     action = str(action_name or meta.get("action") or result.get("title") or "").strip()
     analysis_type = str(meta.get("analysis_type") or "").strip()
 
-    if action == "품목별 재고부족현황" or analysis_type == "stock_shortage":
+    if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"} or analysis_type in {"stock_shortage", "supplier_stock_shortage"}:
         return _build_stock_shortage_analysis_ctx(
             base_df,
             action_name=action,
@@ -3137,6 +3180,20 @@ def _build_sims_analysis_context_from_df(
     )
 
     business_terms = _sims_business_terms(action)
+    try:
+        meta_terms = meta.get("business_terms") if isinstance(meta.get("business_terms"), dict) else {}
+        if isinstance(meta_terms, dict):
+            business_terms.update({k: v for k, v in meta_terms.items() if v not in (None, "")})
+        if meta.get("amount_priority"):
+            business_terms["amount_priority"] = tuple(
+                str(x) for x in (meta.get("amount_priority") or ()) if str(x or "").strip()
+            )
+        if meta.get("amount_label"):
+            business_terms["amount_label"] = str(meta.get("amount_label"))
+        if meta.get("flow"):
+            business_terms["flow_label"] = str(meta.get("flow"))
+    except Exception:
+        pass
 
     sales_time_profile = _build_sims_sales_time_profile(base_df, business_terms)
     sales_group_profile = _build_sims_sales_group_profile(base_df, business_terms)
@@ -3706,6 +3763,25 @@ def _build_sims_context_from_result(
 # SIMS 결과를 채팅 컨텍스트에 올릴 때, DataFrame을 CSV/XLSX로 다운로드할 수 있게 변환하는 함수
 # - DataFrame을 CSV/XLSX로 변환해서, io.BytesIO 객체로 반환한다.
 # - 이 함수는 다운로드 직전에 호출하는 것을 권장한다 (화면 렌더링용 df_display에는 원본 데이터를 유지하는 것이 좋음).
+def _write_supplier_stock_shortage_excel_if_any(writer: Any, df: pd.DataFrame) -> bool:
+    attrs = getattr(df, "attrs", {}) if isinstance(df, pd.DataFrame) else {}
+    detail_df = attrs.get("supplier_detail_df") if isinstance(attrs, dict) else None
+    if not isinstance(detail_df, pd.DataFrame):
+        detail_key = str((attrs or {}).get("supplier_detail_key") or "").strip()
+        detail_store = st.session_state.get("__sims_supplier_stock_shortage_detail_tables") or {}
+        if detail_key and isinstance(detail_store, dict):
+            detail_df = detail_store.get(detail_key)
+    if not isinstance(detail_df, pd.DataFrame) or detail_df.empty:
+        return False
+    summary_df = _sanitize_dataframe_for_excel(df)
+    detail_excel_df = _sanitize_dataframe_for_excel(detail_df)
+    summary_df.to_excel(writer, index=False, sheet_name="매입처별요약")
+    detail_excel_df.to_excel(writer, index=False, sheet_name="제품매입처상세")
+    _apply_sims_excel_number_formats(writer, summary_df, "매입처별요약")
+    _apply_sims_excel_number_formats(writer, detail_excel_df, "제품매입처상세")
+    return True
+
+
 def _make_table_downloads(df: pd.DataFrame) -> Tuple[io.BytesIO, io.BytesIO]:
     csv_buf = io.BytesIO()
     xlsx_buf = io.BytesIO()
@@ -3716,8 +3792,9 @@ def _make_table_downloads(df: pd.DataFrame) -> Tuple[io.BytesIO, io.BytesIO]:
     csv_buf.seek(0)
 
     with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
-        df.to_excel(writer, index=False, sheet_name="SIMS")
-        _apply_sims_excel_number_formats(writer, df, "SIMS")
+        if not _write_supplier_stock_shortage_excel_if_any(writer, df):
+            df.to_excel(writer, index=False, sheet_name="SIMS")
+            _apply_sims_excel_number_formats(writer, df, "SIMS")
     xlsx_buf.seek(0)
     return csv_buf, xlsx_buf
 
@@ -4456,10 +4533,10 @@ def _build_sims_detail_analysis_prompt(
 ④ 다음에 볼 만한 현재표 후속질문 2개
 """
 
-# SIMS 결과가 대형표인 경우, 처음에는 CSV/XLSX bytes를 만들지 않고 [다운로드 준비] 버튼만 표시하는 lazy 버전 액션 영역.
+# SIMS 결과가 대형표인 경우, 처음에는 CSV/XLSX bytes를 만들지 않고 [Excel 다운로드 준비] 버튼만 표시하는 lazy 버전 액션 영역.
 # - 작은 표: 기존처럼 CSV/EXCEL/LLM 버튼 즉시 표시
-# - 큰 표: 처음에는 [다운로드 준비] + [LLM 분석]만 표시
-# - [다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
+# - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
+# - [Excel 다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
 def _get_sims_download_lazy_threshold_rows() -> int:
     """
     대형표 다운로드 lazy 기준 행 수.
@@ -4473,10 +4550,10 @@ def _get_sims_download_lazy_threshold_rows() -> int:
     except Exception:
         return 5000
 
-# SIMS 결과가 대형표인 경우, 처음에는 CSV/XLSX bytes를 만들지 않고 [다운로드 준비] 버튼만 표시하는 lazy 버전 액션 영역.
+# SIMS 결과가 대형표인 경우, 처음에는 CSV/XLSX bytes를 만들지 않고 [Excel 다운로드 준비] 버튼만 표시하는 lazy 버전 액션 영역.
 # - 작은 표: 기존처럼 CSV/EXCEL/LLM 버튼 즉시 표시
-# - 큰 표: 처음에는 [다운로드 준비] + [LLM 분석]만 표시
-# - [다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
+# - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
+# - [Excel 다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
 def _render_sims_result_actions_lazy(
     *,
     key_suffix: str,
@@ -4492,8 +4569,8 @@ def _render_sims_result_actions_lazy(
     채팅 SIMS 결과 하단 액션 영역 lazy 버전.
 
     - 작은 표: 기존처럼 CSV/EXCEL/LLM 버튼 즉시 표시
-    - 큰 표: 처음에는 [다운로드 준비] + [LLM 분석]만 표시
-    - [다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
+    - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
+    - [Excel 다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
     """
     if not isinstance(download_df, pd.DataFrame) or download_df.empty:
         c1, c2, c3 = st.columns(3)
@@ -4541,10 +4618,13 @@ def _render_sims_result_actions_lazy(
     # expected_rows가 9,615건이면 대형표로 판단해야 한다.
     lazy_basis_rows = max(row_count, expected_rows_int)
 
-    is_large_download = threshold_rows > 0 and lazy_basis_rows >= threshold_rows
+    supplier_detail_key = str(getattr(download_df, "attrs", {}).get("supplier_detail_key") or "").strip()
+    force_lazy_supplier_excel = bool(supplier_detail_key)
+    is_large_download = force_lazy_supplier_excel or (threshold_rows > 0 and lazy_basis_rows >= threshold_rows)
+    cache_key_suffix = f"{key_suffix}::{supplier_detail_key}" if supplier_detail_key else key_suffix
 
-    ready_key = f"__sims_download_ready::{key_suffix}"
-    bytes_key = f"__sims_download_bytes::{key_suffix}"
+    ready_key = f"__sims_download_ready::{cache_key_suffix}"
+    bytes_key = f"__sims_download_bytes::{cache_key_suffix}"
 
     ss = st.session_state
     is_ready = bool(ss.get(ready_key))
@@ -4554,19 +4634,19 @@ def _render_sims_result_actions_lazy(
             st.caption(
                 f"대형표 다운로드: 전체 예상 {expected_rows_int:,}건 × {col_count:,}열입니다. "
                 f"현재 화면 표시는 {display_rows_int:,}건입니다. "
-                "속도를 위해 전체 export와 CSV/EXCEL 파일은 [다운로드 준비]를 누른 뒤 생성합니다."
+                "속도를 위해 전체 export와 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누른 뒤 생성합니다."
             )
         else:
             st.caption(
                 f"대형표 다운로드: {row_count:,}건 × {col_count:,}열입니다. "
-                "속도를 위해 CSV/EXCEL 파일은 [다운로드 준비]를 누른 뒤 생성합니다."
+                "속도를 위해 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누른 뒤 생성합니다."
             )
 
         c1, c2, c3 = st.columns(3)
 
         with c1:
             if st.button(
-                "다운로드 준비",
+                "Excel 다운로드 준비",
                 key=f"sims_prepare_download_{key_suffix}",
                 use_container_width=True,
             ):
@@ -4627,8 +4707,9 @@ def _render_sims_result_actions_lazy(
 
         bio = io.BytesIO()
         with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
-            _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
+            if not _write_supplier_stock_shortage_excel_if_any(writer, download_df):
+                excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
+                _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
         excel_bytes = bio.getvalue()
 
         ss[bytes_key] = {
@@ -4841,6 +4922,8 @@ REFERENCE_TABLE_ACTIONS = {
     "제약사별 매출 추세 분석",
     "제약사별 매출 추세 분석 요약표",
     "품목별 재고부족현황",
+            "매입처별 재고부족 현황",
+            "매입처별 재고부족 현황",
     "제품재고현황 조회",
     "제품재고장",
 }
@@ -4878,8 +4961,8 @@ def _sims_table_role_from_action(action_name: Any, meta: Optional[Dict[str, Any]
     if (
         action in REFERENCE_TABLE_ACTIONS
         or "제품재고장" in action
-        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
-        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "supplier_stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "product_stock_shortage", "supplier_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     ):
         return "reference"
 
@@ -4942,6 +5025,51 @@ def _is_current_sims_table_item(item: Dict[str, Any], meta: Dict[str, Any]) -> b
     return False
 
 
+_LIGHT_HISTORY_RERUN_REASONS = {"sims_panel_open", "sims_action_change", "current_table_followup", "chat_room_change"}
+
+
+def _ui_rerun_reason() -> str:
+    try:
+        return str(
+            st.session_state.get("__ui_rerun_reason_current")
+            or st.session_state.get("__ui_rerun_reason")
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _history_render_stats() -> Dict[str, Any]:
+    try:
+        stats = st.session_state.setdefault("__ui_rerun_perf_stats", {})
+        if not isinstance(stats, dict):
+            stats = {}
+            st.session_state["__ui_rerun_perf_stats"] = stats
+        stats.setdefault("history_tables_rendered", 0)
+        stats.setdefault("history_tables_skipped", 0)
+        return stats
+    except Exception:
+        return {}
+
+
+def _record_history_table_render(*, skipped: bool) -> None:
+    stats = _history_render_stats()
+    key = "history_tables_skipped" if skipped else "history_tables_rendered"
+    try:
+        stats[key] = int(stats.get(key) or 0) + 1
+    except Exception:
+        pass
+
+
+def _is_latest_sims_table_key(item: Dict[str, Any], meta: Dict[str, Any]) -> bool:
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    latest_followup_key = str(st.session_state.get("__sims_latest_followup_table_key") or "").strip()
+    if latest_followup_key:
+        return bool(table_key and table_key == latest_followup_key)
+    last_table_key = str(st.session_state.get("__sims_last_table_key") or "").strip()
+    return bool(table_key and last_table_key and table_key == last_table_key)
+
+
 def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], uid: str = "") -> bool:
     """
     full dataframe render 여부.
@@ -4950,9 +5078,6 @@ def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], u
     - 사용자가 '이전 표 다시 표시'를 누른 표: full render
     - 그 외 이전 drilldown 표: placeholder
     """
-    if _is_current_sims_table_item(item, meta):
-        return True
-
     try:
         role = _sims_table_role_from_item(item)
         render_old_reference = str(
@@ -4966,8 +5091,18 @@ def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], u
     except Exception:
         pass
 
+    rerun_reason = _ui_rerun_reason()
+    render_path = str(st.session_state.get("__sims_table_render_path") or "").strip()
+    if render_path == "history" and rerun_reason in _LIGHT_HISTORY_RERUN_REASONS:
+        if rerun_reason == "current_table_followup" and _is_latest_sims_table_key(item, meta):
+            return True
+        return False
+
     force_key = _old_sims_table_force_key(item, meta, uid)
     if bool(st.session_state.get(force_key)):
+        return True
+
+    if _is_current_sims_table_item(item, meta):
         return True
 
     return False
@@ -5007,11 +5142,24 @@ def _render_old_sims_table_placeholder(
         col_count = 0
 
     st.caption(
-        f"이전 조회표: {action_name} / 전체 {row_count:,}건"
+        f"저장된 조회 결과: {action_name} / 전체 {row_count:,}건"
         + (f" / 표시 {display_rows:,}건" if display_rows and display_rows != row_count else "")
         + (f" / {col_count:,}열" if col_count else "")
         + " — 속도를 위해 표 렌더링을 생략했습니다."
     )
+    try:
+        table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+        reason = _ui_rerun_reason() or "old_table"
+        log.info(
+            "[chat.history.table_skip] reason=%s action=%s table_key=%s rows=%s",
+            reason,
+            action_name,
+            table_key,
+            row_count,
+        )
+    except Exception:
+        pass
+    _record_history_table_render(skipped=True)
 
     force_key = _old_sims_table_force_key(item, meta, uid)
 
@@ -5720,6 +5868,9 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
 
                 ss["__sims_last_table_key"] = table_key
                 ss["__sims_last_table_action"] = action_name
+                if bool(meta.get("current_table_followup")):
+                    ss["__sims_latest_followup_table_key"] = str(table_key)
+                    ss["__ui_rerun_reason"] = "current_table_followup"
 
                 meta["kind"] = "table"
                 meta["table_key"] = table_key
@@ -6275,6 +6426,8 @@ def _is_sales_trend_action(action_name: str) -> bool:
         "제약사별 매출 추세 분석",
         "제약사별 매출 추세 분석 요약표",
         "품목별 재고부족현황",
+            "매입처별 재고부족 현황",
+            "매입처별 재고부족 현황",
     }
 
 
@@ -7278,8 +7431,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
         is_monthly_stock = _is_monthly_stock_action(action_name)
         is_sales_trend = (
             _is_sales_trend_action(action_name)
-            or meta.get("analysis_type") in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage"}
-            or meta.get("summary_type") in {"product_summary", "product_forecast", "product_stock_shortage"}
+            or meta.get("analysis_type") in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "supplier_stock_shortage"}
+            or meta.get("summary_type") in {"product_summary", "product_forecast", "product_stock_shortage", "supplier_stock_shortage"}
         )
 
         cond_text = _build_query_condition_text(item)
@@ -7503,8 +7656,19 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             if not _should_full_render_sims_table(item, meta, uid2):
                 _render_old_sims_table_placeholder(item, meta, data, uid2)
                 return
+            if str(st.session_state.get("__sims_table_render_path") or "").strip() == "history":
+                _record_history_table_render(skipped=False)
+            force_key_for_old_table = _old_sims_table_force_key(item, meta, uid2)
+            old_history_table_forced = (
+                str(st.session_state.get("__sims_table_render_path") or "").strip() == "history"
+                and bool(st.session_state.get(force_key_for_old_table))
+                and not (
+                    _ui_rerun_reason() == "current_table_followup"
+                    and _is_latest_sims_table_key(item, meta)
+                )
+            )
 
-            # 다운로드용 전체 DF는 대형표일 경우 [다운로드 준비] 전에는 만들지 않는다.
+            # 다운로드용 전체 DF는 대형표일 경우 [Excel 다운로드 준비] 전에는 만들지 않는다.
             # 기존에는 여기서 _get_full_download_df_for_sims_item()가 먼저 실행되어
             # 화면 표시 200건짜리 NLQ 결과도 전체 9,615건 export 재조회가 발생했다.
             try:
@@ -7531,7 +7695,10 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 and not bool(st.session_state.get(download_ready_key))
             )
 
-            if defer_full_export:
+            if bool(locals().get("old_history_table_forced", False)):
+                raw_download_df = data
+                defer_full_export = True
+            elif defer_full_export:
                 raw_download_df = data
                 _chat_log_info_once(
                     f"defer_full_download::{uid2}::{display_rows_initial}::{expected_rows_initial}",
@@ -7804,12 +7971,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             render_df.insert(0, "순번", range(1, len(render_df) + 1))
 
                         table_render_path = str(st.session_state.get("__sims_table_render_path") or "chat")
-                        table_mode_info = {"mode": "fast" if _chat_is_large_table_for_fast_render(render_df) else "small"}
+                        current_followup_fast = _chat_is_current_followup_fast_table(render_df, meta)
+                        table_mode_info = {"mode": "fast" if (current_followup_fast or _chat_is_large_table_for_fast_render(render_df)) else "small"}
                         try:
                             table_mode_info = log_sims_table_mode(render_df, action=action_name, render_path=table_render_path)
                         except Exception:
                             log.debug("[sims.table_mode] chat log failed", exc_info=True)
-                        is_large_analysis_table = str(table_mode_info.get("mode") or "") == "fast"
+                        is_large_analysis_table = current_followup_fast or str(table_mode_info.get("mode") or "") == "fast"
                         if is_nlq_table:
                             _chat_log_nlq_table_render(
                                 action_name=action_name,
@@ -8021,6 +8189,19 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
             # 다운로드 (CSV / XLSX)
             try:
+                if bool(locals().get("old_history_table_forced", False)):
+                    download_enabled_key = f"__sims_old_table_download_enabled::{uid2}"
+                    if not bool(st.session_state.get(download_enabled_key)):
+                        st.caption("이전 표를 다시 표시했습니다. Excel/CSV는 [Excel 다운로드 준비]를 누른 뒤 생성합니다.")
+                        if st.button(
+                            "Excel 다운로드 준비",
+                            key=f"sims_old_table_prepare_excel_{uid2}",
+                            use_container_width=False,
+                        ):
+                            st.session_state[download_enabled_key] = True
+                            st.rerun()
+                        return
+
                 action = item.get("action") or meta.get("action")
                 base_name = action or title or "SIMS_RESULT"
                 safe_base = re.sub(r"[^\w가-힣\-]+", "_", str(base_name)).strip("_")
@@ -8036,7 +8217,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     st.caption(
                         f"CSV/EXCEL 다운로드 기준: 전체 조회조건 {expected_rows:,}건 "
                         f"(현재 화면 표시 {display_rows_for_download:,}건, "
-                        "[다운로드 준비] 후 전체 export 생성)"
+                        "[Excel 다운로드 준비] 후 전체 export 생성)"
                     )
                 elif download_rows > display_rows_for_download:
                     st.caption(

@@ -637,6 +637,48 @@ def _add_seq_column(out: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _drop_current_followup_detail_attrs(out: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(out, pd.DataFrame):
+        return out
+    for key in ("supplier_detail_key", "supplier_detail_rows", "excel_sheet_names"):
+        try:
+            out.attrs.pop(key, None)
+        except Exception:
+            pass
+    return out
+
+
+def _find_common_top_numeric_column(df: pd.DataFrame, query: str) -> str:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return ""
+    if not any(w in _compact(query) for w in ("TOP", "top", "상위")):
+        return ""
+
+    body_norm = _norm_col_name(query)
+    body_norm = re.sub(r"(top|상위)\d*", "", body_norm, flags=re.IGNORECASE)
+    body_norm = re.sub(r"\d+", "", body_norm)
+    if not body_norm:
+        return ""
+
+    candidates: list[tuple[int, str]] = []
+    for col in [str(c) for c in df.columns]:
+        if col in _COMMON_FILTER_SKIP_COLUMNS:
+            continue
+        nums = _to_numeric_for_common_filter(df[col])
+        if int(nums.notna().sum()) <= 0:
+            continue
+        for alias in _column_filter_aliases(col):
+            alias_norm = _norm_col_name(alias)
+            if alias_norm and alias_norm in body_norm:
+                candidates.append((len(alias_norm), col))
+                break
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+
 # ---------------------------------------------------------------------
 # 현재표 공통 컬럼 집계
 # ---------------------------------------------------------------------
@@ -871,6 +913,7 @@ def handle_common_column_group_followup(
     if has_top and top_n:
         out = out.head(int(top_n)).copy()
         out = _add_seq_column(out)
+    out = _drop_current_followup_detail_attrs(out)
 
     title = f"현재표 {group_col}별 집계"
     try:
@@ -938,6 +981,54 @@ def handle_common_column_filter_followup(
     if not callable(push_table):
         return False
 
+    # 0) 조건 없는 숫자 TOP: 현재표 배정부족예상금액 TOP 20
+    top_col = _find_common_top_numeric_column(df, t)
+    if top_col and top_col in df.columns and top_n:
+        try:
+            nums = _to_numeric_for_common_filter(df[top_col])
+            out = df.copy()
+            out[top_col] = nums.values
+            out = out.sort_values(top_col, ascending=False).head(int(top_n)).copy()
+            out = _reorder_numeric_filter_columns(out, top_col)
+            out = _add_seq_column(out)
+            out = _drop_current_followup_detail_attrs(out)
+        except Exception:
+            try:
+                log.exception("[chat.followup_table] common numeric top failed col=%r top_n=%r", top_col, top_n)
+            except Exception:
+                pass
+            return False
+
+        title = f"현재표 {top_col} TOP {top_n}"
+        try:
+            log.info(
+                "[chat.followup.generic_top] query=%r source_action=%r top_column=%r source_rows=%s rows=%s table_key=%s",
+                t,
+                source_action,
+                top_col,
+                len(df),
+                len(out),
+                table_key,
+            )
+        except Exception:
+            pass
+
+        return bool(push_table(
+            title=title,
+            action=title,
+            df=out,
+            query_summary=f"현재표 / {top_col} TOP {top_n} / 전체 {len(df):,}건 기준",
+            source_query=t,
+            source_table_key=table_key,
+            source_rows=len(df),
+            display_limit=top_n,
+            extra_meta={
+                "top_column": top_col,
+                "top_n": int(top_n),
+                "source_row_count": int(len(df)),
+            },
+        ))
+
     # 1) 숫자 조건 필터: 현재표 현재재고수량 0 이하 보여줘
     num_col, op, threshold, op_label, threshold_label = _find_common_numeric_filter(df, t)
     if num_col and num_col in df.columns and op:
@@ -983,6 +1074,7 @@ def handle_common_column_filter_followup(
                 out = out.head(int(top_n)).copy()
         out = _reorder_numeric_filter_columns(out, num_col)
         out = _add_seq_column(out)
+        out = _drop_current_followup_detail_attrs(out)
 
         title = (
             f"현재표 {num_col} {threshold_text} {op_label} TOP {top_n}"
@@ -1105,6 +1197,7 @@ def handle_common_column_filter_followup(
     out = filtered.copy()
     if has_top and top_n:
         out = out.head(int(top_n)).copy()
+    out = _drop_current_followup_detail_attrs(out)
 
     title = (
         f"현재표 {col} {value_label} TOP {top_n}"

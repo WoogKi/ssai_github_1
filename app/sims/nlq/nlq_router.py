@@ -646,6 +646,22 @@ def _try_answer_ctx_meta_question(
 
 _ANALYTICS_ACTION_SPECS = (
     {
+        "action": "매입처별 재고부족 현황",
+        "service": "get_supplier_stock_shortage_result",
+        "phrases": (
+            "매입처별 재고부족 현황",
+            "매입처별 재고 부족 현황",
+            "매입처별 재고부족",
+            "매입처별 재고 부족",
+            "매입처별 부족예상",
+            "매입처별 부족금액",
+            "발주처별 재고부족",
+            "발주처별 재고 부족",
+            "공급처별 재고부족",
+            "공급처별 재고 부족",
+        ),
+    },
+    {
         "action": "품목별 재고부족현황",
         "service": "get_stock_shortage_result",
         "phrases": (
@@ -1074,7 +1090,7 @@ def _apply_analytics_source_params(params: Dict[str, Any], txt: str, action: str
     else:
         out.setdefault("source_mode", "auto")
 
-    if action == "품목별 재고부족현황":
+    if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"}:
         if has_real:
             out["stock_mode"] = "real"
         elif has_book:
@@ -1208,7 +1224,7 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     if trend_judge and action != "품목별 재고부족현황":
         params["trend_judge"] = trend_judge
 
-    if action == "품목별 재고부족현황":
+    if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"}:
         shortage_grade = _extract_analytics_shortage_grade(txt)
         if shortage_grade:
             params["shortage_grade"] = shortage_grade
@@ -1225,6 +1241,9 @@ def _get_analytics_handler(action: str):
             get_sales_trend_summary_result,
             get_sales_forecast_result,
             get_stock_shortage_result,
+        )
+        from app.services.analytics_supplier_stock_shortage_service import (
+            get_supplier_stock_shortage_result,
         )
         from app.services.analytics_manufacturer_sales_trend_service import (
             get_manufacturer_sales_trend_result,
@@ -1248,6 +1267,7 @@ def _get_analytics_handler(action: str):
         "제약사별 매출 추세 분석": get_manufacturer_sales_trend_result,
         "제약사별 매출 추세 분석 요약표": get_manufacturer_sales_trend_summary_result,
         "품목별 재고부족현황": get_stock_shortage_result,
+        "매입처별 재고부족 현황": get_supplier_stock_shortage_result,
     }
 
     return fn_map.get(str(action or "").strip())

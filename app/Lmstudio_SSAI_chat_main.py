@@ -623,6 +623,179 @@ def _clear_sims_runtime_for_company_change(reason: str = "company_change") -> No
     except Exception:
         log.exception("[company.change.clear_sims] failed reason=%s", reason)
 
+
+def _set_ui_event_started(event_name: str) -> None:
+    """사용자 클릭/선택부터 다음 main rerun 진입까지의 체감시간 측정용."""
+    try:
+        ss = st.session_state
+        ss["__ui_event_name"] = str(event_name or "").strip()
+        ss["__ui_event_started_at"] = time.perf_counter()
+    except Exception:
+        pass
+
+
+def _clear_current_table_source_for_room_change() -> None:
+    """채팅방 전환 시 이전 방의 현재표 source/cache pointer를 제거한다."""
+    try:
+        ss = st.session_state
+        keys = [
+            "__sims_current_table_source_key",
+            "__sims_current_table_source_action",
+            "__sims_current_table_source_analysis_ctx",
+            "__sims_last_table_key",
+            "__sims_last_table_action",
+            "__sims_latest_followup_table_key",
+            "__sims_last_msg_id",
+            "__scroll_to_msg",
+        ]
+        for key in keys:
+            ss.pop(key, None)
+
+        prefixes = (
+            "__sims_force_render_old_table::",
+            "__sims_old_table_download_enabled::",
+            "__sims_panel_force_render_once::",
+            "__sims_download_enabled::",
+            "__sims_table_download_cache::",
+        )
+        for key in list(ss.keys()):
+            sk = str(key)
+            if any(sk.startswith(prefix) for prefix in prefixes):
+                ss.pop(key, None)
+    except Exception:
+        log.exception("[chat.room.source] clear failed")
+
+
+def _close_sims_panel_for_room_change() -> None:
+    """채팅방 전환 시 패널 본문이 재렌더되지 않도록 표시/실행 상태를 완전히 닫는다."""
+    try:
+        ss = st.session_state
+        false_keys = [
+            "__sims_open",
+            "__sims_open_ui",
+            "__sims_panel_active",
+            "__sims_force_open",
+            "__sims_run_flag",
+            "__sims_inner_submit",
+            "__sims_rendered",
+            "__sims_was_final",
+        ]
+        for key in false_keys:
+            ss[key] = False
+
+        for key in [
+            "__sims_result",
+            "__sims_context",
+            "__sims_context_text",
+            "__sims_context_note",
+            "__sims_panel_last_final_action",
+            "__sims_panel_last_final_payload",
+            "__sims_last_final_payload_for_chat",
+            "__sims_last_final_payload_for_chat_action",
+            "__sims_last_render_run_seq",
+            "__sims_panel_source_promoted_sig",
+            "__sims_panel_chat_push_sig",
+            "__sims_form_submitted",
+            "__sims_submitted_form_id",
+            "__sims_widget_ns",
+            "__sims_flash",
+            "__sims_flash_close",
+            "__sims_flash_csv",
+            "__sims_flash_xlsx",
+            "__sims_panel_skip_view_once",
+            "__sims_panel_skip_view_reason",
+        ]:
+            ss.pop(key, None)
+
+        # category/action 선택값은 유지하되, 실제 렌더 기준 snapshot은 비운다.
+        ss["__sims_selected_snapshot"] = {}
+    except Exception:
+        log.exception("[chat.room] close SIMS panel state failed")
+
+
+def _find_latest_source_table_in_room(room: dict) -> tuple[str, str]:
+    """선택된 방 history에서 최신 원본 SIMS table_key/action을 찾는다."""
+    if not isinstance(room, dict):
+        return "", ""
+
+    candidates = []
+    for channel in ("history", "messages", "sims_messages"):
+        rows = room.get(channel) or []
+        if isinstance(rows, list):
+            candidates.extend(x for x in rows if isinstance(x, dict))
+
+    for item in reversed(candidates):
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        if bool(meta.get("current_table_followup")):
+            continue
+        table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+        if not table_key:
+            continue
+        action = str(
+            meta.get("action")
+            or item.get("action")
+            or item.get("title")
+            or ""
+        ).strip()
+        return table_key, action
+
+    return "", ""
+
+
+def _restore_current_table_source_for_room(room_id: str) -> None:
+    """
+    채팅방별 현재표 source 격리.
+    새 방의 최신 원본 table_key payload가 session cache에 살아 있을 때만 복원한다.
+    """
+    restored = False
+    reason = "no_table"
+    table_key = ""
+    action = ""
+    try:
+        ss = st.session_state
+        room = next(
+            (r for r in ss.get("chat_rooms", []) if str(r.get("id") or "") == str(room_id or "")),
+            None,
+        )
+        table_key, action = _find_latest_source_table_in_room(room or {})
+        if table_key:
+            has_payload = False
+            for store_name in ("sims_export_tables", "__sims_export_tables_by_key", "sims_tables"):
+                store = ss.get(store_name)
+                if isinstance(store, dict) and table_key in store:
+                    has_payload = True
+                    break
+
+            if has_payload:
+                ss["__sims_current_table_source_key"] = table_key
+                ss["__sims_current_table_source_action"] = action
+                ss["__sims_last_table_key"] = table_key
+                ss["__sims_last_table_action"] = action
+                restored = True
+                reason = "live_payload"
+            else:
+                reason = "expired"
+        else:
+            reason = "no_table"
+    except Exception:
+        reason = "error"
+        log.exception("[chat.room.source] restore failed room_id=%s", room_id)
+
+    if not restored:
+        _clear_current_table_source_for_room_change()
+
+    try:
+        log.info(
+            "[chat.room.source] room_id=%s restored=%s reason=%s table_key=%s current_source_cleared=%s",
+            room_id,
+            bool(restored),
+            reason,
+            table_key,
+            not bool(restored),
+        )
+    except Exception:
+        pass
+
 def _check_sims_action_permission(selected: dict | None) -> bool:
     """
     SIMS Panel/Hub 실행 전 권한 확인.
@@ -1883,6 +2056,7 @@ def _looks_like_explicit_sims_nlq_command(text: str) -> bool:
         "품목별 매출 추세",
         "품목별 매출 예상",
         "품목별 재고부족현황",
+        "매입처별 재고부족 현황",
         "입고명세",
         "출고명세",
         "매입명세",
@@ -2172,6 +2346,7 @@ def is_sims_result_followup_question(text: str) -> bool:
         "보여",
         "알려",
         "분석",
+        "집계",
         "요약",
         "정리",
         "상세",
@@ -2320,6 +2495,7 @@ _ANALYTICS_KPI_SOURCE_ACTIONS = {
     "품목별 매출 추세 요약표",
     "품목별 매출 예상",
     "품목별 재고부족현황",
+        "매입처별 재고부족 현황",
 }
 
 
@@ -2657,7 +2833,7 @@ def _implicit_analytics_query_matches_source(text: str, source_action: str) -> b
     )
 
     if is_shortage_q:
-        return src == "품목별 재고부족현황"
+        return src in {"품목별 재고부족현황", "매입처별 재고부족 현황"}
 
     if is_forecast_q:
         return src == "품목별 매출 예상"
@@ -3122,6 +3298,32 @@ def _current_table_push_table(
 
     source_table_key = str(source_table_key or "").strip()
 
+    def _supplier_shortage_followup_meta() -> dict:
+        source_action = str(st.session_state.get("__sims_current_table_source_action") or "").strip()
+        if "매입처별 재고부족" not in source_action:
+            return {}
+        return {
+            "source_action": source_action,
+            "flow": "매입처별 재고부족",
+            "amount_col": "배정부족예상금액",
+            "amount_label": "배정부족예상금액",
+            "amount_priority": (
+                "배정부족예상금액",
+                "배정1개월부족금액",
+                "배정2개월부족금액",
+                "배정3개월부족금액",
+                "매입처원본재고금액",
+                "최근6완료월매입금액",
+                "전체완료월매입금액",
+            ),
+            "business_terms": {
+                "flow_label": "매입처별 재고부족",
+                "amount_label": "배정부족예상금액",
+                "vendor_label": "매입처",
+                "qty_label": "부족수량",
+            },
+        }
+
     # 현재표 후속표 공통 보정:
     # 1) 제조사명/제조사 같은 별칭 컬럼 값 보존
     # 2) None/nan 표시값 정리
@@ -3215,6 +3417,9 @@ def _current_table_push_table(
     }
     if isinstance(extra_meta, dict) and extra_meta:
         payload["meta"].update(extra_meta)
+    supplier_meta = _supplier_shortage_followup_meta()
+    if supplier_meta:
+        payload["meta"].update(supplier_meta)
 
     push_sims_result_to_chat(payload, action)
     return True
@@ -6916,6 +7121,8 @@ def _render_sims_sidebar_fragment() -> None:
         )
 
         if clicked:
+            _set_ui_event_started("sims_panel_open")
+            st.session_state["__ui_rerun_reason"] = "sims_panel_open"
             st.session_state["__sims_force_open"] = True
             st.session_state["__sims_panel_active"] = True
             st.session_state["__sims_run_flag"] = True
@@ -7085,10 +7292,26 @@ with st.sidebar:
         key=room_radio_key,
     )
     if picked and picked != ss.current_room:
+        _set_ui_event_started("chat_room_change")
         old_room_id = ss.current_room
+        save_started = time.perf_counter()
+        save_chat_rooms()
+        save_elapsed = time.perf_counter() - save_started
+
         ss.current_room = picked
+        ss["__room_prev_selected"] = picked
+        ss["__room_rename_buf"] = id_to_name.get(picked, "")
+        ss["__ui_rerun_reason"] = "chat_room_change"
+        ss["__chat_room_switch_started_at"] = ss.get("__ui_event_started_at")
+        ss["__chat_room_switch_save_elapsed"] = save_elapsed
+        ss["__chat_room_switch_rerun_count"] = int(ss.get("__chat_room_switch_rerun_count") or 0) + 1
+
+        # 채팅방 선택과 SIMS 패널 닫기를 하나의 app rerun으로 묶는다.
+        _close_sims_panel_for_room_change()
 
         removed_empty_pending = _drop_empty_auto_rooms(keep_room_id=picked)
+        _clear_current_table_source_for_room_change()
+        _restore_current_table_source_for_room(picked)
 
         log.info(
             "[chat.room] selected %s old_room_id=%s new_room_id=%s removed_empty_pending=%s",
@@ -7098,7 +7321,6 @@ with st.sidebar:
             removed_empty_pending,
         )
 
-        save_chat_rooms()
         st.rerun()
 
     # 이름 변경(경고 방지: 선택 바뀌면 버퍼 초기화)
@@ -8236,6 +8458,42 @@ with st.container():
     except Exception:
         st.session_state["__chat_rendered_ids_this_run"] = []
 
+    def _consume_ui_rerun_reason() -> str:
+        priority = {
+            "current_table_followup": 3,
+            "sims_action_change": 2,
+            "chat_room_change": 2,
+            "sims_panel_open": 1,
+            "normal_chat": 0,
+        }
+        raw_reason = str(st.session_state.pop("__ui_rerun_reason", "") or "").strip()
+        current_reason = raw_reason if raw_reason in priority else "normal_chat"
+        st.session_state["__ui_rerun_reason_current"] = current_reason
+        return current_reason
+
+    current_ui_rerun_reason = _consume_ui_rerun_reason()
+    event_to_main_elapsed = 0.0
+    event_name = ""
+    try:
+        event_name = str(st.session_state.pop("__ui_event_name", "") or "").strip()
+        event_started_at = st.session_state.pop("__ui_event_started_at", None)
+        if event_started_at is not None:
+            event_to_main_elapsed = max(0.0, time.perf_counter() - float(event_started_at))
+    except Exception:
+        event_to_main_elapsed = 0.0
+    history_render_started = time.perf_counter()
+    st.session_state["__ui_rerun_perf_stats"] = {
+        "reason": current_ui_rerun_reason,
+        "event": event_name or current_ui_rerun_reason,
+        "event_to_main_elapsed": event_to_main_elapsed,
+        "history_messages": int(len(merged_msgs)),
+        "history_tables_rendered": 0,
+        "history_tables_skipped": 0,
+        "history_elapsed": 0.0,
+        "panel_elapsed": 0.0,
+        "total_elapsed": 0.0,
+    }
+
     # ------------------------------------------------------------
     # SIMS LLM 분석 fragment runner
     # ------------------------------------------------------------
@@ -8295,6 +8553,44 @@ with st.container():
             st.markdown(content)
             if ts:
                 st.caption(ts)
+
+    try:
+        stats = st.session_state.get("__ui_rerun_perf_stats") or {}
+        history_elapsed = time.perf_counter() - history_render_started
+        stats["history_elapsed"] = history_elapsed
+        stats["total_elapsed"] = history_elapsed + float(stats.get("panel_elapsed") or 0.0)
+        log.info(
+            "[ui.rerun.perf] reason=%s history_messages=%s history_tables_rendered=%s history_tables_skipped=%s history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
+            stats.get("reason"),
+            stats.get("history_messages"),
+            stats.get("history_tables_rendered"),
+            stats.get("history_tables_skipped"),
+            float(stats.get("history_elapsed") or 0.0),
+            float(stats.get("panel_elapsed") or 0.0),
+            float(stats.get("total_elapsed") or 0.0),
+        )
+        if stats.get("event"):
+            log.info(
+                "[ui.event_to_rerun] event=%s event_to_main_elapsed=%.3fs history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
+                stats.get("event"),
+                float(stats.get("event_to_main_elapsed") or 0.0),
+                float(stats.get("history_elapsed") or 0.0),
+                float(stats.get("panel_elapsed") or 0.0),
+                float(stats.get("total_elapsed") or 0.0),
+            )
+        if stats.get("reason") == "chat_room_change":
+            save_elapsed = float(st.session_state.pop("__chat_room_switch_save_elapsed", 0.0) or 0.0)
+            switch_total = float(stats.get("event_to_main_elapsed") or 0.0) + float(stats.get("history_elapsed") or 0.0)
+            log.info(
+                "[chat.room.switch.perf] select_to_save=%.3fs save_to_main=%.3fs history=%.3fs total=%.3fs rerun_count=%s",
+                save_elapsed,
+                max(0.0, float(stats.get("event_to_main_elapsed") or 0.0) - save_elapsed),
+                float(stats.get("history_elapsed") or 0.0),
+                switch_total,
+                int(st.session_state.pop("__chat_room_switch_rerun_count", 1) or 1),
+            )
+    except Exception:
+        log.exception("[ui.rerun.perf] logging failed")
 
     # (C) 채팅 바로 아래에 '이번 턴 답변' 표시 영역 예약 (✅ 딱 1곳에서만 생성/지정)
     pending_area = st.container()
@@ -8568,6 +8864,7 @@ with st.container():
                                     log.debug(
                                         "[chat.followup_table] deferred current-table followup handled after panel render → rerun"
                                     )
+                                    st.session_state["__ui_rerun_reason"] = "current_table_followup"
                                     st.rerun()
 
 

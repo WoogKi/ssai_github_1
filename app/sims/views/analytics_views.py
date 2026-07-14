@@ -34,6 +34,9 @@ from app.services.analytics_customer_sales_forecast_service import (
     get_region_sales_forecast_result,
     get_salesperson_sales_forecast_result,
 )
+from app.services.analytics_supplier_stock_shortage_service import (
+    get_supplier_stock_shortage_result,
+)
 
 log = logging.getLogger("ssai")
 
@@ -758,6 +761,57 @@ def _render_stock_shortage_panel_header(meta: Dict[str, Any], query_condition: s
         _color_for_shortage,
     )
 
+
+
+def _render_supplier_stock_shortage_panel_header(meta: Dict[str, Any], query_condition: str) -> None:
+    if not isinstance(meta, dict):
+        meta = {}
+
+    if query_condition:
+        st.caption(f"조회조건: {query_condition}")
+
+    st.markdown("### 매입처별 재고부족 요약")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        _metric_card("매입처수", meta.get("supplier_count"), "개", bg="#eff6ff", border="#bfdbfe")
+    with c2:
+        _metric_card("관련제품수", meta.get("product_count"), "개", bg="#f8fafc", border="#dbe4ee")
+    with c3:
+        _metric_card("부족제품수", meta.get("shortage_product_count"), "개", bg="#fff1f2", border="#fecdd3")
+    with c4:
+        _metric_card("음수재고매입처수", meta.get("negative_supplier_count"), "개", bg="#fff7ed", border="#fed7aa")
+    with c5:
+        _metric_card("음수재고제품수", meta.get("negative_product_count"), "개", bg="#fff7ed", border="#fed7aa")
+
+    c6, c7, c8, c9 = st.columns(4)
+    with c6:
+        _metric_card("제품전체현재재고금액", meta.get("total_product_stock_amount"), "원", bg="#f0fdf4", border="#bbf7d0")
+    with c7:
+        _metric_card("제품전체부족예상금액", meta.get("total_product_shortage_amount"), "원", bg="#fff1f2", border="#fecdd3")
+    with c8:
+        _metric_card("전체매입처배정부족예상금액", meta.get("total_allocated_shortage_amount"), "원", bg="#fff7ed", border="#fed7aa")
+    with c9:
+        _metric_card("미지정 배정금액", meta.get("unassigned_allocated_shortage_amount"), "원", bg="#f8fafc", border="#dbe4ee")
+
+    c10, c11, c12 = st.columns(3)
+    with c10:
+        _metric_card("재고정합성 불일치", meta.get("stock_consistency_mismatch_products"), "개", bg="#fff1f2", border="#fecdd3")
+    with c11:
+        _metric_card("배분정합성 불일치", meta.get("allocation_consistency_mismatch_products"), "개", bg="#fff1f2", border="#fecdd3")
+    with c12:
+        _metric_card("재고기준", "실재고" if str(meta.get("stock_mode") or "") == "real" else "장부재고", "", bg="#f8fafc", border="#dbe4ee")
+
+    basis_counts = meta.get("allocation_basis_distribution") or {}
+    if isinstance(basis_counts, dict) and basis_counts:
+        with st.expander("집계 요약 펼쳐보기", expanded=False):
+            st.write("배분기준별 제품수", basis_counts)
+            stock_dist = meta.get("stock_consistency_distribution") or {}
+            alloc_dist = meta.get("allocation_consistency_distribution") or {}
+            if stock_dist:
+                st.write("재고정합성 분포", stock_dist)
+            if alloc_dist:
+                st.write("배분정합성 분포", alloc_dist)
 
 def _manufacturer_progress_title(meta: Dict[str, Any]) -> str:
     return str(meta.get("current_progress_title") or ("당월 진행 요약" if meta.get("evaluation_mode") == "current_monthly" else "평가월 진행 요약"))
@@ -2375,5 +2429,200 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
                 "analytics": True,
                 "analysis_type": "stock_shortage",
                 "summary_type": "product_stock_shortage",
+            },
+        }
+
+
+def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
+    st.subheader("매입처별 재고부족 현황")
+    st.caption("품목별 공식 부족금액을 매입처별 매입/재고 비중으로 배분하여 매입처 단위 부족 현황을 계산합니다.")
+
+    ns = _ns()
+
+    with st.form(
+        key=f"__analytics_supplier_stock_shortage_form__{ns}",
+        clear_on_submit=False,
+        enter_to_submit=False,
+    ):
+
+
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            source_label = st.selectbox(
+                "분석자료원",
+                ["자동", "월집계-장부재고", "월집계-실재고", "출고상세"],
+                index=0,
+                key=f"__analytics_supplier_stock_shortage_source__{ns}",
+            )
+        with c2:
+            date_from = _render_date_input_with_week(
+                "시작일자",
+                _default_start_date(),
+                f"__analytics_supplier_stock_shortage_date_from__{ns}",
+            )
+        with c3:
+            date_to = _render_date_input_with_week(
+                "종료일자",
+                _default_end_date(),
+                f"__analytics_supplier_stock_shortage_date_to__{ns}",
+            )
+        with c4:
+            shortage_grade = st.selectbox(
+                "부족등급",
+                SHORTAGE_GRADE_OPTIONS,
+                index=0,
+                key=f"__analytics_supplier_stock_shortage_grade__{ns}",
+            )
+        top = _analytics_max_rows()
+
+        c_stock, c6, c7, c8 = st.columns(4)
+        with c_stock:
+            stock_label = st.selectbox(
+                "재고기준",
+                ["장부재고", "실재고"],
+                index=0,
+                key=f"__analytics_supplier_stock_shortage_stock_mode__{ns}",
+            )
+        with c6:
+            physic_cd = st.text_input("제품코드", value="", key=f"__analytics_supplier_stock_shortage_physic_cd__{ns}")
+        with c7:
+            physic_nm = st.text_input("제품명", value="", key=f"__analytics_supplier_stock_shortage_physic_nm__{ns}")
+        with c8:
+            product_ven_nm = st.text_input("제조사명", value="", key=f"__analytics_supplier_stock_shortage_product_ven_nm__{ns}")
+
+        c9, c10, c11, c12 = st.columns(4)
+        with c9:
+            product_group_opt = _select_code_option(
+                "제품그룹명",
+                "0013",
+                key=f"__analytics_supplier_stock_shortage_product_group__{ns}",
+            )
+        with c10:
+            product_di_opts = _select_code_options(
+                "제품구분명",
+                "0004",
+                key=f"__analytics_supplier_stock_shortage_product_di__{ns}",
+            )
+        with c11:
+            product_class_opts = _select_code_options(
+                "제품분류명",
+                "0028",
+                key=f"__analytics_supplier_stock_shortage_product_class__{ns}",
+            )
+        with c12:
+            stock_opts = _select_code_options(
+                "재고위치",
+                "0018",
+                key=f"__analytics_supplier_stock_shortage_stock__{ns}",
+            )
+
+        c13, c14, c15 = st.columns(3)
+        with c13:
+            ven_nm = st.text_input("거래처명", value="", key=f"__analytics_supplier_stock_shortage_ven_nm__{ns}")
+        with c14:
+            buy_nm = st.text_input("매입처명", value="", key=f"__analytics_supplier_stock_shortage_buy_nm__{ns}")
+        with c15:
+            sales_man_nm = st.text_input("영업사원명", value="", key=f"__analytics_supplier_stock_shortage_sales_man_nm__{ns}")
+
+        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+
+    if not submitted:
+        return {
+            "final": False,
+            "type": "text",
+            "title": "매입처별 재고부족 현황",
+            "data": "[조회] 버튼을 눌러 실행하세요.",
+        }
+
+    source_mode = {
+        "자동": "auto",
+        "월집계-장부재고": "monthly_book",
+        "월집계-실재고": "monthly_real",
+        "출고상세": "detail",
+    }.get(source_label, "auto")
+
+    stock_mode = {
+        "장부재고": "book",
+        "실재고": "real",
+    }.get(stock_label, "book")
+
+    date_from_text = _date_to_yyyymmdd(date_from)
+    date_to_text = _date_to_yyyymmdd(date_to)
+
+    params = {
+        "source_mode": source_mode,
+        "stock_mode": stock_mode,
+        "date_from": date_from_text,
+        "date_to": date_to_text,
+        "month_from": _date_to_yyyymm(date_from),
+        "month_to": _date_to_yyyymm(date_to),
+        "physic_cd": _clean_text(physic_cd),
+        "physic_nm": _clean_text(physic_nm),
+        "product_ven_nm": _clean_text(product_ven_nm),
+        "product_group": product_group_opt.get("code", ""),
+        "product_group_nm": product_group_opt.get("name", ""),
+        "product_di": "",
+        "product_di_nm": "",
+        "product_di_list": _selected_codes(product_di_opts),
+        "product_di_nm_list": _selected_names(product_di_opts),
+        "product_class": "",
+        "product_class_nm": "",
+        "product_class_list": _selected_codes(product_class_opts),
+        "product_class_nm_list": _selected_names(product_class_opts),
+        "stock_cd": "",
+        "stock_nm": "",
+        "stock_cd_list": _selected_codes(stock_opts),
+        "stock_nm_list": _selected_names(stock_opts),
+        "ven_nm": _clean_text(ven_nm),
+        "buy_nm": _clean_text(buy_nm),
+        "sales_man_nm": _clean_text(sales_man_nm),
+        "shortage_grade": "" if shortage_grade == "전체" else shortage_grade,
+        "top": int(top),
+    }
+
+    try:
+        result = get_supplier_stock_shortage_result(params)
+
+        meta = dict(result.get("meta") or {})
+        meta.setdefault("analytics", True)
+        meta.setdefault("analysis_type", "supplier_stock_shortage")
+        meta.setdefault("summary_type", "supplier_stock_shortage")
+
+        query_condition = _build_sales_trend_query_condition(params, meta)
+        if query_condition:
+            query_condition = f"{query_condition} / 재고기준 {stock_label}"
+            meta["query_summary"] = query_condition
+            meta["condition"] = query_condition
+
+        result["params_raw"] = params
+        result["params"] = _build_sales_trend_display_params(params, meta)
+        result["params"]["재고기준"] = stock_label
+        result["meta"] = meta
+
+        if (
+            _render_inline_analysis_header_enabled()
+            and int(meta.get("row_count_total") or meta.get("row_count") or 0) > 0
+        ):
+            _render_supplier_stock_shortage_panel_header(meta, query_condition)
+
+        return result
+
+    except Exception as e:
+        log.exception("[analytics.views] supplier stock shortage failed")
+        return {
+            "final": True,
+            "type": "text",
+            "title": "매입처별 재고부족 현황 오류",
+            "action": "매입처별 재고부족 현황",
+            "params": _build_sales_trend_display_params(params, {}),
+            "params_raw": params,
+            "data": str(e),
+            "message": str(e),
+            "meta": {
+                "row_count": 0,
+                "row_count_total": 0,
+                "analytics": True,
+                "analysis_type": "supplier_stock_shortage",
+                "summary_type": "supplier_stock_shortage",
             },
         }

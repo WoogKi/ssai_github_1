@@ -323,7 +323,6 @@ def _render_login_flash() -> None:
     else:
         st.info(message)
 
-
 def _clear_pending_wholesale_auth() -> None:
     st.session_state.pop(SESSION_PENDING_WHOLESALE_AUTH, None)
 
@@ -589,6 +588,8 @@ def logout() -> None:
         SESSION_LOGIN_GREETING,
         SESSION_LOGIN_GREETING_SIG,
         SESSION_COMPANY_CHANGE_NOTICE,
+        "__ssai_company_change_sims_password",
+        "__ssai_clear_company_change_sims_password",
     ]:        
 
         st.session_state.pop(key, None)
@@ -610,7 +611,7 @@ def logout() -> None:
         "__sims_auto_user_input",
     ]:
         st.session_state.pop(key, None)
-        
+
     st.rerun()
 
 
@@ -661,6 +662,14 @@ def render_company_selector() -> bool:
     if not user:
         return False
 
+    password_key = "__ssai_company_change_sims_password"
+    clear_password_key = "__ssai_clear_company_change_sims_password"
+
+    # 성공 또는 취소한 이전 실행에서 요청한 비밀번호 정리를
+    # 위젯이 생성되기 전에 처리한다.
+    if st.session_state.pop(clear_password_key, False):
+        st.session_state.pop(password_key, None)
+
     companies = get_active_companies_for_user(user)
 
     if not companies:
@@ -669,7 +678,11 @@ def render_company_selector() -> bool:
         return False
 
     st.title("회원사 / ERP DB 선택")
-    st.caption("사용할 회원사 ERP DB를 선택한 뒤 [이 회원사 ERP DB로 접속] 버튼을 누르세요.")
+    st.caption(
+        "사용할 회원사 ERP DB를 선택한 뒤 SIMS Password를 입력하고 "
+        "Enter를 누르거나 [이 회원사 ERP DB로 접속] 버튼을 누르세요."
+    )
+
 
     current_company = get_selected_company()
 
@@ -714,92 +727,123 @@ def render_company_selector() -> bool:
     )
 
     sims_change_password = ""
+    company_change_submitted = False
+    company_change_cancelled = False
 
-    if _is_ssart_user(user):
-        sims_user_id_for_change = str(user.sims_user_id or "").strip() or "admin"
+    # 모든 사용자는 자신의 SIMS 사용자 ID로 선택한 ERP DB의 비밀번호를 확인한다.
+    sims_user_id_for_change = str(user.sims_user_id or "").strip()
 
-        st.warning(
-            "신성아트컴 사용자의 회원사/ERP DB 변경은 "
-            "선택한 ERP DB의 SIMS Password 확인 후 적용합니다."
+    # 신성아트컴 사용자는 SIMS 사용자 ID가 없을 때만 기존 admin 기본값을 사용한다.
+    if _is_ssart_user(user) and not sims_user_id_for_change:
+        sims_user_id_for_change = "admin"
+
+    if not sims_user_id_for_change:
+        st.error(
+            "내 정보에 SIMS 사용자 ID가 등록되어 있지 않습니다. "
+            "관리자에게 SIMS 사용자 ID 등록을 요청하세요."
         )
-        st.caption(f"확인할 SIMS 사용자 ID: `{sims_user_id_for_change}`")
+        return False
 
+    st.warning(
+        "회원사/ERP DB 변경은 선택한 ERP DB의 "
+        "SIMS Password 확인 후 적용합니다."
+    )
+    st.caption(f"확인할 SIMS 사용자 ID: `{sims_user_id_for_change}`")
+
+    # 모든 사용자가 Password 입력 후 Enter 또는 버튼으로 제출
+    with st.form(
+        "__ssai_company_change_form",
+        clear_on_submit=False,
+        enter_to_submit=True,
+    ):
         sims_change_password = st.text_input(
             "SIMS Password 확인",
             type="password",
-            key="__ssai_company_change_sims_password",
+            key=password_key,
         )
 
-    col1, col2 = st.columns([1, 1])
+        col1, col2 = st.columns([1, 1])
 
-    with col1:
-        if st.button("이 회원사 ERP DB로 접속", type="primary", use_container_width=True):
-            current_company = get_selected_company()
-
-            current_id = None
-            if isinstance(current_company, dict):
-                current_id = current_company.get("company_id")
-
-            selected_id = selected_company.get("company_id")
-
-            if _is_ssart_user(user):
-                sims_user_id_for_change = str(user.sims_user_id or "").strip() or "admin"
-
-                if not sims_change_password:
-                    st.error("회원사/ERP DB 변경을 위해 SIMS Password를 입력하세요.")
-                    return False
-
-                try:
-                    sims_user = get_sims_user_for_login(
-                        company_id=int(selected_id),
-                        sims_user_id=sims_user_id_for_change,
-                    )
-                except Exception as e:
-                    log.exception(
-                        "[auth.company] sims password check failed company_id=%s login_id=%s",
-                        selected_id,
-                        user.login_id,
-                    )
-                    st.error(f"SIMS 사용자 확인 중 오류가 발생했습니다: {type(e).__name__}: {e}")
-                    return False
-
-                if not sims_user:
-                    st.error(
-                        "선택한 회원사 ERP DB에서 현재 사용자의 SIMS 사용자 ID를 찾지 못했습니다. "
-                        "내 정보의 SIMS 사용자 ID를 확인하세요."
-                    )
-                    return False
-
-                sims_del_flag = str(sims_user.get("sims_del_flag") or "").strip().upper()
-                if sims_del_flag == "E":
-                    st.error("선택한 회원사 ERP DB의 SIMS 사용자가 삭제/비활성 상태입니다.")
-                    return False
-
-                if not verify_sims_plain_password(
-                    sims_change_password,
-                    str(sims_user.get("sims_password") or ""),
-                ):
-                    st.error("SIMS Password가 일치하지 않습니다.")
-                    return False
-
-            if str(current_id or "") != str(selected_id or ""):
-                _clear_company_dependent_state()
-
-            _after_company_selected(
-                selected_company,
-                previous_company=current_company if isinstance(current_company, dict) else None,
-                manual_change=True,
+        with col1:
+            company_change_submitted = st.form_submit_button(
+                "이 회원사 ERP DB로 접속",
+                type="primary",
+                use_container_width=True,
             )
 
-            st.session_state[SESSION_COMPANY_PICK_MODE] = False
-            st.success("회원사/ERP DB 선택 완료")
-            st.rerun()
+        with col2:
+            if current_company is not None:
+                company_change_cancelled = st.form_submit_button(
+                    "취소",
+                    use_container_width=True,
+                )
 
-    with col2:
-        if current_company is not None:
-            if st.button("취소", use_container_width=True):
-                st.session_state[SESSION_COMPANY_PICK_MODE] = False
-                st.rerun()
+
+    if company_change_cancelled:
+        st.session_state[clear_password_key] = True
+        st.session_state[SESSION_COMPANY_PICK_MODE] = False
+        st.rerun()
+
+    if company_change_submitted:
+        current_company = get_selected_company()
+
+        current_id = None
+        if isinstance(current_company, dict):
+            current_id = current_company.get("company_id")
+
+        selected_id = selected_company.get("company_id")
+
+
+        if not sims_change_password:
+            st.error("회원사/ERP DB 변경을 위해 SIMS Password를 입력하세요.")
+            return False
+
+        try:
+            sims_user = get_sims_user_for_login(
+                company_id=int(selected_id),
+                sims_user_id=sims_user_id_for_change,
+            )
+        except Exception as e:
+            log.exception(
+                "[auth.company] sims password check failed company_id=%s login_id=%s",
+                selected_id,
+                user.login_id,
+            )
+            st.error(f"SIMS 사용자 확인 중 오류가 발생했습니다: {type(e).__name__}: {e}")
+            return False
+
+        if not sims_user:
+            st.error(
+                "선택한 회원사 ERP DB에서 현재 사용자의 SIMS 사용자 ID를 찾지 못했습니다. "
+                "내 정보의 SIMS 사용자 ID를 확인하세요."
+            )
+            return False
+
+        sims_del_flag = str(sims_user.get("sims_del_flag") or "").strip().upper()
+        if sims_del_flag == "E":
+            st.error("선택한 회원사 ERP DB의 SIMS 사용자가 삭제/비활성 상태입니다.")
+            return False
+
+        if not verify_sims_plain_password(
+            sims_change_password,
+            str(sims_user.get("sims_password") or ""),
+        ):
+            st.error("SIMS Password가 일치하지 않습니다.")
+            return False
+
+        if str(current_id or "") != str(selected_id or ""):
+            _clear_company_dependent_state()
+
+        _after_company_selected(
+            selected_company,
+            previous_company=current_company if isinstance(current_company, dict) else None,
+            manual_change=True,
+        )
+
+        st.session_state[clear_password_key] = True
+        st.session_state[SESSION_COMPANY_PICK_MODE] = False
+        st.success("회원사/ERP DB 선택 완료")
+        st.rerun()
 
     # 회원사 ERP DB 선택 중에는 메인 화면으로 진행하지 않음
     return False
@@ -1025,7 +1069,7 @@ def render_login_form() -> bool:
     st.caption("1단계: SS AI 로그인 ID와 SS AI Password를 입력하세요.")
 
     with st.form("ssai_login_form", clear_on_submit=False):
-        login_id = st.text_input("로그인 ID", value="admin")
+        login_id = st.text_input("로그인 ID", value="", placeholder="아이디를 입력하세요")
         password = st.text_input("SS AI Password", type="password")
         submitted = st.form_submit_button("다음", use_container_width=True)
 

@@ -607,7 +607,8 @@ def _is_sales_trend_payload(payload: Dict[str, Any], action: str, title: str) ->
             "지역별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
-            "품목별 재고부족현황"
+            "품목별 재고부족현황",
+            "매입처별 재고부족 현황"
         }
         or title_text in {
             "품목별 매출 추세 분석",
@@ -618,10 +619,11 @@ def _is_sales_trend_payload(payload: Dict[str, Any], action: str, title: str) ->
             "지역별 매출 예상",
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
-            "품목별 재고부족현황"
+            "품목별 재고부족현황",
+            "매입처별 재고부족 현황"
         }
-        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
-        or summary_type in {"product_summary", "product_forecast", "customer_forecast", "salesperson_forecast", "region_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
+        or analysis_type in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "supplier_stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or summary_type in {"product_summary", "product_forecast", "customer_forecast", "salesperson_forecast", "region_forecast", "product_stock_shortage", "supplier_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
     )
 
 def _pinned_text_column_config(label: str, width: int):
@@ -1027,9 +1029,9 @@ def _is_sales_trend_summary_payload(payload: Dict[str, Any], action: str, title:
             "제약사별 매출 추세 분석 요약표",
             "품목별 재고부족현황",
         }
-        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "매출처별 매출 예상", "영업사원별 매출 예상", "지역별 매출 예상", "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표", "품목별 재고부족현황"}
-        or summary_type in {"product_summary", "product_forecast", "customer_forecast", "salesperson_forecast", "region_forecast", "product_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
-        or analysis_type in {"sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
+        or title_text in {"품목별 매출 추세 요약표", "품목별 매출 예상", "매출처별 매출 예상", "영업사원별 매출 예상", "지역별 매출 예상", "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표", "품목별 재고부족현황", "매입처별 재고부족 현황"}
+        or summary_type in {"product_summary", "product_forecast", "customer_forecast", "salesperson_forecast", "region_forecast", "product_stock_shortage", "supplier_stock_shortage", "manufacturer_trend_detail", "manufacturer_trend_summary"}
+        or analysis_type in {"sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "supplier_stock_shortage", "manufacturer_sales_trend", "manufacturer_sales_trend_summary"}
     )
 
 def _blank_same_as_previous(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
@@ -1228,6 +1230,7 @@ _CATEGORIES: Dict[str, Dict[str, Any]] = {
             "영업사원별 매출 예상": analytics_views.render_salesperson_sales_forecast_analysis,
             "지역별 매출 예상": analytics_views.render_region_sales_forecast_analysis,
             "품목별 재고부족현황": analytics_views.render_stock_shortage_analysis,
+            "매입처별 재고부족 현황": analytics_views.render_supplier_stock_shortage_analysis,
         }
     },
     "입출고/명세서/재고": {
@@ -2366,6 +2369,8 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
 
     # 액션 변경 시에만 form_id 증가 및 위젯키 정리
     if ss.get("__sims_last_action") != f"{category}::{action}":
+        if str(ss.get("__ui_rerun_reason_current") or "") != "current_table_followup":
+            ss["__ui_rerun_reason"] = "sims_action_change"
         ss["__sims_form_id"] = int(ss.get("__sims_form_id", 0)) + 1
         ss["__sims_widget_ns"] = str(ss["__sims_form_id"])
         ss["__sims_last_action"] = f"{category}::{action}"
@@ -4042,7 +4047,7 @@ def _render_panel_result_actions_lazy(
     SIMS 패널 결과 하단 액션 영역 lazy 버전.
 
     - 작은 표: 기존처럼 CSV/EXCEL/LLM 버튼 즉시 표시
-    - 큰 표: [다운로드 준비]를 눌렀을 때만 CSV/XLSX bytes 생성
+    - 큰 표: [Excel 다운로드 준비]를 눌렀을 때만 CSV/XLSX bytes 생성
     """
     if not isinstance(download_df, pd.DataFrame) or download_df.empty:
         c1, c2, c3 = st.columns(3)
@@ -4102,10 +4107,13 @@ def _render_panel_result_actions_lazy(
         return
 
 
-    is_large_download = threshold_rows > 0 and row_count >= threshold_rows
+    supplier_detail_key = str(getattr(download_df, "attrs", {}).get("supplier_detail_key") or "").strip()
+    force_lazy_supplier_excel = bool(supplier_detail_key)
+    is_large_download = force_lazy_supplier_excel or (threshold_rows > 0 and row_count >= threshold_rows)
+    cache_key_suffix = f"{key_suffix}::{supplier_detail_key}" if supplier_detail_key else key_suffix
 
-    ready_key = f"__panel_download_ready::{key_suffix}"
-    bytes_key = f"__panel_download_bytes::{key_suffix}"
+    ready_key = f"__panel_download_ready::{cache_key_suffix}"
+    bytes_key = f"__panel_download_bytes::{cache_key_suffix}"
 
     ss = st.session_state
     is_ready = bool(ss.get(ready_key))
@@ -4113,14 +4121,14 @@ def _render_panel_result_actions_lazy(
     if is_large_download and not is_ready:
         st.caption(
             f"대형표 다운로드: {row_count:,}건 × {col_count:,}열입니다. "
-            "속도를 위해 CSV/EXCEL 파일은 [다운로드 준비]를 누른 뒤 생성합니다."
+            "속도를 위해 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누른 뒤 생성합니다."
         )
 
         c1, c2, c3 = st.columns(3)
 
         with c1:
             if st.button(
-                "다운로드 준비",
+                "Excel 다운로드 준비",
                 key=f"__panel_prepare_download_{key_suffix}",
                 use_container_width=True,
             ):
@@ -4316,6 +4324,25 @@ def _render_downloads(
         prompt=prompt,
     )    
 
+def _write_supplier_stock_shortage_excel_if_any(writer: Any, df: pd.DataFrame, engine: str) -> bool:
+    attrs = getattr(df, "attrs", {}) if isinstance(df, pd.DataFrame) else {}
+    detail_df = attrs.get("supplier_detail_df") if isinstance(attrs, dict) else None
+    if not isinstance(detail_df, pd.DataFrame):
+        detail_key = str((attrs or {}).get("supplier_detail_key") or "").strip()
+        detail_store = st.session_state.get("__sims_supplier_stock_shortage_detail_tables") or {}
+        if detail_key and isinstance(detail_store, dict):
+            detail_df = detail_store.get(detail_key)
+    if not isinstance(detail_df, pd.DataFrame) or detail_df.empty:
+        return False
+    summary_df = df.copy()
+    detail_excel_df = detail_df.copy()
+    summary_df.to_excel(writer, index=False, sheet_name="매입처별요약")
+    detail_excel_df.to_excel(writer, index=False, sheet_name="제품매입처상세")
+    _apply_sims_excel_number_formats(writer, summary_df, "매입처별요약", engine)
+    _apply_sims_excel_number_formats(writer, detail_excel_df, "제품매입처상세", engine)
+    return True
+
+
 def _xlsx_bytes(df: pd.DataFrame) -> Optional[bytes]:
     """xlsxwriter 또는 openpyxl이 있으면 XLSX 바이트를 반환, 없으면 None."""
     try:
@@ -4329,8 +4356,9 @@ def _xlsx_bytes(df: pd.DataFrame) -> Optional[bytes]:
             return None
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine=engine) as w:
-        df.to_excel(w, index=False, sheet_name="SIMS")
-        _apply_sims_excel_number_formats(w, df, "SIMS", engine)
+        if not _write_supplier_stock_shortage_excel_if_any(w, df, engine):
+            df.to_excel(w, index=False, sheet_name="SIMS")
+            _apply_sims_excel_number_formats(w, df, "SIMS", engine)
     return buf.getvalue()
 
 

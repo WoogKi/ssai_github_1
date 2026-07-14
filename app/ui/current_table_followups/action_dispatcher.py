@@ -90,6 +90,7 @@ def detect_current_table_kind(source_action: str) -> str:
         or "제조사별매출추세분석" in s
         or "제조사별매출추세분석요약표" in s
         or "품목별재고부족현황" in s
+        or "??????????" in s
     ):
         return "analytics_kpi"
 

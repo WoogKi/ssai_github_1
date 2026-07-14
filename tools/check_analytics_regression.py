@@ -27,6 +27,7 @@ import argparse
 import importlib
 import logging
 import os
+import re
 import sys
 import traceback
 from dataclasses import dataclass
@@ -340,6 +341,7 @@ def run_basic_checks() -> list[CheckResult]:
                 ("영업사원별 매출 예상 2025년 조회", "영업사원별 매출 예상"),
                 ("지역별 매출 예상 2025년 조회", "지역별 매출 예상"),
                 ("품목별 재고부족현황 2025년 조회", "품목별 재고부족현황"),
+                ("매입처별 재고부족 현황 2025년 조회", "매입처별 재고부족 현황"),
             ]
             for q, expected in tests:
                 got = resolve(q)
@@ -1559,6 +1561,427 @@ def run_basic_checks() -> list[CheckResult]:
                 setattr(manufacturer_mod, "get_sales_trend_df", old_loader)
     except Exception as e:
         results.append(_fail("manufacturer sales trend", f"{type(e).__name__}: {e}"))
+
+
+    try:
+        supp_mod = importlib.import_module("app.services.analytics_supplier_stock_shortage_service")
+        product_base = pd.DataFrame([
+            {
+                "제품코드": "P001",
+                "제품명": "테스트제품",
+                "규격": "EA",
+                "제조사명": "제조사A",
+                "제품그룹명": "G",
+                "제품구분명": "D",
+                "제품분류명": "C",
+                "재고기준": "장부",
+                "현재재고수량": 100,
+                "현재재고금액": 2000,
+                "재고평가단가": 20,
+                "당월 예상출고수량": 100,
+                "당월 잔여예상출고수량": 150,
+                "당월 출고진척률": 50,
+                "부족예상수량": 50,
+                "부족예상금액": 1000,
+                "1개월부족수량": 10,
+                "2개월부족수량": 20,
+                "3개월부족수량": 30,
+                "재고커버월수": 0.67,
+                "당월 재고충족률": 66.67,
+                "재고부족판정": "부족",
+                "부족등급": "부족",
+            },
+            {
+                "제품코드": "P002",
+                "제품명": "테스트제품2",
+                "규격": "EA",
+                "제조사명": "제조사A",
+                "제품그룹명": "G",
+                "제품구분명": "D",
+                "제품분류명": "C",
+                "재고기준": "장부",
+                "현재재고수량": 13,
+                "현재재고금액": 143,
+                "재고평가단가": 11,
+                "당월 예상출고수량": 0,
+                "당월 잔여예상출고수량": 0,
+                "당월 출고진척률": 0,
+                "부족예상수량": 0,
+                "부족예상금액": 0,
+                "1개월부족수량": 0,
+                "2개월부족수량": 0,
+                "3개월부족수량": 0,
+                "재고커버월수": 0,
+                "당월 재고충족률": 100,
+                "재고부족판정": "수요없음",
+                "부족등급": "정상",
+            }
+        ])
+        supplier_stock = pd.DataFrame([
+            {
+                "제품코드": "P001",
+                "매입처코드": "A",
+                "매입처명": "매입처A",
+                "매입처원본재고수량": 120,
+                "매입처원본재고금액": 1200,
+                "양수재고수량": 120,
+                "양수재고금액": 700,
+                "최근6완료월매입금액": 70,
+                "전체완료월매입금액": 70,
+                "매입처입고누계수량": 70,
+            },
+            {
+                "제품코드": "P001",
+                "매입처코드": "B",
+                "매입처명": "매입처B",
+                "매입처원본재고수량": -20,
+                "매입처원본재고금액": -200,
+                "양수재고수량": 80,
+                "양수재고금액": 300,
+                "최근6완료월매입금액": 30,
+                "전체완료월매입금액": 30,
+                "매입처입고누계수량": 30,
+            },
+            {
+                "제품코드": "P002",
+                "매입처코드": "C",
+                "매입처명": "매입처C",
+                "매입처원본재고수량": 7,
+                "매입처원본재고금액": 999999,
+                "양수재고수량": 7,
+                "양수재고금액": 77,
+                "최근6완료월매입금액": 0,
+                "전체완료월매입금액": 0,
+                "매입처입고누계수량": 7,
+            },
+            {
+                "제품코드": "P002",
+                "매입처코드": "D",
+                "매입처명": "매입처D",
+                "매입처원본재고수량": 6,
+                "매입처원본재고금액": 888888,
+                "양수재고수량": 6,
+                "양수재고금액": 66,
+                "최근6완료월매입금액": 0,
+                "전체완료월매입금액": 0,
+                "매입처입고누계수량": 6,
+            },
+        ])
+        detail = supp_mod.build_supplier_allocation_detail(product_base, supplier_stock)
+        summary_all = supp_mod.build_supplier_shortage_summary(detail, {})
+        summary_b = supp_mod.build_supplier_shortage_summary(detail, {"buy_nm": "매입처B"})
+
+        a_amt = float(summary_all.loc[summary_all["매입처코드"] == "A", "배정부족예상금액"].iloc[0])
+        b_amt = float(summary_all.loc[summary_all["매입처코드"] == "B", "배정부족예상금액"].iloc[0])
+        total_qty = float(detail["배정부족예상수량"].sum())
+        stock_sum = float(detail.loc[detail["제품코드"] == "P001", "매입처원본재고수량"].sum())
+        p001_stock_amt = float(detail.loc[detail["제품코드"] == "P001", "매입처원본재고금액"].sum())
+        p002_stock_amt = float(detail.loc[detail["제품코드"] == "P002", "매입처원본재고금액"].sum())
+        p002_qty_7_amt = float(detail.loc[detail["매입처코드"] == "C", "매입처원본재고금액"].iloc[0])
+        p002_qty_6_amt = float(detail.loc[detail["매입처코드"] == "D", "매입처원본재고금액"].iloc[0])
+        neg_b = float(detail.loc[detail["매입처코드"] == "B", "매입처원본재고수량"].iloc[0])
+        neg_b_amt = float(detail.loc[detail["매입처코드"] == "B", "매입처원본재고금액"].iloc[0])
+        filtered_b_amt = float(summary_b["배정부족예상금액"].sum())
+
+        mismatches = []
+        if abs(a_amt - 700) > 1e-6 or abs(b_amt - 300) > 1e-6:
+            mismatches.append(f"70/30 allocation expected 700/300 got {a_amt}/{b_amt}")
+        if abs(total_qty - 50) > 1e-6:
+            mismatches.append(f"shortage qty should remain product-level 50 got {total_qty}")
+        if abs(stock_sum - 100) > 1e-6 or abs(neg_b + 20) > 1e-6:
+            mismatches.append(f"negative supplier stock not preserved stock_sum={stock_sum} neg_b={neg_b}")
+        if abs(p001_stock_amt - 2000) > 1e-6 or abs(neg_b_amt + 400) > 1e-6:
+            mismatches.append(f"stock amount must use product unit price p001_sum={p001_stock_amt} neg_b_amt={neg_b_amt}")
+        if abs(p002_stock_amt - 143) > 1e-6 or abs(p002_qty_7_amt - 77) > 1e-6 or abs(p002_qty_6_amt - 66) > 1e-6:
+            mismatches.append(f"7/6 stock amount expected 77/66 sum 143 got {p002_qty_7_amt}/{p002_qty_6_amt}/{p002_stock_amt}")
+        if not set(detail["재고정합성"].dropna().astype(str).unique()).issubset({"일치"}):
+            mismatches.append(f"stock consistency should match public basis got={detail['재고정합성'].dropna().astype(str).unique().tolist()}")
+        if abs(filtered_b_amt - 300) > 1e-6 or len(summary_b) != 1:
+            mismatches.append(f"supplier filter must apply after allocation got rows={len(summary_b)} amount={filtered_b_amt}")
+
+        if mismatches:
+            results.append(_fail("supplier stock shortage allocation fixture", "; ".join(mismatches)))
+        else:
+            results.append(_ok("supplier stock shortage allocation fixture", "unit-price stock amount, negative stock, 70/30 allocation, and post-filter OK"))
+
+        old_product_loader = getattr(supp_mod, "load_product_shortage_base")
+        old_supplier_loader = getattr(supp_mod, "load_supplier_product_stock")
+        try:
+            setattr(supp_mod, "load_product_shortage_base", lambda params: product_base.copy())
+            setattr(supp_mod, "load_supplier_product_stock", lambda product_codes, params: supplier_stock.copy())
+            payload = supp_mod.get_supplier_stock_shortage_result({"stock_mode": "book"})
+            result_df = payload.get("df") if isinstance(payload.get("df"), pd.DataFrame) else payload.get("df_display")
+            meta = payload.get("meta") or {}
+            import io
+            import json
+
+            unsafe_types = (pd.DataFrame, pd.Series, bytes, bytearray)
+            unsafe_meta = [k for k, v in meta.items() if isinstance(v, unsafe_types)]
+            unsafe_attrs = [
+                k
+                for k, v in getattr(result_df, "attrs", {}).items()
+                if isinstance(v, unsafe_types)
+            ] if isinstance(result_df, pd.DataFrame) else []
+            room = {
+                "id": "fixture",
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "type": payload.get("type"),
+                        "action": payload.get("action"),
+                        "title": payload.get("title"),
+                        "meta": meta,
+                    }
+                ],
+            }
+            json.dumps(room, ensure_ascii=False)
+
+            from app.ui.chat_middleware import _make_table_downloads
+            from openpyxl import load_workbook
+
+            _, xlsx_buf = _make_table_downloads(result_df)
+            sheet_names = load_workbook(io.BytesIO(xlsx_buf.getvalue()), read_only=True).sheetnames
+            follow_df = result_df.head(1).copy()
+            follow_df.attrs.clear()
+            _, follow_xlsx_buf = _make_table_downloads(follow_df)
+            follow_sheet_names = load_workbook(io.BytesIO(follow_xlsx_buf.getvalue()), read_only=True).sheetnames
+            if unsafe_meta or unsafe_attrs:
+                results.append(_fail("supplier stock shortage json-safe payload", f"unsafe_meta={unsafe_meta} unsafe_attrs={unsafe_attrs}"))
+            elif sheet_names != ["매입처별요약", "제품매입처상세"]:
+                results.append(_fail("supplier stock shortage json-safe payload", f"unexpected excel sheets={sheet_names}"))
+            elif follow_sheet_names != ["SIMS"]:
+                results.append(_fail("supplier stock shortage json-safe payload", f"current-table result should be one sheet got={follow_sheet_names}"))
+            else:
+                results.append(_ok("supplier stock shortage json-safe payload", "json.dumps room OK; original Excel 2 sheets; current-table Excel one sheet"))
+        finally:
+            setattr(supp_mod, "load_product_shortage_base", old_product_loader)
+            setattr(supp_mod, "load_supplier_product_stock", old_supplier_loader)
+
+        try:
+            generic_mod = importlib.import_module("app.ui.current_table_followups.generic")
+            captured: dict[str, object] = {}
+
+            def _push_table(**kwargs):
+                captured.update(kwargs)
+                return True
+
+            top_df = pd.DataFrame({
+                "매입처코드": [f"B{i:02d}" for i in range(25)],
+                "배정부족예상금액": list(range(25)),
+                "매입처원본재고금액": list(range(100, 125)),
+            })
+            top_df.attrs["supplier_detail_key"] = "detail-key-should-not-inherit"
+            ok_top = generic_mod.handle_common_column_filter_followup(
+                df=top_df,
+                query="현재표 배정부족예상금액 TOP 20",
+                top_n=20,
+                table_key="supplier-table",
+                source_action="매입처별 재고부족 현황",
+                helpers={"push_table": _push_table},
+                log=log,
+            )
+            out_top = captured.get("df")
+            if not ok_top or not isinstance(out_top, pd.DataFrame):
+                results.append(_fail("supplier current-table top amount", "TOP 20 route did not push table"))
+            elif len(out_top) != 20 or float(out_top["배정부족예상금액"].iloc[0]) != 24 or float(out_top["배정부족예상금액"].iloc[-1]) != 5:
+                results.append(_fail("supplier current-table top amount", f"unexpected TOP rows={len(out_top)} head/tail={out_top['배정부족예상금액'].head(1).tolist()}/{out_top['배정부족예상금액'].tail(1).tolist()}"))
+            elif getattr(out_top, "attrs", {}).get("supplier_detail_key"):
+                results.append(_fail("supplier current-table top amount", "supplier_detail_key leaked into current-table TOP result"))
+            else:
+                results.append(_ok("supplier current-table top amount", "배정부족예상금액 TOP 20 sorted desc; detail attrs cleared"))
+        except Exception as e:
+            results.append(_fail("supplier current-table top amount", f"{type(e).__name__}: {e}"))
+
+        try:
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+            amount_df = pd.DataFrame({
+                "기준월": ["202607"],
+                "매입처코드": ["B001"],
+                "완료월수": [6],
+                "배정부족예상금액": [1234],
+                "배정1개월부족금액": [100],
+                "매입처원본재고금액": [200],
+            })
+            profile = chat_mod._build_sims_sales_time_profile(
+                amount_df,
+                chat_mod._sims_business_terms("매입처별 재고부족 현황"),
+            )
+            amount_col = str((profile or {}).get("amount_col") or "")
+            amount_label = str((profile or {}).get("amount_label") or "")
+            if amount_col != "배정부족예상금액":
+                results.append(_fail("supplier amount column priority", f"expected 배정부족예상금액 got={amount_col}"))
+            elif amount_label != "배정부족예상금액":
+                results.append(_fail("supplier amount column priority", f"expected amount_label=배정부족예상금액 got={amount_label}"))
+            else:
+                current_profile = chat_mod._build_sims_sales_time_profile(
+                    amount_df,
+                    chat_mod._sims_business_terms("현재표 배정부족예상금액 TOP 20"),
+                )
+                current_amount_col = str((current_profile or {}).get("amount_col") or "")
+                current_amount_label = str((current_profile or {}).get("amount_label") or "")
+                inherited_ctx = chat_mod._build_sims_analysis_context_from_df(
+                    amount_df,
+                    result={},
+                    action_name="현재표 부족제품수 10 이상 목록",
+                    params={},
+                    meta={
+                        "current_table_followup": True,
+                        "flow": "매입처별 재고부족",
+                        "amount_label": "배정부족예상금액",
+                        "amount_priority": (
+                            "배정부족예상금액",
+                            "배정1개월부족금액",
+                            "매입처원본재고금액",
+                        ),
+                    },
+                )
+                inherited_amount_col = str(((inherited_ctx or {}).get("sales_time_profile") or {}).get("amount_col") or "")
+                if current_amount_col != "배정부족예상금액" or current_amount_label != "배정부족예상금액":
+                    results.append(_fail("supplier amount column priority", f"current-table amount mismatch col={current_amount_col} label={current_amount_label}"))
+                elif inherited_amount_col != "배정부족예상금액":
+                    results.append(_fail("supplier amount column priority", f"inherited current-table amount mismatch col={inherited_amount_col}"))
+                else:
+                    results.append(_ok("supplier amount column priority", "amount_col=배정부족예상금액 for source, followup, and inherited profile"))
+        except Exception as e:
+            results.append(_fail("supplier amount column priority", f"{type(e).__name__}: {e}"))
+
+        try:
+            small_df = pd.DataFrame({"배정부족예상금액": range(20), "부족제품수": range(20)})
+            eight_df = pd.DataFrame({"배정부족예상금액": range(8), "부족제품수": range(8)})
+            mid_259_df = pd.DataFrame({
+                "배정부족예상금액": range(259),
+                "부족제품수": range(259),
+                "매입처명": [f"B{i}" for i in range(259)],
+            })
+            mid_470_df = pd.DataFrame({
+                "배정부족예상금액": range(470),
+                "음수재고제품수": range(470),
+                "매입처명": [f"B{i}" for i in range(470)],
+            })
+            group_df = pd.DataFrame({"주요배분기준": ["A", "B", "C", "D"], "배정부족예상금액": [1, 2, 3, 4]})
+            meta_followup = {"current_table_followup": True}
+            checks = {
+                "20": chat_mod._chat_is_current_followup_fast_table(small_df, meta_followup),
+                "8": chat_mod._chat_is_current_followup_fast_table(eight_df, meta_followup),
+                "259": chat_mod._chat_is_current_followup_fast_table(mid_259_df, meta_followup),
+                "470": chat_mod._chat_is_current_followup_fast_table(mid_470_df, meta_followup),
+                "4": chat_mod._chat_is_current_followup_fast_table(group_df, meta_followup),
+            }
+            if checks != {"20": False, "8": False, "259": True, "470": True, "4": False}:
+                results.append(_fail("supplier current-table fast render policy", f"unexpected modes={checks}"))
+            else:
+                results.append(_ok("supplier current-table fast render policy", "20/8/4 small; 259/470 fast"))
+        except Exception as e:
+            results.append(_fail("supplier current-table fast render policy", f"{type(e).__name__}: {e}"))
+
+        try:
+            import streamlit as st
+
+            old_reason = st.session_state.get("__ui_rerun_reason")
+            old_reason_current = st.session_state.get("__ui_rerun_reason_current")
+            old_path = st.session_state.get("__sims_table_render_path")
+            old_last_key = st.session_state.get("__sims_last_table_key")
+            old_latest_followup = st.session_state.get("__sims_latest_followup_table_key")
+            try:
+                st.session_state["__sims_table_render_path"] = "history"
+                st.session_state["__sims_last_table_key"] = "new-table"
+                st.session_state["__sims_latest_followup_table_key"] = "new-table"
+                old_item = {"type": "table", "action": "매입처별 재고부족 현황", "table_key": "old-table"}
+                old_meta = {"table_key": "old-table", "row_count": 975}
+                new_item = {"type": "table", "action": "현재표 배정부족예상금액 TOP 20", "table_key": "new-table"}
+                new_meta = {"table_key": "new-table", "row_count": 20}
+
+                st.session_state["__ui_rerun_reason_current"] = "sims_panel_open"
+                panel_open_old = chat_mod._should_full_render_sims_table(old_item, old_meta, "old")
+                panel_open_new = chat_mod._should_full_render_sims_table(new_item, new_meta, "new")
+                st.session_state["__ui_rerun_reason_current"] = "chat_room_change"
+                room_change_old = chat_mod._should_full_render_sims_table(old_item, old_meta, "old")
+                st.session_state["__ui_rerun_reason"] = "sims_action_change"
+                st.session_state["__ui_rerun_reason_current"] = "current_table_followup"
+                st.session_state[chat_mod._old_sims_table_force_key(old_item, old_meta, "old")] = True
+                followup_old = chat_mod._should_full_render_sims_table(old_item, old_meta, "old")
+                followup_new = chat_mod._should_full_render_sims_table(new_item, new_meta, "new")
+
+                if panel_open_old or panel_open_new or room_change_old:
+                    results.append(_fail("supplier history lightweight rerun policy", f"light rerun should skip history tables panel_old={panel_open_old} panel_new={panel_open_new} room_old={room_change_old}"))
+                elif followup_old or not followup_new:
+                    results.append(_fail("supplier history lightweight rerun policy", f"followup should skip old/render latest old={followup_old} new={followup_new}"))
+                elif chat_mod._ui_rerun_reason() != "current_table_followup":
+                    results.append(_fail("supplier history lightweight rerun policy", f"stale reason priority failed got={chat_mod._ui_rerun_reason()}"))
+                else:
+                    results.append(_ok("supplier history lightweight rerun policy", "panel/action rerun skips old tables; followup renders latest only; stale action reason ignored"))
+            finally:
+                st.session_state.pop(chat_mod._old_sims_table_force_key(old_item, old_meta, "old"), None)
+                if old_reason is None:
+                    st.session_state.pop("__ui_rerun_reason", None)
+                else:
+                    st.session_state["__ui_rerun_reason"] = old_reason
+                if old_reason_current is None:
+                    st.session_state.pop("__ui_rerun_reason_current", None)
+                else:
+                    st.session_state["__ui_rerun_reason_current"] = old_reason_current
+                if old_path is None:
+                    st.session_state.pop("__sims_table_render_path", None)
+                else:
+                    st.session_state["__sims_table_render_path"] = old_path
+                if old_last_key is None:
+                    st.session_state.pop("__sims_last_table_key", None)
+                else:
+                    st.session_state["__sims_last_table_key"] = old_last_key
+                if old_latest_followup is None:
+                    st.session_state.pop("__sims_latest_followup_table_key", None)
+                else:
+                    st.session_state["__sims_latest_followup_table_key"] = old_latest_followup
+        except Exception as e:
+            results.append(_fail("supplier history lightweight rerun policy", f"{type(e).__name__}: {e}"))
+
+        try:
+            main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            required_close_keys = [
+                '"__sims_open"',
+                '"__sims_open_ui"',
+                '"__sims_panel_active"',
+                '"__sims_force_open"',
+                '"__sims_run_flag"',
+                '"__sims_inner_submit"',
+                '"__sims_selected_snapshot"',
+            ]
+            has_close_helper = "def _close_sims_panel_for_room_change" in main_src
+            has_room_reason = '"chat_room_change"' in main_src
+            has_switch_total = 'switch_total = float(stats.get("event_to_main_elapsed") or 0.0) + float(stats.get("history_elapsed") or 0.0)' in main_src
+            missing = [k for k in required_close_keys if k not in main_src]
+            if not has_close_helper or missing:
+                results.append(_fail("chat room switch panel close policy", f"helper={has_close_helper} missing={missing}"))
+            elif not has_room_reason or not has_switch_total:
+                results.append(_fail("chat room switch panel close policy", f"reason={has_room_reason} switch_total={has_switch_total}"))
+            else:
+                results.append(_ok("chat room switch panel close policy", "room change clears SIMS panel keys and total includes event/history"))
+        except Exception as e:
+            results.append(_fail("chat room switch panel close policy", f"{type(e).__name__}: {e}"))
+
+        try:
+            login_src = Path("app/ui/ssai_login.py").read_text(encoding="utf-8")
+            render_defs = len(re.findall(r"^def\s+render_company_selector\s*\(", login_src, flags=re.M))
+            checks = {
+                "single_render_company_selector": render_defs == 1,
+                "empty_login_default": 'st.text_input("로그인 ID", value="", placeholder="아이디를 입력하세요")' in login_src,
+                "enter_to_submit": "enter_to_submit=True" in login_src,
+                "password_key_defined": 'password_key = "__ssai_company_change_sims_password"' in login_src,
+                "clear_password_key_defined": 'clear_password_key = "__ssai_clear_company_change_sims_password"' in login_src,
+                "logout_clears_password": '"__ssai_company_change_sims_password"' in login_src and '"__ssai_clear_company_change_sims_password"' in login_src,
+                "ssart_admin_fallback_only_when_missing": 'if _is_ssart_user(user) and not sims_user_id_for_change:' in login_src,
+                "normal_user_sims_id": 'sims_user_id_for_change = str(user.sims_user_id or "").strip()' in login_src,
+                "sims_password_verify": "verify_sims_plain_password(" in login_src,
+            }
+            failed = [k for k, ok in checks.items() if not ok]
+            if failed:
+                results.append(_fail("ssai login company selector policy", f"failed={failed} render_defs={render_defs}"))
+            else:
+                results.append(_ok("ssai login company selector policy", "selector/password keys/login defaults/logout cleanup verified"))
+        except Exception as e:
+            results.append(_fail("ssai login company selector policy", f"{type(e).__name__}: {e}"))
+    except Exception as e:
+        results.append(_fail("supplier stock shortage allocation fixture", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}"))
 
     results.extend(_run_customer_sales_forecast_basic_checks())
     return results

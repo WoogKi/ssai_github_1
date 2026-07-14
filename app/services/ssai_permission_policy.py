@@ -93,6 +93,7 @@ ACTION_PERMISSION_MAP: dict[str, str] = {
     "영업사원별 매출 예상": "KPI_READ",
     "지역별 매출 예상": "KPI_READ",
     "품목별 재고부족현황": "KPI_READ",
+    "매입처별 재고부족 현황": "KPI_READ",
 }
 
 
