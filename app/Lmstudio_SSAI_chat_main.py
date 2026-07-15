@@ -117,6 +117,26 @@ st.set_page_config(
     initial_sidebar_state=sidebar_state,
 )
 
+_SCRIPT_ENTRY_STARTED_AT = time.perf_counter()
+st.session_state["__ui_script_perf_durations"] = {}
+st.session_state["__ui_script_perf_marks"] = {"script_entry": _SCRIPT_ENTRY_STARTED_AT}
+
+
+def _script_perf_add(name: str, elapsed: float) -> None:
+    try:
+        durations = st.session_state.setdefault("__ui_script_perf_durations", {})
+        durations[str(name)] = float(durations.get(str(name)) or 0.0) + max(0.0, float(elapsed or 0.0))
+    except Exception:
+        pass
+
+
+def _script_perf_mark(name: str) -> None:
+    try:
+        st.session_state.setdefault("__ui_script_perf_marks", {})[str(name)] = time.perf_counter()
+    except Exception:
+        pass
+
+
 import pandas as pd
 from app.sims.nlq.nlq_router import try_handle_nlq
 
@@ -429,8 +449,6 @@ def _reset_sims_result_area_for_selection_change(prev_selected: dict | None, new
         st.session_state.pop(k, None)
 
     # 결과 영역 상태 초기화
-    st.session_state["__sims_open"] = False
-    st.session_state["__sims_open_ui"] = False
     st.session_state["__sims_force_open"] = False
     st.session_state["__sims_panel_active"] = False
     st.session_state["__sims_rendered"] = False
@@ -624,12 +642,48 @@ def _clear_sims_runtime_for_company_change(reason: str = "company_change") -> No
         log.exception("[company.change.clear_sims] failed reason=%s", reason)
 
 
-def _set_ui_event_started(event_name: str) -> None:
+def _new_ui_event_id(prefix: str = "ui") -> str:
+    try:
+        return f"{str(prefix or 'ui')}_{uuid.uuid4().hex[:10]}"
+    except Exception:
+        return f"{str(prefix or 'ui')}_{int(time.time() * 1000)}"
+
+
+def _set_ui_event_started(event_name: str, *, event_id: str | None = None) -> str:
     """사용자 클릭/선택부터 다음 main rerun 진입까지의 체감시간 측정용."""
     try:
         ss = st.session_state
+        event_id = str(event_id or _new_ui_event_id(event_name)).strip()
         ss["__ui_event_name"] = str(event_name or "").strip()
+        ss["__ui_event_id"] = event_id
         ss["__ui_event_started_at"] = time.perf_counter()
+        return event_id
+    except Exception:
+        return str(event_id or "")
+
+
+def _log_sims_panel_room_close_state(phase: str, *, failed_key: str = "") -> None:
+    try:
+        ss = st.session_state
+        log.info(
+            "[chat.room.panel_close] event_id=%s phase=%s open=%s open_ui=%s panel_active=%s force_open=%s run_flag=%s inner_submit=%s failed_key=%s",
+            ss.get("__chat_room_switch_event_id") or ss.get("__ui_event_id") or "",
+            phase,
+            ss.get("__sims_open"),
+            ss.get("__sims_open_ui"),
+            ss.get("__sims_panel_active"),
+            ss.get("__sims_force_open"),
+            ss.get("__sims_run_flag"),
+            ss.get("__sims_inner_submit"),
+            failed_key,
+        )
+    except Exception:
+        pass
+
+
+def _request_sims_close_for_chat_room_change() -> None:
+    try:
+        st.session_state["__sims_close_for_chat_room_change"] = True
     except Exception:
         pass
 
@@ -667,21 +721,19 @@ def _clear_current_table_source_for_room_change() -> None:
 
 
 def _close_sims_panel_for_room_change() -> None:
+    _log_sims_panel_room_close_state("before")
     """채팅방 전환 시 패널 본문이 재렌더되지 않도록 표시/실행 상태를 완전히 닫는다."""
     try:
         ss = st.session_state
-        false_keys = [
-            "__sims_open",
-            "__sims_open_ui",
-            "__sims_panel_active",
-            "__sims_force_open",
-            "__sims_run_flag",
-            "__sims_inner_submit",
-            "__sims_rendered",
-            "__sims_was_final",
-        ]
-        for key in false_keys:
-            ss[key] = False
+        ss.pop("__sims_open", None)
+        ss.pop("__sims_open_ui", None)
+
+        ss["__sims_panel_active"] = False
+        ss["__sims_force_open"] = False
+        ss["__sims_run_flag"] = False
+        ss["__sims_inner_submit"] = False
+        ss["__sims_rendered"] = False
+        ss["__sims_was_final"] = False
 
         for key in [
             "__sims_result",
@@ -709,8 +761,21 @@ def _close_sims_panel_for_room_change() -> None:
 
         # category/action 선택값은 유지하되, 실제 렌더 기준 snapshot은 비운다.
         ss["__sims_selected_snapshot"] = {}
+        _log_sims_panel_room_close_state("after success=True")
     except Exception:
+        _log_sims_panel_room_close_state("after success=False")
         log.exception("[chat.room] close SIMS panel state failed")
+
+
+def _consume_sims_close_for_chat_room_change() -> bool:
+    try:
+        if not st.session_state.pop("__sims_close_for_chat_room_change", False):
+            return False
+        _close_sims_panel_for_room_change()
+        return True
+    except Exception:
+        log.exception("[chat.room.panel_close] consume failed")
+        return False
 
 
 def _find_latest_source_table_in_room(room: dict) -> tuple[str, str]:
@@ -6382,6 +6447,69 @@ def _json_default(o):
     except Exception:
         return repr(o)
 
+def _chat_save_perf_total(perf: dict) -> float:
+    try:
+        return (
+            float(perf.get("json_serialize") or 0.0)
+            + float(perf.get("compare") or 0.0)
+            + float(perf.get("file_write") or 0.0)
+            + float(perf.get("file_replace") or 0.0)
+        )
+    except Exception:
+        return 0.0
+
+
+def _record_chat_save_skip(event_id: str = "", *, reason: str = "unchanged", dirty_reason: str = "selection_only") -> dict:
+    rooms = st.session_state.get("chat_rooms") or []
+    saved_rooms = [room for room in rooms if not _is_empty_auto_room(room)]
+    detail = {
+        "event_id": str(event_id or ""),
+        "skipped": True,
+        "skip_reason": str(reason or "unchanged"),
+        "dirty_reason": str(dirty_reason or "selection_only"),
+        "changed_room_count": 0,
+        "changed_fields": [],
+        "rooms": int(len(rooms)),
+        "saved_rooms": int(len(saved_rooms)),
+        "bytes": 0,
+        "json_serialize": 0.0,
+        "compare": 0.0,
+        "compare_mode": "skipped_dirty",
+        "file_write": 0.0,
+        "file_replace": 0.0,
+    }
+    st.session_state["__chat_save_last_perf"] = dict(detail)
+    if event_id:
+        st.session_state["__chat_room_switch_save_detail"] = dict(detail)
+    log.info(
+        "[chat.save.skip] event_id=%s reason=unchanged dirty_reason=%s skip_reason=unchanged_or_selection_only rooms=%s saved_rooms=%s compare_mode=%s",
+        detail["event_id"],
+        detail["dirty_reason"],
+        detail["rooms"],
+        detail["saved_rooms"],
+        detail["compare_mode"],
+    )
+    log.info(
+        "[chat.save.diff] event_id=%s changed_room_count=%s changed_fields=%s dirty_reason=%s",
+        detail["event_id"],
+        detail["changed_room_count"],
+        detail["changed_fields"],
+        detail["dirty_reason"],
+    )
+    log.info(
+        "[chat.save.perf] event_id=%s skipped=True bytes=%s serialize=%.3fs compare=%.3fs compare_mode=%s write=%.3fs replace=%.3fs total=%.3fs",
+        detail["event_id"],
+        detail["bytes"],
+        detail["json_serialize"],
+        detail["compare"],
+        detail["compare_mode"],
+        detail["file_write"],
+        detail["file_replace"],
+        _chat_save_perf_total(detail),
+    )
+    return detail
+
+
 def save_chat_rooms():
     """원자적 저장: 임시파일에 쓴 뒤 os.replace로 교체"""
     # ✅ chat_rooms 안에 DataFrame/Streamlit 객체(DeltaGenerator 등)가 섞이면
@@ -6444,17 +6572,64 @@ def save_chat_rooms():
             for room in (st.session_state.get("chat_rooms") or [])
             if not _is_empty_auto_room(room)
         ]
+        event_id = str(st.session_state.get("__chat_save_perf_event_id") or "")
+        dirty_reason = str(st.session_state.get("__chat_save_dirty_reason") or "content_changed")
+        t_serialize = time.perf_counter()
+        sanitized_rooms = _json_sanitize(rooms_to_save)
+        serialized_text = json.dumps(sanitized_rooms, ensure_ascii=False, indent=2)
+        serialize_elapsed = time.perf_counter() - t_serialize
 
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(_json_sanitize(rooms_to_save), f, ensure_ascii=False, indent=2)
+            t_write = time.perf_counter()
+            f.write(serialized_text)
+            write_elapsed = time.perf_counter() - t_write
+        t_replace = time.perf_counter()
         os.replace(tmp_path, chat_file)
+        replace_elapsed = time.perf_counter() - t_replace
+        save_detail = {
+            "event_id": event_id,
+            "skipped": False,
+            "dirty_reason": dirty_reason,
+            "changed_fields": ["rooms_payload"],
+            "changed_room_count": len(rooms_to_save),
+            "rooms": len(st.session_state.get("chat_rooms") or []),
+            "saved_rooms": len(rooms_to_save),
+            "bytes": len(serialized_text.encode("utf-8")),
+            "json_serialize": serialize_elapsed,
+            "compare": 0.0,
+            "compare_mode": "skipped_dirty",
+            "file_write": write_elapsed,
+            "file_replace": replace_elapsed,
+        }
+        st.session_state["__chat_save_last_perf"] = dict(save_detail)
+        if event_id:
+            st.session_state["__chat_room_switch_save_detail"] = dict(save_detail)
 
         try:
             log.info(
-                "[chat.save] %s rooms=%s saved_rooms=%s",
+                "[chat.save.diff] event_id=%s changed_room_count=%s changed_fields=%s dirty_reason=%s",
+                event_id,
+                save_detail["changed_room_count"],
+                save_detail["changed_fields"],
+                dirty_reason,
+            )
+            log.info(
+                "[chat.save] %s rooms=%s saved_rooms=%s compare_mode=%s",
                 _chat_log_kv(chat_file=chat_file),
                 len(st.session_state.get("chat_rooms") or []),
                 len(rooms_to_save),
+                save_detail["compare_mode"],
+            )
+            log.info(
+                "[chat.save.perf] event_id=%s skipped=False bytes=%s serialize=%.3fs compare=%.3fs compare_mode=%s write=%.3fs replace=%.3fs total=%.3fs",
+                event_id,
+                save_detail["bytes"],
+                save_detail["json_serialize"],
+                save_detail["compare"],
+                save_detail["compare_mode"],
+                save_detail["file_write"],
+                save_detail["file_replace"],
+                _chat_save_perf_total(save_detail),
             )
         except Exception:
             pass
@@ -7121,7 +7296,8 @@ def _render_sims_sidebar_fragment() -> None:
         )
 
         if clicked:
-            _set_ui_event_started("sims_panel_open")
+            sims_open_event_id = _set_ui_event_started("sims_panel_open")
+            st.session_state["__sims_panel_open_fragment_elapsed"] = 0.0
             st.session_state["__ui_rerun_reason"] = "sims_panel_open"
             st.session_state["__sims_force_open"] = True
             st.session_state["__sims_panel_active"] = True
@@ -7135,6 +7311,11 @@ def _render_sims_sidebar_fragment() -> None:
             st.session_state["__sims_run_seq"] += 1
             st.session_state["__sims_selected_snapshot"] = dict(
                 st.session_state.get("__sims_selected") or {}
+            )
+            log.info(
+                "[sims.panel_open.perf] event_id=%s fragment=%.3fs",
+                sims_open_event_id,
+                float(st.session_state.get("__sims_panel_open_fragment_elapsed") or 0.0),
             )
 
             log.info(
@@ -7162,6 +7343,8 @@ def _render_sims_sidebar_fragment() -> None:
 # =========================
 # 사이드바 (통합본)
 # =========================
+_consume_sims_close_for_chat_room_change()
+
 with st.sidebar:
     # 상단 배너
     st.markdown("""
@@ -7292,10 +7475,23 @@ with st.sidebar:
         key=room_radio_key,
     )
     if picked and picked != ss.current_room:
-        _set_ui_event_started("chat_room_change")
+        switch_event_id = _set_ui_event_started("chat_room_change")
+        ss["__chat_room_switch_event_id"] = switch_event_id
         old_room_id = ss.current_room
+        removed_empty_pending = _drop_empty_auto_rooms(keep_room_id=picked)
         save_started = time.perf_counter()
-        save_chat_rooms()
+        if removed_empty_pending:
+            ss["__chat_save_perf_event_id"] = switch_event_id
+            ss["__chat_save_dirty_reason"] = "removed_empty_pending"
+            save_chat_rooms()
+            ss.pop("__chat_save_perf_event_id", None)
+            ss.pop("__chat_save_dirty_reason", None)
+        else:
+            _record_chat_save_skip(
+                switch_event_id,
+                reason="unchanged",
+                dirty_reason="selection_only",
+            )
         save_elapsed = time.perf_counter() - save_started
 
         ss.current_room = picked
@@ -7307,14 +7503,14 @@ with st.sidebar:
         ss["__chat_room_switch_rerun_count"] = int(ss.get("__chat_room_switch_rerun_count") or 0) + 1
 
         # 채팅방 선택과 SIMS 패널 닫기를 하나의 app rerun으로 묶는다.
-        _close_sims_panel_for_room_change()
+        _request_sims_close_for_chat_room_change()
 
-        removed_empty_pending = _drop_empty_auto_rooms(keep_room_id=picked)
         _clear_current_table_source_for_room_change()
         _restore_current_table_source_for_room(picked)
 
         log.info(
-            "[chat.room] selected %s old_room_id=%s new_room_id=%s removed_empty_pending=%s",
+            "[chat.room] selected event_id=%s %s old_room_id=%s new_room_id=%s removed_empty_pending=%s",
+            switch_event_id,
             _chat_log_kv(_get_current_room_or_pending()),
             old_room_id,
             picked,
@@ -8291,8 +8487,8 @@ with st.container():
                     st.session_state.pop(kk, None)
 
         # 3) 기본값 복구
-        st.session_state["__sims_open"] = False
-        st.session_state["__sims_open_ui"] = False
+        st.session_state.pop("__sims_open", None)
+        st.session_state.pop("__sims_open_ui", None)
         st.session_state["__sims_force_open"] = False
         st.session_state["__sims_rendered"] = False
         st.session_state["__sims_was_final"] = False
@@ -8571,23 +8767,82 @@ with st.container():
         )
         if stats.get("event"):
             log.info(
-                "[ui.event_to_rerun] event=%s event_to_main_elapsed=%.3fs history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
+                "[ui.event_to_rerun] event_id=%s event=%s event_to_main_elapsed=%.3fs history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
+                st.session_state.get("__ui_event_id") or st.session_state.get("__chat_room_switch_event_id") or "",
                 stats.get("event"),
                 float(stats.get("event_to_main_elapsed") or 0.0),
                 float(stats.get("history_elapsed") or 0.0),
                 float(stats.get("panel_elapsed") or 0.0),
                 float(stats.get("total_elapsed") or 0.0),
             )
+            durations = st.session_state.get("__ui_script_perf_durations") or {}
+            total_script = max(0.0, time.perf_counter() - float(globals().get("_SCRIPT_ENTRY_STARTED_AT", time.perf_counter())))
+            bootstrap = float(durations.get("bootstrap") or 0.0)
+            require_login_elapsed = float(durations.get("require_login") or 0.0)
+            sidebar_elapsed = float(durations.get("sidebar") or 0.0)
+            chat_rooms_elapsed = float(durations.get("chat_rooms") or 0.0)
+            room_selector_elapsed = float(durations.get("room_selector") or 0.0)
+            sims_fragment_elapsed = float(durations.get("sims_fragment") or 0.0)
+            prepass_elapsed = float(durations.get("prepass") or 0.0)
+            main_gate_elapsed = float(durations.get("main_gate") or 0.0)
+            measured_total = (
+                bootstrap
+                + require_login_elapsed
+                + sidebar_elapsed
+                + chat_rooms_elapsed
+                + room_selector_elapsed
+                + sims_fragment_elapsed
+                + prepass_elapsed
+                + main_gate_elapsed
+            )
+            unattributed = max(0.0, total_script - measured_total)
+            log.info(
+                "[ui.script_path.perf] event_id=%s reason=%s bootstrap=%.3fs require_login=%.3fs sidebar=%.3fs chat_rooms=%.3fs room_selector=%.3fs sims_fragment=%.3fs prepass=%.3fs main_gate=%.3fs unattributed=%.3fs total=%.3fs",
+                st.session_state.get("__ui_event_id") or st.session_state.get("__chat_room_switch_event_id") or "",
+                stats.get("reason"),
+                bootstrap,
+                require_login_elapsed,
+                sidebar_elapsed,
+                chat_rooms_elapsed,
+                room_selector_elapsed,
+                sims_fragment_elapsed,
+                prepass_elapsed,
+                main_gate_elapsed,
+                unattributed,
+                total_script,
+            )
+            if st.session_state.get("__auth_login_perf_pending"):
+                auth_sig = str(st.session_state.get("__auth_login_event_id") or st.session_state.get("__ui_event_id") or "login")
+                if st.session_state.get("__auth_startup_perf_emitted_sig") != auth_sig:
+                    log.info(
+                        "[auth.login.perf] event_id=%s authenticate=%.3fs company_select=%.3fs chat_load=%.3fs greeting_llm=%.3fs main_render=%.3fs script_total=%.3fs login_to_ui_ready=%.3fs",
+                        auth_sig,
+                        float(st.session_state.get("__auth_login_authenticate_elapsed") or 0.0),
+                        0.0,
+                        0.0,
+                        float(st.session_state.get("__auth_greeting_llm_elapsed") or 0.0),
+                        total_script,
+                        total_script,
+                        max(0.0, time.perf_counter() - float(st.session_state.get("__auth_login_submit_started_at") or time.perf_counter())),
+                    )
+                    st.session_state["__auth_startup_perf_emitted_sig"] = auth_sig
+                st.session_state.pop("__auth_login_perf_pending", None)
         if stats.get("reason") == "chat_room_change":
             save_elapsed = float(st.session_state.pop("__chat_room_switch_save_elapsed", 0.0) or 0.0)
             switch_total = float(stats.get("event_to_main_elapsed") or 0.0) + float(stats.get("history_elapsed") or 0.0)
+            save_detail = st.session_state.pop("__chat_room_switch_save_detail", {}) or {}
             log.info(
-                "[chat.room.switch.perf] select_to_save=%.3fs save_to_main=%.3fs history=%.3fs total=%.3fs rerun_count=%s",
+                "[chat.room.switch.perf] event_id=%s select_to_save=%.3fs save_to_main=%.3fs history=%.3fs total=%.3fs rerun_count=%s json_serialize=%.3fs file_write=%.3fs file_replace=%.3fs compare_mode=%s",
+                st.session_state.get("__chat_room_switch_event_id") or st.session_state.get("__ui_event_id") or "",
                 save_elapsed,
                 max(0.0, float(stats.get("event_to_main_elapsed") or 0.0) - save_elapsed),
                 float(stats.get("history_elapsed") or 0.0),
                 switch_total,
                 int(st.session_state.pop("__chat_room_switch_rerun_count", 1) or 1),
+                float(save_detail.get("json_serialize") or 0.0),
+                float(save_detail.get("file_write") or 0.0),
+                float(save_detail.get("file_replace") or 0.0),
+                str(save_detail.get("compare_mode") or ""),
             )
     except Exception:
         log.exception("[ui.rerun.perf] logging failed")
@@ -8622,6 +8877,62 @@ with st.container():
         st.session_state["__sims_auto_user_input"] = text
         st.session_state["__chat_inline_text"] = ""
 
+    st.markdown(
+        """
+<style>
+html { scroll-behavior: auto; }
+#ssai-chat-bottom-anchor {
+  display: block;
+  height: 1px;
+  scroll-margin-bottom: 96px;
+}
+.ssai-chat-bottom-spacer { height: 72px; }
+.ssai-latest-message-link {
+  position: fixed;
+  right: 24px;
+  bottom: 72px;
+  z-index: 900;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 6px 12px;
+  border: 1px solid rgba(49, 51, 63, 0.18);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.94);
+  color: rgb(49, 51, 63);
+  text-decoration: none;
+  font-size: 13px;
+  line-height: 1.2;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.10);
+}
+.ssai-latest-message-link:hover {
+  text-decoration: none;
+  border-color: rgba(255, 75, 75, 0.45);
+}
+[data-testid="stChatInput"],
+div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
+  position: sticky;
+  bottom: 0;
+  z-index: 850;
+  background: var(--background-color, #ffffff);
+  padding-top: 4px;
+  padding-bottom: 8px;
+}
+@media (max-width: 768px) {
+  .ssai-latest-message-link {
+    right: 12px;
+    bottom: 68px;
+  }
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div id="ssai-chat-bottom-anchor"></div>', unsafe_allow_html=True)
+    st.markdown('<a class="ssai-latest-message-link" href="#ssai-chat-bottom-anchor">↓ 최신 메시지</a>', unsafe_allow_html=True)
+    st.markdown('<div class="ssai-chat-bottom-spacer"></div>', unsafe_allow_html=True)
+
     st.text_input(
         "다음 메시지",
         key="__chat_inline_text",
@@ -8648,18 +8959,8 @@ with st.container():
 """,
                 height=0,
             )
-        elif st.session_state.pop("__did_user_input", False):
-            stc.html(
-                """
-<script>
-(function(){
-  const el = window.parent.document.getElementById('__chat_bottom');
-  if (el) el.scrollIntoView({ behavior: "smooth", block: "end" });
-})();
-</script>
-""",
-                height=0,
-            )
+        else:
+            st.session_state.pop("__did_user_input", None)
     except Exception:
         log.exception("[ui] scrollIntoView failed")
 
@@ -8752,6 +9053,8 @@ with st.container():
                     panel_active
                     or ((run_flag or inner_submit) and not already_rendered_this_run)
                 )
+                if st.session_state.get("__ui_rerun_reason_current") == "chat_room_change":
+                    should_render = False
 
                 if should_render:
                     st.session_state["__sims_last_render_run_seq"] = run_seq

@@ -1947,15 +1947,62 @@ def run_basic_checks() -> list[CheckResult]:
                 '"__sims_selected_snapshot"',
             ]
             has_close_helper = "def _close_sims_panel_for_room_change" in main_src
+            has_close_guard = '"__sims_close_for_chat_room_change"' in main_src
+            has_guard_consume = "def _consume_sims_close_for_chat_room_change" in main_src
+            has_panel_close_log = "[chat.room.panel_close]" in main_src
+            has_after_success_log = '_log_sims_panel_room_close_state("after success=True")' in main_src
+            has_no_open_assignment = '"__sims_open",\n            "__sims_open_ui"' not in main_src and 'ss["__sims_open"] = False' not in main_src
+            room_switch_block = main_src[main_src.find("if picked and picked != ss.current_room:"):main_src.find("cur_name = id_to_name.get", main_src.find("if picked and picked != ss.current_room:"))]
+            has_no_direct_close_in_room_switch = "_close_sims_panel_for_room_change()" not in room_switch_block
+            has_render_block = 'if st.session_state.get("__ui_rerun_reason_current") == "chat_room_change":' in main_src and "should_render = False" in main_src
             has_room_reason = '"chat_room_change"' in main_src
             has_switch_total = 'switch_total = float(stats.get("event_to_main_elapsed") or 0.0) + float(stats.get("history_elapsed") or 0.0)' in main_src
+            has_switch_event_id = '"__chat_room_switch_event_id"' in main_src and "event_id=%s" in room_switch_block
+            has_event_id_perf = '"__ui_event_id"' in main_src and "[ui.event_to_rerun] event_id=%s" in main_src
+            has_startup_pending = '"__auth_login_perf_pending"' in main_src and '"__auth_startup_perf_emitted_sig"' in main_src
+            has_no_unconditional_startup_log = "[auth.startup.perf] company_select=" not in main_src
+            has_save_detail = '"__chat_room_switch_save_detail"' in main_src and "json_serialize=%.3fs" in main_src
+            has_sims_open_perf = "[sims.panel_open.perf]" in main_src and '"__sims_panel_open_fragment_elapsed"' in main_src
+            has_authenticate_perf = "__auth_login_authenticate_elapsed" in main_src and "authenticate=%.3fs" in main_src
+            has_script_path_perf = (
+                "[ui.script_path.perf]" in main_src
+                and "room_selector=%.3fs" in main_src
+                and "sims_fragment=%.3fs" in main_src
+                and "unattributed=%.3fs" in main_src
+                and 'st.session_state["__ui_script_perf_durations"] = {}' in main_src
+            )
+            has_save_skip = (
+                "[chat.save.skip]" in main_src
+                and "reason=unchanged" in main_src
+                and "unchanged_or_selection_only" in main_src
+                and "compare_mode=%s" in main_src
+                and "_record_chat_save_skip" in main_src
+            )
+            has_selection_only_save_skip = (
+                "removed_empty_pending = _drop_empty_auto_rooms(keep_room_id=picked)" in room_switch_block
+                and "dirty_reason=\"selection_only\"" in room_switch_block
+                and "save_chat_rooms()" in room_switch_block
+            )
+            has_chat_save_diff = "[chat.save.diff]" in main_src and "changed_fields=%s" in main_src
+            has_latest_message_anchor = (
+                '"__chat_scroll_to_bottom_once"' not in main_src
+                and '"__chat_scroll_event_id"' not in main_src
+                and "[chat.room.autoscroll]" not in main_src
+                and "setTimeout(run" not in main_src
+                and "focus({ preventScroll: true })" not in main_src
+                and "ssai-chat-bottom-anchor" in main_src
+                and "ssai-latest-message-link" in main_src
+                and 'href="#ssai-chat-bottom-anchor"' in main_src
+                and '[data-testid="stChatInput"]' in main_src
+                and "position: sticky" in main_src
+            )
             missing = [k for k in required_close_keys if k not in main_src]
             if not has_close_helper or missing:
                 results.append(_fail("chat room switch panel close policy", f"helper={has_close_helper} missing={missing}"))
-            elif not has_room_reason or not has_switch_total:
-                results.append(_fail("chat room switch panel close policy", f"reason={has_room_reason} switch_total={has_switch_total}"))
+            elif not has_room_reason or not has_switch_total or not has_close_guard or not has_guard_consume or not has_panel_close_log or not has_after_success_log or not has_no_open_assignment or not has_no_direct_close_in_room_switch or not has_render_block or not has_switch_event_id or not has_event_id_perf or not has_startup_pending or not has_no_unconditional_startup_log or not has_save_detail or not has_sims_open_perf or not has_authenticate_perf or not has_script_path_perf or not has_save_skip or not has_selection_only_save_skip or not has_chat_save_diff or not has_latest_message_anchor:
+                results.append(_fail("chat room switch panel close policy", f"reason={has_room_reason} switch_total={has_switch_total} guard={has_close_guard} consume={has_guard_consume} log={has_panel_close_log} after_success={has_after_success_log} no_open_assign={has_no_open_assignment} no_direct_close={has_no_direct_close_in_room_switch} render_block={has_render_block} switch_event_id={has_switch_event_id} event_perf={has_event_id_perf} startup_pending={has_startup_pending} no_unconditional_startup={has_no_unconditional_startup_log} save_detail={has_save_detail} sims_open_perf={has_sims_open_perf} authenticate_perf={has_authenticate_perf} script_path_perf={has_script_path_perf} save_skip={has_save_skip} selection_only_skip={has_selection_only_save_skip} save_diff={has_chat_save_diff} latest_anchor={has_latest_message_anchor}"))
             else:
-                results.append(_ok("chat room switch panel close policy", "room change clears SIMS panel keys and total includes event/history"))
+                results.append(_ok("chat room switch panel close policy", "room change consumes close guard, blocks SIMS render, logs event-scoped perf, startup perf is one-shot, skips unchanged saves, and uses manual latest-message anchor"))
         except Exception as e:
             results.append(_fail("chat room switch panel close policy", f"{type(e).__name__}: {e}"))
 

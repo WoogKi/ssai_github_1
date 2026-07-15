@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import logging
+import time
 
 import streamlit as st
 
@@ -1090,7 +1091,10 @@ def render_login_form() -> bool:
         st.error("SS AI Password를 입력하세요.")
         return False
 
+    auth_started_at = time.perf_counter()
+    st.session_state["__auth_login_submit_started_at"] = auth_started_at
     result = authenticate_ssai_password(login_id, password)
+    st.session_state["__auth_login_authenticate_elapsed"] = max(0.0, time.perf_counter() - auth_started_at)
 
     if not result.success:
         log.warning(
