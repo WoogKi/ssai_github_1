@@ -15,6 +15,8 @@ from typing import Any
 import pyodbc
 from cryptography.fernet import Fernet
 
+from app.utils.env_config import ENV_PATH
+
 
 ALGORITHM = "pbkdf2_sha256"
 
@@ -59,6 +61,8 @@ class CompanyDbConfig:
 def load_dotenv(path: str = ".env") -> dict[str, str]:
     env: dict[str, str] = {}
     p = Path(path)
+    if not p.is_absolute() and str(path).strip() == ".env":
+        p = ENV_PATH
 
     if not p.exists():
         return env
@@ -76,7 +80,7 @@ def load_dotenv(path: str = ".env") -> dict[str, str]:
 
 
 def get_env(name: str, env: dict[str, str], default: str | None = None) -> str | None:
-    return os.environ.get(name) or env.get(name) or default
+    return env.get(name) or os.environ.get(name) or default
 
 
 def pick_env(env: dict[str, str], names: list[str], default: str | None = None) -> str | None:
@@ -977,4 +981,3 @@ def authenticate_user(login_id: str, password: str) -> AuthResult:
         )
 
     return AuthResult(success=False, fail_reason="UNKNOWN_USER_TYPE")
-

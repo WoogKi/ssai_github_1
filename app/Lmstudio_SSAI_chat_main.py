@@ -64,10 +64,17 @@ if str(_ROOT) not in sys.path:
 
 # =========================================================
 # 0) .env를 "가장 먼저" 로드 (DB/클라이언트 임포트 이전)
-#    - 프로젝트 루트/.env, app/.env 순으로 탐색
+#    - 프로젝트 루트/.env만 절대경로로 로드
 # =========================================================
-from dotenv import load_dotenv  # type: ignore
-load_dotenv(override=True)
+from app.utils.env_config import (
+    ENV_PATH as ROOT_ENV_PATH,
+    app_env as _app_env_name,
+    config_path as _config_path,
+    load_project_env,
+    validate_startup_env,
+)
+
+_ENV_LOAD_RESULT = load_project_env(override=True)
 
 import os as _os_for_log_init, sys as _sys_for_log_init, logging as _logging_init
 from app.utils.logging_setup import setup_rotating_logger
@@ -88,7 +95,16 @@ log = setup_rotating_logger(
     log_file=_log_file,
 )
 
-log.debug("LOG INIT → level=%s (.env loaded)", _level_name)
+log.info(
+    "[app.env] env_file=%s exists=%s loaded=%s APP_ENV=%s SSAI_INSTANCE_ID=%s sys_executable=%s",
+    str(ROOT_ENV_PATH),
+    bool(_ENV_LOAD_RESULT.exists),
+    bool(_ENV_LOAD_RESULT.loaded),
+    _app_env_name(),
+    os.getenv("SSAI_INSTANCE_ID") or "",
+    sys.executable,
+)
+log.debug("LOG INIT level=%s project_env=%s", _level_name, str(ROOT_ENV_PATH))
 
 # (선택) SQLAlchemy 로깅 톤 정리는 초기화 이후에 설정
 _logging_init.getLogger("sqlalchemy.engine").setLevel(_logging_init.WARNING)
@@ -104,7 +120,7 @@ import streamlit as st
 # =========================================================
 # Streamlit Page Config
 # - 반드시 첫 번째 st.* 호출 전에 실행
-# - .env는 위에서 이미 load_dotenv(override=True) 완료됨
+# - Project-root .env was loaded above by absolute path.
 # =========================================================
 sidebar_state = os.getenv("SSAI_INITIAL_SIDEBAR_STATE", "collapsed").strip().lower()
 
@@ -331,45 +347,7 @@ def _can_show_admin_diagnostics_sidebar() -> bool:
 # 5) Config / Client / Paths (single source of truth)
 # =========================================================
 APP_DIR = Path(__file__).parent
-ENV_PATH = APP_DIR / ".env"  # 실제 운영은 프로젝트 루트 .env 권장
-
-_DEFAULT_ENV_TEXT = textwrap.dedent("""\
-# (옵션) LLM 호출 보호막
-# LLM_TIMEOUT_S=25
-# LLM_MAX_RETRY=2
-
-
-# LM Studio API 연결
-LMSTUDIO_BASE_URL=http://localhost:1234/v1
-LMSTUDIO_API_KEY=lm-studio
-
-# 파일/채팅 저장
-CHAT_FILE=data/chat_rooms.json
-UPLOAD_DIR=uploads
-
-# 업로드 제한
-MAX_FILE_SIZE_MB=25
-MAX_PREVIEW_CHARS=4000
-""")
-
-# .env 파일이 없으면 생성 (권한 이슈 등은 조용히 무시)
-def _ensure_dotenv_exists():
-    try:
-        if not ENV_PATH.exists():
-            ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
-            ENV_PATH.write_text(_DEFAULT_ENV_TEXT, encoding="utf-8")
-    except Exception:
-        pass  # 권한 이슈 등은 조용히 무시
-
-def _load_dotenv_if_possible():
-    if load_dotenv is not None:
-        try:
-            load_dotenv(dotenv_path=ENV_PATH, override=False)  # 기존 env 보존
-        except Exception:
-            pass
-
-_ensure_dotenv_exists()
-_load_dotenv_if_possible()
+ENV_PATH = ROOT_ENV_PATH
 
 # 안전한 설정 getter: OS env > st.secrets > default
 def get_config(key: str, default=None, cast=str):
@@ -1066,6 +1044,13 @@ cfg_str  = lambda k, d="":  get_config(k, d, cast=str)
 cfg_int  = lambda k, d=0:   get_config(k, d, cast=int)
 cfg_bool = lambda k, d=False: get_config(k, d, cast=lambda x: str(x).strip().lower() in ("1","true","yes","y","on"))
 
+_ENV_STARTUP_ERRORS = validate_startup_env(environ=os.environ)
+if _ENV_STARTUP_ERRORS:
+    for _env_error in _ENV_STARTUP_ERRORS:
+        log.error("[app.env.invalid] %s", _env_error)
+    st.error("프로젝트 루트 .env의 필수 저장 경로 설정이 올바르지 않습니다. 관리자에게 문의하세요.")
+    st.stop()
+
 
 # --- LLM 호출 보호막 기본값 ---
 LLM_TIMEOUT_S   = cfg_int("LLM_TIMEOUT_S", 90)   # 1회 요청 타임아웃(초) - Parallel 1 다중 사용자 대기 고려
@@ -1484,8 +1469,8 @@ def _scroll_to_anchor_js(anchor_id: str, *, center: bool = True) -> None:
 # =========================================================
 # 값 로드
 # =========================================================
-CHAT_FILE         = cfg_str("CHAT_FILE", "data/chat_rooms.json")
-UPLOAD_DIR        = cfg_str("UPLOAD_DIR", "uploads")
+CHAT_FILE         = str(_config_path("CHAT_FILE"))
+UPLOAD_DIR        = str(_config_path("UPLOAD_DIR"))
 MAX_FILE_SIZE_MB  = cfg_int("MAX_FILE_SIZE_MB", 25)
 MAX_PREVIEW_CHARS = cfg_int("MAX_PREVIEW_CHARS", 4000)
 
@@ -1502,6 +1487,16 @@ MAX_PREVIEW_CHARS = cfg_int("MAX_PREVIEW_CHARS", 4000)
 # =========================================================
 Path(CHAT_FILE).parent.mkdir(parents=True, exist_ok=True)
 Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
+
+log.info(
+    "[app.env.paths] env_file=%s exists=%s APP_ENV=%s SSAI_INSTANCE_ID=%s CHAT_FILE=%s sys_executable=%s",
+    str(ROOT_ENV_PATH),
+    bool(ROOT_ENV_PATH.exists()),
+    _app_env_name(),
+    os.getenv("SSAI_INSTANCE_ID") or "",
+    str(CHAT_FILE),
+    sys.executable,
+)
 
 # =========================================================
 # Phase 3) SS AI 로그인 게이트
@@ -7752,6 +7747,15 @@ def _reset_chat_session_when_user_changed() -> None:
         owner_id,
         _chat_log_kv(user_id=owner_id),
     )
+    try:
+        effective_chat_file = _effective_chat_file()
+        log.info(
+            "[app.env.user_paths] effective_user_chat_file=%s partition_root=%s",
+            str(effective_chat_file),
+            str(_partitioned_chat_root(effective_chat_file)),
+        )
+    except Exception:
+        log.exception("[app.env.user_paths] failed to resolve user chat paths")
 
     for key in [
         "chat_rooms",

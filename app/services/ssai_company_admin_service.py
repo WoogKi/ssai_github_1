@@ -17,11 +17,11 @@ from typing import Any
 
 import pyodbc
 from cryptography.fernet import Fernet
-from dotenv import load_dotenv
 
+from app.utils.env_config import load_project_env
 from app.services.ssai_auth_service import connect_ssai_db
 
-load_dotenv()
+load_project_env(override=False)
 
 
 VALID_COMPANY_TYPES = {"SSART", "WHOLESALE", "TEST"}

@@ -331,6 +331,134 @@ def run_basic_checks() -> list[CheckResult]:
 
     # NLQ router 쪽 분석 action 해석 함수 확인
     try:
+        from app.utils import env_config
+
+        saved_env = {k: os.environ.get(k) for k in ("APP_ENV", "CHAT_FILE", "UPLOAD_DIR", "SSAI_INSTANCE_ID", "SSAI_ENV_FILE")}
+        old_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            other = Path(td) / "other"
+            chat_dir = root / "chat"
+            upload_dir = root / "uploads"
+            root.mkdir()
+            other.mkdir()
+            chat_dir.mkdir()
+            upload_dir.mkdir()
+            project_env = root / ".env"
+            project_chat = chat_dir / "root_chat_rooms.json"
+            other_chat = other / "wrong_chat_rooms.json"
+            project_env.write_text(
+                "\n".join(
+                    [
+                        "APP_ENV=prod",
+                        "SSAI_INSTANCE_ID=regression",
+                        f"CHAT_FILE={project_chat}",
+                        f"UPLOAD_DIR={upload_dir}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (other / ".env").write_text(f"CHAT_FILE={other_chat}\nUPLOAD_DIR={other / 'uploads'}\n", encoding="utf-8")
+
+            os.environ["CHAT_FILE"] = str(other_chat)
+            os.environ["UPLOAD_DIR"] = str(other / "uploads")
+            os.chdir(other)
+            loaded = env_config.load_project_env(override=True, env_path=project_env)
+            load_ok = (
+                loaded.env_path == project_env
+                and loaded.exists
+                and os.environ.get("CHAT_FILE") == str(project_chat)
+                and os.environ.get("UPLOAD_DIR") == str(upload_dir)
+                and os.environ.get("SSAI_ENV_FILE") == str(project_env)
+            )
+            errors = env_config.validate_startup_env(env_path=project_env, project_root=root, environ=os.environ)
+            if load_ok and not errors:
+                results.append(_ok("project-root .env overrides cwd and OS env", f"env_file={project_env}"))
+            else:
+                results.append(_fail("project-root .env overrides cwd and OS env", f"load_ok={load_ok}, errors={errors}"))
+
+            missing_errors = env_config.validate_startup_env(
+                env_path=root / "missing.env",
+                project_root=root,
+                environ={"APP_ENV": "prod", "CHAT_FILE": str(project_chat), "UPLOAD_DIR": str(upload_dir)},
+            )
+            relative_errors = env_config.validate_startup_env(
+                env_path=project_env,
+                project_root=root,
+                environ={"APP_ENV": "prod", "CHAT_FILE": "data/chat.json", "UPLOAD_DIR": str(upload_dir)},
+            )
+            blank_errors = env_config.validate_startup_env(
+                env_path=project_env,
+                project_root=root,
+                environ={"APP_ENV": "prod", "CHAT_FILE": "", "UPLOAD_DIR": str(upload_dir)},
+            )
+            dev_path = env_config.config_path("CHAT_FILE", project_root=root, environ={"CHAT_FILE": "data/dev_chat.json"})
+            policy_ok = (
+                any("missing project env file" in e for e in missing_errors)
+                and any("relative path is not allowed in prod: CHAT_FILE" in e for e in relative_errors)
+                and any("missing required path env: CHAT_FILE" in e for e in blank_errors)
+                and dev_path == (root / "data" / "dev_chat.json").resolve()
+            )
+            if policy_ok:
+                results.append(_ok("prod env path validation and dev relative resolution", "missing/blank/relative prod paths blocked"))
+            else:
+                results.append(_fail("prod env path validation and dev relative resolution", f"missing={missing_errors}, relative={relative_errors}, blank={blank_errors}, dev_path={dev_path}"))
+            os.chdir(old_cwd)
+        os.chdir(old_cwd)
+        for k, v in saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    except Exception as e:
+        try:
+            os.chdir(PROJECT_ROOT)
+        except Exception:
+            pass
+        results.append(_fail("project-root .env policy helpers", f"{type(e).__name__}: {e}"))
+
+    try:
+        main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+        mssql_src = Path("app/db/mssql_client.py").read_text(encoding="utf-8")
+        auth_src = Path("app/services/ssai_auth_service.py").read_text(encoding="utf-8")
+        company_admin_src = Path("app/services/ssai_company_admin_service.py").read_text(encoding="utf-8")
+        source_checks = [
+            ("main auto dotenv removed", "load_dotenv(override=True)" not in main_src and 'ENV_PATH = APP_DIR / ".env"' not in main_src and "_DEFAULT_ENV_TEXT" not in main_src),
+            ("main chat paths require config_path", 'CHAT_FILE         = str(_config_path("CHAT_FILE"))' in main_src and 'UPLOAD_DIR        = str(_config_path("UPLOAD_DIR"))' in main_src),
+            ("startup env validation/logs present", "validate_startup_env(environ=os.environ)" in main_src and "[app.env.paths]" in main_src and "[app.env.user_paths]" in main_src),
+            ("db cwd dotenv search removed", "find_dotenv" not in mssql_src),
+            ("auth root env parser priority", "p = ENV_PATH" in auth_src and "return env.get(name) or os.environ.get(name) or default" in auth_src),
+            ("company admin project env loader", "load_project_env(override=False)" in company_admin_src and "load_dotenv()" not in company_admin_src),
+        ]
+        for name, ok in source_checks:
+            results.append(_ok(name) if ok else _fail(name, "source guard failed"))
+
+        import types
+
+        effective_block = re.search(r"def _effective_chat_file\(\).*?def _chat_storage_mode_enabled", main_src, re.S)
+        partition_block = re.search(r"def _partitioned_chat_root\(chat_file: str \| None = None\).*?def _partitioned_rooms_file", main_src, re.S)
+        if not effective_block or not partition_block:
+            results.append(_fail("user legacy and partition chat path calculation", "function block not found"))
+        else:
+            ns: dict[str, Any] = {
+                "Path": Path,
+                "CHAT_FILE": str(PROJECT_ROOT / "tmp_chat" / "chat_rooms.json"),
+                "get_current_user": lambda: types.SimpleNamespace(user_id=8),
+            }
+            exec(effective_block.group(0).rsplit("def _chat_storage_mode_enabled", 1)[0], ns)
+            exec(partition_block.group(0).rsplit("def _partitioned_rooms_file", 1)[0], ns)
+            effective = Path(ns["_effective_chat_file"]())
+            root = ns["_partitioned_chat_root"](str(effective))
+            expected_file = PROJECT_ROOT / "tmp_chat" / "user_8_chat_rooms.json"
+            expected_root = PROJECT_ROOT / "tmp_chat" / "user_8"
+            if effective == expected_file and root == expected_root:
+                results.append(_ok("user legacy and partition chat path calculation", f"file={effective.name}, root={root.name}"))
+            else:
+                results.append(_fail("user legacy and partition chat path calculation", f"file={effective}, root={root}"))
+    except Exception as e:
+        results.append(_fail("project-root .env source guards", f"{type(e).__name__}: {e}"))
+
+    try:
         router = importlib.import_module("app.sims.nlq.nlq_router")
         resolve = getattr(router, "_resolve_analytics_action", None)
         if callable(resolve):
@@ -1310,7 +1438,6 @@ def run_basic_checks() -> list[CheckResult]:
                 mismatches.append("detail total and summary total differ under identical params")
 
             try:
-                import os
                 from app.ui.sims_table_display import resolve_sims_table_mode
                 old_chat_env = os.environ.get("SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD")
                 old_panel_env = os.environ.get("SIMS_FAST_TABLE_CELL_THRESHOLD")

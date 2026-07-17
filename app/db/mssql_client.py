@@ -4,7 +4,6 @@
 VERSION = "chat_middleware/2025-11-01T-v1"
 
 import os, logging
-from pathlib import Path
 from contextlib import contextmanager
 from urllib.parse import quote_plus
 import pyodbc
@@ -36,11 +35,10 @@ from typing import Any, Optional, Sequence, Dict
 # SQL_ECHO=no                       # yes면 SQLAlchemy echo on
 # -----------------------------------------------------------------------------
 
-# .env 자동 로드
+# .env load: project-root only, no cwd-based discovery.
 try:
-    from dotenv import load_dotenv, find_dotenv
-    _env = find_dotenv(usecwd=True) or str((Path(__file__).resolve().parents[2] / ".env"))
-    load_dotenv(_env, override=False)
+    from app.utils.env_config import load_project_env
+    load_project_env(override=False)
 except Exception:
     pass
 
