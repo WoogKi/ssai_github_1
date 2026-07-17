@@ -24,6 +24,7 @@ from app.sims.views.rddbc_io_shared import (
 
 from app.ui.sims_table_display import (
     build_sims_table_display_config,
+    log_sims_display_fields,
     log_sims_table_mode,
     log_sims_table_render,
     normalize_display_df_for_streamlit,
@@ -95,6 +96,39 @@ _FAST_TABLE_NUMERIC_KPI_COLS = (
     | _FAST_TABLE_DECIMAL_KPI_COLS
     | _FAST_TABLE_PERCENT_KPI_COLS
 )
+
+
+def _chat_is_stock_shortage_quantity_int_col(name: Any) -> bool:
+    """재고부족/현재표 수량 계열은 화면에서 정수 천단위로 표시한다."""
+    s = str(name or "").strip()
+    if not s:
+        return False
+    if any(w in s for w in ("률", "율", "%", "금액", "단가", "매출", "세액", "공급가액")):
+        return False
+    text_words = (
+        "기준",
+        "판정",
+        "등급",
+        "원천",
+        "자료원",
+    )
+    explicit_quantity_words = (
+        "수량",
+        "재고수량",
+        "현재재고수량",
+        "실재고수량",
+        "장부재고수량",
+        "출고수량",
+        "수요수량",
+        "예상수요",
+        "실제수요",
+        "잔여수요",
+        "부족수량",
+        "필요수량",
+    )
+    if any(w in s for w in text_words) and not any(w in s for w in explicit_quantity_words):
+        return False
+    return any(w in s for w in explicit_quantity_words)
 
 
 def _safe_log_value(value: Any, limit: int = 120) -> str:
@@ -743,6 +777,9 @@ def _chat_log_nlq_table_render(
 
 
 def _render_nlq_table_meta_caption(meta: Dict[str, Any]) -> None:
+    if bool(meta.get("current_table_followup")) or bool(meta.get("hide_table_key_caption")):
+        return
+
     if not _chat_is_nlq_table_meta(meta):
         return
 
@@ -764,12 +801,65 @@ def _render_nlq_table_meta_caption(meta: Dict[str, Any]) -> None:
         pass
 
 
+def _render_current_followup_compact_header(
+    meta: Dict[str, Any],
+    *,
+    loaded_rows: int = 0,
+    display_rows: int = 0,
+) -> None:
+    """현재표 후속결과 전용 1~2줄 compact header."""
+    try:
+        source_rows = _safe_int_for_download(
+            meta.get("source_rows")
+            or meta.get("source_row_count")
+            or meta.get("row_count_total_for_followup")
+            or 0,
+            0,
+        )
+        result_rows = _safe_int_for_download(
+            loaded_rows
+            or meta.get("download_row_count")
+            or meta.get("row_count_loaded")
+            or meta.get("row_count_total")
+            or meta.get("row_count")
+            or 0,
+            0,
+        )
+        shown_rows = _safe_int_for_download(display_rows or result_rows, result_rows)
+        query_summary = str(meta.get("query_summary") or "").strip()
+
+        condition = ""
+        if query_summary:
+            parts = [p.strip() for p in query_summary.split("/") if str(p).strip()]
+            for part in parts:
+                compact = re.sub(r"\s+", "", part)
+                if part == "현재표":
+                    continue
+                if "전체" in part and ("건" in part or "기준" in part):
+                    continue
+                if "후속분석" in part:
+                    continue
+                condition = part
+                break
+        if not condition:
+            condition = str(meta.get("filter_column") or meta.get("group_column") or meta.get("query") or "조건").strip()
+
+        if source_rows and result_rows:
+            st.caption(f"현재표 {source_rows:,}건 중 {condition} {result_rows:,}건")
+        elif result_rows:
+            st.caption(f"현재표 {condition} {result_rows:,}건")
+
+        if shown_rows and result_rows and shown_rows != result_rows:
+            st.caption(f"화면 {shown_rows:,}건 / 다운로드 {result_rows:,}건")
+    except Exception:
+        pass
+
+
 def _chat_clean_display_none_values(df: pd.DataFrame) -> pd.DataFrame:
     """
     채팅 표 화면 표시용 None/NaN 정리.
 
-    - 실제 None/NaN은 빈칸으로 표시
-    - 문자열 "None", "nan", "<NA>", "NaT", "NULL"도 빈칸 처리
+    - 실제 None/NaN/pd.NA/NaT는 빈칸으로 표시
     - 값이 있는 셀은 건드리지 않음
     """
     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -777,21 +867,14 @@ def _chat_clean_display_none_values(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    blank_tokens = {
-        "None", "none", "NONE",
-        "nan", "NaN", "NAN",
-        "<NA>", "NaT",
-        "NULL", "null",
-    }
-
     for col in out.columns:
         try:
-            if str(col).strip() == "순번" or str(col).strip() in _FAST_TABLE_NUMERIC_KPI_COLS:
+            col_name = str(col).strip()
+            if col_name == "순번" or col_name in _FAST_TABLE_NUMERIC_KPI_COLS or _chat_is_stock_shortage_quantity_int_col(col_name):
                 continue
 
             s = out[col].astype("object")
             s = s.where(pd.notna(s), "")
-            s = s.map(lambda v: "" if str(v).strip() in blank_tokens else v)
             out[col] = s
         except Exception:
             pass
@@ -831,7 +914,8 @@ def _chat_drop_number_config_for_blank_numeric_cols(
         if not has_blank:
             continue
 
-        if str(col or "").strip() in _FAST_TABLE_NUMERIC_KPI_COLS:
+        col_name = str(col or "").strip()
+        if col_name in _FAST_TABLE_NUMERIC_KPI_COLS or _chat_is_stock_shortage_quantity_int_col(col_name):
             continue
 
         try:
@@ -859,6 +943,9 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
     if s in {"순번", "조회순번"}:
         return True
 
+    if _chat_is_stock_shortage_quantity_int_col(s):
+        return True
+
     if s in _FAST_TABLE_NUMERIC_KPI_COLS:
         return True
 
@@ -877,6 +964,10 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
         "시간",
         "명",
         "이름",
+        "기준",
+        "판정",
+        "등급",
+        "원천",
         "재고기준",
         "자료원",
         "추세판정",
@@ -927,13 +1018,6 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = _chat_clean_display_none_values(df)
 
-    blank_tokens = {
-        "", "None", "none", "NONE",
-        "nan", "NaN", "NAN",
-        "<NA>", "NaT",
-        "NULL", "null",
-    }
-
     for col in out.columns:
         s = str(col or "").strip()
 
@@ -943,9 +1027,7 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
         try:
             raw_obj = out[col].astype("object")
 
-            blank_mask = raw_obj.isna() | raw_obj.map(
-                lambda v: str(v).strip() in blank_tokens
-            )
+            blank_mask = raw_obj.isna() | raw_obj.map(lambda v: str(v).strip() == "")
 
             num = pd.to_numeric(
                 raw_obj.astype(str).str.replace(",", "", regex=False),
@@ -954,6 +1036,8 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
 
             if s in _FAST_TABLE_PERCENT_KPI_COLS:
                 converted = num
+            elif _chat_is_stock_shortage_quantity_int_col(s):
+                converted = num.round(0)
             elif s in _FAST_TABLE_DECIMAL_KPI_COLS:
                 converted = num.round(2)
             elif (
@@ -999,7 +1083,7 @@ def _chat_fast_column_config(df: pd.DataFrame) -> dict:
         # NumberColumn을 적용하면 빈칸이 Streamlit에서 None처럼 보일 수 있다.
         try:
             has_blank = df[col].astype("object").map(lambda v: str(v).strip() == "").any()
-            if has_blank:
+            if has_blank and s not in _FAST_TABLE_NUMERIC_KPI_COLS and not _chat_is_stock_shortage_quantity_int_col(s):
                 continue
         except Exception:
             pass
@@ -1009,6 +1093,12 @@ def _chat_fast_column_config(df: pd.DataFrame) -> dict:
                 s,
                 format="%.2f%%",
                 step=0.01,
+            )
+        elif _chat_is_stock_shortage_quantity_int_col(s):
+            cfg[col] = st.column_config.NumberColumn(
+                s,
+                format="localized",
+                step=1,
             )
         elif (
             s in {"순번", "조회순번"}
@@ -1071,6 +1161,13 @@ def _render_chat_fast_dataframe(
 
         view_df = _chat_clean_display_none_values(view_df)
         column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
+        log_sims_display_fields(
+            df,
+            view_df,
+            action=action_name,
+            render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
+            mode="fast",
+        )
 
         st.dataframe(
             view_df,
@@ -1082,6 +1179,13 @@ def _render_chat_fast_dataframe(
     except Exception:
         log.exception("[chat] fast common table render failed")
         cfg = _chat_fast_column_config(view_df)
+        log_sims_display_fields(
+            df,
+            view_df,
+            action=action_name,
+            render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
+            mode="fast",
+        )
         st.dataframe(
             view_df,
             use_container_width=True,
@@ -1639,6 +1743,171 @@ def _limit_chat_display_df(df: pd.DataFrame, *, limit: int | None = None) -> pd.
     return out
 
 
+_STOCK_DISPLAY_VALUE_COLS = (
+    "재고기준",
+    "수요예상기준",
+    "분석자료원",
+    "현재고원천",
+)
+
+_DISPLAY_PLACEHOLDER_STRINGS = {
+    "",
+    "None",
+    "none",
+    "NONE",
+    "nan",
+    "NaN",
+    "NAN",
+    "<NA>",
+    "NaT",
+    "NULL",
+    "null",
+}
+
+
+def _is_actual_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        return bool(pd.isna(value))
+    except Exception:
+        return False
+
+
+def _is_display_placeholder_value(value: Any) -> bool:
+    if _is_actual_missing_value(value):
+        return True
+    return isinstance(value, str) and value.strip() in _DISPLAY_PLACEHOLDER_STRINGS
+
+
+def _series_actual_non_null_count(series: pd.Series) -> int:
+    try:
+        return int(series.astype("object").map(lambda v: not _is_actual_missing_value(v)).sum())
+    except Exception:
+        return 0
+
+
+def _series_actual_null_count(series: pd.Series) -> int:
+    try:
+        return int(series.astype("object").map(_is_actual_missing_value).sum())
+    except Exception:
+        return 0
+
+
+def _first_value_type_name(series: pd.Series) -> str:
+    try:
+        if series.empty:
+            return ""
+        return type(series.iloc[0]).__name__
+    except Exception:
+        return ""
+
+
+def _aligned_full_series_for_display(full_df: pd.DataFrame, display_df: pd.DataFrame, col: str) -> pd.Series | None:
+    if not isinstance(full_df, pd.DataFrame) or not isinstance(display_df, pd.DataFrame):
+        return None
+    if col not in full_df.columns:
+        return None
+
+    try:
+        if len(display_df) == 0:
+            return pd.Series(dtype="object", index=display_df.index)
+        if display_df.index.isin(full_df.index).all():
+            aligned = full_df.loc[display_df.index, col]
+            aligned.index = display_df.index
+            return aligned
+    except Exception:
+        pass
+
+    try:
+        if len(full_df) == len(display_df):
+            return pd.Series(full_df[col].to_numpy(), index=display_df.index)
+    except Exception:
+        pass
+
+    return None
+
+
+def _insert_display_column_like_full_order(
+    display_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    col: str,
+    values: pd.Series,
+) -> None:
+    try:
+        full_pos = list(full_df.columns).index(col)
+    except Exception:
+        full_pos = len(display_df.columns)
+    insert_at = min(max(full_pos, 0), len(display_df.columns))
+    if col in display_df.columns:
+        display_df[col] = values
+    else:
+        display_df.insert(insert_at, col, values)
+
+
+def _restore_display_fields_from_full_df(
+    display_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    *,
+    action: Any = "",
+    stage: str = "",
+) -> pd.DataFrame:
+    """Restore display-only business labels from the full export df by row index/order."""
+    if not isinstance(display_df, pd.DataFrame) or not isinstance(full_df, pd.DataFrame):
+        return display_df
+
+    out = display_df.copy()
+    for col in _STOCK_DISPLAY_VALUE_COLS:
+        full_present = col in full_df.columns
+        display_present_before = col in out.columns
+        if not full_present:
+            continue
+
+        aligned = _aligned_full_series_for_display(full_df, out, col)
+        if aligned is None:
+            continue
+
+        restored_count = 0
+        inserted = False
+        if not display_present_before:
+            if _series_actual_non_null_count(aligned) > 0:
+                _insert_display_column_like_full_order(out, full_df, col, aligned)
+                inserted = True
+                restored_count = _series_actual_non_null_count(aligned)
+        else:
+            current = out[col].astype("object")
+            can_restore = aligned.astype("object").map(lambda v: not _is_actual_missing_value(v))
+            lost_mask = current.map(_is_display_placeholder_value) & can_restore
+            restored_count = int(lost_mask.sum()) if hasattr(lost_mask, "sum") else 0
+            if restored_count:
+                out.loc[lost_mask, col] = aligned.loc[lost_mask]
+
+        try:
+            display_series = out[col] if col in out.columns else pd.Series(dtype="object")
+            log.info(
+                "[sims.table.field_compare] action=%s stage=%s field=%s full_present=%s display_present=%s inserted=%s restored_count=%s full_dtype=%s display_dtype=%s full_non_null_count=%s display_non_null_count=%s full_actual_null_count=%s display_actual_null_count=%s first_full_type=%s first_display_type=%s",
+                str(action or ""),
+                str(stage or ""),
+                col,
+                bool(full_present),
+                bool(display_present_before),
+                bool(inserted),
+                int(restored_count),
+                str(full_df[col].dtype),
+                str(display_series.dtype),
+                _series_actual_non_null_count(full_df[col]),
+                _series_actual_non_null_count(display_series),
+                _series_actual_null_count(full_df[col]),
+                _series_actual_null_count(display_series),
+                _first_value_type_name(full_df[col]),
+                _first_value_type_name(display_series),
+            )
+        except Exception:
+            pass
+
+    return out
+
+
 def _apply_chat_display_limit_to_payload(payload: Dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         return
@@ -1654,6 +1923,13 @@ def _apply_chat_display_limit_to_payload(payload: Dict[str, Any]) -> None:
     if not isinstance(df_display, pd.DataFrame):
         return
 
+    if isinstance(df_full, pd.DataFrame):
+        df_display = _restore_display_fields_from_full_df(
+            df_display,
+            df_full,
+            action=payload.get("action") or payload.get("title") or "",
+            stage="payload.limit",
+        )
     limited = _limit_chat_display_df(df_display)
     payload["df_display"] = limited
     payload["data"] = limited
@@ -1809,6 +2085,13 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
 
             if not isinstance(df_disp, pd.DataFrame) or df_disp.empty:
                 df_disp = df_full
+            else:
+                df_disp = _restore_display_fields_from_full_df(
+                    df_disp,
+                    df_full,
+                    action=payload.get("action") or title,
+                    stage="normalize_result",
+                )
             df_disp = _limit_chat_display_df(df_disp)
 
             sample_df = df_disp
@@ -4550,6 +4833,18 @@ def _get_sims_download_lazy_threshold_rows() -> int:
     except Exception:
         return 5000
 
+
+def _get_sims_excel_eager_max_cells() -> int:
+    """Excel bytes를 최초 렌더에서 즉시 만들 최대 셀 수."""
+    for key in ("SIMS_EXCEL_EAGER_MAX_CELLS", "SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD", "SIMS_FAST_TABLE_CELL_THRESHOLD"):
+        try:
+            value = int(os.getenv(key, "").strip())
+            if value > 0:
+                return value
+        except Exception:
+            pass
+    return 20000
+
 # SIMS 결과가 대형표인 경우, 처음에는 CSV/XLSX bytes를 만들지 않고 [Excel 다운로드 준비] 버튼만 표시하는 lazy 버전 액션 영역.
 # - 작은 표: 기존처럼 CSV/EXCEL/LLM 버튼 즉시 표시
 # - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
@@ -4557,6 +4852,7 @@ def _get_sims_download_lazy_threshold_rows() -> int:
 def _render_sims_result_actions_lazy(
     *,
     key_suffix: str,
+    table_key: str = "",
     download_df: pd.DataFrame,
     csv_name: str,
     xlsx_name: str,
@@ -4617,10 +4913,16 @@ def _render_sims_result_actions_lazy(
     # download_df가 아직 화면 표시용 200건이어도,
     # expected_rows가 9,615건이면 대형표로 판단해야 한다.
     lazy_basis_rows = max(row_count, expected_rows_int)
+    lazy_basis_cells = max(row_count, expected_rows_int) * max(1, col_count)
+    eager_max_cells = _get_sims_excel_eager_max_cells()
 
     supplier_detail_key = str(getattr(download_df, "attrs", {}).get("supplier_detail_key") or "").strip()
     force_lazy_supplier_excel = bool(supplier_detail_key)
-    is_large_download = force_lazy_supplier_excel or (threshold_rows > 0 and lazy_basis_rows >= threshold_rows)
+    is_large_download = (
+        force_lazy_supplier_excel
+        or (threshold_rows > 0 and lazy_basis_rows >= threshold_rows)
+        or (eager_max_cells > 0 and lazy_basis_cells > eager_max_cells)
+    )
     cache_key_suffix = f"{key_suffix}::{supplier_detail_key}" if supplier_detail_key else key_suffix
 
     ready_key = f"__sims_download_ready::{cache_key_suffix}"
@@ -4650,6 +4952,11 @@ def _render_sims_result_actions_lazy(
                 key=f"sims_prepare_download_{key_suffix}",
                 use_container_width=True,
             ):
+                try:
+                    ss["__ui_rerun_reason"] = "download_prepare"
+                    ss["__sims_download_prepare_table_key"] = str(table_key or "").strip()
+                except Exception:
+                    pass
                 ss[ready_key] = True
                 st.rerun()
 
@@ -4721,10 +5028,12 @@ def _render_sims_result_actions_lazy(
         }
 
         log.info(
-            "[chat] download bytes prepared lazy=%s rows=%s cols=%s %.3fs",
+            "[chat] download bytes prepared lazy=%s rows=%s cols=%s cells=%s eager_max_cells=%s %.3fs",
             is_large_download,
             row_count,
             col_count,
+            row_count * col_count,
+            eager_max_cells,
             time.perf_counter() - t0,
         )
 
@@ -5025,7 +5334,7 @@ def _is_current_sims_table_item(item: Dict[str, Any], meta: Dict[str, Any]) -> b
     return False
 
 
-_LIGHT_HISTORY_RERUN_REASONS = {"sims_panel_open", "sims_action_change", "current_table_followup", "chat_room_change"}
+_LIGHT_HISTORY_RERUN_REASONS = {"sims_panel_open", "sims_action_change", "current_table_followup", "chat_room_change", "download_prepare"}
 
 
 def _ui_rerun_reason() -> str:
@@ -5096,6 +5405,11 @@ def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], u
     if render_path == "history" and rerun_reason in _LIGHT_HISTORY_RERUN_REASONS:
         if rerun_reason == "current_table_followup" and _is_latest_sims_table_key(item, meta):
             return True
+        if rerun_reason == "download_prepare":
+            table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+            prepare_key = str(st.session_state.get("__sims_download_prepare_table_key") or "").strip()
+            if table_key and prepare_key and table_key == prepare_key:
+                return True
         return False
 
     force_key = _old_sims_table_force_key(item, meta, uid)
@@ -5578,7 +5892,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         if not isinstance(df, pd.DataFrame):
             if isinstance(df_display, pd.DataFrame):
                 df = df_display
-            elif payload.get("type") == "table" and isinstance(payload.get("data"), pd.DataFrame):
+            elif isinstance(payload.get("data"), pd.DataFrame):
                 df = payload["data"]
                 df_display = df
             elif "records" in payload and "columns" in payload:
@@ -5586,6 +5900,12 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     df = pd.DataFrame.from_records(
                         payload["records"], columns=payload["columns"]
                     )
+                    df_display = df
+                except Exception:
+                    df = None
+            elif isinstance(payload.get("records"), list) and payload.get("records"):
+                try:
+                    df = pd.DataFrame.from_records(payload["records"])
                     df_display = df
                 except Exception:
                     df = None
@@ -5770,6 +6090,13 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     ss["__sims_current_table_source_action"] = str(action_name or "")
 
                 # 화면 렌더용: 제한된 df_display
+                if isinstance(df_full_for_export, pd.DataFrame):
+                    df_display_for_ui = _restore_display_fields_from_full_df(
+                        df_display_for_ui,
+                        df_full_for_export,
+                        action=action_name,
+                        stage="chat.stash",
+                    )
                 ss["sims_tables"][table_key] = df_display_for_ui
 
                 # 다운로드용: 전체 df 우선
@@ -6932,11 +7259,27 @@ def _lookup_sims_table_payload_for_render(
     """
     data = item.get("data")
     if isinstance(data, pd.DataFrame):
+        item_full = item.get("df")
+        if isinstance(item_full, pd.DataFrame):
+            data = _restore_display_fields_from_full_df(
+                data,
+                item_full,
+                action=(meta or {}).get("action") or item.get("action") or item.get("title") or "",
+                stage="history.lookup.data",
+            )
         return data, "item.data"
 
     for key_name in ("df_display", "df"):
         cand = item.get(key_name)
         if isinstance(cand, pd.DataFrame):
+            item_full = item.get("df")
+            if key_name == "df_display" and isinstance(item_full, pd.DataFrame):
+                cand = _restore_display_fields_from_full_df(
+                    cand,
+                    item_full,
+                    action=(meta or {}).get("action") or item.get("action") or item.get("title") or "",
+                    stage="history.lookup.item",
+                )
             return cand, f"item.{key_name}"
 
     table_key = str((meta or {}).get("table_key") or item.get("table_key") or "").strip()
@@ -6969,6 +7312,17 @@ def _lookup_sims_table_payload_for_render(
                 if isinstance(store, dict):
                     cand = store.get(key)
                     if isinstance(cand, pd.DataFrame):
+                        if store_name == "sims_tables":
+                            for export_store_name in ("sims_export_tables", "__sims_export_tables_by_key"):
+                                export_store = ss.get(export_store_name)
+                                if isinstance(export_store, dict) and isinstance(export_store.get(key), pd.DataFrame):
+                                    cand = _restore_display_fields_from_full_df(
+                                        cand,
+                                        export_store.get(key),
+                                        action=(meta or {}).get("action") or item.get("action") or item.get("title") or "",
+                                        stage=f"history.lookup.{store_name}",
+                                    )
+                                    break
                         return cand, f"{store_name}.{key_label}"
             except Exception:
                 continue
@@ -7324,27 +7678,12 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 )
 
                 if is_current_followup:
-                    source_action = str(
-                        meta.get("source_action")
-                        or meta.get("source_table_action")
-                        or meta.get("source_title")
-                        or ""
-                    ).strip()
-                    source_rows = _safe_int_for_download(
-                        meta.get("source_rows")
-                        or meta.get("source_row_count")
-                        or meta.get("row_count_total_for_followup")
-                        or 0,
-                        0,
+                    _render_current_followup_compact_header(
+                        meta,
+                        loaded_rows=header_loaded_rows,
+                        display_rows=header_display_rows,
                     )
-                    if source_action or source_rows:
-                        source_text = source_action or "원본 현재표"
-                        if source_rows:
-                            st.caption(f"원본: {source_text} / {source_rows:,}건")
-                        else:
-                            st.caption(f"원본: {source_text}")
-
-                if db_total_rows and header_loaded_rows and db_total_rows > header_loaded_rows:
+                elif db_total_rows and header_loaded_rows and db_total_rows > header_loaded_rows:
                     st.caption(
                         f"결과: 조건 전체 {db_total_rows:,}건 중 {header_loaded_rows:,}건 조회, "
                         f"화면 {header_display_rows:,}건 표시"
@@ -7355,7 +7694,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     else:
                         st.caption(f"결과: {header_loaded_rows:,}건")
 
-                if result_time_text:
+                if result_time_text and not is_current_followup:
                     time_label = "처리시각" if is_current_followup else "조회시각"
                     st.caption(f"{time_label}: {result_time_text}")
             except Exception:
@@ -7446,6 +7785,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
         except Exception:
             pass
 
+        if bool(meta.get("current_table_followup")):
+            cond_text = ""
+
         if cond_text:
             st.caption(cond_text)
 
@@ -7518,7 +7860,10 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             )
 
         else:
-            if _chat_is_analysis_payload(item, meta, title):
+            if bool(meta.get("current_table_followup")):
+                # ??? ???? ?? compact header? ????.
+                pass
+            elif _chat_is_analysis_payload(item, meta, title):
                 _render_chat_analysis_header(meta)
                 _render_chat_summary_expander(
                     meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
@@ -7530,16 +7875,16 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 if isinstance(summary_md, str) and summary_md.strip():
                     summary_text = summary_md.strip()
 
-                    # 위에서 조회조건을 caption으로 이미 표시했으면,
-                    # summary_md의 첫 줄 조회조건은 중복 표시하지 않는다.
-                    if cond_text and summary_text.startswith("조회조건:"):
+                    # ??? ????? caption?? ?? ?????,
+                    # summary_md? ? ? ????? ?? ???? ???.
+                    if cond_text and summary_text.startswith("????:"):
                         lines = summary_text.splitlines()
                         lines = lines[1:]
                         summary_text = "\n".join(lines).strip()
 
-                    # 조회건수/표시건수는 위 헤더에서 이미 표시한다.
-                    # summary_md 안의 첫 줄 또는 중간 줄에 같은 의미의 "조회결과:"가 있으면
-                    # 중복 표시되므로 제거한다.
+                    # ????/????? ? ???? ?? ????.
+                    # summary_md ?? ? ? ?? ?? ?? ?? ??? "????:"? ???
+                    # ?? ????? ????.
                     try:
                         cleaned_lines = []
                         for line in summary_text.splitlines():
@@ -7549,14 +7894,14 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 cleaned_lines.append(line)
                                 continue
 
-                            # 예:
-                            # - 조회결과: 20,000건 (표시는 상위 5,000건)
-                            # - 조회결과: 전체 20,000건 중 화면 5,000건 표시
-                            # - 조회 완료: 20,000건
+                            # ?:
+                            # - ????: 20,000? (??? ?? 5,000?)
+                            # - ????: ?? 20,000? ? ?? 5,000? ??
+                            # - ?? ??: 20,000?
                             if (
-                                s.startswith("조회결과:")
-                                or s.startswith("조회 완료:")
-                                or s.startswith("조회완료:")
+                                s.startswith("????:")
+                                or s.startswith("?? ??:")
+                                or s.startswith("????:")
                             ):
                                 continue
 
@@ -7574,35 +7919,35 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             or ""
                         ).strip()
 
-                        # 마스터 조회의 summary_md는 표 위에 길게 나오면
-                        # LLM 분석이 먼저 나온 것처럼 보인다.
-                        # 따라서 마스터 요약은 접기 처리하고, 표를 바로 볼 수 있게 한다.
+                        # ??? ??? summary_md? ? ?? ?? ???
+                        # LLM ??? ?? ?? ??? ???.
+                        # ??? ??? ??? ?? ????, ?? ?? ? ? ?? ??.
                         master_summary_actions = {
-                            "거래처 목록",
-                            "거래처 상세",
-                            "사용자목록 + 부서명",
-                            "부서별 사용자 수",
-                            "부서별사용자수",
-                            "그룹코드조회",
-                            "그룹별 코드 조회",
-                            "코드명 검색",
-                            "제품코드 목록",
-                            "제품코드 상세",
-                            "제품코드목록",
-                            "제품코드상세",
-                            "도로명주소 조회",
-                            "입고명세 조회",
-                            "출고명세 조회",
-                            "거래명세서 공통 조회",
-                            "세금계산서 공통 조회",
-                            "실재고월집계 조회",
-                            "장부재고월집계 조회",
-                            "입고↔거래명세서 검증",
-                            "입고↔세금계산서 검증",
-                            "출고↔거래명세서 검증",
-                            "출고↔세금계산서 검증",
-                            "제품수불현황 조회",
-                            "제품재고현황 조회",
+                            "??? ??",
+                            "??? ??",
+                            "????? + ???",
+                            "??? ??? ?",
+                            "???????",
+                            "??????",
+                            "??? ?? ??",
+                            "??? ??",
+                            "???? ??",
+                            "???? ??",
+                            "??????",
+                            "??????",
+                            "????? ??",
+                            "???? ??",
+                            "???? ??",
+                            "????? ?? ??",
+                            "????? ?? ??",
+                            "?????? ??",
+                            "??????? ??",
+                            "???????? ??",
+                            "???????? ??",
+                            "???????? ??",
+                            "???????? ??",
+                            "?????? ??",
+                            "?????? ??",
                         }
 
                         is_master_summary = (
@@ -7619,11 +7964,10 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         )
 
                         if is_master_summary and not bool(meta.get("current_table_followup")):
-                            with st.expander("집계 요약 펼쳐보기", expanded=False):
+                            with st.expander("?? ?? ????", expanded=False):
                                 st.markdown(summary_text)
                         else:
                             st.markdown(summary_text)
-
 
             debug_meta = str(os.getenv("SSAI_DEBUG_META", "false")).strip().lower() in {
                 "1", "true", "yes", "y", "on"
@@ -7887,6 +8231,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                     view_df = _chat_clean_display_none_values(view_df)
                     column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
+                    log_sims_display_fields(
+                        data,
+                        view_df,
+                        action=action_name,
+                        render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
+                        mode="small",
+                    )
 
                     log.debug(
                         "[chat] io common table render action=%s rows=%s cols=%s natural_width=%s height=%s pinned=%s",
@@ -7986,7 +8337,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 cols=int(len(render_df.columns)),
                                 fast=bool(is_large_analysis_table),
                             )
-                        if is_large_analysis_table:
+                        if is_large_analysis_table and not bool(meta.get("current_table_followup")):
                             st.caption("빠른 표 모드: 채팅 분석/KPI 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
 
                         # 분석/KPI 표는 좌측 고정 컬럼이 우선이다.
@@ -8029,6 +8380,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             )
                             view_df = _chat_clean_display_none_values(view_df)
                             column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
+                            log_sims_display_fields(
+                                data,
+                                view_df,
+                                action=action_name,
+                                render_path=table_render_path,
+                                mode="small",
+                            )
                             log_sims_table_render(
                                 view_df,
                                 action=action_name,
@@ -8239,6 +8597,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                 _render_sims_result_actions_lazy(
                     key_suffix=uid2,
+                    table_key=nlq_table_key,
                     download_df=raw_download_df,
                     csv_name=csv_name,
                     xlsx_name=xlsx_name,

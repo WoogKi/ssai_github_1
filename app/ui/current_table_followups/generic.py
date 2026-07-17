@@ -265,6 +265,8 @@ def _column_filter_aliases(col: str) -> list[str]:
         "당월 진척률": ("당월진척률", "진척률"),
         "평가월 진척률": ("평가월진척률", "달성률", "진척률"),
         "총매출액": ("매출액", "총매출", "매출"),
+        "부족예상수량": ("부족제품수", "부족수량", "제품부족수량", "부족예상수량"),
+        "배정부족예상수량": ("부족제품수", "부족수량", "제품부족수량", "부족예상수량"),
     }
     for extra in alias_map.get(raw, ()):
         _add(extra)
@@ -277,6 +279,26 @@ def _column_filter_aliases(col: str) -> list[str]:
             _add(raw[len(prefix):])
 
     return aliases
+
+
+def _first_series_for_column(df: pd.DataFrame, col: str) -> pd.Series:
+    """중복 컬럼명이 있어도 첫 번째 실제 컬럼 Series만 사용한다."""
+    try:
+        if not isinstance(df, pd.DataFrame) or col not in df.columns:
+            return pd.Series(dtype="object")
+        idx = list(df.columns).index(col)
+        sr = df.iloc[:, idx]
+        if isinstance(sr, pd.Series):
+            return sr
+    except Exception:
+        pass
+    try:
+        value = df[col]
+        if isinstance(value, pd.DataFrame):
+            return value.iloc[:, 0]
+        return value
+    except Exception:
+        return pd.Series(dtype="object")
 
 
 def _strip_common_filter_value(value: str) -> str:
@@ -664,7 +686,7 @@ def _find_common_top_numeric_column(df: pd.DataFrame, query: str) -> str:
     for col in [str(c) for c in df.columns]:
         if col in _COMMON_FILTER_SKIP_COLUMNS:
             continue
-        nums = _to_numeric_for_common_filter(df[col])
+        nums = _to_numeric_for_common_filter(_first_series_for_column(df, col))
         if int(nums.notna().sum()) <= 0:
             continue
         for alias in _column_filter_aliases(col):
@@ -985,7 +1007,7 @@ def handle_common_column_filter_followup(
     top_col = _find_common_top_numeric_column(df, t)
     if top_col and top_col in df.columns and top_n:
         try:
-            nums = _to_numeric_for_common_filter(df[top_col])
+            nums = _to_numeric_for_common_filter(_first_series_for_column(df, top_col))
             out = df.copy()
             out[top_col] = nums.values
             out = out.sort_values(top_col, ascending=False).head(int(top_n)).copy()
@@ -1033,7 +1055,7 @@ def handle_common_column_filter_followup(
     num_col, op, threshold, op_label, threshold_label = _find_common_numeric_filter(df, t)
     if num_col and num_col in df.columns and op:
         try:
-            nums = _to_numeric_for_common_filter(df[num_col])
+            nums = _to_numeric_for_common_filter(_first_series_for_column(df, num_col))
             mask = _apply_numeric_mask(nums, op, threshold)
             filtered = df.loc[mask].copy()
             if not filtered.empty:
@@ -1156,7 +1178,7 @@ def handle_common_column_filter_followup(
         return False
 
     try:
-        compact_values = _series_compact_for_filter(df[col])
+        compact_values = _series_compact_for_filter(_first_series_for_column(df, col))
         mask = compact_values.str.contains(re.escape(value_norm), na=False, regex=True)
         filtered = df.loc[mask].copy()
     except Exception:

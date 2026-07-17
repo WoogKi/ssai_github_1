@@ -15,7 +15,7 @@ import datetime as dt
 
 import streamlit as st
 import pandas as pd
-from app.ui.sims_table_display import log_sims_table_mode, log_sims_table_render
+from app.ui.sims_table_display import log_sims_display_fields, log_sims_table_mode, log_sims_table_render
 
 log = logging.getLogger("ssai")
 
@@ -503,6 +503,7 @@ def _render_fast_dataframe(
             max_height=height,
             row_height=32,
         )
+        log_sims_display_fields(df, view_df, action=action_name, render_path="panel", mode="fast")
         st.dataframe(
             view_df,
             use_container_width=True,
@@ -3391,6 +3392,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                     )
 
                     render_df = view_df
+                    log_sims_display_fields(safe_df, view_df, action=str(action or title or ""), render_path="panel", mode="small")
 
                     log.debug(
                         "[panel] io common table render action=%s rows=%s cols=%s natural_width=%s height=%s pinned=%s",
@@ -3687,6 +3689,13 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                         )
 
                     else:
+                        log_sims_display_fields(
+                            df_disp if isinstance(df_disp, pd.DataFrame) else view_df,
+                            view_df,
+                            action=action,
+                            render_path="panel",
+                            mode="small",
+                        )
                         log_sims_table_render(
                             view_df,
                             action=action,

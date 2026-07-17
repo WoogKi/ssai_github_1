@@ -29,11 +29,12 @@ import logging
 import os
 import re
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -1793,6 +1794,46 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("supplier current-table top amount", f"{type(e).__name__}: {e}"))
 
         try:
+            generic_mod = importlib.import_module("app.ui.current_table_followups.generic")
+            captured_filter: dict[str, object] = {}
+
+            def _push_filter_table(**kwargs):
+                captured_filter.clear()
+                captured_filter.update(kwargs)
+                return True
+
+            shortage_df = pd.DataFrame(
+                [
+                    {"제품코드": "P001", "제품명": "가나다정", "규격": "10T", "제조사명": "A제약", "부족예상수량": 5, "부족예상금액": 1000},
+                    {"제품코드": "P002", "제품명": "라마바정", "규격": "20T", "제조사명": "B제약", "부족예상수량": 12, "부족예상금액": 2000},
+                    {"제품코드": "P003", "제품명": "사아자정", "규격": "30T", "제조사명": "C제약", "부족예상수량": 30, "부족예상금액": 3000},
+                ]
+            )
+            ok_filter = generic_mod.handle_common_column_filter_followup(
+                df=shortage_df,
+                query="현재표 부족제품수 10 이상 목록",
+                top_n=20,
+                table_key="stock-shortage",
+                source_action="품목별 재고부족현황",
+                helpers={"push_table": _push_filter_table},
+                log=log,
+            )
+            out_filter = captured_filter.get("df")
+            action_filter = str(captured_filter.get("action") or "")
+            if not ok_filter or not isinstance(out_filter, pd.DataFrame):
+                results.append(_fail("current-table shortage qty alias", "부족제품수 numeric filter did not push table"))
+            elif "부족예상수량" not in action_filter or "제품명" in action_filter:
+                results.append(_fail("current-table shortage qty alias", f"unexpected action={action_filter}"))
+            elif list(out_filter["제품명"]) != ["라마바정", "사아자정"]:
+                results.append(_fail("current-table shortage qty alias", f"product names shifted={list(out_filter['제품명'])}"))
+            elif "부족예상수량" not in list(out_filter.columns):
+                results.append(_fail("current-table shortage qty alias", f"missing 부족예상수량 columns={list(out_filter.columns)}"))
+            else:
+                results.append(_ok("current-table shortage qty alias", "부족제품수 10 이상 -> 부족예상수량 numeric filter; 제품명 values preserved"))
+        except Exception as e:
+            results.append(_fail("current-table shortage qty alias", f"{type(e).__name__}: {e}"))
+
+        try:
             chat_mod = importlib.import_module("app.ui.chat_middleware")
             amount_df = pd.DataFrame({
                 "기준월": ["202607"],
@@ -1844,6 +1885,251 @@ def run_basic_checks() -> list[CheckResult]:
                     results.append(_ok("supplier amount column priority", "amount_col=배정부족예상금액 for source, followup, and inherited profile"))
         except Exception as e:
             results.append(_fail("supplier amount column priority", f"{type(e).__name__}: {e}"))
+
+        try:
+            chat_mw_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
+            checks = {
+                "download_prepare_light": '"download_prepare"' in chat_mw_src and '"__ui_rerun_reason"] = "download_prepare"' in chat_mw_src,
+                "download_prepare_table_key": "__sims_download_prepare_table_key" in chat_mw_src,
+                "current_followup_compact": "def _render_current_followup_compact_header" in chat_mw_src,
+                "current_followup_no_time_line": "if result_time_text and not is_current_followup:" in chat_mw_src,
+                "current_followup_query_once": "if bool(meta.get(\"current_table_followup\")):\n            cond_text = \"\"" in chat_mw_src,
+                "current_followup_no_table_key_caption": "hide_table_key_caption" in chat_mw_src and "bool(meta.get(\"current_table_followup\"))" in chat_mw_src,
+                "excel_cell_lazy": "SIMS_EXCEL_EAGER_MAX_CELLS" in chat_mw_src and "lazy_basis_cells" in chat_mw_src,
+            }
+            failed = [name for name, ok in checks.items() if not ok]
+            if failed:
+                results.append(_fail("current-table compact render policy", f"failed={failed}"))
+            else:
+                results.append(_ok("current-table compact render policy", "followup header compact; hides table_key/meta captions; download_prepare uses light history path; Excel lazy uses cell threshold"))
+        except Exception as e:
+            results.append(_fail("current-table compact render policy", f"{type(e).__name__}: {e}"))
+
+        try:
+            from app.ui import sims_table_display as display_mod
+
+            quantity_kind = {
+                "완료월평균출고수량": display_mod._numeric_display_kind("완료월평균출고수량"),
+                "최근3개월평균수요수량": display_mod._numeric_display_kind("최근3개월평균수요수량"),
+                "부족예상수량": display_mod._numeric_display_kind("부족예상수량"),
+                "수요증감률": display_mod._numeric_display_kind("수요증감률"),
+            }
+            if quantity_kind != {
+                "완료월평균출고수량": "int",
+                "최근3개월평균수요수량": "int",
+                "부족예상수량": "int",
+                "수요증감률": "percent2",
+            }:
+                results.append(_fail("stock shortage quantity display format", f"unexpected={quantity_kind}"))
+            else:
+                results.append(_ok("stock shortage quantity display format", "shortage quantity columns render as integer; percent columns keep percent2"))
+        except Exception as e:
+            results.append(_fail("stock shortage quantity display format", f"{type(e).__name__}: {e}"))
+
+        try:
+            from app.ui import sims_table_display as display_mod
+
+            src_df = pd.DataFrame(
+                [
+                    {"제품코드": "0001", "재고기준": "장부재고", "수요예상기준": "비교자료부족", "분석자료원": "월집계-장부재고(Rddbc220)", "현재고원천": "장부재고월집계(Rddbc220) 누계", "부족예상수량": 0, "flag": False},
+                    {"제품코드": "0002", "재고기준": "장부재고", "수요예상기준": "최근3개월평균수요수량", "분석자료원": "월집계-장부재고(Rddbc220)", "현재고원천": "장부재고월집계(Rddbc220) 누계", "부족예상수량": 10, "flag": True},
+                    {"제품코드": "0003", "재고기준": "None", "수요예상기준": "NULL", "분석자료원": None, "현재고원천": pd.NA, "부족예상수량": 0, "flag": False},
+                ]
+            )
+            original_nulls = {
+                "재고기준": int(src_df["재고기준"].isna().sum()),
+                "수요예상기준": int(src_df["수요예상기준"].isna().sum()),
+                "분석자료원": int(src_df["분석자료원"].isna().sum()),
+                "현재고원천": int(src_df["현재고원천"].isna().sum()),
+            }
+            display_df = display_mod.normalize_display_df_for_streamlit(src_df)
+            display_mod.log_sims_display_fields(src_df, display_df, action="품목별 재고부족현황", render_path="chat", mode="fast")
+            ok_display = (
+                original_nulls == {"재고기준": 0, "수요예상기준": 0, "분석자료원": 1, "현재고원천": 1}
+                and display_df.loc[0, "재고기준"] == "장부재고"
+                and display_df.loc[0, "수요예상기준"] == "비교자료부족"
+                and display_df.loc[0, "분석자료원"] == "월집계-장부재고(Rddbc220)"
+                and display_df.loc[0, "현재고원천"] == "장부재고월집계(Rddbc220) 누계"
+                and display_df.loc[1, "수요예상기준"] == "최근3개월평균수요수량"
+                and display_df.loc[1, "현재고원천"] == "장부재고월집계(Rddbc220) 누계"
+                and display_df.loc[2, "재고기준"] == "None"
+                and display_df.loc[2, "수요예상기준"] == "NULL"
+                and display_df.loc[2, "분석자료원"] == ""
+                and display_df.loc[2, "현재고원천"] == ""
+                and display_df.loc[0, "부족예상수량"] == 0
+                and bool(display_df.loc[0, "flag"]) is False
+            )
+            if ok_display:
+                results.append(_ok("stock shortage display null cleanup", "display copy preserves business strings and blanks only actual nulls while numeric zero/False stay unchanged"))
+            else:
+                results.append(_fail("stock shortage display null cleanup", f"display={display_df.to_dict(orient='records')} source={src_df.to_dict(orient='records')}"))
+        except Exception as e:
+            results.append(_fail("stock shortage display null cleanup", f"{type(e).__name__}: {e}"))
+
+        try:
+            from app.ui import chat_middleware as chat_mod
+            from app.ui import sims_table_display as display_mod
+
+            text_cols = [
+                "\uc7ac\uace0\uae30\uc900",
+                "\uc7ac\uace0\uae30\uc900\ud310\uc815",
+                "\ubd80\uc871\ub4f1\uae09",
+                "\uc218\uc694\uc608\uc0c1\ub4f1\uae09",
+                "\uc218\uc694\uc608\uc0c1\uae30\uc900",
+                "\ubd84\uc11d\uc790\ub8cc\uc6d0",
+                "\ud604\uc7ac\uace0\uc6d0\ucc9c",
+            ]
+            row0 = {
+                "\uc7ac\uace0\uae30\uc900": "\uc7a5\ubd80\uc7ac\uace0",
+                "\uc7ac\uace0\uae30\uc900\ud310\uc815": "\uc801\uc815",
+                "\ubd80\uc871\ub4f1\uae09": "\uc815\uc0c1",
+                "\uc218\uc694\uc608\uc0c1\ub4f1\uae09": "\ube44\uad50\uc790\ub8cc\ubd80\uc871",
+                "\uc218\uc694\uc608\uc0c1\uae30\uc900": "\ucd5c\uadfc3\uac1c\uc6d4\ud3c9\uade0\uc218\uc694\uc218\ub7c9",
+                "\ubd84\uc11d\uc790\ub8cc\uc6d0": "\uc6d4\uc9d1\uacc4-\uc7a5\ubd80\uc7ac\uace0(Rddbc220)",
+                "\ud604\uc7ac\uace0\uc6d0\ucc9c": "\uc7a5\ubd80\uc7ac\uace0\uc6d4\uc9d1\uacc4(Rddbc220) \ub204\uacc4",
+                "\ubd80\uc871\uc608\uc0c1\uc218\ub7c9": 0,
+                "\ud3c9\uac00\uc6d4 \uc218\uc694\uc9c4\ucc99\ub960": 61.67,
+                "flag": False,
+            }
+            row1 = dict(row0)
+            row1.update({
+                "\uc7ac\uace0\uae30\uc900": None,
+                "\uc218\uc694\uc608\uc0c1\uae30\uc900": "None",
+                "\ud604\uc7ac\uace0\uc6d0\ucc9c": pd.NA,
+                "\ubd80\uc871\uc608\uc0c1\uc218\ub7c9": 10,
+                "\ud3c9\uac00\uc6d4 \uc218\uc694\uc9c4\ucc99\ub960": 0,
+            })
+            source_df = pd.DataFrame([row0, row1])
+            source_snapshot = source_df.copy(deep=True)
+
+            def _common_renderer_view(frame: pd.DataFrame) -> pd.DataFrame:
+                fast = chat_mod._chat_fast_display_df(frame)
+                normalized = display_mod.normalize_display_df_for_streamlit(fast)
+                view, _cfg, _width, _height = display_mod.build_sims_table_display_config(
+                    normalized,
+                    action_name="\ud488\ubaa9\ubcc4 \uc7ac\uace0\ubd80\uc871\ud604\ud669",
+                    add_row_no=False,
+                    row_no_name="\uc21c\ubc88",
+                    enable_pinning=True,
+                    max_pinned_cols=5,
+                )
+                return view
+
+            route_views = {
+                "chat_fast": _common_renderer_view(source_df),
+                "chat_small": display_mod.build_sims_table_display_config(
+                    display_mod.normalize_display_df_for_streamlit(source_df),
+                    action_name="\ud488\ubaa9\ubcc4 \uc7ac\uace0\ubd80\uc871\ud604\ud669",
+                    add_row_no=False,
+                )[0],
+                "panel_fast": _common_renderer_view(source_df),
+                "panel_small": display_mod.build_sims_table_display_config(
+                    display_mod.normalize_display_df_for_streamlit(source_df),
+                    action_name="\ud488\ubaa9\ubcc4 \uc7ac\uace0\ubd80\uc871\ud604\ud669",
+                    add_row_no=False,
+                )[0],
+                "history_reopen": _common_renderer_view(source_df),
+                "current_followup": _common_renderer_view(source_df.loc[[0]].copy()),
+            }
+
+            route_failures: list[str] = []
+            for route, view in route_views.items():
+                for col in text_cols:
+                    if col not in view.columns:
+                        route_failures.append(f"{route}:{col}:missing")
+                        continue
+                    if not (pd.api.types.is_object_dtype(view[col]) or pd.api.types.is_string_dtype(view[col])):
+                        route_failures.append(f"{route}:{col}:dtype={view[col].dtype}")
+                    expected_non_null = int(source_df.loc[view.index, col].notna().sum()) if len(view.index) else 0
+                    actual_non_null = int(view[col].replace("", pd.NA).notna().sum())
+                    if actual_non_null != expected_non_null:
+                        route_failures.append(f"{route}:{col}:non_null={actual_non_null}/{expected_non_null}")
+                    if col in row0 and view.iloc[0][col] != row0[col]:
+                        route_failures.append(f"{route}:{col}:value={view.iloc[0][col]!r}")
+                if "current_followup" != route:
+                    if view.loc[1, "\uc7ac\uace0\uae30\uc900"] != "":
+                        route_failures.append(f"{route}:actual_none_not_blank")
+                    if view.loc[1, "\uc218\uc694\uc608\uc0c1\uae30\uc900"] != "None":
+                        route_failures.append(f"{route}:literal_none_not_preserved")
+                    if view.loc[0, "\ubd80\uc871\uc608\uc0c1\uc218\ub7c9"] != 0:
+                        route_failures.append(f"{route}:numeric_zero_changed")
+                    if bool(view.loc[0, "flag"]) is not False:
+                        route_failures.append(f"{route}:false_changed")
+
+            source_unchanged = source_df.equals(source_snapshot)
+            numeric_preserved = all(pd.api.types.is_numeric_dtype(v["\ubd80\uc871\uc608\uc0c1\uc218\ub7c9"]) for v in route_views.values())
+            if route_failures or not source_unchanged or not numeric_preserved:
+                results.append(_fail("stock shortage renderer text field preservation", f"failures={route_failures} source_unchanged={source_unchanged} numeric_preserved={numeric_preserved}"))
+            else:
+                results.append(_ok("stock shortage renderer text field preservation", "chat fast/small, panel fast/small, history reopen, and current-table followup preserve stock shortage business text fields while numeric columns stay numeric"))
+        except Exception as e:
+            results.append(_fail("stock shortage renderer text field preservation", f"{type(e).__name__}: {e}"))
+
+        try:
+            from app.ui import chat_middleware as chat_mod
+            from app.ui import sims_table_display as display_mod
+
+            full_df = pd.DataFrame(
+                [
+                    {"제품코드": "0001", "재고기준": "장부재고", "수요예상기준": "비교자료부족", "분석자료원": "월집계-장부재고(Rddbc220)", "현재고원천": "장부재고월집계(Rddbc220) 누계", "부족예상수량": 0},
+                    {"제품코드": "0002", "재고기준": "장부재고", "수요예상기준": "최근3개월평균수요수량", "분석자료원": "월집계-장부재고(Rddbc220)", "현재고원천": "장부재고월집계(Rddbc220) 누계", "부족예상수량": 10},
+                    {"제품코드": "0003", "재고기준": None, "수요예상기준": None, "분석자료원": None, "현재고원천": None, "부족예상수량": 0},
+                ],
+                index=[10, 20, 30],
+            )
+            display_df = full_df[["제품코드", "재고기준", "수요예상기준", "분석자료원", "현재고원천", "부족예상수량"]].copy()
+            display_df.loc[10, ["재고기준", "수요예상기준", "분석자료원", "현재고원천"]] = [None, None, "None", pd.NA]
+            display_df.loc[20, ["재고기준", "수요예상기준", "분석자료원", "현재고원천"]] = ["None", "NULL", None, "nan"]
+
+            restored = chat_mod._restore_display_fields_from_full_df(
+                display_df,
+                full_df,
+                action="품목별 재고부족현황",
+                stage="regression",
+            )
+            fast_view = display_mod.normalize_display_df_for_streamlit(restored)
+            small_view = display_mod.normalize_display_df_for_streamlit(restored.copy())
+            filtered_view = display_mod.normalize_display_df_for_streamlit(restored.loc[[20]].copy())
+            unchanged_full = (
+                full_df.loc[10, "수요예상기준"] == "비교자료부족"
+                and full_df.loc[20, "수요예상기준"] == "최근3개월평균수요수량"
+            )
+            ok_restore = (
+                fast_view.loc[10, "재고기준"] == "장부재고"
+                and fast_view.loc[10, "수요예상기준"] == "비교자료부족"
+                and fast_view.loc[10, "분석자료원"] == "월집계-장부재고(Rddbc220)"
+                and fast_view.loc[10, "현재고원천"] == "장부재고월집계(Rddbc220) 누계"
+                and small_view.loc[20, "수요예상기준"] == "최근3개월평균수요수량"
+                and filtered_view.loc[20, "분석자료원"] == "월집계-장부재고(Rddbc220)"
+                and filtered_view.loc[20, "현재고원천"] == "장부재고월집계(Rddbc220) 누계"
+                and fast_view.loc[30, "재고기준"] == ""
+                and fast_view.loc[30, "수요예상기준"] == ""
+                and fast_view.loc[10, "부족예상수량"] == 0
+                and unchanged_full
+            )
+            if ok_restore:
+                results.append(_ok("stock shortage display field restore", "full/display/fast/small/filter paths preserve Excel business values by original index"))
+            else:
+                results.append(_fail("stock shortage display field restore", f"fast={fast_view.to_dict(orient='records')} full={full_df.to_dict(orient='records')}"))
+        except Exception as e:
+            results.append(_fail("stock shortage display field restore", f"{type(e).__name__}: {e}"))
+
+        try:
+            main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            no_source_checks = {
+                "simple_notice": "현재표가 없습니다. 먼저 SIMS 조회를 실행한 뒤 다시 질문해 주세요." in main_src,
+                "source_probe": "def _has_current_table_source_df" in main_src,
+                "immediate_notice": "no current source; notice pushed immediately" in main_src,
+                "no_deferred": "st.session_state.pop(\"__deferred_current_table_followup\", None)" in main_src,
+                "title_limit": "def _room_title_text_from_message(content: str, *, limit: int = 20)" in main_src,
+            }
+            failed = [name for name, ok in no_source_checks.items() if not ok]
+            if failed:
+                results.append(_fail("current-table missing source immediate notice", f"failed={failed}"))
+            else:
+                results.append(_ok("current-table missing source immediate notice", "no-source current-table questions push one notice immediately and do not defer to panel"))
+        except Exception as e:
+            results.append(_fail("current-table missing source immediate notice", f"{type(e).__name__}: {e}"))
 
         try:
             small_df = pd.DataFrame({"배정부족예상금액": range(20), "부족제품수": range(20)})
@@ -1996,15 +2282,593 @@ def run_basic_checks() -> list[CheckResult]:
                 and '[data-testid="stChatInput"]' in main_src
                 and "position: sticky" in main_src
             )
+            has_chronological_render_merge = (
+                "def _build_room_render_messages" in main_src
+                and "for channel in (\"messages\", \"history\", \"sims_messages\", \"gen_messages\")" in main_src
+                and "merged_msgs = _build_room_render_messages(current_room)" in main_src
+                and "def _message_time_key" in main_src
+                and "def _message_dedupe_key" in main_src
+                and "content_sig" in main_src
+            )
+            has_stale_event_clear = (
+                'current_ui_event_id = str(st.session_state.pop("__ui_event_id", "") or "").strip()' in main_src
+                and 'if current_ui_rerun_reason != "chat_room_change":' in main_src
+                and 'st.session_state.pop("__chat_room_switch_event_id", None)' in main_src
+            )
+            has_partitioned_storage = (
+                "def _partitioned_chat_root" in main_src
+                and "def _load_partitioned_chat_rooms" in main_src
+                and "def _save_partitioned_chat_rooms" in main_src
+                and "def _try_migrate_legacy_to_partitioned" in main_src
+                and "def _ensure_partitioned_room_loaded" in main_src
+                and "def _load_partitioned_room_messages" in main_src
+                and '"messages.jsonl"' in main_src
+                and '"rooms.json"' in main_src
+                and "[chat.storage.migration]" in main_src
+                and "[chat.storage.save]" in main_src
+                and "[chat.storage.load]" in main_src
+                and "_partition_message_key" in main_src
+                and "_partition_message_payload" in main_src
+                and "append_count" in main_src
+                and "skipped_bad_lines" in main_src
+                and "fallback=True" in main_src
+                and "legacy_chat_file" in main_src
+                and "storage_mode=partitioned" in main_src
+                and '"__messages_loaded"' in main_src
+                and "_ensure_partitioned_room_loaded(picked)" in main_src
+            )
+            has_partitioned_allowlist = (
+                "_CHAT_PARTITION_MESSAGE_ALLOW_KEYS" in main_src
+                and "_CHAT_PARTITION_META_ALLOW_KEYS" in main_src
+                and "def _partition_record_line" in main_src
+                and "[chat.storage.record_guard]" in main_src
+                and '"channels"' in main_src
+                and "def _partition_collect_records" in main_src
+                and "_partition_logical_message_key" in main_src
+            )
+            has_room_index = (
+                "def _write_rooms_index_csv" in main_src
+                and '"rooms_index.csv"' in main_src
+                and '"utf-8-sig"' in main_src
+                and "messages_file_bytes" in main_src
+            )
+            has_compact_room_context = (
+                "def _build_current_room_compact_context" in main_src
+                and "[CURRENT_ROOM_COMPACT_CONTEXT]" in main_src
+                and "[chat.room.compact_context]" in main_src
+                and "Do not invent hidden table rows" in main_src
+            )
+            has_partitioned_perf_detail = (
+                '"render_list"' in main_src
+                and '"chat_context"' in main_src
+                and '"session_compact"' in main_src
+                and "render_list=%.3fs" in main_src
+                and "chat_context=%.3fs" in main_src
+                and "session_compact=%.3fs" in main_src
+                and "[chat.storage.append_record]" in main_src
+            )
+            has_compact_common_drop_keys = (
+                "CHAT_PERSISTENCE_DROP_KEYS = {" in main_src
+                and "supplier_detail_df" in main_src
+                and "product_shortage_df" in main_src
+                and "for k in DROP_KEYS" not in main_src
+                and " in DROP_KEYS" not in main_src
+                and "CHAT_PERSISTENCE_DROP_KEYS" in main_src
+                and "has_large_nested = any(k in msg for k in CHAT_PERSISTENCE_DROP_KEYS)" in main_src
+            )
+            has_room_projection = (
+                "def _room_persistence_projection" in main_src
+                and "_room_persistence_projection(cur_room)" in main_src
+                and "json.dumps(cur_room, ensure_ascii=False, indent=2).encode" not in main_src
+                and "str(k) not in CHAT_PERSISTENCE_DROP_KEYS" in main_src
+            )
+            has_pending_login_policy = (
+                'selected_room_id = str(st.session_state.get("current_room") or "").strip()' in main_src
+                and 'selected_room_id = ""' in main_src
+                and "meta_obj.get(\"current_room\")" not in main_src
+                and "_select_pending_new_room()" in main_src
+                and "new pending room selected" in main_src
+                and "was_pending = room.get(\"auto_created\") is True and room.get(\"title_initialized\") is not True" in main_src
+                and "room[\"title_initialized\"] = True" in main_src
+            )
+            has_readable_folder_policy = (
+                "def _readable_room_dirname" in main_src
+                and "def _split_room_name_datetime_prefix" in main_src
+                and "def _ensure_room_relative_path" in main_src
+                and "relative_path" in main_src
+                and "_partitioned_messages_file_for_room(root, room)" in main_src
+                and "_partitioned_room_dir_for_room(root, room)" in main_src
+            )
+            chat_mw_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
+            has_sims_df_detection = (
+                'elif isinstance(payload.get("data"), pd.DataFrame):' in chat_mw_src
+                and 'pd.DataFrame.from_records(payload["records"])' in chat_mw_src
+            )
+            compact_runtime_ok = False
+            compact_runtime_detail = ""
+            projection_runtime_ok = False
+            projection_runtime_detail = ""
+            readable_tool_runtime_ok = False
+            readable_tool_runtime_detail = ""
+            try:
+                start = main_src.index("_CHAT_PARTITION_MESSAGE_ALLOW_KEYS = {")
+                end = main_src.index("\ndef _partition_seen_index", start)
+                compact_src = main_src[start:end]
+
+                class _FakeState(dict):
+                    pass
+
+                class _FakeSt:
+                    session_state = _FakeState({"__chat_storage_mode": "partitioned"})
+
+                class _FakeLog:
+                    def warning(self, *args, **kwargs):
+                        return None
+
+                    def exception(self, *args, **kwargs):
+                        return None
+
+                ns = {
+                    "os": __import__("os"),
+                    "time": __import__("time"),
+                    "json": __import__("json"),
+                    "hashlib": __import__("hashlib"),
+                    "Any": object,
+                    "_CHAT_PARTITION_CHANNELS": ("messages", "history", "sims_messages", "gen_messages"),
+                    "st": _FakeSt,
+                    "log": _FakeLog(),
+                    "_json_sanitize": lambda obj: obj,
+                    "_script_perf_add": lambda name, elapsed: None,
+                    "_partition_message_key": lambda msg: "id:" + str((msg or {}).get("id") or (msg or {}).get("table_key") or id(msg)),
+                }
+                exec(compact_src, ns)
+                ns["_room_meta_only"] = lambda room: {
+                    "id": str((room or {}).get("id") or ""),
+                    "name": str((room or {}).get("name") or ""),
+                    "message_count": len(ns["_partition_collect_records"](room)),
+                }
+                room = {
+                    "id": "fixture-room",
+                    "name": "fixture",
+                    "messages": [
+                        {"role": "user", "content": "small", "meta": {"action": "일반"}},
+                        {
+                            "role": "assistant",
+                            "type": "table",
+                            "action": "매입처별 재고부족 현황",
+                            "table_key": "tbl-1",
+                            "meta": {
+                                "action": "매입처별 재고부족 현황",
+                                "summary_md": "요약",
+                                "table_key": "tbl-1",
+                                "supplier_detail_df": {"records": [{"a": 1}]},
+                                "product_shortage_df": {"records": [{"b": 2}]},
+                            },
+                        },
+                        {
+                            "role": "assistant",
+                            "type": "table",
+                            "action": "SIMS DF",
+                            "table_key": "tbl-df",
+                            "df": pd.DataFrame({"제품코드": ["001"], "배정부족예상금액": [10]}),
+                            "df_display": pd.DataFrame({"제품코드": ["001"], "배정부족예상금액": [10]}),
+                            "data": pd.DataFrame({"제품코드": ["001"], "배정부족예상금액": [10]}),
+                            "records": [{"제품코드": "001", "배정부족예상금액": 10}],
+                            "columns": ["제품코드", "배정부족예상금액"],
+                            "meta": {
+                                "action": "SIMS DF",
+                                "summary_md": "summary",
+                                "table_key": "tbl-df",
+                                "supplier_detail_df": {"records": [{"a": 1}]},
+                            },
+                        },
+                    ],
+                    "history": [],
+                    "sims_messages": [],
+                    "gen_messages": [],
+                }
+                stats = ns["_compact_partition_room_in_memory"](room)
+                meta = room["messages"][1].get("meta") or {}
+                runtime_df_msg = room["messages"][2]
+                projection = ns["_room_persistence_projection"](room)
+                projection_json = json.dumps(projection, ensure_ascii=False)
+                projected_msg = next(
+                    (
+                        m.get("message")
+                        for m in projection.get("messages", [])
+                        if (m.get("message") or {}).get("table_key") == "tbl-df"
+                    ),
+                    {},
+                )
+                compact_runtime_ok = (
+                    stats.get("changed") == 1
+                    and "supplier_detail_df" not in meta
+                    and "product_shortage_df" not in meta
+                    and meta.get("action") == "매입처별 재고부족 현황"
+                    and meta.get("summary_md") == "요약"
+                    and meta.get("table_key") == "tbl-1"
+                )
+                compact_runtime_detail = f"stats={stats} meta_keys={sorted(meta.keys())}"
+                projection_runtime_ok = (
+                    isinstance(runtime_df_msg.get("df"), pd.DataFrame)
+                    and isinstance(runtime_df_msg.get("df_display"), pd.DataFrame)
+                    and isinstance(runtime_df_msg.get("data"), pd.DataFrame)
+                    and "supplier_detail_df" not in projection_json
+                    and '"df"' not in projection_json
+                    and '"df_display"' not in projection_json
+                    and '"data"' not in projection_json
+                    and '"records"' not in projection_json
+                    and isinstance(projected_msg, dict)
+                    and (projected_msg.get("meta") or {}).get("table_key") == "tbl-df"
+                    and (projected_msg.get("meta") or {}).get("summary_md") == "summary"
+                )
+                projection_runtime_detail = f"projection_messages={len(projection.get('messages') or [])} bytes={len(projection_json.encode('utf-8'))}"
+            except Exception as e:
+                compact_runtime_detail = f"{type(e).__name__}: {e}"
+                projection_runtime_detail = f"{type(e).__name__}: {e}"
+            remigrate_src = Path("tools/remigrate_partitioned_chat.py").read_text(encoding="utf-8")
+            has_remigrate_tool = (
+                "def run(args: argparse.Namespace)" in remigrate_src
+                and "parser.add_argument(\"--apply\"" in remigrate_src
+                and "dry-run" in remigrate_src
+                and "PARTITION_NEW_MESSAGES_AFTER_DEDUPE" in remigrate_src
+                and "REMOVED_LARGE_KEY_PATH_COUNTS" in remigrate_src
+                and "ROLLBACK_COMMAND" in remigrate_src
+                and "messages.jsonl" in remigrate_src
+                and "rooms_index.csv" in remigrate_src
+                and "def messages_file_from_meta" in remigrate_src
+                and "relative_path" in remigrate_src
+                and "legacy file not found" in remigrate_src
+                and "os.replace(str(partition_root), str(backup_root))" in remigrate_src
+                and "os.replace(str(tmp_root), str(partition_root))" in remigrate_src
+                and "logical_key(" in remigrate_src
+                and "compact_message(" in remigrate_src
+            )
+            try:
+                rename_path = Path("tools/rename_partitioned_room_folders.py")
+                spec = importlib.util.spec_from_file_location("rename_partitioned_room_folders", rename_path)
+                rename_mod = importlib.util.module_from_spec(spec)
+                assert spec and spec.loader
+                spec.loader.exec_module(rename_mod)
+                with tempfile.TemporaryDirectory() as td:
+                    chat_root = Path(td)
+                    root = chat_root / "user_8"
+                    rooms_dir = root / "rooms"
+                    rooms_dir.mkdir(parents=True)
+                    rooms = [
+                        {
+                            "id": "5266b472-4869-4b52-8a41-afe7d2f79a75",
+                            "name": "2026-07-16 13:08 오늘 이 채팅방에서 정리한 내용을 간단히 정리 해줘",
+                            "created_at": "2026-07-14T10:19:00",
+                            "updated_at": "2026-07-14T10:20:00",
+                            "message_count": 2,
+                        },
+                        {
+                            "id": "cdc0d332-0000-0000-0000-000000000000",
+                            "name": "2026-07-16 13:06 오늘 이 채팅방에서 정리한 내용을 간단히 정리 해줘",
+                            "created_at": "2026-07-12T15:43:00",
+                            "updated_at": "2026-07-12T15:44:00",
+                            "message_count": 2,
+                        },
+                        {
+                            "id": "e22dd0d9-0000-0000-0000-000000000000",
+                            "name": "2026-07-16 13:13 매입처별 재고부족 현황",
+                            "created_at": "2026-07-16T13:13:00",
+                            "updated_at": "2026-07-16T13:14:00",
+                            "message_count": 2,
+                        },
+                        {
+                            "id": "abcdef12-0000-0000-0000-000000000001",
+                            "name": '동일:제목/테스트*긴 제목 ' + "가" * 80,
+                            "created_at": "2026-07-14T10:19:10",
+                            "updated_at": "2026-07-14T10:20:00",
+                            "message_count": 1,
+                        },
+                        {
+                            "id": "abcdef12-0000-0000-0000-000000000002",
+                            "name": '동일:제목/테스트*긴 제목 ' + "가" * 80,
+                            "created_at": "2026-07-14T10:19:20",
+                            "updated_at": "2026-07-14T10:20:00",
+                            "message_count": 1,
+                        },
+                    ]
+                    legacy_rooms = [
+                        {
+                            "id": "5266b472-4869-4b52-8a41-afe7d2f79a75",
+                            "name": "2026-07-14 10:19 품목별 재고부족현황",
+                        },
+                        {
+                            "id": "cdc0d332-0000-0000-0000-000000000000",
+                            "name": "2026-07-12 15:43 품목별 재고부족현황",
+                        },
+                    ]
+                    (chat_root / "user_8_chat_rooms.json").write_text(
+                        json.dumps({"rooms": legacy_rooms}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    for room in rooms:
+                        d = rooms_dir / rename_mod.safe_uuid_dirname(room["id"])
+                        d.mkdir()
+                        (d / "messages.jsonl").write_text('{"message":{"role":"user","content":"x"}}\n', encoding="utf-8")
+                        (d / "room.json").write_text(json.dumps(room, ensure_ascii=False), encoding="utf-8")
+                    (root / "rooms.json").write_text(json.dumps({"version": 1, "rooms": rooms}, ensure_ascii=False, indent=2), encoding="utf-8")
+                    originals = rename_mod.load_original_room_names(chat_root, "8")
+                    plan = rename_mod.build_plan(root, originals)
+                    target_by_id = {item["room_id"]: item for item in plan}
+                    restore_ok = (
+                        target_by_id["5266b472-4869-4b52-8a41-afe7d2f79a75"]["needs_title_restore"]
+                        and target_by_id["5266b472-4869-4b52-8a41-afe7d2f79a75"]["proposed_name"] == "2026-07-14 10:19 품목별 재고부족현황"
+                        and target_by_id["cdc0d332-0000-0000-0000-000000000000"]["proposed_name"] == "2026-07-12 15:43 품목별 재고부족현황"
+                        and target_by_id["e22dd0d9-0000-0000-0000-000000000000"]["proposed_name"] == "2026-07-16 13:13 매입처별 재고부족 현황"
+                    )
+                    expected_date_parse = rename_mod.readable_dirname_for_name(
+                        {
+                            "id": "5266b472-4869-4b52-8a41-afe7d2f79a75",
+                            "created_at": "2026-07-16T13:08:00",
+                        },
+                        "2026-07-14 10:19 품목별 재고부족현황",
+                    )
+                    no_dup_date = not any(item.get("duplicated_date") for item in plan)
+                    dry_run_ok = (
+                        len(plan) == 5
+                        and all(item["needs_rename"] for item in plan)
+                        and restore_ok
+                        and no_dup_date
+                        and expected_date_parse == "2026-07-14_10-19_품목별_재고부족현황__5266b472"
+                        and not any(item["exists_conflict"] or item["too_long"] for item in plan)
+                    )
+                    rename_mod.apply_plan(root, plan)
+                    doc = json.loads((root / "rooms.json").read_text(encoding="utf-8"))
+                    rels = [str(r.get("relative_path") or "") for r in doc.get("rooms", [])]
+                    names_after = {str(r.get("id") or ""): str(r.get("name") or "") for r in doc.get("rooms", [])}
+                    applied_ok = (
+                        len(set(rels)) == 5
+                        and all("messages.jsonl" in rel for rel in rels)
+                        and all((root / rel).exists() for rel in rels)
+                        and (root / "rooms_index.csv").exists()
+                        and any("2026-07-14_10-19_품목별_재고부족현황__5266b472" in rel for rel in rels)
+                        and any("2026-07-12_15-43_품목별_재고부족현황__cdc0d332" in rel for rel in rels)
+                        and names_after["5266b472-4869-4b52-8a41-afe7d2f79a75"] == "2026-07-14 10:19 품목별 재고부족현황"
+                        and names_after["e22dd0d9-0000-0000-0000-000000000000"] == "2026-07-16 13:13 매입처별 재고부족 현황"
+                    )
+                    # Failure path: conflict should be detected before apply.
+                    root_conflict = Path(td) / "user_9"
+                    (root_conflict / "rooms").mkdir(parents=True)
+                    conflict_room = {
+                        "id": "11111111-2222-3333-4444-555555555555",
+                        "name": "충돌 테스트",
+                        "created_at": "2026-07-14T10:19:00",
+                        "message_count": 1,
+                    }
+                    old_conflict = root_conflict / "rooms" / rename_mod.safe_uuid_dirname(conflict_room["id"])
+                    old_conflict.mkdir()
+                    (old_conflict / "messages.jsonl").write_text('{"message":{"role":"user","content":"x"}}\n', encoding="utf-8")
+                    target_conflict = root_conflict / "rooms" / rename_mod.readable_dirname(conflict_room)
+                    target_conflict.mkdir()
+                    (root_conflict / "rooms.json").write_text(json.dumps({"version": 1, "rooms": [conflict_room]}, ensure_ascii=False), encoding="utf-8")
+                    conflict_plan = rename_mod.build_plan(root_conflict)
+                    failure_detected = any(item["exists_conflict"] for item in conflict_plan)
+                    readable_tool_runtime_ok = dry_run_ok and applied_ok and failure_detected
+                    readable_tool_runtime_detail = f"dry_run={dry_run_ok} restore={restore_ok} no_dup_date={no_dup_date} applied={applied_ok} conflict={failure_detected} rels={rels[:2]}"
+            except Exception as e:
+                readable_tool_runtime_detail = f"{type(e).__name__}: {e}"
             missing = [k for k in required_close_keys if k not in main_src]
             if not has_close_helper or missing:
                 results.append(_fail("chat room switch panel close policy", f"helper={has_close_helper} missing={missing}"))
-            elif not has_room_reason or not has_switch_total or not has_close_guard or not has_guard_consume or not has_panel_close_log or not has_after_success_log or not has_no_open_assignment or not has_no_direct_close_in_room_switch or not has_render_block or not has_switch_event_id or not has_event_id_perf or not has_startup_pending or not has_no_unconditional_startup_log or not has_save_detail or not has_sims_open_perf or not has_authenticate_perf or not has_script_path_perf or not has_save_skip or not has_selection_only_save_skip or not has_chat_save_diff or not has_latest_message_anchor:
-                results.append(_fail("chat room switch panel close policy", f"reason={has_room_reason} switch_total={has_switch_total} guard={has_close_guard} consume={has_guard_consume} log={has_panel_close_log} after_success={has_after_success_log} no_open_assign={has_no_open_assignment} no_direct_close={has_no_direct_close_in_room_switch} render_block={has_render_block} switch_event_id={has_switch_event_id} event_perf={has_event_id_perf} startup_pending={has_startup_pending} no_unconditional_startup={has_no_unconditional_startup_log} save_detail={has_save_detail} sims_open_perf={has_sims_open_perf} authenticate_perf={has_authenticate_perf} script_path_perf={has_script_path_perf} save_skip={has_save_skip} selection_only_skip={has_selection_only_save_skip} save_diff={has_chat_save_diff} latest_anchor={has_latest_message_anchor}"))
+            elif not has_room_reason or not has_switch_total or not has_close_guard or not has_guard_consume or not has_panel_close_log or not has_after_success_log or not has_no_open_assignment or not has_no_direct_close_in_room_switch or not has_render_block or not has_switch_event_id or not has_event_id_perf or not has_startup_pending or not has_no_unconditional_startup_log or not has_save_detail or not has_sims_open_perf or not has_authenticate_perf or not has_script_path_perf or not has_save_skip or not has_selection_only_save_skip or not has_chat_save_diff or not has_latest_message_anchor or not has_chronological_render_merge or not has_stale_event_clear or not has_partitioned_storage or not has_partitioned_allowlist or not has_room_index or not has_compact_room_context or not has_partitioned_perf_detail or not has_compact_common_drop_keys or not has_room_projection or not has_pending_login_policy or not has_readable_folder_policy or not has_sims_df_detection or not compact_runtime_ok or not projection_runtime_ok or not has_remigrate_tool or not readable_tool_runtime_ok:
+                results.append(_fail("chat room switch panel close policy", f"reason={has_room_reason} switch_total={has_switch_total} guard={has_close_guard} consume={has_guard_consume} log={has_panel_close_log} after_success={has_after_success_log} no_open_assign={has_no_open_assignment} no_direct_close={has_no_direct_close_in_room_switch} render_block={has_render_block} switch_event_id={has_switch_event_id} event_perf={has_event_id_perf} startup_pending={has_startup_pending} no_unconditional_startup={has_no_unconditional_startup_log} save_detail={has_save_detail} sims_open_perf={has_sims_open_perf} authenticate_perf={has_authenticate_perf} script_path_perf={has_script_path_perf} save_skip={has_save_skip} selection_only_skip={has_selection_only_save_skip} save_diff={has_chat_save_diff} latest_anchor={has_latest_message_anchor} chronological_merge={has_chronological_render_merge} stale_event_clear={has_stale_event_clear} partitioned_storage={has_partitioned_storage} partitioned_allowlist={has_partitioned_allowlist} room_index={has_room_index} compact_context={has_compact_room_context} partitioned_perf={has_partitioned_perf_detail} common_drop_keys={has_compact_common_drop_keys} room_projection={has_room_projection} pending_login={has_pending_login_policy} readable_folder={has_readable_folder_policy} readable_tool={readable_tool_runtime_ok} readable_detail={readable_tool_runtime_detail} sims_df_detection={has_sims_df_detection} compact_runtime={compact_runtime_ok} compact_detail={compact_runtime_detail} projection_runtime={projection_runtime_ok} projection_detail={projection_runtime_detail} remigrate_tool={has_remigrate_tool}"))
             else:
-                results.append(_ok("chat room switch panel close policy", "room change consumes close guard, blocks SIMS render, logs event-scoped perf, startup perf is one-shot, skips unchanged saves, and uses manual latest-message anchor"))
+                results.append(_ok("chat room switch panel close policy", "room change consumes close guard, blocks SIMS render, logs event-scoped perf, startup perf is one-shot, skips unchanged saves, restores login pending-room flow, uses readable room folders for new rooms, uses manual latest-message anchor, renders normal/SIMS history chronologically, uses allow-listed partitioned append-only storage, writes room index, keeps runtime DataFrames out of persistence projection, adds compact room context, and provides safe remigration tooling"))
         except Exception as e:
             results.append(_fail("chat room switch panel close policy", f"{type(e).__name__}: {e}"))
+
+        try:
+            main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            helper_start = main_src.index("def _room_has_any_messages")
+            start = main_src.index("def _compute_room_sidebar_state")
+            end = main_src.index("\ndef _ensure_sims_panel_room_title", start)
+            sidebar_src = main_src[helper_start:end]
+            ns: dict[str, Any] = {"Any": Any, "Iterable": Iterable}
+            exec(sidebar_src, ns)
+            compute = ns["_compute_room_sidebar_state"]
+            resolve_pick = ns["_resolve_room_pick"]
+            rooms = [{"id": f"room-{i:02d}", "name": f"room {i:02d}"} for i in range(22)]
+            initial = compute(rooms, current_room_id="room-00", filter_text="", page=0, previous_filter="", page_size=10, initial_to_last=True)
+            page0 = compute(rooms, current_room_id="room-00", filter_text="", page=0, previous_filter="", page_size=10)
+            page1 = compute(rooms, current_room_id="room-00", filter_text="", page=1, previous_filter="", page_size=10)
+            page2 = compute(rooms, current_room_id="room-00", filter_text="", page=2, previous_filter="", page_size=10)
+            stale = compute(rooms, current_room_id="missing-room", filter_text="", page=1, previous_filter="", page_size=10)
+            filter_changed = compute(rooms, current_room_id="room-00", filter_text="room", page=0, previous_filter="", page_size=10)
+            filter_two = compute(rooms, current_room_id="room-00", filter_text="room 2", page=1, previous_filter="", page_size=10)
+            filter_cleared = compute(rooms, current_room_id="room-00", filter_text="", page=1, previous_filter="room 2", page_size=10)
+            same_filter = compute(rooms, current_room_id="room-00", filter_text="room", page=1, previous_filter="room", page_size=10)
+            pending_rooms = rooms + [{"id": "pending", "name": "새 대화", "auto_created": True, "messages": []}]
+            initial = compute(pending_rooms, current_room_id="pending", filter_text="", page=0, previous_filter="", page_size=10, initial_to_last=True)
+            pending = compute(pending_rooms, current_room_id="pending", filter_text="", page=0, previous_filter="", page_size=10, initial_to_last=True)
+            has_save_current_room_guard = (
+                "def _valid_current_room_id_for_rooms" in main_src
+                and "current_room_for_meta = _valid_current_room_id_for_rooms(rooms_to_save)" in main_src
+                and "current_room_for_meta = _valid_current_room_id_for_rooms(rooms)" in main_src
+                and '"current_room": current_room_for_meta' in main_src
+            )
+            has_room_list_log = (
+                "[chat.room_list]" in main_src
+                and "persisted_rooms=%s pending_visible=%s filtered_persisted_rooms=%s" in main_src
+                and "current_kind=%s current_room_id=%s current_in_persisted=%s page_reset_reason=%s" in main_src
+            )
+            has_visible_pager = (
+                'st.button(\n                "이전"' in main_src
+                and 'st.button(\n                "다음"' in main_src
+                and "페이지 {room_list_state['page_label']}" in main_src
+            )
+            has_visible_pager = (
+                'key="__room_prev"' in main_src
+                and 'key="__room_next"' in main_src
+                and "room_list_state['page_label']" in main_src
+            )
+            has_no_page_callback_rerun = (
+                "on_click=_room_prev_page" in main_src
+                and "on_click=_room_next_page" in main_src
+                and "explicit_rerun_called=%s" in main_src
+                and "on_click=lambda: ss.update(__room_page" not in main_src
+            )
+            login_no_auto_pick = resolve_pick(
+                current_room_id="pending",
+                picked_pending="pending",
+                picked_persisted=None,
+                pending_ids=["pending"],
+                persisted_ids=[r["id"] for r in page2["view"]],
+            )
+            page2_pick = resolve_pick(
+                current_room_id="pending",
+                picked_pending="pending",
+                picked_persisted="room-21",
+                pending_ids=["pending"],
+                persisted_ids=[r["id"] for r in page2["view"]],
+            )
+            page0_pick = resolve_pick(
+                current_room_id="pending",
+                picked_pending="pending",
+                picked_persisted="room-00",
+                pending_ids=["pending"],
+                persisted_ids=[r["id"] for r in page0["view"]],
+            )
+            page1_pick = resolve_pick(
+                current_room_id="pending",
+                picked_pending="pending",
+                picked_persisted="room-10",
+                pending_ids=["pending"],
+                persisted_ids=[r["id"] for r in page1["view"]],
+            )
+            pending_pick = resolve_pick(
+                current_room_id="room-21",
+                picked_pending="pending",
+                picked_persisted="room-21",
+                pending_ids=["pending"],
+                persisted_ids=[r["id"] for r in page2["view"]],
+            )
+            has_selection_resolver = (
+                "def _resolve_room_pick" in main_src
+                and "picked = _resolve_room_pick(" in main_src
+                and "picked = picked_persisted or picked_pending" not in main_src
+            )
+            has_room_select_log = "[chat.room_select] phase=request" in main_src and "[chat.room_select] phase=render_ready" in main_src
+            ok = (
+                len(page0["view"]) == 20
+                and page0["caption"] == "1-20 / 저장된 채팅방 총 22개"
+                and page0["page"] == 0
+                and page0["next_disabled"] is False
+                and len(page1["view"]) == 2
+                and page1["caption"] == "21-22 / 저장된 채팅방 총 22개"
+                and page1["page"] == 1
+                and page1["prev_disabled"] is False
+                and page1["next_disabled"] is True
+                and stale["page"] == 2
+                and stale["page_reset_reason"] == "stale_current_room"
+                and stale["current_kind"] == "stale"
+                and stale["current_in_persisted"] is False
+                and filter_changed["page"] == 0
+                and filter_changed["page_reset_reason"] == "filter_changed"
+                and filter_changed["caption"] == "검색 결과 2개 / 전체 22개"
+                and filter_cleared["page"] == 0
+                and filter_cleared["page_reset_reason"] == "filter_changed"
+                and same_filter["page"] == 1
+                and same_filter["page_reset_reason"] == ""
+                and pending["persisted_room_count"] == 22
+                and pending["filtered_persisted_rooms"] == 22
+                and pending["pending_visible"] is True
+                and pending["current_kind"] == "pending"
+                and len(pending["view"]) == 20
+                and has_save_current_room_guard
+                and has_room_list_log
+                and has_visible_pager
+            )
+            ok = (
+                len(initial["view"]) == 2
+                and initial["page"] == 2
+                and initial["current_kind"] == "pending"
+                and initial["page_label"] == "3 / 3"
+                and initial["prev_disabled"] is False
+                and initial["next_disabled"] is True
+                and len(page0["view"]) == 10
+                and page0["page"] == 0
+                and page0["next_disabled"] is False
+                and len(page1["view"]) == 10
+                and page1["page"] == 1
+                and page1["prev_disabled"] is False
+                and page1["next_disabled"] is False
+                and len(page2["view"]) == 2
+                and page2["page"] == 2
+                and page2["prev_disabled"] is False
+                and page2["next_disabled"] is True
+                and stale["page"] == 2
+                and stale["page_reset_reason"] == "stale_current_room"
+                and stale["current_kind"] == "stale"
+                and stale["current_in_persisted"] is False
+                and filter_changed["page"] == 2
+                and filter_changed["page_reset_reason"] == "filter_changed"
+                and filter_two["page"] == 0
+                and filter_two["filtered_persisted_rooms"] == 2
+                and filter_cleared["page"] == 2
+                and filter_cleared["page_reset_reason"] == "filter_changed"
+                and same_filter["page"] == 1
+                and same_filter["page_reset_reason"] == ""
+                and pending["persisted_room_count"] == 22
+                and pending["filtered_persisted_rooms"] == 22
+                and pending["pending_visible"] is True
+                and pending["current_kind"] == "pending"
+                and len(pending["view"]) == 2
+                and pending["page"] == 2
+                and has_save_current_room_guard
+                and has_room_list_log
+                and has_visible_pager
+                and has_no_page_callback_rerun
+                and has_selection_resolver
+                and login_no_auto_pick is None
+                and page2_pick == "room-21"
+                and page1_pick == "room-10"
+                and page0_pick == "room-00"
+                and pending_pick == "pending"
+                and has_room_select_log
+            )
+            fixture_messages = {r["id"]: f"history-message-{r['id']}" for r in rooms}
+            loaded_page2_message = fixture_messages.get(page2_pick or "")
+            loaded_page1_message = fixture_messages.get(page1_pick or "")
+            loaded_page0_message = fixture_messages.get(page0_pick or "")
+            checks = {
+                "login_pending_page2": len(initial["view"]) == 2 and initial["page"] == 2 and initial["current_kind"] == "pending" and initial["page_label"] == "3 / 3",
+                "page0_ten_rooms": len(page0["view"]) == 10 and page0["page"] == 0 and page0["next_disabled"] is False,
+                "page1_ten_rooms": len(page1["view"]) == 10 and page1["page"] == 1 and page1["prev_disabled"] is False and page1["next_disabled"] is False,
+                "page2_two_rooms": len(page2["view"]) == 2 and page2["page"] == 2 and page2["prev_disabled"] is False and page2["next_disabled"] is True,
+                "stale_current_room_to_page2": stale["page"] == 2 and stale["page_reset_reason"] == "stale_current_room" and stale["current_kind"] == "stale" and stale["current_in_persisted"] is False,
+                "filter_change_to_last_page": filter_changed["page"] == 2 and filter_changed["page_reset_reason"] == "filter_changed",
+                "filtered_two_rooms": filter_two["page"] == 0 and filter_two["filtered_persisted_rooms"] == 2,
+                "filter_clear_to_last_page": filter_cleared["page"] == 2 and filter_cleared["page_reset_reason"] == "filter_changed",
+                "same_filter_preserves_page": same_filter["page"] == 1 and same_filter["page_reset_reason"] == "",
+                "pending_not_in_persisted_page": pending["persisted_room_count"] == 22 and pending["filtered_persisted_rooms"] == 22 and pending["pending_visible"] is True and pending["current_kind"] == "pending" and len(pending["view"]) == 2 and pending["page"] == 2,
+                "save_current_room_guard": has_save_current_room_guard,
+                "room_list_log": has_room_list_log,
+                "visible_pager": has_visible_pager,
+                "page_callback_no_explicit_rerun": has_no_page_callback_rerun,
+                "selection_resolver_used": has_selection_resolver,
+                "login_no_auto_pick": login_no_auto_pick is None,
+                "page2_request": page2_pick == "room-21",
+                "page1_request": page1_pick == "room-10",
+                "page0_request": page0_pick == "room-00",
+                "pending_return_request": pending_pick == "pending",
+                "room_select_phase_logs": has_room_select_log,
+                "selected_page2_history_message": loaded_page2_message == "history-message-room-21",
+                "selected_page1_history_message": loaded_page1_message == "history-message-room-10",
+                "selected_page0_history_message": loaded_page0_message == "history-message-room-00",
+            }
+            failed_checks = [name for name, passed in checks.items() if not passed]
+            ok = not failed_checks
+            if ok:
+                results.append(_ok("chat room sidebar pagination policy", "focused integration harness executed pagination, delta-based room selection, request/consume/load/render-ready logging, selected-room history mapping, stale guard, and callback no-rerun policy"))
+            else:
+                results.append(_fail("chat room sidebar pagination policy", f"failed_checks={failed_checks} initial={initial} page0={len(page0['view'])}/{page0['caption']} page1={len(page1['view'])}/{page1['caption']} page2={len(page2['view'])}/{page2['caption']} stale={stale} filter_changed={filter_changed} filter_cleared={filter_cleared} same_filter={same_filter} pending={pending} picks={[login_no_auto_pick, page0_pick, page1_pick, page2_pick, pending_pick]} loaded={[loaded_page0_message, loaded_page1_message, loaded_page2_message]} save_guard={has_save_current_room_guard} log={has_room_list_log} pager={has_visible_pager} resolver={has_selection_resolver}"))
+        except Exception as e:
+            results.append(_fail("chat room sidebar pagination policy", f"{type(e).__name__}: {e}"))
 
         try:
             login_src = Path("app/ui/ssai_login.py").read_text(encoding="utf-8")

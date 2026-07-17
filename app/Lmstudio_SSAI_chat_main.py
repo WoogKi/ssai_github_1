@@ -42,10 +42,11 @@ import textwrap
 import zipfile
 import tempfile
 import traceback
+import shutil
 
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, Iterable, List, Union
 from openai import OpenAI 
 import random
 # (사용 여부 확인 후 유지/제거)
@@ -686,6 +687,61 @@ def _request_sims_close_for_chat_room_change() -> None:
         st.session_state["__sims_close_for_chat_room_change"] = True
     except Exception:
         pass
+
+
+def _request_sims_close_for_new_pending_room() -> None:
+    """
+    새 대화 대기방으로 전환할 때 이전 방의 SIMS 패널/현재표 포인터가
+    새 방 화면에 남지 않게 one-shot close guard만 건다.
+
+    주의: 이 함수는 사이드바 버튼 callback에서 호출될 수 있으므로
+    Streamlit widget key(__sims_open)는 직접 수정하지 않는다.
+    실제 panel key 정리는 다음 rerun 최상단의 guard 소비 지점에서 수행한다.
+    """
+    try:
+        st.session_state["__sims_close_for_chat_room_change"] = True
+        st.session_state["__ui_rerun_reason"] = "chat_room_change"
+        st.session_state["__sims_panel_active"] = False
+        st.session_state["__sims_force_open"] = False
+        st.session_state["__sims_run_flag"] = False
+        st.session_state["__sims_inner_submit"] = False
+        st.session_state["__sims_rendered"] = False
+        st.session_state["__sims_was_final"] = False
+        st.session_state["__sims_panel_skip_view_once"] = True
+        st.session_state["__sims_panel_skip_view_reason"] = "new_pending_room"
+        for key in [
+            "__deferred_current_table_followup",
+            "__sims_result",
+            "__sims_context",
+            "__sims_context_text",
+            "__sims_context_note",
+            "__sims_context_obj",
+            "__sims_analysis_ctx",
+            "__sims_panel_last_final_action",
+            "__sims_panel_last_final_payload",
+            "__sims_last_final_payload_for_chat",
+            "__sims_panel_source_promoted_sig",
+            "__sims_panel_chat_push_sig",
+            "__sims_last_push_sig",
+            "__sims_download_prepare_table_key",
+            "__sims_failed_key",
+            "__sims_pending_action",
+            "__sims_pending_result",
+        ]:
+            st.session_state.pop(key, None)
+        for key in list(st.session_state.keys()):
+            sk = str(key)
+            if sk.startswith((
+                "__sims_download_ready::",
+                "__sims_download_bytes::",
+                "__sims_table_download_cache::",
+                "__sims_force_render_old_table::",
+                "__sims_old_table_download_enabled::",
+            )):
+                st.session_state.pop(key, None)
+        _clear_current_table_source_for_room_change()
+    except Exception:
+        log.exception("[chat.room] request SIMS close for new pending room failed")
 
 
 def _clear_current_table_source_for_room_change() -> None:
@@ -1944,6 +2000,138 @@ def normalize_ts(ts: str) -> str:
         ts += ":00"
     return ts
 
+
+def _message_time_key(message: dict) -> str:
+    """Return a normalized timestamp used only for display ordering."""
+    if not isinstance(message, dict):
+        return ""
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    for key in ("created_at", "timestamp", "datetime", "time"):
+        value = message.get(key)
+        if value:
+            normalized = normalize_ts(str(value))
+            if normalized:
+                return normalized
+    for key in ("created_at", "timestamp", "datetime", "display_time"):
+        value = meta.get(key)
+        if value:
+            normalized = normalize_ts(str(value))
+            if normalized:
+                return normalized
+    return ""
+
+
+def _message_dedupe_key(message: dict) -> tuple:
+    """Deduplicate the same saved message across legacy/channel stores."""
+    if not isinstance(message, dict):
+        return ("object", id(message))
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    table_key = str(meta.get("table_key") or message.get("table_key") or "").strip()
+    if table_key:
+        return ("table", table_key, str(meta.get("action") or message.get("action") or ""))
+    content_sig = str(message.get("content") or message.get("title") or message.get("action") or "")[:500]
+    if content_sig:
+        return (
+            "sig",
+            str(message.get("role") or ""),
+            _message_time_key(message),
+            content_sig,
+        )
+    msg_id = str(message.get("id") or "").strip()
+    if msg_id:
+        return ("id", msg_id)
+    return (
+        "sig",
+        str(message.get("role") or ""),
+        _message_time_key(message),
+        content_sig,
+    )
+
+
+def _build_room_render_messages(room: dict) -> list[dict]:
+    """
+    Build a display-only chronological message list without changing JSON layout.
+
+    The returned list keeps references to original message dicts so large table
+    payloads/DataFrames are not copied.
+    """
+    if not isinstance(room, dict):
+        return []
+
+    channel_order = {
+        "messages": 0,
+        "history": 1,
+        "sims_messages": 2,
+        "gen_messages": 3,
+    }
+    rows: list[tuple[str, int, dict]] = []
+    for channel in ("messages", "history", "sims_messages", "gen_messages"):
+        items = room.get(channel) or []
+        if not isinstance(items, list):
+            continue
+        for idx, item in enumerate(items):
+            if isinstance(item, dict):
+                rows.append((channel, idx, item))
+
+    seen: set[tuple] = set()
+    deduped: list[tuple[str, int, dict]] = []
+    for channel, idx, item in rows:
+        key = _message_dedupe_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((channel, idx, item))
+
+    def _sort_key(row: tuple[str, int, dict]) -> tuple:
+        channel, idx, item = row
+        ts = _message_time_key(item)
+        has_ts = 0 if ts else 1
+        seq = item.get("seq")
+        if not isinstance(seq, (int, float)):
+            seq = 0
+        return (has_ts, ts, int(seq or 0), channel_order.get(channel, 99), idx)
+
+    deduped.sort(key=_sort_key)
+    return [item for _, _, item in deduped]
+
+
+def _build_current_room_compact_context(limit_chars: int = 5000) -> str:
+    """Build a small room-local context for ordinary chat without table payloads."""
+    try:
+        rid = str(st.session_state.get("current_room") or "")
+        rooms = st.session_state.get("chat_rooms") or []
+        room = next((r for r in rooms if isinstance(r, dict) and str(r.get("id") or "") == rid), None)
+        if not isinstance(room, dict):
+            return ""
+        lines: list[str] = []
+        for msg in _build_room_render_messages(room)[-18:]:
+            if not isinstance(msg, dict):
+                continue
+            meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+            role = str(msg.get("role") or meta.get("role") or "")
+            action = str(msg.get("action") or meta.get("action") or msg.get("title") or meta.get("title") or "").strip()
+            rows = meta.get("row_count") or meta.get("rows") or meta.get("full_rows") or msg.get("rows")
+            params = meta.get("condition_summary") or meta.get("query_summary") or meta.get("params") or msg.get("params") or ""
+            summary = meta.get("summary_md") or meta.get("summary") or msg.get("message") or msg.get("content") or ""
+            if action or meta.get("table_key") or msg.get("table_key"):
+                part = f"- SIMS action={action or '-'} rows={rows or '-'}"
+                if params:
+                    part += f" condition={_clip_partition_text(str(params), 500)}"
+                if summary:
+                    part += f" summary={_clip_partition_text(str(summary), 900)}"
+                lines.append(part)
+            elif role in {"user", "assistant"} and summary:
+                lines.append(f"- {role}: {_clip_partition_text(str(summary), 500)}")
+        text = "\n".join(lines)
+        if len(text) > limit_chars:
+            text = text[-limit_chars:]
+        if text.strip():
+            log.info("[chat.room.compact_context] room_id=%s lines=%s chars=%s", rid, len(lines), len(text))
+        return text
+    except Exception:
+        log.exception("[chat.room.compact_context] build failed")
+        return ""
+
 # =========================
 # 요약 파이프라인
 # =========================
@@ -3045,6 +3233,26 @@ def _normalize_current_table_followup_input(text: str) -> str:
 def _current_table_norm_text(value: Any) -> str:
     return str(value or "").strip()
 
+def _current_table_first_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """중복 컬럼명이 있어도 첫 번째 실제 컬럼 Series만 반환한다."""
+    try:
+        if not isinstance(df, pd.DataFrame) or col not in df.columns:
+            return pd.Series(dtype="object")
+        idx = list(df.columns).index(col)
+        sr = df.iloc[:, idx]
+        if isinstance(sr, pd.Series):
+            return sr
+    except Exception:
+        pass
+    try:
+        value = df[col]
+        if isinstance(value, pd.DataFrame):
+            return value.iloc[:, 0]
+        return value
+    except Exception:
+        return pd.Series(dtype="object")
+
+
 def _current_table_to_num(series: pd.Series) -> pd.Series:
     try:
         return pd.to_numeric(
@@ -3057,7 +3265,10 @@ def _current_table_to_num(series: pd.Series) -> pd.Series:
             errors="coerce",
         ).fillna(0)
     except Exception:
-        return pd.Series([0] * len(series), index=series.index)
+        try:
+            return pd.Series([0] * len(series), index=series.index)
+        except Exception:
+            return pd.Series(dtype="float64")
 
 
 def _current_table_find_col(
@@ -3185,15 +3396,19 @@ def _push_no_current_table_notice(source_query: str) -> bool:
     return _current_table_push_notice(
         title="현재표 후속분석 불가",
         action="현재표 후속분석 불가",
-        message=(
-            "현재표로 사용할 조회 결과가 없습니다.\n\n"
-            "방금 실행한 조회가 0건 또는 안내 결과로 끝났거나, 현재표 원본이 비어 있습니다.\n"
-            "이전 조회표를 잘못 분석하지 않도록 LLM 분석으로 넘기지 않았습니다.\n\n"
-            "조회 결과가 있는 화면을 다시 실행한 뒤 현재표 질문을 해 주세요."
-        ),
+        message="현재표가 없습니다. 먼저 SIMS 조회를 실행한 뒤 다시 질문해 주세요.",
         query_summary="현재표 / 후속분석 불가 / 현재표 원본 없음",
         source_query=str(source_query or ""),
     )
+
+
+def _has_current_table_source_df() -> bool:
+    """현재표 후속질문에 사용할 source DataFrame이 살아 있는지 빠르게 확인한다."""
+    try:
+        df, _table_key = _current_table_get_latest_df()
+        return isinstance(df, pd.DataFrame) and not df.empty
+    except Exception:
+        return False
 
 def _current_table_is_blankish_value(v: Any) -> bool:
     """
@@ -3424,6 +3639,8 @@ def _current_table_push_table(
                 "source_query": source_query,
                 "source_table_key": source_table_key,
                 "source_rows": source_rows_int,
+                "hide_meta_expander": True,
+                "hide_table_key_caption": True,
             },
         }
         push_sims_result_to_chat(payload, action)
@@ -3478,6 +3695,8 @@ def _current_table_push_table(
             "source_table_key": source_table_key,
             "source_rows": source_rows_int,
             "table_profile": "current_table_followup",
+            "hide_meta_expander": True,
+            "hide_table_key_caption": True,
         },
     }
     if isinstance(extra_meta, dict) and extra_meta:
@@ -3523,6 +3742,7 @@ def _current_table_push_notice(
             "source_query": source_query,
             "render_as_text": True,
             "hide_meta_expander": True,
+            "hide_table_key_caption": True,
         },
     }
 
@@ -4078,7 +4298,7 @@ def _try_handle_current_table_dataframe_followup(
             log.warning("[chat.followup_table] detail col not found label=%s columns=%s", label, list(df.columns)[:30])
             return False
 
-        mask = df[col].astype(str).str.contains(value, case=False, na=False, regex=False)
+        mask = _current_table_first_series(df, col).astype(str).str.contains(value, case=False, na=False, regex=False)
         out = df.loc[mask].copy()
 
         title = f"현재표 {field_name} {value} 상세표"
@@ -4110,13 +4330,22 @@ def _try_handle_current_table_dataframe_followup(
     # - 현재표에서 입고수량이 100 이상인 제품 표로 보여줘
     op, threshold, op_label = _current_table_numeric_filter_op(t)
 
+    shortage_qty_words = ("부족제품수", "부족수량", "제품부족수량", "부족예상수량")
     numeric_filter_hit = (
         bool(op)
-        and any(w in t for w in ("수량", "재고수량", "출고수량", "입고수량"))
+        and any(w in t for w in ("수량", "재고수량", "출고수량", "입고수량", *shortage_qty_words))
     )
 
     if numeric_filter_hit:
-        if "재고수량" in t:
+        if any(w in t for w in shortage_qty_words):
+            qty_col = _current_table_find_col(
+                df,
+                exact=("부족예상수량", "배정부족예상수량", "부족수량", "1개월부족수량"),
+                include_any=("부족예상수량", "부족수량"),
+                exclude_any=("금액", "단가", "코드"),
+            )
+            qty_label = "부족예상수량"
+        elif "재고수량" in t:
             qty_col = _current_table_find_col(
                 df,
                 exact=("재고수량", "현재재고수량", "기말재고수량", "실재고수량", "장부재고수량"),
@@ -4178,7 +4407,7 @@ def _try_handle_current_table_dataframe_followup(
                 source_query=t,
             )
 
-        nums = _current_table_to_num(df[qty_col])
+        nums = _current_table_to_num(_current_table_first_series(df, qty_col))
 
         if op == ">=":
             mask = nums >= threshold
@@ -5351,6 +5580,27 @@ def build_messages_with_system(
     # ✅ 일반 질문일 때는 SIMS 관련 히스토리를 제외해 "SIMS에 없다" 답변을 방지
     sims_noise = re.compile(r"(SIMS|ERP|\[SIMS_|컨텍스트|거래처|사용자목록|부서별|Rddbc0\d+)", re.IGNORECASE)
 
+    if not attach_sims:
+        t_ctx = time.perf_counter()
+        compact_room_ctx = _build_current_room_compact_context()
+        try:
+            _script_perf_add("chat_context", time.perf_counter() - t_ctx)
+        except Exception:
+            pass
+        if compact_room_ctx:
+            msgs.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "[CURRENT_ROOM_COMPACT_CONTEXT]\n"
+                        "Use only this current chat room/company context when it helps answer the user's latest question. "
+                        "Do not invent hidden table rows; this is compact metadata only.\n"
+                        f"{compact_room_ctx}\n"
+                        "[/CURRENT_ROOM_COMPACT_CONTEXT]"
+                    ),
+                }
+            )
+
     for m in reversed(history_msgs):
         if m.get("role") not in ("user", "assistant"):
             continue
@@ -5448,7 +5698,7 @@ def _default_room_name() -> str:
 
     return f"{now_text} 업무 대화"
 
-def _room_title_text_from_message(content: str, *, limit: int = 32) -> str:
+def _room_title_text_from_message(content: str, *, limit: int = 20) -> str:
     """
     첫 사용자 메시지에서 채팅방 제목으로 쓸 짧은 문구를 만든다.
     LLM 호출 없이 즉시 처리한다.
@@ -5469,6 +5719,16 @@ def _room_title_text_from_message(content: str, *, limit: int = 32) -> str:
 
     if not text:
         return ""
+
+    limit = max(20, min(int(limit or 26), 30))
+
+    # 첫 문장/첫 절 중심으로 잘라 긴 일반 질문이 채팅방 제목 전체를 차지하지 않게 한다.
+    for sep in ("?", "？", "!", "！", ".", "。"):
+        if sep in text:
+            head = text.split(sep, 1)[0].strip()
+            if head:
+                text = head
+            break
 
     if len(text) > limit:
         text = text[:limit].rstrip() + "…"
@@ -5529,6 +5789,12 @@ def _ensure_auto_room_name(room: dict[str, Any]) -> None:
     if not isinstance(room, dict):
         return
 
+    if room.get("title_initialized") is True:
+        return
+
+    if room.get("auto_created") is not True:
+        return
+
     if room.get("name_auto") is not True:
         return
 
@@ -5542,6 +5808,8 @@ def _ensure_auto_room_name(room: dict[str, Any]) -> None:
 
         room["name"] = new_name
         room["title_source"] = "first_user_message"
+        room["title_initialized"] = True
+        room["name_auto"] = False
 
         try:
             if str(st.session_state.get("current_room") or "") == str(room.get("id") or ""):
@@ -5570,6 +5838,7 @@ def _make_chat_room(*, name: str | None = None, auto_created: bool = False) -> d
         "updated_at": make_ts(),
         "auto_created": bool(auto_created),
         "name_auto": name is None,
+        "title_initialized": bool(name is not None or not auto_created),
         "title_source": "default",        
         "messages": [],
         "gen_messages": [],
@@ -5602,7 +5871,7 @@ def _is_empty_auto_room(room: dict[str, Any] | None) -> bool:
     )
 
 
-def _select_pending_new_room() -> dict[str, Any]:
+def _select_pending_new_room(*, close_sims_state: bool = False) -> dict[str, Any]:
     """
     로그인 직후 기본 입력 대상은 기존 방이 아니라 새 대화 대기방이다.
 
@@ -5618,11 +5887,15 @@ def _select_pending_new_room() -> dict[str, Any]:
     for room in ss.chat_rooms:
         if _is_empty_auto_room(room):
             ss.current_room = room.get("id")
+            if close_sims_state:
+                _request_sims_close_for_new_pending_room()
             return room
 
     room = _make_chat_room(auto_created=True)
     ss.chat_rooms.append(room)
     ss.current_room = room["id"]
+    if close_sims_state:
+        _request_sims_close_for_new_pending_room()
 
     try:
         log.info("[chat.room] pending new room %s", _chat_log_kv(room))
@@ -5641,6 +5914,8 @@ def _get_current_room_or_pending() -> dict[str, Any]:
     if current_id:
         for room in ss.chat_rooms:
             if str(room.get("id") or "") == current_id:
+                if room.get("__messages_loaded") is False:
+                    _ensure_partitioned_room_loaded(current_id)
                 return room
 
     return _select_pending_new_room()
@@ -5676,6 +5951,137 @@ def _drop_empty_auto_rooms(*, keep_room_id: str = "") -> int:
     return removed
 
 
+CHAT_ROOM_PAGE_SIZE = 10
+
+
+def _compute_room_sidebar_state(
+    rooms: list[dict[str, Any]],
+    *,
+    current_room_id: str = "",
+    filter_text: str = "",
+    page: Any = 0,
+    previous_filter: str | None = None,
+    page_size: int = CHAT_ROOM_PAGE_SIZE,
+    force_reset_reason: str = "",
+    initial_to_last: bool = False,
+) -> dict[str, Any]:
+    """Return the persisted sidebar room slice without mutating room data."""
+
+    room_list = [room for room in rooms or [] if isinstance(room, dict)]
+    pending_rooms = [room for room in room_list if _is_empty_auto_room(room)]
+    persisted_rooms = [room for room in room_list if not _is_empty_auto_room(room)]
+    persisted_ids = {str(room.get("id") or "") for room in persisted_rooms if str(room.get("id") or "")}
+    pending_ids = {str(room.get("id") or "") for room in pending_rooms if str(room.get("id") or "")}
+    current_id = str(current_room_id or "").strip()
+    q = str(filter_text or "").strip().lower()
+    prev_q = None if previous_filter is None else str(previous_filter or "").strip().lower()
+    filter_changed = prev_q is not None and q != prev_q
+    filtered = [room for room in persisted_rooms if q in str(room.get("name") or "").lower()]
+    total_persisted_rooms = len(persisted_rooms)
+    filtered_persisted_rooms = len(filtered)
+    page_size = max(1, int(page_size or CHAT_ROOM_PAGE_SIZE))
+    max_page = max(0, (filtered_persisted_rooms - 1) // page_size)
+    try:
+        page_int = int(page)
+    except Exception:
+        page_int = max_page if initial_to_last else 0
+
+    current_in_persisted = bool(current_id and current_id in persisted_ids)
+    if current_id and current_id in pending_ids:
+        current_kind = "pending"
+    elif current_in_persisted:
+        current_kind = "persisted"
+    elif current_id:
+        current_kind = "stale"
+    else:
+        current_kind = "none"
+    page_reset_reason = str(force_reset_reason or "")
+    if filter_changed and not page_reset_reason:
+        page_reset_reason = "filter_changed"
+    elif current_kind == "stale" and not page_reset_reason:
+        page_reset_reason = "stale_current_room"
+    elif page_int < 0 or page_int > max_page:
+        page_reset_reason = "page_out_of_range"
+
+    if page_reset_reason == "filter_changed":
+        page_int = max_page
+    elif page_reset_reason == "page_out_of_range":
+        page_int = max_page
+    elif page_reset_reason == "stale_current_room":
+        page_int = max_page
+    elif page_reset_reason:
+        page_int = 0
+    elif initial_to_last:
+        page_int = max_page
+    else:
+        page_int = max(0, min(page_int, max_page))
+
+    start = page_int * page_size
+    end = start + page_size
+    view = filtered[start:end]
+    range_start = start + 1 if filtered_persisted_rooms else 0
+    range_end = min(end, filtered_persisted_rooms)
+    if q:
+        caption = f"검색 결과 {filtered_persisted_rooms}개 / 전체 {total_persisted_rooms}개"
+    elif filtered_persisted_rooms:
+        caption = f"{range_start}-{range_end} / 저장된 채팅방 총 {filtered_persisted_rooms}개"
+    else:
+        caption = f"0 / 저장된 채팅방 총 {total_persisted_rooms}개"
+
+    return {
+        "filter_text": q,
+        "filter_set": bool(q),
+        "filter_changed": filter_changed,
+        "rooms_filtered": filtered,
+        "persisted_rooms": persisted_rooms,
+        "pending_rooms": pending_rooms,
+        "pending_visible": bool(pending_rooms),
+        "total_rooms": total_persisted_rooms,
+        "persisted_room_count": total_persisted_rooms,
+        "filtered_rooms": filtered_persisted_rooms,
+        "filtered_persisted_rooms": filtered_persisted_rooms,
+        "page": page_int,
+        "max_page": max_page,
+        "start": start,
+        "end": end,
+        "range_start": range_start,
+        "range_end": range_end,
+        "view": view,
+        "current_kind": current_kind,
+        "current_in_rooms": current_in_persisted,
+        "current_in_persisted": current_in_persisted,
+        "page_reset_reason": page_reset_reason,
+        "caption": caption,
+        "prev_disabled": page_int <= 0,
+        "next_disabled": page_int >= max_page,
+        "page_label": f"{page_int + 1} / {max_page + 1}",
+    }
+
+
+def _resolve_room_pick(
+    *,
+    current_room_id: Any,
+    picked_pending: Any,
+    picked_persisted: Any,
+    pending_ids: Iterable[Any],
+    persisted_ids: Iterable[Any],
+) -> str | None:
+    current = str(current_room_id or "")
+    pending_set = {str(v or "") for v in (pending_ids or []) if str(v or "")}
+    persisted_set = {str(v or "") for v in (persisted_ids or []) if str(v or "")}
+    pending = str(picked_pending or "")
+    persisted = str(picked_persisted or "")
+
+    persisted_changed = bool(persisted and persisted in persisted_set and persisted != current)
+    pending_changed = bool(pending and pending in pending_set and pending != current)
+
+    if persisted_changed:
+        return persisted
+    if pending_changed:
+        return pending
+    return None
+
+
 def _ensure_sims_panel_room_title(room: dict[str, Any], action: str) -> None:
     """
     첫 이벤트가 일반 채팅이 아니라 SIMS 패널 조회인 경우,
@@ -5692,7 +6098,8 @@ def _ensure_sims_panel_room_title(room: dict[str, Any], action: str) -> None:
 
         room["name"] = new_name
         room["auto_created"] = False
-        room["name_auto"] = True
+        room["name_auto"] = False
+        room["title_initialized"] = True
         room["title_source"] = "sims_panel_action"
         room["updated_at"] = make_ts()
 
@@ -6045,8 +6452,12 @@ def _sync_room_meta(
     room.update(_current_chat_meta())
 
     if materialize:
+        was_pending = room.get("auto_created") is True and room.get("title_initialized") is not True
+        if was_pending:
+            _ensure_auto_room_name(room)
         room["auto_created"] = False
-        _ensure_auto_room_name(room)
+        room["name_auto"] = False
+        room["title_initialized"] = True
 
     room["updated_at"] = make_ts()
 
@@ -6204,6 +6615,981 @@ def _effective_chat_file() -> str:
     return str(base.parent / f"user_{int(user.user_id)}_chat_rooms.json")
 
 
+_CHAT_PARTITION_CHANNELS = ("messages", "history", "sims_messages", "gen_messages")
+
+
+def _chat_storage_mode_enabled() -> bool:
+    return str(os.getenv("SSAI_CHAT_STORAGE_MODE", "partitioned") or "").strip().lower() != "legacy"
+
+
+def _partitioned_chat_root(chat_file: str | None = None) -> Path:
+    path = Path(str(chat_file or _effective_chat_file()))
+    stem = path.stem
+    if stem.endswith("_chat_rooms"):
+        stem = stem[: -len("_chat_rooms")]
+    return path.parent / stem
+
+
+def _partitioned_rooms_file(root: Path) -> Path:
+    return root / "rooms.json"
+
+
+def _safe_room_dirname(room_id: Any) -> str:
+    s = str(room_id or "").strip() or str(uuid.uuid4())
+    return re.sub(r"[^0-9A-Za-z_.-]+", "_", s)[:120] or str(uuid.uuid4())
+
+
+def _short_room_id(room_id: Any, length: int = 8) -> str:
+    s = re.sub(r"[^0-9A-Za-z]+", "", str(room_id or ""))
+    return (s[:length] or uuid.uuid4().hex[:length]).lower()
+
+
+def _safe_room_title_slug(title: Any, limit: int = 48) -> str:
+    text = str(title or "새 대화").strip()
+    text = re.sub(r'[<>:"/\\|?*]+', "_", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    text = text.replace(" ", "_")
+    text = re.sub(r"_+", "_", text).strip("._ ")
+    return (text[:limit].strip("._ ") or "새_대화")
+
+
+def _split_room_name_datetime_prefix(name: Any) -> tuple[str | None, str]:
+    text = str(name or "").strip()
+    m = re.match(
+        r"^\s*(\d{4})-(\d{2})-(\d{2})[ T_]+(\d{1,2})[:\-_](\d{2})(?:[:\-_]\d{2})?\s+(.+?)\s*$",
+        text,
+    )
+    if not m:
+        return None, text
+    date_part = f"{m.group(1)}-{m.group(2)}-{m.group(3)}_{int(m.group(4)):02d}-{m.group(5)}"
+    title = str(m.group(6) or "").strip()
+    return date_part, title
+
+
+def _readable_room_dirname(room: dict[str, Any]) -> str:
+    rid = str((room or {}).get("id") or uuid.uuid4())
+    raw_title = (room or {}).get("name") or (room or {}).get("title") or "새 대화"
+    date_part, title_text = _split_room_name_datetime_prefix(raw_title)
+    if not date_part:
+        created = str((room or {}).get("created_at") or make_ts())
+        prefix = re.sub(r"[^0-9]", "", created)[:12]
+        if len(prefix) >= 12:
+            date_part = f"{prefix[:4]}-{prefix[4:6]}-{prefix[6:8]}_{prefix[8:10]}-{prefix[10:12]}"
+        else:
+            date_part = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    title = _safe_room_title_slug(title_text or raw_title)
+    return f"{date_part}_{title}__{_short_room_id(rid)}"[:150].rstrip(" .")
+
+
+def _room_relative_messages_path_from_dirname(dirname: str) -> str:
+    return str(Path("rooms") / dirname / "messages.jsonl")
+
+
+def _room_dir_from_relative_path(root: Path, relative_path: Any) -> Path | None:
+    rel_s = str(relative_path or "").strip()
+    if not rel_s:
+        return None
+    rel = Path(rel_s)
+    if rel.is_absolute() or any(part == ".." for part in rel.parts):
+        return None
+    if rel.name == "messages.jsonl":
+        rel = rel.parent
+    path = (root / rel).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except Exception:
+        return None
+    return path
+
+
+def _partitioned_room_dir(root: Path, room_id: Any) -> Path:
+    return root / "rooms" / _safe_room_dirname(room_id)
+
+
+def _partitioned_messages_file(root: Path, room_id: Any) -> Path:
+    return _partitioned_room_dir(root, room_id) / "messages.jsonl"
+
+
+def _partitioned_room_dir_for_room(root: Path, room: dict[str, Any]) -> Path:
+    if isinstance(room, dict):
+        rel_dir = _room_dir_from_relative_path(root, room.get("relative_path"))
+        if rel_dir is not None:
+            return rel_dir
+        rid = str(room.get("id") or "")
+        legacy_dir = _partitioned_room_dir(root, rid)
+        if rid and legacy_dir.exists():
+            room["relative_path"] = _room_relative_messages_path_from_dirname(legacy_dir.name)
+            return legacy_dir
+        dirname = _readable_room_dirname(room)
+        room["relative_path"] = _room_relative_messages_path_from_dirname(dirname)
+        return root / "rooms" / dirname
+    return _partitioned_room_dir(root, "")
+
+
+def _partitioned_messages_file_for_room(root: Path, room: dict[str, Any]) -> Path:
+    return _partitioned_room_dir_for_room(root, room) / "messages.jsonl"
+
+
+def _ensure_room_relative_path(root: Path, room: dict[str, Any]) -> None:
+    if not isinstance(room, dict):
+        return
+    old_dir = _room_dir_from_relative_path(root, room.get("relative_path"))
+    rid = str(room.get("id") or "")
+    if old_dir is None and rid:
+        legacy_dir = _partitioned_room_dir(root, rid)
+        if legacy_dir.exists():
+            room["relative_path"] = _room_relative_messages_path_from_dirname(legacy_dir.name)
+            return
+    if old_dir is None:
+        dirname = _readable_room_dirname(room)
+        room["relative_path"] = _room_relative_messages_path_from_dirname(dirname)
+        return
+    if old_dir.name == _safe_room_dirname(rid):
+        return
+    desired = root / "rooms" / _readable_room_dirname(room)
+    if desired == old_dir:
+        return
+    if old_dir.exists() and not desired.exists():
+        try:
+            desired.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(str(old_dir), str(desired))
+            room["relative_path"] = _room_relative_messages_path_from_dirname(desired.name)
+            log.info(
+                "[chat.storage.room_dir] renamed room_id=%s old=%s new=%s",
+                rid,
+                str(old_dir),
+                str(desired),
+            )
+        except Exception:
+            log.warning(
+                "[chat.storage.room_dir] rename failed; keep relative_path room_id=%s old=%s desired=%s",
+                rid,
+                str(old_dir),
+                str(desired),
+            )
+
+
+def _room_meta_only(room: dict[str, Any]) -> dict[str, Any]:
+    out = {
+        str(k): _compact_partition_value(v)
+        for k, v in (room or {}).items()
+        if k not in _CHAT_PARTITION_CHANNELS
+        and str(k) not in CHAT_PERSISTENCE_DROP_KEYS
+        and not str(k).startswith("__")
+    }
+    out.setdefault("id", str((room or {}).get("id") or uuid.uuid4()))
+    out.setdefault("name", str((room or {}).get("name") or "업무 대화"))
+    out.setdefault("created_at", (room or {}).get("created_at") or make_ts())
+    out.setdefault("updated_at", (room or {}).get("updated_at") or make_ts())
+    try:
+        out["message_count"] = int(len(_partition_collect_records(room)))
+    except Exception:
+        out.setdefault("message_count", 0)
+    return out
+
+
+def _write_rooms_index_csv(root: Path, meta_rooms: list[dict[str, Any]]) -> None:
+    import csv
+
+    rows: list[dict[str, Any]] = []
+    for meta in meta_rooms or []:
+        if not isinstance(meta, dict):
+            continue
+        rid = str(meta.get("id") or "")
+        if not rid:
+            continue
+        rel_path = str(meta.get("relative_path") or _room_relative_messages_path_from_dirname(_safe_room_dirname(rid)))
+        msg_dir = _room_dir_from_relative_path(root, rel_path)
+        msg_path = (msg_dir / "messages.jsonl") if msg_dir is not None else _partitioned_messages_file(root, rid)
+        try:
+            file_bytes = int(msg_path.stat().st_size) if msg_path.exists() else 0
+        except Exception:
+            file_bytes = 0
+        rows.append(
+            {
+                "room_id": rid,
+                "room_name": str(meta.get("name") or meta.get("title") or ""),
+                "created_at": str(meta.get("created_at") or ""),
+                "updated_at": str(meta.get("updated_at") or ""),
+                "company_id": str(meta.get("company_id") or ""),
+                "message_count": int(meta.get("message_count") or 0),
+                "messages_file_bytes": file_bytes,
+                "messages_file_mb": f"{file_bytes / (1024 * 1024):.2f}",
+                "relative_path": rel_path,
+            }
+        )
+
+    index_path = root / "rooms_index.csv"
+    tmp_path = root / f"rooms_index.{uuid.uuid4().hex}.tmp"
+    with tmp_path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "room_id",
+                "room_name",
+                "created_at",
+                "updated_at",
+                "company_id",
+                "message_count",
+                "messages_file_bytes",
+                "messages_file_mb",
+                "relative_path",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(str(tmp_path), str(index_path))
+
+
+def _partition_message_key(message: dict[str, Any]) -> str:
+    mid = str((message or {}).get("id") or "").strip()
+    if mid:
+        return f"id:{mid}"
+    try:
+        raw = repr(_message_dedupe_key(message))
+    except Exception:
+        raw = str(type(message).__name__)
+    return "sig:" + hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+_CHAT_PARTITION_MESSAGE_ALLOW_KEYS = {
+    "id",
+    "message_id",
+    "seq",
+    "role",
+    "type",
+    "kind",
+    "channel",
+    "content",
+    "message",
+    "title",
+    "action",
+    "time",
+    "created_at",
+    "timestamp",
+    "datetime",
+    "params",
+    "table_key",
+    "payload_id",
+    "source_key",
+    "source_action",
+    "meta",
+}
+
+_CHAT_PARTITION_META_ALLOW_KEYS = {
+    "id",
+    "message_id",
+    "kind",
+    "type",
+    "action",
+    "title",
+    "table_key",
+    "payload_id",
+    "source_key",
+    "source_action",
+    "source_table_key",
+    "source_room_id",
+    "company_id",
+    "company_name",
+    "db_name",
+    "created_at",
+    "display_time",
+    "result_seq",
+    "row_count",
+    "rows",
+    "full_rows",
+    "display_rows",
+    "expected_rows",
+    "column_count",
+    "columns",
+    "summary_md",
+    "summary",
+    "query_summary",
+    "condition_summary",
+    "params",
+    "nlq",
+    "current_table_followup",
+    "supplier_detail_key",
+    "supplier_detail_rows",
+    "excel_sheet_names",
+}
+
+_CHAT_PARTITION_TEXT_LIMIT = int(os.getenv("SSAI_CHAT_MESSAGE_TEXT_LIMIT") or "20000")
+_CHAT_PARTITION_META_TEXT_LIMIT = int(os.getenv("SSAI_CHAT_MESSAGE_META_TEXT_LIMIT") or "8000")
+_CHAT_PARTITION_RECORD_MAX_BYTES = int(os.getenv("SSAI_CHAT_MESSAGE_RECORD_MAX_BYTES") or "65536")
+CHAT_PERSISTENCE_DROP_KEYS = {
+    "df",
+    "df_display",
+    "data",
+    "records",
+    "full_df",
+    "display_df",
+    "excel_bytes",
+    "csv_bytes",
+    "payload",
+    "rows_data",
+    "supplier_detail_df",
+    "product_shortage_df",
+}
+
+
+def _clip_partition_text(value: Any, limit: int) -> Any:
+    if isinstance(value, str) and len(value) > limit:
+        return value[:limit].rstrip() + "\n...[truncated]"
+    return value
+
+
+def _compact_partition_value(value: Any, *, text_limit: int = _CHAT_PARTITION_META_TEXT_LIMIT, depth: int = 0) -> Any:
+    if depth > 4:
+        return str(type(value).__name__)
+    if isinstance(value, str):
+        return _clip_partition_text(value, text_limit)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            sk = str(k)
+            if sk in CHAT_PERSISTENCE_DROP_KEYS:
+                continue
+            if len(out) >= 80:
+                out["__truncated_keys__"] = True
+                break
+            out[sk] = _compact_partition_value(v, text_limit=text_limit, depth=depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        if len(value) > 80:
+            return [_compact_partition_value(v, text_limit=text_limit, depth=depth + 1) for v in value[:80]] + ["...[truncated]"]
+        return [_compact_partition_value(v, text_limit=text_limit, depth=depth + 1) for v in value]
+    return _json_sanitize(value)
+
+
+def _partition_large_paths(obj: Any, prefix: str = "$", limit: int = 8) -> list[tuple[str, int]]:
+    rows: list[tuple[str, int]] = []
+
+    def _size(v: Any) -> int:
+        try:
+            return len(json.dumps(_json_sanitize(v), ensure_ascii=False, default=str).encode("utf-8"))
+        except Exception:
+            return len(str(type(v).__name__).encode("utf-8"))
+
+    def _walk(v: Any, p: str, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(v, dict):
+            for k, child in v.items():
+                cp = f"{p}.{k}"
+                rows.append((cp, _size(child)))
+                _walk(child, cp, depth + 1)
+        elif isinstance(v, list):
+            for i, child in enumerate(v[:20]):
+                cp = f"{p}[{i}]"
+                rows.append((cp, _size(child)))
+                _walk(child, cp, depth + 1)
+
+    _walk(obj, prefix)
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return rows[:limit]
+
+
+def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
+    """Return an allow-listed, JSON-safe message record without table payload bodies."""
+    if not isinstance(message, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in _CHAT_PARTITION_MESSAGE_ALLOW_KEYS:
+        if key not in message:
+            continue
+        value = message.get(key)
+        if key in {"content", "message"}:
+            value = _clip_partition_text(value, _CHAT_PARTITION_TEXT_LIMIT)
+        elif key == "meta" and isinstance(value, dict):
+            meta_out: dict[str, Any] = {}
+            for mk in _CHAT_PARTITION_META_ALLOW_KEYS:
+                if mk in value:
+                    meta_out[mk] = _compact_partition_value(value.get(mk))
+            value = meta_out
+        else:
+            value = _compact_partition_value(value)
+        out[key] = value
+    if "meta" not in out and isinstance(message.get("meta"), dict):
+        out["meta"] = {}
+    return _json_sanitize(out)
+
+
+def _partition_logical_message_key(message: dict[str, Any]) -> str:
+    try:
+        key = _message_dedupe_key(message)
+        return "logical:" + hashlib.sha1(repr(key).encode("utf-8", errors="ignore")).hexdigest()
+    except Exception:
+        return _partition_message_key(message)
+
+
+def _partition_collect_records(room: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    if not isinstance(room, dict):
+        return records
+    for ch in _CHAT_PARTITION_CHANNELS:
+        for msg in room.get(ch) or []:
+            if not isinstance(msg, dict):
+                continue
+            key = _partition_logical_message_key(msg)
+            entry = records.setdefault(key, {"channels": [], "message": msg})
+            if ch not in entry["channels"]:
+                entry["channels"].append(ch)
+            # Keep the object with more metadata keys without stringifying large payloads.
+            if len(msg.keys()) > len((entry.get("message") or {}).keys()):
+                entry["message"] = msg
+    return records
+
+
+def _room_persistence_projection(room: dict[str, Any]) -> dict[str, Any]:
+    """Build a JSON-safe room export using the same compact persistence schema.
+
+    This is intentionally separate from the runtime room object. Runtime entries may
+    contain DataFrame payloads needed for rendering/current-table followups, while
+    this projection only carries message metadata and compact table references.
+    """
+    if not isinstance(room, dict):
+        return {"version": 2, "storage_mode": "partitioned", "room": {}, "messages": []}
+    room_id = str(room.get("id") or "")
+    messages: list[dict[str, Any]] = []
+    for logical_key, entry in _partition_collect_records(room).items():
+        msg = entry.get("message")
+        if not isinstance(msg, dict):
+            continue
+        channels = entry.get("channels") if isinstance(entry.get("channels"), list) else ["messages"]
+        messages.append(
+            {
+                "logical_key": str(logical_key),
+                "channels": [str(ch) for ch in channels if str(ch) in _CHAT_PARTITION_CHANNELS] or ["messages"],
+                "message": _partition_message_payload(msg),
+            }
+        )
+    return {
+        "version": 2,
+        "storage_mode": str(st.session_state.get("__chat_storage_mode") or "partitioned"),
+        "room_id": room_id,
+        "room": _room_meta_only(room),
+        "messages": messages,
+    }
+
+
+def _partition_record_line(room_id: str, logical_key: str, channels: list[str], message: dict[str, Any]) -> tuple[str, int]:
+    payload = _partition_message_payload(message)
+    rec = {
+        "version": 2,
+        "logical_key": logical_key,
+        "channels": [ch for ch in channels if ch in _CHAT_PARTITION_CHANNELS] or ["messages"],
+        "message": payload,
+    }
+    line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"), default=str)
+    record_bytes = len(line.encode("utf-8"))
+    if record_bytes > _CHAT_PARTITION_RECORD_MAX_BYTES:
+        large_paths = _partition_large_paths(rec)
+        log.warning(
+            "[chat.storage.record_guard] room_id=%s logical_key=%s record_bytes=%s max_bytes=%s large_paths=%s role=%s action=%s",
+            str(room_id or ""),
+            logical_key,
+            record_bytes,
+            _CHAT_PARTITION_RECORD_MAX_BYTES,
+            [(p, s) for p, s in large_paths],
+            str(message.get("role") or ""),
+            str(message.get("action") or message.get("title") or ""),
+        )
+        compact = dict(payload)
+        if isinstance(compact.get("content"), str):
+            compact["content"] = _clip_partition_text(compact.get("content"), 4000)
+        if isinstance(compact.get("message"), str):
+            compact["message"] = _clip_partition_text(compact.get("message"), 4000)
+        meta = compact.get("meta")
+        if isinstance(meta, dict):
+            for k in list(meta.keys()):
+                if isinstance(meta.get(k), str):
+                    meta[k] = _clip_partition_text(meta.get(k), 2000)
+            compact["meta"] = meta
+        compact["storage_truncated"] = True
+        rec["message"] = _json_sanitize(compact)
+        line = json.dumps(rec, ensure_ascii=False, separators=(",", ":"), default=str)
+        record_bytes = len(line.encode("utf-8"))
+    return line, record_bytes
+
+
+def _compact_partition_room_in_memory(room: dict[str, Any]) -> dict[str, Any]:
+    """Remove nested table payloads from already-loaded partition messages in session_state."""
+    stats = {"messages": 0, "changed": 0, "elapsed": 0.0}
+    if not isinstance(room, dict):
+        return stats
+    if str(st.session_state.get("__chat_storage_mode") or "") != "partitioned":
+        return stats
+    t0 = time.perf_counter()
+    for ch in _CHAT_PARTITION_CHANNELS:
+        items = room.get(ch)
+        if not isinstance(items, list):
+            continue
+        for idx, msg in enumerate(list(items)):
+            if not isinstance(msg, dict):
+                continue
+            stats["messages"] += 1
+            has_live_dataframe = False
+            try:
+                import pandas as _pd
+                has_live_dataframe = any(
+                    isinstance(msg.get(k), _pd.DataFrame)
+                    for k in ("df", "df_display", "data")
+                )
+            except Exception:
+                has_live_dataframe = False
+            if has_live_dataframe:
+                continue
+            meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
+            has_large_nested = any(k in msg for k in CHAT_PERSISTENCE_DROP_KEYS) or any(k in meta for k in CHAT_PERSISTENCE_DROP_KEYS)
+            if has_large_nested:
+                items[idx] = _partition_message_payload(msg)
+                stats["changed"] += 1
+    stats["elapsed"] = time.perf_counter() - t0
+    if stats["changed"]:
+        log.warning(
+            "[chat.storage.session_compact] room_id=%s messages=%s changed=%s elapsed=%.3fs",
+            str(room.get("id") or ""),
+            stats["messages"],
+            stats["changed"],
+            stats["elapsed"],
+        )
+    try:
+        _script_perf_add("session_compact", float(stats["elapsed"] or 0.0))
+    except Exception:
+        pass
+    return stats
+
+
+def _partition_seen_index(rooms: list[dict[str, Any]]) -> dict[str, dict[str, set[str]]]:
+    seen: dict[str, dict[str, set[str]]] = {}
+    for room in rooms or []:
+        if not isinstance(room, dict):
+            continue
+        rid = str(room.get("id") or "")
+        if not rid:
+            continue
+        room_seen = seen.setdefault(rid, {ch: set() for ch in _CHAT_PARTITION_CHANNELS})
+        room_seen.setdefault("__logical__", set())
+        for ch in _CHAT_PARTITION_CHANNELS:
+            for msg in room.get(ch) or []:
+                if isinstance(msg, dict):
+                    room_seen.setdefault(ch, set()).add(_partition_message_key(msg))
+                    room_seen.setdefault("__logical__", set()).add(_partition_logical_message_key(msg))
+    return seen
+
+
+def _set_chat_storage_state(mode: str, root: Path | None = None, rooms: list[dict[str, Any]] | None = None) -> None:
+    try:
+        st.session_state["__chat_storage_mode"] = str(mode or "legacy")
+        if root is not None:
+            st.session_state["__chat_partition_root"] = str(root)
+        if rooms is not None:
+            st.session_state["__chat_partition_seen"] = _partition_seen_index(rooms)
+    except Exception:
+        pass
+
+
+def _load_partitioned_room_messages(root: Path, room: dict[str, Any]) -> int:
+    if not isinstance(room, dict):
+        return 0
+    rid = str(room.get("id") or "")
+    if not rid:
+        return 0
+    for ch in _CHAT_PARTITION_CHANNELS:
+        room[ch] = []
+    loaded_bytes = 0
+    skipped_bad_lines = 0
+    msg_path = _partitioned_messages_file_for_room(root, room)
+    if msg_path.exists():
+        loaded_bytes = int(msg_path.stat().st_size)
+        with msg_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                if len(line.encode("utf-8", errors="ignore")) > _CHAT_PARTITION_RECORD_MAX_BYTES:
+                    log.warning(
+                        "[chat.storage.record_guard] phase=load room_id=%s record_bytes=%s max_bytes=%s",
+                        rid,
+                        len(line.encode("utf-8", errors="ignore")),
+                        _CHAT_PARTITION_RECORD_MAX_BYTES,
+                    )
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    skipped_bad_lines += 1
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                channels = rec.get("channels")
+                if not isinstance(channels, list):
+                    channels = [str(rec.get("channel") or "messages")]
+                channels = [str(ch) for ch in channels if str(ch) in _CHAT_PARTITION_CHANNELS]
+                if not channels:
+                    channels = ["messages"]
+                msg = rec.get("message")
+                if isinstance(msg, dict):
+                    msg = _partition_message_payload(msg)
+                    for ch in channels:
+                        room.setdefault(ch, []).append(dict(msg))
+    if skipped_bad_lines:
+        st.session_state["__chat_partition_skipped_bad_lines"] = int(
+            st.session_state.get("__chat_partition_skipped_bad_lines") or 0
+        ) + skipped_bad_lines
+    room["__messages_loaded"] = True
+    try:
+        seen = st.session_state.setdefault("__chat_partition_seen", {})
+        seen[str(rid)] = _partition_seen_index([room]).get(str(rid), {ch: set() for ch in _CHAT_PARTITION_CHANNELS})
+    except Exception:
+        pass
+    return loaded_bytes
+
+
+def _ensure_partitioned_room_loaded(room_id: str) -> None:
+    if str(st.session_state.get("__chat_storage_mode") or "") != "partitioned":
+        return
+    root_s = str(st.session_state.get("__chat_partition_root") or "")
+    if not root_s:
+        return
+    rooms = st.session_state.get("chat_rooms") or []
+    for room in rooms:
+        if isinstance(room, dict) and str(room.get("id") or "") == str(room_id or ""):
+            if room.get("__messages_loaded") is True:
+                return
+            t0 = time.perf_counter()
+            loaded_bytes = _load_partitioned_room_messages(Path(root_s), room)
+            log.info(
+                "[chat.storage.room_load] storage_mode=partitioned room_id=%s loaded_messages=%s loaded_bytes=%s room_load=%.3fs fallback=False",
+                str(room_id or ""),
+                sum(len(room.get(ch) or []) for ch in _CHAT_PARTITION_CHANNELS),
+                loaded_bytes,
+                time.perf_counter() - t0,
+            )
+            return
+
+
+def _load_partitioned_chat_rooms(chat_file: str) -> list[dict[str, Any]] | None:
+    root = _partitioned_chat_root(chat_file)
+    rooms_path = _partitioned_rooms_file(root)
+    if not rooms_path.exists():
+        return None
+
+    t0 = time.perf_counter()
+    loaded_bytes = 0
+    skipped_bad_lines = 0
+    try:
+        t_meta = time.perf_counter()
+        meta_obj = json.loads(rooms_path.read_text(encoding="utf-8"))
+        metadata_elapsed = time.perf_counter() - t_meta
+        loaded_bytes += int(rooms_path.stat().st_size)
+        room_metas = meta_obj.get("rooms") if isinstance(meta_obj, dict) else meta_obj
+        if not isinstance(room_metas, list):
+            raise ValueError("rooms.json does not contain room list")
+
+        selected_room_id = ""
+        if isinstance(meta_obj, dict):
+            # 로그인 직후에는 기존 rooms.json의 current_room/첫 방을 자동 선택하지 않는다.
+            # 사용자가 방을 고르기 전까지는 메모리 pending room만 사용한다.
+            selected_room_id = str(st.session_state.get("current_room") or "").strip()
+
+        rooms: list[dict[str, Any]] = []
+        for meta in room_metas:
+            if isinstance(meta, dict) and str(meta.get("id") or "") == selected_room_id:
+                break
+        else:
+            selected_room_id = ""
+
+        room_load_elapsed = 0.0
+        for meta in room_metas:
+            if not isinstance(meta, dict):
+                continue
+            room = dict(meta)
+            for ch in _CHAT_PARTITION_CHANNELS:
+                room[ch] = []
+            rid = str(room.get("id") or "")
+            if not rid:
+                continue
+            if "relative_path" not in room:
+                legacy_dir = _partitioned_room_dir(root, rid)
+                if legacy_dir.exists():
+                    room["relative_path"] = _room_relative_messages_path_from_dirname(legacy_dir.name)
+            if rid == selected_room_id:
+                t_room = time.perf_counter()
+                loaded_bytes += _load_partitioned_room_messages(root, room)
+                room_load_elapsed += time.perf_counter() - t_room
+                room["__messages_loaded"] = True
+                st.session_state["current_room"] = rid
+            else:
+                room["__messages_loaded"] = False
+            rooms.append(room)
+
+        rooms = migrate_rooms(rooms)
+        _set_chat_storage_state("partitioned", root, rooms)
+        total_elapsed = time.perf_counter() - t0
+        log.info(
+            "[chat.storage.load] storage_mode=partitioned root=%s rooms=%s loaded_messages=%s loaded_bytes=%s metadata=%.3fs room_load=%.3fs payload_check=0.000s migration=0.000s fallback=False skipped_bad_lines=%s total=%.3fs",
+            str(root),
+            len(rooms),
+            sum(len(r.get(ch) or []) for r in rooms for ch in _CHAT_PARTITION_CHANNELS),
+            loaded_bytes,
+            metadata_elapsed,
+            room_load_elapsed,
+            int(st.session_state.get("__chat_partition_skipped_bad_lines") or skipped_bad_lines),
+            total_elapsed,
+        )
+        return rooms
+    except Exception:
+        log.exception("[chat.storage.load] partitioned failed root=%s fallback=True", str(root))
+        _set_chat_storage_state("legacy", root, None)
+        return None
+
+
+
+def _write_partitioned_store_from_rooms(rooms: list[dict[str, Any]], chat_file: str) -> bool:
+    root = _partitioned_chat_root(chat_file)
+    parent = root.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    tmp_root = parent / f".{root.name}.tmp_{uuid.uuid4().hex}"
+    t0 = time.perf_counter()
+    message_count = 0
+    try:
+        (tmp_root / "rooms").mkdir(parents=True, exist_ok=True)
+        meta_rooms = []
+        for room in rooms or []:
+            if not isinstance(room, dict):
+                continue
+            rid = str(room.get("id") or uuid.uuid4())
+            room["id"] = rid
+            _ensure_room_relative_path(tmp_root, room)
+            meta = _room_meta_only(room)
+            meta_rooms.append(meta)
+
+            rdir = _partitioned_room_dir_for_room(tmp_root, room)
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "room.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            with (rdir / "messages.jsonl").open("w", encoding="utf-8", newline="\n") as f:
+                for logical_key, entry in _partition_collect_records(room).items():
+                    msg = entry.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    channels = entry.get("channels") if isinstance(entry.get("channels"), list) else ["messages"]
+                    line, record_bytes = _partition_record_line(rid, logical_key, channels, msg)
+                    f.write(line)
+                    f.write("\n")
+                    message_count += 1
+                    log.debug(
+                        "[chat.storage.append_record] phase=migration room_id=%s channels=%s role=%s message_id=%s record_bytes=%s action=%s",
+                        rid,
+                        ",".join(str(ch) for ch in channels),
+                        str(msg.get("role") or ""),
+                        str(msg.get("id") or msg.get("message_id") or logical_key),
+                        record_bytes,
+                        str(msg.get("action") or msg.get("title") or ""),
+                    )
+                f.flush()
+
+        current_room_for_meta = _valid_current_room_id_for_rooms(rooms)
+        rooms_doc = {
+            "version": 1,
+            "storage_mode": "partitioned",
+            "created_at": make_ts(),
+            "legacy_chat_file": str(chat_file),
+            "current_room": current_room_for_meta,
+            "rooms": meta_rooms,
+        }
+        _partitioned_rooms_file(tmp_root).write_text(
+            json.dumps(rooms_doc, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        # Basic validation before activation.
+        test = _partitioned_rooms_file(tmp_root)
+        if not test.exists() or not (tmp_root / "rooms").exists():
+            raise RuntimeError("partitioned validation failed")
+        _write_rooms_index_csv(tmp_root, meta_rooms)
+        tmp_root.rename(root)
+        _set_chat_storage_state("partitioned", root, rooms)
+        log.info(
+            "[chat.storage.migration] legacy_file=%s root=%s rooms=%s messages=%s elapsed=%.3fs fallback=False",
+            str(chat_file),
+            str(root),
+            len(meta_rooms),
+            message_count,
+            time.perf_counter() - t0,
+        )
+        return True
+    except Exception:
+        try:
+            if tmp_root.exists():
+                shutil.rmtree(tmp_root, ignore_errors=True)
+        except Exception:
+            pass
+        log.exception(
+            "[chat.storage.migration] legacy_file=%s root=%s elapsed=%.3fs fallback=True",
+            str(chat_file),
+            str(root),
+            time.perf_counter() - t0,
+        )
+        _set_chat_storage_state("legacy", root, None)
+        return False
+
+
+def _try_migrate_legacy_to_partitioned(rooms: list[dict[str, Any]], chat_file: str) -> bool:
+    if not _chat_storage_mode_enabled():
+        return False
+    root = _partitioned_chat_root(chat_file)
+    if _partitioned_rooms_file(root).exists():
+        return True
+    try:
+        size = os.path.getsize(chat_file) if os.path.exists(chat_file) else 0
+        mtime = datetime.fromtimestamp(os.path.getmtime(chat_file)).isoformat() if os.path.exists(chat_file) else ""
+    except Exception:
+        size = 0
+        mtime = ""
+    log.info(
+        "[chat.storage.migration.precheck] legacy_file=%s legacy_bytes=%s legacy_mtime=%s rooms=%s messages=%s",
+        str(chat_file),
+        size,
+        mtime,
+        len(rooms or []),
+        sum(len(r.get(ch) or []) for r in rooms or [] for ch in _CHAT_PARTITION_CHANNELS if isinstance(r, dict)),
+    )
+    return _write_partitioned_store_from_rooms(rooms, chat_file)
+
+
+def _valid_current_room_id_for_rooms(rooms: list[dict[str, Any]]) -> str:
+    current_room_id = str(st.session_state.get("current_room") or "").strip()
+    if current_room_id and any(str((room or {}).get("id") or "") == current_room_id for room in rooms or [] if isinstance(room, dict)):
+        return current_room_id
+    return ""
+
+
+def _save_partitioned_chat_rooms(rooms_to_save: list[dict[str, Any]], chat_file: str, *, event_id: str, dirty_reason: str) -> dict[str, Any]:
+    root = _partitioned_chat_root(chat_file)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "rooms").mkdir(parents=True, exist_ok=True)
+
+    seen = st.session_state.setdefault("__chat_partition_seen", {})
+    if not isinstance(seen, dict):
+        seen = {}
+        st.session_state["__chat_partition_seen"] = seen
+
+    t0 = time.perf_counter()
+    t_meta = time.perf_counter()
+    for room in rooms_to_save:
+        if isinstance(room, dict):
+            _ensure_room_relative_path(root, room)
+    meta_rooms = [_room_meta_only(room) for room in rooms_to_save if isinstance(room, dict)]
+    current_room_for_meta = _valid_current_room_id_for_rooms(rooms_to_save)
+    rooms_doc = {
+        "version": 1,
+        "storage_mode": "partitioned",
+        "updated_at": make_ts(),
+        "legacy_chat_file": str(chat_file),
+        "current_room": current_room_for_meta,
+        "rooms": meta_rooms,
+    }
+    rooms_text = json.dumps(rooms_doc, ensure_ascii=False, indent=2)
+    meta_tmp = root / f"rooms.{uuid.uuid4().hex}.tmp"
+    meta_tmp.write_text(rooms_text, encoding="utf-8")
+    os.replace(str(meta_tmp), str(_partitioned_rooms_file(root)))
+    metadata_elapsed = time.perf_counter() - t_meta
+
+    append_bytes = 0
+    append_count = 0
+    t_append = time.perf_counter()
+    for room in rooms_to_save:
+        if not isinstance(room, dict):
+            continue
+        rid = str(room.get("id") or "")
+        if not rid:
+            continue
+        _ensure_room_relative_path(root, room)
+        rdir = _partitioned_room_dir_for_room(root, room)
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "room.json").write_text(
+            json.dumps(_room_meta_only(room), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        room_seen = seen.setdefault(rid, {ch: set() for ch in _CHAT_PARTITION_CHANNELS})
+        for ch in _CHAT_PARTITION_CHANNELS:
+            room_seen.setdefault(ch, set())
+        logical_seen = room_seen.setdefault("__logical__", set())
+
+        new_lines: list[str] = []
+        for logical_key, entry in _partition_collect_records(room).items():
+            if logical_key in logical_seen:
+                continue
+            msg = entry.get("message")
+            if not isinstance(msg, dict):
+                continue
+            channels = entry.get("channels") if isinstance(entry.get("channels"), list) else ["messages"]
+            line, record_bytes = _partition_record_line(rid, logical_key, channels, msg)
+            new_lines.append(line)
+            logical_seen.add(logical_key)
+            for ch in channels:
+                if ch in _CHAT_PARTITION_CHANNELS:
+                    room_seen.setdefault(ch, set()).add(_partition_message_key(msg))
+            append_count += 1
+            log.info(
+                "[chat.storage.append_record] room_id=%s channels=%s role=%s message_id=%s record_bytes=%s action=%s",
+                rid,
+                ",".join(str(ch) for ch in channels),
+                str(msg.get("role") or ""),
+                str(msg.get("id") or msg.get("message_id") or logical_key),
+                record_bytes,
+                str(msg.get("action") or msg.get("title") or ""),
+            )
+        if new_lines:
+            msg_path = _partitioned_messages_file_for_room(root, room)
+            msg_path.parent.mkdir(parents=True, exist_ok=True)
+            with msg_path.open("a", encoding="utf-8", newline="\n") as f:
+                for line in new_lines:
+                    f.write(line)
+                    f.write("\n")
+                    append_bytes += len(line.encode("utf-8")) + 1
+                f.flush()
+    append_elapsed = time.perf_counter() - t_append
+    try:
+        _write_rooms_index_csv(root, meta_rooms)
+    except Exception:
+        log.exception("[chat.storage.index] write failed root=%s", str(root))
+
+    detail = {
+        "event_id": event_id,
+        "skipped": False,
+        "dirty_reason": dirty_reason,
+        "changed_fields": ["rooms_meta", "messages_jsonl"] if append_count else ["rooms_meta"],
+        "changed_room_count": len(rooms_to_save),
+        "rooms": len(st.session_state.get("chat_rooms") or []),
+        "saved_rooms": len(rooms_to_save),
+        "bytes": int(append_bytes + len(rooms_text.encode("utf-8"))),
+        "append_bytes": int(append_bytes),
+        "append_count": int(append_count),
+        "metadata": metadata_elapsed,
+        "json_serialize": 0.0,
+        "compare": 0.0,
+        "compare_mode": "partitioned_append",
+        "file_write": append_elapsed,
+        "file_replace": 0.0,
+    }
+    _set_chat_storage_state("partitioned", root, rooms_to_save)
+    log.info(
+        "[chat.storage.save] storage_mode=partitioned room_id=%s append_count=%s append_bytes=%s append_elapsed=%.3fs metadata=%.3fs rooms=%s total=%.3fs",
+        str(st.session_state.get("current_room") or ""),
+        append_count,
+        append_bytes,
+        append_elapsed,
+        metadata_elapsed,
+        len(rooms_to_save),
+        time.perf_counter() - t0,
+    )
+    return detail
+
+
 
 def _safe_log_value(value: Any, limit: int = 120) -> str:
     """
@@ -6293,19 +7679,52 @@ def _chat_log_kv(room: dict[str, Any] | None = None, **extra: Any) -> str:
 def load_chat_rooms() -> List[Dict[str, Any]]:
     chat_file = _effective_chat_file()
 
+    if _chat_storage_mode_enabled():
+        rooms_partitioned = _load_partitioned_chat_rooms(chat_file)
+        if rooms_partitioned is not None:
+            return rooms_partitioned
+
     if not os.path.exists(chat_file):
         log.debug("[chat.load] missing %s", _chat_log_kv(chat_file=chat_file))
+        if _chat_storage_mode_enabled():
+            _set_chat_storage_state("partitioned", _partitioned_chat_root(chat_file), [])
         return []
 
+    legacy_size = 0
+    try:
+        legacy_size = os.path.getsize(chat_file)
+    except Exception:
+        legacy_size = 0
+
+    t0 = time.perf_counter()
     try:
         with open(chat_file, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
         log.exception("[chat.load] failed %s", _chat_log_kv(chat_file=chat_file))
+        _set_chat_storage_state("legacy", _partitioned_chat_root(chat_file), None)
         return []
 
     rooms = migrate_rooms(raw)
-    log.info("[chat.load] %s rooms=%s", _chat_log_kv(chat_file=chat_file), len(rooms))
+    load_elapsed = time.perf_counter() - t0
+    migrated = False
+    if _chat_storage_mode_enabled():
+        migrated = _try_migrate_legacy_to_partitioned(rooms, chat_file)
+        if migrated:
+            _set_chat_storage_state("partitioned", _partitioned_chat_root(chat_file), rooms)
+        else:
+            _set_chat_storage_state("legacy", _partitioned_chat_root(chat_file), rooms)
+    else:
+        _set_chat_storage_state("legacy", _partitioned_chat_root(chat_file), rooms)
+    log.info(
+        "[chat.load] %s rooms=%s storage_mode=%s legacy_bytes=%s load_elapsed=%.3fs migration=%s",
+        _chat_log_kv(chat_file=chat_file),
+        len(rooms),
+        st.session_state.get("__chat_storage_mode") or "legacy",
+        legacy_size,
+        load_elapsed,
+        bool(migrated),
+    )
     return rooms
 
 def _reset_chat_session_when_user_changed() -> None:
@@ -6560,9 +7979,7 @@ def save_chat_rooms():
             return str(o)
 
     chat_file = _effective_chat_file()
-    tmp_dir = os.path.dirname(chat_file) or "."
-    os.makedirs(tmp_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix="chat_rooms_", suffix=".json", dir=tmp_dir)
+    tmp_path = ""
 
     try:
         # 로그인 직후 입력 대기용 빈 auto_created 방은 파일에 저장하지 않는다.
@@ -6574,6 +7991,53 @@ def save_chat_rooms():
         ]
         event_id = str(st.session_state.get("__chat_save_perf_event_id") or "")
         dirty_reason = str(st.session_state.get("__chat_save_dirty_reason") or "content_changed")
+
+        if _chat_storage_mode_enabled() and str(st.session_state.get("__chat_storage_mode") or "partitioned") == "partitioned":
+            try:
+                save_detail = _save_partitioned_chat_rooms(
+                    rooms_to_save,
+                    chat_file,
+                    event_id=event_id,
+                    dirty_reason=dirty_reason,
+                )
+                st.session_state["__chat_save_last_perf"] = dict(save_detail)
+                if event_id:
+                    st.session_state["__chat_room_switch_save_detail"] = dict(save_detail)
+                log.info(
+                    "[chat.save.diff] event_id=%s changed_room_count=%s changed_fields=%s dirty_reason=%s",
+                    event_id,
+                    save_detail["changed_room_count"],
+                    save_detail["changed_fields"],
+                    dirty_reason,
+                )
+                log.info(
+                    "[chat.save] %s rooms=%s saved_rooms=%s compare_mode=%s storage_mode=partitioned",
+                    _chat_log_kv(chat_file=chat_file),
+                    len(st.session_state.get("chat_rooms") or []),
+                    len(rooms_to_save),
+                    save_detail["compare_mode"],
+                )
+                log.info(
+                    "[chat.save.perf] event_id=%s skipped=False bytes=%s serialize=%.3fs compare=%.3fs compare_mode=%s write=%.3fs replace=%.3fs total=%.3fs append_bytes=%s append_count=%s",
+                    event_id,
+                    save_detail["bytes"],
+                    save_detail["json_serialize"],
+                    save_detail["compare"],
+                    save_detail["compare_mode"],
+                    save_detail["file_write"],
+                    save_detail["file_replace"],
+                    _chat_save_perf_total(save_detail),
+                    save_detail.get("append_bytes", 0),
+                    save_detail.get("append_count", 0),
+                )
+                return
+            except Exception:
+                log.exception("[chat.storage.save] partitioned failed fallback legacy file=%s", chat_file)
+                st.session_state["__chat_storage_mode"] = "legacy"
+
+        tmp_dir = os.path.dirname(chat_file) or "."
+        os.makedirs(tmp_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="chat_rooms_", suffix=".json", dir=tmp_dir)
         t_serialize = time.perf_counter()
         sanitized_rooms = _json_sanitize(rooms_to_save)
         serialized_text = json.dumps(sanitized_rooms, ensure_ascii=False, indent=2)
@@ -7089,7 +8553,9 @@ def stream_and_append_assistant(
 _reset_chat_session_when_user_changed()
 
 if "chat_rooms" not in st.session_state:
+    _chat_rooms_load_started = time.perf_counter()
     st.session_state.chat_rooms = load_chat_rooms()
+    _script_perf_add("chat_rooms", time.perf_counter() - _chat_rooms_load_started)
 
     # ✅ 2-채널 히스토리 마이그레이션(기존 rooms.json 호환)
     # - messages는 UI 렌더용(기존 유지)
@@ -7386,6 +8852,13 @@ with st.sidebar:
     # 첫 채팅 / SIMS 결과 / 회사 변경 안내가 들어갈 때 save_chat_rooms()로 실제 저장된다.
     ss.setdefault("chat_rooms", [])
 
+    existing_room_ids = {str((room or {}).get("id") or "") for room in ss.chat_rooms if isinstance(room, dict)}
+    stale_current_room_id = ""
+    if ss.get("current_room") and str(ss.get("current_room") or "") not in existing_room_ids:
+        stale_current_room_id = str(ss.get("current_room") or "")
+        ss["current_room"] = None
+        ss["__room_page"] = 0
+
     if "current_room" not in ss or not ss.current_room:
         _select_pending_new_room()
     else:
@@ -7394,40 +8867,66 @@ with st.sidebar:
     # 추가 옵션 상태(필터/페이지) — 목록은 이 상태를 기준으로 보여줌
     ss.setdefault("__room_filter", "")
     ss.setdefault("__room_page", 0)
-    PAGE_SIZE = 20
+    ss.setdefault("__room_filter_prev", str(ss.get("__room_filter") or "").strip().lower())
+    room_page_before = ss.get("__room_page", 0)
+    room_page_was_initialized = bool(ss.get("__room_page_initialized"))
+    PAGE_SIZE = CHAT_ROOM_PAGE_SIZE
 
     # ── 필터/페이지 계산(옵션 패널을 안 열어도 상태는 반영됨) ──────────
-    q = (ss.__room_filter or "").strip().lower()
-    rooms_filtered = [r for r in ss.chat_rooms if q in str(r.get("name") or "").lower()]
-
-    # 로그인 직후 새 대화 대기방이 첫 화면에 보이도록 현재 방이 포함된 페이지를 우선 표시한다.
-    current_id = str(ss.get("current_room") or "").strip()
-    current_idx = next(
-        (idx for idx, room in enumerate(rooms_filtered) if str(room.get("id") or "") == current_id),
-        -1,
+    room_list_state = _compute_room_sidebar_state(
+        ss.chat_rooms,
+        current_room_id=str(ss.get("current_room") or ""),
+        filter_text=str(ss.get("__room_filter") or ""),
+        page=ss.get("__room_page", 0),
+        previous_filter=ss.get("__room_filter_prev"),
+        page_size=PAGE_SIZE,
+        force_reset_reason="stale_current_room" if stale_current_room_id else "",
+        initial_to_last=not room_page_was_initialized and not stale_current_room_id,
     )
+    ss["__room_page"] = int(room_list_state["page"])
+    ss["__room_page_initialized"] = True
+    ss["__room_filter_prev"] = str(room_list_state["filter_text"])
+    rooms_filtered = room_list_state["rooms_filtered"]
 
-    total = len(rooms_filtered)
-    max_page = max(0, (total - 1) // PAGE_SIZE)
+    # 목록 페이지는 사용자가 선택한 페이지를 유지한다.
+    current_id = str(ss.get("current_room") or "").strip()
+    max_page = int(room_list_state["max_page"])
+    view = list(room_list_state["view"])
+    pending_view = list(room_list_state.get("pending_rooms") or [])
 
-    if current_idx >= 0:
-        ss.__room_page = max(0, min(current_idx // PAGE_SIZE, max_page))
-    else:
-        ss.__room_page = max(0, min(ss.__room_page, max_page))
-
-    start = ss.__room_page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    view = rooms_filtered[start:end]
-
-    # 필터 때문에 현재 방이 view에 없으면 첫 줄에 현재 방을 임시로 보여준다.
-    # 라디오 위젯이 첫 번째 기존 방을 자동 선택해 current_room을 바꾸는 것을 막기 위함이다.
-    if current_id and current_id not in [str(r.get("id") or "") for r in view]:
-        current_room_for_list = next(
-            (r for r in ss.chat_rooms if str(r.get("id") or "") == current_id),
-            None,
+    log.info(
+        "[chat.room_list] persisted_rooms=%s pending_visible=%s filtered_persisted_rooms=%s page=%s max_page=%s view_count=%s range_start=%s range_end=%s filter_set=%s filter_changed=%s current_kind=%s current_room_id=%s current_in_persisted=%s page_reset_reason=%s",
+        room_list_state["persisted_room_count"],
+        room_list_state["pending_visible"],
+        room_list_state["filtered_persisted_rooms"],
+        room_list_state["page"],
+        room_list_state["max_page"],
+        len(view),
+        room_list_state["range_start"],
+        room_list_state["range_end"],
+        room_list_state["filter_set"],
+        room_list_state["filter_changed"],
+        room_list_state["current_kind"],
+        current_id,
+        room_list_state["current_in_persisted"],
+        room_list_state["page_reset_reason"],
+    )
+    if (
+        not room_page_was_initialized
+        or room_list_state["filter_changed"]
+        or room_list_state["page_reset_reason"]
+    ):
+        nav_action = "filter_change" if room_list_state["filter_changed"] else "init"
+        log.info(
+            "[chat.room_nav] action=%s page_before=%s page_after=%s page_size=%s max_page=%s inside_callback=%s explicit_rerun_called=%s",
+            nav_action,
+            room_page_before,
+            room_list_state["page"],
+            PAGE_SIZE,
+            room_list_state["max_page"],
+            False,
+            False,
         )
-        if isinstance(current_room_for_list, dict):
-            view = [current_room_for_list] + view[: max(0, PAGE_SIZE - 1)]
 
     # 최조 대화 등록 하기 전
     id_to_name = {}
@@ -7446,38 +8945,92 @@ with st.sidebar:
     # ── (항상 보임) 핵심: 새 대화 + 목록 + 이름 변경 ────────────────
     def _new_room():
         # 사용자가 직접 누른 경우는 임시방이 아니라 정식 새 채팅방이다.
-        new_room = _make_chat_room(auto_created=False)
-
-        ss.chat_rooms.append(new_room)
-        ss.current_room = new_room["id"]
+        new_room = _select_pending_new_room(close_sims_state=True)
         ss["__room_prev_selected"] = new_room["id"]
         ss["__room_rename_buf"] = new_room.get("name") or ""
         ss["__room_filter"] = ""
+        ss["__room_page"] = int(room_list_state.get("max_page") or 0)
+        ss["__room_page_initialized"] = True
+        ss["__ui_rerun_reason"] = "chat_room_change"
 
-        log.info("[chat.room] new room created %s", _chat_log_kv(new_room))
-        save_chat_rooms()
-        st.rerun()
+        log.info("[chat.room] new pending room selected %s", _chat_log_kv(new_room))
 
     st.button("➕ 새 대화 시작", use_container_width=True, key="__room_new_btn", on_click=_new_room)
 
     # 목록(라디오)
+    pending_ids = [r["id"] for r in pending_view]
+    pending_index = pending_ids.index(ss.current_room) if (pending_ids and ss.current_room in pending_ids) else None
+    pending_radio_key = f"__room_pending_radio_{str(ss.current_room or '')[:12]}"
+    picked_pending = None
+    if pending_ids:
+        picked_pending = st.radio(
+            "새 대화 입력 대기",
+            options=pending_ids,
+            format_func=lambda rid: id_to_name.get(rid, rid),
+            index=pending_index,
+            label_visibility="collapsed",
+            key=pending_radio_key,
+        )
+
     options_ids = [r["id"] for r in view]
-    picked_index = options_ids.index(ss.current_room) if (options_ids and ss.current_room in options_ids) else 0
+    picked_index = options_ids.index(ss.current_room) if (options_ids and ss.current_room in options_ids) else None
     # Streamlit radio는 같은 key를 쓰면 이전 선택값을 계속 기억한다.
     # 로그인 직후 기본값이 기존 방으로 되돌아가지 않도록 현재 방 ID 기반 key를 사용한다.
     room_radio_key = f"__room_pick_radio_{str(ss.current_room or '')[:12]}"
-    picked = st.radio(
-        "채팅방 목록",
-        options=options_ids,
-        format_func=lambda rid: id_to_name.get(rid, rid),
-        index=picked_index if options_ids else 0,
-        label_visibility="collapsed",
-        key=room_radio_key,
+    picked_persisted = None
+    if options_ids:
+        picked_persisted = st.radio(
+            "채팅방 목록",
+            options=options_ids,
+            format_func=lambda rid: id_to_name.get(rid, rid),
+            index=picked_index,
+            label_visibility="collapsed",
+            key=room_radio_key,
+        )
+    else:
+        st.caption("표시할 저장된 채팅방이 없습니다.")
+
+    picked = _resolve_room_pick(
+        current_room_id=ss.current_room,
+        picked_pending=picked_pending,
+        picked_persisted=picked_persisted,
+        pending_ids=pending_ids,
+        persisted_ids=options_ids,
     )
     if picked and picked != ss.current_room:
         switch_event_id = _set_ui_event_started("chat_room_change")
         ss["__chat_room_switch_event_id"] = switch_event_id
         old_room_id = ss.current_room
+        previous_kind = str(room_list_state.get("current_kind") or "")
+        room_exists = str(picked) in existing_room_ids
+        log.info(
+            "[chat.room_select] phase=request requested_room_id=%s previous_kind=%s new_kind=%s page=%s room_exists=%s loaded_messages=%s load_elapsed=%.3fs request_consumed=%s switch_reason=%s",
+            picked,
+            previous_kind,
+            "persisted" if room_exists else "pending",
+            room_list_state["page"],
+            room_exists,
+            0,
+            0.0,
+            False,
+            "radio",
+        )
+        if not room_exists and picked_persisted:
+            log.info(
+                "[chat.room_select] phase=consume requested_room_id=%s previous_kind=%s new_kind=%s page=%s room_exists=%s loaded_messages=%s load_elapsed=%.3fs request_consumed=%s switch_reason=%s",
+                picked,
+                previous_kind,
+                "missing",
+                room_list_state["page"],
+                False,
+                0,
+                0.0,
+                True,
+                "missing_room",
+            )
+            picked = None
+    if picked and picked != ss.current_room:
+        switch_event_id = ss.get("__chat_room_switch_event_id") or _set_ui_event_started("chat_room_change")
         removed_empty_pending = _drop_empty_auto_rooms(keep_room_id=picked)
         save_started = time.perf_counter()
         if removed_empty_pending:
@@ -7495,6 +9048,11 @@ with st.sidebar:
         save_elapsed = time.perf_counter() - save_started
 
         ss.current_room = picked
+        load_started = time.perf_counter()
+        _ensure_partitioned_room_loaded(picked)
+        load_elapsed = time.perf_counter() - load_started
+        loaded_room = _get_current_room_or_pending()
+        loaded_messages = len(_build_room_render_messages(loaded_room)) if isinstance(loaded_room, dict) else 0
         ss["__room_prev_selected"] = picked
         ss["__room_rename_buf"] = id_to_name.get(picked, "")
         ss["__ui_rerun_reason"] = "chat_room_change"
@@ -7511,13 +9069,33 @@ with st.sidebar:
         log.info(
             "[chat.room] selected event_id=%s %s old_room_id=%s new_room_id=%s removed_empty_pending=%s",
             switch_event_id,
-            _chat_log_kv(_get_current_room_or_pending()),
+            _chat_log_kv(loaded_room),
             old_room_id,
             picked,
             removed_empty_pending,
         )
-
-        st.rerun()
+        log.info(
+            "[chat.room_select] phase=loaded requested_room_id=%s previous_kind=%s new_kind=%s page=%s room_exists=%s loaded_messages=%s load_elapsed=%.3fs request_consumed=%s switch_reason=%s",
+            picked,
+            previous_kind,
+            "persisted" if room_exists else "pending",
+            room_list_state["page"],
+            room_exists,
+            loaded_messages,
+            load_elapsed,
+            True,
+            "radio",
+        )
+        ss["__chat_room_select_render_ready"] = {
+            "requested_room_id": picked,
+            "previous_kind": previous_kind,
+            "new_kind": "persisted" if room_exists else "pending",
+            "page": int(room_list_state["page"]),
+            "room_exists": bool(room_exists),
+            "loaded_messages": int(loaded_messages),
+            "load_elapsed": float(load_elapsed),
+            "switch_reason": "radio",
+        }
 
     # 이름 변경(경고 방지: 선택 바뀌면 버퍼 초기화)
     cur_name = id_to_name.get(ss.current_room, "")
@@ -7545,6 +9123,7 @@ with st.sidebar:
                 if r["id"] == ss.current_room:
                     r["name"] = new_name
                     r["name_auto"] = False
+                    r["title_initialized"] = True
                     r["title_source"] = "manual"
                     break                
             save_chat_rooms()
@@ -7553,28 +9132,64 @@ with st.sidebar:
     st.button("이름 적용", use_container_width=True, key="__room_rename_apply", on_click=_apply_rename)
 
     # 간단한 현황(현재 페이지 범위/총개수)
-    if total:
-        st.caption(f"{start+1}–{min(end, total)} / 총 {total}개")
+    st.caption(str(room_list_state["caption"]))
+
+    # 페이지네이션은 접힌 관리 영역 안에 숨기지 않는다.
+    if max_page > 0:
+        def _room_prev_page():
+            page_before = int(ss.get("__room_page") or 0)
+            page_after = max(0, page_before - 1)
+            ss["__room_page"] = page_after
+            log.info(
+                "[chat.room_nav] action=%s page_before=%s page_after=%s page_size=%s max_page=%s inside_callback=%s explicit_rerun_called=%s",
+                "previous",
+                page_before,
+                page_after,
+                PAGE_SIZE,
+                max_page,
+                True,
+                False,
+            )
+
+        def _room_next_page():
+            page_before = int(ss.get("__room_page") or 0)
+            page_after = min(max_page, page_before + 1)
+            ss["__room_page"] = page_after
+            log.info(
+                "[chat.room_nav] action=%s page_before=%s page_after=%s page_size=%s max_page=%s inside_callback=%s explicit_rerun_called=%s",
+                "next",
+                page_before,
+                page_after,
+                PAGE_SIZE,
+                max_page,
+                True,
+                False,
+            )
+
+        c_prev, c_page, c_next = st.columns([1, 2, 1])
+        with c_prev:
+            st.button(
+                "이전",
+                use_container_width=True,
+                disabled=bool(room_list_state["prev_disabled"]),
+                key="__room_prev",
+                on_click=_room_prev_page,
+            )
+        with c_page:
+            st.caption(f"페이지 {room_list_state['page_label']}")
+        with c_next:
+            st.button(
+                "다음",
+                use_container_width=True,
+                disabled=bool(room_list_state["next_disabled"]),
+                key="__room_next",
+                on_click=_room_next_page,
+            )
 
     # ── (접는) 추가 옵션: 필터/페이지/삭제/내보내기 ────────────────
     with st.expander("채팅방 관리", expanded=False):
         # 필터
         st.text_input("이름 검색", key="__room_filter", placeholder="채팅방 이름 필터")
-
-        # 페이지네이션
-        c_prev, c_page, c_next = st.columns([1, 2, 1])
-        with c_prev:
-            st.button("◀ ", use_container_width=True,
-                    disabled=ss.__room_page <= 0,
-                    key="__room_prev",
-                    on_click=lambda: ss.update(__room_page=max(0, ss.__room_page-1)) or st.rerun())
-        with c_page:
-            st.caption(f"페이지 {ss.__room_page+1} / {max_page+1}")
-        with c_next:
-            st.button(" ▶", use_container_width=True,
-                    disabled=ss.__room_page >= max_page,
-                    key="__room_next",
-                    on_click=lambda: ss.update(__room_page=min(max_page, ss.__room_page+1)) or st.rerun())
 
         st.write("")
 
@@ -7620,8 +9235,11 @@ with st.sidebar:
 
         # 현재 JSON
         cur_room = next((r for r in ss.chat_rooms if r["id"] == ss.current_room), ss.chat_rooms[0])
-        cur_json = json.dumps(cur_room, ensure_ascii=False, indent=2, default=_json_default)
-        cur_json = json.dumps(cur_room, ensure_ascii=False, indent=2).encode("utf-8")
+        cur_json = json.dumps(
+            _room_persistence_projection(cur_room),
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
         st.download_button("⬇️ 현재 대화(JSON)", data=cur_json,
                         file_name=f"{re.sub(r'[^a-zA-Z0-9가-힣]+','_', cur_room['name'])}.json",
                         mime="application/json", use_container_width=True, key="__dl_current_json")
@@ -8048,6 +9666,22 @@ with st.sidebar:
                         st.code(preview)
 # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 
+current_room = _get_current_room_or_pending()
+_room_select_render_ready = st.session_state.pop("__chat_room_select_render_ready", None)
+if isinstance(_room_select_render_ready, dict):
+    log.info(
+        "[chat.room_select] phase=render_ready requested_room_id=%s previous_kind=%s new_kind=%s page=%s room_exists=%s loaded_messages=%s load_elapsed=%.3fs request_consumed=%s switch_reason=%s",
+        _room_select_render_ready.get("requested_room_id", ""),
+        _room_select_render_ready.get("previous_kind", ""),
+        _room_select_render_ready.get("new_kind", ""),
+        _room_select_render_ready.get("page", 0),
+        bool(_room_select_render_ready.get("room_exists")),
+        int(_room_select_render_ready.get("loaded_messages") or 0),
+        float(_room_select_render_ready.get("load_elapsed") or 0.0),
+        True,
+        _room_select_render_ready.get("switch_reason", ""),
+    )
+
 def _display_room_name(room: dict[str, Any] | None) -> str:
     if _is_empty_auto_room(room):
         return "➕ 새 대화 입력 대기 (저장 전)"
@@ -8282,16 +9916,28 @@ if user_input and user_input.strip():
         # - 현재표 거래처명 대학약국 상세표 만들어줘
         # - 현재표 제품별 매출 TOP 20 표로 만들어줘
         # - 현재표 거래처별 매출 TOP 20 표로 만들어줘
-        try:
-            handled = _try_handle_current_table_dataframe_followup(
-                current_table_followup_input,
-                room=current_room,
-                make_ts=make_ts,
-                next_seq=_next_seq,
+        if (is_current_table_forced_followup or is_implicit_analytics_current_followup) and not _has_current_table_source_df():
+            st.session_state.pop("__deferred_current_table_followup", None)
+            st.session_state["__sims_panel_active"] = False
+            st.session_state["__sims_force_open"] = False
+            st.session_state["__sims_run_flag"] = False
+            st.session_state["__sims_inner_submit"] = False
+            handled = _push_no_current_table_notice(current_table_followup_input)
+            log.info(
+                "[chat.followup_table] no current source; notice pushed immediately query=%r",
+                str(current_table_followup_input or "")[:80],
             )
-        except Exception:
-            log.exception("[chat.followup_table] handler failed")
-            handled = False
+        else:
+            try:
+                handled = _try_handle_current_table_dataframe_followup(
+                    current_table_followup_input,
+                    room=current_room,
+                    make_ts=make_ts,
+                    next_seq=_next_seq,
+                )
+            except Exception:
+                log.exception("[chat.followup_table] handler failed")
+                handled = False
 
         if handled:
             log.debug("[chat.followup_table] handled → skip LLM/NLQ, content=%r", user_input[:80])
@@ -8559,6 +10205,13 @@ with st.container():
         pass
 
     # SIMS 표 버블 전용 렌더
+    # Display-only chronological merge across normal/SIMS channels.
+    # Keep the persisted JSON layout unchanged and do not copy table payloads.
+    _compact_partition_room_in_memory(current_room)
+    _render_list_started = time.perf_counter()
+    merged_msgs = _build_room_render_messages(current_room)
+    _script_perf_add("render_list", time.perf_counter() - _render_list_started)
+
     def _render_message(m: dict) -> bool:
         meta = (m.get("meta") or {})
 
@@ -8659,6 +10312,7 @@ with st.container():
             "current_table_followup": 3,
             "sims_action_change": 2,
             "chat_room_change": 2,
+            "download_prepare": 2,
             "sims_panel_open": 1,
             "normal_chat": 0,
         }
@@ -8670,7 +10324,9 @@ with st.container():
     current_ui_rerun_reason = _consume_ui_rerun_reason()
     event_to_main_elapsed = 0.0
     event_name = ""
+    current_ui_event_id = ""
     try:
+        current_ui_event_id = str(st.session_state.pop("__ui_event_id", "") or "").strip()
         event_name = str(st.session_state.pop("__ui_event_name", "") or "").strip()
         event_started_at = st.session_state.pop("__ui_event_started_at", None)
         if event_started_at is not None:
@@ -8681,6 +10337,7 @@ with st.container():
     st.session_state["__ui_rerun_perf_stats"] = {
         "reason": current_ui_rerun_reason,
         "event": event_name or current_ui_rerun_reason,
+        "event_id": current_ui_event_id,
         "event_to_main_elapsed": event_to_main_elapsed,
         "history_messages": int(len(merged_msgs)),
         "history_tables_rendered": 0,
@@ -8689,6 +10346,8 @@ with st.container():
         "panel_elapsed": 0.0,
         "total_elapsed": 0.0,
     }
+    if current_ui_rerun_reason != "chat_room_change":
+        st.session_state.pop("__chat_room_switch_event_id", None)
 
     # ------------------------------------------------------------
     # SIMS LLM 분석 fragment runner
@@ -8768,7 +10427,7 @@ with st.container():
         if stats.get("event"):
             log.info(
                 "[ui.event_to_rerun] event_id=%s event=%s event_to_main_elapsed=%.3fs history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
-                st.session_state.get("__ui_event_id") or st.session_state.get("__chat_room_switch_event_id") or "",
+                stats.get("event_id") or "",
                 stats.get("event"),
                 float(stats.get("event_to_main_elapsed") or 0.0),
                 float(stats.get("history_elapsed") or 0.0),
@@ -8785,6 +10444,9 @@ with st.container():
             sims_fragment_elapsed = float(durations.get("sims_fragment") or 0.0)
             prepass_elapsed = float(durations.get("prepass") or 0.0)
             main_gate_elapsed = float(durations.get("main_gate") or 0.0)
+            render_list_elapsed = float(durations.get("render_list") or 0.0)
+            chat_context_elapsed = float(durations.get("chat_context") or 0.0)
+            session_compact_elapsed = float(durations.get("session_compact") or 0.0)
             measured_total = (
                 bootstrap
                 + require_login_elapsed
@@ -8794,11 +10456,14 @@ with st.container():
                 + sims_fragment_elapsed
                 + prepass_elapsed
                 + main_gate_elapsed
+                + render_list_elapsed
+                + chat_context_elapsed
+                + session_compact_elapsed
             )
             unattributed = max(0.0, total_script - measured_total)
             log.info(
-                "[ui.script_path.perf] event_id=%s reason=%s bootstrap=%.3fs require_login=%.3fs sidebar=%.3fs chat_rooms=%.3fs room_selector=%.3fs sims_fragment=%.3fs prepass=%.3fs main_gate=%.3fs unattributed=%.3fs total=%.3fs",
-                st.session_state.get("__ui_event_id") or st.session_state.get("__chat_room_switch_event_id") or "",
+                "[ui.script_path.perf] event_id=%s reason=%s bootstrap=%.3fs require_login=%.3fs sidebar=%.3fs chat_rooms=%.3fs room_selector=%.3fs sims_fragment=%.3fs prepass=%.3fs main_gate=%.3fs session_compact=%.3fs render_list=%.3fs chat_context=%.3fs unattributed=%.3fs total=%.3fs",
+                stats.get("event_id") or "",
                 stats.get("reason"),
                 bootstrap,
                 require_login_elapsed,
@@ -8808,11 +10473,14 @@ with st.container():
                 sims_fragment_elapsed,
                 prepass_elapsed,
                 main_gate_elapsed,
+                session_compact_elapsed,
+                render_list_elapsed,
+                chat_context_elapsed,
                 unattributed,
                 total_script,
             )
             if st.session_state.get("__auth_login_perf_pending"):
-                auth_sig = str(st.session_state.get("__auth_login_event_id") or st.session_state.get("__ui_event_id") or "login")
+                auth_sig = str(st.session_state.get("__auth_login_event_id") or stats.get("event_id") or "login")
                 if st.session_state.get("__auth_startup_perf_emitted_sig") != auth_sig:
                     log.info(
                         "[auth.login.perf] event_id=%s authenticate=%.3fs company_select=%.3fs chat_load=%.3fs greeting_llm=%.3fs main_render=%.3fs script_total=%.3fs login_to_ui_ready=%.3fs",
@@ -8833,7 +10501,7 @@ with st.container():
             save_detail = st.session_state.pop("__chat_room_switch_save_detail", {}) or {}
             log.info(
                 "[chat.room.switch.perf] event_id=%s select_to_save=%.3fs save_to_main=%.3fs history=%.3fs total=%.3fs rerun_count=%s json_serialize=%.3fs file_write=%.3fs file_replace=%.3fs compare_mode=%s",
-                st.session_state.get("__chat_room_switch_event_id") or st.session_state.get("__ui_event_id") or "",
+                st.session_state.pop("__chat_room_switch_event_id", None) or stats.get("event_id") or "",
                 save_elapsed,
                 max(0.0, float(stats.get("event_to_main_elapsed") or 0.0) - save_elapsed),
                 float(stats.get("history_elapsed") or 0.0),

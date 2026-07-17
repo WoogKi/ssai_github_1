@@ -21,6 +21,26 @@ import streamlit as st
 
 log = logging.getLogger("ssai")
 
+_DISPLAY_LITERAL_NULL_STRINGS = {
+    "None",
+    "none",
+    "NONE",
+    "nan",
+    "NaN",
+    "NAN",
+    "<NA>",
+    "NaT",
+    "NULL",
+    "null",
+}
+
+_DISPLAY_FIELD_DIAGNOSTIC_COLS = (
+    "재고기준",
+    "수요예상기준",
+    "분석자료원",
+    "현재고원천",
+)
+
 
 def resolve_sims_table_mode(
     df: pd.DataFrame,
@@ -116,6 +136,95 @@ def log_sims_table_render(
     )
 
 
+def _is_display_missing_token(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _display_non_null_count(series: pd.Series) -> int:
+    try:
+        return int(series.astype("object").map(lambda v: not _is_display_missing_token(v)).sum())
+    except Exception:
+        return 0
+
+
+def _display_literal_none_count(series: pd.Series) -> int:
+    try:
+        return int(series.astype("object").map(lambda v: isinstance(v, str) and v.strip() in _DISPLAY_LITERAL_NULL_STRINGS).sum())
+    except Exception:
+        return 0
+
+
+def log_sims_display_fields(
+    source_df: pd.DataFrame,
+    display_df: pd.DataFrame,
+    *,
+    action: Any = "",
+    render_path: str = "",
+    mode: str = "",
+) -> None:
+    """Log display-only null handling for selected business fields without row data."""
+    if not isinstance(source_df, pd.DataFrame) or not isinstance(display_df, pd.DataFrame):
+        return
+
+    for col in _DISPLAY_FIELD_DIAGNOSTIC_COLS:
+        column_present = col in source_df.columns or col in display_df.columns
+        if not column_present:
+            continue
+
+        src = source_df[col] if col in source_df.columns else pd.Series(dtype="object")
+        disp = display_df[col] if col in display_df.columns else pd.Series(dtype="object")
+        try:
+            actual_null_count = int(disp.isna().sum())
+        except Exception:
+            actual_null_count = 0
+        try:
+            source_actual_null_count = int(src.isna().sum())
+        except Exception:
+            source_actual_null_count = 0
+        try:
+            source_dtype = str(src.dtype)
+        except Exception:
+            source_dtype = ""
+        try:
+            display_dtype = str(disp.dtype)
+        except Exception:
+            display_dtype = ""
+        try:
+            source_first_type = type(src.iloc[0]).__name__ if len(src) else ""
+        except Exception:
+            source_first_type = ""
+        try:
+            display_first_type = type(disp.iloc[0]).__name__ if len(disp) else ""
+        except Exception:
+            display_first_type = ""
+
+        log.info(
+            "[sims.table.display_fields] action=%s render_path=%s mode=%s rows=%s field=%s column_present=%s source_dtype=%s display_dtype=%s source_non_null_count=%s display_non_null_count=%s source_actual_null_count=%s display_actual_null_count=%s literal_none_count=%s first_source_type=%s first_display_type=%s",
+            str(action or ""),
+            str(render_path or ""),
+            str(mode or ""),
+            int(len(display_df)),
+            col,
+            bool(column_present),
+            source_dtype,
+            display_dtype,
+            _display_non_null_count(src),
+            _display_non_null_count(disp),
+            source_actual_null_count,
+            actual_null_count,
+            _display_literal_none_count(disp),
+            source_first_type,
+            display_first_type,
+        )
+
+
 def _clean_text(value: Any) -> str:
     try:
         if value is None or pd.isna(value):
@@ -151,6 +260,25 @@ def _is_numeric_display_name(col: Any) -> bool:
     s = _clean_text(col)
 
     if _is_explicit_code_display_name(s):
+        return False
+
+    text_words = (
+        "기준",
+        "판정",
+        "등급",
+        "원천",
+        "자료원",
+        "설명",
+        "결과",
+    )
+    text_numeric_exceptions = (
+        "예상기준월수량",
+        "수요예상수량",
+        "평가월 예상수요수량",
+        "당월 예상출고수량",
+        "당월 잔여예상출고수량",
+    )
+    if any(w in s for w in text_words) and not any(w in s for w in text_numeric_exceptions):
         return False
 
     # 분석/KPI 명시 숫자 컬럼
@@ -220,13 +348,8 @@ def _is_numeric_display_name(col: Any) -> bool:
 
 
 def _normalize_display_scalar(value: Any) -> Any:
-    if value is None:
+    if _is_display_missing_token(value):
         return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except Exception:
-        pass
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="replace")
@@ -468,6 +591,7 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         "등급",
         "판정",
         "기준",
+        "원천",
         "자료원",
         "설명",
         "결과",
@@ -536,6 +660,9 @@ def _numeric_display_kind(col: Any) -> str:
     s = _clean_text(col)
 
     if _is_row_no_col(s):
+        return "int"
+
+    if _is_stock_shortage_quantity_int_col(s):
         return "int"
 
     int_money_cols = {
@@ -642,6 +769,16 @@ def _numeric_display_kind(col: Any) -> str:
         return "int"
 
     return "decimal2"
+
+
+def _is_stock_shortage_quantity_int_col(name: Any) -> bool:
+    """재고부족 수량 계열은 화면에서 정수 천단위로 표시한다."""
+    s = _clean_text(name)
+    if not s:
+        return False
+    if any(w in s for w in ("률", "율", "%", "금액", "단가", "매출", "세액", "공급가액")):
+        return False
+    return any(w in s for w in ("수량", "수요", "출고", "재고", "부족", "필요"))
 
 def _infer_width_px(df: pd.DataFrame, col: Any, *, sample_n: int = 80) -> int:
     """
