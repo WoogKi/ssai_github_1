@@ -333,17 +333,33 @@ def run_basic_checks() -> list[CheckResult]:
     try:
         from app.utils import env_config
 
-        saved_env = {k: os.environ.get(k) for k in ("APP_ENV", "CHAT_FILE", "UPLOAD_DIR", "SSAI_INSTANCE_ID", "SSAI_ENV_FILE")}
+        saved_env = {
+            k: os.environ.get(k)
+            for k in (
+                "APP_ENV",
+                "CHAT_FILE",
+                "UPLOAD_DIR",
+                "SSAI_STORAGE_ROOT",
+                "LOG_FILE",
+                "SIMS_LOG_FILE",
+                "SSAI_INSTANCE_ID",
+                "SSAI_ENV_FILE",
+            )
+        }
         old_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
             other = Path(td) / "other"
             chat_dir = root / "chat"
             upload_dir = root / "uploads"
+            storage_dir = root / "storage"
+            log_file = root / "logs" / "app.log"
             root.mkdir()
             other.mkdir()
             chat_dir.mkdir()
             upload_dir.mkdir()
+            storage_dir.mkdir()
+            log_file.parent.mkdir()
             project_env = root / ".env"
             project_chat = chat_dir / "root_chat_rooms.json"
             other_chat = other / "wrong_chat_rooms.json"
@@ -354,14 +370,28 @@ def run_basic_checks() -> list[CheckResult]:
                         "SSAI_INSTANCE_ID=regression",
                         f"CHAT_FILE={project_chat}",
                         f"UPLOAD_DIR={upload_dir}",
+                        f"SSAI_STORAGE_ROOT={storage_dir}",
+                        f"LOG_FILE={log_file}",
                     ]
                 ),
                 encoding="utf-8",
             )
-            (other / ".env").write_text(f"CHAT_FILE={other_chat}\nUPLOAD_DIR={other / 'uploads'}\n", encoding="utf-8")
+            (other / ".env").write_text(
+                "\n".join(
+                    [
+                        f"CHAT_FILE={other_chat}",
+                        f"UPLOAD_DIR={other / 'uploads'}",
+                        f"SSAI_STORAGE_ROOT={other / 'storage'}",
+                        f"LOG_FILE={other / 'logs' / 'app.log'}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
 
             os.environ["CHAT_FILE"] = str(other_chat)
             os.environ["UPLOAD_DIR"] = str(other / "uploads")
+            os.environ["SSAI_STORAGE_ROOT"] = str(other / "storage")
+            os.environ["LOG_FILE"] = str(other / "logs" / "app.log")
             os.chdir(other)
             loaded = env_config.load_project_env(override=True, env_path=project_env)
             load_ok = (
@@ -369,9 +399,12 @@ def run_basic_checks() -> list[CheckResult]:
                 and loaded.exists
                 and os.environ.get("CHAT_FILE") == str(project_chat)
                 and os.environ.get("UPLOAD_DIR") == str(upload_dir)
+                and os.environ.get("SSAI_STORAGE_ROOT") == str(storage_dir)
+                and os.environ.get("LOG_FILE") == str(log_file)
                 and os.environ.get("SSAI_ENV_FILE") == str(project_env)
             )
-            errors = env_config.validate_startup_env(env_path=project_env, project_root=root, environ=os.environ)
+            required_paths = ("CHAT_FILE", "UPLOAD_DIR", "SSAI_STORAGE_ROOT", ("LOG_FILE", "SIMS_LOG_FILE"))
+            errors = env_config.validate_startup_env(env_path=project_env, project_root=root, environ=os.environ, required_path_keys=required_paths)
             if load_ok and not errors:
                 results.append(_ok("project-root .env overrides cwd and OS env", f"env_file={project_env}"))
             else:
@@ -380,27 +413,177 @@ def run_basic_checks() -> list[CheckResult]:
             missing_errors = env_config.validate_startup_env(
                 env_path=root / "missing.env",
                 project_root=root,
-                environ={"APP_ENV": "prod", "CHAT_FILE": str(project_chat), "UPLOAD_DIR": str(upload_dir)},
+                environ={
+                    "APP_ENV": "prod",
+                    "CHAT_FILE": str(project_chat),
+                    "UPLOAD_DIR": str(upload_dir),
+                    "SSAI_STORAGE_ROOT": str(storage_dir),
+                    "LOG_FILE": str(log_file),
+                },
+                required_path_keys=required_paths,
+            )
+            relative_env = root / "relative.env"
+            relative_env.write_text(
+                "\n".join(
+                    [
+                        "APP_ENV=prod",
+                        "CHAT_FILE=data/chat.json",
+                        f"UPLOAD_DIR={upload_dir}",
+                        "SSAI_STORAGE_ROOT=data/ssai_storage",
+                        "LOG_FILE=logs/app.log",
+                    ]
+                ),
+                encoding="utf-8",
             )
             relative_errors = env_config.validate_startup_env(
-                env_path=project_env,
+                env_path=relative_env,
                 project_root=root,
-                environ={"APP_ENV": "prod", "CHAT_FILE": "data/chat.json", "UPLOAD_DIR": str(upload_dir)},
+                environ={},
+                required_path_keys=required_paths,
+            )
+            blank_env = root / "blank.env"
+            blank_env.write_text(
+                "\n".join(
+                    [
+                        "APP_ENV=prod",
+                        "CHAT_FILE=",
+                        f"UPLOAD_DIR={upload_dir}",
+                        "SSAI_STORAGE_ROOT=",
+                        "LOG_FILE=",
+                    ]
+                ),
+                encoding="utf-8",
             )
             blank_errors = env_config.validate_startup_env(
-                env_path=project_env,
+                env_path=blank_env,
                 project_root=root,
-                environ={"APP_ENV": "prod", "CHAT_FILE": "", "UPLOAD_DIR": str(upload_dir)},
+                environ={},
+                required_path_keys=required_paths,
             )
+            missing_app_env = root / "missing_app.env"
+            missing_app_env.write_text(
+                "\n".join(
+                    [
+                        f"CHAT_FILE={project_chat}",
+                        f"UPLOAD_DIR={upload_dir}",
+                        f"SSAI_STORAGE_ROOT={storage_dir}",
+                        f"LOG_FILE={log_file}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            blank_app_env = root / "blank_app.env"
+            blank_app_env.write_text(
+                "\n".join(
+                    [
+                        "APP_ENV=",
+                        f"CHAT_FILE={project_chat}",
+                        f"UPLOAD_DIR={upload_dir}",
+                        f"SSAI_STORAGE_ROOT={storage_dir}",
+                        f"LOG_FILE={log_file}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            unknown_app_env = root / "unknown_app.env"
+            unknown_app_env.write_text(
+                "\n".join(
+                    [
+                        "APP_ENV=production",
+                        f"CHAT_FILE={project_chat}",
+                        f"UPLOAD_DIR={upload_dir}",
+                        f"SSAI_STORAGE_ROOT={storage_dir}",
+                        f"LOG_FILE={log_file}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            app_env_errors = {
+                "missing": env_config.validate_startup_env(env_path=missing_app_env, project_root=root, environ={}, required_path_keys=required_paths),
+                "blank": env_config.validate_startup_env(env_path=blank_app_env, project_root=root, environ={}, required_path_keys=required_paths),
+                "unknown": env_config.validate_startup_env(env_path=unknown_app_env, project_root=root, environ={}, required_path_keys=required_paths),
+            }
+            app_env_ok = True
+            for mode in ("dev", "test", "prod"):
+                mode_env = root / f"{mode}.env"
+                mode_env.write_text(
+                    "\n".join(
+                        [
+                            f"APP_ENV={mode}",
+                            f"CHAT_FILE={project_chat}",
+                            f"UPLOAD_DIR={upload_dir}",
+                            f"SSAI_STORAGE_ROOT={storage_dir}",
+                            f"LOG_FILE={log_file}",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                if env_config.validate_startup_env(env_path=mode_env, project_root=root, environ={}, required_path_keys=required_paths):
+                    app_env_ok = False
+            alias_env = root / "alias.env"
+            alias_log_file = root / "logs" / "sims-app.log"
+            alias_env.write_text(
+                "\n".join(
+                    [
+                        "APP_ENV=prod",
+                        f"CHAT_FILE={project_chat}",
+                        f"UPLOAD_DIR={upload_dir}",
+                        f"SSAI_STORAGE_ROOT={storage_dir}",
+                        f"SIMS_LOG_FILE={alias_log_file}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            no_log_env = root / "no_log.env"
+            no_log_env.write_text(
+                "\n".join(
+                    [
+                        "APP_ENV=prod",
+                        f"CHAT_FILE={project_chat}",
+                        f"UPLOAD_DIR={upload_dir}",
+                        f"SSAI_STORAGE_ROOT={storage_dir}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            os.environ["LOG_FILE"] = str(other / "logs" / "os-app.log")
+            os.environ["SIMS_LOG_FILE"] = str(other / "logs" / "os-sims-app.log")
+            alias_errors = env_config.validate_startup_env(env_path=alias_env, project_root=root, environ=os.environ, required_path_keys=required_paths)
+            no_log_errors = env_config.validate_startup_env(env_path=no_log_env, project_root=root, environ=os.environ, required_path_keys=required_paths)
+            app_env_policy_ok = (
+                any("missing required env: APP_ENV" in e for e in app_env_errors["missing"])
+                and any("missing required env: APP_ENV" in e for e in app_env_errors["blank"])
+                and any("invalid APP_ENV" in e for e in app_env_errors["unknown"])
+                and app_env_ok
+            )
+            if app_env_policy_ok:
+                results.append(_ok("APP_ENV required and allow-listed", "dev/test/prod accepted; missing/blank/unknown blocked"))
+            else:
+                results.append(_fail("APP_ENV required and allow-listed", f"errors={app_env_errors}, valid_modes_ok={app_env_ok}"))
             dev_path = env_config.config_path("CHAT_FILE", project_root=root, environ={"CHAT_FILE": "data/dev_chat.json"})
+            storage_path = env_config.config_path("SSAI_STORAGE_ROOT", project_root=root, environ=env_config.read_project_env_file(project_env))
+            log_path = env_config.config_path_any(("LOG_FILE", "SIMS_LOG_FILE"), project_root=root, environ=env_config.read_project_env_file(project_env))
+            alias_log_path = env_config.config_path_any(("LOG_FILE", "SIMS_LOG_FILE"), project_root=root, environ=env_config.read_project_env_file(alias_env))
             policy_ok = (
                 any("missing project env file" in e for e in missing_errors)
+                and app_env_policy_ok
+                and not alias_errors
+                and alias_log_path == alias_log_file.resolve()
+                and any("missing required path env: LOG_FILE" in e for e in no_log_errors)
                 and any("relative path is not allowed in prod: CHAT_FILE" in e for e in relative_errors)
+                and any("relative path is not allowed in prod: SSAI_STORAGE_ROOT" in e for e in relative_errors)
+                and any("relative path is not allowed in prod: LOG_FILE" in e for e in relative_errors)
                 and any("missing required path env: CHAT_FILE" in e for e in blank_errors)
+                and any("missing required path env: SSAI_STORAGE_ROOT" in e for e in blank_errors)
+                and any("missing required path env: LOG_FILE" in e for e in blank_errors)
                 and dev_path == (root / "data" / "dev_chat.json").resolve()
+                and storage_path == storage_dir.resolve()
+                and log_path == log_file.resolve()
+                and not (root / "data" / "ssai_storage").exists()
+                and not (root / "logs" / "app.log").exists()
             )
             if policy_ok:
-                results.append(_ok("prod env path validation and dev relative resolution", "missing/blank/relative prod paths blocked"))
+                results.append(_ok("prod env path validation and dev relative resolution", "storage/log missing/blank/relative prod paths blocked"))
             else:
                 results.append(_fail("prod env path validation and dev relative resolution", f"missing={missing_errors}, relative={relative_errors}, blank={blank_errors}, dev_path={dev_path}"))
             os.chdir(old_cwd)
@@ -422,13 +605,22 @@ def run_basic_checks() -> list[CheckResult]:
         mssql_src = Path("app/db/mssql_client.py").read_text(encoding="utf-8")
         auth_src = Path("app/services/ssai_auth_service.py").read_text(encoding="utf-8")
         company_admin_src = Path("app/services/ssai_company_admin_service.py").read_text(encoding="utf-8")
+        storage_src = Path("app/services/ssai_storage_service.py").read_text(encoding="utf-8")
+        logging_src = Path("app/utils/logging_setup.py").read_text(encoding="utf-8")
+        company_tool_src = Path("tools/ssai_test_company_connection.py").read_text(encoding="utf-8")
+        verify_tool_src = Path("tools/ssai_verify_admin_password.py").read_text(encoding="utf-8")
         source_checks = [
             ("main auto dotenv removed", "load_dotenv(override=True)" not in main_src and 'ENV_PATH = APP_DIR / ".env"' not in main_src and "_DEFAULT_ENV_TEXT" not in main_src),
             ("main chat paths require config_path", 'CHAT_FILE         = str(_config_path("CHAT_FILE"))' in main_src and 'UPLOAD_DIR        = str(_config_path("UPLOAD_DIR"))' in main_src),
-            ("startup env validation/logs present", "validate_startup_env(environ=os.environ)" in main_src and "[app.env.paths]" in main_src and "[app.env.user_paths]" in main_src),
+            ("startup env validation/logs present", "_STARTUP_REQUIRED_PATHS" in main_src and '("LOG_FILE", "SIMS_LOG_FILE")' in main_src and "[app.env.paths]" in main_src and "[app.env.user_paths]" in main_src),
             ("db cwd dotenv search removed", "find_dotenv" not in mssql_src),
             ("auth root env parser priority", "p = ENV_PATH" in auth_src and "return env.get(name) or os.environ.get(name) or default" in auth_src),
             ("company admin project env loader", "load_project_env(override=False)" in company_admin_src and "load_dotenv()" not in company_admin_src),
+            ("APP_ENV allow-list enforced", "ALLOWED_APP_ENVS" in Path("app/utils/env_config.py").read_text(encoding="utf-8") and "missing required env: APP_ENV" in Path("app/utils/env_config.py").read_text(encoding="utf-8")),
+            ("storage root has no data fallback", 'config_path("SSAI_STORAGE_ROOT"' in storage_src and "DEFAULT_STORAGE_ROOT" not in storage_src and "data/ssai_storage" not in storage_src),
+            ("logger requires root env log path", "read_project_env_file()" in logging_src and "LOG_FILE is required" in logging_src and "Path(log_dir) / filename" not in logging_src and "C:\\\\" not in logging_src and "D:\\\\" not in logging_src),
+            ("connection tool ignores cwd dotenv", "read_project_env_file()" in company_tool_src and "def load_dotenv" not in company_tool_src),
+            ("password tool ignores cwd dotenv", "read_project_env_file()" in verify_tool_src and "def load_dotenv" not in verify_tool_src),
         ]
         for name, ok in source_checks:
             results.append(_ok(name) if ok else _fail(name, "source guard failed"))

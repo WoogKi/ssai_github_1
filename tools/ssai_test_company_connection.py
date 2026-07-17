@@ -19,32 +19,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import pyodbc
 from cryptography.fernet import Fernet
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-def load_dotenv(path: str = ".env") -> dict[str, str]:
-    env: dict[str, str] = {}
-
-    p = Path(path)
-    if not p.exists():
-        return env
-
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        env[key.strip()] = value.strip().strip('"').strip("'")
-
-    return env
+from app.utils.env_config import read_project_env_file
 
 
 def get_env(name: str, env: dict[str, str], default: str | None = None) -> str | None:
-    return os.environ.get(name) or env.get(name) or default
+    return env.get(name) or os.environ.get(name) or default
 
 
 def pick_env(env: dict[str, str], names: list[str], default: str | None = None) -> str | None:
@@ -193,7 +182,7 @@ def main() -> None:
     parser.add_argument("--company-id", type=int, required=True)
     args = parser.parse_args()
 
-    env = load_dotenv(".env")
+    env = read_project_env_file()
 
     secret_key = pick_env(env, ["SSAI_SECRET_KEY"])
     if not secret_key:

@@ -6,15 +6,11 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from typing import Any
 
-from app.services.ssai_auth_service import load_dotenv, pick_env
-
-
-DEFAULT_STORAGE_ROOT = "data/ssai_storage"
+from app.utils.env_config import config_path, read_project_env_file
 
 STORAGE_AREAS = {
     "uploads",
@@ -41,17 +37,9 @@ def get_storage_root() -> Path:
     - SSAI_STORAGE_ROOT
 
     없으면:
-    - data/ssai_storage
+    - no fallback path is used
     """
-    env = load_dotenv(".env")
-    root_value = pick_env(env, ["SSAI_STORAGE_ROOT"], DEFAULT_STORAGE_ROOT)
-
-    root = Path(str(root_value or DEFAULT_STORAGE_ROOT))
-
-    if not root.is_absolute():
-        root = _project_root() / root
-
-    return root.resolve()
+    return config_path("SSAI_STORAGE_ROOT", environ=read_project_env_file()).resolve()
 
 
 def _safe_int_id(value: int | str, *, name: str) -> int:
@@ -180,7 +168,7 @@ def ensure_user_storage_dirs(
     사용자별 기본 저장 폴더를 모두 생성한다.
 
     구조:
-    data/ssai_storage/
+    <SSAI_STORAGE_ROOT>/
       company_1/
         user_3/
           uploads/

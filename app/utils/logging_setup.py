@@ -1,18 +1,19 @@
 # app/utils/logging_setup.py
 # ---------------------------------------------------------
 # 파일+콘솔 로깅 설정
-# - .env LOG_FILE 우선 사용
-# - 기존 log_dir / filename 방식도 호환
+# - project-root .env LOG_FILE 우선 사용
+# - 상대 fallback 경로 생성 금지
 # - 반복 호출 시 중복 핸들러 제거
 # ---------------------------------------------------------
 
 from __future__ import annotations
 
 import logging
-import os
 import sys
 from pathlib import Path
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
+
+from app.utils.env_config import app_env, config_path_any, read_project_env_file
 
 
 class OnlyNamespace(logging.Filter):
@@ -44,24 +45,20 @@ def _resolve_log_file(
     1. 함수 인자 log_file
     2. 환경변수 LOG_FILE
     3. 환경변수 SIMS_LOG_FILE
-    4. 기존 방식 log_dir / filename
+    4. fallback 없음
     """
-    value = (
-        str(log_file).strip()
-        if log_file not in (None, "")
-        else (
-            os.getenv("LOG_FILE")
-            or os.getenv("SIMS_LOG_FILE")
-            or ""
-        ).strip()
-    )
-
-    if value:
-        path = Path(value)
+    if log_file not in (None, ""):
+        value = str(log_file).strip()
     else:
-        path = Path(log_dir) / filename
+        project_env = read_project_env_file()
+        return config_path_any(("LOG_FILE", "SIMS_LOG_FILE"), environ=project_env)
 
-    return path
+    if not value:
+        raise RuntimeError("LOG_FILE is required for rotating logger setup")
+    if app_env(read_project_env_file()) == "prod" and not Path(value).is_absolute():
+        raise RuntimeError("relative LOG_FILE is not allowed in prod")
+
+    return Path(value)
 
 
 def setup_rotating_logger(
@@ -92,12 +89,9 @@ def setup_rotating_logger(
     파일+콘솔 핸들러를 붙인 logger 반환.
 
     LOG_FILE 사용 예:
-        LOG_FILE=C:\\SSAI_TEST_DATA\\logs\\app.log
-        LOG_FILE=D:\\SSAI_DATA\\logs\\app.log
 
     기존 사용도 계속 가능:
         setup_rotating_logger(name="ssai", level=level)
-        setup_rotating_logger(name="ssai", level=level, log_dir="logs", filename="app.log")
     """
 
     # 0) 루트 레벨 설정

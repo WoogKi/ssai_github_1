@@ -70,6 +70,7 @@ from app.utils.env_config import (
     ENV_PATH as ROOT_ENV_PATH,
     app_env as _app_env_name,
     config_path as _config_path,
+    config_path_any as _config_path_any,
     load_project_env,
     validate_startup_env,
 )
@@ -79,15 +80,23 @@ _ENV_LOAD_RESULT = load_project_env(override=True)
 import os as _os_for_log_init, sys as _sys_for_log_init, logging as _logging_init
 from app.utils.logging_setup import setup_rotating_logger
 
+_STARTUP_REQUIRED_PATHS = (
+    "CHAT_FILE",
+    "UPLOAD_DIR",
+    "SSAI_STORAGE_ROOT",
+    ("LOG_FILE", "SIMS_LOG_FILE"),
+)
+_PRE_LOG_ENV_ERRORS = validate_startup_env(required_path_keys=_STARTUP_REQUIRED_PATHS)
+if _PRE_LOG_ENV_ERRORS:
+    for _env_error in _PRE_LOG_ENV_ERRORS:
+        print(f"[app.env.invalid] {_env_error}", file=_sys_for_log_init.stderr)
+    raise SystemExit("invalid project root .env configuration")
+
 _level_name = (_os_for_log_init.getenv("LOG_LEVEL") or _os_for_log_init.getenv("SIMS_LOG_LEVEL") or "INFO").upper()
 _level = getattr(_logging_init, _level_name, _logging_init.INFO)
 
-# 파일+콘솔 회전 로거( logs/app.log )
-_log_file = (
-    _os_for_log_init.getenv("LOG_FILE")
-    or _os_for_log_init.getenv("SIMS_LOG_FILE")
-    or "logs/app.log"
-)
+# 파일+콘솔 회전 로거
+_log_file = str(_config_path_any(("LOG_FILE", "SIMS_LOG_FILE")))
 
 log = setup_rotating_logger(
     name="ssai",
@@ -96,12 +105,14 @@ log = setup_rotating_logger(
 )
 
 log.info(
-    "[app.env] env_file=%s exists=%s loaded=%s APP_ENV=%s SSAI_INSTANCE_ID=%s sys_executable=%s",
+    "[app.env] env_file=%s exists=%s loaded=%s APP_ENV=%s SSAI_INSTANCE_ID=%s CHAT_FILE=%s LOG_FILE=%s sys_executable=%s",
     str(ROOT_ENV_PATH),
     bool(_ENV_LOAD_RESULT.exists),
     bool(_ENV_LOAD_RESULT.loaded),
     _app_env_name(),
     os.getenv("SSAI_INSTANCE_ID") or "",
+    str(_config_path("CHAT_FILE")),
+    _log_file,
     sys.executable,
 )
 log.debug("LOG INIT level=%s project_env=%s", _level_name, str(ROOT_ENV_PATH))
@@ -1044,7 +1055,7 @@ cfg_str  = lambda k, d="":  get_config(k, d, cast=str)
 cfg_int  = lambda k, d=0:   get_config(k, d, cast=int)
 cfg_bool = lambda k, d=False: get_config(k, d, cast=lambda x: str(x).strip().lower() in ("1","true","yes","y","on"))
 
-_ENV_STARTUP_ERRORS = validate_startup_env(environ=os.environ)
+_ENV_STARTUP_ERRORS = validate_startup_env(environ=os.environ, required_path_keys=_STARTUP_REQUIRED_PATHS)
 if _ENV_STARTUP_ERRORS:
     for _env_error in _ENV_STARTUP_ERRORS:
         log.error("[app.env.invalid] %s", _env_error)
@@ -9573,7 +9584,7 @@ with st.sidebar:
                     except Exception:
                         return default
 
-                app_env = os.getenv("APP_ENV") or "development"
+                app_env = _app_env_name()
                 log_level = os.getenv("LOG_LEVEL") or "DEBUG"
 
                 CHAT_FILE_val = _safe("CHAT_FILE")
@@ -10946,7 +10957,7 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
             if show_console:
                 try:
                     import pathlib, itertools
-                    log_path = pathlib.Path(os.getenv("LOG_FILE") or "logs/app.log")
+                    log_path = pathlib.Path(_log_file)
                     if log_path.exists():
                         tail = "\n".join(log_path.read_text(encoding="utf-8", errors="ignore").splitlines()[-60:])
                         st.text_area("app.log (tail 60)", value=tail, height=220, label_visibility="collapsed")

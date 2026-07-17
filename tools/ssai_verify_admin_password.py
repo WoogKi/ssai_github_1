@@ -23,35 +23,22 @@ import getpass
 import hashlib
 import hmac
 import os
+import sys
 from pathlib import Path
 
 import pyodbc
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.utils.env_config import read_project_env_file
 
 ALGORITHM = "pbkdf2_sha256"
 
 
-def load_dotenv(path: str = ".env") -> dict[str, str]:
-    env: dict[str, str] = {}
-
-    p = Path(path)
-    if not p.exists():
-        return env
-
-    for line in p.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        env[key.strip()] = value.strip().strip('"').strip("'")
-
-    return env
-
-
 def get_env(name: str, env: dict[str, str], default: str | None = None) -> str | None:
-    return os.environ.get(name) or env.get(name) or default
+    return env.get(name) or os.environ.get(name) or default
 
 
 def pick_env(env: dict[str, str], names: list[str], default: str | None = None) -> str | None:
@@ -166,7 +153,7 @@ def main() -> None:
     parser.add_argument("--login-id", default="admin")
     args = parser.parse_args()
 
-    env = load_dotenv(".env")
+    env = read_project_env_file()
 
     with connect_ssai_db(env) as conn:
         user = get_user_password_hash(conn, args.login_id)
