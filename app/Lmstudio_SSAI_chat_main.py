@@ -284,6 +284,51 @@ from app.ui.ssai_admin import (
 # =========================================================
 # 4-0) 전역 CSS: SIMS popover / expander UI 스타일 보정
 # =========================================================
+def _inject_korean_document_language_once() -> None:
+    """Tell the browser that the SSAI document is Korean.
+
+    This only changes document-level language/translation hints. It does not
+    inspect or rewrite user input, DB values, LLM responses, or export data.
+    """
+    if st.session_state.get("__korean_document_language_loaded"):
+        return
+
+    script = """
+<script>
+(function () {
+  try {
+    const root = document.documentElement;
+    if (root) {
+      root.lang = "ko";
+      root.setAttribute("translate", "no");
+      root.classList.add("notranslate");
+    }
+
+    if (document.head) {
+      let meta = document.querySelector('meta[name="google"]');
+      if (!meta) {
+        meta = document.createElement("meta");
+        meta.setAttribute("name", "google");
+        document.head.appendChild(meta);
+      }
+      meta.setAttribute("content", "notranslate");
+    }
+  } catch (e) {}
+})();
+</script>
+"""
+    try:
+        st.html(script, width="content", unsafe_allow_javascript=True)
+    except Exception:
+        try:
+            log.debug("[browser.language] Korean document language injection failed", exc_info=True)
+        except Exception:
+            pass
+        return
+
+    st.session_state["__korean_document_language_loaded"] = True
+
+
 def _inject_base_css_once() -> None:
     """Streamlit 전역 CSS를 1회만 주입한다.
 
@@ -321,6 +366,7 @@ details[open] > summary {
     st.session_state["__base_css_loaded"] = True
 
 
+_inject_korean_document_language_once()
 _inject_base_css_once()
 
 #

@@ -609,10 +609,37 @@ def run_basic_checks() -> list[CheckResult]:
         logging_src = Path("app/utils/logging_setup.py").read_text(encoding="utf-8")
         company_tool_src = Path("tools/ssai_test_company_connection.py").read_text(encoding="utf-8")
         verify_tool_src = Path("tools/ssai_verify_admin_password.py").read_text(encoding="utf-8")
+        korean_doc_call_matches = list(re.finditer(r"(?m)^_inject_korean_document_language_once\(\)\s*$", main_src))
+        korean_doc_call_pos = korean_doc_call_matches[0].start() if korean_doc_call_matches else -1
+        login_check_pos = main_src.find("if not require_login():")
+        korean_doc_block_match = re.search(
+            r"def _inject_korean_document_language_once\(\) -> None:.*?(?=\ndef _inject_base_css_once)",
+            main_src,
+            re.S,
+        )
+        korean_doc_block = korean_doc_block_match.group(0) if korean_doc_block_match else ""
         source_checks = [
             ("main auto dotenv removed", "load_dotenv(override=True)" not in main_src and 'ENV_PATH = APP_DIR / ".env"' not in main_src and "_DEFAULT_ENV_TEXT" not in main_src),
             ("main chat paths require config_path", 'CHAT_FILE         = str(_config_path("CHAT_FILE"))' in main_src and 'UPLOAD_DIR        = str(_config_path("UPLOAD_DIR"))' in main_src),
             ("startup env validation/logs present", "_STARTUP_REQUIRED_PATHS" in main_src and '("LOG_FILE", "SIMS_LOG_FILE")' in main_src and "[app.env.paths]" in main_src and "[app.env.user_paths]" in main_src),
+            (
+                "browser Korean document language guard",
+                "def _inject_korean_document_language_once()" in main_src
+                and "document.documentElement" in main_src
+                and 'root.lang = "ko"' in main_src
+                and 'root.setAttribute("translate", "no")' in main_src
+                and 'root.classList.add("notranslate")' in main_src
+                and 'meta.setAttribute("name", "google")' in main_src
+                and 'meta.setAttribute("content", "notranslate")' in main_src
+                and "unsafe_allow_javascript=True" in main_src
+                and "__korean_document_language_loaded" in main_src
+                and len(korean_doc_call_matches) == 1
+                and korean_doc_call_pos >= 0
+                and login_check_pos >= 0
+                and korean_doc_call_pos < login_check_pos
+                and "user_input" not in korean_doc_block
+                and "stc.html(" not in korean_doc_block
+            ),
             ("db cwd dotenv search removed", "find_dotenv" not in mssql_src),
             ("auth root env parser priority", "p = ENV_PATH" in auth_src and "return env.get(name) or os.environ.get(name) or default" in auth_src),
             ("company admin project env loader", "load_project_env(override=False)" in company_admin_src and "load_dotenv()" not in company_admin_src),
@@ -624,6 +651,58 @@ def run_basic_checks() -> list[CheckResult]:
         ]
         for name, ok in source_checks:
             results.append(_ok(name) if ok else _fail(name, "source guard failed"))
+
+        try:
+            class _FakeLog:
+                def __init__(self):
+                    self.debug_calls = 0
+
+                def debug(self, *args, **kwargs):
+                    self.debug_calls += 1
+
+            class _FakeSt:
+                def __init__(self, *, fail: bool = False, loaded: bool = False):
+                    self.session_state = {"__korean_document_language_loaded": True} if loaded else {}
+                    self.fail = fail
+                    self.html_calls = 0
+
+                def html(self, *args, **kwargs):
+                    self.html_calls += 1
+                    if self.fail:
+                        raise RuntimeError("html failed")
+
+            if not korean_doc_block:
+                raise AssertionError("helper block not found")
+
+            fake_ok = _FakeSt()
+            ns_ok = {"st": fake_ok, "log": _FakeLog()}
+            exec(korean_doc_block, ns_ok)
+            ns_ok["_inject_korean_document_language_once"]()
+
+            fake_fail = _FakeSt(fail=True)
+            ns_fail = {"st": fake_fail, "log": _FakeLog()}
+            exec(korean_doc_block, ns_fail)
+            ns_fail["_inject_korean_document_language_once"]()
+
+            fake_loaded = _FakeSt(loaded=True)
+            ns_loaded = {"st": fake_loaded, "log": _FakeLog()}
+            exec(korean_doc_block, ns_loaded)
+            ns_loaded["_inject_korean_document_language_once"]()
+
+            behavior_ok = (
+                fake_ok.html_calls == 1
+                and fake_ok.session_state.get("__korean_document_language_loaded") is True
+                and fake_fail.html_calls == 1
+                and "__korean_document_language_loaded" not in fake_fail.session_state
+                and fake_loaded.html_calls == 0
+                and fake_loaded.session_state.get("__korean_document_language_loaded") is True
+            )
+            if behavior_ok:
+                results.append(_ok("browser Korean document language helper behavior", "loaded flag is set only after successful st.html; already-loaded reruns skip injection"))
+            else:
+                results.append(_fail("browser Korean document language helper behavior", f"ok_calls={fake_ok.html_calls}, fail_state={fake_fail.session_state}, loaded_calls={fake_loaded.html_calls}"))
+        except Exception as e:
+            results.append(_fail("browser Korean document language helper behavior", f"{type(e).__name__}: {e}"))
 
         import types
 
