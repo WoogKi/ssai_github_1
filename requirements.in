@@ -1,5 +1,5 @@
 # === Core App ===
-streamlit>=1.34        # UI 프레임워크
+streamlit==1.59.0     # UI 프레임워크
 openai>=1.0            # from openai import OpenAI 사용
 
 # === Data / File IO ===
