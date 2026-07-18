@@ -3193,6 +3193,152 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("stock shortage display field restore", f"{type(e).__name__}: {e}"))
 
         try:
+            import io
+            import json
+            from openpyxl import load_workbook
+
+            from app.services import product_flow_service as product_flow_mod
+            from app.sims.views import rddbc_io_shared as io_shared_mod
+            from app.ui import chat_middleware as chat_mod
+            from app.ui import sims_table_display as display_mod
+
+            seq_col = "\uba85\uc138\uc11c\ubc88\ud638"
+            product_no_col = "\uc81c\uc870\ubc88\ud638"
+            validation_col = "\uac80\uc218\ud655\uc778"
+            in_qty_col = "\uc785\uace0\uc218\ub7c9"
+            out_qty_col = "\ucd9c\uace0\uc218\ub7c9"
+            supply_col = "\uacf5\uae09\uac00\uc561"
+            total_col = "\ud569\uacc4\uae08\uc561"
+            product_code_col = "\uc81c\ud488\ucf54\ub4dc"
+            biz_no_col = "\uc0ac\uc5c5\uc790\ubc88\ud638"
+            phone_col = "\uc804\ud654\ubc88\ud638"
+            zip_col = "\uc6b0\ud3b8\ubc88\ud638"
+
+            source_df = pd.DataFrame(
+                {
+                    seq_col: [None, 268, 628, 893, None, None, None],
+                    product_no_col: ["114625021", "000123", "001-A", "", None, pd.NA, "NULL"],
+                    validation_col: ["1", "0", "Y", "", float("nan"), "<NA>", "nan"],
+                    in_qty_col: [0, "10", "20", "", "30", "40", "50"],
+                    out_qty_col: [0, "1", "2", "", "3", "4", "5"],
+                    supply_col: [0, "1000", "2000", "", "3000", "4000", "5000"],
+                    total_col: [0, "1100", "2200", "", "3300", "4400", "5500"],
+                    product_code_col: ["00001", "00002", "00003", "00004", "00005", "00006", "00007"],
+                    biz_no_col: ["012-34-56789", "1112233333", "", "999-88-77777", "0000011111", "2222233333", "4444455555"],
+                    phone_col: ["02-1234-5678", "01000000000", "", "031-123-4567", "01011112222", "01033334444", "01055556666"],
+                    zip_col: ["01234", "12345", "", "67890", "00001", "00002", "00003"],
+                }
+            )
+
+            finalized = product_flow_mod._finalize_display_df_250(source_df)
+            prepared = io_shared_mod._prepare_io_display_df(finalized, add_row_no=False)
+            view_df, column_config, _table_width, _table_height = display_mod.build_sims_table_display_config(
+                prepared.copy(),
+                action_name="\uc81c\ud488\uc218\ubd88\ud604\ud669 \uc870\ud68c",
+                add_row_no=False,
+            )
+
+            failures: list[str] = []
+
+            if str(finalized[seq_col].dtype) != "Int64":
+                failures.append(f"service_seq_dtype={finalized[seq_col].dtype}")
+            if finalized[seq_col].isna().iloc[0] is not True and not pd.isna(finalized[seq_col].iloc[0]):
+                failures.append(f"service_seq_blank={finalized[seq_col].iloc[0]!r}")
+            if finalized[seq_col].dropna().astype(int).tolist() != [268, 628, 893]:
+                failures.append(f"service_seq_values={finalized[seq_col].tolist()!r}")
+
+            for col, expected in [
+                (product_no_col, ["114625021", "000123", "001-A", "", "", "", "NULL"]),
+                (validation_col, ["1", "0", "Y", "", "", "<NA>", "nan"]),
+            ]:
+                if not (pd.api.types.is_object_dtype(finalized[col]) or pd.api.types.is_string_dtype(finalized[col])):
+                    failures.append(f"service_{col}_dtype={finalized[col].dtype}")
+                if finalized[col].tolist() != expected:
+                    failures.append(f"service_{col}_values={finalized[col].tolist()!r}")
+
+            if str(prepared[seq_col].dtype) != "Int64":
+                failures.append(f"display_seq_dtype={prepared[seq_col].dtype}")
+            for col, expected in [
+                (product_no_col, ["114625021", "000123", "001-A", "", "", "", "NULL"]),
+                (validation_col, ["1", "0", "Y", "", "", "<NA>", "nan"]),
+                (product_code_col, ["00001", "00002", "00003", "00004", "00005", "00006", "00007"]),
+                (biz_no_col, ["012-34-56789", "1112233333", "", "999-88-77777", "0000011111", "2222233333", "4444455555"]),
+                (phone_col, ["02-1234-5678", "01000000000", "", "031-123-4567", "01011112222", "01033334444", "01055556666"]),
+                (zip_col, ["01234", "12345", "", "67890", "00001", "00002", "00003"]),
+            ]:
+                if prepared[col].tolist() != expected:
+                    failures.append(f"display_{col}_values={prepared[col].tolist()!r}")
+                if not (pd.api.types.is_object_dtype(prepared[col]) or pd.api.types.is_string_dtype(prepared[col])):
+                    failures.append(f"display_{col}_dtype={prepared[col].dtype}")
+
+            for col in [in_qty_col, out_qty_col, supply_col, total_col]:
+                if not pd.api.types.is_numeric_dtype(prepared[col]):
+                    failures.append(f"numeric_{col}_dtype={prepared[col].dtype}")
+
+            if not display_mod._is_numeric_display_col(view_df, seq_col):
+                failures.append("seq_not_number_column")
+            for col in [product_no_col, validation_col, product_code_col, biz_no_col, phone_col, zip_col]:
+                if display_mod._is_numeric_display_col(view_df, col):
+                    failures.append(f"{col}_unexpected_number_column")
+            type_expectations = {
+                seq_col: ("number", 1),
+                product_no_col: ("text", None),
+                validation_col: ("text", None),
+                product_code_col: ("text", None),
+                biz_no_col: ("text", None),
+                phone_col: ("text", None),
+                zip_col: ("text", None),
+            }
+            for col, (expected_type, expected_step) in type_expectations.items():
+                cfg = column_config.get(col)
+                actual_type = (cfg or {}).get("type_config", {}).get("type")
+                actual_step = (cfg or {}).get("type_config", {}).get("step")
+                if actual_type != expected_type:
+                    failures.append(f"column_config_{col}_type={actual_type}")
+                if expected_step is not None and actual_step != expected_step:
+                    failures.append(f"column_config_{col}_step={actual_step}")
+
+            json.dumps(prepared.to_dict(orient="records"), ensure_ascii=False)
+
+            bio = io.BytesIO()
+            excel_df = chat_mod._sanitize_dataframe_for_excel(finalized)
+            excel_df.to_excel(bio, index=False, sheet_name="SIMS")
+            bio.seek(0)
+            wb = load_workbook(bio, read_only=True, data_only=True)
+            ws = wb["SIMS"]
+            header = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+
+            def _cell(row: int, col_name: str):
+                return ws.cell(row=row, column=header.index(col_name) + 1)
+
+            if _cell(2, seq_col).value is not None:
+                failures.append(f"excel_seq_blank={_cell(2, seq_col).value!r}")
+            for row in [3, 4, 5]:
+                if _cell(row, seq_col).data_type != "n":
+                    failures.append(f"excel_seq_type_row{row}={_cell(row, seq_col).data_type}")
+            for row in [2, 3, 4]:
+                if _cell(row, product_no_col).data_type not in {"s", "inlineStr"}:
+                    failures.append(f"excel_product_no_type_row{row}={_cell(row, product_no_col).data_type}")
+                if _cell(row, validation_col).data_type not in {"s", "inlineStr"}:
+                    failures.append(f"excel_validation_type_row{row}={_cell(row, validation_col).data_type}")
+            if _cell(3, product_no_col).value != "000123":
+                failures.append(f"excel_leading_zero={_cell(3, product_no_col).value!r}")
+            if _cell(8, product_no_col).value != "NULL":
+                failures.append(f"excel_literal_NULL={_cell(8, product_no_col).value!r}")
+            if _cell(7, validation_col).value != "<NA>":
+                failures.append(f"excel_literal_pdna={_cell(7, validation_col).value!r}")
+            if _cell(8, validation_col).value != "nan":
+                failures.append(f"excel_literal_nan={_cell(8, validation_col).value!r}")
+            wb.close()
+
+            if failures:
+                results.append(_fail("product flow column type policy", "; ".join(failures)))
+            else:
+                results.append(_ok("product flow column type policy", "statement seq is nullable integer/numeric Excel cell; product no and validation remain text in service/display/Excel; numeric and identifier columns preserved"))
+        except Exception as e:
+            results.append(_fail("product flow column type policy", f"{type(e).__name__}: {e}"))
+
+        try:
             main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
             no_source_checks = {
                 "simple_notice": "현재표가 없습니다. 먼저 SIMS 조회를 실행한 뒤 다시 질문해 주세요." in main_src,

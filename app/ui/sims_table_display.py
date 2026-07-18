@@ -259,6 +259,9 @@ def _is_explicit_code_display_name(col: Any) -> bool:
 def _is_numeric_display_name(col: Any) -> bool:
     s = _clean_text(col)
 
+    if s == "명세서번호":
+        return True
+
     if _is_explicit_code_display_name(s):
         return False
 
@@ -526,6 +529,9 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
     if _is_row_no_col(s):
         return True
 
+    if s == "명세서번호":
+        return True
+
     explicit_numeric_cols = {
         "완료월총매출",
         "월평균매출",
@@ -660,6 +666,9 @@ def _numeric_display_kind(col: Any) -> str:
     s = _clean_text(col)
 
     if _is_row_no_col(s):
+        return "int"
+
+    if s == "명세서번호":
         return "int"
 
     if _is_stock_shortage_quantity_int_col(s):

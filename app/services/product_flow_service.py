@@ -287,11 +287,30 @@ _DISPLAY_NUMERIC_COLS_250 = {
 }
 
 
+_PRODUCT_FLOW_INTEGER_ID_COLS = {"명세서번호"}
+_PRODUCT_FLOW_TEXT_ID_COLS = {"제조번호", "검수확인"}
+
+
+def _product_flow_integer_id_series(sr: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(sr, errors="coerce")
+    numeric = numeric.mask(numeric.abs() < 1e-12)
+    return numeric.round(0).astype("Int64")
+
+
+def _product_flow_text_id_series(sr: pd.Series) -> pd.Series:
+    work = sr.where(sr.notna(), "")
+    return work.astype(str).str.strip()
+
+
 def _finalize_display_df_250(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     for col in out.columns:
-        if col in _DISPLAY_NUMERIC_COLS_250:
+        if col in _PRODUCT_FLOW_INTEGER_ID_COLS:
+            out[col] = _product_flow_integer_id_series(out[col])
+        elif col in _PRODUCT_FLOW_TEXT_ID_COLS:
+            out[col] = _product_flow_text_id_series(out[col])
+        elif col in _DISPLAY_NUMERIC_COLS_250:
             s = pd.to_numeric(out[col], errors="coerce")
             s = s.mask(s.abs() < 1e-12)
             out[col] = s

@@ -932,6 +932,10 @@ _IO_TEXTISH_NAME_HINTS = [
 ]
 
 
+_IO_TEXT_IDENTIFIER_COLS = {"제조번호", "검수확인", "사업자번호", "전화번호", "우편번호"}
+_IO_INTEGER_IDENTIFIER_COLS = {"명세서번호"}
+
+
 def _normalize_col_key(name: Any) -> str:
     return (
         str(name or "")
@@ -972,6 +976,14 @@ def _looks_date_col(col_name: str) -> bool:
 
 def _looks_textish_label_col(col_name: str) -> bool:
     return _has_name_hint(col_name, _IO_TEXTISH_NAME_HINTS)
+
+
+def _looks_text_identifier_col(col_name: str) -> bool:
+    return str(col_name or "").strip() in _IO_TEXT_IDENTIFIER_COLS
+
+
+def _looks_integer_identifier_col(col_name: str) -> bool:
+    return str(col_name or "").strip() in _IO_INTEGER_IDENTIFIER_COLS
 
 
 def _looks_decimal_col(col_name: str) -> bool:
@@ -1042,6 +1054,22 @@ def _series_to_code_text(sr: pd.Series) -> pd.Series:
     return sr.apply(_normalize_code_cell).astype(str)
 
 
+def _series_to_identifier_text(sr: pd.Series) -> pd.Series:
+    return sr.where(sr.notna(), "").astype(str).str.strip()
+
+
+def _series_to_nullable_integer(sr: pd.Series) -> pd.Series:
+    if is_numeric_dtype(sr):
+        numeric = pd.to_numeric(sr, errors="coerce")
+    else:
+        numeric = pd.to_numeric(
+            _clean_object_series(sr).str.replace(",", "", regex=False),
+            errors="coerce",
+        )
+    numeric = numeric.mask(numeric.abs() < 1e-12)
+    return numeric.round(0).astype("Int64")
+
+
 def _normalize_date_cell(value: Any) -> str:
     if pd.isna(value):
         return ""
@@ -1089,6 +1117,12 @@ def _series_to_date_text(sr: pd.Series) -> pd.Series:
 
 
 def _maybe_to_numeric(sr: pd.Series, col_name: str):
+    if _looks_text_identifier_col(col_name):
+        return _series_to_identifier_text(sr)
+
+    if _looks_integer_identifier_col(col_name):
+        return _series_to_nullable_integer(sr)
+
     if _looks_code_col(col_name):
         return _series_to_code_text(sr)
 
@@ -1172,10 +1206,15 @@ def _prepare_io_display_df(
 
     object_cols = work.select_dtypes(include=["object", "string"]).columns
     for col in object_cols:
-        work[col] = _clean_object_series(work[col])
+        if _looks_text_identifier_col(str(col)):
+            work[col] = _series_to_identifier_text(work[col])
+        else:
+            work[col] = _clean_object_series(work[col])
 
     numeric_cols = work.select_dtypes(include=["number"]).columns
     for col in numeric_cols:
+        if _looks_integer_identifier_col(str(col)):
+            continue
         s = pd.to_numeric(work[col], errors="coerce")
         s = _normalize_zero_numeric_series(s)
         work[col] = s.fillna(0)
@@ -1855,6 +1894,3 @@ def _render_product_candidate_row(
         st.caption(product_msg)
 
     return physic_cd, physic_nm, product_search
-
-
-
