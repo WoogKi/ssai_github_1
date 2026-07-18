@@ -651,6 +651,199 @@ def run_basic_checks() -> list[CheckResult]:
         results.append(_fail("project-root .env source guards", f"{type(e).__name__}: {e}"))
 
     try:
+        from app.services import llm_health
+        import time as _time
+
+        class _FakeExc(Exception):
+            def __init__(self, status_code: int | None = None, message: str = "fixture error without secrets"):
+                super().__init__(message)
+                if status_code is not None:
+                    self.status_code = status_code
+
+        secret_fixture = "sk-secret-fixture"
+        classified = {
+            "401": llm_health.classify_llm_exception(_FakeExc(401))["code"],
+            "connection": llm_health.classify_llm_exception(type("APIConnectFixture", (Exception,), {})())["code"],
+            "404": llm_health.classify_llm_exception(_FakeExc(404))["code"],
+            "429": llm_health.classify_llm_exception(_FakeExc(429))["code"],
+            "500": llm_health.classify_llm_exception(_FakeExc(500))["code"],
+            "timeout": llm_health.classify_llm_exception(type("RequestTimeout", (Exception,), {})())["code"],
+        }
+        unknown_info = llm_health.classify_llm_exception(_FakeExc(None, f"raw {secret_fixture} http://127.0.0.1/body"))
+        preset_unknown = RuntimeError(f"raw preset {secret_fixture}")
+        setattr(preset_unknown, "llm_error_code", "not_a_known_code")
+        preset_info = llm_health.classify_llm_exception(preset_unknown)
+
+        class _Model:
+            def __init__(self, model_id: str):
+                self.id = model_id
+
+        class _Models:
+            def __init__(self, ids: list[str]):
+                self._ids = ids
+                self.calls = 0
+
+            def list(self):
+                self.calls += 1
+                return type("ModelList", (), {"data": [_Model(x) for x in self._ids]})()
+
+        class _Client:
+            def __init__(self, ids: list[str]):
+                self.models = _Models(ids)
+                self.last_options = {}
+
+            def with_options(self, **kwargs):
+                self.last_options = dict(kwargs)
+                return self
+
+        class _TimeoutModels:
+            def __init__(self):
+                self.calls = 0
+
+            def list(self):
+                self.calls += 1
+                raise TimeoutError("fast health timeout fixture")
+
+        class _TimeoutClient:
+            def __init__(self):
+                self.models = _TimeoutModels()
+                self.last_options = {}
+
+            def with_options(self, **kwargs):
+                self.last_options = dict(kwargs)
+                return self
+
+        ok_client = _Client(["model-a"])
+        ok_status = llm_health.check_llm(expected_model="model-a", client=ok_client)
+        empty_status = llm_health.check_llm(expected_model="model-a", client=_Client([]))
+        mismatch_status = llm_health.check_llm(expected_model="model-a", client=_Client(["model-b"]))
+        timeout_client = _TimeoutClient()
+        health_t0 = _time.perf_counter()
+        timeout_status = llm_health.check_llm(expected_model="model-a", client=timeout_client, health_timeout_s=4)
+        health_elapsed = _time.perf_counter() - health_t0
+        model_list_options_ok = (
+            ok_client.last_options.get("max_retries") == 0
+            and timeout_client.last_options.get("timeout") == 4
+            and timeout_client.last_options.get("max_retries") == 0
+            and timeout_client.models.calls == 1
+        )
+
+        class _Usage:
+            prompt_tokens = 3
+            completion_tokens = 5
+            total_tokens = 8
+
+        def _resp(content: str = "", reasoning: str = "", finish: str | None = None):
+            msg = type("Msg", (), {"content": content, "reasoning_content": reasoning})()
+            choice = type("Choice", (), {"message": msg, "finish_reason": finish})()
+            return type("Resp", (), {"choices": [choice], "usage": _Usage()})()
+
+        normal = llm_health.extract_chat_completion_text(_resp("ok", finish="stop"))
+        reasoning_only = llm_health.extract_chat_completion_text(_resp("", "hidden reasoning"))
+        empty = llm_health.extract_chat_completion_text(_resp(""))
+        length = llm_health.extract_chat_completion_text(_resp("cut", finish="length"))
+        retry_info = {"code": "timeout", "retryable": True}
+        non_retry_info = {"code": "authentication_error", "retryable": False}
+        retry_checks = {
+            "bounded_none": llm_health.bounded_retry_count(None) == 0,
+            "bounded_negative": llm_health.bounded_retry_count(-3) == 0,
+            "bounded_high": llm_health.bounded_retry_count(9) == 1,
+            "retry_before_content": llm_health.should_retry_llm_error(retry_info, attempt=0, max_retries=1, content_started=False),
+            "no_retry_after_max": not llm_health.should_retry_llm_error(retry_info, attempt=1, max_retries=1, content_started=False),
+            "no_retry_after_content": not llm_health.should_retry_llm_error(retry_info, attempt=0, max_retries=1, content_started=True),
+            "no_retry_auth": not llm_health.should_retry_llm_error(non_retry_info, attempt=0, max_retries=1, content_started=False),
+        }
+        def _simulated_attempts(err_info: dict, *, max_retries: int, content_started: bool = False) -> int:
+            calls = 0
+            for attempt in range(llm_health.bounded_retry_count(max_retries) + 1):
+                calls += 1
+                if not llm_health.should_retry_llm_error(err_info, attempt=attempt, max_retries=max_retries, content_started=content_started):
+                    break
+            return calls
+
+        retry_call_counts = {
+            "non_retry_total_1": _simulated_attempts(non_retry_info, max_retries=1) == 1,
+            "retryable_total_2": _simulated_attempts(retry_info, max_retries=1) == 2,
+            "partial_total_1": _simulated_attempts(retry_info, max_retries=1, content_started=True) == 1,
+        }
+
+        main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8", errors="replace")
+        top_src = "\n".join(main_src.splitlines()[:280])
+        model_ready_block = main_src[main_src.find("def _llm_model_ready"):main_src.find("def _fallback_login_greeting")]
+        protected_block = main_src[main_src.find("def call_chat_protected"):main_src.find("# =========================================================", main_src.find("def call_chat_protected") + 1)]
+        stream_call_start = main_src.find("response_stream = call_chat_protected")
+        stream_call_end = main_src.find(")", stream_call_start)
+        stream_call_block = main_src[stream_call_start:stream_call_end]
+        get_models_start = main_src.find("def _get_models_cached()")
+        get_models_end = main_src.find("# =========================", get_models_start + 1)
+        get_models_block = main_src[get_models_start:get_models_end]
+        source_guards = {
+            "top_health_lazy": "LLM_STATUS = {\"ok\": None" in top_src and "LLM_STATUS = check_llm(" not in top_src,
+            "model_cache_ttl_short": "@st.cache_data(ttl=5)" in main_src and "def _get_models_cached" in main_src,
+            "model_list_timeout": "with_options" in get_models_block and "LLM_HEALTH_TIMEOUT_S" in get_models_block,
+            "model_list_sdk_retry_off": "max_retries=0" in get_models_block,
+            "client_sdk_retry_off": "CLIENT = OpenAI(" in main_src and "max_retries=0" in main_src,
+            "model_ready_no_duplicate_check": "check_llm(" not in model_ready_block,
+            "call_protected_no_unused_client": "cli = getattr(CLIENT" not in protected_block,
+            "stream_inner_retry_off": "max_retry=0" in stream_call_block,
+            "expected_model_fixed_ui": "st.session_state.selected_model = EXPECTED_LM_MODEL" in main_src and "st.expander(" in main_src,
+            "stream_no_retry_after_tokens": "if collected:\n                    final_text = \"\".join(collected).strip()" in main_src,
+            "reasoning_delta_guard": "reasoning_content" in main_src and "reasoning_seen" in main_src,
+            "login_fallback_ready_check": "ready, _ready_message = _llm_model_ready(EXPECTED_LM_MODEL)" in main_src,
+            "wait_placeholder": "wait_slot = st.empty()" in main_src and "_clear_wait_notice()" in main_src,
+            "no_local_model_runtime_fallback": 'or "local-model"' not in main_src.replace('#                model=model or st.session_state.get("selected_model") or "local-model"', ""),
+        }
+
+        mismatches = []
+        expected_codes = {
+            "401": "authentication_error",
+            "connection": "connection_error",
+            "404": "model_not_found",
+            "429": "rate_or_queue_busy",
+            "500": "server_error",
+            "timeout": "timeout",
+        }
+        for key, expected in expected_codes.items():
+            if classified.get(key) != expected:
+                mismatches.append(f"{key}->{classified.get(key)}")
+        if not ok_status.get("ok"):
+            mismatches.append("expected model should be ok")
+        if empty_status.get("code") != "model_not_loaded":
+            mismatches.append(f"empty models code={empty_status.get('code')}")
+        if mismatch_status.get("code") != "model_mismatch":
+            mismatches.append(f"mismatch code={mismatch_status.get('code')}")
+        if timeout_status.get("code") != "timeout" or not model_list_options_ok or health_elapsed > 0.5:
+            mismatches.append(f"health timeout/retry guard failed code={timeout_status.get('code')} options={timeout_client.last_options} calls={timeout_client.models.calls} elapsed={health_elapsed:.3f}")
+        if secret_fixture in str(unknown_info.get("user_message")) or unknown_info.get("code") != "unknown_error":
+            mismatches.append("unknown exception leaked raw user message")
+        if secret_fixture in str(preset_info.get("user_message")) or preset_info.get("user_message") != llm_health.SAFE_MESSAGES["unknown_error"]:
+            mismatches.append("preset unknown exception leaked raw user message")
+        if normal.get("content") != "ok" or normal.get("usage", {}).get("completion_tokens") != 5:
+            mismatches.append("normal content/usage extraction failed")
+        if reasoning_only.get("code") != "reasoning_only" or reasoning_only.get("content"):
+            mismatches.append("reasoning-only guard failed")
+        if empty.get("code") != "empty_response":
+            mismatches.append("empty response guard failed")
+        if length.get("finish_reason") != "length":
+            mismatches.append("finish_reason length not preserved")
+        failed_retry = [k for k, ok in retry_checks.items() if not ok]
+        if failed_retry:
+            mismatches.append(f"retry_checks={failed_retry}")
+        failed_retry_counts = [k for k, ok in retry_call_counts.items() if not ok]
+        if failed_retry_counts:
+            mismatches.append(f"retry_call_counts={failed_retry_counts}")
+        failed_guards = [k for k, ok in source_guards.items() if not ok]
+        if failed_guards:
+            mismatches.append(f"source_guards={failed_guards}")
+
+        if mismatches:
+            results.append(_fail("LM Studio 0.4.19 stability guards", "; ".join(mismatches)))
+        else:
+            results.append(_ok("LM Studio 0.4.19 stability guards", "health classification, model mismatch, response guards, and retry source guards verified"))
+    except Exception as e:
+        results.append(_fail("LM Studio 0.4.19 stability guards", f"{type(e).__name__}: {e}"))
+
+    try:
         router = importlib.import_module("app.sims.nlq.nlq_router")
         resolve = getattr(router, "_resolve_analytics_action", None)
         if callable(resolve):

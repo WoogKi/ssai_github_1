@@ -215,13 +215,17 @@ except Exception as e:
 # =========================================================
 # 2-1) LLM 상태 체크 (임포트 전에)
 # =========================================================
-from app.services.llm_health import check_llm
+from app.services.llm_health import (
+    SAFE_MESSAGES as LLM_SAFE_MESSAGES,
+    bounded_retry_count,
+    check_llm,
+    classify_llm_exception,
+    expected_model_from_env,
+    extract_chat_completion_text,
+    should_retry_llm_error,
+)
 
-LLM_STATUS = None
-try:
-    LLM_STATUS = check_llm()
-except Exception as _e:
-    LLM_STATUS = {"ok": False, "error": str(_e)}
+LLM_STATUS = {"ok": None, "code": "not_checked", "user_message": ""}
 # =========================================================
 # 2-2) 로깅 설정 (DB/클라이언트 임포트 이전)
 # =========================================================
@@ -1054,6 +1058,7 @@ def _extract_recent_sims_context() -> dict | None:
 cfg_str  = lambda k, d="":  get_config(k, d, cast=str)
 cfg_int  = lambda k, d=0:   get_config(k, d, cast=int)
 cfg_bool = lambda k, d=False: get_config(k, d, cast=lambda x: str(x).strip().lower() in ("1","true","yes","y","on"))
+LLM_HEALTH_TIMEOUT_S = max(3, min(5, cfg_int("LLM_HEALTH_TIMEOUT_S", 4)))
 
 _ENV_STARTUP_ERRORS = validate_startup_env(environ=os.environ, required_path_keys=_STARTUP_REQUIRED_PATHS)
 if _ENV_STARTUP_ERRORS:
@@ -1300,13 +1305,13 @@ def call_chat_with_retry(
 
     # 전역 기본값과 per-call 오버라이드 병합
     eff_timeout = int(timeout_s if timeout_s is not None else LLM_TIMEOUT_S)
-    eff_retry   = int(max_retry if max_retry is not None else LLM_MAX_RETRY)
+    eff_retry   = bounded_retry_count(max_retry if max_retry is not None else LLM_MAX_RETRY)
     eff_backoff = list(backoff_seq) if backoff_seq is not None else list(LLM_BACKOFF_SEQ or [0.6, 1.2, 2.0])
 
     # per-call 타임아웃 부여 (드라이버가 지원하면 with_options 사용)
-    cli = getattr(CLIENT, "with_options", lambda **kw: CLIENT)(timeout=eff_timeout)
+    cli = getattr(CLIENT, "with_options", lambda **kw: CLIENT)(timeout=eff_timeout, max_retries=0)
 
-    model_id = model or (st.session_state.get("selected_model") or cfg_str("LMSTUDIO_MODEL", "local-model"))
+    model_id = model or EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
 
     try:
         prompt_chars = sum(len(str(m.get("content") or "")) for m in fixed_messages if isinstance(m, dict))
@@ -1340,48 +1345,74 @@ def call_chat_with_retry(
 
             elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
             total_ms = int((time.perf_counter() - total_t0) * 1000)
+            finish_reason = ""
+            first_content = None
+            prompt_tokens = None
+            completion_tokens = None
+            total_tokens = None
+            if not stream:
+                extracted = extract_chat_completion_text(resp)
+                finish_reason = str(extracted.get("finish_reason") or "")
+                first_content = bool(extracted.get("content"))
+                usage = extracted.get("usage") if isinstance(extracted.get("usage"), dict) else {}
+                prompt_tokens = usage.get("prompt_tokens")
+                completion_tokens = usage.get("completion_tokens")
+                total_tokens = usage.get("total_tokens")
             log.info(
-                "[llm.request] create_ok model=%s stream=%s attempt=%s/%s elapsed_ms=%s total_ms=%s",
+                "[llm.request] create_ok model=%s stream=%s attempt=%s/%s elapsed_ms=%s total_ms=%s first_content=%s finish_reason=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
                 model_id,
                 stream,
                 attempt + 1,
                 total_tries,
                 elapsed_ms,
                 total_ms,
+                first_content,
+                finish_reason,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
             )
             return resp
 
         except Exception as e:
             last_err = e
             elapsed_ms = int((time.perf_counter() - attempt_t0) * 1000)
+            err_info = classify_llm_exception(e)
 
-            if attempt >= total_tries - 1:
+            if attempt >= total_tries - 1 or not bool(err_info.get("retryable")):
                 break
 
             sleep_s = eff_backoff[attempt] if attempt < len(eff_backoff) else eff_backoff[-1]
             log.warning(
-                "[llm.request] retry model=%s attempt=%s/%s elapsed_ms=%s sleep_s=%.2f error=%s: %s",
+                "[llm.request] retry model=%s attempt=%s/%s elapsed_ms=%s sleep_s=%.2f error_code=%s status=%s exception=%s",
                 model_id,
                 attempt + 1,
                 total_tries,
                 elapsed_ms,
                 sleep_s,
-                type(e).__name__,
-                e,
+                err_info.get("code"),
+                err_info.get("status"),
+                err_info.get("exception_type"),
             )
             time.sleep(sleep_s + random.uniform(0, 0.3))
 
     total_ms = int((time.perf_counter() - total_t0) * 1000)
+    err_info = classify_llm_exception(last_err)
     log.warning(
-        "[llm.request] failed model=%s stream=%s tries=%s total_ms=%s error=%s: %s",
+        "[llm.request] failed model=%s stream=%s tries=%s total_ms=%s error_code=%s status=%s exception=%s",
         model_id,
         stream,
         total_tries,
         total_ms,
-        type(last_err).__name__,
-        last_err,
+        err_info.get("code"),
+        err_info.get("status"),
+        err_info.get("exception_type"),
     )
-    raise RuntimeError(f"LLM 호출 실패(최종): {type(last_err).__name__}: {last_err}") from last_err
+    safe_exc = RuntimeError(str(err_info.get("user_message") or LLM_SAFE_MESSAGES["unknown_error"]))
+    setattr(safe_exc, "llm_error_code", err_info.get("code"))
+    setattr(safe_exc, "llm_status", err_info.get("status"))
+    setattr(safe_exc, "llm_exception_type", err_info.get("exception_type"))
+    raise safe_exc from last_err
 
 # =========================================================
 # --- 안정 스크롤 헬퍼: DOM 붙을 때까지 기다리며 여러 번 시도 ---
@@ -1533,7 +1564,33 @@ if render_ssai_admin_page():
 CLIENT = OpenAI(
     base_url=cfg_str("LMSTUDIO_BASE_URL", "http://localhost:1234/v1"),
     api_key=cfg_str("LMSTUDIO_API_KEY", "lm-studio"),
+    max_retries=0,
 )
+
+EXPECTED_LM_MODEL = (
+    str(cfg_str("LLM_MODEL_DEFAULT", "") or "").strip()
+    or str(cfg_str("LMSTUDIO_MODEL", "") or "").strip()
+)
+
+
+def _llm_status_user_message(status: dict | None = None) -> str:
+    status = status if isinstance(status, dict) else (LLM_STATUS if isinstance(LLM_STATUS, dict) else {})
+    return str(status.get("user_message") or LLM_SAFE_MESSAGES.get(str(status.get("code") or ""), "") or LLM_SAFE_MESSAGES["unknown_error"])
+
+
+def _llm_model_ready(model_id: str | None = None) -> tuple[bool, str]:
+    expected = str(EXPECTED_LM_MODEL or model_id or "").strip()
+    if not expected:
+        return False, "LM Studio 운영 모델 설정이 비어 있습니다. 관리자에게 설정을 확인해 달라고 요청하세요."
+    try:
+        models = get_models()
+    except Exception:
+        models = []
+    if not models:
+        return False, LLM_SAFE_MESSAGES["model_not_loaded"]
+    if expected not in models:
+        return False, LLM_SAFE_MESSAGES["model_mismatch"]
+    return True, ""
 
 def _fallback_login_greeting(profile: dict[str, Any]) -> str:
     company_name = str(profile.get("company_name") or "").strip()
@@ -1615,6 +1672,10 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
     fallback = _fallback_login_greeting(profile)
 
     try:
+        ready, _ready_message = _llm_model_ready(EXPECTED_LM_MODEL)
+        if not ready:
+            return fallback
+
         company_name = str(profile.get("company_name") or "").strip()
         duty_name = str(profile.get("duty_name") or "").strip()
         sims_user_name = str(profile.get("sims_user_name") or "").strip()
@@ -1656,14 +1717,19 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
 
         resp = call_chat_with_retry(
             messages=[{"role": "user", "content": prompt}],
-            model=st.session_state.get("selected_model") or "local-model",
+            model=EXPECTED_LM_MODEL or st.session_state.get("selected_model") or "",
             temperature=0.7,
             stream=False,
             timeout_s=10,
             max_retry=0,
         )
 
-        text = (resp.choices[0].message.content or "").strip()
+        extracted = extract_chat_completion_text(resp)
+        text = str(extracted.get("content") or "").strip()
+        if not text:
+            return fallback
+        if extracted.get("finish_reason") == "length":
+            text += "..."
         text = re.sub(r"\s+", " ", text).strip()
 
         if not text:
@@ -2166,11 +2232,17 @@ def summarize_text_long(
 
     def _first_content(resp) -> str:
         try:
-            return (resp.choices[0].message.content or "").strip()
+            extracted = extract_chat_completion_text(resp)
+            content = str(extracted.get("content") or "").strip()
+            if not content:
+                return str(extracted.get("user_message") or "").strip()
+            if extracted.get("finish_reason") == "length":
+                content += "\n\n_※ 응답이 길이 제한으로 중단된 것 같습니다._"
+            return content
         except Exception:
             return ""
 
-    model_id = st.session_state.get("selected_model") or "local-model"
+    model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
 
     # 1) 청크 요약
     parts: list[str] = []
@@ -4670,10 +4742,6 @@ def call_chat_protected(
     local_max_retry = int(max_retry if max_retry is not None else LLM_MAX_RETRY)
     local_backoffs  = list(backoff_seq) if backoff_seq is not None else list(LLM_BACKOFF_SEQ)
 
-    # ── 2) per-call 타임아웃을 클라이언트에 적용 ───────────────────
-    cli = getattr(CLIENT, "with_options", lambda **kw: CLIENT)(timeout=local_timeout)
-
-
     # ── 회로차단 게이트 + 재시도 호출 ─────────────────────────────
     _cb_init()  # 기본 상태값 보장
 
@@ -4689,7 +4757,7 @@ def call_chat_protected(
     try:
         resp = call_chat_with_retry(
             messages=messages,
-            model=model or (st.session_state.get("selected_model") or cfg_str("LMSTUDIO_MODEL", "local-model")),
+            model=model or EXPECTED_LM_MODEL or st.session_state.get("selected_model") or "",
             temperature=temperature,
             stream=stream,
             timeout_s=local_timeout,
@@ -4701,7 +4769,7 @@ def call_chat_protected(
 
     except Exception as e:
         _cb_on_failure()   # 실패 → 실패 카운트 증가 / 필요 시 trip(open)
-        raise RuntimeError(f"LLM 호출 실패(최종): {type(e).__name__}: {e}") from e
+        raise
 # =========================================================
 # 공백제거 + (기본값: 행 수는 자르지 않음)
 def _compact_records_for_model(
@@ -5622,13 +5690,25 @@ def build_messages_with_system(
 
     return msgs
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=5)
+def _get_models_cached() -> List[str]:
+    list_client = getattr(CLIENT, "with_options", lambda **kw: CLIENT)(timeout=LLM_HEALTH_TIMEOUT_S, max_retries=0)
+    models = list_client.models.list()
+    return [m.id for m in models.data]
+
+
 def get_models() -> List[str]:
     try:
-        models = CLIENT.models.list()
-        return [m.id for m in models.data]
-    except Exception:
-        return ["local-model"]
+        return _get_models_cached()
+    except Exception as exc:
+        info = classify_llm_exception(exc)
+        log.warning(
+            "[llm.models] failed error_code=%s status=%s exception=%s",
+            info.get("code"),
+            info.get("status"),
+            info.get("exception_type"),
+        )
+        return []
 
 # =========================
 # 저장/로드
@@ -8456,7 +8536,7 @@ def stream_and_append_assistant(
     backoff: float = 1.5,
     history_channel: str = "gen_messages",
 ) -> str:
-    model_id = st.session_state.get("selected_model") or "local-model"
+    model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
     collected: List[str] = []
     final_text = ""
     finish_reason = None
@@ -8464,15 +8544,56 @@ def stream_and_append_assistant(
 
     import time as _time, random as _random
 
+    ready, ready_message = _llm_model_ready(model_id)
+    if not ready:
+        final_text = ready_message or LLM_SAFE_MESSAGES["model_not_loaded"]
+        assistant_time = make_ts()
+        with st.chat_message("assistant"):
+            st.markdown(final_text)
+            st.caption(assistant_time)
+        room.setdefault("messages", []).append({
+            "id": str(uuid.uuid4()),
+            "seq": _next_seq(),
+            "role": "assistant",
+            "content": final_text,
+            "time": assistant_time,
+            **_message_meta("chat"),
+        })
+        _sync_room_meta(room, materialize=True)
+        room.setdefault(history_channel, []).append({
+            "id": str(uuid.uuid4()),
+            "seq": _next_seq(),
+            "role": "assistant",
+            "content": final_text,
+            "time": assistant_time,
+            **_message_meta("chat"),
+        })
+        save_chat_rooms()
+        return final_text
+
     with st.chat_message("assistant"):
         container = st.empty()
         caption_slot = st.empty()
         last_err = None
+        wait_slot = st.empty()
+        wait_slot.caption("다른 요청 처리 중에는 잠시 대기할 수 있습니다.")
 
-        for attempt in range(max_retries + 1):
+        def _clear_wait_notice() -> None:
+            try:
+                wait_slot.empty()
+            except Exception:
+                pass
+
+        stream_retry_count = bounded_retry_count(max_retries)
+        total_stream_tries = stream_retry_count + 1
+        for attempt in range(total_stream_tries):
             collected.clear()
             last_render = 0.0
             render_interval = 0.04  # 40ms
+            finish_reason = None
+            reasoning_seen = False
+            first_content_ms = None
+            stream_t0 = _time.perf_counter()
 
             try:
                 # ✅ 요청 보호막 + 회로차단 포함 (스트림 모드)
@@ -8485,15 +8606,23 @@ def stream_and_append_assistant(
                     # timeout_s=LLM_TIMEOUT_S,
                     # max_retry=LLM_MAX_RETRY,
                     # backoff_seq=LLM_BACKOFF_SEQ,
+                    max_retry=0,
                     allow_when_open=True,  # 회로차단 open이더라도 half-open 1회 허용
                 )
 
                 for chunk in response_stream:
-                    delta = getattr(chunk.choices[0].delta, "content", None) or ""
+                    choice = chunk.choices[0]
+                    delta_obj = getattr(choice, "delta", None)
+                    delta = getattr(delta_obj, "content", None) or ""
+                    reasoning_delta = getattr(delta_obj, "reasoning_content", None) or ""
+                    if reasoning_delta:
+                        reasoning_seen = True
                     if delta:
+                        if first_content_ms is None:
+                            first_content_ms = int((_time.perf_counter() - stream_t0) * 1000)
                         collected.append(delta)
 
-                    fr = getattr(chunk.choices[0], "finish_reason", None)
+                    fr = getattr(choice, "finish_reason", None)
                     if fr:
                         finish_reason = fr
 
@@ -8506,8 +8635,25 @@ def stream_and_append_assistant(
 
                 if finish_reason in ("length",) and final_text:
                     final_text += "\n\n_※ 응답이 길이 제한으로 중단된 것 같습니다._"
+                elif not final_text and reasoning_seen:
+                    final_text = LLM_SAFE_MESSAGES["reasoning_only"]
+                elif not final_text:
+                    final_text = LLM_SAFE_MESSAGES["empty_response"]
+
+                log.info(
+                    "[llm.stream] done model=%s attempt=%s/%s first_content=%s ttft_ms=%s finish_reason=%s elapsed_ms=%s reasoning_seen=%s",
+                    model_id,
+                    attempt + 1,
+                    total_stream_tries,
+                    bool(first_content_ms is not None),
+                    first_content_ms,
+                    finish_reason,
+                    int((_time.perf_counter() - stream_t0) * 1000),
+                    reasoning_seen,
+                )
 
                 assistant_time = make_ts()
+                _clear_wait_notice()
                 container.markdown(final_text or "_(빈 응답)_")
                 caption_slot.caption(assistant_time)
 
@@ -8516,19 +8662,37 @@ def stream_and_append_assistant(
 
             except Exception as e:
                 last_err = e
-                if attempt < max_retries:
+                err_info = classify_llm_exception(e)
+                log.warning(
+                    "[llm.stream] error model=%s attempt=%s/%s first_content=%s elapsed_ms=%s error_code=%s status=%s exception=%s",
+                    model_id,
+                    attempt + 1,
+                    total_stream_tries,
+                    bool(collected),
+                    int((_time.perf_counter() - stream_t0) * 1000),
+                    err_info.get("code"),
+                    err_info.get("status"),
+                    err_info.get("exception_type"),
+                )
+                if collected:
+                    final_text = "".join(collected).strip() + "\n\n_※ 응답 생성 중 연결이 중단되었습니다. 이미 생성된 내용만 표시합니다._"
+                    assistant_time = make_ts()
+                    _clear_wait_notice()
+                    container.markdown(final_text)
+                    caption_slot.caption(assistant_time)
+                    break
+                if should_retry_llm_error(err_info, attempt=attempt, max_retries=stream_retry_count, content_started=False):
                     sleep_s = (backoff ** attempt) + _random.uniform(0, 0.3)
-                    container.markdown(f"_연결 이슈로 재시도 중... ({attempt+1}/{max_retries})_")
+                    container.markdown(f"_연결 이슈로 재시도 중... ({attempt+1}/{total_stream_tries - 1})_")
                     _time.sleep(sleep_s)
                 else:
-                    msg = f"{type(e).__name__}: {str(e)}"
-                    if len(msg) > 400:
-                        msg = msg[:400] + " …"
-                    final_text = f"⚠️ 모델 스트리밍 중 오류: {msg}"
+                    final_text = str(err_info.get("user_message") or LLM_SAFE_MESSAGES["unknown_error"])
                     assistant_time = make_ts()
+                    _clear_wait_notice()
                     container.markdown(final_text)
                     caption_slot.caption(assistant_time)
 
+        _clear_wait_notice()
 
     # ✅ 기존 정렬/앵커/중복제거 로직과 100% 호환되게 저장
     room.setdefault("messages", []).append({
@@ -8671,7 +8835,13 @@ if "current_room" not in st.session_state or not st.session_state.current_room:
 
 
 if "selected_model" not in st.session_state:
-    st.session_state.selected_model = get_models()[0]
+    _initial_models = get_models()
+    if EXPECTED_LM_MODEL and EXPECTED_LM_MODEL in _initial_models:
+        st.session_state.selected_model = EXPECTED_LM_MODEL
+    elif _initial_models:
+        st.session_state.selected_model = _initial_models[0]
+    else:
+        st.session_state.selected_model = ""
 
 current_room = _get_current_room_or_pending()
 
@@ -8845,12 +9015,26 @@ with st.sidebar:
     # 1) 모델 선택
     st.markdown("## 🧠 모델 선택")
     try:
-        models = get_models() or ["local-model"]
+        models = get_models()
     except Exception:
-        models = ["local-model"]
-    current = st.session_state.get("selected_model")
-    default_idx = models.index(current) if current in models else 0
-    st.session_state.selected_model = st.selectbox("모델", options=models, index=default_idx)
+        models = []
+    if not models:
+        st.session_state.selected_model = ""
+        st.warning("LM Studio 모델 목록을 가져올 수 없습니다. 서버와 운영 모델 로드 상태를 확인해 주세요.")
+    else:
+        if EXPECTED_LM_MODEL:
+            st.session_state.selected_model = EXPECTED_LM_MODEL
+            st.info(f"운영 모델: `{EXPECTED_LM_MODEL}`")
+            with st.expander("로드된 LM Studio 모델 목록", expanded=False):
+                st.write(models)
+        else:
+            current = st.session_state.get("selected_model")
+            default_idx = models.index(current) if current in models else 0
+            st.session_state.selected_model = st.selectbox("모델", options=models, index=default_idx)
+        if EXPECTED_LM_MODEL and EXPECTED_LM_MODEL not in models:
+            st.warning("운영 모델이 LM Studio에 로드되어 있지 않아 질문 전송이 차단됩니다.")
+        elif not EXPECTED_LM_MODEL:
+            st.warning("운영 LLM 모델 설정이 비어 있어 질문 전송이 차단됩니다.")
 
     # 2) 채팅방 관리
     # =========================
@@ -9482,7 +9666,7 @@ with st.sidebar:
             # LLM
             try:
                 from app.services.llm_health import check_llm
-                llm = check_llm()
+                llm = check_llm(expected_model=EXPECTED_LM_MODEL, health_timeout_s=LLM_HEALTH_TIMEOUT_S)
                 if isinstance(llm, dict) and llm.get("ok"):
                     st.success(f"LLM OK ({llm.get('count', 0)} models)")
                     with st.expander("Models (Top 20)", expanded=False):
