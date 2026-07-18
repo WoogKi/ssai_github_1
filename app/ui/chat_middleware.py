@@ -777,28 +777,8 @@ def _chat_log_nlq_table_render(
 
 
 def _render_nlq_table_meta_caption(meta: Dict[str, Any]) -> None:
-    if bool(meta.get("current_table_followup")) or bool(meta.get("hide_table_key_caption")):
-        return
-
-    if not _chat_is_nlq_table_meta(meta):
-        return
-
-    try:
-        nlq_query = str(
-            meta.get("nlq_query")
-            or meta.get("question")
-            or meta.get("user_query")
-            or ""
-        ).strip()
-        table_key = str(meta.get("table_key") or "").strip()
-
-        if nlq_query:
-            st.caption(f"NLQ 질문: {nlq_query}")
-        if table_key:
-            st.caption(f"table_key: {table_key}")
-            st.caption("현재표 후속질문 가능")
-    except Exception:
-        pass
+    """호환용 no-op. NLQ/table_key 진단 정보는 SIMS 헤더 상세 expander에서 표시한다."""
+    return
 
 
 def _render_current_followup_compact_header(
@@ -3700,6 +3680,146 @@ def _build_sims_analysis_context_from_df(
         "analysis_text": analysis_text,
     }
 
+
+def _sims_analysis_ctx_cache() -> Dict[str, Dict[str, Any]]:
+    """Return the compact per-table LLM analysis context cache."""
+    ss = st.session_state
+    cache = ss.get("__sims_analysis_ctx_by_table_key")
+    if not isinstance(cache, dict):
+        cache = {}
+        ss["__sims_analysis_ctx_by_table_key"] = cache
+    return cache
+
+
+def _cache_sims_analysis_ctx_by_table_key(ctx: Any) -> str:
+    """Store a compact SIMS analysis context by its table_key and return that key."""
+    if not isinstance(ctx, dict) or ctx.get("kind") != "SIMS_ANALYSIS_CONTEXT_V1":
+        return ""
+    table_key = str(ctx.get("table_key") or ctx.get("source_table_key") or "").strip()
+    if not table_key:
+        return ""
+    _sims_analysis_ctx_cache()[table_key] = dict(ctx)
+    return table_key
+
+
+def _normalize_sims_action_name(value: Any) -> str:
+    """Normalize harmless spacing differences in SIMS action labels."""
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _sims_clicked_llm_context_mismatch(
+    ctx: Any,
+    clicked_table_key: str = "",
+    clicked_action: str = "",
+) -> str:
+    """Return a mismatch reason when a clicked table cannot use the selected context."""
+    if not isinstance(ctx, dict) or ctx.get("kind") != "SIMS_ANALYSIS_CONTEXT_V1":
+        return "missing_context"
+    clicked = str(clicked_table_key or "").strip()
+    selected = str(ctx.get("table_key") or ctx.get("source_table_key") or "").strip()
+    if clicked and selected and clicked != selected:
+        return "table_key_mismatch"
+    if clicked and not selected:
+        return "context_table_key_missing"
+    clicked_action_norm = _normalize_sims_action_name(clicked_action)
+    selected_action_norm = _normalize_sims_action_name(ctx.get("action"))
+    if clicked_action_norm and selected_action_norm and clicked_action_norm != selected_action_norm:
+        return "action_mismatch"
+    return ""
+
+
+def _select_sims_analysis_ctx_for_table(
+    *,
+    table_key: str = "",
+    action: str = "",
+    meta: Optional[Dict[str, Any]] = None,
+    download_df: Optional[pd.DataFrame] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Select the LLM analysis context for the clicked table only.
+
+    The global latest context is intentionally not used as a fallback here,
+    because old table action buttons must not analyze a newer table.
+    """
+    table_key = str(table_key or "").strip()
+    action = str(action or "").strip()
+    meta = dict(meta or {})
+
+    if table_key:
+        cached = _sims_analysis_ctx_cache().get(table_key)
+        if isinstance(cached, dict) and cached.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1":
+            return dict(cached), "cache"
+
+    if isinstance(download_df, pd.DataFrame) and not download_df.empty:
+        ctx = _build_sims_analysis_context_from_df(
+            download_df,
+            result={},
+            action_name=action or str(meta.get("action") or "").strip(),
+            params=meta.get("params") if isinstance(meta.get("params"), dict) else {},
+            meta=meta,
+        )
+        if isinstance(ctx, dict) and ctx.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1":
+            ctx["table_key"] = table_key or str(meta.get("table_key") or "").strip()
+            ctx["source_table_key"] = str(meta.get("source_table_key") or "").strip()
+            ctx["current_table_followup"] = bool(meta.get("current_table_followup"))
+            _cache_sims_analysis_ctx_by_table_key(ctx)
+            return dict(ctx), "rebuilt"
+
+    return None, "missing"
+
+
+def _run_clicked_sims_llm_analysis(
+    *,
+    prompt: str,
+    key_suffix: str,
+    table_key: str = "",
+    action: str = "",
+    message_id: str = "",
+    analysis_ctx: Optional[Dict[str, Any]] = None,
+    context_source: str = "",
+) -> None:
+    """Run LLM analysis for the table that owns the clicked button."""
+    runner = st.session_state.get("__sims_llm_analysis_runner")
+    selected_table_key = str((analysis_ctx or {}).get("table_key") or (analysis_ctx or {}).get("source_table_key") or "").strip()
+    selected_action = str((analysis_ctx or {}).get("action") or "").strip()
+    selected_source_key = str((analysis_ctx or {}).get("source_table_key") or "").strip()
+    mismatch = _sims_clicked_llm_context_mismatch(analysis_ctx, table_key, action)
+    log.info(
+        "[chat] LLM analysis clicked runner=%s key=%s clicked_message_id=%s clicked_table_key=%s clicked_action=%s selected_context_table_key=%s selected_context_action=%s selected_context_source_key=%s context_source=%s mismatch=%s",
+        callable(runner),
+        key_suffix,
+        str(message_id or "")[:32],
+        str(table_key or ""),
+        str(action or ""),
+        selected_table_key,
+        selected_action,
+        selected_source_key,
+        str(context_source or ""),
+        mismatch,
+    )
+
+    if not callable(runner):
+        st.warning("LLM 분석 실행기가 아직 준비되지 않았습니다.")
+        return
+    if mismatch:
+        st.warning("이 표의 분석 컨텍스트를 찾을 수 없어 LLM 분석을 실행하지 않았습니다.")
+        return
+
+    try:
+        runner(
+            prompt,
+            analysis_ctx_override=analysis_ctx,
+            clicked_table_key=str(table_key or "").strip(),
+            clicked_action=str(action or "").strip(),
+            clicked_message_id=str(message_id or "").strip(),
+        )
+    except TypeError:
+        log.exception("[chat] LLM runner does not accept table-scoped context")
+        st.error("LLM 분석 실행기가 표별 컨텍스트를 지원하지 않습니다.")
+    except Exception:
+        log.exception("[chat] LLM analysis failed")
+        st.error("LLM 분석 중 오류가 발생했습니다.")
+
 # SIMS 뷰 함수가 반환한 결과를 채팅 컨텍스트에 올릴 표준 컨테이너로 변환하는 함수
 # - 위 _normalize_result_for_chat()로 표준 payload로 변환한 후, LLM이 소비하기 좋은 JSON 컨테이너 + 텍스트로 변환한다.
 # - 세션 상태에 '최신 1개 컨텍스트'를 저장한다.
@@ -3989,6 +4109,7 @@ def _build_sims_context_from_result(
 
             data_container = analysis_ctx
             ctx_text = str(analysis_ctx.get("analysis_text") or ctx_text)
+            _cache_sims_analysis_ctx_by_table_key(analysis_ctx)
             log.info(
                 "[SIMS_ANALYSIS_CTX_UPDATED] action=%s rows=%s cols=%s risk_top=%s current_followup=%s source_key=%s",
                 action_name,
@@ -4548,7 +4669,16 @@ def _queue_sims_llm_analysis(prompt: Optional[str] = None) -> None:
 # - fragment runner가 준비되지 않은 경우에는 fallback으로 전체 rerun을 한다.
 # - 이 fragment는 SIMS 표/요약/조회조건을 건드리지 않고, LLM 분석과 답변 표시만 담당한다.
 @st.fragment
-def _render_sims_llm_analysis_fragment(key_suffix: str, prompt: str) -> None:
+def _render_sims_llm_analysis_fragment(
+    key_suffix: str,
+    prompt: str,
+    *,
+    table_key: str = "",
+    clicked_action: str = "",
+    clicked_message_id: str = "",
+    analysis_ctx: Optional[Dict[str, Any]] = None,
+    context_source: str = "",
+) -> None:
     """
     LLM 분석 버튼 전용 fragment.
 
@@ -4572,7 +4702,18 @@ def _render_sims_llm_analysis_fragment(key_suffix: str, prompt: str) -> None:
         with st.container(border=True):
             st.caption("LLM 분석 결과")
             try:
-                runner(prompt)
+                if not table_key and analysis_ctx is None:
+                    runner(prompt)
+                else:
+                    _run_clicked_sims_llm_analysis(
+                        prompt=prompt,
+                        key_suffix=key_suffix,
+                        table_key=table_key,
+                        action=clicked_action,
+                        message_id=clicked_message_id,
+                        analysis_ctx=analysis_ctx,
+                        context_source=context_source,
+                    )
             except Exception:
                 log.exception("[chat] fragment LLM analysis failed")
                 st.error("LLM 분석 중 오류가 발생했습니다.")
@@ -4587,6 +4728,11 @@ def _render_sims_result_actions_fragment(
     excel_bytes: bytes,
     xlsx_name: str,
     prompt: str,
+    table_key: str = "",
+    clicked_action: str = "",
+    clicked_message_id: str = "",
+    analysis_ctx: Optional[Dict[str, Any]] = None,
+    context_source: str = "",
 ) -> None:
     """
     SIMS 결과 하단 액션 영역.
@@ -4635,7 +4781,15 @@ def _render_sims_result_actions_fragment(
             return
 
         try:
-            runner(prompt)
+            _run_clicked_sims_llm_analysis(
+                prompt=prompt,
+                key_suffix=key_suffix,
+                table_key=table_key,
+                action=clicked_action,
+                message_id=clicked_message_id,
+                analysis_ctx=analysis_ctx,
+                context_source=context_source,
+            )
         except Exception:
             log.exception("[chat] fragment LLM analysis failed")
             st.error("LLM 분석 중 오류가 발생했습니다.")
@@ -4859,6 +5013,9 @@ def _render_sims_result_actions_lazy(
     prompt: str,
     expected_rows: int | None = None,
     display_rows: int | None = None,
+    clicked_message_id: str = "",
+    clicked_action: str = "",
+    clicked_meta: Optional[Dict[str, Any]] = None,
 ) -> None:    
 
     """
@@ -4868,6 +5025,13 @@ def _render_sims_result_actions_lazy(
     - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
     - [Excel 다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
     """
+    analysis_ctx, analysis_ctx_source = _select_sims_analysis_ctx_for_table(
+        table_key=table_key,
+        action=clicked_action,
+        meta=clicked_meta,
+        download_df=download_df if isinstance(download_df, pd.DataFrame) else None,
+    )
+
     if not isinstance(download_df, pd.DataFrame) or download_df.empty:
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -4880,18 +5044,15 @@ def _render_sims_result_actions_lazy(
             )
 
         if run_llm:
-            runner = st.session_state.get("__sims_llm_analysis_runner")
-            log.info("[chat] LLM analysis clicked runner=%s key=%s", callable(runner), key_suffix)
-
-            if not callable(runner):
-                st.warning("LLM 분석 실행기가 아직 준비되지 않았습니다.")
-                return
-
-            try:
-                runner(prompt)
-            except Exception:
-                log.exception("[chat] LLM analysis failed")
-                st.error("LLM 분석 중 오류가 발생했습니다.")
+            _run_clicked_sims_llm_analysis(
+                prompt=prompt,
+                key_suffix=key_suffix,
+                table_key=table_key,
+                action=clicked_action,
+                message_id=clicked_message_id,
+                analysis_ctx=analysis_ctx,
+                context_source=analysis_ctx_source,
+            )
 
         return
 
@@ -4971,18 +5132,15 @@ def _render_sims_result_actions_lazy(
             )
 
         if run_llm:
-            runner = ss.get("__sims_llm_analysis_runner")
-            log.info("[chat] LLM analysis clicked runner=%s key=%s", callable(runner), key_suffix)
-
-            if not callable(runner):
-                st.warning("LLM 분석 실행기가 아직 준비되지 않았습니다.")
-                return
-
-            try:
-                runner(prompt)
-            except Exception:
-                log.exception("[chat] LLM analysis failed")
-                st.error("LLM 분석 중 오류가 발생했습니다.")
+            _run_clicked_sims_llm_analysis(
+                prompt=prompt,
+                key_suffix=key_suffix,
+                table_key=table_key,
+                action=clicked_action,
+                message_id=clicked_message_id,
+                analysis_ctx=analysis_ctx,
+                context_source=analysis_ctx_source,
+            )
 
         return
 
@@ -5044,6 +5202,11 @@ def _render_sims_result_actions_lazy(
         excel_bytes=excel_bytes,
         xlsx_name=xlsx_name,
         prompt=prompt,
+        table_key=table_key,
+        clicked_action=clicked_action,
+        clicked_message_id=clicked_message_id,
+        analysis_ctx=analysis_ctx,
+        context_source=analysis_ctx_source,
     )
 
 
@@ -5057,6 +5220,11 @@ def _render_sims_result_actions_plain(
     excel_bytes: bytes,
     xlsx_name: str,
     prompt: str,
+    table_key: str = "",
+    clicked_action: str = "",
+    clicked_message_id: str = "",
+    clicked_meta: Optional[Dict[str, Any]] = None,
+    download_df: Optional[pd.DataFrame] = None,
 ) -> None:
     """
     SIMS 결과 하단 액션 버튼 직접 렌더링.
@@ -5100,18 +5268,21 @@ def _render_sims_result_actions_plain(
         )
 
     if run_llm:
-        runner = st.session_state.get("__sims_llm_analysis_runner")
-        log.info("[chat] LLM analysis clicked runner=%s key=%s", callable(runner), key_suffix)
-
-        if not callable(runner):
-            st.warning("LLM 분석 실행기가 아직 준비되지 않았습니다.")
-            return
-
-        try:
-            runner(prompt)
-        except Exception:
-            log.exception("[chat] LLM analysis failed")
-            st.error("LLM 분석 중 오류가 발생했습니다.")
+        analysis_ctx, analysis_ctx_source = _select_sims_analysis_ctx_for_table(
+            table_key=table_key,
+            action=clicked_action,
+            meta=clicked_meta,
+            download_df=download_df,
+        )
+        _run_clicked_sims_llm_analysis(
+            prompt=prompt,
+            key_suffix=key_suffix,
+            table_key=table_key,
+            action=clicked_action,
+            message_id=clicked_message_id,
+            analysis_ctx=analysis_ctx,
+            context_source=analysis_ctx_source,
+        )
 
 # LLM 분석 버튼 클릭 시, fragment runner가 준비되지 않은 경우에 대비한 fallback 함수.
 # - 이 함수는 전체 앱을 rerun해서 LLM 분석을 실행하는 기존 방식이다.
@@ -5306,6 +5477,23 @@ def _old_sims_table_force_key(item: Dict[str, Any], meta: Dict[str, Any], uid: s
     return f"__sims_force_render_old_table::{safe}"
 
 
+def _is_old_sims_table_force_rendered(item: Dict[str, Any], meta: Dict[str, Any], uid: str = "") -> bool:
+    return bool(st.session_state.get(_old_sims_table_force_key(item, meta, uid)))
+
+
+def _set_old_sims_table_force_rendered(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+    uid: str = "",
+    enabled: bool = True,
+) -> None:
+    force_key = _old_sims_table_force_key(item, meta, uid)
+    if enabled:
+        st.session_state[force_key] = True
+    else:
+        st.session_state.pop(force_key, None)
+
+
 def _is_current_sims_table_item(item: Dict[str, Any], meta: Dict[str, Any]) -> bool:
     """
     현재 새로 조회한 SIMS 표인지 판정.
@@ -5413,7 +5601,7 @@ def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], u
         return False
 
     force_key = _old_sims_table_force_key(item, meta, uid)
-    if bool(st.session_state.get(force_key)):
+    if _is_old_sims_table_force_rendered(item, meta, uid):
         return True
 
     if _is_current_sims_table_item(item, meta):
@@ -5482,7 +5670,7 @@ def _render_old_sims_table_placeholder(
         key=f"show_old_sims_table_{uid}",
         use_container_width=False,
     ):
-        st.session_state[force_key] = True
+        _set_old_sims_table_force_rendered(item, meta, uid, True)
         st.rerun()
 
 
@@ -5603,6 +5791,16 @@ def _prune_old_sims_table_history(
             }
     except Exception:
         log.exception("[chat] prune sims_tables by table policy failed")
+
+    try:
+        ctx_cache = ss.get("__sims_analysis_ctx_by_table_key")
+        if isinstance(ctx_cache, dict):
+            ss["__sims_analysis_ctx_by_table_key"] = {
+                str(k): v for k, v in ctx_cache.items()
+                if str(k) in keep_table_keys
+            }
+    except Exception:
+        log.exception("[chat] prune sims analysis contexts by table policy failed")
 
     try:
         log.debug(
@@ -5970,6 +6168,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                         "__sims_context_text",
                         "__sims_context_obj",
                         "__sims_analysis_ctx",
+                        "__sims_analysis_ctx_by_table_key",
                         "__sims_latest_analysis_key",
                     ):
                         ss.pop(k, None)
@@ -6826,6 +7025,85 @@ def _build_product_inventory_info_caption(meta: Dict[str, Any], item: Dict[str, 
     bits = [x for x in bits if not x.endswith(" ")]
     return "제품정보: " + " / ".join(bits)
 
+
+def _has_explicit_product_filter(meta: Dict[str, Any]) -> bool:
+    if not isinstance(meta, dict):
+        return False
+
+    product_code_keys = {
+        "제품코드",
+        "품목코드",
+        "상품코드",
+        "product_code",
+        "goods_code",
+        "item_code",
+        "prd_cd",
+    }
+
+    product_code_key_norms = {
+        re.sub(r"[\s_\-]+", "", key).lower()
+        for key in product_code_keys
+    }
+
+    def _is_product_code_key(key: Any) -> bool:
+        key_s = str(key or "").strip()
+        if key_s in product_code_keys:
+            return True
+        return re.sub(r"[\s_\-]+", "", key_s).lower() in product_code_key_norms
+
+    def _has_value(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, (list, tuple, set)):
+            return any(_has_value(v) for v in value)
+        return bool(str(value).strip())
+
+    def _scan_mapping(mapping: Any) -> bool:
+        if not isinstance(mapping, dict):
+            return False
+        for key, value in mapping.items():
+            if _is_product_code_key(key) and _has_value(value):
+                return True
+        return False
+
+    return any(
+        _scan_mapping(candidate)
+        for candidate in (
+            meta.get("params"),
+            meta.get("query_params"),
+            meta.get("filters"),
+            meta,
+        )
+    )
+
+
+def _is_single_product_dataframe(data: Any) -> bool:
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return False
+    candidate_cols = [
+        "제품코드",
+        "품목코드",
+        "상품코드",
+        "product_code",
+        "goods_code",
+        "item_code",
+        "prd_cd",
+    ]
+    for col in candidate_cols:
+        if col not in data.columns:
+            continue
+        try:
+            values = data[col].dropna().astype(str).str.strip()
+            values = values[values != ""]
+            return bool(values.nunique(dropna=True) == 1)
+        except Exception:
+            return False
+    return False
+
+
+def _should_show_product_inventory_info(meta: Dict[str, Any], data: Any = None) -> bool:
+    return _has_explicit_product_filter(meta) or _is_single_product_dataframe(data)
+
 def _render_product_flow_metrics(meta: Dict[str, Any]) -> None:
     labels = ["이월재고", "입고수량", "출고수량", "재고수량"]
     values = [
@@ -7172,6 +7450,206 @@ def _render_chat_summary_expander(summary_md: Any, cond_text: str = "") -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 # 렌더링
 # ──────────────────────────────────────────────────────────────────────────────
+_CHAT_DUPLICATE_ROW_COUNT_LABELS = (
+    "조회결과",
+    "조회 결과",
+    "조회 완료",
+    "조회완료",
+    "전체 조회건수",
+    "화면 표시건수",
+    "��ȸ���",
+    "��ȸ �Ϸ�",
+    "��ȸ�Ϸ�",
+)
+
+
+_CHAT_DUPLICATE_CONDITION_LABELS = (
+    "조회조건",
+    "조회 조건",
+)
+
+
+_CHAT_DUPLICATE_PRODUCT_INFO_LABELS = (
+    "제품정보",
+    "제품 정보",
+)
+
+
+_CHAT_SUMMARY_PRESERVE_KEYWORDS = (
+    "조회 결과가 없습니다",
+    "조건에 맞는 자료가 없습니다",
+    "일부 자료를 불러오지 못했습니다",
+    "오류",
+    "권한",
+    "검증",
+    "경고",
+    "주의",
+    "확인해 주세요",
+    "불러오지 못했습니다",
+)
+
+
+def _summary_norm_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _strip_summary_markup(value: str) -> str:
+    s = str(value or "").strip()
+    s = re.sub(r"^\s*[-*+]\s+", "", s)
+    s = re.sub(r"^\s*\d+[.)]\s+", "", s)
+    s = s.strip()
+    if s.startswith("**") and "**" in s[2:]:
+        s = s.replace("**", "", 2)
+    return s.strip()
+
+
+def _split_summary_label_body(line: str) -> tuple[str, str]:
+    s = _strip_summary_markup(str(line or ""))
+    if ":" not in s:
+        return "", s
+    label, body = s.split(":", 1)
+    return _summary_norm_text(_strip_summary_markup(label)), _summary_norm_text(_strip_summary_markup(body))
+
+
+def _should_preserve_summary_line(line: str) -> bool:
+    s = _summary_norm_text(line)
+    return bool(s and any(keyword in s for keyword in _CHAT_SUMMARY_PRESERVE_KEYWORDS))
+
+
+def _is_duplicate_row_count_summary_line(line: str) -> bool:
+    s = str(line or "").strip()
+    if ":" not in s:
+        return False
+
+    label, body = _split_summary_label_body(s)
+    if label not in _CHAT_DUPLICATE_ROW_COUNT_LABELS:
+        return False
+
+    if not body:
+        return False
+
+    row_count = r"\d{1,3}(?:,\d{3})*|\d+"
+    pure_count = rf"^(?:{row_count})건$"
+    whole_screen = rf"^전체\s*(?:{row_count})건\s*/\s*화면\s*표시\s*(?:{row_count})건$"
+    parenthesized_display = rf"^(?:{row_count})건\s*\([^)]*(?:{row_count})건[^)]*\)$"
+    partial_display = rf"^(?:{row_count})건\s*중\s*(?:{row_count})건(?:\s*(?:표시|기준))?$"
+    return bool(
+        re.fullmatch(pure_count, body)
+        or re.fullmatch(whole_screen, body)
+        or re.fullmatch(parenthesized_display, body)
+        or re.fullmatch(partial_display, body)
+    )
+
+
+def _is_duplicate_condition_summary_line(line: str, cond_text: str = "") -> bool:
+    label, body = _split_summary_label_body(line)
+    if label not in _CHAT_DUPLICATE_CONDITION_LABELS or not body:
+        return False
+    cond_norm = _summary_norm_text(cond_text)
+    if cond_norm.startswith("조회조건:") or cond_norm.startswith("조회 조건:"):
+        cond_norm = _summary_norm_text(cond_norm.split(":", 1)[1])
+    if not cond_norm:
+        return False
+    return body == cond_norm or body in cond_norm or cond_norm in body
+
+
+def _is_duplicate_product_info_summary_line(line: str) -> bool:
+    label, body = _split_summary_label_body(line)
+    if label not in _CHAT_DUPLICATE_PRODUCT_INFO_LABELS or not body:
+        return False
+    condition_tokens = ("제품코드", "제품명", "제조사", "제조사명")
+    return any(token in body for token in condition_tokens)
+
+
+def _clean_chat_summary_text_v2(summary_md: Any, cond_text: str = "", *, drop_product_info: bool = False) -> str:
+    summary_text = str(summary_md or "").strip()
+    if not summary_text:
+        return ""
+
+    if cond_text and summary_text.startswith(("조회조건:", "��ȸ����:")):
+        summary_text = "\n".join(summary_text.splitlines()[1:]).strip()
+
+    cleaned_lines: list[str] = []
+    for line in summary_text.splitlines():
+        s = str(line or "").strip()
+        if not s:
+            cleaned_lines.append(line)
+            continue
+        if _should_preserve_summary_line(s):
+            cleaned_lines.append(line)
+            continue
+        if _is_duplicate_row_count_summary_line(s):
+            continue
+        if _is_duplicate_condition_summary_line(s, cond_text):
+            continue
+        if drop_product_info and _is_duplicate_product_info_summary_line(s):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
+def _render_chat_summary_expander_v2(summary_md: Any, cond_text: str = "", *, drop_product_info: bool = False) -> None:
+    summary_text = _clean_chat_summary_text_v2(summary_md, cond_text, drop_product_info=drop_product_info)
+    if not summary_text:
+        return
+    with st.expander("집계 요약 펼쳐보기", expanded=False):
+        st.markdown(summary_text)
+
+
+def _is_internal_admin_for_raw_meta() -> bool:
+    candidates = []
+    try:
+        candidates.extend(
+            st.session_state.get(key)
+            for key in (
+                "user",
+                "current_user",
+                "auth_user",
+                "login_user",
+                "__ssai_user",
+                "ssai_user",
+            )
+        )
+        candidates.append(st.session_state)
+    except Exception:
+        candidates = []
+
+    for obj in candidates:
+        if not isinstance(obj, dict):
+            continue
+        user_type = str(obj.get("user_type") or obj.get("type") or "").strip().upper()
+        if user_type == "SSART_ADMIN":
+            return True
+    return False
+
+
+def _is_internal_master_summary(meta: Dict[str, Any]) -> bool:
+    """
+    화면 기본 영역에는 숨기되 LLM 분석 컨텍스트에는 보존할 마스터 자동 집계 summary 판별.
+
+    action 이름 문자열은 깨지거나 지역화될 수 있으므로 보조 신호로만 보고,
+    payload가 이미 가진 구조화 meta를 우선한다.
+    """
+    if not isinstance(meta, dict) or not meta:
+        return False
+
+    llm_kind = str(meta.get("llm_summary_kind") or "").strip().lower()
+    analysis_type = str(meta.get("analysis_type") or "").strip().lower()
+    has_llm_summary = bool(str(meta.get("llm_summary_md") or "").strip())
+    has_master_payload = any(
+        str(k).endswith("_master_summary") and bool(v)
+        for k, v in meta.items()
+    )
+
+    if llm_kind.endswith("_master_summary"):
+        return True
+    if analysis_type.endswith("_master") and (has_llm_summary or has_master_payload):
+        return True
+    if bool(meta.get("master_nlq")) and (has_llm_summary or has_master_payload):
+        return True
+    return False
+
+
 def _render_chat_item(item: Dict[str, Any], *, target=None) -> None:
     """채팅 아이템을 렌더링한다. target이 있으면 해당 컨테이너 안에 렌더."""
     _tgt = target if target is not None else globals().get("_CHAT_RENDER_TARGET", None)
@@ -7374,6 +7852,167 @@ def _sims_table_meta_row_count(meta: Dict[str, Any], data: Any = None) -> tuple[
     return full_rows, display_rows, expected_rows
 
 
+def _sims_compact_text(value: Any, *, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) > limit:
+        return text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _sims_detail_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _sims_detail_add(lines: list[str], label: str, value: Any) -> None:
+    text = _sims_detail_text(value)
+    if text:
+        lines.append(f"- {label}: {text}")
+
+
+def _sims_query_summary_for_header(item: Dict[str, Any], meta: Dict[str, Any]) -> tuple[str, str]:
+    full_cond = ""
+    try:
+        meta_summary = str(meta.get("query_summary") or "").strip()
+        if meta_summary:
+            full_cond = meta_summary
+        else:
+            full_cond = _build_query_condition_text(item)
+            if full_cond.startswith("조회조건:"):
+                full_cond = full_cond.split(":", 1)[1].strip()
+    except Exception:
+        full_cond = ""
+
+    return _sims_compact_text(full_cond, limit=160), full_cond
+
+
+def _summary_condition_text_for_cleanup(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    is_sims_table_or_text: bool,
+    caption_cond_text: str = "",
+) -> str:
+    if is_sims_table_or_text:
+        try:
+            query_summary, full_condition = _sims_query_summary_for_header(item, meta)
+            return str(full_condition or query_summary or "").strip()
+        except Exception:
+            return ""
+    return str(caption_cond_text or "").strip()
+
+
+def _build_sims_result_header_view(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+    data: Any = None,
+    *,
+    title: str = "",
+    expired: bool = False,
+) -> Dict[str, Any]:
+    """
+    SIMS 결과 상단 표시용 텍스트만 만든다.
+    DataFrame을 자르거나 복사하지 않고, 이미 계산된 meta/행수만 읽는다.
+    """
+    safe_meta = meta if isinstance(meta, dict) else {}
+    action_name = str(
+        item.get("action")
+        or safe_meta.get("action")
+        or title
+        or item.get("title")
+        or "SIMS 결과"
+    ).strip() or "SIMS 결과"
+    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(safe_meta, data)
+    download_rows = _safe_int_for_download(safe_meta.get("download_row_count") or full_rows, full_rows)
+    query_summary, full_condition = _sims_query_summary_for_header(item, safe_meta)
+
+    status_suffix = " · 표시 데이터 만료" if expired else ""
+    if expected_rows and full_rows and expected_rows > full_rows:
+        line1 = f"결과: 조건 전체 {expected_rows:,}건 · 조회 {full_rows:,}건"
+        if display_rows and display_rows < full_rows:
+            line1 += f" · 표 데이터 {display_rows:,}건"
+    elif full_rows and display_rows and full_rows > display_rows:
+        line1 = f"결과: 전체 {full_rows:,}건 · 표 데이터 {display_rows:,}건"
+    elif full_rows:
+        line1 = f"결과: {full_rows:,}건"
+    elif display_rows:
+        line1 = f"결과: {display_rows:,}건"
+    else:
+        line1 = "결과 정보가 저장되어 있습니다."
+    line1 += status_suffix
+
+    followup_available = (
+        not expired
+        and not bool(safe_meta.get("current_table_followup"))
+        and bool(str(safe_meta.get("table_key") or item.get("table_key") or "").strip())
+    )
+    line2_parts = []
+    if query_summary:
+        line2_parts.append(f"조회조건: {query_summary}")
+    elif expired:
+        line2_parts.append("저장된 조회정보만 표시합니다.")
+    if followup_available:
+        line2_parts.append("현재표 후속질문 가능")
+    line2 = " · ".join(line2_parts)
+
+    result_time_text = _sims_result_datetime_text(item, safe_meta)
+    nlq_query = str(
+        safe_meta.get("nlq_query")
+        or safe_meta.get("question")
+        or safe_meta.get("user_query")
+        or ""
+    ).strip()
+    table_key = str(safe_meta.get("table_key") or item.get("table_key") or "").strip()
+    source_key = str(safe_meta.get("source_table_key") or safe_meta.get("source_key") or "").strip()
+    source_action = str(safe_meta.get("source_action") or safe_meta.get("source_table_action") or "").strip()
+    source = str(safe_meta.get("source") or "").strip()
+
+    details: list[str] = []
+    _sims_detail_add(details, "조회명", action_name)
+    _sims_detail_add(details, "조회시각", result_time_text)
+    _sims_detail_add(details, "전체 조회조건", full_condition)
+    _sims_detail_add(details, "NLQ 원문", nlq_query)
+    if expected_rows and expected_rows != full_rows:
+        _sims_detail_add(details, "조건 전체 행수", f"{expected_rows:,}건")
+    if full_rows:
+        _sims_detail_add(details, "전체 결과 행수", f"{full_rows:,}건")
+    if display_rows:
+        _sims_detail_add(details, "표시 행수", f"{display_rows:,}건")
+    if download_rows:
+        _sims_detail_add(details, "다운로드 행수", f"{download_rows:,}건")
+    _sims_detail_add(details, "현재표 후속질문", "가능" if followup_available else "")
+    _sims_detail_add(details, "action", action_name)
+    _sims_detail_add(details, "source", source)
+    _sims_detail_add(details, "source_action", source_action)
+    _sims_detail_add(details, "table_key", table_key)
+    _sims_detail_add(details, "source_key", source_key)
+    if expired:
+        _sims_detail_add(details, "상태", "표시 데이터 만료 또는 현재 세션 payload 없음")
+
+    return {
+        "title": action_name,
+        "line1": line1,
+        "line2": line2,
+        "details": details,
+        "full_rows": full_rows,
+        "display_rows": display_rows,
+        "download_rows": download_rows,
+        "followup_available": followup_available,
+    }
+
+
+def _render_sims_result_header_view(view: Dict[str, Any]) -> None:
+    line1 = str((view or {}).get("line1") or "").strip()
+    line2 = str((view or {}).get("line2") or "").strip()
+    if line1:
+        st.caption(line1)
+    if line2:
+        st.caption(line2)
+    details = [str(x).strip() for x in ((view or {}).get("details") or []) if str(x).strip()]
+    if details:
+        with st.expander("상세 조회정보", expanded=False):
+            st.markdown("\n".join(details))
+
+
 def _sims_render_dedupe_key(item: Dict[str, Any], meta: Dict[str, Any], data: Any = None) -> str:
     """한 rerun 화면 안에서 같은 SIMS 결과 카드가 두 번 그려지는 것을 막기 위한 key."""
     if not isinstance(item, dict):
@@ -7482,46 +8121,16 @@ def _render_expired_sims_table_fallback(item: Dict[str, Any], meta: Dict[str, An
         or item.get("content")
         or "SIMS 결과"
     ).strip() or "SIMS 결과"
-    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
-    source_key = str(meta.get("source_table_key") or meta.get("source_key") or "").strip()
-    result_time_text = _sims_result_datetime_text(item, meta)
     cond_text = _build_query_condition_text(item)
     if not cond_text:
         query_summary = str(meta.get("query_summary") or "").strip()
         if query_summary:
             cond_text = f"조회조건: {query_summary}"
-    full_rows, display_rows, expected_rows = _sims_table_meta_row_count(meta)
 
     st.markdown(f"---\n##### {action_name}")
-    if result_time_text:
-        time_label = "처리시각" if bool(meta.get("current_table_followup")) else "조회시각"
-        st.caption(f"{time_label}: {result_time_text}")
-    else:
-        st.caption("조회시각: 저장된 메타에 시간 정보가 없습니다.")
-
-    if cond_text:
-        st.caption(cond_text)
-
-    row_bits: list[str] = []
-    if expected_rows and expected_rows != full_rows:
-        row_bits.append(f"expected_rows={expected_rows:,}")
-    if full_rows:
-        row_bits.append(f"rows={full_rows:,}")
-    if display_rows:
-        row_bits.append(f"display_rows={display_rows:,}")
-    if row_bits:
-        st.caption(" / ".join(row_bits))
-
-    key_bits = []
-    if table_key:
-        key_bits.append(f"table_key={table_key}")
-    if source_key:
-        key_bits.append(f"source_key={source_key}")
-    source_action = str(meta.get("source_action") or meta.get("source_table_action") or "").strip()
-    if source_action:
-        key_bits.append(f"source_action={source_action}")
-    if key_bits:
-        st.caption(" / ".join(key_bits))
+    _render_sims_result_header_view(
+        _build_sims_result_header_view(item, meta, title=action_name, expired=True)
+    )
 
     st.info(
         "표 데이터는 현재 세션에서 만료되어 다시 펼칠 수 없습니다.\n\n"
@@ -7531,18 +8140,18 @@ def _render_expired_sims_table_fallback(item: Dict[str, Any], meta: Dict[str, An
 
     summary_md = meta.get("summary_md") or meta.get("summary") or ""
     if isinstance(summary_md, str) and summary_md.strip():
-        _render_chat_summary_expander(summary_md, cond_text)
+        _render_chat_summary_expander_v2(summary_md, cond_text)
 
     try:
         log.info(
             "[chat.table.render] payload expired fallback table_key=%s action=%s has_meta=%s",
-            table_key,
+            str(meta.get("table_key") or item.get("table_key") or "").strip(),
             action_name,
             bool(meta),
         )
         log.info(
             "[chat.table.render] expired table did not clear current source table_key=%s",
-            table_key,
+            str(meta.get("table_key") or item.get("table_key") or "").strip(),
         )
     except Exception:
         pass
@@ -7646,8 +8255,6 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
             header_title = action_name_for_header or str(title or "결과").strip() or "결과"
             is_current_followup = bool(meta.get("current_table_followup"))
-            result_time_text = _sims_result_datetime_text(item, meta)
-
             st.markdown(f"---\n##### {header_title}")
 
             try:
@@ -7683,20 +8290,20 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         loaded_rows=header_loaded_rows,
                         display_rows=header_display_rows,
                     )
-                elif db_total_rows and header_loaded_rows and db_total_rows > header_loaded_rows:
-                    st.caption(
-                        f"결과: 조건 전체 {db_total_rows:,}건 중 {header_loaded_rows:,}건 조회, "
-                        f"화면 {header_display_rows:,}건 표시"
+                else:
+                    header_meta = dict(meta)
+                    if db_total_rows:
+                        header_meta.setdefault("expected_rows", db_total_rows)
+                    header_meta.setdefault("download_row_count", header_loaded_rows)
+                    header_meta.setdefault("display_row_count", header_display_rows)
+                    _render_sims_result_header_view(
+                        _build_sims_result_header_view(
+                            item,
+                            header_meta,
+                            data,
+                            title=header_title,
+                        )
                     )
-                elif header_loaded_rows > 0:
-                    if header_display_rows and header_display_rows < header_loaded_rows:
-                        st.caption(f"결과: 조회 {header_loaded_rows:,}건 중 화면 {header_display_rows:,}건 표시")
-                    else:
-                        st.caption(f"결과: {header_loaded_rows:,}건")
-
-                if result_time_text and not is_current_followup:
-                    time_label = "처리시각" if is_current_followup else "조회시각"
-                    st.caption(f"{time_label}: {result_time_text}")
             except Exception:
                 pass
 
@@ -7774,24 +8381,34 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             or meta.get("summary_type") in {"product_summary", "product_forecast", "product_stock_shortage", "supplier_stock_shortage"}
         )
 
-        cond_text = _build_query_condition_text(item)
+        cond_text = ""
+        summary_cond_text = ""
+        if not is_sims_table_or_text:
+            cond_text = _build_query_condition_text(item)
 
-        # IO/NLQ는 meta.query_summary가 가장 완전한 조회조건이다.
-        # 예: 기간 + 기준월 + 최근 1개월 자동적용
-        try:
-            meta_query_summary = str(meta.get("query_summary") or "").strip()
-            if meta_query_summary:
-                cond_text = f"조회조건: {meta_query_summary}"
-        except Exception:
-            pass
+            # IO/NLQ는 meta.query_summary가 가장 완전한 조회조건이다.
+            # 예: 기간 + 기준월 + 최근 1개월 자동적용
+            try:
+                meta_query_summary = str(meta.get("query_summary") or "").strip()
+                if meta_query_summary:
+                    cond_text = f"조회조건: {meta_query_summary}"
+            except Exception:
+                pass
 
-        if bool(meta.get("current_table_followup")):
-            cond_text = ""
+            if bool(meta.get("current_table_followup")):
+                cond_text = ""
 
-        if cond_text:
-            st.caption(cond_text)
+            if cond_text:
+                st.caption(cond_text)
 
-        _render_nlq_table_meta_caption(meta)
+            _render_nlq_table_meta_caption(meta)
+
+        summary_cond_text = _summary_condition_text_for_cleanup(
+            item,
+            meta,
+            is_sims_table_or_text=is_sims_table_or_text,
+            caption_cond_text=cond_text,
+        )
 
         if bool(meta.get("candidate_table")):
             # 제품수불현황 후보표 안내
@@ -7829,34 +8446,36 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 st.caption(product_info_text)
 
             _render_product_flow_metrics(meta)
-            _render_chat_summary_expander(
+            _render_chat_summary_expander_v2(
                 meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
-                cond_text,
+                summary_cond_text,
             )
 
         elif is_product_inventory:            
             product_info_text = _build_product_inventory_info_caption(meta, item)
-            if product_info_text:
+            show_product_info = _should_show_product_inventory_info(meta, data)
+            if product_info_text and show_product_info:
                 st.caption(product_info_text)
 
             _render_product_inventory_metrics(meta)
-            _render_chat_summary_expander(
+            _render_chat_summary_expander_v2(
                 meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
-                cond_text,
+                summary_cond_text,
+                drop_product_info=not show_product_info,
             )
 
         elif is_monthly_stock:
             _render_monthly_stock_metrics(meta)
-            _render_chat_summary_expander(
+            _render_chat_summary_expander_v2(
                 meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
-                cond_text,
+                summary_cond_text,
             )
 
         elif is_sales_trend:
             _render_sales_trend_metrics(meta)
-            _render_chat_summary_expander(
+            _render_chat_summary_expander_v2(
                 meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
-                cond_text,
+                summary_cond_text,
             )
 
         else:
@@ -7865,115 +8484,27 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 pass
             elif _chat_is_analysis_payload(item, meta, title):
                 _render_chat_analysis_header(meta)
-                _render_chat_summary_expander(
+                _render_chat_summary_expander_v2(
                     meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
-                    cond_text,
+                    summary_cond_text,
                 )
             else:
                 summary_md = meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name)
-
-                if isinstance(summary_md, str) and summary_md.strip():
-                    summary_text = summary_md.strip()
-
-                    # ??? ????? caption?? ?? ?????,
-                    # summary_md? ? ? ????? ?? ???? ???.
-                    if cond_text and summary_text.startswith("????:"):
-                        lines = summary_text.splitlines()
-                        lines = lines[1:]
-                        summary_text = "\n".join(lines).strip()
-
-                    # ????/????? ? ???? ?? ????.
-                    # summary_md ?? ? ? ?? ?? ?? ?? ??? "????:"? ???
-                    # ?? ????? ????.
-                    try:
-                        cleaned_lines = []
-                        for line in summary_text.splitlines():
-                            s = str(line or "").strip()
-
-                            if not s:
-                                cleaned_lines.append(line)
-                                continue
-
-                            # ?:
-                            # - ????: 20,000? (??? ?? 5,000?)
-                            # - ????: ?? 20,000? ? ?? 5,000? ??
-                            # - ?? ??: 20,000?
-                            if (
-                                s.startswith("????:")
-                                or s.startswith("?? ??:")
-                                or s.startswith("????:")
-                            ):
-                                continue
-
-                            cleaned_lines.append(line)
-
-                        summary_text = "\n".join(cleaned_lines).strip()
-                    except Exception:
-                        pass
-
-                    if summary_text:
-                        action_for_summary = str(
-                            item.get("action")
-                            or meta.get("action")
-                            or title
-                            or ""
-                        ).strip()
-
-                        # ??? ??? summary_md? ? ?? ?? ???
-                        # LLM ??? ?? ?? ??? ???.
-                        # ??? ??? ??? ?? ????, ?? ?? ? ? ?? ??.
-                        master_summary_actions = {
-                            "??? ??",
-                            "??? ??",
-                            "????? + ???",
-                            "??? ??? ?",
-                            "???????",
-                            "??????",
-                            "??? ?? ??",
-                            "??? ??",
-                            "???? ??",
-                            "???? ??",
-                            "??????",
-                            "??????",
-                            "????? ??",
-                            "???? ??",
-                            "???? ??",
-                            "????? ?? ??",
-                            "????? ?? ??",
-                            "?????? ??",
-                            "??????? ??",
-                            "???????? ??",
-                            "???????? ??",
-                            "???????? ??",
-                            "???????? ??",
-                            "?????? ??",
-                            "?????? ??",
-                        }
-
-                        is_master_summary = (
-                            action_for_summary in master_summary_actions
-                            or bool(meta.get("master_nlq"))
-                            or str(meta.get("domain") or "").strip() in {
-                                "vendors",
-                                "vendor",
-                                "users",
-                                "codes",
-                                "goods",
-                                "road_address",
-                            }
-                        )
-
-                        if is_master_summary and not bool(meta.get("current_table_followup")):
-                            with st.expander("?? ?? ????", expanded=False):
-                                st.markdown(summary_text)
-                        else:
-                            st.markdown(summary_text)
+                summary_text = _clean_chat_summary_text_v2(summary_md, summary_cond_text)
+                if summary_text and not _is_internal_master_summary(meta):
+                    st.markdown(summary_text)
 
             debug_meta = str(os.getenv("SSAI_DEBUG_META", "false")).strip().lower() in {
                 "1", "true", "yes", "y", "on"
             }
 
-            if meta and debug_meta and not bool(meta.get("hide_meta_expander")):
+            if (
+                meta
+                and debug_meta
+                and _is_internal_admin_for_raw_meta()
+                and not bool(meta.get("hide_meta_expander"))
+                and not _is_internal_master_summary(meta)
+            ):
                 with st.expander("meta", expanded=False):
                     st.json(meta)
 
@@ -8005,7 +8536,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             force_key_for_old_table = _old_sims_table_force_key(item, meta, uid2)
             old_history_table_forced = (
                 str(st.session_state.get("__sims_table_render_path") or "").strip() == "history"
-                and bool(st.session_state.get(force_key_for_old_table))
+                and _is_old_sims_table_force_rendered(item, meta, uid2)
                 and not (
                     _ui_rerun_reason() == "current_table_followup"
                     and _is_latest_sims_table_key(item, meta)
@@ -8545,21 +9076,35 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             height=520,
                         )
 
+            if bool(locals().get("old_history_table_forced", False)):
+                try:
+                    table_key_for_log = str(meta.get("table_key") or item.get("table_key") or "").strip()
+                    action_for_log = str(item.get("action") or meta.get("action") or action_name or title or "").strip()
+                    if st.button(
+                        "이전표 접기",
+                        key=f"hide_old_sims_table_{uid2}",
+                        use_container_width=False,
+                    ):
+                        _set_old_sims_table_force_rendered(item, meta, uid2, False)
+                        log.info(
+                            "[chat.history.table_collapse] action=%s table_key=%s message_id=%s",
+                            action_for_log,
+                            table_key_for_log,
+                            str(item.get("id") or ""),
+                        )
+                        st.rerun()
+                    else:
+                        log.debug(
+                            "[chat.history.table_expand] action=%s table_key=%s message_id=%s",
+                            action_for_log,
+                            table_key_for_log,
+                            str(item.get("id") or ""),
+                        )
+                except Exception:
+                    log.debug("[chat.history.table_collapse] render skipped", exc_info=True)
+
             # 다운로드 (CSV / XLSX)
             try:
-                if bool(locals().get("old_history_table_forced", False)):
-                    download_enabled_key = f"__sims_old_table_download_enabled::{uid2}"
-                    if not bool(st.session_state.get(download_enabled_key)):
-                        st.caption("이전 표를 다시 표시했습니다. Excel/CSV는 [Excel 다운로드 준비]를 누른 뒤 생성합니다.")
-                        if st.button(
-                            "Excel 다운로드 준비",
-                            key=f"sims_old_table_prepare_excel_{uid2}",
-                            use_container_width=False,
-                        ):
-                            st.session_state[download_enabled_key] = True
-                            st.rerun()
-                        return
-
                 action = item.get("action") or meta.get("action")
                 base_name = action or title or "SIMS_RESULT"
                 safe_base = re.sub(r"[^\w가-힣\-]+", "_", str(base_name)).strip("_")
@@ -8604,6 +9149,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     prompt=prompt,
                     expected_rows=expected_rows,
                     display_rows=display_rows_for_download,
+                    clicked_message_id=str(item.get("id") or ""),
+                    clicked_action=str(action or action_name or title or ""),
+                    clicked_meta=meta,
                 )
 
             except Exception:
@@ -8672,7 +9220,7 @@ def render_sims_context_controls() -> None:
                 KEY_SIMS_CTX,
                 "__sims_ctx", "__sims_ctx_hash", "__sims_ctx_dirty",
                 "__sims_context", "__sims_context_text", "__sims_context_obj",
-                "__sims_analysis_ctx", "__sims_latest_analysis_key",
+                "__sims_analysis_ctx", "__sims_analysis_ctx_by_table_key", "__sims_latest_analysis_key",
             ):
                 ss.pop(k, None)
 

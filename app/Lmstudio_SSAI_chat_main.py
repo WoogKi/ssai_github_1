@@ -46,7 +46,7 @@ import shutil
 
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 from openai import OpenAI 
 import random
 # (사용 여부 확인 후 유지/제거)
@@ -548,6 +548,7 @@ def _clear_sims_runtime_for_company_change(reason: str = "company_change") -> No
             "__sims_ctx",
             "__sims_ctx_hash",
             "__sims_analysis_ctx",
+            "__sims_analysis_ctx_by_table_key",
             "__sims_latest_analysis_key",
             "__sims_current_table_source_key",
             "__sims_current_table_source_action",
@@ -710,6 +711,7 @@ def _request_sims_close_for_new_pending_room() -> None:
             "__sims_context_note",
             "__sims_context_obj",
             "__sims_analysis_ctx",
+            "__sims_analysis_ctx_by_table_key",
             "__sims_panel_last_final_action",
             "__sims_panel_last_final_payload",
             "__sims_last_final_payload_for_chat",
@@ -4956,6 +4958,7 @@ def build_messages_with_system(
     history_msgs: list[dict],
     system_prompt: str | None = None,
     user_text: str | None = None,
+    analysis_ctx_override: Optional[dict] = None,
 ) -> list[dict]:
     """
     대화 히스토리 + (선택) 시스템 프롬프트 + (선택) 최신 SIMS 컨텍스트를 결합해 messages를 만든다.
@@ -4995,7 +4998,12 @@ def build_messages_with_system(
         sims_ctx = None
 
     # 2) ✅ SIMS 관련 질문일 때만 SIMS JSON/CONTEXT를 주입
-    analysis_ctx = st.session_state.get("__sims_analysis_ctx")
+    analysis_ctx = (
+        analysis_ctx_override
+        if isinstance(analysis_ctx_override, dict)
+        and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
+        else st.session_state.get("__sims_analysis_ctx")
+    )
 
     def _wants_current_table_source_ctx(q: str) -> bool:
         """
@@ -5424,7 +5432,12 @@ def build_messages_with_system(
         # - 이렇게 해야 LLM이 sample_rows=10 같은 예전 샘플 표가 아니라
         #   최신 전체 결과 기준 분석 컨텍스트를 보게 된다.
         try:
-            analysis_ctx = st.session_state.get("__sims_analysis_ctx")
+            analysis_ctx = (
+                analysis_ctx_override
+                if isinstance(analysis_ctx_override, dict)
+                and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
+                else st.session_state.get("__sims_analysis_ctx")
+            )
 
             if (
                 isinstance(analysis_ctx, dict)
@@ -5581,7 +5594,12 @@ def build_messages_with_system(
     # 조건을 sims_context_kind 하나에만 의존하지 않고,
     # sims_block 내용과 session_state의 분석 컨텍스트까지 함께 확인한다.
     try:
-        _analysis_ctx = st.session_state.get("__sims_analysis_ctx")
+        _analysis_ctx = (
+            analysis_ctx_override
+            if isinstance(analysis_ctx_override, dict)
+            and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
+            else st.session_state.get("__sims_analysis_ctx")
+        )
         analysis_mode = bool(
             attach_sims
             and (
@@ -10553,13 +10571,73 @@ with st.container():
     # ------------------------------------------------------------
     # chat_middleware.py의 LLM 분석 버튼은 st.fragment 안에서 실행된다.
     # 따라서 전체 앱 rerun 없이, 현재 화면은 그대로 둔 채 LLM 분석만 수행한다.
-    def _run_sims_llm_analysis_from_fragment(prompt: str) -> None:
+    def _run_sims_llm_analysis_from_fragment(
+        prompt: str,
+        *,
+        analysis_ctx_override: Optional[dict] = None,
+        clicked_table_key: str = "",
+        clicked_action: str = "",
+        clicked_message_id: str = "",
+    ) -> None:
         try:
             prompt = (prompt or "").strip()
             if not prompt:
                 prompt = "현재 조회 결과를 핵심 요약, 주요 수치, 주의할 점, 다음 조회 제안 순서로 분석해줘"
 
-            msgs = build_messages_with_system([], user_text=prompt)
+            selected_ctx_table_key = ""
+            selected_ctx_action = ""
+            selected_ctx_source_key = ""
+            mismatch = False
+            clicked_table_key_norm = str(clicked_table_key or "").strip()
+            clicked_action_norm = re.sub(r"\s+", " ", str(clicked_action or "").strip())
+            table_scoped_request = bool(clicked_table_key_norm or clicked_action_norm)
+            valid_override = (
+                isinstance(analysis_ctx_override, dict)
+                and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
+            )
+
+            if table_scoped_request and not valid_override:
+                log.warning(
+                    "[chat.fragment] LLM analysis blocked missing table context clicked_message_id=%s clicked_table_key=%s clicked_action=%s",
+                    str(clicked_message_id or "")[:32],
+                    clicked_table_key_norm,
+                    clicked_action_norm,
+                )
+                st.warning("선택한 표의 LLM 분석 컨텍스트를 찾을 수 없어 분석을 실행하지 않았습니다.")
+                return
+
+            if valid_override:
+                selected_ctx_table_key = str(
+                    analysis_ctx_override.get("table_key")
+                    or analysis_ctx_override.get("source_table_key")
+                    or ""
+                ).strip()
+                selected_ctx_action = re.sub(r"\s+", " ", str(analysis_ctx_override.get("action") or "").strip())
+                selected_ctx_source_key = str(analysis_ctx_override.get("source_table_key") or "").strip()
+                mismatch = bool(clicked_table_key_norm and selected_ctx_table_key and clicked_table_key_norm != selected_ctx_table_key)
+                if not mismatch and clicked_action_norm and selected_ctx_action and clicked_action_norm != selected_ctx_action:
+                    mismatch = True
+
+            log.info(
+                "[chat.fragment] LLM analysis context selected clicked_message_id=%s clicked_table_key=%s clicked_action=%s selected_context_table_key=%s selected_context_action=%s selected_context_source_key=%s mismatch=%s",
+                str(clicked_message_id or "")[:32],
+                clicked_table_key_norm,
+                clicked_action_norm,
+                selected_ctx_table_key,
+                selected_ctx_action,
+                selected_ctx_source_key,
+                mismatch,
+            )
+
+            if mismatch:
+                st.warning("선택한 표와 LLM 분석 컨텍스트가 일치하지 않아 분석을 실행하지 않았습니다.")
+                return
+
+            msgs = build_messages_with_system(
+                [],
+                user_text=prompt,
+                analysis_ctx_override=analysis_ctx_override,
+            )
 
             try:
                 has_sims = any(

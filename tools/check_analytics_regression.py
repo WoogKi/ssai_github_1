@@ -2399,14 +2399,580 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("supplier amount column priority", f"{type(e).__name__}: {e}"))
 
         try:
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+            panel_mod = importlib.import_module("app.ui.sims_panel")
+
+            class _FakeExpander:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+            class _FakeStHeader:
+                def __init__(self):
+                    self.captions: list[str] = []
+                    self.markdowns: list[str] = []
+                    self.expanders: list[tuple[str, bool]] = []
+
+                def caption(self, text, *args, **kwargs):
+                    self.captions.append(str(text))
+
+                def markdown(self, text, *args, **kwargs):
+                    self.markdowns.append(str(text))
+
+                def expander(self, label, expanded=False, *args, **kwargs):
+                    self.expanders.append((str(label), bool(expanded)))
+                    return _FakeExpander()
+
+            long_tail = "끝부분-원문보존"
+            long_query = "조회조건 " + ("가나다라마바사 " * 80) + long_tail
+            long_nlq = "NLQ 원문 " + ("사용자 질문 내용 " * 80) + long_tail
+            sample_df = pd.DataFrame({"제품코드": ["P001", "P002"], "부족예상수량": [1, 2]})
+            sample_item = {
+                "type": "table",
+                "title": "품목별 재고부족현황",
+                "action": "품목별 재고부족현황",
+                "params": {"date_from": "2026-01-01", "date_to": "2026-07-17"},
+            }
+            sample_meta = {
+                "table_key": "sims_fixture",
+                "source_key": "source_fixture",
+                "source_action": "품목별 재고부족현황",
+                "query_summary": long_query,
+                "download_row_count": 11713,
+                "display_row_count": 3000,
+                "created_at": "2026-07-17T20:01:31",
+                "nlq_query": long_nlq,
+            }
+            view = chat_mod._build_sims_result_header_view(sample_item, sample_meta, sample_df, title="품목별 재고부족현황")
+            fake_chat_st = _FakeStHeader()
+            old_chat_st = getattr(chat_mod, "st", None)
+            setattr(chat_mod, "st", fake_chat_st)
+            try:
+                chat_mod._render_sims_result_header_view(view)
+            finally:
+                if old_chat_st is not None:
+                    setattr(chat_mod, "st", old_chat_st)
+
+            expired_view = chat_mod._build_sims_result_header_view(sample_item, sample_meta, title="품목별 재고부족현황", expired=True)
+            panel_payload = {
+                "title": "품목별 재고부족현황",
+                "action": "품목별 재고부족현황",
+                "df": pd.DataFrame({"제품코드": range(5)}),
+                "meta": dict(sample_meta),
+            }
+            fake_panel_st = _FakeStHeader()
+            old_panel_st = getattr(panel_mod, "st", None)
+            setattr(panel_mod, "st", fake_panel_st)
+            try:
+                panel_mod._render_panel_result_compact_header(panel_payload, "품목별 재고부족현황", "품목별 재고부족현황", sample_df)
+            finally:
+                if old_panel_st is not None:
+                    setattr(panel_mod, "st", old_panel_st)
+            panel_payload_no_key = {
+                "title": "품목별 재고부족현황",
+                "action": "품목별 재고부족현황",
+                "df": pd.DataFrame({"제품코드": range(5)}),
+                "meta": {k: v for k, v in sample_meta.items() if k != "table_key"},
+            }
+            fake_panel_no_key_st = _FakeStHeader()
+            setattr(panel_mod, "st", fake_panel_no_key_st)
+            try:
+                panel_mod._render_panel_result_compact_header(panel_payload_no_key, "품목별 재고부족현황", "품목별 재고부족현황", sample_df)
+            finally:
+                if old_panel_st is not None:
+                    setattr(panel_mod, "st", old_panel_st)
+
+            header_mismatches = []
+            if len(fake_chat_st.captions) != 2:
+                header_mismatches.append(f"chat captions expected 2 got={fake_chat_st.captions}")
+            if any("table_key" in c or "NLQ" in c for c in fake_chat_st.captions):
+                header_mismatches.append(f"chat captions leaked diagnostics={fake_chat_st.captions}")
+            detail_text = "\n".join(fake_chat_st.markdowns)
+            if "table_key" not in detail_text or "sims_fixture" not in detail_text or "NLQ 원문" not in detail_text:
+                header_mismatches.append(f"chat details missing diagnostics={detail_text}")
+            if long_tail not in detail_text:
+                header_mismatches.append("chat details truncated long query/NLQ tail")
+            if long_tail in "\n".join(fake_chat_st.captions):
+                header_mismatches.append(f"chat captions must compact long query={fake_chat_st.captions}")
+            if fake_chat_st.expanders != [("상세 조회정보", False)]:
+                header_mismatches.append(f"chat expander unexpected={fake_chat_st.expanders}")
+            if "전체 11,713건" not in str(view.get("line1")) or "표 데이터 3,000건" not in str(view.get("line1")):
+                header_mismatches.append(f"row summary unexpected={view.get('line1')}")
+            if "품목별 재고부족현황" in str(view.get("line1")):
+                header_mismatches.append("title duplicated inside row summary")
+            if expired_view.get("followup_available"):
+                header_mismatches.append("expired fallback must not advertise followup availability")
+            if "만료" not in str(expired_view.get("line1")):
+                header_mismatches.append(f"expired line missing status={expired_view.get('line1')}")
+            if len(fake_panel_st.captions) != 2:
+                header_mismatches.append(f"panel captions expected 2 got={fake_panel_st.captions}")
+            if any("table_key" in c for c in fake_panel_st.captions):
+                header_mismatches.append(f"panel captions leaked table_key={fake_panel_st.captions}")
+            if "table_key" not in "\n".join(fake_panel_st.markdowns):
+                header_mismatches.append("panel details missing table_key")
+            if "현재표 후속질문 가능" not in " ".join(fake_panel_st.captions):
+                header_mismatches.append(f"panel caption missing followup availability={fake_panel_st.captions}")
+            if "현재표 후속질문 가능" in " ".join(fake_panel_no_key_st.captions):
+                header_mismatches.append(f"panel without table_key advertised followup={fake_panel_no_key_st.captions}")
+            if long_tail not in "\n".join(fake_panel_st.markdowns):
+                header_mismatches.append("panel details truncated long query tail")
+
+            if header_mismatches:
+                results.append(_fail("sims result compact header render", "; ".join(header_mismatches)))
+            else:
+                results.append(_ok("sims result compact header render", "chat/panel headers use two captions; detail expander preserves long originals; expired/no-key paths hide followup"))
+        except Exception as e:
+            results.append(_fail("sims result compact header render", f"{type(e).__name__}: {e}"))
+
+        try:
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+            st_obj = getattr(chat_mod, "st", None)
+            session_state = getattr(st_obj, "session_state", None)
+            if session_state is None:
+                raise RuntimeError("streamlit session_state unavailable")
+
+            old_cache = session_state.get("__sims_analysis_ctx_by_table_key")
+            old_latest = session_state.get("__sims_analysis_ctx")
+            try:
+                product_ctx = {
+                    "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                    "table_key": "sims_product_codes",
+                    "source_table_key": "",
+                    "action": "제품코드 목록",
+                    "row_count": 2,
+                    "column_count": 2,
+                    "analysis_text": "product context",
+                }
+                vendor_ctx = {
+                    "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                    "table_key": "sims_vendors",
+                    "source_table_key": "",
+                    "action": "거래처 목록",
+                    "row_count": 3,
+                    "column_count": 2,
+                    "analysis_text": "vendor context",
+                }
+                session_state["__sims_analysis_ctx_by_table_key"] = {}
+                chat_mod._cache_sims_analysis_ctx_by_table_key(product_ctx)
+                chat_mod._cache_sims_analysis_ctx_by_table_key(vendor_ctx)
+                session_state["__sims_analysis_ctx"] = vendor_ctx
+
+                selected_ctx, selected_source = chat_mod._select_sims_analysis_ctx_for_table(
+                    table_key="sims_product_codes",
+                    action="제품코드 목록",
+                    meta={"table_key": "sims_product_codes", "action": "제품코드 목록"},
+                    download_df=pd.DataFrame({"제품코드": ["A", "B"], "제품명": ["a", "b"]}),
+                )
+                mismatch_same = chat_mod._sims_clicked_llm_context_mismatch(
+                    selected_ctx,
+                    "sims_product_codes",
+                    "제품코드 목록",
+                )
+                mismatch_wrong = chat_mod._sims_clicked_llm_context_mismatch(
+                    vendor_ctx,
+                    "sims_product_codes",
+                    "제품코드 목록",
+                )
+                rebuilt_ctx, rebuilt_source = chat_mod._select_sims_analysis_ctx_for_table(
+                    table_key="sims_rebuilt",
+                    action="제품코드 목록",
+                    meta={"table_key": "sims_rebuilt", "action": "제품코드 목록"},
+                    download_df=pd.DataFrame({"제품코드": ["C"], "제품명": ["c"]}),
+                )
+                mismatch_spaced = chat_mod._sims_clicked_llm_context_mismatch(
+                    {"kind": "SIMS_ANALYSIS_CONTEXT_V1", "table_key": "sims_product_codes", "action": "Product Codes"},
+                    "sims_product_codes",
+                    "  Product   Codes  ",
+                )
+
+                class _DummyColumn:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, exc_type, exc, tb):
+                        return False
+
+                calls = []
+                warnings = []
+
+                def _fake_runner(prompt, **kwargs):
+                    calls.append({"prompt": prompt, "kwargs": kwargs})
+
+                old_runner = session_state.get("__sims_llm_analysis_runner")
+                old_button = getattr(chat_mod.st, "button")
+                old_columns = getattr(chat_mod.st, "columns")
+                old_download_button = getattr(chat_mod.st, "download_button")
+                old_caption = getattr(chat_mod.st, "caption")
+                old_warning = getattr(chat_mod.st, "warning")
+                try:
+                    session_state["__sims_llm_analysis_runner"] = _fake_runner
+                    chat_mod.st.columns = lambda *args, **kwargs: [_DummyColumn(), _DummyColumn(), _DummyColumn()]
+                    chat_mod.st.download_button = lambda *args, **kwargs: None
+                    chat_mod.st.caption = lambda *args, **kwargs: None
+                    chat_mod.st.warning = lambda msg, *args, **kwargs: warnings.append(str(msg))
+
+                    chat_mod.st.button = lambda *args, **kwargs: True
+                    chat_mod._render_sims_result_actions_plain(
+                        key_suffix="plain_product",
+                        csv_bytes=b"a,b\n1,2\n",
+                        csv_name="plain.csv",
+                        excel_bytes=b"xlsx",
+                        xlsx_name="plain.xlsx",
+                        prompt="analyze product",
+                        table_key="sims_product_codes",
+                        clicked_action="",
+                        clicked_message_id="msg_product",
+                        clicked_meta={"table_key": "sims_product_codes", "action": ""},
+                        download_df=pd.DataFrame({"code": ["A"], "name": ["a"]}),
+                    )
+
+                    chat_mod.st.button = lambda *args, **kwargs: "prepare" not in str(kwargs.get("key") or "")
+                    chat_mod._render_sims_result_actions_lazy(
+                        key_suffix="lazy_product",
+                        table_key="sims_product_codes",
+                        download_df=pd.DataFrame({"code": ["A"], "name": ["a"]}),
+                        csv_name="lazy.csv",
+                        xlsx_name="lazy.xlsx",
+                        prompt="analyze lazy product",
+                        expected_rows=10000,
+                        display_rows=1,
+                        clicked_message_id="msg_product_lazy",
+                        clicked_action="",
+                        clicked_meta={"table_key": "sims_product_codes", "action": ""},
+                    )
+
+                    before_missing = len(calls)
+                    chat_mod._run_clicked_sims_llm_analysis(
+                        prompt="missing override",
+                        key_suffix="missing_product",
+                        table_key="sims_missing",
+                        action="Product Codes",
+                        message_id="msg_missing",
+                        analysis_ctx=None,
+                        context_source="missing",
+                    )
+                    missing_blocked = len(calls) == before_missing
+
+                    before_mismatch = len(calls)
+                    chat_mod._run_clicked_sims_llm_analysis(
+                        prompt="wrong override",
+                        key_suffix="wrong_product",
+                        table_key="sims_product_codes",
+                        action="?쒗뭹肄붾뱶 紐⑸줉",
+                        message_id="msg_wrong",
+                        analysis_ctx=vendor_ctx,
+                        context_source="cache",
+                    )
+                    mismatch_blocked = len(calls) == before_mismatch
+                finally:
+                    if old_runner is None:
+                        session_state.pop("__sims_llm_analysis_runner", None)
+                    else:
+                        session_state["__sims_llm_analysis_runner"] = old_runner
+                    chat_mod.st.button = old_button
+                    chat_mod.st.columns = old_columns
+                    chat_mod.st.download_button = old_download_button
+                    chat_mod.st.caption = old_caption
+                    chat_mod.st.warning = old_warning
+
+                source = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
+                main_source = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+                mismatches = []
+                if selected_ctx.get("table_key") != "sims_product_codes" or selected_ctx.get("action") != "제품코드 목록":
+                    mismatches.append(f"selected wrong ctx={selected_ctx}")
+                if selected_source != "cache":
+                    mismatches.append(f"expected cache source got={selected_source}")
+                if mismatch_same:
+                    mismatches.append(f"same table/action mismatch={mismatch_same}")
+                if mismatch_wrong != "table_key_mismatch":
+                    mismatches.append(f"wrong table mismatch={mismatch_wrong}")
+                if mismatch_spaced:
+                    mismatches.append(f"spaced action should match, got={mismatch_spaced}")
+                if rebuilt_source != "rebuilt" or rebuilt_ctx.get("table_key") != "sims_rebuilt":
+                    mismatches.append(f"rebuilt ctx/source unexpected={rebuilt_ctx}, {rebuilt_source}")
+                if len(calls) != 2:
+                    mismatches.append(f"expected plain/lazy runner calls=2 got={len(calls)} calls={calls}")
+                else:
+                    plain_ctx = calls[0]["kwargs"].get("analysis_ctx_override")
+                    lazy_ctx = calls[1]["kwargs"].get("analysis_ctx_override")
+                    if not isinstance(plain_ctx, dict) or plain_ctx.get("table_key") != "sims_product_codes":
+                        mismatches.append(f"plain runner used wrong ctx={plain_ctx}")
+                    if not isinstance(lazy_ctx, dict) or lazy_ctx.get("table_key") != "sims_product_codes":
+                        mismatches.append(f"lazy runner used wrong ctx={lazy_ctx}")
+                if not missing_blocked:
+                    mismatches.append("missing table-scoped context did not block runner")
+                if not mismatch_blocked:
+                    mismatches.append("mismatched table-scoped context did not block runner")
+                if "__sims_old_table_download_enabled" in source or "sims_old_table_prepare_excel" in source:
+                    mismatches.append("old-table early Excel-only return block remains")
+                if "analysis_ctx_override" not in main_source or "selected_context_table_key" not in main_source:
+                    mismatches.append("main runner does not accept/log table-scoped analysis context")
+                if "table_scoped_request and not valid_override" not in main_source:
+                    mismatches.append("main runner does not fail closed when clicked table context is missing")
+                if "_run_clicked_sims_llm_analysis" not in source or "clicked_table_key" not in source:
+                    mismatches.append("chat action buttons do not use table-scoped LLM helper")
+
+                if mismatches:
+                    results.append(_fail("table-scoped SIMS LLM analysis context", "; ".join(mismatches)))
+                else:
+                    results.append(_ok("table-scoped SIMS LLM analysis context", "old table buttons use clicked table_key/action context; latest global context is not used as fallback; mismatch blocks LLM"))
+            finally:
+                if old_cache is None:
+                    session_state.pop("__sims_analysis_ctx_by_table_key", None)
+                else:
+                    session_state["__sims_analysis_ctx_by_table_key"] = old_cache
+                if old_latest is None:
+                    session_state.pop("__sims_analysis_ctx", None)
+                else:
+                    session_state["__sims_analysis_ctx"] = old_latest
+        except Exception as e:
+            results.append(_fail("table-scoped SIMS LLM analysis context", f"{type(e).__name__}: {e}"))
+
+        try:
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+
+            master_cases = [
+                {
+                    "analysis_type": "users_master",
+                    "llm_summary_kind": "users_master_summary",
+                    "llm_summary_md": "사용자마스터 전체 집계 요약\n- 전체 조회건수: 227건",
+                    "users_master_summary": {"top": ["부서"]},
+                    "table_key": "sims_users",
+                },
+                {
+                    "analysis_type": "goods_master",
+                    "llm_summary_kind": "goods_master_summary",
+                    "llm_summary_md": "제품마스터 전체 집계 요약\n- 전체 조회건수: 120건",
+                    "goods_master_summary": {"top": ["제품"]},
+                    "table_key": "sims_goods",
+                },
+                {
+                    "analysis_type": "vendor_master",
+                    "llm_summary_kind": "vendor_master_summary",
+                    "llm_summary_md": "거래처마스터 자동 집계 요약\n- 전체 조회건수: 340건",
+                    "vendor_master_summary": {"top": ["거래처"]},
+                    "master_nlq": True,
+                    "domain": "vendors",
+                    "source_key": "sims_vendors",
+                },
+                {
+                    "analysis_type": "codes_master",
+                    "llm_summary_kind": "codes_master_summary",
+                    "llm_summary_md": "코드마스터 전체 집계 요약\n- 전체 조회건수: 42건",
+                    "codes_master_summary": {"top": ["코드"]},
+                    "table_key": "sims_codes",
+                },
+            ]
+            visible_cases = [
+                {"summary_md": "조회 결과가 없습니다. 조건을 확인해 주세요.", "analysis_type": "no_data"},
+                {"summary_md": "오류가 발생했습니다. 다시 시도해 주세요.", "analysis_type": "error"},
+                {"summary_md": "LLM 분석 답변입니다.", "analysis_type": "llm_answer"},
+                {"summary_md": "현재표 후속질문 결과 요약", "current_table_followup": True},
+            ]
+            summary_sample = (
+                "조회조건: 기간 2026-01-01 ~ 2026-07-17\n"
+                "조회결과: 227건\n"
+                "조회결과: 11,713건\n"
+                "전체 조회건수: 11,713건\n"
+                "화면 표시건수: 3,000건\n"
+                "조회 완료: 29,716건\n"
+                "조회 결과: 11,713건 (표시 3,000건)\n"
+                "조회결과: 조회 결과가 없습니다.\n"
+                "조회 결과: 조건에 맞는 자료가 없습니다.\n"
+                "조회 완료: 일부 자료를 불러오지 못했습니다.\n"
+                "오류가 발생했습니다.\n"
+                "권한이 없습니다.\n"
+                "조건을 확인해 주세요.\n"
+                "일부 데이터만 조회됐다는 경고\n"
+                "KPI 수치: 123건\n"
+                "업무 요약 본문"
+            )
+            cleaned = chat_mod._clean_chat_summary_text_v2(summary_sample, "기간 2026-01-01 ~ 2026-07-17")
+            inbound_summary = (
+                "조회조건: 기간 2026-07-01 ~ 2026-07-18 / 재고위치 전체\n"
+                "조회결과: 전체 12,131건 / 화면 표시 12,131건\n"
+                "입고수량: 9,999개\n"
+                "업무 요약 본문"
+            )
+            inbound_cleaned = chat_mod._clean_chat_summary_text_v2(
+                inbound_summary,
+                "기간 2026-07-01 ~ 2026-07-18 / 재고위치 전체",
+            )
+            inbound_item_for_header = {
+                "type": "table",
+                "action": "입고명세 조회",
+                "meta": {
+                    "query_summary": "기간 2026-07-01 ~ 2026-07-18 / 재고위치 전체",
+                    "table_key": "sims_dfca5279",
+                },
+            }
+            inbound_summary_cond_text = chat_mod._summary_condition_text_for_cleanup(
+                inbound_item_for_header,
+                inbound_item_for_header["meta"],
+                is_sims_table_or_text=True,
+                caption_cond_text="",
+            )
+            inbound_cleaned_from_render_path = chat_mod._clean_chat_summary_text_v2(
+                inbound_summary,
+                inbound_summary_cond_text,
+            )
+            product_flow_summary = (
+                "제품정보: 제품코드 12345 / 제품명 테스트제품 / 제조사명 테스트제약\n"
+                "이월재고: 10개\n"
+                "입고수량: 20개\n"
+                "출고수량: 5개\n"
+                "재고수량: 25개\n"
+                "집계 요약 펼쳐보기"
+            )
+            product_flow_cleaned = chat_mod._clean_chat_summary_text_v2(
+                product_flow_summary,
+                "제품코드 12345 / 제품명 테스트제품 / 제조사명 테스트제약",
+            )
+            inventory_summary = (
+                "조회조건: 기간 2026-01-01 ~ 2026-07-18 / 재고기준 장부재고\n"
+                "조회 결과: 14,308건 (표시 3,000건)\n"
+                "현재재고수량: 100개\n"
+                "경고: 일부 데이터만 조회됐다는 경고"
+            )
+            inventory_cleaned = chat_mod._clean_chat_summary_text_v2(
+                inventory_summary,
+                "기간 2026-01-01 ~ 2026-07-18 / 재고기준 장부재고",
+            )
+            inventory_cleaned_drop_product = chat_mod._clean_chat_summary_text_v2(
+                "제품정보: 제품코드 12345 / 제품명 테스트제제\n현재재고수량: 100개",
+                "기간 2026-01-01 ~ 2026-07-18 / 재고기준 장부재고",
+                drop_product_info=True,
+            )
+            inventory_cleaned_keep_product = chat_mod._clean_chat_summary_text_v2(
+                "제품정보: 제품코드 12345 / 제품명 테스트제제\n현재재고수량: 100개",
+                "제품코드 12345 / 제품명 테스트제제",
+                drop_product_info=False,
+            )
+            explicit_product_meta = {"params": {"제품코드": "12345"}}
+            maker_only_meta = {"params": {"제조사명": "테스트제약"}}
+            product_group_only_meta = {"params": {"제품그룹명": "전문의약품"}}
+            product_name_only_meta = {"params": {"제품명": "정"}}
+            blank_product_code_meta = {"params": {"제품코드": ""}}
+            full_inventory_df = pd.DataFrame({"제품코드": ["A", "B"], "제품명": ["a", "b"]})
+            single_inventory_df = pd.DataFrame({"제품코드": ["A", "A"], "제품명": ["a", "a"]})
+            src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
+            mismatches = []
+            if not all(chat_mod._is_internal_master_summary(meta) for meta in master_cases):
+                mismatches.append("master summary meta not hidden")
+            if any(chat_mod._is_internal_master_summary(meta) for meta in visible_cases):
+                mismatches.append("visible user-facing summary misclassified as internal master")
+            if "업무 요약 본문" not in cleaned:
+                mismatches.append(f"cleaned summary lost body={cleaned!r}")
+            removed_lines = (
+                "조회결과: 227건",
+                "조회결과: 11,713건",
+                "전체 조회건수: 11,713건",
+                "화면 표시건수: 3,000건",
+                "조회 완료: 29,716건",
+                "조회 결과: 11,713건 (표시 3,000건)",
+            )
+            preserved_lines = (
+                "조회결과: 조회 결과가 없습니다.",
+                "조회 결과: 조건에 맞는 자료가 없습니다.",
+                "조회 완료: 일부 자료를 불러오지 못했습니다.",
+                "오류가 발생했습니다.",
+                "권한이 없습니다.",
+                "조건을 확인해 주세요.",
+                "일부 데이터만 조회됐다는 경고",
+                "KPI 수치: 123건",
+            )
+            if any(line in cleaned for line in removed_lines):
+                mismatches.append(f"cleaned summary kept duplicate row-count line={cleaned!r}")
+            if any(line not in cleaned for line in preserved_lines):
+                mismatches.append(f"cleaned summary removed business notice={cleaned!r}")
+            if "조회조건:" in inbound_cleaned or "조회결과:" in inbound_cleaned:
+                mismatches.append(f"inbound duplicate condition/row-count kept={inbound_cleaned!r}")
+            if "조회조건:" in inbound_cleaned_from_render_path or "조회결과:" in inbound_cleaned_from_render_path:
+                mismatches.append(f"inbound render-path duplicate condition/row-count kept={inbound_cleaned_from_render_path!r}")
+            if inbound_summary_cond_text != "기간 2026-07-01 ~ 2026-07-18 / 재고위치 전체":
+                mismatches.append(f"inbound render-path summary condition unexpected={inbound_summary_cond_text!r}")
+            if "입고수량: 9,999개" not in inbound_cleaned or "업무 요약 본문" not in inbound_cleaned:
+                mismatches.append(f"inbound business summary lost={inbound_cleaned!r}")
+            if "입고수량: 9,999개" not in inbound_cleaned_from_render_path or "업무 요약 본문" not in inbound_cleaned_from_render_path:
+                mismatches.append(f"inbound render-path business summary lost={inbound_cleaned_from_render_path!r}")
+            if "제품정보:" not in product_flow_cleaned:
+                mismatches.append(f"product flow product info removed={product_flow_cleaned!r}")
+            for token in ("이월재고: 10개", "입고수량: 20개", "출고수량: 5개", "재고수량: 25개", "집계 요약 펼쳐보기"):
+                if token not in product_flow_cleaned:
+                    mismatches.append(f"product flow KPI lost token={token!r} cleaned={product_flow_cleaned!r}")
+            if "조회조건:" in inventory_cleaned or "조회 결과:" in inventory_cleaned:
+                mismatches.append(f"inventory duplicate condition/row-count kept={inventory_cleaned!r}")
+            if "현재재고수량: 100개" not in inventory_cleaned or "경고: 일부 데이터만 조회됐다는 경고" not in inventory_cleaned:
+                mismatches.append(f"inventory business/warning summary lost={inventory_cleaned!r}")
+            if "제품정보:" in inventory_cleaned_drop_product or "현재재고수량: 100개" not in inventory_cleaned_drop_product:
+                mismatches.append(f"inventory full-list product info cleanup failed={inventory_cleaned_drop_product!r}")
+            if "제품정보:" not in inventory_cleaned_keep_product:
+                mismatches.append(f"inventory explicit product info removed={inventory_cleaned_keep_product!r}")
+            if not chat_mod._should_show_product_inventory_info(explicit_product_meta, full_inventory_df):
+                mismatches.append("explicit product filter did not show product info")
+            if chat_mod._should_show_product_inventory_info(maker_only_meta, full_inventory_df):
+                mismatches.append("maker-only filter showed product info for multi-product inventory")
+            if chat_mod._should_show_product_inventory_info(product_group_only_meta, full_inventory_df):
+                mismatches.append("product-group-only filter showed product info for multi-product inventory")
+            if chat_mod._should_show_product_inventory_info(product_name_only_meta, full_inventory_df):
+                mismatches.append("product-name-only filter showed product info for multi-product inventory")
+            if chat_mod._should_show_product_inventory_info(blank_product_code_meta, full_inventory_df):
+                mismatches.append("blank product-code filter showed product info for multi-product inventory")
+            if chat_mod._should_show_product_inventory_info({}, full_inventory_df):
+                mismatches.append("multi-product inventory showed first-row product info")
+            if not chat_mod._should_show_product_inventory_info({}, single_inventory_df):
+                mismatches.append("single-product inventory did not show product info")
+            fake_item_for_force = {"id": "msg-force"}
+            fake_meta_for_force = {"table_key": "sims_force_table"}
+            chat_mod._set_old_sims_table_force_rendered(fake_item_for_force, fake_meta_for_force, "force_uid", True)
+            if not chat_mod._is_old_sims_table_force_rendered(fake_item_for_force, fake_meta_for_force, "force_uid"):
+                mismatches.append("old table force render helper did not enable")
+            chat_mod._set_old_sims_table_force_rendered(fake_item_for_force, fake_meta_for_force, "force_uid", False)
+            if chat_mod._is_old_sims_table_force_rendered(fake_item_for_force, fake_meta_for_force, "force_uid"):
+                mismatches.append("old table force render helper did not clear one table")
+            old_user_keys = {
+                key: session_state.get(key)
+                for key in ("user", "current_user", "auth_user", "login_user", "__ssai_user", "ssai_user")
+                if key in session_state
+            }
+            try:
+                for key in ("user", "current_user", "auth_user", "login_user", "__ssai_user", "ssai_user"):
+                    session_state.pop(key, None)
+                session_state["user"] = {"user_type": "SALES"}
+                if chat_mod._is_internal_admin_for_raw_meta():
+                    mismatches.append("raw meta visible to non-internal user")
+                session_state["user"] = {"user_type": "SSART_ADMIN"}
+                if not chat_mod._is_internal_admin_for_raw_meta():
+                    mismatches.append("raw meta hidden from internal admin")
+            finally:
+                for key in ("user", "current_user", "auth_user", "login_user", "__ssai_user", "ssai_user"):
+                    session_state.pop(key, None)
+                session_state.update(old_user_keys)
+            if not all("llm_summary_md" in meta and (meta.get("table_key") or meta.get("source_key")) for meta in master_cases[:3]):
+                mismatches.append("master metadata keys not preserved in fixture")
+            if '"?? ?? ????"' in src or "master_summary_actions = {" in src:
+                mismatches.append("broken master expander/action-list branch remains")
+            if "and not _is_internal_master_summary(meta)" not in src:
+                mismatches.append("debug meta expander is not guarded for internal master summaries")
+
+            if mismatches:
+                results.append(_fail("master llm summary hidden from screen", "; ".join(mismatches)))
+            else:
+                results.append(_ok("master llm summary hidden from screen", "users/goods/vendors/codes master summaries hidden from default screen; LLM metadata preserved; visible summaries unaffected"))
+        except Exception as e:
+            results.append(_fail("master llm summary hidden from screen", f"{type(e).__name__}: {e}"))
+
+        try:
             chat_mw_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
             checks = {
                 "download_prepare_light": '"download_prepare"' in chat_mw_src and '"__ui_rerun_reason"] = "download_prepare"' in chat_mw_src,
                 "download_prepare_table_key": "__sims_download_prepare_table_key" in chat_mw_src,
                 "current_followup_compact": "def _render_current_followup_compact_header" in chat_mw_src,
-                "current_followup_no_time_line": "if result_time_text and not is_current_followup:" in chat_mw_src,
-                "current_followup_query_once": "if bool(meta.get(\"current_table_followup\")):\n            cond_text = \"\"" in chat_mw_src,
-                "current_followup_no_table_key_caption": "hide_table_key_caption" in chat_mw_src and "bool(meta.get(\"current_table_followup\"))" in chat_mw_src,
+                "current_followup_header_branch": "if is_current_followup:" in chat_mw_src and "_render_current_followup_compact_header" in chat_mw_src,
+                "compact_header_helper": "def _build_sims_result_header_view" in chat_mw_src and "상세 조회정보" in chat_mw_src,
+                "no_default_table_key_caption": 'st.caption(f"table_key:' not in chat_mw_src and "NLQ 질문:" not in chat_mw_src,
                 "excel_cell_lazy": "SIMS_EXCEL_EAGER_MAX_CELLS" in chat_mw_src and "lazy_basis_cells" in chat_mw_src,
             }
             failed = [name for name, ok in checks.items() if not ok]

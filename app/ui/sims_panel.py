@@ -2080,6 +2080,113 @@ def _render_panel_result_count_caption(payload: Dict[str, Any], df_disp: pd.Data
     else:
         st.caption(f"조회결과: {display_count:,}건")
 
+
+def _panel_compact_text(value: Any, *, limit: int = 180) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) > limit:
+        return text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _panel_detail_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _panel_result_header_rows(payload: Dict[str, Any], df_disp: pd.DataFrame) -> tuple[int, int, int]:
+    meta = payload.get("meta") or {}
+    df_full = payload.get("df")
+    display_count = _panel_detail_count_for_display(df_disp, payload) if isinstance(df_disp, pd.DataFrame) else 0
+
+    full_count = 0
+    for key in ("download_row_count", "detail_count", "row_count_total", "row_count"):
+        try:
+            raw = meta.get(key)
+            if raw is not None:
+                full_count = int(raw or 0)
+                if full_count > 0:
+                    break
+        except Exception:
+            full_count = 0
+
+    if full_count <= 0 and isinstance(df_full, pd.DataFrame):
+        full_count = _panel_detail_count_for_display(df_full, payload)
+    if full_count <= 0:
+        full_count = display_count
+
+    expected_count = 0
+    for key in ("db_total_count", "total_count", "matched_row_count", "matched_total_count"):
+        try:
+            raw = meta.get(key)
+            if raw is not None:
+                expected_count = int(raw or 0)
+                if expected_count > 0:
+                    break
+        except Exception:
+            expected_count = 0
+    if expected_count <= 0:
+        expected_count = full_count
+
+    return full_count, display_count, expected_count
+
+
+def _render_panel_result_compact_header(payload: Dict[str, Any], action: str, title: str, df_disp: pd.DataFrame) -> None:
+    meta = payload.get("meta") or {}
+    query_summary = str(meta.get("query_summary") or "").strip()
+
+    if not query_summary:
+        params = payload.get("params") or {}
+        parts = []
+        for k, v in params.items():
+            text = str(v or "").strip()
+            if text:
+                parts.append(f"{k} {text}")
+        query_summary = " / ".join(parts)
+
+    full_rows, display_rows, expected_rows = _panel_result_header_rows(payload, df_disp)
+    if expected_rows and full_rows and expected_rows > full_rows:
+        line1 = f"결과: 조건 전체 {expected_rows:,}건 · 조회 {full_rows:,}건"
+        if display_rows and display_rows < full_rows:
+            line1 += f" · 표 데이터 {display_rows:,}건"
+    elif full_rows and display_rows and full_rows > display_rows:
+        line1 = f"결과: 전체 {full_rows:,}건 · 표 데이터 {display_rows:,}건"
+    elif full_rows:
+        line1 = f"결과: {full_rows:,}건"
+    else:
+        line1 = "결과 정보가 저장되어 있습니다."
+    st.caption(line1)
+
+    line2_parts: list[str] = []
+    if query_summary:
+        line2_parts.append(f"조회조건: {_panel_compact_text(query_summary, limit=160)}")
+    if str(meta.get("table_key") or "").strip():
+        line2_parts.append("현재표 후속질문 가능")
+    if line2_parts:
+        st.caption(" · ".join(line2_parts))
+
+    details: list[str] = []
+    for label, value in (
+        ("조회명", title or action),
+        ("조회시각", meta.get("created_at") or meta.get("timestamp") or meta.get("ts") or payload.get("time")),
+        ("전체 조회조건", query_summary),
+        ("전체 결과 행수", f"{full_rows:,}건" if full_rows else ""),
+        ("표시 행수", f"{display_rows:,}건" if display_rows else ""),
+        ("다운로드 행수", f"{int(meta.get('download_row_count') or full_rows):,}건" if (meta.get("download_row_count") or full_rows) else ""),
+        ("현재표 후속질문", "가능" if meta.get("table_key") else ""),
+        ("action", action),
+        ("source", meta.get("source")),
+        ("source_action", meta.get("source_action") or meta.get("source_table_action")),
+        ("table_key", meta.get("table_key")),
+        ("source_key", meta.get("source_table_key") or meta.get("source_key")),
+    ):
+        text = _panel_detail_text(value)
+        if text:
+            details.append(f"- {label}: {text}")
+
+    if details:
+        with st.expander("상세 조회정보", expanded=False):
+            st.markdown("\n".join(details))
+
+
 def _stash_panel_table_for_current_followup(payload: Dict[str, Any], action: str) -> None:
     """
     패널 결과를 채팅에 표로 중복 표시하지 않더라도,
@@ -3327,22 +3434,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
         st.subheader(title)
 
         meta = payload.get("meta") or {}
-        query_summary = str(meta.get("query_summary") or "").strip()
-
-        if not query_summary:
-            params = payload.get("params") or {}
-            parts = []
-            for k, v in params.items():
-                text = str(v or "").strip()
-                if text:
-                    parts.append(f"{k} {text}")
-            query_summary = " / ".join(parts)
-
-        if query_summary:
-            st.caption(f"조회조건: {query_summary}")
-
-        # 조회조건 아래에 전체/화면 표시 건수를 표시한다.
-        _render_panel_result_count_caption(payload, df_disp)
+        _render_panel_result_compact_header(payload, action, str(title or action or ""), df_disp)
 
         if df_disp.empty:
             data = payload.get("data")
