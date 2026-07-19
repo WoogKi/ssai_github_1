@@ -1011,7 +1011,7 @@ def _has_row_number_col(df: pd.DataFrame) -> bool:
 
 
 def _clean_object_series(sr: pd.Series) -> pd.Series:
-    text = sr.fillna("").astype(str).str.strip()
+    text = sr.astype("string").fillna("").str.strip()
     return text.replace(
         {
             "None": "",
@@ -1024,7 +1024,7 @@ def _clean_object_series(sr: pd.Series) -> pd.Series:
             "NULL": "",
             "null": "",
         }
-    )
+    ).astype(object)
 
 
 def _normalize_code_cell(value: Any) -> str:

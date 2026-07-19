@@ -3628,6 +3628,77 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("stock shortage display field restore", f"{type(e).__name__}: {e}"))
 
         try:
+            import warnings
+
+            import numpy as np
+
+            from app.sims.views import rddbc_io_shared as io_shared_mod
+
+            metric_col = "\uc785\uace0\uc218\ub7c9"
+            text_col = "\uba54\ubaa8"
+            all_null_col = "\uc804\ubd80\uacb0\uce21"
+            seq_col = "\uba85\uc138\uc11c\ubc88\ud638"
+            product_no_col = "\uc81c\uc870\ubc88\ud638"
+            validation_col = "\uac80\uc218\ud655\uc778"
+
+            source_df = pd.DataFrame(
+                {
+                    metric_col: pd.Series([1, 0, "2", None, pd.NA, np.nan, ""], dtype="object"),
+                    text_col: pd.Series(["A", "0", "", None, pd.NA, np.nan, "NULL"], dtype="object"),
+                    all_null_col: pd.Series([None, pd.NA, np.nan, None, pd.NA, np.nan, None], dtype="object"),
+                    seq_col: pd.Series([None, 268, "628", "", pd.NA, np.nan, 0], dtype="object"),
+                    product_no_col: pd.Series(["000123", "001-A", "114625021", None, pd.NA, np.nan, "NULL"], dtype="object"),
+                    validation_col: pd.Series(["1", "0", "Y", "", None, pd.NA, "<NA>"], dtype="object"),
+                }
+            )
+            source_before = source_df.copy(deep=True)
+
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                prepared = io_shared_mod._prepare_io_display_df(source_df, add_row_no=False)
+
+            failures: list[str] = []
+            warning_matches = [
+                str(w.message)
+                for w in caught
+                if "Downcasting object dtype arrays on .fillna" in str(w.message)
+            ]
+            if warning_matches:
+                failures.append(f"futurewarning_count={len(warning_matches)}")
+
+            try:
+                pd.testing.assert_frame_equal(source_df, source_before, check_dtype=True)
+            except AssertionError as assert_exc:
+                failures.append(f"source_mutated={assert_exc}")
+
+            if not pd.api.types.is_numeric_dtype(prepared[metric_col]):
+                failures.append(f"metric_dtype={prepared[metric_col].dtype}")
+            if prepared[metric_col].tolist() != [1, 0, 2, 0, 0, 0, 0]:
+                failures.append(f"metric_values={prepared[metric_col].tolist()!r}")
+            if prepared[text_col].tolist() != ["A", "0", "", "", "", "", ""]:
+                failures.append(f"text_values={prepared[text_col].tolist()!r}")
+            if prepared[all_null_col].tolist() != ["", "", "", "", "", "", ""]:
+                failures.append(f"all_null_values={prepared[all_null_col].tolist()!r}")
+            if str(prepared[seq_col].dtype) != "Int64":
+                failures.append(f"seq_dtype={prepared[seq_col].dtype}")
+            if prepared[seq_col].dropna().astype(int).tolist() != [268, 628]:
+                failures.append(f"seq_values={prepared[seq_col].tolist()!r}")
+            if prepared[product_no_col].tolist() != ["000123", "001-A", "114625021", "", "", "", "NULL"]:
+                failures.append(f"product_no_values={prepared[product_no_col].tolist()!r}")
+            if prepared[validation_col].tolist() != ["1", "0", "Y", "", "", "", "<NA>"]:
+                failures.append(f"validation_values={prepared[validation_col].tolist()!r}")
+            for col in [text_col, all_null_col, product_no_col, validation_col]:
+                if not (pd.api.types.is_object_dtype(prepared[col]) or pd.api.types.is_string_dtype(prepared[col])):
+                    failures.append(f"{col}_dtype={prepared[col].dtype}")
+
+            if failures:
+                results.append(_fail("rddbc IO fillna futurewarning", "; ".join(failures)))
+            else:
+                results.append(_ok("rddbc IO fillna futurewarning", "production display helper emits no fillna downcast FutureWarning and preserves numeric/text/null policy"))
+        except Exception as e:
+            results.append(_fail("rddbc IO fillna futurewarning", f"{type(e).__name__}: {e}"))
+
+        try:
             import io
             import json
             from openpyxl import load_workbook
