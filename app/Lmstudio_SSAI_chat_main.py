@@ -283,6 +283,7 @@ from app.services.ssai_storage_service import (
 from app.services.ssai_audit_service import safe_log_audit_event
 
 from app.ui.ssai_admin import (
+    _is_super_admin_user as _is_platform_super_admin_user,
     render_ssai_admin_page,
     render_ssai_admin_sidebar,
 )
@@ -402,6 +403,38 @@ def _can_show_admin_diagnostics_sidebar() -> bool:
     user_type = str(getattr(user, "user_type", "") or "").strip().upper()
 
     return user_type == "SSART_ADMIN"
+
+
+
+def _is_platform_operations_admin() -> bool:
+    """
+    Return True only for the platform operations super admin.
+
+    This reuses the existing super-admin policy: SSART_ADMIN + SUPER.
+    Company admins and SSART managers do not receive LM Studio model controls.
+    """
+    user = get_current_user()
+    if not user:
+        return False
+    return bool(_is_platform_super_admin_user(user))
+
+
+def _render_sidebar_app_title_once() -> None:
+    """Render the application title at the very top of the sidebar."""
+    with st.sidebar:
+        st.markdown("""
+        <div style="
+            background-color:#1E3A8A;
+            color:white;
+            padding:12px;
+            border-radius:8px;
+            text-align:center;
+            font-size:18px;
+            font-weight:bold;
+            margin-bottom:10px;">
+            &#129302; SSAI LM Studio Chatbot
+        </div>
+        """, unsafe_allow_html=True)
 #
 # =========================================================
 # 4-1) SIMS ↔ 채팅 브리지 미들웨어 연결
@@ -1599,6 +1632,8 @@ log.info(
 # - 로그인 전: 로그인 화면만 표시
 # - 로그인 후: 회사 선택 완료 시 기존 메인 화면 진입
 # =========================================================
+_render_sidebar_app_title_once()
+
 if not require_login():
     st.stop()
 
@@ -1632,10 +1667,18 @@ def _llm_status_user_message(status: dict | None = None) -> str:
     return str(status.get("user_message") or LLM_SAFE_MESSAGES.get(str(status.get("code") or ""), "") or LLM_SAFE_MESSAGES["unknown_error"])
 
 
-def _llm_model_ready(model_id: str | None = None) -> tuple[bool, str]:
+def _llm_request_config_ready(model_id: str | None = None) -> tuple[bool, str]:
     expected = str(EXPECTED_LM_MODEL or model_id or "").strip()
     if not expected:
         return False, "LM Studio 운영 모델 설정이 비어 있습니다. 관리자에게 설정을 확인해 달라고 요청하세요."
+    return True, ""
+
+
+def _llm_model_ready(model_id: str | None = None) -> tuple[bool, str]:
+    ready, message = _llm_request_config_ready(model_id)
+    if not ready:
+        return False, message
+    expected = str(EXPECTED_LM_MODEL or model_id or "").strip()
     try:
         models = get_models()
     except Exception:
@@ -1726,7 +1769,7 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
     fallback = _fallback_login_greeting(profile)
 
     try:
-        ready, _ready_message = _llm_model_ready(EXPECTED_LM_MODEL)
+        ready, _ready_message = _llm_request_config_ready(EXPECTED_LM_MODEL)
         if not ready:
             return fallback
 
@@ -8703,7 +8746,7 @@ def stream_and_append_assistant(
 
     import time as _time, random as _random
 
-    ready, ready_message = _llm_model_ready(model_id)
+    ready, ready_message = _llm_request_config_ready(model_id)
     if not ready:
         final_text = ready_message or LLM_SAFE_MESSAGES["model_not_loaded"]
         assistant_time = make_ts()
@@ -8994,13 +9037,7 @@ if "current_room" not in st.session_state or not st.session_state.current_room:
 
 
 if "selected_model" not in st.session_state:
-    _initial_models = get_models()
-    if EXPECTED_LM_MODEL and EXPECTED_LM_MODEL in _initial_models:
-        st.session_state.selected_model = EXPECTED_LM_MODEL
-    elif _initial_models:
-        st.session_state.selected_model = _initial_models[0]
-    else:
-        st.session_state.selected_model = ""
+    st.session_state.selected_model = EXPECTED_LM_MODEL or ""
 
 current_room = _get_current_room_or_pending()
 
@@ -9156,44 +9193,42 @@ def _render_sims_sidebar_fragment() -> None:
 _consume_sims_close_for_chat_room_change()
 
 with st.sidebar:
-    # 상단 배너
-    st.markdown("""
-    <div style="
-        background-color:#1E3A8A;
-        color:white;
-        padding:12px;
-        border-radius:8px;
-        text-align:center;
-        font-size:18px;
-        font-weight:bold;
-        margin-bottom:10px;">
-        🤖 SSAI LM Studio Chatbot
-    </div>
-    """, unsafe_allow_html=True)
+    sidebar_model_admin_allowed = _is_platform_operations_admin()
+    loaded_model_lookup_called = False
+    model_controls_rendered = False
 
-    # 1) 모델 선택
-    st.markdown("## 🧠 모델 선택")
-    try:
-        models = get_models()
-    except Exception:
-        models = []
-    if not models:
-        st.session_state.selected_model = ""
-        st.warning("LM Studio 모델 목록을 가져올 수 없습니다. 서버와 운영 모델 로드 상태를 확인해 주세요.")
-    else:
-        if EXPECTED_LM_MODEL:
-            st.session_state.selected_model = EXPECTED_LM_MODEL
-            st.info(f"운영 모델: `{EXPECTED_LM_MODEL}`")
-            with st.expander("로드된 LM Studio 모델 목록", expanded=False):
-                st.write(models)
+    if sidebar_model_admin_allowed:
+        # 1) 모델 선택
+        model_controls_rendered = True
+        st.markdown("## 🧠 모델 선택")
+        try:
+            loaded_model_lookup_called = True
+            models = get_models()
+        except Exception:
+            models = []
+        if not models:
+            st.warning("LM Studio 모델 목록을 가져올 수 없습니다. 서버와 운영 모델 로드 상태를 확인해 주세요.")
         else:
-            current = st.session_state.get("selected_model")
-            default_idx = models.index(current) if current in models else 0
-            st.session_state.selected_model = st.selectbox("모델", options=models, index=default_idx)
-        if EXPECTED_LM_MODEL and EXPECTED_LM_MODEL not in models:
-            st.warning("운영 모델이 LM Studio에 로드되어 있지 않아 질문 전송이 차단됩니다.")
-        elif not EXPECTED_LM_MODEL:
-            st.warning("운영 LLM 모델 설정이 비어 있어 질문 전송이 차단됩니다.")
+            if EXPECTED_LM_MODEL:
+                st.session_state.selected_model = EXPECTED_LM_MODEL
+                st.info(f"운영 모델: `{EXPECTED_LM_MODEL}`")
+                with st.expander("로드된 LM Studio 모델 목록", expanded=False):
+                    st.write(models)
+            else:
+                current = st.session_state.get("selected_model")
+                default_idx = models.index(current) if current in models else 0
+                st.session_state.selected_model = st.selectbox("모델", options=models, index=default_idx)
+            if EXPECTED_LM_MODEL and EXPECTED_LM_MODEL not in models:
+                st.warning("운영 모델이 LM Studio에 로드되어 있지 않아 질문 전송이 차단됩니다.")
+            elif not EXPECTED_LM_MODEL:
+                st.warning("운영 LLM 모델 설정이 비어 있어 질문 전송이 차단됩니다.")
+
+    log.info(
+        "[sidebar.model] sidebar_model_admin_allowed=%s model_controls_rendered=%s loaded_model_lookup_called=%s",
+        sidebar_model_admin_allowed,
+        model_controls_rendered,
+        loaded_model_lookup_called,
+    )
 
     # 2) 채팅방 관리
     # =========================

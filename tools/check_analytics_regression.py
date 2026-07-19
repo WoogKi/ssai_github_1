@@ -869,7 +869,7 @@ def run_basic_checks() -> list[CheckResult]:
             "expected_model_fixed_ui": "st.session_state.selected_model = EXPECTED_LM_MODEL" in main_src and "st.expander(" in main_src,
             "stream_no_retry_after_tokens": "if collected:\n                    final_text = \"\".join(collected).strip()" in main_src,
             "reasoning_delta_guard": "reasoning_content" in main_src and "reasoning_seen" in main_src,
-            "login_fallback_ready_check": "ready, _ready_message = _llm_model_ready(EXPECTED_LM_MODEL)" in main_src,
+            "login_fallback_ready_check": "ready, _ready_message = _llm_request_config_ready(EXPECTED_LM_MODEL)" in main_src,
             "wait_placeholder": "wait_slot = st.empty()" in main_src and "_clear_wait_notice()" in main_src,
             "no_local_model_runtime_fallback": 'or "local-model"' not in main_src.replace('#                model=model or st.session_state.get("selected_model") or "local-model"', ""),
         }
@@ -922,6 +922,144 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_ok("LM Studio 0.4.19 stability guards", "health classification, model mismatch, response guards, and retry source guards verified"))
     except Exception as e:
         results.append(_fail("LM Studio 0.4.19 stability guards", f"{type(e).__name__}: {e}"))
+
+    try:
+        sidebar_errors = []
+        main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8", errors="replace")
+        helper_start = main_src.index("def _is_platform_operations_admin")
+        helper_end = main_src.index("def _render_sidebar_app_title_once", helper_start)
+        helper_ns: dict[str, Any] = {}
+
+        class _User:
+            def __init__(self, user_type: str, user_grade: str):
+                self.user_type = user_type
+                self.user_grade = user_grade
+
+        current_user_box = {"user": None}
+        helper_ns["get_current_user"] = lambda: current_user_box["user"]
+        from app.ui.ssai_admin import _is_super_admin_user as _actual_super_admin_user
+        helper_ns["_is_platform_super_admin_user"] = _actual_super_admin_user
+        exec(main_src[helper_start:helper_end], helper_ns)
+        can_model_admin = helper_ns["_is_platform_operations_admin"]
+        cases = [
+            (None, False),
+            (_User("WHOLESALE_USER", "STAFF"), False),
+            (_User("WHOLESALE_ADMIN", "MANAGER"), False),
+            (_User("SSART_ADMIN", "MANAGER"), False),
+            (_User("SSART_ADMIN", "SUPER"), True),
+        ]
+        for user_case, expected in cases:
+            current_user_box["user"] = user_case
+            got = bool(can_model_admin())
+            if got != expected:
+                sidebar_errors.append(f"platform_admin_case_failed={getattr(user_case, 'user_type', None)}:{getattr(user_case, 'user_grade', None)}->{got}")
+
+        title_call = main_src.find("\n_render_sidebar_app_title_once()\n")
+        login_call = main_src.find("if not require_login():")
+        sidebar_block_start = main_src.find("with st.sidebar:", main_src.find("_consume_sims_close_for_chat_room_change()"))
+        model_gate = main_src.find("if sidebar_model_admin_allowed:", sidebar_block_start)
+        model_lookup = main_src.find("models = get_models()", sidebar_block_start)
+        chat_section = main_src.find("# 2) 채팅방 관리", sidebar_block_start)
+        lower_sidebar_model_block = main_src[sidebar_block_start:chat_section]
+        old_banner_after_login = lower_sidebar_model_block.find("SSAI LM Studio Chatbot")
+        selected_model_init_start = main_src.find('if "selected_model" not in st.session_state:')
+        selected_model_init = main_src[selected_model_init_start:main_src.find("current_room =", selected_model_init_start)]
+
+        if not (0 <= title_call < login_call):
+            sidebar_errors.append("sidebar title is not rendered before require_login")
+        if old_banner_after_login >= 0:
+            sidebar_errors.append("duplicate sidebar title remains in lower sidebar block")
+        if not (0 <= model_gate < model_lookup < chat_section):
+            sidebar_errors.append("model lookup is not gated inside platform admin block")
+        if "get_models()" in selected_model_init:
+            sidebar_errors.append("selected_model init still calls get_models")
+        if 'st.session_state.selected_model = EXPECTED_LM_MODEL or ""' not in selected_model_init:
+            sidebar_errors.append("selected_model init does not preserve expected model")
+
+        ready_start = main_src.index("def _llm_request_config_ready")
+        ready_end = main_src.index("def _fallback_login_greeting", ready_start)
+        ready_calls = {"get_models": 0}
+        ready_ns: dict[str, Any] = {
+            "EXPECTED_LM_MODEL": "expected-model",
+            "LLM_SAFE_MESSAGES": {
+                "model_not_loaded": "model not loaded",
+                "model_mismatch": "model mismatch",
+            },
+            "get_models": lambda: ready_calls.__setitem__("get_models", ready_calls["get_models"] + 1) or ["expected-model"],
+        }
+        exec(main_src[ready_start:ready_end], ready_ns)
+        ready, _message = ready_ns["_llm_request_config_ready"]("expected-model")
+        if not ready or ready_calls["get_models"] != 0:
+            sidebar_errors.append(f"member config readiness called get_models={ready_calls['get_models']}")
+        ready, _message = ready_ns["_llm_model_ready"]("expected-model")
+        if not ready or ready_calls["get_models"] != 1:
+            sidebar_errors.append(f"platform-admin model readiness did not call get_models once={ready_calls['get_models']}")
+
+        from app.services.llm_health import SAFE_MESSAGES as _SAFE_MESSAGES
+        from app.services.llm_health import bounded_retry_count as _bounded_retry_count
+        from app.services.llm_health import classify_llm_exception as _classify_llm_exception
+        retry_start = main_src.index("def call_chat_with_retry")
+        retry_end = main_src.index("# =========================================================", retry_start + 1)
+        completion_calls = {"create": 0, "with_options": []}
+
+        class _FakeCompletions:
+            def create(self, **_kwargs):
+                completion_calls["create"] += 1
+                raise type("APIConnectFixture", (Exception,), {})("raw secret-token http://127.0.0.1/body")
+
+        class _FakeClient:
+            chat = type("_FakeChat", (), {"completions": _FakeCompletions()})()
+
+            def with_options(self, **kwargs):
+                completion_calls["with_options"].append(dict(kwargs))
+                return self
+
+        retry_ns: dict[str, Any] = {
+            "_normalize_for_lmstudio": lambda messages: messages,
+            "LLM_TIMEOUT_S": 1,
+            "LLM_MAX_RETRY": 0,
+            "LLM_BACKOFF_SEQ": [0.01],
+            "bounded_retry_count": _bounded_retry_count,
+            "CLIENT": _FakeClient(),
+            "EXPECTED_LM_MODEL": "expected-model",
+            "st": type("_FakeSt", (), {"session_state": {}})(),
+            "log": type("_FakeLog", (), {"info": lambda *a, **k: None, "warning": lambda *a, **k: None})(),
+            "time": type("_FakeTime", (), {"perf_counter": __import__("time").perf_counter, "sleep": lambda *_a, **_k: None})(),
+            "random": type("_FakeRandom", (), {"uniform": lambda *_a, **_k: 0.0})(),
+            "classify_llm_exception": _classify_llm_exception,
+            "LLM_SAFE_MESSAGES": _SAFE_MESSAGES,
+        }
+        exec(main_src[retry_start:retry_end], retry_ns)
+        try:
+            retry_ns["call_chat_with_retry"](
+                messages=[{"role": "user", "content": "hello"}],
+                model="expected-model",
+                stream=False,
+                timeout_s=1,
+                max_retry=0,
+            )
+            sidebar_errors.append("completion failure did not raise safe RuntimeError")
+        except RuntimeError as exc:
+            if "secret-token" in str(exc) or "127.0.0.1" in str(exc):
+                sidebar_errors.append("completion failure exposed raw exception text")
+        if completion_calls["create"] != 1:
+            sidebar_errors.append(f"completion failure call count unexpected={completion_calls['create']}")
+
+        for required in (
+            "sidebar_model_admin_allowed",
+            "model_controls_rendered",
+            "loaded_model_lookup_called",
+            "[sidebar.model]",
+        ):
+            if required not in main_src:
+                sidebar_errors.append(f"sidebar diagnostic missing={required}")
+
+        if sidebar_errors:
+            results.append(_fail("sidebar model admin permission policy", "; ".join(sidebar_errors)))
+        else:
+            results.append(_ok("sidebar model admin permission policy", "title precedes login/sidebar info; model UI and get_models are gated to SSART_ADMIN SUPER"))
+    except Exception as e:
+        results.append(_fail("sidebar model admin permission policy", f"{type(e).__name__}: {e}"))
 
     try:
         router = importlib.import_module("app.sims.nlq.nlq_router")
