@@ -255,7 +255,12 @@ from app.ui.chat_bridge import get_sims_context_text, get_sims_context_data  # �
 from app.db.mssql_client import health_check
 
 
-from app.ui.current_table_followups.action_dispatcher import handle_current_table_followup_by_action
+from app.ui.current_table_followups.action_dispatcher import (
+    classify_current_table_followup_intent,
+    current_table_analysis_query_matches,
+    handle_current_table_followup_by_action,
+    select_current_table_analysis_context,
+)
 
 from app.services.ssai_permission_policy import (
     describe_permission,
@@ -3503,18 +3508,53 @@ def _current_table_should_block_llm_fallback(text: str) -> bool:
     if not compact:
         return True
 
-    if "현재표" in compact and "별" in compact and any(w in compact for w in ("분석", "집계", "요약")):
-        return True
+    return classify_current_table_followup_intent(normalized) == "dataframe_table"
 
-    hard_keywords = (
-        "목록", "리스트", "상세", "상세표", "보여", "보여줘", "필터", "만",
-        "표", "테이블", "TOP", "top", "상위",
-        "월별", "일자별", "날짜별", "요일별",
-        "거래처별", "제품별", "품목별", "매입처별", "매출처별", "제조사별", "재고위치별",
-        "이상", "이하", "초과", "미만", "같음", "동일", "=",
-        "불일치목록", "차이금액", "계산서금액", "거래금액",
+
+def _prepare_current_table_analysis_override(source_query: str) -> bool:
+    """
+    일반 현재표 분석 요청에 사용할 table-scoped analysis context를 one-shot으로 준비한다.
+
+    current source와 정확히 일치하는 context가 없으면 전역 최신 context로 대체하지 않고
+    안내만 반환한다.
+    """
+    ss = st.session_state
+    ctx, ctx_source, reason = select_current_table_analysis_context(ss)
+    current_table_key = str(ss.get("__sims_current_table_source_key") or "").strip()
+    current_action = str(ss.get("__sims_current_table_source_action") or "").strip()
+    selected_table_key = str((ctx or {}).get("table_key") or (ctx or {}).get("source_table_key") or "").strip()
+    selected_action = str((ctx or {}).get("action") or "").strip()
+    mismatch = bool(reason)
+
+    log.info(
+        "[current_table.analysis_ctx] current_table_key=%s current_action=%s selected_context_table_key=%s selected_context_action=%s context_source=%s mismatch=%s reason=%s",
+        current_table_key,
+        current_action,
+        selected_table_key,
+        selected_action,
+        ctx_source,
+        mismatch,
+        reason,
     )
-    return any(k in compact for k in hard_keywords)
+
+    if mismatch or not isinstance(ctx, dict):
+        _current_table_push_notice(
+            title="현재표 분석 컨텍스트 불가",
+            action="현재표 분석 컨텍스트 불가",
+            message=(
+                "현재표에 연결된 분석 컨텍스트를 사용할 수 없습니다.\n\n"
+                "다른 표의 최신 컨텍스트로 대체하지 않았습니다. 현재표를 다시 조회한 뒤 분석을 요청해 주세요."
+            ),
+            query_summary="현재표 / LLM 분석 컨텍스트 불가 / fail-closed",
+            source_query=source_query,
+        )
+        ss.pop("__current_table_analysis_ctx_override", None)
+        ss.pop("__current_table_analysis_query", None)
+        return False
+
+    ss["__current_table_analysis_ctx_override"] = ctx
+    ss["__current_table_analysis_query"] = str(source_query or "").strip()
+    return True
 
 
 def _push_no_current_table_notice(source_query: str) -> bool:
@@ -3736,6 +3776,14 @@ def _current_table_push_table(
     if isinstance(df, pd.DataFrame) and not df.empty:
         df = _current_table_fill_alias_values(df)
         df = _current_table_clean_none_for_display(df)
+        try:
+            from app.ui.chat_middleware import _preserve_product_flow_table_dtypes
+
+            source_action_for_dtype = str(st.session_state.get("__sims_current_table_source_action") or "").strip()
+            if "제품수불현황" in source_action_for_dtype and {"명세서번호", "제조번호", "검수확인"}.issubset({str(c) for c in df.columns}):
+                df = _preserve_product_flow_table_dtypes(df)
+        except Exception:
+            log.debug("[current_table] product flow dtype preservation skipped", exc_info=True)
 
     try:
         source_rows_int = int(source_rows) if source_rows is not None else 0
@@ -4194,6 +4242,15 @@ def _try_handle_current_table_dataframe_followup(
         or "현재조회결과" in compact
         or "현재결과" in compact
     ):
+        return False
+
+    intent = classify_current_table_followup_intent(t)
+    if intent != "dataframe_table":
+        log.info(
+            "[current_table.route] intent=%s stage=pandas_handler_skip query=%r",
+            intent,
+            str(t or "")[:120],
+        )
         return False
     
     source_action_current = str(
@@ -5005,6 +5062,7 @@ def build_messages_with_system(
     system_prompt: str | None = None,
     user_text: str | None = None,
     analysis_ctx_override: Optional[dict] = None,
+    disable_sims_analysis_ctx: bool = False,
 ) -> list[dict]:
     """
     대화 히스토리 + (선택) 시스템 프롬프트 + (선택) 최신 SIMS 컨텍스트를 결합해 messages를 만든다.
@@ -5048,7 +5106,7 @@ def build_messages_with_system(
         analysis_ctx_override
         if isinstance(analysis_ctx_override, dict)
         and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
-        else st.session_state.get("__sims_analysis_ctx")
+        else (None if disable_sims_analysis_ctx else st.session_state.get("__sims_analysis_ctx"))
     )
 
     def _wants_current_table_source_ctx(q: str) -> bool:
@@ -5482,7 +5540,7 @@ def build_messages_with_system(
                 analysis_ctx_override
                 if isinstance(analysis_ctx_override, dict)
                 and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
-                else st.session_state.get("__sims_analysis_ctx")
+                else (None if disable_sims_analysis_ctx else st.session_state.get("__sims_analysis_ctx"))
             )
 
             if (
@@ -5644,7 +5702,7 @@ def build_messages_with_system(
             analysis_ctx_override
             if isinstance(analysis_ctx_override, dict)
             and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
-            else st.session_state.get("__sims_analysis_ctx")
+            else (None if disable_sims_analysis_ctx else st.session_state.get("__sims_analysis_ctx"))
         )
         analysis_mode = bool(
             attach_sims
@@ -6328,6 +6386,11 @@ def _push_panel_result_to_current_chat(
         or ss.get("__sims_current_table_source_key")
         or ""
     ).strip()
+    meta_for_sig = (stored_payload or {}).get("meta") if isinstance((stored_payload or {}).get("meta"), dict) else {}
+    panel_source_sig = str(
+        (meta_for_sig or {}).get("_panel_source_sig")
+        or f"{run_seq or ss.get('__sims_run_seq') or 0}::{str((selected_for_render or {}).get('category') or '').strip()}::{action}"
+    ).strip()
 
     df_full = None
     df_display = None
@@ -6423,16 +6486,28 @@ def _push_panel_result_to_current_chat(
                     }
                 )
 
-                sig_src = f"{run_seq or ss.get('__sims_run_seq') or 0}::text::{action}::{message}"
+                sig_src = f"{run_seq or ss.get('__sims_run_seq') or 0}::text::{panel_source_sig}::{action}::{message}"
                 sig = hashlib.sha256(sig_src.encode("utf-8")).hexdigest()[:16]
 
-                if ss.get("__sims_panel_chat_push_sig") == sig:
+                if ss.get("__sims_panel_chat_push_sig") == sig or (
+                    panel_source_sig and ss.get("__sims_panel_chat_pushed_source_sig") == panel_source_sig
+                ):
+                    ss.pop("__sims_last_final_payload_for_chat", None)
+                    ss.pop("__sims_last_final_payload_for_chat_action", None)
+                    ss.pop("__sims_panel_last_final_payload", None)
+                    ss.pop("__sims_panel_last_final_action", None)
                     return False
 
                 _ensure_sims_panel_room_title(room, action)
                 push_sims_result_to_chat(payload, action=action)
 
                 ss["__sims_panel_chat_push_sig"] = sig
+                if panel_source_sig:
+                    ss["__sims_panel_chat_pushed_source_sig"] = panel_source_sig
+                ss.pop("__sims_last_final_payload_for_chat", None)
+                ss.pop("__sims_last_final_payload_for_chat_action", None)
+                ss.pop("__sims_panel_last_final_payload", None)
+                ss.pop("__sims_panel_last_final_action", None)
 
                 log.info(
                     "[chat.panel.push] text saved action=%s run_seq=%s message=%s",
@@ -6467,8 +6542,14 @@ def _push_panel_result_to_current_chat(
     elif display_cap > 0 and len(df_display) > display_cap:
         df_display = df_display.head(display_cap).copy()
 
-    sig = f"{run_seq or ss.get('__sims_run_seq') or 0}::{table_key}::{action}::{len(df_full)}"
-    if ss.get("__sims_panel_chat_push_sig") == sig:
+    sig = f"{run_seq or ss.get('__sims_run_seq') or 0}::{panel_source_sig}::{action}::{len(df_full)}"
+    if ss.get("__sims_panel_chat_push_sig") == sig or (
+        panel_source_sig and ss.get("__sims_panel_chat_pushed_source_sig") == panel_source_sig
+    ):
+        ss.pop("__sims_last_final_payload_for_chat", None)
+        ss.pop("__sims_last_final_payload_for_chat_action", None)
+        ss.pop("__sims_panel_last_final_payload", None)
+        ss.pop("__sims_panel_last_final_action", None)
         return False
 
     _ensure_sims_panel_room_title(room, action)
@@ -6530,10 +6611,14 @@ def _push_panel_result_to_current_chat(
 
     _sync_room_meta(room, materialize=True)
     ss["__sims_panel_chat_push_sig"] = sig
+    if panel_source_sig:
+        ss["__sims_panel_chat_pushed_source_sig"] = panel_source_sig
 
     # 같은 payload가 다음 rerun에서 다시 push되지 않도록 정리
     ss.pop("__sims_last_final_payload_for_chat", None)
     ss.pop("__sims_last_final_payload_for_chat_action", None)
+    ss.pop("__sims_panel_last_final_payload", None)
+    ss.pop("__sims_panel_last_final_action", None)
 
     save_chat_rooms()
 
@@ -11099,6 +11184,19 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
                                 # v2 자동 닫기/이전 실험 플래그 제거
                                 st.session_state.pop("__sims_close_after_push", None)
                                 st.session_state.pop("__sims_keep_open_after_push", None)
+                                try:
+                                    from app.ui.chat_middleware import consume_old_table_history_refresh_once
+
+                                    if consume_old_table_history_refresh_once(
+                                        st.session_state,
+                                        run_seq=run_seq,
+                                        rerun=st.rerun,
+                                        logger=log,
+                                    ):
+                                        pass
+                                except Exception:
+                                    log.exception("[old_table.history_refresh] consume failed")
+
                                 st.session_state.pop("__sims_panel_skip_view_once", None)
                                 st.session_state.pop("__sims_panel_skip_view_reason", None)
 
@@ -11173,6 +11271,7 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
                                     df_now, table_key_now = _current_table_get_latest_df()
                                     no_current_source = not isinstance(df_now, pd.DataFrame) or df_now.empty
                                     hard_table_request = _current_table_should_block_llm_fallback(deferred_query)
+                                    route_intent = classify_current_table_followup_intent(deferred_query)
 
                                     if no_current_source:
                                         _push_no_current_table_notice(deferred_query)
@@ -11185,6 +11284,12 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
                                         st.rerun()
 
                                     elif hard_table_request:
+                                        log.info(
+                                            "[current_table.route] intent=%s stage=deferred_block table_key=%s action=%s handled=False fallback_llm=False",
+                                            route_intent,
+                                            table_key_now,
+                                            st.session_state.get("__sims_current_table_source_action") or "",
+                                        )
                                         _current_table_push_notice(
                                             title="현재표 후속분석 미지원",
                                             action="현재표 후속분석 미지원",
@@ -11206,12 +11311,25 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
                                         st.rerun()
 
                                     else:
-                                        st.session_state["__queue_ai"] = True
-                                        st.session_state.pop("__sims_last_push_sig", None)
-                                        log.debug(
-                                            "[chat.followup_table] deferred current-table analysis not handled → fallback to LLM query=%r",
-                                            deferred_query[:80],
+                                        prepared = _prepare_current_table_analysis_override(deferred_query)
+                                        log.info(
+                                            "[current_table.route] intent=%s stage=deferred_llm table_key=%s action=%s handled=False fallback_llm=%s",
+                                            route_intent,
+                                            table_key_now,
+                                            st.session_state.get("__sims_current_table_source_action") or "",
+                                            prepared,
                                         )
+                                        if prepared:
+                                            st.session_state["__queue_ai"] = True
+                                            st.session_state.pop("__sims_last_push_sig", None)
+                                            log.debug(
+                                                "[chat.followup_table] deferred current-table analysis not handled → table-scoped LLM query=%r",
+                                                deferred_query[:80],
+                                            )
+                                        else:
+                                            st.session_state["__queue_ai"] = False
+                                            save_chat_rooms()
+                                            st.rerun()
 
 
                             except Exception:
@@ -11460,7 +11578,31 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
         history_msgs = current_room.get("sims_messages" if use_sims_hist else "gen_messages", []) or []
 
         try:
-            msgs = build_messages_with_system(history_msgs, user_text=last_user_text)
+            analysis_ctx_override = st.session_state.pop("__current_table_analysis_ctx_override", None)
+            analysis_query = st.session_state.pop("__current_table_analysis_query", "")
+            disable_sims_analysis_ctx = False
+            if isinstance(analysis_ctx_override, dict):
+                if current_table_analysis_query_matches(analysis_query, last_user_text):
+                    log.info(
+                        "[current_table.analysis_ctx] use_override=True query=%r table_key=%s action=%s",
+                        str(analysis_query or last_user_text or "")[:120],
+                        analysis_ctx_override.get("table_key") or analysis_ctx_override.get("source_table_key") or "",
+                        analysis_ctx_override.get("action") or "",
+                    )
+                else:
+                    log.warning(
+                        "[current_table.analysis_ctx] use_override=False reason=query_mismatch stored_query=%r last_user_text=%r",
+                        str(analysis_query or "")[:120],
+                        str(last_user_text or "")[:120],
+                    )
+                    analysis_ctx_override = None
+                    disable_sims_analysis_ctx = True
+            msgs = build_messages_with_system(
+                history_msgs,
+                user_text=last_user_text,
+                analysis_ctx_override=analysis_ctx_override if isinstance(analysis_ctx_override, dict) else None,
+                disable_sims_analysis_ctx=disable_sims_analysis_ctx,
+            )
 
             try:
                 has_sims = any(

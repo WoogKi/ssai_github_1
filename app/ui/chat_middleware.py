@@ -1121,6 +1121,7 @@ def _render_chat_fast_dataframe(
     분석/KPI 큰 표도 공용 column_config를 사용해서
     좌측 고정 칼럼/컬럼폭/숫자 표시를 유지한다.
     """
+    df = _preserve_product_flow_table_dtypes(df)
     view_df = normalize_display_df_for_streamlit(_chat_fast_display_df(df))
 
     try:
@@ -1139,7 +1140,7 @@ def _render_chat_fast_dataframe(
             row_height=32,
         )
 
-        view_df = _chat_clean_display_none_values(view_df)
+        view_df = _preserve_product_flow_table_dtypes(_chat_clean_display_none_values(view_df))
         column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
         log_sims_display_fields(
             df,
@@ -1176,6 +1177,69 @@ def _render_chat_fast_dataframe(
 
 
 #   정리대상 2026/05/19 이후 
+# 제품수불 파생표는 current-table generic 경로를 타면 IO 전용 display 보정을 우회한다.
+# 명세서번호/제조번호/검수확인 3개가 모두 있는 표에만 03 dtype 정책을 다시 적용한다.
+def _preserve_product_flow_table_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    required_cols = {"명세서번호", "제조번호", "검수확인"}
+    if not required_cols.issubset({str(c) for c in df.columns}):
+        return df
+    try:
+        from app.services.product_flow_service import _finalize_display_df_250
+
+        out = df.copy()
+        target_cols = [c for c in out.columns if str(c) in required_cols]
+        if not target_cols:
+            return out
+        fixed = _finalize_display_df_250(out[target_cols].copy())
+        for col in target_cols:
+            if col in fixed.columns:
+                out[col] = fixed[col]
+        return out
+    except Exception:
+        log.debug("[chat] product flow dtype preservation skipped", exc_info=True)
+        return df
+
+
+def consume_old_table_history_refresh_once(
+    session_state: Any,
+    *,
+    run_seq: Any = "",
+    rerun: Any = None,
+    logger: Any = None,
+) -> bool:
+    """Consume one-shot old-table history refresh without touching DB/push/save state."""
+    try:
+        refresh_key = str(session_state.pop("__old_table_history_refresh_key_pending", "") or "").strip()
+    except Exception:
+        refresh_key = ""
+    if not refresh_key:
+        return False
+
+    refresh_sig = f"{run_seq or ''}::{refresh_key}"
+    try:
+        if session_state.get("__old_table_history_refresh_done_sig") == refresh_sig:
+            return False
+        session_state["__old_table_history_refresh_done_sig"] = refresh_sig
+        session_state["__ui_rerun_reason"] = "old_table_history_refresh"
+    except Exception:
+        return False
+
+    try:
+        if logger is not None:
+            logger.info(
+                "[old_table.history_refresh] new_key=%s rerun_scheduled=True already_consumed=False",
+                refresh_key,
+            )
+    except Exception:
+        pass
+
+    if callable(rerun):
+        rerun()
+    return True
+
+
 def _apply_chat_table_profile(df: pd.DataFrame, meta: Dict[str, Any]) -> tuple[pd.DataFrame, dict]:
     """
     채팅 표 전용 표시 프로필.
@@ -5522,7 +5586,14 @@ def _is_current_sims_table_item(item: Dict[str, Any], meta: Dict[str, Any]) -> b
     return False
 
 
-_LIGHT_HISTORY_RERUN_REASONS = {"sims_panel_open", "sims_action_change", "current_table_followup", "chat_room_change", "download_prepare"}
+_LIGHT_HISTORY_RERUN_REASONS = {
+    "sims_panel_open",
+    "sims_action_change",
+    "current_table_followup",
+    "old_table_history_refresh",
+    "chat_room_change",
+    "download_prepare",
+}
 
 
 def _ui_rerun_reason() -> str:
@@ -5590,6 +5661,27 @@ def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], u
 
     rerun_reason = _ui_rerun_reason()
     render_path = str(st.session_state.get("__sims_table_render_path") or "").strip()
+    if _is_old_sims_table_force_rendered(item, meta, uid):
+        try:
+            log.info(
+                "[old_table.render] message_id=%s table_key=%s mode=full reason=forced current_source_key=%s current_source_action=%s",
+                str(item.get("id") or ""),
+                str(meta.get("table_key") or item.get("table_key") or "").strip(),
+                str(st.session_state.get("__sims_current_table_source_key") or "").strip(),
+                str(st.session_state.get("__sims_current_table_source_action") or "").strip(),
+            )
+        except Exception:
+            pass
+        return True
+
+    try:
+        item_table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+        current_source_key = str(st.session_state.get("__sims_current_table_source_key") or "").strip()
+        if item_table_key and current_source_key and item_table_key == current_source_key:
+            return True
+    except Exception:
+        pass
+
     if render_path == "history" and rerun_reason in _LIGHT_HISTORY_RERUN_REASONS:
         if rerun_reason == "current_table_followup" and _is_latest_sims_table_key(item, meta):
             return True
@@ -5599,10 +5691,6 @@ def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], u
             if table_key and prepare_key and table_key == prepare_key:
                 return True
         return False
-
-    force_key = _old_sims_table_force_key(item, meta, uid)
-    if _is_old_sims_table_force_rendered(item, meta, uid):
-        return True
 
     if _is_current_sims_table_item(item, meta):
         return True
@@ -5664,13 +5752,36 @@ def _render_old_sims_table_placeholder(
     _record_history_table_render(skipped=True)
 
     force_key = _old_sims_table_force_key(item, meta, uid)
+    try:
+        log.info(
+            "[old_table.render] message_id=%s table_key=%s mode=placeholder current_source_key=%s current_source_action=%s",
+            str(item.get("id") or ""),
+            str(meta.get("table_key") or item.get("table_key") or "").strip(),
+            str(st.session_state.get("__sims_current_table_source_key") or "").strip(),
+            str(st.session_state.get("__sims_current_table_source_action") or "").strip(),
+        )
+    except Exception:
+        pass
 
     if st.button(
         "이전 표 다시 표시",
         key=f"show_old_sims_table_{uid}",
         use_container_width=False,
     ):
+        before_force = _is_old_sims_table_force_rendered(item, meta, uid)
         _set_old_sims_table_force_rendered(item, meta, uid, True)
+        try:
+            log.info(
+                "[old_table.toggle] message_id=%s table_key=%s before_force=%s after_force=%s current_source_key=%s current_source_action=%s",
+                str(item.get("id") or ""),
+                str(meta.get("table_key") or item.get("table_key") or "").strip(),
+                before_force,
+                _is_old_sims_table_force_rendered(item, meta, uid),
+                str(st.session_state.get("__sims_current_table_source_key") or "").strip(),
+                str(st.session_state.get("__sims_current_table_source_action") or "").strip(),
+            )
+        except Exception:
+            pass
         st.rerun()
 
 
@@ -5681,6 +5792,7 @@ def _render_old_sims_table_placeholder(
 def _prune_old_sims_table_history(
     new_table_key: Optional[str] = None,
     new_item: Optional[Dict[str, Any]] = None,
+    previous_current_source_key: Optional[str] = None,
 ) -> None:
     """
     SIMS 표 history 유지 정책.
@@ -5716,6 +5828,161 @@ def _prune_old_sims_table_history(
     keep_table_keys: set[str] = set()
     if new_table_key:
         keep_table_keys.add(str(new_table_key))
+    previous_current_source_key_from_state = str(
+        ss.pop("__sims_previous_current_table_source_key_for_prune", "") or ""
+    ).strip()
+    previous_current_source_target_key = str(
+        ss.pop("__sims_previous_current_table_source_target_key_for_prune", "") or ""
+    ).strip()
+    ss.pop("__sims_previous_current_table_source_action_for_prune", None)
+    if (
+        previous_current_source_target_key
+        and str(new_table_key or "").strip()
+        and previous_current_source_target_key != str(new_table_key or "").strip()
+    ):
+        try:
+            if str(ss.get("__old_table_history_refresh_key_pending") or "").strip() == previous_current_source_target_key:
+                ss.pop("__old_table_history_refresh_key_pending", None)
+        except Exception:
+            pass
+        previous_current_source_key_from_state = ""
+    previous_current_source_key = str(
+        previous_current_source_key
+        or previous_current_source_key_from_state
+        or ""
+    ).strip()
+    if previous_current_source_key:
+        keep_table_keys.add(previous_current_source_key)
+
+    def _source_table_key_from_item(x: Dict[str, Any]) -> str:
+        try:
+            meta = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+            return str(
+                meta.get("source_table_key")
+                or meta.get("source_key")
+                or x.get("source_table_key")
+                or ""
+            ).strip()
+        except Exception:
+            return ""
+
+    def _table_key_list(items: list[Any]) -> list[str]:
+        out: list[str] = []
+        for x in items:
+            if isinstance(x, dict) and _is_sims_table_history_item(x):
+                tk = _sims_table_key_from_item(x)
+                if tk:
+                    out.append(tk)
+        return out
+
+    def _history_identity(item: Any) -> str:
+        if not isinstance(item, dict):
+            return f"obj:{id(item)}"
+        try:
+            msg_id = str(item.get("id") or item.get("message_id") or "").strip()
+            if msg_id:
+                return f"msg:{msg_id}"
+            table_key = _sims_table_key_from_item(item)
+            if table_key:
+                return f"table:{table_key}"
+        except Exception:
+            pass
+        return f"obj:{id(item)}"
+
+    authoritative_order: dict[str, int] = {}
+
+    def _ordered_reconcile_items(old_items: list[Any], restored_item: Dict[str, Any]) -> list[Any]:
+        deduped: list[Any] = []
+        seen: set[str] = set()
+        restored_ident = _history_identity(restored_item)
+        for item in old_items:
+            ident = _history_identity(item)
+            if ident in seen:
+                continue
+            seen.add(ident)
+            deduped.append(item)
+        if restored_ident in seen:
+            return deduped
+        restored_order = authoritative_order.get(restored_ident)
+        if restored_order is None:
+            return deduped + [restored_item]
+        insert_at = len(deduped)
+        for idx, item in enumerate(deduped):
+            item_order = authoritative_order.get(_history_identity(item))
+            if item_order is not None and item_order > restored_order:
+                insert_at = idx
+                break
+        return deduped[:insert_at] + [restored_item] + deduped[insert_at:]
+
+    room_obj = None
+    try:
+        room_obj = _get_current_room_from_session()
+    except Exception:
+        room_obj = None
+
+    prune_containers: list[tuple[str, list[Any], Optional[Dict[str, Any]], Optional[str]]] = []
+    try:
+        prune_containers.append(("session.__chat_history", list(ss.get("__chat_history") or []), None, "__chat_history"))
+    except Exception:
+        prune_containers.append(("session.__chat_history", [], None, "__chat_history"))
+    if isinstance(room_obj, dict):
+        for channel in ("history", "sims_messages", "gen_messages", "messages"):
+            try:
+                prune_containers.append((f"room.{channel}", list(room_obj.get(channel) or []), room_obj, channel))
+            except Exception:
+                prune_containers.append((f"room.{channel}", [], room_obj, channel))
+        try:
+            for idx, item in enumerate(list(room_obj.get("history") or [])):
+                authoritative_order.setdefault(_history_identity(item), idx)
+        except Exception:
+            pass
+
+    protected_previous_item: Optional[Dict[str, Any]] = None
+    if previous_current_source_key and isinstance(room_obj, dict):
+        try:
+            for channel in ("history", "sims_messages", "gen_messages", "messages"):
+                for candidate in list(room_obj.get(channel) or []):
+                    if not isinstance(candidate, dict) or not _is_sims_table_history_item(candidate):
+                        continue
+                    if _sims_table_key_from_item(candidate) == previous_current_source_key:
+                        protected_previous_item = candidate
+                        raise StopIteration
+        except StopIteration:
+            pass
+        except Exception:
+            protected_previous_item = None
+
+    all_table_items: list[Dict[str, Any]] = []
+    for _container_name, items, _owner, _key in prune_containers:
+        for x in items:
+            if isinstance(x, dict) and _is_sims_table_history_item(x):
+                all_table_items.append(x)
+    if isinstance(new_item, dict) and _is_sims_table_history_item(new_item):
+        all_table_items.append(new_item)
+
+    source_table_keys: set[str] = set()
+    if previous_current_source_key:
+        source_table_keys.add(previous_current_source_key)
+    for x in all_table_items:
+        source_key = _source_table_key_from_item(x)
+        if source_key:
+            source_table_keys.add(source_key)
+            keep_table_keys.add(source_key)
+
+    if isinstance(new_item, dict) and not bool((new_item.get("meta") or {}).get("current_table_followup")):
+        new_key_str = str(new_table_key or "").strip()
+        for x in reversed(all_table_items):
+            try:
+                x_meta = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+                if bool(x_meta.get("current_table_followup")):
+                    continue
+                tk = _sims_table_key_from_item(x)
+                if tk and tk != new_key_str:
+                    source_table_keys.add(tk)
+                    keep_table_keys.add(tk)
+                    break
+            except Exception:
+                pass
 
     def _prune_list(items: list[Any]) -> list[Any]:
         table_items: list[Dict[str, Any]] = []
@@ -5731,10 +5998,28 @@ def _prune_old_sims_table_history(
 
         # 기준표는 전부 유지
         reference_ids: set[int] = set()
+        forced_ids: set[int] = set()
+        protected_source_ids: set[int] = set()
         drilldown_items: list[Dict[str, Any]] = []
 
         for x in table_items:
             role = _sims_table_role_from_item(x)
+            try:
+                x_meta = x.get("meta") if isinstance(x.get("meta"), dict) else {}
+                if _is_old_sims_table_force_rendered(x, x_meta or {}, ""):
+                    forced_ids.add(id(x))
+                    tk = _sims_table_key_from_item(x)
+                    if tk:
+                        keep_table_keys.add(tk)
+            except Exception:
+                pass
+            try:
+                tk = _sims_table_key_from_item(x)
+                if tk and tk in source_table_keys:
+                    protected_source_ids.add(id(x))
+                    keep_table_keys.add(tk)
+            except Exception:
+                pass
             if role == "reference":
                 reference_ids.add(id(x))
                 tk = _sims_table_key_from_item(x)
@@ -5759,26 +6044,49 @@ def _prune_old_sims_table_history(
                 continue
 
             if isinstance(x, dict):
-                if id(x) in reference_ids or id(x) in keep_drilldown_ids:
+                if id(x) in reference_ids or id(x) in forced_ids or id(x) in protected_source_ids or id(x) in keep_drilldown_ids:
                     out.append(x)
 
         return out
 
-    # 1) session 전역 chat history 정리
-    try:
-        old_history = list(ss.get("__chat_history") or [])
-        ss["__chat_history"] = _prune_list(old_history)
-    except Exception:
-        log.exception("[chat] prune __chat_history sims tables failed")
-
-    # 2) 현재 room history 정리
-    try:
-        room_obj = _get_current_room_from_session()
-        if isinstance(room_obj, dict):
-            old_room_history = list(room_obj.get("history") or [])
-            room_obj["history"] = _prune_list(old_room_history)
-    except Exception:
-        log.exception("[chat] prune current_room.history sims tables failed")
+    for container_name, old_items, owner, owner_key in prune_containers:
+        try:
+            restored_previous = False
+            if (
+                container_name == "session.__chat_history"
+                and previous_current_source_key
+                and isinstance(protected_previous_item, dict)
+                and previous_current_source_key not in set(_table_key_list(old_items))
+            ):
+                old_items = _ordered_reconcile_items(old_items, protected_previous_item)
+                restored_previous = True
+            input_keys = _table_key_list(old_items)
+            new_items = _prune_list(old_items)
+            output_keys = _table_key_list(new_items)
+            if owner is None:
+                ss[str(owner_key)] = new_items
+            elif isinstance(owner, dict) and owner_key:
+                owner[str(owner_key)] = new_items
+            removed = [k for k in input_keys if k not in set(output_keys)]
+            if restored_previous:
+                log.info(
+                    "[old_table.reconcile] container=%s protected_key=%s restored=True removed=%s",
+                    container_name,
+                    previous_current_source_key,
+                    removed,
+                )
+            if input_keys or removed:
+                log.info(
+                    "[old_table.prune] container=%s new_table_key=%s previous_current_source_key=%s input=%s protected=%s removed=%s",
+                    container_name,
+                    str(new_table_key or ""),
+                    previous_current_source_key,
+                    input_keys,
+                    sorted(keep_table_keys),
+                    removed,
+                )
+        except Exception:
+            log.exception("[chat] prune %s sims tables failed", container_name)
 
     # 3) session_state에 보관된 DataFrame 정리
     #    화면 history에 남아 있는 table_key + 새 table_key만 유지한다.
@@ -6285,6 +6593,10 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                         meta["source_table_key"] = source_table_key
                         ss["__sims_current_table_source_key"] = source_table_key
                 else:
+                    previous_source_key = str(ss.get("__sims_current_table_source_key") or "").strip()
+                    if previous_source_key and previous_source_key != str(table_key):
+                        ss["__sims_previous_current_table_source_key_for_prune"] = previous_source_key
+                        ss["__sims_previous_current_table_source_target_key_for_prune"] = str(table_key)
                     ss["__sims_current_table_source_key"] = str(table_key)
                     ss["__sims_current_table_source_action"] = str(action_name or "")
 
@@ -6375,6 +6687,10 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                             meta["row_count_total_for_followup"] = int(len(full_df_for_followup))
 
                             # 후속질문 기준 source는 전체 DF가 묶인 원본 table_key 유지
+                            previous_source_key = str(ss.get("__sims_current_table_source_key") or "").strip()
+                            if previous_source_key and previous_source_key != str(table_key):
+                                ss["__sims_previous_current_table_source_key_for_prune"] = previous_source_key
+                                ss["__sims_previous_current_table_source_target_key_for_prune"] = str(table_key)
                             ss["__sims_current_table_source_key"] = str(table_key)
                             ss["__sims_current_table_source_action"] = action_for_export
 
@@ -8852,6 +9168,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         if "순번" not in render_df.columns and "조회순번" not in render_df.columns:
                             render_df.insert(0, "순번", range(1, len(render_df) + 1))
 
+                        render_df = _preserve_product_flow_table_dtypes(render_df)
+
                         table_render_path = str(st.session_state.get("__sims_table_render_path") or "chat")
                         current_followup_fast = _chat_is_current_followup_fast_table(render_df, meta)
                         table_mode_info = {"mode": "fast" if (current_followup_fast or _chat_is_large_table_for_fast_render(render_df)) else "small"}
@@ -8909,7 +9227,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 max_height=520,
                                 row_height=32,
                             )
-                            view_df = _chat_clean_display_none_values(view_df)
+                            view_df = _preserve_product_flow_table_dtypes(_chat_clean_display_none_values(view_df))
                             column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
                             log_sims_display_fields(
                                 data,
@@ -9085,7 +9403,17 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         key=f"hide_old_sims_table_{uid2}",
                         use_container_width=False,
                     ):
+                        before_force = _is_old_sims_table_force_rendered(item, meta, uid2)
                         _set_old_sims_table_force_rendered(item, meta, uid2, False)
+                        log.info(
+                            "[old_table.toggle] message_id=%s table_key=%s before_force=%s after_force=%s current_source_key=%s current_source_action=%s",
+                            str(item.get("id") or ""),
+                            table_key_for_log,
+                            before_force,
+                            _is_old_sims_table_force_rendered(item, meta, uid2),
+                            str(st.session_state.get("__sims_current_table_source_key") or "").strip(),
+                            str(st.session_state.get("__sims_current_table_source_action") or "").strip(),
+                        )
                         log.info(
                             "[chat.history.table_collapse] action=%s table_key=%s message_id=%s",
                             action_for_log,

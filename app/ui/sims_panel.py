@@ -1560,11 +1560,25 @@ def _store_panel_final_payload_for_chat(payload: Dict[str, Any], action: str) ->
             return
 
         _panel_stamp_payload_company(payload)
+        try:
+            meta = payload.setdefault("meta", {})
+            if isinstance(meta, dict):
+                meta["_panel_source_sig"] = _make_panel_source_sig(action)
+        except Exception:
+            pass
 
         st.session_state["__sims_last_final_payload_for_chat"] = payload
         st.session_state["__sims_last_final_payload_for_chat_action"] = str(action or payload.get("action") or "")
     except Exception:
         log.exception("[panel] store final payload for chat failed")
+
+
+def _panel_chat_push_already_consumed(panel_source_sig: str) -> bool:
+    try:
+        sig = str(panel_source_sig or "").strip()
+        return bool(sig and st.session_state.get("__sims_panel_chat_pushed_source_sig") == sig)
+    except Exception:
+        return False
 
 
 def _render_panel_chat_only_done(payload: Dict[str, Any], action: str) -> None:
@@ -2187,7 +2201,12 @@ def _render_panel_result_compact_header(payload: Dict[str, Any], action: str, ti
             st.markdown("\n".join(details))
 
 
-def _stash_panel_table_for_current_followup(payload: Dict[str, Any], action: str) -> None:
+def _stash_panel_table_for_current_followup(
+    payload: Dict[str, Any],
+    action: str,
+    *,
+    record_previous_source_for_prune: bool = False,
+) -> None:
     """
     패널 결과를 채팅에 표로 중복 표시하지 않더라도,
     '현재표 ...' 후속분석이 가능하도록 session_state에 테이블만 저장한다.
@@ -2326,6 +2345,27 @@ def _stash_panel_table_for_current_followup(payload: Dict[str, Any], action: str
 
         except Exception:
             log.exception("[panel] upgrade followup df to full export failed")
+
+        previous_source_key = str(ss.get("__sims_current_table_source_key") or "").strip()
+        previous_source_action = str(ss.get("__sims_current_table_source_action") or "").strip()
+        if (
+            record_previous_source_for_prune
+            and previous_source_key
+            and previous_source_key != table_key
+            and not bool(meta.get("current_table_followup"))
+        ):
+            ss["__sims_previous_current_table_source_key_for_prune"] = previous_source_key
+            ss["__sims_previous_current_table_source_action_for_prune"] = previous_source_action
+            ss["__sims_previous_current_table_source_target_key_for_prune"] = table_key
+            ss["__old_table_history_refresh_key_pending"] = table_key
+            try:
+                log.info(
+                    "[current_table.source_transition] previous_key=%s new_key=%s reason=panel_new_result",
+                    previous_source_key,
+                    table_key,
+                )
+            except Exception:
+                pass
 
         ss["sims_tables"][table_key] = df_disp
         ss["sims_export_tables"][table_key] = df_full
@@ -3336,17 +3376,29 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
             # 여기서 return 해버리면 메인에서 chat.panel.push skip: no df 가 발생한다.
             if _panel_result_target_chat_enabled():
                 try:
-                    df_for_meta: Optional[pd.DataFrame] = None
-                    if isinstance(df_full, pd.DataFrame) and not df_full.empty:
-                        df_for_meta = df_full
-                    elif isinstance(df_disp, pd.DataFrame) and not df_disp.empty:
-                        df_for_meta = df_disp
+                    panel_source_sig = _make_panel_source_sig(action)
+                    if _panel_chat_push_already_consumed(panel_source_sig):
+                        log.info(
+                            "[panel] skip compact chat payload store: already pushed action=%s sig=%s",
+                            action,
+                            panel_source_sig,
+                        )
+                    else:
+                        df_for_meta: Optional[pd.DataFrame] = None
+                        if isinstance(df_full, pd.DataFrame) and not df_full.empty:
+                            df_for_meta = df_full
+                        elif isinstance(df_disp, pd.DataFrame) and not df_disp.empty:
+                            df_for_meta = df_disp
 
-                    if df_for_meta is not None:
-                        _enrich_payload_meta_with_basic_stats(payload, df_for_meta)
+                        if df_for_meta is not None:
+                            _enrich_payload_meta_with_basic_stats(payload, df_for_meta)
 
-                    _stash_panel_table_for_current_followup(payload, action)
-                    _store_panel_final_payload_for_chat(payload, action)
+                        _stash_panel_table_for_current_followup(
+                            payload,
+                            action,
+                            record_previous_source_for_prune=True,
+                        )
+                        _store_panel_final_payload_for_chat(payload, action)
 
                 except Exception:
                     log.exception("[panel] store compact payload for chat failed")
@@ -3399,7 +3451,11 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
 
             # 현재표 후속분석 source는 반드시 갱신
             if ss.get("__sims_panel_source_promoted_sig") != panel_source_sig:
-                _stash_panel_table_for_current_followup(payload, action)
+                _stash_panel_table_for_current_followup(
+                    payload,
+                    action,
+                    record_previous_source_for_prune=True,
+                )
                 ss["__sims_panel_source_promoted_sig"] = panel_source_sig
 
                 log.info(
@@ -3891,7 +3947,11 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                         if df_for_meta is not None:
                             _enrich_payload_meta_with_basic_stats(payload, df_for_meta)
 
-                        _stash_panel_table_for_current_followup(payload, action)
+                        _stash_panel_table_for_current_followup(
+                            payload,
+                            action,
+                            record_previous_source_for_prune=True,
+                        )
 
                         ss["__sims_panel_source_promoted_sig"] = panel_source_sig
 

@@ -908,6 +908,105 @@ def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFram
     return out.loc[:, order + rest]
 
 
+def _select_common_group_top_metric(out: pd.DataFrame, query: str) -> tuple[str, str]:
+    """차원별 TOP 정렬 기준을 선택한다."""
+    if not isinstance(out, pd.DataFrame) or out.empty:
+        return "", ""
+
+    compact = _compact(query)
+
+    def _first_existing(names: tuple[str, ...]) -> str:
+        for name in names:
+            if name in out.columns:
+                return name
+        return ""
+
+    amount_cols = (
+        "합계금액",
+        "수불금액",
+        "공급가액",
+        "총매출공급가액",
+        "총매출액",
+        "매출액",
+        "부족예상금액",
+        "배정부족예상금액",
+    )
+    default_qty_cols = (
+        "합계수량",
+        "수불수량",
+        "총수량",
+        "집계수량",
+    )
+    explicit_qty_cols = default_qty_cols + (
+        "출고수량",
+        "입고수량",
+        "재고수량",
+        "부족예상수량",
+        "배정부족예상수량",
+    )
+    count_cols = ("건수", "행수", "거래처수", "제품수", "품목수", "고유값수")
+
+    if any(w in compact for w in ("건수", "행수")):
+        col = _first_existing(count_cols)
+        if col:
+            return col, "건수"
+
+    def _metric_label(col_name: str) -> str:
+        if col_name in count_cols:
+            return "건수"
+        if col_name in amount_cols:
+            return "금액"
+        return "수량"
+
+    # 정확한 지표명은 일반 단어("수량")보다 먼저 본다.
+    explicit_metric_cols = tuple(
+        sorted(
+            set(amount_cols + explicit_qty_cols + count_cols),
+            key=lambda name: len(_compact(name)),
+            reverse=True,
+        )
+    )
+    for col_name in explicit_metric_cols:
+        if col_name in out.columns and _compact(col_name) in compact:
+            return col_name, _metric_label(col_name)
+
+    short_metric_aliases = (
+        ("출고수량", ("출고",)),
+        ("입고수량", ("입고",)),
+        ("재고수량", ("재고",)),
+        ("수불수량", ("수불",)),
+        ("부족예상수량", ("부족수량",)),
+        ("배정부족예상수량", ("배정부족수량",)),
+    )
+    for col_name, aliases in short_metric_aliases:
+        if col_name in out.columns and any(alias in compact for alias in aliases):
+            return col_name, "수량"
+
+    if any(w in compact for w in ("수량",)):
+        col = _first_existing(default_qty_cols)
+        if col:
+            return col, "수량"
+        col = _first_existing(count_cols)
+        if col:
+            return col, "건수"
+
+    if any(w in compact for w in ("금액", "매출", "공급가액", "합계")):
+        col = _first_existing(amount_cols)
+        if col:
+            return col, "금액"
+
+    col = _first_existing(amount_cols)
+    if col:
+        return col, "금액"
+    col = _first_existing(default_qty_cols)
+    if col:
+        return col, "수량"
+    col = _first_existing(count_cols)
+    if col:
+        return col, "건수"
+    return "", ""
+
+
 def handle_common_column_group_followup(
     *,
     df: pd.DataFrame,
@@ -932,18 +1031,30 @@ def handle_common_column_group_followup(
 
     out = _build_common_group_summary(df, group_col)
     has_top = any(w in _compact(t) for w in ("TOP", "top", "상위"))
+    metric_col = ""
+    metric_label = ""
     if has_top and top_n:
+        metric_col, metric_label = _select_common_group_top_metric(out, t)
+        if metric_col and metric_col in out.columns:
+            nums = _to_numeric_for_common_filter(out[metric_col])
+            out = out.assign(__sort_metric=nums)
+            out = out.sort_values(
+                ["__sort_metric", group_col],
+                ascending=[False, True],
+                kind="mergesort",
+            ).drop(columns=["__sort_metric"])
         out = out.head(int(top_n)).copy()
         out = _add_seq_column(out)
     out = _drop_current_followup_detail_attrs(out)
 
-    title = f"현재표 {group_col}별 집계"
+    title = f"현재표 {group_col}별 TOP {top_n}" if has_top and top_n else f"현재표 {group_col}별 집계"
     try:
         log.info(
-            "[chat.followup.generic_group] query=%r source_action=%r group_column=%r source_rows=%s result_rows=%s table_key=%s",
+            "[chat.followup.generic_group] query=%r source_action=%r group_column=%r metric_column=%r source_rows=%s result_rows=%s table_key=%s",
             t,
             source_action,
             group_col,
+            metric_col,
             len(df),
             len(out),
             table_key,
@@ -955,13 +1066,18 @@ def handle_common_column_group_followup(
         title=title,
         action=title,
         df=out,
-        query_summary=f"현재표 / {group_col}별 집계 / 전체 {len(df):,}건 기준",
+        query_summary=(
+            f"현재표 / {group_col}별 TOP {top_n} · 기준: {metric_col or metric_label or '건수'} / 전체 {len(df):,}건 기준"
+            if has_top and top_n
+            else f"현재표 / {group_col}별 집계 / 전체 {len(df):,}건 기준"
+        ),
         source_query=t,
         source_table_key=table_key,
         source_rows=len(df),
         display_limit=top_n if has_top else None,
         extra_meta={
             "group_column": group_col,
+            "group_top_metric": metric_col,
             "source_row_count": int(len(df)),
         },
     ))
@@ -1004,6 +1120,13 @@ def handle_common_column_filter_followup(
         return False
 
     # 0) 조건 없는 숫자 TOP: 현재표 배정부족예상금액 TOP 20
+    if top_n and any(w in _compact(t) for w in ("TOP", "top", "상위")):
+        try:
+            if _find_common_group_column(df, t):
+                return False
+        except Exception:
+            pass
+
     top_col = _find_common_top_numeric_column(df, t)
     if top_col and top_col in df.columns and top_n:
         try:

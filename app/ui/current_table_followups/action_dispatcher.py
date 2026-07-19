@@ -54,6 +54,227 @@ from app.ui.current_table_followups.generic import (
 )
 
 
+def normalize_current_table_action(value: Any) -> str:
+    """현재표 action 비교용 정규화. 의미 있는 문구는 바꾸지 않고 공백 차이만 흡수한다."""
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _strip_current_table_referents(compact: str) -> str:
+    """Remove words that only point at the current table before intent checks."""
+    out = str(compact or "")
+    referents = ("현재표", "현재조회결과", "현재결과")
+    suffixes = ("에서", "으로", "로", "를", "을", "만", "의", "가", "는", "은")
+    for referent in referents:
+        for suffix in suffixes:
+            out = out.replace(referent + suffix, "")
+        out = out.replace(referent, "")
+    return out
+
+
+def current_table_analysis_query_matches(stored_query: Any, current_query: Any) -> bool:
+    """Return True only when the one-shot analysis context belongs to this request."""
+    stored = re.sub(r"\s+", " ", str(stored_query or "").strip())
+    current = re.sub(r"\s+", " ", str(current_query or "").strip())
+    return bool(stored and current and stored == current)
+
+
+def _is_current_table_analysis_ctx_expired(ctx: Any) -> bool:
+    """Reuse existing expired/payload_expired style flags when they are present."""
+    if not isinstance(ctx, dict):
+        return False
+
+    def _truthy_expired(value: Any) -> bool:
+        if value is True:
+            return True
+        if value is False or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return value == 1
+        normalized = str(value).strip().lower()
+        if normalized in ("true", "1", "yes", "expired"):
+            return True
+        if normalized in ("", "false", "0", "no", "none", "null"):
+            return False
+        return False
+
+    for key in ("expired", "payload_expired", "is_expired", "data_expired", "table_expired"):
+        if _truthy_expired(ctx.get(key)):
+            return True
+    status = str(ctx.get("status") or ctx.get("payload_status") or "").strip().lower()
+    return status == "expired"
+
+
+def classify_current_table_followup_intent(query: str) -> str:
+    """
+    현재표 후속질문을 표 생성 요청과 일반 LLM 분석 요청으로 분리한다.
+
+    반환값:
+    - dataframe_table: pandas handler가 처리해야 하는 명시적 표/집계/필터 요청
+    - llm_analysis: current table-scoped context로 LLM 분석해야 하는 서술형 요청
+    - empty: 비어 있는 요청
+    """
+    text = str(query or "").strip()
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return "empty"
+
+    intent_compact = _strip_current_table_referents(compact)
+
+    numeric_condition_re = re.compile(
+        r"\d[\d,]*(?:\.\d+)?(?:만원|억원|천원|원|개|건|%|퍼센트|박스|병|정|EA|ea)?(?:이상|이하|초과|미만)"
+    )
+    if numeric_condition_re.search(intent_compact):
+        return "dataframe_table"
+
+    explicit_table_markers = (
+        "표로",
+        "표를",
+        "표만",
+        "테이블",
+        "목록",
+        "리스트",
+        "상세표",
+        "TOP",
+        "top",
+        "상위",
+        "하위",
+        "정렬",
+        "필터",
+        "조건",
+        "같음",
+        "동일",
+        "=",
+        "불일치목록",
+        "요약표",
+        "집계표",
+    )
+    if any(marker in intent_compact for marker in explicit_table_markers):
+        return "dataframe_table"
+
+    dimension_markers = (
+        "거래처별",
+        "제품별",
+        "품목별",
+        "매입처별",
+        "매출처별",
+        "제조사별",
+        "재고위치별",
+        "영업사원별",
+        "담당자별",
+        "월별",
+        "일자별",
+        "날짜별",
+        "요일별",
+        "기간별",
+        "연도별",
+    )
+    aggregate_markers = ("집계", "집계해", "합계", "건수", "금액", "수량")
+    if any(dim in intent_compact for dim in dimension_markers) and any(agg in intent_compact for agg in aggregate_markers):
+        return "dataframe_table"
+
+    analysis_phrase_markers = (
+        "이상항목",
+        "문제점",
+        "주의사항",
+        "확인할점",
+        "특징",
+        "경향",
+    )
+    if any(marker in intent_compact for marker in analysis_phrase_markers):
+        return "llm_analysis"
+
+    analysis_markers = (
+        "분석",
+        "요약",
+        "요약해",
+        "특징",
+        "경향",
+        "이상항목",
+        "문제점",
+        "주의사항",
+        "확인할점",
+        "알려줘",
+        "설명",
+        "의견",
+    )
+    if any(marker in intent_compact for marker in analysis_markers):
+        return "llm_analysis"
+
+    return "dataframe_table"
+
+
+def current_table_analysis_ctx_mismatch(
+    ctx: Any,
+    table_key: str = "",
+    action: str = "",
+) -> str:
+    """current source와 analysis context가 일치하지 않으면 사유를 반환한다."""
+    if not isinstance(ctx, dict) or ctx.get("kind") != "SIMS_ANALYSIS_CONTEXT_V1":
+        return "missing_context"
+    if _is_current_table_analysis_ctx_expired(ctx):
+        return "expired_context"
+
+    expected_table_key = str(table_key or "").strip()
+    selected_table_key = str(ctx.get("table_key") or ctx.get("source_table_key") or "").strip()
+    if expected_table_key and selected_table_key != expected_table_key:
+        return "table_key_mismatch" if selected_table_key else "context_table_key_missing"
+
+    expected_action = normalize_current_table_action(action)
+    selected_action = normalize_current_table_action(ctx.get("action"))
+    if expected_action and not selected_action:
+        return "context_action_missing"
+    if expected_action and selected_action and expected_action != selected_action:
+        return "action_mismatch"
+
+    return ""
+
+
+def select_current_table_analysis_context(session_state: Any) -> tuple[dict[str, Any] | None, str, str]:
+    """
+    현재 source table_key/action에 정확히 연결된 analysis context만 선택한다.
+
+    반환값: (context, source, reason)
+    - context가 None이면 source는 빈 문자열이고 reason에 차단 사유가 들어간다.
+    - 후보는 __sims_analysis_ctx_by_table_key와 __sims_current_table_source_analysis_ctx만 사용한다.
+    """
+    try:
+        table_key = str(session_state.get("__sims_current_table_source_key") or "").strip()
+        action = str(session_state.get("__sims_current_table_source_action") or "").strip()
+    except Exception:
+        return None, "", "invalid_session_state"
+
+    if not table_key:
+        return None, "", "missing_current_table_key"
+    if not action:
+        return None, "", "missing_current_action"
+
+    candidates: list[tuple[str, Any]] = []
+    try:
+        cache = session_state.get("__sims_analysis_ctx_by_table_key")
+        if isinstance(cache, dict):
+            candidates.append(("cache", cache.get(table_key)))
+    except Exception:
+        pass
+
+    for source_name, key in (
+        ("current_source", "__sims_current_table_source_analysis_ctx"),
+    ):
+        try:
+            candidates.append((source_name, session_state.get(key)))
+        except Exception:
+            pass
+
+    last_reason = "missing_context"
+    for source_name, ctx in candidates:
+        reason = current_table_analysis_ctx_mismatch(ctx, table_key, action)
+        if not reason and isinstance(ctx, dict):
+            return dict(ctx), source_name, ""
+        if reason != "missing_context":
+            last_reason = reason
+
+    return None, "", last_reason
+
+
 def detect_current_table_kind(source_action: str) -> str:
     s = re.sub(r"\s+", "", str(source_action or ""))
 
@@ -372,6 +593,26 @@ def handle_current_table_followup_by_action(
 
     if handled:
         return True
+
+    # action 전용 handler가 처리하지 못한 차원별 집계/TOP은 공통 group handler로 먼저 처리한다.
+    # 예: 제품수불현황 현재표에서 "영업사원별 TOP 20"은 영업사원 컬럼 자체의 row TOP이 아니라
+    #     영업사원별 집계 결과를 TOP N으로 잘라야 한다.
+    try:
+        if handle_common_column_group_followup(
+            df=df,
+            query=query,
+            top_n=top_n,
+            table_key=table_key,
+            source_action=source_action,
+            helpers=helpers,
+            log=log,
+        ):
+            return True
+    except Exception:
+        try:
+            log.exception("[chat.followup_table] common column group failed kind=%s", kind)
+        except Exception:
+            pass
 
     # action 전용 handler가 처리하지 못한 경우에도,
     # "현재표 <컬럼명> <값> 상세히" 형태는 모든 현재표에서 공통 필터로 처리한다.

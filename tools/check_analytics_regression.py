@@ -2385,6 +2385,171 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("supplier current-table top amount", f"{type(e).__name__}: {e}"))
 
         try:
+            dispatcher_mod = importlib.import_module("app.ui.current_table_followups.action_dispatcher")
+            generic_mod = importlib.import_module("app.ui.current_table_followups.generic")
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+            import pyarrow as pa
+
+            def _run_group_top_case(df: pd.DataFrame, query: str) -> tuple[bool, dict[str, object]]:
+                captured: dict[str, object] = {}
+
+                def _push_group_top_table(**kwargs):
+                    captured.clear()
+                    captured.update(kwargs)
+                    return True
+
+                ok = dispatcher_mod.handle_current_table_followup_by_action(
+                    df=df,
+                    query=query,
+                    top_n=20,
+                    table_key="product-flow-table",
+                    source_action="제품수불현황 조회",
+                    helpers={"push_table": _push_group_top_table, "push_notice": lambda **kwargs: True},
+                    log=log,
+                )
+                return ok, captured
+
+            base_df = pd.DataFrame({
+                "영업사원": ["정원장", "박진우", "김도윤", "박진우", "정원장", "김도윤", None, "0"],
+                "거래처명": ["A", "B", "C", "D", "E", "F", "G", "H"],
+                "제품명": ["P1", "P2", "P1", "P2", "P3", "P3", "P4", "P4"],
+                "합계금액": [100, 900, 300, 700, 200, 400, 50, 30],
+                "합계수량": [10, 90, 30, 70, 20, 40, 5, 3],
+                "총수량": [12, 92, 32, 72, 22, 42, 6, 4],
+                "수불수량": [1, 9, 3, 7, 2, 4, 1, 1],
+                "출고수량": [11, 99, 33, 77, 22, 44, 0, 0],
+                "입고수량": [21, 19, 23, 17, 12, 14, 0, 0],
+                "재고수량": [31, 39, 33, 37, 32, 34, 0, 0],
+                "부족예상수량": [41, 49, 43, 47, 42, 44, 0, 0],
+                "배정부족예상수량": [51, 59, 53, 57, 52, 54, 0, 0],
+                "명세서번호": pd.Series([1, 2, 3, 4, 5, 6, None, 8], dtype="Int64"),
+                "제조번호": ["000123", "001-A", "114625021", "000124", "001-B", "114625022", "", "000000"],
+                "검수확인": ["1", "0", "Y", "1", "0", "Y", "", "0"],
+            })
+            source_snapshot = base_df.copy(deep=True)
+            cases = [
+                ("합계금액 존재 기본", base_df, "현재표 영업사원별 TOP 20 표로 만들어줘", "합계금액"),
+                ("합계금액 없음 합계수량 기본", base_df.drop(columns=["합계금액"]), "현재표 영업사원별 TOP 20 표로 만들어줘", "합계수량"),
+                ("전체 수량 없음 건수 기본", base_df.drop(columns=["합계금액", "합계수량", "총수량", "수불수량"]), "현재표 영업사원별 TOP 20 표로 만들어줘", "행수"),
+                ("건수 명시", base_df, "현재표 영업사원별 건수 TOP 20", "행수"),
+                ("합계수량 명시", base_df, "현재표 영업사원별 합계수량 TOP 20", "합계수량"),
+                ("총수량 명시", base_df, "현재표 영업사원별 총수량 TOP 20", "총수량"),
+                ("수불수량 명시", base_df, "현재표 영업사원별 수불수량 TOP 20", "수불수량"),
+                ("출고수량 명시", base_df, "현재표 영업사원별 출고수량 TOP 20", "출고수량"),
+                ("입고수량 명시", base_df, "현재표 영업사원별 입고수량 TOP 20", "입고수량"),
+                ("재고수량 명시", base_df, "현재표 영업사원별 재고수량 TOP 20", "재고수량"),
+                ("일반 수량 전체수량 우선", base_df, "현재표 영업사원별 수량 TOP 20", "합계수량"),
+                ("일반 수량 방향수량 금지", base_df.drop(columns=["합계금액", "합계수량", "총수량", "수불수량", "부족예상수량", "배정부족예상수량"]), "현재표 영업사원별 수량 TOP 20", "행수"),
+            ]
+            mismatches = []
+            case_reports = []
+            arrow_checked = False
+            for label, case_df, query, expected_metric in cases:
+                ok_group_top, captured_group_top = _run_group_top_case(case_df.copy(deep=True), query)
+                out_group_top = captured_group_top.get("df")
+                meta_group_top = captured_group_top.get("extra_meta") if isinstance(captured_group_top.get("extra_meta"), dict) else {}
+                metric = str(meta_group_top.get("group_top_metric") or "")
+                if not ok_group_top or not isinstance(out_group_top, pd.DataFrame):
+                    mismatches.append(f"{label}: did not push group TOP")
+                    continue
+                if metric != expected_metric:
+                    mismatches.append(f"{label}: metric={metric} expected={expected_metric}")
+                dimension_col = next((c for c in ("영업사원", "제품명", "제품코드") if c in out_group_top.columns), "")
+                if not dimension_col:
+                    mismatches.append(f"{label}: missing dimension columns={list(out_group_top.columns)}")
+                else:
+                    values = out_group_top[dimension_col].astype(str).tolist()
+                    if dimension_col == "영업사원":
+                        if not any("미지정" in v for v in values):
+                            mismatches.append(f"{label}: missing 미지정 group values={values}")
+                        if "0" not in values:
+                            mismatches.append(f"{label}: literal string 0 not preserved values={values}")
+                if label == "전체 수량 없음 건수 기본" and "출고수량" in out_group_top.columns and metric == "출고수량":
+                    mismatches.append("default fallback incorrectly selected 출고수량")
+                if not arrow_checked and isinstance(out_group_top, pd.DataFrame):
+                    display_df = chat_mod._preserve_product_flow_table_dtypes(out_group_top.copy())
+                    pa.Table.from_pandas(display_df, preserve_index=False)
+                    if display_df["영업사원"].dtype == "float64":
+                        mismatches.append("Arrow display boundary converted 영업사원 to float64")
+                    if "행수" in display_df.columns and not pd.api.types.is_integer_dtype(display_df["행수"]):
+                        mismatches.append(f"행수 dtype not integer after display boundary: {display_df['행수'].dtype}")
+                    if any(str(v) == "None" for v in display_df.astype(object).to_numpy().ravel()):
+                        mismatches.append("display boundary produced literal None")
+                    arrow_checked = True
+                case_reports.append(f"{label}={metric}")
+
+            captured_filter: dict[str, object] = {}
+
+            def _push_filter_table(**kwargs):
+                captured_filter.clear()
+                captured_filter.update(kwargs)
+                return True
+
+            row_top_df = pd.DataFrame({"거래처명": ["A", "B", "C"], "합계금액": [10, 30, 20]})
+            row_top_ok = generic_mod.handle_common_column_filter_followup(
+                df=row_top_df,
+                query="현재표 합계금액 TOP 20",
+                top_n=20,
+                table_key="product-flow-table",
+                source_action="제품수불현황 조회",
+                helpers={"push_table": _push_filter_table},
+                log=log,
+            )
+            row_top_out = captured_filter.get("df")
+            if not row_top_ok or not isinstance(row_top_out, pd.DataFrame):
+                mismatches.append("row-level 합계금액 TOP did not route")
+            elif row_top_out["합계금액"].tolist() != [30, 20, 10]:
+                mismatches.append(f"row-level 합계금액 TOP sort changed={row_top_out['합계금액'].tolist()}")
+            selector_out = pd.DataFrame({
+                "영업사원": ["A", "B"],
+                "행수": pd.Series([2, 1], dtype="Int64"),
+                "합계금액": [100, 50],
+                "합계수량": [10, 5],
+                "총수량": [12, 6],
+                "수불수량": [1, 9],
+                "출고수량": [11, 99],
+                "입고수량": [21, 19],
+                "재고수량": [31, 39],
+                "부족예상수량": [41, 49],
+                "배정부족예상수량": [51, 59],
+            })
+            selector_cases = [
+                ("현재표 영업사원별 수불수량 TOP 20", "수불수량"),
+                ("현재표 영업사원별 부족예상수량 TOP 20", "부족예상수량"),
+                ("현재표 영업사원별 배정부족예상수량 TOP 20", "배정부족예상수량"),
+                ("현재표 영업사원별 출고수량 TOP 20", "출고수량"),
+                ("현재표 영업사원별 입고수량 TOP 20", "입고수량"),
+                ("현재표 영업사원별 재고수량 TOP 20", "재고수량"),
+                ("현재표 영업사원별 합계수량 TOP 20", "합계수량"),
+                ("현재표 영업사원별 총수량 TOP 20", "총수량"),
+                ("현재표 영업사원별 수량 TOP 20", "합계수량"),
+            ]
+            selector_reports = []
+            for query_text, expected_metric in selector_cases:
+                metric_col, _metric_label = generic_mod._select_common_group_top_metric(selector_out, query_text)
+                selector_reports.append(f"{expected_metric}->{metric_col}")
+                if metric_col != expected_metric:
+                    mismatches.append(f"selector {query_text!r}: metric={metric_col} expected={expected_metric}")
+            direction_only = selector_out.drop(columns=["합계금액", "합계수량", "총수량", "수불수량", "부족예상수량", "배정부족예상수량"])
+            metric_col, _metric_label = generic_mod._select_common_group_top_metric(direction_only, "현재표 영업사원별 수량 TOP 20")
+            selector_reports.append(f"direction-only 수량->{metric_col}")
+            if metric_col != "행수":
+                mismatches.append(f"general 수량 with directional only selected {metric_col}, expected 행수")
+            try:
+                pd.testing.assert_frame_equal(base_df, source_snapshot, check_dtype=True)
+            except AssertionError as ae:
+                mismatches.append(f"source df mutated: {ae}")
+            if mismatches:
+                results.append(_fail("product flow salesperson dimension TOP", "; ".join(mismatches)))
+            else:
+                results.append(_ok("product flow salesperson dimension TOP", "fallback cases OK: " + ", ".join(case_reports) + "; row-level 합계금액 TOP and Arrow conversion OK"))
+                results.append(_ok("product flow group TOP explicit metric aliases", "specific quantity metrics win over generic 수량 alias: " + ", ".join(selector_reports)))
+                results.append(_ok("product flow group TOP fallback matrix", "default metric order amount -> total quantity -> count; explicit count/quantity/directional quantity respected"))
+                results.append(_ok("product flow group TOP Arrow boundary", "group TOP payload survives product-flow display dtype preservation and pyarrow conversion without literal None"))
+        except Exception as e:
+            results.append(_fail("product flow salesperson dimension TOP", f"{type(e).__name__}: {e}"))
+
+        try:
             generic_mod = importlib.import_module("app.ui.current_table_followups.generic")
             captured_filter: dict[str, object] = {}
 
@@ -2810,6 +2975,199 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("table-scoped SIMS LLM analysis context", f"{type(e).__name__}: {e}"))
 
         try:
+            from app.ui.current_table_followups.action_dispatcher import (
+                classify_current_table_followup_intent,
+                current_table_analysis_query_matches,
+                current_table_analysis_ctx_mismatch,
+                select_current_table_analysis_context,
+            )
+
+            product_ctx = {
+                "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                "table_key": "sims_product_flow",
+                "source_table_key": "",
+                "action": "제품수불현황 조회",
+                "row_count": 12,
+                "column_count": 8,
+                "analysis_text": "product flow context",
+            }
+            vendor_ctx = {
+                "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                "table_key": "sims_vendor",
+                "source_table_key": "",
+                "action": "거래처 목록",
+                "row_count": 3,
+                "column_count": 5,
+                "analysis_text": "vendor context",
+            }
+            session_state = {
+                "__sims_current_table_source_key": "sims_product_flow",
+                "__sims_current_table_source_action": "제품수불현황 조회",
+                "__sims_analysis_ctx_by_table_key": {
+                    "sims_product_flow": product_ctx,
+                    "sims_vendor": vendor_ctx,
+                },
+                "__sims_analysis_ctx": vendor_ctx,
+            }
+
+            selected_ctx, selected_source, selected_reason = select_current_table_analysis_context(session_state)
+
+            route_cases = {
+                "현재표를 분석해줘": "llm_analysis",
+                "현재표만 분석해줘": "llm_analysis",
+                "현재표로 분석해줘": "llm_analysis",
+                "현재표 이상 항목 분석해줘": "llm_analysis",
+                "현재표에서 이상 항목을 알려줘": "llm_analysis",
+                "현재표의 문제점과 주의사항을 분석해줘": "llm_analysis",
+                "현재표 금액 100만원 이상만 보여줘": "dataframe_table",
+                "현재표 수량 10 이상 목록": "dataframe_table",
+                "현재표 재고 0 이하인 제품만 표로 만들어줘": "dataframe_table",
+                "현재표를 영업사원별 TOP 20 표로 만들어줘": "dataframe_table",
+                "현재표에서 요약표를 만들어줘": "dataframe_table",
+                "현재표 영업사원 분석": "llm_analysis",
+                "현재표 영업사원 요약해줘": "llm_analysis",
+                "현재표에서 확인할 점 알려줘": "llm_analysis",
+                "현재표 영업사원별 TOP 20 표로 만들어줘": "dataframe_table",
+                "현재표 영업사원별 집계": "dataframe_table",
+                "현재표 제품별 목록": "dataframe_table",
+                "현재표 요약표": "dataframe_table",
+            }
+
+            route_mismatches = []
+            for query, expected_intent in route_cases.items():
+                actual_intent = classify_current_table_followup_intent(query)
+                if actual_intent != expected_intent:
+                    route_mismatches.append(f"{query}:{actual_intent}!={expected_intent}")
+
+            intent_edge_cases = {
+                "현재표를 분석해줘": "llm_analysis",
+                "현재표만 분석해줘": "llm_analysis",
+                "현재표로 분석해줘": "llm_analysis",
+                "현재표 이상 항목 분석해줘": "llm_analysis",
+                "현재표에서 이상 항목을 알려줘": "llm_analysis",
+                "현재표 금액 100만원 이상만 보여줘": "dataframe_table",
+                "현재표 수량 10 이상 목록": "dataframe_table",
+                "현재표를 영업사원별 TOP 20 표로 만들어줘": "dataframe_table",
+                "현재표에서 요약표를 만들어줘": "dataframe_table",
+                "현재표 이상 항목 목록을 만들어줘": "dataframe_table",
+                "현재표 이상 항목 중 100만원 이상만 보여줘": "dataframe_table",
+                "현재표 문제점을 요약표로 만들어줘": "dataframe_table",
+                "현재표 주의사항을 표로 정리해줘": "dataframe_table",
+            }
+            intent_edge_mismatches = []
+            for query, expected_intent in intent_edge_cases.items():
+                actual_intent = classify_current_table_followup_intent(query)
+                if actual_intent != expected_intent:
+                    intent_edge_mismatches.append(f"{query}:{actual_intent}!={expected_intent}")
+            if intent_edge_mismatches:
+                results.append(_fail("current-table intent edge cases", "; ".join(intent_edge_mismatches)))
+            else:
+                results.append(_ok("current-table intent edge cases", "current-table referent particles and 이상 항목 analysis are separated from explicit table/filter requests"))
+
+            if selected_source != "cache" or selected_reason:
+                route_mismatches.append(f"expected cache ctx got source={selected_source} reason={selected_reason}")
+            if not isinstance(selected_ctx, dict) or selected_ctx.get("table_key") != "sims_product_flow":
+                route_mismatches.append(f"selected wrong current ctx={selected_ctx}")
+            if current_table_analysis_ctx_mismatch(selected_ctx, "sims_product_flow", "제품수불현황 조회"):
+                route_mismatches.append("matched current ctx reported mismatch")
+            if current_table_analysis_ctx_mismatch(vendor_ctx, "sims_product_flow", "제품수불현황 조회") != "table_key_mismatch":
+                route_mismatches.append("vendor latest ctx must not be accepted for product current table")
+
+            expired_state = {
+                "__sims_current_table_source_key": "sims_expired",
+                "__sims_current_table_source_action": "제품수불현황 조회",
+                "__sims_analysis_ctx_by_table_key": {
+                    "sims_expired": {
+                        **product_ctx,
+                        "table_key": "sims_expired",
+                        "expired": True,
+                    }
+                },
+            }
+            expired_ctx, expired_source, expired_reason = select_current_table_analysis_context(expired_state)
+            if expired_ctx is not None or expired_source or expired_reason != "expired_context":
+                route_mismatches.append(f"expired current ctx should fail closed got ctx={expired_ctx} source={expired_source} reason={expired_reason}")
+            expired_string_false_state = {
+                "__sims_current_table_source_key": "sims_product_flow",
+                "__sims_current_table_source_action": "제품수불현황 조회",
+                "__sims_analysis_ctx_by_table_key": {
+                    "sims_product_flow": {
+                        **product_ctx,
+                        "expired": "false",
+                    }
+                },
+            }
+            false_ctx, false_source, false_reason = select_current_table_analysis_context(expired_string_false_state)
+            if not isinstance(false_ctx, dict) or false_source != "cache" or false_reason:
+                route_mismatches.append(f"expired='false' should remain valid got ctx={false_ctx} source={false_source} reason={false_reason}")
+            expired_string_true_state = {
+                "__sims_current_table_source_key": "sims_product_flow",
+                "__sims_current_table_source_action": "제품수불현황 조회",
+                "__sims_analysis_ctx_by_table_key": {
+                    "sims_product_flow": {
+                        **product_ctx,
+                        "expired": "true",
+                    }
+                },
+            }
+            true_ctx, true_source, true_reason = select_current_table_analysis_context(expired_string_true_state)
+            if true_ctx is not None or true_source or true_reason != "expired_context":
+                route_mismatches.append(f"expired='true' should fail closed got ctx={true_ctx} source={true_source} reason={true_reason}")
+
+            latest_only_state = {
+                "__sims_current_table_source_key": "sims_product_flow",
+                "__sims_current_table_source_action": "제품수불현황 조회",
+                "__sims_analysis_ctx": product_ctx,
+            }
+            latest_ctx, latest_source, latest_reason = select_current_table_analysis_context(latest_only_state)
+            if latest_ctx is not None or latest_source or latest_reason != "missing_context":
+                route_mismatches.append(f"latest-only global ctx should not be accepted got ctx={latest_ctx} source={latest_source} reason={latest_reason}")
+
+            action_mismatch_state = {
+                "__sims_current_table_source_key": "sims_product_flow",
+                "__sims_current_table_source_action": "제품수불현황 조회",
+                "__sims_analysis_ctx_by_table_key": {
+                    "sims_product_flow": {
+                        **product_ctx,
+                        "action": "거래처 목록",
+                    }
+                },
+            }
+            mismatch_ctx, mismatch_source, mismatch_reason = select_current_table_analysis_context(action_mismatch_state)
+            if mismatch_ctx is not None or mismatch_source or mismatch_reason != "action_mismatch":
+                route_mismatches.append(f"action mismatch should fail closed got ctx={mismatch_ctx} source={mismatch_source} reason={mismatch_reason}")
+            if not current_table_analysis_query_matches("현재표 영업사원 분석", "현재표 영업사원 분석"):
+                route_mismatches.append("analysis query match helper rejected identical query")
+            if current_table_analysis_query_matches("현재표 영업사원 분석", "다른 질문"):
+                route_mismatches.append("analysis query match helper accepted mismatched query")
+
+            main_source = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            dispatcher_source = Path("app/ui/current_table_followups/action_dispatcher.py").read_text(encoding="utf-8")
+            required_snippets = {
+                "intent_helper_import": "classify_current_table_followup_intent" in main_source,
+                "pandas_skip": "stage=pandas_handler_skip" in main_source,
+                "one_shot_override": "__current_table_analysis_ctx_override" in main_source,
+                "queue_override": "analysis_ctx_override=analysis_ctx_override" in main_source,
+                "fail_closed_notice": "현재표 분석 컨텍스트 불가" in main_source,
+                "route_log": "[current_table.route]" in main_source,
+                "analysis_ctx_log": "[current_table.analysis_ctx]" in main_source,
+                "query_match_guard": "current_table_analysis_query_matches(analysis_query, last_user_text)" in main_source,
+                "disable_context_on_mismatch": "disable_sims_analysis_ctx = True" in main_source,
+                "latest_global_removed": '("latest", "__sims_analysis_ctx")' not in dispatcher_source,
+                "expired_context_guard": "expired_context" in dispatcher_source,
+            }
+            missing_snippets = [name for name, ok in required_snippets.items() if not ok]
+            if missing_snippets:
+                route_mismatches.append(f"main routing snippets missing={missing_snippets}")
+
+            if route_mismatches:
+                results.append(_fail("current-table source routing and LLM analysis intent", "; ".join(route_mismatches)))
+            else:
+                results.append(_ok("current-table source routing and LLM analysis intent", "general analysis uses table-scoped current source context; explicit table requests remain pandas-only; missing/mismatch contexts fail closed"))
+        except Exception as e:
+            results.append(_fail("current-table source routing and LLM analysis intent", f"{type(e).__name__}: {e}"))
+
+        try:
             chat_mod = importlib.import_module("app.ui.chat_middleware")
 
             master_cases = [
@@ -3011,24 +3369,22 @@ def run_basic_checks() -> list[CheckResult]:
             chat_mod._set_old_sims_table_force_rendered(fake_item_for_force, fake_meta_for_force, "force_uid", False)
             if chat_mod._is_old_sims_table_force_rendered(fake_item_for_force, fake_meta_for_force, "force_uid"):
                 mismatches.append("old table force render helper did not clear one table")
-            old_user_keys = {
-                key: session_state.get(key)
-                for key in ("user", "current_user", "auth_user", "login_user", "__ssai_user", "ssai_user")
-                if key in session_state
-            }
+            old_chat_st_for_raw_meta = chat_mod.st
+            class _RawMetaFakeSt:
+                def __init__(self) -> None:
+                    self.session_state = {}
+
             try:
-                for key in ("user", "current_user", "auth_user", "login_user", "__ssai_user", "ssai_user"):
-                    session_state.pop(key, None)
-                session_state["user"] = {"user_type": "SALES"}
+                raw_meta_fake_st = _RawMetaFakeSt()
+                chat_mod.st = raw_meta_fake_st
+                raw_meta_fake_st.session_state["user"] = {"user_type": "SALES"}
                 if chat_mod._is_internal_admin_for_raw_meta():
                     mismatches.append("raw meta visible to non-internal user")
-                session_state["user"] = {"user_type": "SSART_ADMIN"}
+                raw_meta_fake_st.session_state["user"] = {"user_type": "SSART_ADMIN"}
                 if not chat_mod._is_internal_admin_for_raw_meta():
                     mismatches.append("raw meta hidden from internal admin")
             finally:
-                for key in ("user", "current_user", "auth_user", "login_user", "__ssai_user", "ssai_user"):
-                    session_state.pop(key, None)
-                session_state.update(old_user_keys)
+                chat_mod.st = old_chat_st_for_raw_meta
             if not all("llm_summary_md" in meta and (meta.get("table_key") or meta.get("source_key")) for meta in master_cases[:3]):
                 mismatches.append("master metadata keys not preserved in fixture")
             if '"?? ?? ????"' in src or "master_summary_actions = {" in src:
@@ -3292,6 +3648,10 @@ def run_basic_checks() -> list[CheckResult]:
             biz_no_col = "\uc0ac\uc5c5\uc790\ubc88\ud638"
             phone_col = "\uc804\ud654\ubc88\ud638"
             zip_col = "\uc6b0\ud3b8\ubc88\ud638"
+            salesperson_col = "\uc601\uc5c5\uc0ac\uc6d0"
+            salesperson_name_col = "\uc601\uc5c5\uc0ac\uc6d0\uba85"
+            row_no_col = "\uc21c\ubc88"
+            no_col = "\ubc88\ud638"
 
             source_df = pd.DataFrame(
                 {
@@ -3306,6 +3666,10 @@ def run_basic_checks() -> list[CheckResult]:
                     biz_no_col: ["012-34-56789", "1112233333", "", "999-88-77777", "0000011111", "2222233333", "4444455555"],
                     phone_col: ["02-1234-5678", "01000000000", "", "031-123-4567", "01011112222", "01033334444", "01055556666"],
                     zip_col: ["01234", "12345", "", "67890", "00001", "00002", "00003"],
+                    salesperson_col: ["0", "001", "", None, "A-01", "0", "002"],
+                    salesperson_name_col: ["0", "Kim", "", None, "A team", "0", "Lee"],
+                    row_no_col: [1, 2, 3, 4, 5, 6, 7],
+                    no_col: ["0", "10", "", None, "20", "0", "30"],
                 }
             )
 
@@ -3410,6 +3774,70 @@ def run_basic_checks() -> list[CheckResult]:
                 failures.append(f"excel_literal_nan={_cell(8, validation_col).value!r}")
             wb.close()
 
+            try:
+                import pyarrow as pa
+
+                mixed_derived = pd.DataFrame({
+                    seq_col: [None, 268.0, pd.NA, ""],
+                    product_no_col: ["000123", "001-A", "114625021", ""],
+                    validation_col: ["1", "0", "Y", ""],
+                    salesperson_col: pd.Series(["0", "001", None, pd.NA], dtype="object"),
+                    salesperson_name_col: pd.Series(["0", "Kim", None, ""], dtype="object"),
+                    row_no_col: pd.Series([0, 0.0, "0", None], dtype="object"),
+                    no_col: pd.Series(["0007", "0", "", pd.NA], dtype="object"),
+                    "\uac70\ub798\ucc98\uba85": pd.Series(["0", None, "A", ""], dtype="object"),
+                    "\ucf54\ub4dc": pd.Series(["0001", "0", None, pd.NA], dtype="object"),
+                })
+                mixed_before = {
+                    col: mixed_derived[col].copy()
+                    for col in [salesperson_col, salesperson_name_col, row_no_col, no_col, "\uac70\ub798\ucc98\uba85", "\ucf54\ub4dc"]
+                }
+                mixed_after = chat_mod._preserve_product_flow_table_dtypes(mixed_derived)
+                for col, before_series in mixed_before.items():
+                    try:
+                        pd.testing.assert_series_equal(mixed_after[col], before_series, check_dtype=True, check_names=True)
+                    except AssertionError as assert_exc:
+                        failures.append(f"mixed_{col}_changed={assert_exc}")
+                if str(mixed_after[seq_col].dtype) != "Int64":
+                    failures.append(f"mixed_seq_dtype={mixed_after[seq_col].dtype}")
+                for col in [product_no_col, validation_col]:
+                    if not (pd.api.types.is_object_dtype(mixed_after[col]) or pd.api.types.is_string_dtype(mixed_after[col])):
+                        failures.append(f"mixed_{col}_dtype={mixed_after[col].dtype}")
+
+                derived = finalized.iloc[[1, 2, 4]].copy()
+                derived[seq_col] = pd.Series([float("nan"), 268.0, 628.0], dtype="object")
+                for numeric_col in [in_qty_col, out_qty_col, supply_col, total_col]:
+                    derived[numeric_col] = pd.to_numeric(derived[numeric_col], errors="coerce")
+                preserved_before = {
+                    col: derived[col].copy()
+                    for col in [salesperson_col, salesperson_name_col, row_no_col, no_col]
+                }
+                derived = chat_mod._preserve_product_flow_table_dtypes(derived)
+                for col, before_series in preserved_before.items():
+                    if derived[col].tolist() != before_series.tolist():
+                        failures.append(f"derived_{col}_changed={derived[col].tolist()!r}")
+                fast_like = display_mod.normalize_display_df_for_streamlit(chat_mod._chat_fast_display_df(derived.copy()))
+                fast_like, fast_cfg, _tw, _th = display_mod.build_sims_table_display_config(
+                    fast_like,
+                    action_name="현재표 영업사원 TOP 20",
+                    meta={"current_table_followup": True},
+                    add_row_no=False,
+                )
+                fast_like = chat_mod._preserve_product_flow_table_dtypes(chat_mod._chat_clean_display_none_values(fast_like))
+                if str(derived[seq_col].dtype) != "Int64":
+                    failures.append(f"derived_seq_dtype={derived[seq_col].dtype}")
+                if not (pd.api.types.is_object_dtype(derived[product_no_col]) or pd.api.types.is_string_dtype(derived[product_no_col])):
+                    failures.append(f"derived_product_no_dtype={derived[product_no_col].dtype}")
+                if not (pd.api.types.is_object_dtype(derived[validation_col]) or pd.api.types.is_string_dtype(derived[validation_col])):
+                    failures.append(f"derived_validation_dtype={derived[validation_col].dtype}")
+                if (fast_cfg.get(product_no_col) or {}).get("type_config", {}).get("type") == "number":
+                    failures.append("derived_product_no_number_config")
+                if (fast_cfg.get(validation_col) or {}).get("type_config", {}).get("type") == "number":
+                    failures.append("derived_validation_number_config")
+                pa.Table.from_pandas(fast_like, preserve_index=False)
+            except Exception as arrow_exc:
+                failures.append(f"derived_pyarrow={type(arrow_exc).__name__}: {arrow_exc}")
+
             if failures:
                 results.append(_fail("product flow column type policy", "; ".join(failures)))
             else:
@@ -3493,12 +3921,12 @@ def run_basic_checks() -> list[CheckResult]:
 
                 if panel_open_old or panel_open_new or room_change_old:
                     results.append(_fail("supplier history lightweight rerun policy", f"light rerun should skip history tables panel_old={panel_open_old} panel_new={panel_open_new} room_old={room_change_old}"))
-                elif followup_old or not followup_new:
-                    results.append(_fail("supplier history lightweight rerun policy", f"followup should skip old/render latest old={followup_old} new={followup_new}"))
+                elif not followup_old or not followup_new:
+                    results.append(_fail("supplier history lightweight rerun policy", f"followup should render forced old and latest old={followup_old} new={followup_new}"))
                 elif chat_mod._ui_rerun_reason() != "current_table_followup":
                     results.append(_fail("supplier history lightweight rerun policy", f"stale reason priority failed got={chat_mod._ui_rerun_reason()}"))
                 else:
-                    results.append(_ok("supplier history lightweight rerun policy", "panel/action rerun skips old tables; followup renders latest only; stale action reason ignored"))
+                    results.append(_ok("supplier history lightweight rerun policy", "panel/action rerun skips old tables; forced old table and latest followup render; stale action reason ignored"))
             finally:
                 st.session_state.pop(chat_mod._old_sims_table_force_key(old_item, old_meta, "old"), None)
                 if old_reason is None:
@@ -3523,6 +3951,784 @@ def run_basic_checks() -> list[CheckResult]:
                     st.session_state["__sims_latest_followup_table_key"] = old_latest_followup
         except Exception as e:
             results.append(_fail("supplier history lightweight rerun policy", f"{type(e).__name__}: {e}"))
+
+        try:
+            import streamlit as st
+
+            old_chat_history = st.session_state.get("__chat_history")
+            old_sims_tables = st.session_state.get("sims_tables")
+            old_current_source_key = st.session_state.get("__sims_current_table_source_key")
+            old_current_source_action = st.session_state.get("__sims_current_table_source_action")
+            old_room = st.session_state.get("current_room")
+            old_forced_key = None
+            try:
+                product_a = {
+                    "id": "msg-product-a",
+                    "type": "table",
+                    "action": "제품수불현황 조회",
+                    "meta": {"table_key": "sims_product_a", "action": "제품수불현황 조회"},
+                }
+                followup_1 = {
+                    "id": "msg-followup-1",
+                    "type": "table",
+                    "action": "현재표 영업사원 TOP 20",
+                    "meta": {"table_key": "sims_followup_1", "action": "현재표 영업사원 TOP 20", "current_table_followup": True},
+                }
+                followup_2 = {
+                    "id": "msg-followup-2",
+                    "type": "table",
+                    "action": "현재표 영업사원별 집계",
+                    "meta": {"table_key": "sims_followup_2", "action": "현재표 영업사원별 집계", "current_table_followup": True},
+                }
+                vendor_b = {
+                    "id": "msg-vendor-b",
+                    "type": "table",
+                    "action": "거래처 목록",
+                    "meta": {"table_key": "sims_vendor_b", "action": "거래처 목록"},
+                }
+                st.session_state["__chat_history"] = [product_a, followup_1, followup_2, vendor_b]
+                st.session_state["sims_tables"] = {
+                    "sims_product_a": object(),
+                    "sims_followup_1": object(),
+                    "sims_followup_2": object(),
+                    "sims_vendor_b": object(),
+                }
+                st.session_state["__sims_current_table_source_key"] = "sims_vendor_b"
+                st.session_state["__sims_current_table_source_action"] = "거래처 목록"
+                old_forced_key = chat_mod._old_sims_table_force_key(product_a, product_a["meta"], "")
+                st.session_state[old_forced_key] = True
+
+                chat_mod._prune_old_sims_table_history(new_table_key="sims_vendor_b", new_item=vendor_b)
+                kept_history_keys = [
+                    str((x.get("meta") or {}).get("table_key") or "")
+                    for x in st.session_state.get("__chat_history", [])
+                    if isinstance(x, dict)
+                ]
+                kept_table_keys = set((st.session_state.get("sims_tables") or {}).keys())
+                current_source_key_after = st.session_state.get("__sims_current_table_source_key")
+                current_source_action_after = st.session_state.get("__sims_current_table_source_action")
+
+                prune_mismatches = []
+                if "sims_product_a" not in kept_history_keys:
+                    prune_mismatches.append(f"forced old table missing from history keys={kept_history_keys}")
+                if "sims_product_a" not in kept_table_keys:
+                    prune_mismatches.append(f"forced old table payload missing keys={sorted(kept_table_keys)}")
+                if current_source_key_after != "sims_vendor_b" or current_source_action_after != "거래처 목록":
+                    prune_mismatches.append(f"current source changed key={current_source_key_after} action={current_source_action_after}")
+
+                if prune_mismatches:
+                    results.append(_fail("old SIMS table reopen preserves clicked table", "; ".join(prune_mismatches)))
+                else:
+                    results.append(_ok("old SIMS table reopen preserves clicked table", "forced old table survives prune/history payload cleanup while current source remains latest new table"))
+            finally:
+                if old_forced_key:
+                    st.session_state.pop(old_forced_key, None)
+                if old_chat_history is None:
+                    st.session_state.pop("__chat_history", None)
+                else:
+                    st.session_state["__chat_history"] = old_chat_history
+                if old_sims_tables is None:
+                    st.session_state.pop("sims_tables", None)
+                else:
+                    st.session_state["sims_tables"] = old_sims_tables
+                if old_current_source_key is None:
+                    st.session_state.pop("__sims_current_table_source_key", None)
+                else:
+                    st.session_state["__sims_current_table_source_key"] = old_current_source_key
+                if old_current_source_action is None:
+                    st.session_state.pop("__sims_current_table_source_action", None)
+                else:
+                    st.session_state["__sims_current_table_source_action"] = old_current_source_action
+                if old_room is None:
+                    st.session_state.pop("current_room", None)
+                else:
+                    st.session_state["current_room"] = old_room
+        except Exception as e:
+            results.append(_fail("old SIMS table reopen preserves clicked table", f"{type(e).__name__}: {e}"))
+
+        try:
+            import streamlit as st
+
+            old_chat_history = st.session_state.get("__chat_history")
+            old_sims_tables = st.session_state.get("sims_tables")
+            old_current_source_key = st.session_state.get("__sims_current_table_source_key")
+            old_current_source_action = st.session_state.get("__sims_current_table_source_action")
+            old_path = st.session_state.get("__sims_table_render_path")
+            old_reason_current = st.session_state.get("__ui_rerun_reason_current")
+            old_latest_followup = st.session_state.get("__sims_latest_followup_table_key")
+            old_last_table = st.session_state.get("__sims_last_table_key")
+            old_chat_rooms = st.session_state.get("chat_rooms")
+            old_current_room = st.session_state.get("current_room")
+            old_previous_target = st.session_state.get("__sims_previous_current_table_source_target_key_for_prune")
+            force_key = None
+            try:
+                product_a = {
+                    "id": "msg-product-a-preforce",
+                    "type": "table",
+                    "action": "제품수불현황 조회",
+                    "meta": {"table_key": "sims_product_a_preforce", "action": "제품수불현황 조회"},
+                }
+                followup_1 = {
+                    "id": "msg-followup-preforce-1",
+                    "type": "table",
+                    "action": "현재표 영업사원 TOP 20",
+                    "meta": {
+                        "table_key": "sims_followup_preforce_1",
+                        "action": "현재표 영업사원 TOP 20",
+                        "current_table_followup": True,
+                        "source_table_key": "sims_product_a_preforce",
+                    },
+                }
+                followup_2 = {
+                    "id": "msg-followup-preforce-2",
+                    "type": "table",
+                    "action": "현재표 영업사원별 집계",
+                    "meta": {
+                        "table_key": "sims_followup_preforce_2",
+                        "action": "현재표 영업사원별 집계",
+                        "current_table_followup": True,
+                        "source_table_key": "sims_product_a_preforce",
+                    },
+                }
+                vendor_b = {
+                    "id": "msg-vendor-b-preforce",
+                    "type": "table",
+                    "action": "거래처 목록",
+                    "meta": {"table_key": "sims_vendor_b_preforce", "action": "거래처 목록"},
+                }
+                room = {
+                    "id": "room-preforce-reconcile",
+                    "history": [
+                        {"id": "msg-normal-before-a", "role": "user", "content": "normal message"},
+                        product_a,
+                        followup_1,
+                        followup_2,
+                    ],
+                    "sims_messages": [],
+                    "gen_messages": [],
+                    "messages": [],
+                }
+                st.session_state["chat_rooms"] = [room]
+                st.session_state["current_room"] = room["id"]
+                st.session_state["__chat_history"] = [
+                    {"id": "msg-normal-before-a", "role": "user", "content": "normal message"},
+                    followup_1,
+                    followup_2,
+                ]
+                st.session_state["sims_tables"] = {
+                    "sims_product_a_preforce": object(),
+                    "sims_followup_preforce_1": object(),
+                    "sims_followup_preforce_2": object(),
+                    "sims_vendor_b_preforce": object(),
+                }
+                st.session_state["__sims_current_table_source_key"] = "sims_vendor_b_preforce"
+                st.session_state["__sims_current_table_source_action"] = "거래처 목록"
+
+                st.session_state["__sims_previous_current_table_source_key_for_prune"] = "sims_product_a_preforce"
+                st.session_state["__sims_previous_current_table_source_target_key_for_prune"] = "sims_vendor_b_preforce"
+
+                chat_mod._prune_old_sims_table_history(new_table_key="sims_vendor_b_preforce", new_item=vendor_b)
+                kept_history_keys = [
+                    str((x.get("meta") or {}).get("table_key") or "")
+                    for x in st.session_state.get("__chat_history", [])
+                    if isinstance(x, dict)
+                ]
+                kept_table_keys = set((st.session_state.get("sims_tables") or {}).keys())
+                force_key = chat_mod._old_sims_table_force_key(product_a, product_a["meta"], "preforce")
+                st.session_state[force_key] = True
+                st.session_state["__sims_table_render_path"] = "history"
+                st.session_state["__ui_rerun_reason_current"] = "current_table_followup"
+                st.session_state["__sims_latest_followup_table_key"] = "sims_followup_preforce_2"
+                st.session_state["__sims_last_table_key"] = "sims_vendor_b_preforce"
+                full_after_force = chat_mod._should_full_render_sims_table(product_a, product_a["meta"], "preforce")
+                st.session_state.pop(force_key, None)
+                placeholder_after_collapse = not chat_mod._should_full_render_sims_table(product_a, product_a["meta"], "preforce")
+
+                prune_mismatches = []
+                if "sims_product_a_preforce" not in kept_history_keys:
+                    prune_mismatches.append(f"pre-force source table missing from history keys={kept_history_keys}")
+                if kept_history_keys.count("sims_product_a_preforce") > 1:
+                    prune_mismatches.append(f"pre-force source duplicated keys={kept_history_keys}")
+                kept_table_order = [k for k in kept_history_keys if k]
+                if kept_table_order[:3] != ["sims_product_a_preforce", "sims_followup_preforce_1", "sims_followup_preforce_2"]:
+                    prune_mismatches.append(f"reconciled table order changed keys={kept_history_keys}")
+                if "sims_product_a_preforce" not in kept_table_keys:
+                    prune_mismatches.append(f"pre-force source payload missing keys={sorted(kept_table_keys)}")
+                if st.session_state.get("__sims_current_table_source_key") != "sims_vendor_b_preforce":
+                    prune_mismatches.append(f"current source key changed={st.session_state.get('__sims_current_table_source_key')}")
+                if st.session_state.get("__sims_previous_current_table_source_key_for_prune"):
+                    prune_mismatches.append("previous source prune key was not consumed")
+                if not full_after_force:
+                    prune_mismatches.append("forced source table did not full-render")
+                if not placeholder_after_collapse:
+                    prune_mismatches.append("collapsed source table did not return to placeholder")
+
+                if prune_mismatches:
+                    results.append(_fail("old SIMS table pre-force prune keeps source", "; ".join(prune_mismatches)))
+                else:
+                    results.append(_ok("old SIMS table pre-force prune keeps source", "previous source table survives new basis prune before force, can full-render/collapse, and current source stays latest table"))
+            finally:
+                if force_key:
+                    st.session_state.pop(force_key, None)
+                if old_chat_history is None:
+                    st.session_state.pop("__chat_history", None)
+                else:
+                    st.session_state["__chat_history"] = old_chat_history
+                if old_sims_tables is None:
+                    st.session_state.pop("sims_tables", None)
+                else:
+                    st.session_state["sims_tables"] = old_sims_tables
+                if old_current_source_key is None:
+                    st.session_state.pop("__sims_current_table_source_key", None)
+                else:
+                    st.session_state["__sims_current_table_source_key"] = old_current_source_key
+                if old_current_source_action is None:
+                    st.session_state.pop("__sims_current_table_source_action", None)
+                else:
+                    st.session_state["__sims_current_table_source_action"] = old_current_source_action
+                if old_path is None:
+                    st.session_state.pop("__sims_table_render_path", None)
+                else:
+                    st.session_state["__sims_table_render_path"] = old_path
+                if old_reason_current is None:
+                    st.session_state.pop("__ui_rerun_reason_current", None)
+                else:
+                    st.session_state["__ui_rerun_reason_current"] = old_reason_current
+                if old_latest_followup is None:
+                    st.session_state.pop("__sims_latest_followup_table_key", None)
+                else:
+                    st.session_state["__sims_latest_followup_table_key"] = old_latest_followup
+                if old_last_table is None:
+                    st.session_state.pop("__sims_last_table_key", None)
+                else:
+                    st.session_state["__sims_last_table_key"] = old_last_table
+                if old_chat_rooms is None:
+                    st.session_state.pop("chat_rooms", None)
+                else:
+                    st.session_state["chat_rooms"] = old_chat_rooms
+                if old_current_room is None:
+                    st.session_state.pop("current_room", None)
+                else:
+                    st.session_state["current_room"] = old_current_room
+                if old_previous_target is None:
+                    st.session_state.pop("__sims_previous_current_table_source_target_key_for_prune", None)
+                else:
+                    st.session_state["__sims_previous_current_table_source_target_key_for_prune"] = old_previous_target
+        except Exception as e:
+            results.append(_fail("old SIMS table pre-force prune keeps source", f"{type(e).__name__}: {e}"))
+
+        try:
+            import streamlit as st
+
+            panel_mod = importlib.import_module("app.ui.sims_panel")
+
+            state_keys = [
+                "__sims_current_table_source_key",
+                "__sims_current_table_source_action",
+                "__sims_previous_current_table_source_key_for_prune",
+                "__sims_previous_current_table_source_action_for_prune",
+                "__sims_previous_current_table_source_target_key_for_prune",
+                "__old_table_history_refresh_key_pending",
+            ]
+            saved_state = {key: st.session_state.get(key) for key in state_keys}
+            missing_state = {key for key in state_keys if key not in st.session_state}
+            try:
+                df = pd.DataFrame({"value": [1]})
+                for key in state_keys:
+                    st.session_state.pop(key, None)
+                st.session_state["__sims_current_table_source_key"] = "sims_product_a_stash"
+                st.session_state["__sims_current_table_source_action"] = "제품수불현황 조회"
+
+                panel_mod._stash_panel_table_for_current_followup(
+                    {
+                        "df": df,
+                        "df_display": df.copy(),
+                        "meta": {"table_key": "sims_vendor_b_stash", "action": "거래처 목록"},
+                    },
+                    "거래처 목록",
+                    record_previous_source_for_prune=True,
+                )
+
+                mismatches = []
+                if st.session_state.get("__sims_current_table_source_key") != "sims_vendor_b_stash":
+                    mismatches.append("new panel result did not become current source")
+                if st.session_state.get("__sims_previous_current_table_source_key_for_prune") != "sims_product_a_stash":
+                    mismatches.append("previous source key not recorded for prune")
+                if st.session_state.get("__sims_previous_current_table_source_target_key_for_prune") != "sims_vendor_b_stash":
+                    mismatches.append("previous source target key not recorded for prune")
+                if st.session_state.get("__old_table_history_refresh_key_pending") != "sims_vendor_b_stash":
+                    mismatches.append("history refresh key not recorded")
+
+                for key in (
+                    "__sims_previous_current_table_source_key_for_prune",
+                    "__sims_previous_current_table_source_action_for_prune",
+                    "__sims_previous_current_table_source_target_key_for_prune",
+                    "__old_table_history_refresh_key_pending",
+                ):
+                    st.session_state.pop(key, None)
+                panel_mod._stash_panel_table_for_current_followup(
+                    {
+                        "df": df,
+                        "df_display": df.copy(),
+                        "meta": {
+                            "table_key": "sims_followup_stash",
+                            "action": "현재표 영업사원 TOP 20",
+                            "current_table_followup": True,
+                        },
+                    },
+                    "현재표 영업사원 TOP 20",
+                    record_previous_source_for_prune=True,
+                )
+                if st.session_state.get("__sims_previous_current_table_source_key_for_prune"):
+                    mismatches.append("followup table incorrectly recorded previous source")
+                if st.session_state.get("__old_table_history_refresh_key_pending"):
+                    mismatches.append("followup table incorrectly requested history refresh")
+
+                if mismatches:
+                    results.append(_fail("panel current source transition records previous source", "; ".join(mismatches)))
+                else:
+                    results.append(_ok("panel current source transition records previous source", "new panel result records previous source for prune and one-shot history refresh; followup render does not"))
+            finally:
+                for key in state_keys:
+                    if key in missing_state:
+                        st.session_state.pop(key, None)
+                    else:
+                        st.session_state[key] = saved_state.get(key)
+        except Exception as e:
+            results.append(_fail("panel current source transition records previous source", f"{type(e).__name__}: {e}"))
+
+        try:
+            import streamlit as st
+
+            panel_mod = importlib.import_module("app.ui.sims_panel")
+            state_keys = [
+                "__sims_panel_chat_pushed_source_sig",
+                "__sims_last_final_payload_for_chat",
+                "__sims_last_final_payload_for_chat_action",
+                "__sims_panel_last_final_payload",
+                "__sims_panel_last_final_action",
+                "__sims_run_seq",
+                "__sims_selected",
+            ]
+            saved_state = {key: st.session_state.get(key) for key in state_keys}
+            missing_state = {key for key in state_keys if key not in st.session_state}
+            try:
+                for key in state_keys:
+                    st.session_state.pop(key, None)
+                calls = {"entry": 0, "push": 0, "save": 0}
+                table_keys: list[str] = []
+
+                def _clear_payload_cache() -> None:
+                    for key in (
+                        "__sims_last_final_payload_for_chat",
+                        "__sims_last_final_payload_for_chat_action",
+                        "__sims_panel_last_final_payload",
+                        "__sims_panel_last_final_action",
+                    ):
+                        st.session_state.pop(key, None)
+
+                def _fake_panel_push_boundary(*, run_seq: int, action: str, table_key: str) -> bool:
+                    calls["entry"] += 1
+                    st.session_state["__sims_run_seq"] = run_seq
+                    st.session_state["__sims_selected"] = {"category": "마스터", "action": action}
+                    payload = {
+                        "type": "table",
+                        "action": action,
+                        "meta": {
+                            "table_key": table_key,
+                            "action": action,
+                            "_panel_source_sig": panel_mod._make_panel_source_sig(action),
+                        },
+                    }
+                    st.session_state["__sims_last_final_payload_for_chat"] = payload
+                    st.session_state["__sims_panel_last_final_payload"] = payload
+                    sig = str((payload.get("meta") or {}).get("_panel_source_sig") or "")
+                    if panel_mod._panel_chat_push_already_consumed(sig):
+                        _clear_payload_cache()
+                        return False
+                    calls["push"] += 1
+                    calls["save"] += 1
+                    table_keys.append(table_key)
+                    st.session_state["__sims_panel_chat_pushed_source_sig"] = sig
+                    _clear_payload_cache()
+                    return True
+
+                st.session_state["__sims_run_seq"] = 77
+                st.session_state["__sims_selected"] = {"category": "마스터", "action": "거래처 목록"}
+                sig = panel_mod._make_panel_source_sig("거래처 목록")
+                first = _fake_panel_push_boundary(run_seq=77, action="거래처 목록", table_key="sims_vendor_b_once")
+                second = _fake_panel_push_boundary(run_seq=77, action="거래처 목록", table_key="sims_vendor_b_duplicate")
+                third = _fake_panel_push_boundary(run_seq=78, action="거래처 목록", table_key="sims_vendor_c_new_run")
+                cache_left = any(st.session_state.get(k) for k in (
+                    "__sims_last_final_payload_for_chat",
+                    "__sims_last_final_payload_for_chat_action",
+                    "__sims_panel_last_final_payload",
+                    "__sims_panel_last_final_action",
+                ))
+                mismatches = []
+                if not first:
+                    mismatches.append("first production boundary push skipped")
+                if second:
+                    mismatches.append("duplicate source push was not skipped")
+                if not third:
+                    mismatches.append("new run_seq push was blocked")
+                if calls != {"entry": 3, "push": 2, "save": 2}:
+                    mismatches.append(f"unexpected calls={calls}")
+                if len(set(table_keys)) != 2 or table_keys != ["sims_vendor_b_once", "sims_vendor_c_new_run"]:
+                    mismatches.append(f"unexpected table_keys={table_keys}")
+                if cache_left:
+                    mismatches.append("cached final payload was not cleaned")
+                if panel_mod._panel_chat_push_already_consumed(sig + "::other"):
+                    mismatches.append("different panel source was incorrectly consumed")
+                if mismatches:
+                    results.append(_fail("panel chat push lifecycle signature", "; ".join(mismatches)))
+                else:
+                    results.append(_ok("panel chat push lifecycle signature", "same run/action panel source pushes/saves once, duplicate skips and clears cache, new run pushes once"))
+            finally:
+                for key in state_keys:
+                    if key in missing_state:
+                        st.session_state.pop(key, None)
+                    else:
+                        st.session_state[key] = saved_state.get(key)
+        except Exception as e:
+            results.append(_fail("panel chat push lifecycle signature", f"{type(e).__name__}: {e}"))
+
+        try:
+            import streamlit as st
+
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+
+            state_keys = [
+                "__chat_history",
+                "chat_rooms",
+                "current_room",
+                "sims_tables",
+                "__sims_previous_current_table_source_key_for_prune",
+                "__sims_previous_current_table_source_target_key_for_prune",
+                "__sims_previous_current_table_source_action_for_prune",
+                "__old_table_history_refresh_key_pending",
+            ]
+            saved_state = {key: st.session_state.get(key) for key in state_keys}
+            missing_state = {key for key in state_keys if key not in st.session_state}
+            try:
+                product_a = {
+                    "id": "msg-product-a-mismatch",
+                    "type": "table",
+                    "action": "제품수불현황 조회",
+                    "meta": {"table_key": "sims_product_a_mismatch", "action": "제품수불현황 조회"},
+                }
+                followup = {
+                    "id": "msg-followup-mismatch",
+                    "type": "table",
+                    "action": "현재표 영업사원 TOP 20",
+                    "meta": {
+                        "table_key": "sims_followup_mismatch",
+                        "action": "현재표 영업사원 TOP 20",
+                        "current_table_followup": True,
+                        "source_table_key": "sims_product_a_mismatch",
+                    },
+                }
+                vendor_c = {
+                    "id": "msg-vendor-c-mismatch",
+                    "type": "table",
+                    "action": "거래처 목록",
+                    "meta": {"table_key": "sims_vendor_c_mismatch", "action": "거래처 목록"},
+                }
+                room = {"id": "room-target-mismatch", "history": [product_a, followup], "sims_messages": [], "gen_messages": [], "messages": []}
+                st.session_state["chat_rooms"] = [room]
+                st.session_state["current_room"] = room["id"]
+                st.session_state["__chat_history"] = [followup]
+                st.session_state["sims_tables"] = {
+                    "sims_product_a_mismatch": object(),
+                    "sims_followup_mismatch": object(),
+                    "sims_vendor_c_mismatch": object(),
+                }
+                st.session_state["__sims_previous_current_table_source_key_for_prune"] = "sims_product_a_mismatch"
+                st.session_state["__sims_previous_current_table_source_target_key_for_prune"] = "sims_vendor_b_failed"
+                st.session_state["__sims_previous_current_table_source_action_for_prune"] = "제품수불현황 조회"
+                st.session_state["__old_table_history_refresh_key_pending"] = "sims_vendor_b_failed"
+
+                chat_mod._prune_old_sims_table_history(new_table_key="sims_vendor_c_mismatch", new_item=vendor_c)
+                kept_history_keys = [
+                    str((x.get("meta") or {}).get("table_key") or "")
+                    for x in st.session_state.get("__chat_history", [])
+                    if isinstance(x, dict)
+                ]
+                mismatches = []
+                if "sims_product_a_mismatch" in kept_history_keys:
+                    mismatches.append(f"stale previous source was reconciled keys={kept_history_keys}")
+                for key in (
+                    "__sims_previous_current_table_source_key_for_prune",
+                    "__sims_previous_current_table_source_target_key_for_prune",
+                    "__sims_previous_current_table_source_action_for_prune",
+                    "__old_table_history_refresh_key_pending",
+                ):
+                    if st.session_state.get(key):
+                        mismatches.append(f"temporary key not cleared {key}={st.session_state.get(key)!r}")
+                if mismatches:
+                    results.append(_fail("old SIMS table target mismatch clears stale previous source", "; ".join(mismatches)))
+                else:
+                    results.append(_ok("old SIMS table target mismatch clears stale previous source", "stale A->B transition is not consumed by C prune and temporary keys are cleared"))
+            finally:
+                for key in state_keys:
+                    if key in missing_state:
+                        st.session_state.pop(key, None)
+                    else:
+                        st.session_state[key] = saved_state.get(key)
+        except Exception as e:
+            results.append(_fail("old SIMS table target mismatch clears stale previous source", f"{type(e).__name__}: {e}"))
+
+        try:
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+
+            class _State(dict):
+                def pop(self, key, default=None):
+                    return super().pop(key, default)
+
+            calls = {"rerun": 0, "db": 0, "push": 0, "save": 0}
+
+            def _rerun():
+                calls["rerun"] += 1
+
+            state = _State({
+                "__old_table_history_refresh_key_pending": "sims_vendor_b_refresh",
+                "__chat_pending_render": [{"meta": {"table_key": "sims_vendor_b_refresh"}}],
+                "__sims_panel_skip_view_once": True,
+                "__sims_panel_skip_view_reason": "panel_new_result",
+            })
+            first = chat_mod.consume_old_table_history_refresh_once(state, run_seq="run-1", rerun=_rerun)
+            second = chat_mod.consume_old_table_history_refresh_once(
+                _State({
+                    "__old_table_history_refresh_key_pending": "sims_vendor_b_refresh",
+                    "__old_table_history_refresh_done_sig": state.get("__old_table_history_refresh_done_sig"),
+                }),
+                run_seq="run-1",
+                rerun=_rerun,
+            )
+            mismatches = []
+            if not first:
+                mismatches.append("first refresh was not consumed")
+            if second:
+                mismatches.append("duplicate refresh was consumed")
+            if calls["rerun"] != 1:
+                mismatches.append(f"rerun_count={calls['rerun']}")
+            if calls["db"] or calls["push"] or calls["save"]:
+                mismatches.append(f"unexpected side effects={calls}")
+            if state.get("__chat_pending_render") != [{"meta": {"table_key": "sims_vendor_b_refresh"}}]:
+                mismatches.append("pending B was changed")
+            if not state.get("__sims_panel_skip_view_once"):
+                mismatches.append("skip-view one-shot was cleared before refresh")
+            if state.get("__ui_rerun_reason") != "old_table_history_refresh":
+                mismatches.append(f"unexpected refresh reason={state.get('__ui_rerun_reason')!r}")
+            if mismatches:
+                results.append(_fail("old table history refresh consumes once without side effects", "; ".join(mismatches)))
+            else:
+                results.append(_ok("old table history refresh consumes once without side effects", "pending refresh reruns exactly once with dedicated reason, keeps pending render/skip-view state, and calls no DB/push/save hooks"))
+        except Exception as e:
+            results.append(_fail("old table history refresh consumes once without side effects", f"{type(e).__name__}: {e}"))
+
+        try:
+            import streamlit as st
+
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+
+            state_keys = [
+                "__chat_history",
+                "__chat_inbox",
+                "__chat_pending_items",
+                "__chat_pending_render",
+                "chat_rooms",
+                "current_room",
+                "sims_tables",
+                "sims_export_tables",
+                "__sims_export_tables_by_key",
+                "__sims_analysis_ctx_by_table_key",
+                "__sims_current_table_source_key",
+                "__sims_current_table_source_action",
+                "__sims_previous_current_table_source_key_for_prune",
+                "__sims_table_render_path",
+                "__ui_rerun_reason_current",
+                "__sims_latest_followup_table_key",
+                "__sims_last_table_key",
+                "__sims_last_table_action",
+                "__sims_last_push",
+                "__sims_last_push_sig",
+                "__sims_push_count",
+                "__seq",
+            ]
+            saved_state = {key: st.session_state.get(key) for key in state_keys}
+            missing_state = {key for key in state_keys if key not in st.session_state}
+            force_key = None
+
+            def _payload(table_key: str, action: str, df: pd.DataFrame, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+                payload_meta = {
+                    "table_key": table_key,
+                    "action": action,
+                    "_force_push": True,
+                    "_nlq_nonce": table_key,
+                    "query_summary": "regression fixture",
+                }
+                if meta:
+                    payload_meta.update(meta)
+                return {
+                    "final": True,
+                    "type": "table",
+                    "title": action,
+                    "action": action,
+                    "params": {},
+                    "df": df.copy(),
+                    "df_display": df.copy(),
+                    "meta": payload_meta,
+                }
+
+            def _history_keys(items: list[Any]) -> list[str]:
+                keys: list[str] = []
+                for item in items:
+                    if isinstance(item, dict):
+                        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                        key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+                        if key:
+                            keys.append(key)
+                return keys
+
+            def _find_item(items: list[Any], table_key: str) -> dict[str, Any] | None:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                    if str(meta.get("table_key") or item.get("table_key") or "").strip() == table_key:
+                        return item
+                return None
+
+            try:
+                room = {
+                    "id": "room-old-table-production-prune",
+                    "history": [],
+                    "sims_messages": [],
+                    "gen_messages": [],
+                    "messages": [],
+                }
+                st.session_state["chat_rooms"] = [room]
+                st.session_state["current_room"] = room["id"]
+                st.session_state["__chat_history"] = []
+                st.session_state["__chat_inbox"] = []
+                st.session_state["__chat_pending_items"] = []
+                st.session_state["__chat_pending_render"] = []
+                st.session_state["sims_tables"] = {}
+                st.session_state["sims_export_tables"] = {}
+                st.session_state["__sims_export_tables_by_key"] = {}
+                st.session_state["__sims_analysis_ctx_by_table_key"] = {}
+                st.session_state["__sims_push_count"] = 0
+                st.session_state["__seq"] = 0
+                for key in ("__sims_current_table_source_key", "__sims_current_table_source_action", "__sims_previous_current_table_source_key_for_prune"):
+                    st.session_state.pop(key, None)
+
+                product_df = pd.DataFrame({
+                    "명세서번호": pd.Series([None, 268, 628], dtype="Int64"),
+                    "제조번호": ["000123", "001-A", "114625021"],
+                    "검수확인": ["1", "0", "Y"],
+                    "영업사원": ["김", "이", "박"],
+                    "합계금액": [1000000, 2000000, 3000000],
+                })
+                top_df = product_df.head(2).copy()
+                group_df = pd.DataFrame({"영업사원": ["김", "이"], "합계금액": [1000000, 2000000]})
+                vendor_df = pd.DataFrame({"거래처코드": ["V001"], "거래처명": ["테스트"]})
+
+                chat_mod.push_sims_result_to_chat(
+                    _payload("sims_product_a_prodpath", "제품수불현황 조회", product_df),
+                    "제품수불현황 조회",
+                )
+                if st.session_state.get("__sims_current_table_source_key") != "sims_product_a_prodpath":
+                    raise AssertionError("product A did not become current source")
+
+                chat_mod.push_sims_result_to_chat(
+                    _payload(
+                        "sims_top_prodpath",
+                        "현재표 영업사원 TOP 20",
+                        top_df,
+                        {"current_table_followup": True},
+                    ),
+                    "현재표 영업사원 TOP 20",
+                )
+                chat_mod.push_sims_result_to_chat(
+                    _payload(
+                        "sims_group_prodpath",
+                        "현재표 영업사원별 집계",
+                        group_df,
+                        {"current_table_followup": True},
+                    ),
+                    "현재표 영업사원별 집계",
+                )
+
+                history_after_followups = list(room.get("history") or [])
+                top_item = _find_item(history_after_followups, "sims_top_prodpath")
+                group_item = _find_item(history_after_followups, "sims_group_prodpath")
+                top_source = str(((top_item or {}).get("meta") or {}).get("source_table_key") or "")
+                group_source = str(((group_item or {}).get("meta") or {}).get("source_table_key") or "")
+
+                chat_mod.push_sims_result_to_chat(
+                    _payload("sims_vendor_b_prodpath", "거래처 목록", vendor_df),
+                    "거래처 목록",
+                )
+
+                room_history = list(room.get("history") or [])
+                session_history = list(st.session_state.get("__chat_history") or [])
+                room_keys = _history_keys(room_history)
+                session_keys = _history_keys(session_history)
+                table_keys = set((st.session_state.get("sims_tables") or {}).keys())
+                current_source_key = st.session_state.get("__sims_current_table_source_key")
+                current_source_action = st.session_state.get("__sims_current_table_source_action")
+                product_item = _find_item(room_history, "sims_product_a_prodpath")
+
+                mismatches = []
+                if top_source != "sims_product_a_prodpath" or group_source != "sims_product_a_prodpath":
+                    mismatches.append(f"production followup source meta missing top={top_source} group={group_source}")
+                if "sims_product_a_prodpath" not in room_keys:
+                    mismatches.append(f"product A missing from room.history keys={room_keys}")
+                if "sims_product_a_prodpath" not in session_keys:
+                    mismatches.append(f"product A missing from __chat_history keys={session_keys}")
+                if "sims_product_a_prodpath" not in table_keys:
+                    mismatches.append(f"product A payload missing keys={sorted(table_keys)}")
+                if current_source_key != "sims_vendor_b_prodpath" or current_source_action != "거래처 목록":
+                    mismatches.append(f"current source changed key={current_source_key} action={current_source_action}")
+                if not isinstance(product_item, dict):
+                    mismatches.append("product A item missing before force")
+                else:
+                    meta = product_item.get("meta") if isinstance(product_item.get("meta"), dict) else {}
+                    force_key = chat_mod._old_sims_table_force_key(product_item, meta, "prodpath")
+                    st.session_state["__sims_table_render_path"] = "history"
+                    st.session_state["__ui_rerun_reason_current"] = "old_table_history_refresh"
+                    st.session_state["__sims_latest_followup_table_key"] = "sims_group_prodpath"
+                    st.session_state["__sims_last_table_key"] = "sims_vendor_b_prodpath"
+                    vendor_item = _find_item(room_history, "sims_vendor_b_prodpath")
+                    vendor_meta = vendor_item.get("meta") if isinstance(vendor_item, dict) and isinstance(vendor_item.get("meta"), dict) else {}
+                    if not isinstance(vendor_item, dict) or not chat_mod._should_full_render_sims_table(vendor_item, vendor_meta, "prodpath"):
+                        mismatches.append("current source B did not full-render during history refresh")
+                    if chat_mod._should_full_render_sims_table(product_item, meta, "prodpath"):
+                        mismatches.append("product A full-rendered before explicit force")
+                    st.session_state[force_key] = True
+                    if not chat_mod._should_full_render_sims_table(product_item, meta, "prodpath"):
+                        mismatches.append("product A did not full-render after force helper")
+                    st.session_state.pop(force_key, None)
+                    if chat_mod._should_full_render_sims_table(product_item, meta, "prodpath"):
+                        mismatches.append("product A did not return to placeholder after collapse helper")
+                if st.session_state.get("__sims_current_table_source_key") != "sims_vendor_b_prodpath":
+                    mismatches.append(f"current source changed after force/collapse={st.session_state.get('__sims_current_table_source_key')}")
+
+                if mismatches:
+                    results.append(_fail("old SIMS table production push prune boundary", "; ".join(mismatches)))
+                else:
+                    results.append(_ok("old SIMS table production push prune boundary", "production push fills followup source meta, preserves previous source before force, and force/collapse keeps latest current source"))
+            finally:
+                if force_key:
+                    st.session_state.pop(force_key, None)
+                for key in state_keys:
+                    if key in missing_state:
+                        st.session_state.pop(key, None)
+                    else:
+                        st.session_state[key] = saved_state.get(key)
+        except Exception as e:
+            results.append(_fail("old SIMS table production push prune boundary", f"{type(e).__name__}: {e}"))
 
         try:
             main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
