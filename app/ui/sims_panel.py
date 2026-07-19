@@ -1174,6 +1174,7 @@ from app.ui.chat_middleware import (
     _build_sims_detail_analysis_prompt,
     _expected_analysis_row_count,
     _get_full_download_df_for_sims_item,
+    _sims_clicked_llm_context_mismatch,
 )
 from app.ui.sims_table_display import (
     build_sims_table_display_config,
@@ -4122,33 +4123,7 @@ def _render_panel_result_actions_fragment(
         st.info(_export_unavailable_message())
 
     if run_llm:
-        runner = st.session_state.get("__sims_llm_analysis_runner")
-        log.info("[panel.fragment] LLM analysis clicked runner=%s key=%s", callable(runner), key_suffix)
-
-        if not callable(runner):
-            st.warning("LLM 분석 실행기가 아직 준비되지 않았습니다. 잠시 후 다시 눌러 주세요.")
-            return
-
-        sel = st.session_state.get("__sims_selected") or {}
-        category = str(sel.get("category") or "")
-        action = str(sel.get("action") or "")
-
-        ok_ctx = _ensure_panel_llm_context_from_payload(
-            category=category,
-            action=action,
-        )
-
-        if not ok_ctx:
-            st.warning("현재 SIMS 조회 결과를 LLM 분석 컨텍스트로 준비하지 못했습니다. 조회를 다시 실행한 뒤 눌러 주세요.")
-            return
-
-        st.markdown("#### 🤖 LLM 분석 결과")
-
-        try:
-            runner(prompt)
-        except Exception:
-            log.exception("[panel.fragment] LLM analysis failed")
-            st.error("LLM 분석 중 오류가 발생했습니다.")
+        _run_panel_llm_analysis_from_button(prompt, key_suffix)
 
 # ==========================================================
 # 🧩 결과 렌더링 - 액션 영역 (다운로드/LLM
@@ -4178,19 +4153,71 @@ def _run_panel_llm_analysis_from_button(prompt: str, key_suffix: str) -> None:
     category = str(sel.get("category") or "")
     action = str(sel.get("action") or "")
 
-    ok_ctx = _ensure_panel_llm_context_from_payload(
-        category=category,
-        action=action,
+    payload = _get_panel_last_final_payload(category, action)
+    if not isinstance(payload, dict):
+        st.warning("현재 SIMS 조회 결과를 LLM 분석 컨텍스트로 준비하지 못했습니다. 조회를 다시 실행한 뒤 눌러 주세요.")
+        return
+
+    meta = payload.get("meta") or {}
+    table_key = str(meta.get("table_key") or meta.get("download_table_key") or payload.get("table_key") or "").strip()
+    clicked_action = str(payload.get("action") or meta.get("action") or action or payload.get("title") or "").strip()
+    if not table_key:
+        st.warning("선택한 표의 식별값을 찾을 수 없어 LLM 분석을 실행하지 않았습니다.")
+        return
+
+    ss = st.session_state
+    restore_keys = (
+        "__sims_current_table_source_key",
+        "__sims_current_table_source_action",
+        "__sims_current_table_source_analysis_ctx",
+        "__sims_last_table_key",
+        "__sims_last_table_action",
+        "__sims_analysis_ctx",
     )
+    before_state = {k: ss.get(k) for k in restore_keys if k in ss}
+    missing_before = {k for k in restore_keys if k not in ss}
+
+    ok_ctx = False
+    try:
+        ok_ctx = _ensure_panel_llm_context_from_payload(
+            category=category,
+            action=action,
+        )
+    finally:
+        for k in restore_keys:
+            if k in missing_before:
+                ss.pop(k, None)
+            elif k in before_state:
+                ss[k] = before_state[k]
 
     if not ok_ctx:
         st.warning("현재 SIMS 조회 결과를 LLM 분석 컨텍스트로 준비하지 못했습니다. 조회를 다시 실행한 뒤 눌러 주세요.")
         return
 
+    cache = ss.get("__sims_analysis_ctx_by_table_key") or {}
+    analysis_ctx = cache.get(table_key)
+    mismatch_reason = _sims_clicked_llm_context_mismatch(analysis_ctx, table_key, clicked_action)
+    log.info(
+        "[sims.analysis.button] source=panel table_key=%s action=%s context_action=%s mismatch=%s",
+        table_key,
+        clicked_action,
+        analysis_ctx.get("action") if isinstance(analysis_ctx, dict) else "",
+        mismatch_reason or "",
+    )
+    if mismatch_reason:
+        st.warning("선택한 표의 LLM 분석 컨텍스트가 유효하지 않아 분석을 실행하지 않았습니다.")
+        return
+
     st.markdown("#### 🤖 LLM 분석 결과")
 
     try:
-        runner(prompt)
+        runner(
+            prompt,
+            analysis_ctx_override=analysis_ctx,
+            clicked_table_key=table_key,
+            clicked_action=clicked_action,
+            clicked_message_id="",
+        )
     except Exception:
         log.exception("[panel.fragment] LLM analysis failed")
         st.error("LLM 분석 중 오류가 발생했습니다.")

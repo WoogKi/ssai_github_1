@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import logging
 import os
 import re
@@ -2975,6 +2976,179 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("table-scoped SIMS LLM analysis context", f"{type(e).__name__}: {e}"))
 
         try:
+            chat_mod = importlib.import_module("app.ui.chat_middleware")
+            st_obj = getattr(chat_mod, "st", None)
+            session_state = getattr(st_obj, "session_state", None)
+            if session_state is None:
+                raise RuntimeError("streamlit session_state unavailable")
+
+            saved_state = {
+                key: session_state.get(key)
+                for key in (
+                    "__sims_analysis_ctx_by_table_key",
+                    "__sims_analysis_ctx",
+                    "__sims_current_table_source_key",
+                    "__sims_current_table_source_action",
+                    "__sims_current_table_source_analysis_ctx",
+                    "__sims_last_table_key",
+                    "__sims_last_table_action",
+                    "sims_tables",
+                    "sims_export_tables",
+                    "__sims_export_tables_by_key",
+                    "__chat_inbox",
+                )
+            }
+            old_drain = getattr(chat_mod, "drain_inbox_to_chat")
+            old_company_match = getattr(chat_mod, "_chat_payload_matches_current_company")
+            try:
+                for key in saved_state:
+                    session_state.pop(key, None)
+                session_state["__sims_analysis_ctx_by_table_key"] = {}
+                session_state["sims_tables"] = {}
+                session_state["sims_export_tables"] = {}
+                session_state["__sims_export_tables_by_key"] = {}
+                session_state["__chat_inbox"] = []
+                chat_mod.drain_inbox_to_chat = lambda *args, **kwargs: None
+                chat_mod._chat_payload_matches_current_company = lambda payload: True
+
+                df_a = pd.DataFrame({"제품코드": ["P001", "P002"], "합계금액": [100, 200]})
+                df_p = pd.DataFrame({"영업사원": ["김"], "합계금액": [300]})
+                df_b = pd.DataFrame({"거래처명": ["거래처"], "건수": [1]})
+
+                chat_mod.wssz(
+                    {
+                        "type": "table",
+                        "title": "제품수불현황 조회",
+                        "action": "제품수불현황 조회",
+                        "df": df_a,
+                        "df_display": df_a,
+                        "meta": {"table_key": "sims_a_ctx_owner", "action": "제품수불현황 조회"},
+                    },
+                    "제품수불현황 조회",
+                )
+                cache_after_a = dict(session_state.get("__sims_analysis_ctx_by_table_key") or {})
+
+                chat_mod.wssz(
+                    {
+                        "type": "table",
+                        "title": "현재표 영업사원별 집계",
+                        "action": "현재표 영업사원별 집계",
+                        "df": df_p,
+                        "df_display": df_p,
+                        "meta": {
+                            "current_table_followup": True,
+                            "source_table_key": "sims_a_ctx_owner",
+                            "action": "현재표 영업사원별 집계",
+                        },
+                    },
+                    "현재표 영업사원별 집계",
+                )
+                p_key = str(session_state.get("__sims_last_table_key") or "").strip()
+                cache_after_p = dict(session_state.get("__sims_analysis_ctx_by_table_key") or {})
+
+                chat_mod.wssz(
+                    {
+                        "type": "table",
+                        "title": "거래처 목록",
+                        "action": "거래처 목록",
+                        "df": df_b,
+                        "df_display": df_b,
+                        "meta": {"table_key": "sims_b_ctx_owner", "action": "거래처 목록"},
+                    },
+                    "거래처 목록",
+                )
+                cache_after_b = dict(session_state.get("__sims_analysis_ctx_by_table_key") or {})
+
+                selected_a, selected_a_source = chat_mod._select_sims_analysis_ctx_for_table(
+                    table_key="sims_a_ctx_owner",
+                    action="제품수불현황 조회",
+                    meta={"table_key": "sims_a_ctx_owner", "action": "제품수불현황 조회"},
+                    download_df=df_a,
+                )
+                selected_p, selected_p_source = chat_mod._select_sims_analysis_ctx_for_table(
+                    table_key=p_key,
+                    action="현재표 영업사원별 집계",
+                    meta={"table_key": p_key, "source_table_key": "sims_a_ctx_owner", "current_table_followup": True, "action": "현재표 영업사원별 집계"},
+                    download_df=df_p,
+                )
+
+                original_ctx = {
+                    "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                    "table_key": "sims_a_rebuild",
+                    "source_table_key": "",
+                    "action": "제품수불현황 조회",
+                    "analysis_text": "original",
+                }
+                bad_derived_ctx = {
+                    "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                    "table_key": "sims_a_rebuild",
+                    "source_table_key": "sims_a_rebuild",
+                    "current_table_followup": True,
+                    "action": "현재표 영업사원별 집계",
+                    "analysis_text": "bad derived",
+                }
+                session_state["__sims_analysis_ctx_by_table_key"] = {"sims_a_rebuild": original_ctx}
+                blocked_key = chat_mod._cache_sims_analysis_ctx_by_table_key(bad_derived_ctx)
+                blocked_ctx = dict(session_state.get("__sims_analysis_ctx_by_table_key") or {}).get("sims_a_rebuild")
+
+                session_state["__sims_analysis_ctx_by_table_key"] = {"sims_a_rebuild": bad_derived_ctx}
+                rebuilt_a, rebuilt_a_source = chat_mod._select_sims_analysis_ctx_for_table(
+                    table_key="sims_a_rebuild",
+                    action="제품수불현황 조회",
+                    meta={"table_key": "sims_a_rebuild", "action": "제품수불현황 조회"},
+                    download_df=df_a,
+                )
+                session_state["__sims_analysis_ctx_by_table_key"] = {"sims_a_rebuild": bad_derived_ctx}
+                missing_a, missing_a_source = chat_mod._select_sims_analysis_ctx_for_table(
+                    table_key="sims_a_rebuild",
+                    action="제품수불현황 조회",
+                    meta={"table_key": "sims_a_rebuild", "action": "제품수불현황 조회"},
+                    download_df=None,
+                )
+
+                mismatches = []
+                if cache_after_a.get("sims_a_ctx_owner", {}).get("action") != "제품수불현황 조회":
+                    mismatches.append(f"A cache not original after A={cache_after_a}")
+                if cache_after_p.get("sims_a_ctx_owner", {}).get("action") != "제품수불현황 조회":
+                    mismatches.append(f"A cache overwritten by P={cache_after_p.get('sims_a_ctx_owner')}")
+                if not p_key or p_key == "sims_a_ctx_owner":
+                    mismatches.append(f"derived table key invalid={p_key}")
+                if cache_after_p.get(p_key, {}).get("action") != "현재표 영업사원별 집계":
+                    mismatches.append(f"P cache missing/wrong={p_key}:{cache_after_p.get(p_key)}")
+                if cache_after_p.get(p_key, {}).get("source_table_key") != "sims_a_ctx_owner":
+                    mismatches.append(f"P source key wrong={cache_after_p.get(p_key)}")
+                for key in ("sims_a_ctx_owner", p_key, "sims_b_ctx_owner"):
+                    if key not in cache_after_b:
+                        mismatches.append(f"cache key missing after B={key}:{cache_after_b}")
+                if selected_a_source != "cache" or selected_a.get("action") != "제품수불현황 조회":
+                    mismatches.append(f"A selection wrong={selected_a_source}:{selected_a}")
+                if selected_p_source != "cache" or selected_p.get("action") != "현재표 영업사원별 집계":
+                    mismatches.append(f"P selection wrong={selected_p_source}:{selected_p}")
+                if str(session_state.get("__sims_current_table_source_key") or "") != "sims_b_ctx_owner":
+                    mismatches.append(f"current source changed={session_state.get('__sims_current_table_source_key')}")
+                if blocked_key or blocked_ctx.get("action") != "제품수불현황 조회":
+                    mismatches.append(f"collision block failed key={blocked_key} ctx={blocked_ctx}")
+                if rebuilt_a_source != "rebuilt" or rebuilt_a.get("action") != "제품수불현황 조회":
+                    mismatches.append(f"rebuild from clicked df failed={rebuilt_a_source}:{rebuilt_a}")
+                if missing_a is not None or missing_a_source != "missing":
+                    mismatches.append(f"missing df should fail closed={missing_a_source}:{missing_a}")
+
+                if mismatches:
+                    results.append(_fail("SIMS LLM context cache ownership", "; ".join(mismatches)))
+                else:
+                    results.append(_ok("SIMS LLM context cache ownership", "source A and derived P contexts stay under their own table_key; stale collision rebuild/fail-closed verified"))
+            finally:
+                chat_mod.drain_inbox_to_chat = old_drain
+                chat_mod._chat_payload_matches_current_company = old_company_match
+                for key, value in saved_state.items():
+                    if value is None:
+                        session_state.pop(key, None)
+                    else:
+                        session_state[key] = value
+        except Exception as e:
+            results.append(_fail("SIMS LLM context cache ownership", f"{type(e).__name__}: {e}"))
+
+        try:
             from app.ui.current_table_followups.action_dispatcher import (
                 classify_current_table_followup_intent,
                 current_table_analysis_query_matches,
@@ -5710,6 +5884,364 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("ssai login company selector policy", f"{type(e).__name__}: {e}"))
     except Exception as e:
         results.append(_fail("supplier stock shortage allocation fixture", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}"))
+
+    try:
+        profile_mod = importlib.import_module("app.ui.sims_analysis_profiles")
+        chat_mod = importlib.import_module("app.ui.chat_middleware")
+        panel_mod = importlib.import_module("app.ui.sims_panel")
+
+        profile_cases = [
+            ("제품수불현황 조회", {}, "product_flow", "제품별 입고·출고·재고 변동과 수불금액 확인", "source_table"),
+            ("제품재고현황 조회", {}, "stock_risk", "현재 재고, 부족 예상, 배정 부족과 공급 위험 확인", "source_table"),
+            ("품목별 재고부족현황", {"analysis_type": "stock_shortage"}, "stock_risk", "현재 재고, 부족 예상, 배정 부족과 공급 위험 확인", "source_table"),
+            ("입고명세 조회", {}, "trade_document", "기간·거래처·제품별 거래금액과 수량 흐름 확인", "source_table"),
+            ("거래처 목록", {"analysis_type": "vendor_master"}, "master", "등록 현황, 분류, 상태 및 필수정보 완전성 확인", "source_table"),
+            ("제품코드 목록", {"analysis_type": "goods_master"}, "master", "등록 현황, 분류, 상태 및 필수정보 완전성 확인", "source_table"),
+            ("도로명주소 조회", {"analysis_type": "road_address_master"}, "road_address", "검색 조건에 맞는 도로명·지역 주소 후보 확인", "source_table"),
+            ("현재표 영업사원 TOP 20", {"current_table_followup": True}, "current_table_top", "선택 차원과 기준 지표의 상위 그룹 비교", "derived_table"),
+            ("현재표 영업사원별 집계", {"current_table_followup": True}, "current_table_group", "선택 차원별 건수·수량·금액 집계 비교", "derived_table"),
+            ("현재표 조건 필터", {"current_table_followup": True}, "current_table_filter", "사용자가 지정한 조건으로 제한된 결과의 특징 확인", "derived_table"),
+            ("알 수 없는 조회", {}, "generic", "현재 조회 조건과 결과 컬럼을 기준으로 주요 분포·수치·결측을 요약", "source_table"),
+        ]
+        profile_errors = []
+        for action, meta, expected_id, expected_purpose, expected_mode in profile_cases:
+            profile = profile_mod.build_sims_analysis_profile(
+                action,
+                params={"start_date": "2026-07-01", "end_date": "2026-07-19"},
+                meta=meta,
+                columns=["제품코드", "전화번호", "합계금액"],
+            )
+            if profile.get("profile_id") != expected_id:
+                profile_errors.append(f"{action}:profile={profile.get('profile_id')} expected={expected_id}")
+            if profile.get("screen_purpose") != expected_purpose:
+                profile_errors.append(f"{action}:purpose={profile.get('screen_purpose')!r}")
+            if profile.get("response_mode") != expected_mode:
+                profile_errors.append(f"{action}:mode={profile.get('response_mode')} expected={expected_mode}")
+            if not profile.get("analysis_focus"):
+                profile_errors.append(f"{action}:missing_focus")
+        if profile_errors:
+            results.append(_fail("SIMS LLM analysis profiles", "; ".join(profile_errors)))
+        else:
+            results.append(_ok("SIMS LLM analysis profiles", f"profile_cases={len(profile_cases)}"))
+
+        scope_profile = profile_mod.build_sims_analysis_profile("거래처 목록", columns=["사업자번호", "전화번호", "거래처명", "합계금액"])
+        params = {
+            "start_date": "2026-07-01",
+            "end_date": "2026-07-19",
+            "거래처명": "테스트약국",
+            "전화번호": "010-1111-2222",
+            "사업자번호": "123-45-67890",
+            "상세주소": "서울시 테스트로 1",
+            "계좌번호": "111-222-333",
+            "api_key": "sk-test-secret",
+        }
+        params_before = dict(params)
+        scope = profile_mod.build_query_scope_summary(params=params, meta={}, profile=scope_profile)
+        scope_errors = []
+        if "2026-07-01" not in scope or "2026-07-19" not in scope or "거래처명 테스트약국" not in scope:
+            scope_errors.append(f"missing_expected_scope={scope!r}")
+        for secret in ("010-1111-2222", "123-45-67890"):
+            if secret in scope:
+                scope_errors.append(f"sensitive_scope_leaked={secret}")
+        if params != params_before:
+            scope_errors.append("params_mutated")
+        no_scope = profile_mod.build_query_scope_summary(params={}, meta={}, profile=scope_profile)
+        if "전체 조회 결과" not in no_scope:
+            scope_errors.append(f"no_condition_text={no_scope!r}")
+        if scope_errors:
+            results.append(_fail("SIMS LLM query scope summary", "; ".join(scope_errors)))
+        else:
+            results.append(_ok("SIMS LLM query scope summary", f"scope={scope!r} no_scope={no_scope!r}"))
+
+        sample_df = pd.DataFrame(
+            [
+                {
+                    "사업자번호": "123-45-67890",
+                    "전화번호": "02-111-2222",
+                    "대표자명": "홍길동",
+                    "상세주소": "서울시 테스트로 1",
+                    "이메일": "secret@example.com",
+                    "로그인ID": "user01",
+                    "계좌번호": "111-222-333",
+                    "거래처명": "테스트약국",
+                    "거래처종류": "도매",
+                    "시도": "경기",
+                    "시군구": "수원시",
+                    "도로명": "광교로",
+                    "제품코드": "000123",
+                    "합계금액": 1000,
+                    "수량": 2,
+                }
+            ]
+        )
+        sample_before = sample_df.copy(deep=True)
+        sanitized = profile_mod.sanitize_sims_llm_dataframe(sample_df, scope_profile)
+        sanitizer_errors = []
+        mapping_fixture = {
+            "accounting_count": 7,
+            "\uc0ac\uc6a9\uc790\uc218": 12,
+            "\ub300\ud45c\uc790\uc218": 3,
+            "\uc81c\ud488\ucf54\ub4dc": "123-45-67890",
+            "\ud488\ubaa9\ucf54\ub4dc": "010-1111-2222",
+            "\uc0c1\ud488\ucf54\ub4dc": "000123",
+            "\uc218\ub7c9": 0,
+            "\uae08\uc561": 0,
+            "\uc804\ud654\ubc88\ud638": "010-1111-2222",
+            "\uc0ac\uc5c5\uc790\ubc88\ud638": "123-45-67890",
+            "\ub300\ud45c\uc790\uba85": "\ud64d\uae38\ub3d9",
+            "query_summary": "\uc804\ud654\ubc88\ud638 010-1111-2222 / \uc0ac\uc5c5\uc790\ubc88\ud638 123-45-67890",
+            "nested": {"password": "pw-secret", "token": "tok-secret", "api_key": "sk-secret"},
+        }
+        mapping_before = dict(mapping_fixture)
+        mapping_before["nested"] = dict(mapping_fixture["nested"])
+        mapping_safe = profile_mod.sanitize_llm_mapping(mapping_fixture, profile=scope_profile)
+        for key in ("accounting_count", "\uac74\uc218", "\uc0ac\uc6a9\uc790\uc218", "\ub300\ud45c\uc790\uc218"):
+            if not profile_mod._is_aggregate_key(key):
+                sanitizer_errors.append(f"aggregate_key_not_detected={key}")
+        expected_preserved = {
+            "accounting_count": 7,
+            "\uc0ac\uc6a9\uc790\uc218": 12,
+            "\ub300\ud45c\uc790\uc218": 3,
+            "\uc81c\ud488\ucf54\ub4dc": "123-45-67890",
+            "\ud488\ubaa9\ucf54\ub4dc": "010-1111-2222",
+            "\uc0c1\ud488\ucf54\ub4dc": "000123",
+            "\uc218\ub7c9": 0,
+            "\uae08\uc561": 0,
+        }
+        for key, expected in expected_preserved.items():
+            if mapping_safe.get(key) != expected:
+                sanitizer_errors.append(f"mapping_preserve_failed={key}:{mapping_safe.get(key)!r}")
+        expected_masked = {
+            "\uc804\ud654\ubc88\ud638": "\uc804\ud654\ubc88\ud638 \uc870\uac74 \uc801\uc6a9",
+            "\uc0ac\uc5c5\uc790\ubc88\ud638": "\uc0ac\uc5c5\uc790\ubc88\ud638 \uc870\uac74 \uc801\uc6a9",
+            "\ub300\ud45c\uc790\uba85": "\ub300\ud45c\uc790\uba85 \uc870\uac74 \uc801\uc6a9",
+        }
+        for key, expected in expected_masked.items():
+            if mapping_safe.get(key) != expected:
+                sanitizer_errors.append(f"mapping_mask_failed={key}:{mapping_safe.get(key)!r}")
+        for key in ("password", "token", "api_key"):
+            expected = f"{key} \uc870\uac74 \uc801\uc6a9"
+            if mapping_safe.get("nested", {}).get(key) != expected:
+                sanitizer_errors.append(f"nested_mask_failed={key}:{mapping_safe.get('nested', {}).get(key)!r}")
+        mapping_json = json.dumps(mapping_safe, ensure_ascii=False, default=str)
+        profile_src = (PROJECT_ROOT / "app" / "ui" / "sims_analysis_profiles.py").read_text(encoding="utf-8")
+        helper_src = profile_src[profile_src.index("def _is_aggregate_key"):profile_src.index("def is_sensitive_llm_column")]
+        if "??" in mapping_json or "??" in helper_src:
+            sanitizer_errors.append("broken_question_mark_literal_remains")
+        for secret in ("pw-secret", "tok-secret", "sk-secret", "\ud64d\uae38\ub3d9"):
+            if secret in mapping_json:
+                sanitizer_errors.append(f"mapping_secret_leaked={secret}")
+        if str(mapping_safe.get("\uc804\ud654\ubc88\ud638") or "") == "010-1111-2222":
+            sanitizer_errors.append("phone_field_not_masked")
+        if str(mapping_safe.get("\uc0ac\uc5c5\uc790\ubc88\ud638") or "") == "123-45-67890":
+            sanitizer_errors.append("bizno_field_not_masked")
+        if "010-1111-2222 / \uc0ac\uc5c5\uc790" in mapping_json:
+            sanitizer_errors.append("query_summary_raw_sensitive_phrase_leaked")
+        if mapping_fixture != mapping_before:
+            sanitizer_errors.append("mapping_source_mutated")
+        for col in ("사업자번호", "전화번호", "대표자명", "상세주소", "이메일", "로그인ID"):
+            if col in sanitized.columns:
+                sanitizer_errors.append(f"sensitive_col_kept={col}")
+        for col in ("거래처명", "거래처종류", "제품코드", "합계금액", "수량"):
+            if col not in sanitized.columns:
+                sanitizer_errors.append(f"allowed_col_missing={col}")
+        if int(sanitized["합계금액"].sum()) != 1000:
+            sanitizer_errors.append("aggregate_changed")
+        try:
+            pd.testing.assert_frame_equal(sample_df, sample_before)
+        except AssertionError as exc:
+            sanitizer_errors.append(f"source_mutated={exc}")
+        ctx = chat_mod._build_sims_analysis_context_from_df(
+            sample_df,
+            result={"title": "거래처 목록", "meta": {"analysis_type": "vendor_master"}, "df": sample_df},
+            action_name="거래처 목록",
+            params=params,
+            meta={
+                "analysis_type": "vendor_master",
+                "table_key": "sims_vendor",
+                "query_summary": "전화번호 010-1111-2222 / 사업자번호 123-45-67890",
+                "summary_md": "대표자명 홍길동 / 이메일 secret@example.com",
+                "detail_summary": {"상세주소": "서울시 테스트로 1"},
+            },
+        )
+        ctx_json = json.dumps(ctx, ensure_ascii=False, default=str)
+        for secret in (
+            "123-45-67890",
+            "010-1111-2222",
+            "02-111-2222",
+            "홍길동",
+            "secret@example.com",
+            "user01",
+            "서울시 테스트로 1",
+            "111-222-333",
+            "sk-test-secret",
+        ):
+            if secret in ctx_json:
+                sanitizer_errors.append(f"context_leaked={secret}")
+        for container_name in ("params", "meta", "query_scope_summary", "analysis_text", "llm_summary_md", "detail_summary", "sample_records"):
+            if container_name not in ctx_json and container_name in {"params", "meta", "query_scope_summary", "analysis_text", "sample_records"}:
+                sanitizer_errors.append(f"context_container_missing={container_name}")
+        if ctx.get("analysis_profile_id") != "master" or not ctx.get("query_scope_summary"):
+            sanitizer_errors.append("context_profile_missing")
+        road_df = pd.DataFrame(
+            [
+                {
+                    "시도": "경기",
+                    "시군구": "수원시",
+                    "도로명": "광교로",
+                    "도로명주소": "경기도 수원시 광교로 123",
+                    "상세주소": "101동 202호",
+                }
+            ]
+        )
+        road_profile = profile_mod.build_sims_analysis_profile("도로명주소 조회", meta={"analysis_type": "road_address_master"}, columns=list(road_df.columns))
+        road_safe = profile_mod.sanitize_sims_llm_dataframe(road_df, road_profile)
+        if not {"시도", "시군구", "도로명"}.issubset(set(road_safe.columns)):
+            sanitizer_errors.append(f"road_safe_region_missing={list(road_safe.columns)}")
+        if "도로명주소" in road_safe.columns or "상세주소" in road_safe.columns:
+            sanitizer_errors.append(f"road_full_address_kept={list(road_safe.columns)}")
+        stock_ctx = chat_mod._build_stock_shortage_analysis_ctx(
+            pd.DataFrame([{"제품코드": "P001", "부족등급": "정상", "현재고수량": 1, "1개월부족수량": 0}]),
+            action_name="품목별 재고부족현황",
+            params={"전화번호": "010-1111-2222"},
+            meta={"analysis_type": "stock_shortage", "query_summary": "사업자번호 123-45-67890"},
+        )
+        stock_json = json.dumps(stock_ctx, ensure_ascii=False, default=str)
+        for key in ("analysis_profile_id", "screen_purpose", "query_scope_summary", "analysis_focus", "analysis_response_mode"):
+            if key not in stock_ctx:
+                sanitizer_errors.append(f"stock_profile_missing={key}")
+        for secret in ("010-1111-2222", "123-45-67890"):
+            if secret in stock_json:
+                sanitizer_errors.append(f"stock_context_leaked={secret}")
+        if sanitizer_errors:
+            results.append(_fail("SIMS LLM sanitizer and context", "; ".join(sanitizer_errors)))
+        else:
+            results.append(_ok("SIMS LLM sanitizer and context", f"kept_cols={list(sanitized.columns)} profile={ctx.get('analysis_profile_id')}"))
+
+        rule_full = profile_mod.build_response_format_instruction("현재표 분석해줘")
+        rule_summary = profile_mod.build_response_format_instruction("현재표 요약해줘")
+        prompt_errors = []
+        if "조회 이해" not in rule_full or "LLM 의견" not in rule_full or "8~12줄" not in rule_full:
+            prompt_errors.append("full_analysis_rule_missing_sections")
+        if "2~3문장" not in rule_full or "근거가 부족하면 길이를 늘리지 말고" not in rule_full:
+            prompt_errors.append("llm_opinion_length_policy_missing")
+        if "두 부분만" not in rule_summary or "LLM 의견은 강제하지 마세요" not in rule_summary:
+            prompt_errors.append("summary_rule_forces_opinion")
+        main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+        if "build_response_format_instruction(" not in main_src or "analysis_ctx_override.get(\"kind\") == \"SIMS_ANALYSIS_CONTEXT_V1\"" not in main_src:
+            prompt_errors.append("main_prompt_or_override_guard_missing")
+        if prompt_errors:
+            results.append(_fail("SIMS LLM prompt shape", "; ".join(prompt_errors)))
+        else:
+            results.append(_ok("SIMS LLM prompt shape", "analysis vs summary response instructions verified"))
+
+        class _FakeSt:
+            def __init__(self):
+                self.session_state: dict[str, Any] = {}
+                self.warnings: list[str] = []
+                self.markdowns: list[str] = []
+
+            def warning(self, msg: str) -> None:
+                self.warnings.append(str(msg))
+
+            def markdown(self, msg: str) -> None:
+                self.markdowns.append(str(msg))
+
+            def error(self, msg: str) -> None:
+                self.warnings.append(str(msg))
+
+        fake_st = _FakeSt()
+        panel_errors = []
+        panel_ctx = {
+            "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+            "table_key": "sims_panel",
+            "action": "제품수불현황 조회",
+            "analysis_profile_id": "product_flow",
+        }
+        fake_st.session_state.update(
+            {
+                "__sims_selected": {"category": "테스트", "action": "제품수불현황 조회"},
+                "__sims_current_table_source_key": "sims_current_b",
+                "__sims_current_table_source_action": "거래처 목록",
+                "__sims_current_table_source_analysis_ctx": {"table_key": "sims_current_b", "action": "거래처 목록"},
+                "__sims_analysis_ctx": {"table_key": "sims_current_b", "action": "거래처 목록"},
+                "__sims_analysis_ctx_by_table_key": {"sims_panel": panel_ctx},
+            }
+        )
+        runner_calls: list[dict[str, Any]] = []
+        fake_st.session_state["__sims_llm_analysis_runner"] = lambda prompt, **kw: runner_calls.append({"prompt": prompt, **kw})
+        old_panel_st = panel_mod.st
+        old_get_payload = panel_mod._get_panel_last_final_payload
+        old_ensure = panel_mod._ensure_panel_llm_context_from_payload
+        try:
+            panel_mod.st = fake_st
+            panel_mod._get_panel_last_final_payload = lambda category, action: {
+                "action": "제품수불현황 조회",
+                "title": "제품수불현황 조회",
+                "meta": {"table_key": "sims_panel", "action": "제품수불현황 조회"},
+            }
+            ensure_calls = {"count": 0}
+
+            def _fake_ensure(**kwargs):
+                ensure_calls["count"] += 1
+                fake_st.session_state["__sims_current_table_source_key"] = "sims_panel"
+                fake_st.session_state["__sims_current_table_source_action"] = kwargs.get("action")
+                fake_st.session_state["__sims_analysis_ctx"] = panel_ctx
+                return True
+
+            panel_mod._ensure_panel_llm_context_from_payload = _fake_ensure
+            panel_mod._run_panel_llm_analysis_from_button("패널 표 분석", "panel-key")
+            if ensure_calls["count"] != 1:
+                panel_errors.append(f"ensure_calls={ensure_calls['count']}")
+            if len(runner_calls) != 1:
+                panel_errors.append(f"runner_calls={len(runner_calls)}")
+            elif runner_calls[0].get("analysis_ctx_override") is not panel_ctx:
+                panel_errors.append("runner_override_not_exact_context")
+            elif runner_calls[0].get("clicked_table_key") != "sims_panel" or runner_calls[0].get("clicked_action") != "제품수불현황 조회":
+                panel_errors.append(f"clicked_identity_wrong={runner_calls[0]}")
+            if fake_st.session_state.get("__sims_current_table_source_key") != "sims_current_b":
+                panel_errors.append("current_source_changed")
+            runner_calls.clear()
+            fake_st.session_state["__sims_analysis_ctx_by_table_key"] = {"sims_panel": {**panel_ctx, "table_key": "other"}}
+            panel_mod._run_panel_llm_analysis_from_button("패널 표 분석", "panel-key")
+            if runner_calls:
+                panel_errors.append("mismatch_called_runner")
+        finally:
+            panel_mod.st = old_panel_st
+            panel_mod._get_panel_last_final_payload = old_get_payload
+            panel_mod._ensure_panel_llm_context_from_payload = old_ensure
+        if panel_errors:
+            results.append(_fail("SIMS panel LLM exact override", "; ".join(panel_errors)))
+        else:
+            results.append(_ok("SIMS panel LLM exact override", "panel button selects exact table context, blocks mismatch, restores current source"))
+
+        source_ctx = {
+            "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+            "table_key": "sims_a",
+            "action": "제품수불현황 조회",
+            "analysis_text": "source A",
+        }
+        derived_ctx = {
+            "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+            "table_key": "sims_p",
+            "source_table_key": "sims_a",
+            "action": "현재표 영업사원 TOP 20",
+            "current_table_followup": True,
+            "analysis_text": "derived P",
+        }
+        mismatch_errors = []
+        if chat_mod._sims_clicked_llm_context_mismatch(derived_ctx, "sims_p", "현재표 영업사원 TOP 20"):
+            mismatch_errors.append("derived_ctx_exact_rejected")
+        if chat_mod._sims_clicked_llm_context_mismatch(source_ctx, "sims_p", "현재표 영업사원 TOP 20") != "table_key_mismatch":
+            mismatch_errors.append("source_ctx_should_not_replace_derived")
+        if chat_mod._sims_clicked_llm_context_mismatch({**derived_ctx, "expired": "true"}, "sims_p", "현재표 영업사원 TOP 20") != "expired_context":
+            mismatch_errors.append("expired_clicked_context_not_blocked")
+        if mismatch_errors:
+            results.append(_fail("SIMS clicked table override fail-closed", "; ".join(mismatch_errors)))
+        else:
+            results.append(_ok("SIMS clicked table override fail-closed", "derived table override remains table-scoped; source/global fallback blocked on mismatch/expired"))
+    except Exception as e:
+        results.append(_fail("SIMS query-specific LLM analysis profiles", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}"))
 
     results.extend(_run_customer_sales_forecast_basic_checks())
     return results

@@ -29,6 +29,13 @@ from app.ui.sims_table_display import (
     log_sims_table_render,
     normalize_display_df_for_streamlit,
 )
+from app.ui.sims_analysis_profiles import (
+    build_query_scope_summary,
+    build_sims_analysis_profile,
+    sanitize_llm_mapping,
+    sanitize_llm_text,
+    sanitize_sims_llm_dataframe,
+)
 
 import datetime as dt
 import time
@@ -2405,6 +2412,19 @@ def _build_stock_shortage_analysis_ctx(
 
     row_count = int(len(df))
     col_count = int(len(df.columns))
+    profile = build_sims_analysis_profile(
+        action_name,
+        params=params,
+        meta=meta,
+        columns=list(df.columns),
+    )
+    safe_params = sanitize_llm_mapping(params, profile=profile)
+    safe_meta = sanitize_llm_mapping(meta, profile=profile)
+    query_scope_summary = build_query_scope_summary(
+        params=safe_params if isinstance(safe_params, dict) else {},
+        meta=safe_meta if isinstance(safe_meta, dict) else {},
+        profile=profile,
+    )
 
     product_cols = [
         "순번",
@@ -2726,6 +2746,9 @@ def _build_stock_shortage_analysis_ctx(
         f"- action: {action_name}\n"
         f"- rows: {row_count}\n"
         f"- cols: {col_count}\n"
+        f"- screen_purpose: {profile.get('screen_purpose')}\n"
+        f"- query_scope_summary: {query_scope_summary}\n"
+        f"- analysis_focus: {', '.join(str(x) for x in (profile.get('analysis_focus') or [])[:6])}\n"
         f"- 품목수: {summary.get('product_count')}\n"
         f"- 부족품목수: {summary.get('shortage_item_count')}\n"
         f"- 현재재고수량합계: {summary.get('sum_current_stock_qty')}\n"
@@ -2743,10 +2766,17 @@ def _build_stock_shortage_analysis_ctx(
         "analysis_target": "latest_sims_result_only",
         "analysis_key": str(uuid.uuid4()),
         "action": action_name,
-        "params": params,
+        "params": safe_params,
         "row_count": row_count,
         "column_count": col_count,
         "columns": [str(c) for c in df.columns],
+        "analysis_profile_id": profile.get("profile_id"),
+        "screen_purpose": profile.get("screen_purpose"),
+        "query_scope_summary": query_scope_summary,
+        "analysis_focus": profile.get("analysis_focus") or [],
+        "analysis_response_mode": profile.get("response_mode"),
+        "sensitive_columns_removed": profile.get("sensitive_columns") or [],
+        "meta": safe_meta,
         "summary": summary,
         "shortage_grade_counts": shortage_grade_counts,
         "forecast_grade_counts": forecast_grade_counts,
@@ -3461,6 +3491,20 @@ def _build_sims_analysis_context_from_df(
 
     action = str(action_name or meta.get("action") or result.get("title") or "").strip()
     analysis_type = str(meta.get("analysis_type") or "").strip()
+    profile = build_sims_analysis_profile(
+        action,
+        params=params,
+        meta=meta,
+        columns=list(base_df.columns),
+    )
+    safe_sample_df = sanitize_sims_llm_dataframe(base_df, profile)
+    safe_params = sanitize_llm_mapping(params, profile=profile)
+    safe_meta = sanitize_llm_mapping(meta, profile=profile)
+    query_scope_summary = build_query_scope_summary(
+        params=safe_params if isinstance(safe_params, dict) else {},
+        meta=safe_meta if isinstance(safe_meta, dict) else {},
+        profile=profile,
+    )
 
     if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"} or analysis_type in {"stock_shortage", "supplier_stock_shortage"}:
         return _build_stock_shortage_analysis_ctx(
@@ -3470,7 +3514,7 @@ def _build_sims_analysis_context_from_df(
             meta=meta,
         )
 
-    fallback_cols = list(base_df.columns[:25])
+    fallback_cols = list(safe_sample_df.columns[:25])
 
     # 입고명세/출고명세는 nlq_router에서 만든 전체 집계 meta를 우선 사용한다.
     detail_summary = {}
@@ -3490,6 +3534,8 @@ def _build_sims_analysis_context_from_df(
 
 
     llm_summary_md = str(meta.get("llm_summary_md") or meta.get("summary_md") or "").strip()
+    detail_summary = sanitize_llm_mapping(detail_summary, profile=profile)
+    llm_summary_md = sanitize_llm_text(llm_summary_md, label="llm_summary_md")
 
     analysis_row_count = int(
         detail_summary.get("row_count_total")
@@ -3657,6 +3703,12 @@ def _build_sims_analysis_context_from_df(
     )
 
     analysis_text += (
+        f"- screen_purpose: {profile.get('screen_purpose')}\n"
+        f"- query_scope_summary: {query_scope_summary}\n"
+        f"- analysis_focus: {', '.join(str(x) for x in (profile.get('analysis_focus') or [])[:6])}\n"
+    )
+
+    analysis_text += (
         f"- 업무흐름: {business_terms.get('flow_label')}\n"
         f"- 금액표현: {business_terms.get('amount_label')}\n"
         f"- 거래처표현: {business_terms.get('vendor_label')}\n"
@@ -3696,13 +3748,19 @@ def _build_sims_analysis_context_from_df(
         "analysis_target": "latest_sims_result_only",
         "analysis_key": str(uuid.uuid4()),
         "action": action,
-        "params": params,
+        "params": safe_params,
         "row_count": analysis_row_count,
         "display_row_count": display_row_count,
         "column_count": int(len(base_df.columns)),
         "columns": [str(c) for c in base_df.columns],
+        "analysis_profile_id": profile.get("profile_id"),
+        "screen_purpose": profile.get("screen_purpose"),
+        "query_scope_summary": query_scope_summary,
+        "analysis_focus": profile.get("analysis_focus") or [],
+        "analysis_response_mode": profile.get("response_mode"),
+        "sensitive_columns_removed": profile.get("sensitive_columns") or [],
         "meta": {
-            k: v
+            k: (safe_meta or {}).get(k)
             for k, v in meta.items()
             if k in keep_meta_keys
         },
@@ -3716,7 +3774,7 @@ def _build_sims_analysis_context_from_df(
         "doc_counterparty_profile": doc_counterparty_profile,
         "sales_time_profile": sales_time_profile_out,
         "sales_group_profile": sales_group_profile_out,
-        "sample_records": _llm_records_from_df(base_df, fallback_cols, limit=30),
+        "sample_records": _llm_records_from_df(safe_sample_df, fallback_cols, limit=30),
 
         "llm_rules": [
             "이 컨텍스트는 최신 SIMS 조회 결과 1건만 대상으로 한다.",
@@ -3759,10 +3817,32 @@ def _cache_sims_analysis_ctx_by_table_key(ctx: Any) -> str:
     """Store a compact SIMS analysis context by its table_key and return that key."""
     if not isinstance(ctx, dict) or ctx.get("kind") != "SIMS_ANALYSIS_CONTEXT_V1":
         return ""
-    table_key = str(ctx.get("table_key") or ctx.get("source_table_key") or "").strip()
+    table_key = str(ctx.get("table_key") or "").strip()
+    source_table_key = str(ctx.get("source_table_key") or "").strip()
+    current_followup = bool(ctx.get("current_table_followup"))
+    collision_blocked = False
+    cache = _sims_analysis_ctx_cache()
+    existing = cache.get(table_key) if table_key else None
+    if current_followup and (not table_key or table_key == source_table_key):
+        collision_blocked = True
+    if current_followup and isinstance(existing, dict) and not bool(existing.get("current_table_followup")):
+        collision_blocked = True
+    try:
+        log.info(
+            "[sims.analysis.context] cache_key=%s table_key=%s source_table_key=%s action=%s collision_blocked=%s",
+            table_key,
+            table_key,
+            source_table_key,
+            str(ctx.get("action") or ""),
+            collision_blocked,
+        )
+    except Exception:
+        pass
+    if collision_blocked:
+        return ""
     if not table_key:
         return ""
-    _sims_analysis_ctx_cache()[table_key] = dict(ctx)
+    cache[table_key] = dict(ctx)
     return table_key
 
 
@@ -3779,6 +3859,19 @@ def _sims_clicked_llm_context_mismatch(
     """Return a mismatch reason when a clicked table cannot use the selected context."""
     if not isinstance(ctx, dict) or ctx.get("kind") != "SIMS_ANALYSIS_CONTEXT_V1":
         return "missing_context"
+    try:
+        for key in ("expired", "payload_expired", "is_expired", "data_expired", "table_expired"):
+            value = ctx.get(key)
+            if isinstance(value, str):
+                if value.strip().lower() in ("true", "1", "yes", "expired"):
+                    return "expired_context"
+            elif bool(value):
+                return "expired_context"
+        status = str(ctx.get("status") or ctx.get("payload_status") or "").strip().lower()
+        if status == "expired":
+            return "expired_context"
+    except Exception:
+        pass
     clicked = str(clicked_table_key or "").strip()
     selected = str(ctx.get("table_key") or ctx.get("source_table_key") or "").strip()
     if clicked and selected and clicked != selected:
@@ -3812,7 +3905,9 @@ def _select_sims_analysis_ctx_for_table(
     if table_key:
         cached = _sims_analysis_ctx_cache().get(table_key)
         if isinstance(cached, dict) and cached.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1":
-            return dict(cached), "cache"
+            cached_copy = dict(cached)
+            if not _sims_clicked_llm_context_mismatch(cached_copy, table_key, action):
+                return cached_copy, "cache"
 
     if isinstance(download_df, pd.DataFrame) and not download_df.empty:
         ctx = _build_sims_analysis_context_from_df(
@@ -4151,9 +4246,30 @@ def _build_sims_context_from_result(
     
 
         if analysis_ctx:
+            try:
+                if not analysis_ctx.get("analysis_profile_id"):
+                    profile = build_sims_analysis_profile(
+                        action_name,
+                        params=params,
+                        meta=meta,
+                        columns=list(base_df.columns) if isinstance(base_df, pd.DataFrame) else [],
+                    )
+                    analysis_ctx["analysis_profile_id"] = profile.get("profile_id")
+                    analysis_ctx["screen_purpose"] = profile.get("screen_purpose")
+                    analysis_ctx["query_scope_summary"] = build_query_scope_summary(
+                        params=params,
+                        meta=meta,
+                        profile=profile,
+                    )
+                    analysis_ctx["analysis_focus"] = profile.get("analysis_focus") or []
+                    analysis_ctx["analysis_response_mode"] = profile.get("response_mode")
+                    analysis_ctx["sensitive_columns_removed"] = profile.get("sensitive_columns") or []
+            except Exception:
+                log.exception("[SIMS_ANALYSIS_PROFILE] enrich failed")
+
             is_current_table_followup = bool(meta.get("current_table_followup"))
             source_table_key = str(meta.get("source_table_key") or "").strip()
-            table_key = str(meta.get("table_key") or ss.get("__sims_last_table_key") or "").strip()
+            table_key = str(meta.get("table_key") or "").strip()
 
             analysis_ctx["current_table_followup"] = is_current_table_followup
             analysis_ctx["source_table_key"] = source_table_key
@@ -6382,6 +6498,11 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
 
     # ✅ 모든 push payload에 고유 id 부여 (스크롤/중복판정 안정화)
     payload.setdefault("id", str(uuid.uuid4()))
+
+    if isinstance(payload, dict) and payload.get("type") == "table":
+        meta = dict(payload.get("meta") or {})
+        meta.setdefault("table_key", f"sims_{uuid.uuid4().hex[:8]}")
+        payload["meta"] = meta
 
     # ✅ NLQ 등에서 동일 조건 반복 호출 시에도 표 버블을 다시 띄우기 위한 플래그
     force_push = bool(meta.get("_force_push")) or bool(ss.pop("__sims_force_push", False))

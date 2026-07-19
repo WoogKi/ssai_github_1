@@ -261,6 +261,7 @@ from app.ui.current_table_followups.action_dispatcher import (
     handle_current_table_followup_by_action,
     select_current_table_analysis_context,
 )
+from app.ui.sims_analysis_profiles import build_response_format_instruction
 
 from app.services.ssai_permission_policy import (
     describe_permission,
@@ -5178,6 +5179,10 @@ def build_messages_with_system(
 
         if (
             attach_sims
+            and not (
+                isinstance(analysis_ctx_override, dict)
+                and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
+            )
             and _wants_current_table_source_ctx(user_text or "")
             and latest_is_current_followup
             and isinstance(source_analysis_ctx, dict)
@@ -5723,11 +5728,16 @@ def build_messages_with_system(
         current_question = (user_text or "").strip()
         if not current_question:
             current_question = "현재 조회 결과를 핵심 요약, 주요 수치, 주의할 점, 다음 조회 제안 순서로 분석해줘"
+        response_format_instruction = build_response_format_instruction(
+            current_question,
+            default_include_opinion=True,
+        )
 
         analysis_rule = (
             "\n\n[SIMS_ANALYSIS_RULE]\n"
             "- 현재 SIMS_JSON은 SIMS_ANALYSIS_CONTEXT_V1이다.\n"
             "- 이 컨텍스트는 최신 SIMS 조회 결과 전체 원본 DataFrame을 Python에서 집계한 분석 컨텍스트다.\n"
+            f"- {response_format_instruction}\n"
             "- summary와 shortage_grade_counts, forecast_grade_counts, trend_judge_counts는 전체 결과 기준이다.\n"
             "- 일자/날짜/요일/일별/월별 매출 질문은 sales_time_profile을 우선 근거로 답한다.\n"
             "- 제품별/거래처별/영업사원별/수량 TOP 질문은 sales_group_profile을 우선 근거로 답한다.\n"
@@ -10713,7 +10723,7 @@ with st.container():
         try:
             prompt = (prompt or "").strip()
             if not prompt:
-                prompt = "현재 조회 결과를 핵심 요약, 주요 수치, 주의할 점, 다음 조회 제안 순서로 분석해줘"
+                prompt = "현재 조회 결과를 조회 이해, 핵심 요약, 주요 특징과 확인할 점, LLM 의견 순서로 짧게 분석해줘"
 
             selected_ctx_table_key = ""
             selected_ctx_action = ""
