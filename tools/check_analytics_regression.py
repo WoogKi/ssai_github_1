@@ -3699,6 +3699,133 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("rddbc IO fillna futurewarning", f"{type(e).__name__}: {e}"))
 
         try:
+            import warnings
+
+            import numpy as np
+
+            from app.services import product_flow_service as product_flow_mod
+
+            msg_part = "DataFrame concatenation with empty or all-NA entries"
+            detail_params = {"date_from": "20260701", "date_to": "20260719", "top": 10}
+            detail_settings = product_flow_mod._mode_settings({"flow_scope": "all"})
+            detail_frames = [
+                pd.DataFrame(
+                    {
+                        "\uc218\ub7c9": pd.Series([1, 0, np.nan], dtype="float64"),
+                        "\uc2dd\ubcc4\uc790": pd.Series(["001", "0", ""], dtype="object"),
+                        "\uc785\uace0\ub9cc\uc788\ub294\uacf5\ubc31": pd.Series([None, pd.NA, np.nan], dtype="object"),
+                    }
+                ),
+                pd.DataFrame(
+                    {
+                        "\uc218\ub7c9": pd.Series([pd.NA], dtype="object"),
+                        "\uc2dd\ubcc4\uc790": pd.Series([pd.NA], dtype="object"),
+                        "\ucd9c\uace0\ub9cc\uc788\ub294\uacf5\ubc31": pd.Series([pd.NA], dtype="object"),
+                    }
+                ),
+            ]
+            detail_before = [df.copy(deep=True) for df in detail_frames]
+            query_calls = {"count": 0}
+            original_query_to_df = product_flow_mod.query_to_df
+
+            def _fake_query_to_df(_sql, _params):
+                idx = query_calls["count"]
+                query_calls["count"] += 1
+                return detail_frames[idx].copy(deep=True)
+
+            try:
+                product_flow_mod.query_to_df = _fake_query_to_df
+                with warnings.catch_warnings(record=True) as caught_detail:
+                    warnings.simplefilter("always")
+                    detail_out = product_flow_mod._get_detail_df(detail_params, detail_settings)
+            finally:
+                product_flow_mod.query_to_df = original_query_to_df
+
+            display_settings = product_flow_mod._mode_settings({"flow_scope": "all"})
+            display_detail = pd.DataFrame(
+                {
+                    "\uc815\ub82c\uc77c\uc790": ["20260702", "20260703"],
+                    "\uc815\ub82c\uc21c\ubc88": [2, 3],
+                    "\ub0b4\ubd80\ubc29\ud5a5": ["IN", "OUT"],
+                    "\uc7ac\uace0\uc99d\uac10": [10, -4],
+                    "\uc785\uace0\uc218\ub7c9": [10, 0],
+                    "\ucd9c\uace0\uc218\ub7c9": [0, 4],
+                    "\ud560\uc99d": [0, 0],
+                    "\uacf5\uae09\uac00\uc561": [1000, 2000],
+                    "\ubd80\uac00\uc138": [100, 200],
+                    "\ud569\uacc4\uae08\uc561": [1100, 2200],
+                    "\uc785\ucd9c\uace0\uc77c\uc790": ["20260702", "20260703"],
+                    "\uba85\uc138\uc11c\uc77c\uc790": ["20260702", "20260703"],
+                    "\uc7ac\uace0\uc704\uce58": ["0001", "0001"],
+                    "\uc81c\uc870\ubc88\ud638": ["000123", "001-A"],
+                    "\uac80\uc218\ud655\uc778": ["1", "0"],
+                    "\uc601\uc5c5\uc0ac\uc6d0": ["0", "001"],
+                }
+            )
+            display_before = display_detail.copy(deep=True)
+            with warnings.catch_warnings(record=True) as caught_display:
+                warnings.simplefilter("always")
+                display_out, display_meta = product_flow_mod._prepare_display_df(
+                    display_detail,
+                    5.0,
+                    display_settings,
+                    {"physic_cd": "000123", "physic_nm": "\ud14c\uc2a4\ud2b8", "stock_names": ["0001"]},
+                )
+
+            failures: list[str] = []
+            detail_warnings = [str(w.message) for w in caught_detail if msg_part in str(w.message)]
+            display_warnings = [str(w.message) for w in caught_display if msg_part in str(w.message)]
+            if detail_warnings:
+                failures.append(f"detail_concat_futurewarning={len(detail_warnings)}")
+            if display_warnings:
+                failures.append(f"display_concat_futurewarning={len(display_warnings)}")
+            if query_calls["count"] != 2:
+                failures.append(f"detail_query_calls={query_calls['count']}")
+            if len(detail_out) != 4:
+                failures.append(f"detail_rows={len(detail_out)}")
+            expected_detail_cols = ["\uc218\ub7c9", "\uc2dd\ubcc4\uc790", "\uc785\uace0\ub9cc\uc788\ub294\uacf5\ubc31", "\ucd9c\uace0\ub9cc\uc788\ub294\uacf5\ubc31"]
+            if list(detail_out.columns) != expected_detail_cols:
+                failures.append(f"detail_cols={list(detail_out.columns)!r}")
+            if detail_out["\uc2dd\ubcc4\uc790"].iloc[0] != "001" or detail_out["\uc2dd\ubcc4\uc790"].iloc[1] != "0":
+                failures.append(f"detail_identifier_values={detail_out['\uc2dd\ubcc4\uc790'].tolist()!r}")
+            if detail_out["\uc218\ub7c9"].iloc[1] != 0:
+                failures.append(f"detail_zero={detail_out['\uc218\ub7c9'].tolist()!r}")
+            if not pd.isna(detail_out["\uc785\uace0\ub9cc\uc788\ub294\uacf5\ubc31"]).all():
+                failures.append("detail_all_na_col_changed")
+            for actual, before in zip(detail_frames, detail_before):
+                try:
+                    pd.testing.assert_frame_equal(actual, before, check_dtype=True)
+                except AssertionError as assert_exc:
+                    failures.append(f"detail_input_mutated={assert_exc}")
+
+            if len(display_out) != 3:
+                failures.append(f"display_rows={len(display_out)}")
+            if display_out.iloc[0].get("\uc785\ucd9c\uace0\uc77c\uc790") != "\uc774\uc6d4\uc7ac\uace0":
+                failures.append(f"display_carry_label={display_out.iloc[0].get('\uc785\ucd9c\uace0\uc77c\uc790')!r}")
+            if str(display_out["\uba85\uc138\uc11c\ubc88\ud638"].dtype) != "Int64":
+                failures.append(f"display_seq_dtype={display_out['\uba85\uc138\uc11c\ubc88\ud638'].dtype}")
+            if display_out["\uc81c\uc870\ubc88\ud638"].tolist()[1:] != ["000123", "001-A"]:
+                failures.append(f"display_product_no={display_out['\uc81c\uc870\ubc88\ud638'].tolist()!r}")
+            if display_out["\uac80\uc218\ud655\uc778"].tolist()[1:] != ["1", "0"]:
+                failures.append(f"display_validation={display_out['\uac80\uc218\ud655\uc778'].tolist()!r}")
+            for col in ["\uc785\uace0\uc218\ub7c9", "\ucd9c\uace0\uc218\ub7c9", "\uacf5\uae09\uac00\uc561", "\ud569\uacc4\uae08\uc561"]:
+                if not pd.api.types.is_numeric_dtype(display_out[col]):
+                    failures.append(f"display_numeric_{col}_dtype={display_out[col].dtype}")
+            if display_meta.get("row_count") != 3:
+                failures.append(f"display_meta_row_count={display_meta.get('row_count')}")
+            try:
+                pd.testing.assert_frame_equal(display_detail, display_before, check_dtype=True)
+            except AssertionError as assert_exc:
+                failures.append(f"display_input_mutated={assert_exc}")
+
+            if failures:
+                results.append(_fail("product flow concat futurewarning", "; ".join(failures)))
+            else:
+                results.append(_ok("product flow concat futurewarning", "detail and carry-row concat paths emit no concat FutureWarning while preserving rows, column order, dtypes, and input frames"))
+        except Exception as e:
+            results.append(_fail("product flow concat futurewarning", f"{type(e).__name__}: {e}"))
+
+        try:
             import io
             import json
             from openpyxl import load_workbook

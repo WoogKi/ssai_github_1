@@ -334,6 +334,45 @@ def _finalize_display_df_250(df: pd.DataFrame) -> pd.DataFrame:
             )
     return out
 
+
+def _concat_product_flow_frames(
+    frames: list[pd.DataFrame],
+    *,
+    columns: list[str] | None = None,
+    ignore_index: bool = True,
+    sort: bool = False,
+) -> pd.DataFrame:
+    """Concat product-flow frames without letting empty/all-NA columns decide dtypes."""
+    ordered_cols: list[Any] = list(columns or [])
+    if not ordered_cols:
+        seen_cols: set[Any] = set()
+        for df in frames:
+            if not isinstance(df, pd.DataFrame):
+                continue
+            for col in df.columns:
+                if col not in seen_cols:
+                    ordered_cols.append(col)
+                    seen_cols.add(col)
+
+    concat_inputs: list[pd.DataFrame] = []
+    for df in frames:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        work = df.copy()
+        all_na_cols = [col for col in work.columns if work[col].isna().all()]
+        if all_na_cols:
+            work = work.drop(columns=all_na_cols)
+        concat_inputs.append(work)
+
+    if not concat_inputs:
+        return pd.DataFrame(columns=ordered_cols)
+
+    out = pd.concat(concat_inputs, ignore_index=ignore_index, sort=sort)
+    if ordered_cols:
+        out = out.reindex(columns=ordered_cols)
+    return out
+
+
 def _clean_display_df_250(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
@@ -674,7 +713,7 @@ def _get_detail_df(params: Dict[str, Any], settings: Dict[str, Any]) -> pd.DataF
     if not frames:
         return pd.DataFrame()
 
-    return pd.concat(frames, ignore_index=True, sort=False)
+    return _concat_product_flow_frames(frames, ignore_index=True, sort=False)
 
 
 def _build_month_carry_sql(params: Dict[str, Any], settings: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -940,12 +979,13 @@ def _prepare_display_df(
     product_info = _build_product_info(first_src)
     carry_row = _make_carry_row(first_src)
 
-    out = pd.concat(
+    out = _concat_product_flow_frames(
         [
             pd.DataFrame([carry_row], columns=display_cols),
             work[display_cols],
         ],
         ignore_index=True,
+        columns=display_cols,
     )
     out = _finalize_display_df_250(out)
 
