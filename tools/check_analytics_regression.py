@@ -3826,6 +3826,116 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("product flow concat futurewarning", f"{type(e).__name__}: {e}"))
 
         try:
+            import pyarrow as pa
+
+            from app.sims.views import rddbc_io_shared as io_shared_mod
+            from app.ui import chat_middleware as chat_mod
+            from app.ui import sims_panel as panel_mod
+            from app.ui import sims_table_display as display_mod
+
+            seq_col = "\uba85\uc138\uc11c\ubc88\ud638"
+            product_no_col = "\uc81c\uc870\ubc88\ud638"
+            validation_col = "\uac80\uc218\ud655\uc778"
+            amount_col = "\ud569\uacc4\uae08\uc561"
+            qty_col = "\uc785\uace0\uc218\ub7c9"
+            salesperson_col = "\uc601\uc5c5\uc0ac\uc6d0"
+            source_df = pd.DataFrame(
+                {
+                    seq_col: pd.Series([pd.NA, 268, 628], dtype="Int64"),
+                    product_no_col: ["000123", "001-A", "114625021"],
+                    validation_col: ["1", "0", "Y"],
+                    amount_col: [0, 1100, 2200],
+                    qty_col: [0, 10, 20],
+                    salesperson_col: ["0", "001", "A-01"],
+                }
+            )
+            source_before = source_df.copy(deep=True)
+            calls: list[dict[str, Any]] = []
+            original_dataframe = display_mod.st.dataframe
+
+            def _fake_dataframe(data=None, *args, **kwargs):
+                calls.append({"data": data, "args": args, "kwargs": dict(kwargs)})
+                return data
+
+            try:
+                display_mod.st.dataframe = _fake_dataframe
+                chat_mod.st.dataframe = _fake_dataframe
+                panel_mod.st.dataframe = _fake_dataframe
+                io_shared_mod.st.dataframe = _fake_dataframe
+
+                display_view = display_mod.render_sims_table(
+                    source_df.copy(),
+                    action_name="\uc81c\ud488\uc218\ubd88\ud604\ud669 \uc870\ud68c",
+                    add_row_no=False,
+                    key="__regression_width_display",
+                )
+                chat_mod._render_chat_fast_dataframe(
+                    source_df.copy(),
+                    height=320,
+                    action_name="\ud604\uc7ac\ud45c \uc601\uc5c5\uc0ac\uc6d0 TOP 20",
+                    meta={"current_table_followup": True},
+                )
+                panel_mod._render_fast_dataframe(
+                    source_df.copy(),
+                    height=340,
+                    action_name="\uc81c\ud488\uc218\ubd88\ud604\ud669 \uc870\ud68c",
+                    meta={"table_key": "sims_width_panel"},
+                )
+                io_view = io_shared_mod._render_io_dataframe(
+                    source_df.copy(),
+                    key="__regression_width_io",
+                    add_row_no=False,
+                    use_container_width=False,
+                    height=280,
+                )
+            finally:
+                display_mod.st.dataframe = original_dataframe
+                chat_mod.st.dataframe = original_dataframe
+                panel_mod.st.dataframe = original_dataframe
+                io_shared_mod.st.dataframe = original_dataframe
+
+            failures: list[str] = []
+            if len(calls) != 4:
+                failures.append(f"dataframe_call_count={len(calls)}")
+            expected_widths = ["stretch", "stretch", "stretch", "content"]
+            for idx, expected_width in enumerate(expected_widths):
+                if idx >= len(calls):
+                    continue
+                kwargs = calls[idx]["kwargs"]
+                if "use_container_width" in kwargs:
+                    failures.append(f"call{idx}_deprecated_kwarg")
+                if kwargs.get("width") != expected_width:
+                    failures.append(f"call{idx}_width={kwargs.get('width')!r}")
+                if "height" not in kwargs:
+                    failures.append(f"call{idx}_height_missing")
+            for idx in [0, 1, 2]:
+                if idx < len(calls) and not calls[idx]["kwargs"].get("column_config"):
+                    failures.append(f"call{idx}_column_config_missing")
+            if len(calls) >= 4 and calls[3]["kwargs"].get("height") != 280:
+                failures.append(f"io_height={calls[3]['kwargs'].get('height')!r}")
+            if isinstance(display_view, pd.DataFrame):
+                try:
+                    pa.Table.from_pandas(display_view, preserve_index=False)
+                except Exception as arrow_exc:
+                    failures.append(f"display_arrow={type(arrow_exc).__name__}: {arrow_exc}")
+            if isinstance(io_view, pd.DataFrame):
+                if io_view[product_no_col].tolist() != ["000123", "001-A", "114625021"]:
+                    failures.append(f"io_product_no={io_view[product_no_col].tolist()!r}")
+                if io_view[validation_col].tolist() != ["1", "0", "Y"]:
+                    failures.append(f"io_validation={io_view[validation_col].tolist()!r}")
+            try:
+                pd.testing.assert_frame_equal(source_df, source_before, check_dtype=True)
+            except AssertionError as assert_exc:
+                failures.append(f"source_mutated={assert_exc}")
+
+            if failures:
+                results.append(_fail("streamlit width compatibility for SIMS tables", "; ".join(failures)))
+            else:
+                results.append(_ok("streamlit width compatibility for SIMS tables", "display/chat-fast/panel-fast/io wrappers pass width kwargs, preserve height/column_config and avoid deprecated use_container_width"))
+        except Exception as e:
+            results.append(_fail("streamlit width compatibility for SIMS tables", f"{type(e).__name__}: {e}"))
+
+        try:
             import io
             import json
             from openpyxl import load_workbook

@@ -1266,7 +1266,7 @@ def render_sims_table(
     )
 
     kwargs = {
-        "use_container_width": use_container_width,
+        "width": "stretch" if use_container_width else "content",
         "hide_index": hide_index,
         "height": table_height,
     }

@@ -506,7 +506,7 @@ def _render_fast_dataframe(
         log_sims_display_fields(df, view_df, action=action_name, render_path="panel", mode="fast")
         st.dataframe(
             view_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=table_height,
             column_config=column_config if column_config else None,
@@ -516,7 +516,7 @@ def _render_fast_dataframe(
         cfg = _fast_column_config(view_df)
         st.dataframe(
             view_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=height,
             column_config=cfg if cfg else None,
@@ -1768,7 +1768,7 @@ def _render_compact_panel_result_placeholder(
         if st.button(
             "📊 패널 표 다시 표시",
             key=f"__panel_show_full_again_{button_key_base}",
-            use_container_width=True,
+            width="stretch",
         ):
             st.session_state[force_key] = True
             st.rerun()
@@ -1777,7 +1777,7 @@ def _render_compact_panel_result_placeholder(
         run_llm = st.button(
             "🤖 LLM 분석",
             key=f"__panel_compact_llm_{button_key_base}",
-            use_container_width=True,
+            width="stretch",
         )
 
     with c3:
@@ -3554,7 +3554,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
 
                     st.dataframe(
                         view_df,
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=table_height,
                         column_config=column_config if column_config else None,
@@ -3565,7 +3565,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
 
                     st.dataframe(
                         safe_df,
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=520,
                     )
@@ -4078,14 +4078,14 @@ def _render_panel_result_actions_fragment(
                 file_name=csv_name,
                 mime="text/csv",
                 key=f"__panel_dl_csv_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.button(
                 "🔒 CSV 저장",
                 disabled=True,
                 key=f"__panel_dl_csv_disabled_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
                 help=_export_unavailable_help(),
             )
 
@@ -4098,7 +4098,7 @@ def _render_panel_result_actions_fragment(
                     file_name=xlsx_name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key=f"__panel_dl_xlsx_{key_suffix}",
-                    use_container_width=True,
+                    width="stretch",
                 )
             else:
                 st.caption("Excel 엔진 없음")
@@ -4107,7 +4107,7 @@ def _render_panel_result_actions_fragment(
                 "🔒 Excel 저장",
                 disabled=True,
                 key=f"__panel_dl_xlsx_disabled_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
                 help=_export_unavailable_help(),
             )
 
@@ -4115,7 +4115,7 @@ def _render_panel_result_actions_fragment(
         run_llm = st.button(
             "🤖 LLM 분석",
             key=f"__panel_llm_analysis_fragment_btn_{key_suffix}",
-            use_container_width=True,
+            width="stretch",
         )
 
     if not can_export_excel:
@@ -4218,7 +4218,7 @@ def _render_panel_result_actions_lazy(
             run_llm = st.button(
                 "🤖 LLM 분석",
                 key=f"__panel_llm_analysis_lazy_empty_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             )
 
         if run_llm:
@@ -4242,7 +4242,7 @@ def _render_panel_result_actions_lazy(
                 "🔒 CSV 저장",
                 disabled=True,
                 key=f"__panel_dl_csv_lazy_disabled_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
                 help=_export_unavailable_help(),
             )
 
@@ -4251,7 +4251,7 @@ def _render_panel_result_actions_lazy(
                 "🔒 Excel 저장",
                 disabled=True,
                 key=f"__panel_dl_xlsx_lazy_disabled_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
                 help=_export_unavailable_help(),
             )
 
@@ -4259,7 +4259,7 @@ def _render_panel_result_actions_lazy(
             run_llm = st.button(
                 "🤖 LLM 분석",
                 key=f"__panel_llm_analysis_lazy_no_export_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             )
 
         if run_llm:
@@ -4291,7 +4291,7 @@ def _render_panel_result_actions_lazy(
             if st.button(
                 "Excel 다운로드 준비",
                 key=f"__panel_prepare_download_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             ):
                 ss[ready_key] = True
                 st.rerun()
@@ -4303,7 +4303,7 @@ def _render_panel_result_actions_lazy(
             run_llm = st.button(
                 "🤖 LLM 분석",
                 key=f"__panel_llm_analysis_lazy_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             )
 
         if run_llm:

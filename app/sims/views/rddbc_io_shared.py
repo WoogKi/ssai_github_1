@@ -1363,7 +1363,7 @@ def _render_io_dataframe(
 
     st.dataframe(
         _build_io_display_styler(work, add_row_no=False, band_size=band_size),
-        use_container_width=use_container_width,
+        width="stretch" if use_container_width else "content",
         hide_index=hide_index,
         height=height,
         key=key,
@@ -1843,7 +1843,7 @@ def _render_vendor_candidate_row(
     with c3:
         vendor_search = st.form_submit_button(
             search_label,
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_inner_submit,
         )
     with c4:
@@ -1877,7 +1877,7 @@ def _render_product_candidate_row(
     with c3:
         product_search = st.form_submit_button(
             search_label,
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_inner_submit,
         )
     with c4:

@@ -1152,7 +1152,7 @@ def _render_chat_fast_dataframe(
 
         st.dataframe(
             view_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=table_height,
             column_config=column_config if column_config else None,
@@ -1169,7 +1169,7 @@ def _render_chat_fast_dataframe(
         )
         st.dataframe(
             view_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=height,
             column_config=cfg if cfg else None,
@@ -4756,7 +4756,7 @@ def _render_sims_llm_analysis_fragment(
     if st.button(
         "LLM 분석",
         key=f"sims_llm_analysis_fragment_btn_{key_suffix}",
-        use_container_width=True,
+        width="stretch",
     ):
         if not callable(runner):
             st.warning("LLM 분석 실행기가 아직 준비되지 않았습니다. 기존 방식으로 실행합니다.")
@@ -4815,7 +4815,7 @@ def _render_sims_result_actions_fragment(
             file_name=csv_name,
             mime="text/csv",
             key=f"sims_csv_{key_suffix}",
-            use_container_width=True,
+            width="stretch",
         )
 
     with c2:
@@ -4825,14 +4825,14 @@ def _render_sims_result_actions_fragment(
             file_name=xlsx_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"sims_xlsx_{key_suffix}",
-            use_container_width=True,
+            width="stretch",
         )
 
     with c3:
         run_llm = st.button(
             "LLM 분석",
             key=f"sims_llm_analysis_fragment_btn_{key_suffix}",
-            use_container_width=True,
+            width="stretch",
         )
 
     # 중요: columns 밖이므로 결과는 전체 폭으로 표시된다.
@@ -5104,7 +5104,7 @@ def _render_sims_result_actions_lazy(
             run_llm = st.button(
                 "LLM 분석",
                 key=f"sims_llm_analysis_btn_lazy_empty_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             )
 
         if run_llm:
@@ -5175,7 +5175,7 @@ def _render_sims_result_actions_lazy(
             if st.button(
                 "Excel 다운로드 준비",
                 key=f"sims_prepare_download_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             ):
                 try:
                     ss["__ui_rerun_reason"] = "download_prepare"
@@ -5192,7 +5192,7 @@ def _render_sims_result_actions_lazy(
             run_llm = st.button(
                 "LLM 분석",
                 key=f"sims_llm_analysis_btn_lazy_{key_suffix}",
-                use_container_width=True,
+                width="stretch",
             )
 
         if run_llm:
@@ -5311,7 +5311,7 @@ def _render_sims_result_actions_plain(
             file_name=csv_name,
             mime="text/csv",
             key=f"sims_csv_{key_suffix}",
-            use_container_width=True,
+            width="stretch",
         )
 
     with c2:
@@ -5321,14 +5321,14 @@ def _render_sims_result_actions_plain(
             file_name=xlsx_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"sims_xlsx_{key_suffix}",
-            use_container_width=True,
+            width="stretch",
         )
 
     with c3:
         run_llm = st.button(
             "LLM 분석",
             key=f"sims_llm_analysis_btn_{key_suffix}",
-            use_container_width=True,
+            width="stretch",
         )
 
     if run_llm:
@@ -5766,7 +5766,7 @@ def _render_old_sims_table_placeholder(
     if st.button(
         "이전 표 다시 표시",
         key=f"show_old_sims_table_{uid}",
-        use_container_width=False,
+        width="content",
     ):
         before_force = _is_old_sims_table_force_rendered(item, meta, uid)
         _set_old_sims_table_force_rendered(item, meta, uid, True)
@@ -8998,7 +8998,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                     st.dataframe(
                         candidate_df,
-                        use_container_width=False,
+                        width="content",
                         hide_index=True,
                         height=min(460, 80 + 30 * max(len(candidate_df), 1)),
                         column_config=column_config if column_config else None,
@@ -9014,7 +9014,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     log.exception("[chat] candidate compact table render failed")
                     st.dataframe(
                         data,
-                        use_container_width=False,
+                        width="content",
                         hide_index=True,
                         height=min(460, 80 + 30 * max(len(data), 1)),
                     )
@@ -9119,7 +9119,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
                             st.dataframe(
                                 styled_view,
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                                 height=table_height,
                                 column_config=column_config if column_config else None,
@@ -9131,7 +9131,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     if not rendered_with_style:
                         st.dataframe(
                             view_df,
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                             height=table_height,
                             column_config=column_config if column_config else None,
@@ -9150,7 +9150,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                     st.dataframe(
                         render_df,
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                         height=520,
                     )
@@ -9203,7 +9203,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 renderer="_render_chat_fast_dataframe",
                                 height=520,
                                 visible_rows=min(int(len(render_df)), 300),
-                                width_mode="use_container_width",
+                                width_mode="stretch",
                                 column_config_count=0,
                             )
                             _render_chat_fast_dataframe(
@@ -9244,13 +9244,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 renderer="build_sims_table_display_config+st.dataframe",
                                 height=table_height,
                                 visible_rows=min(int(len(view_df)), max(int((int(table_height) - 48) / 32), 0)),
-                                width_mode="use_container_width",
+                                width_mode="stretch",
                                 column_config_count=len(column_config or {}),
                             )
                             try:
                                 st.dataframe(
                                     view_df,
-                                    use_container_width=True,
+                                    width="stretch",
                                     hide_index=True,
                                     height=table_height,
                                     column_config=column_config if column_config else None,
@@ -9259,7 +9259,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 log.debug("[chat] small analysis table styler skipped", exc_info=True)
                                 st.dataframe(
                                     view_df,
-                                    use_container_width=True,
+                                    width="stretch",
                                     hide_index=True,
                                     height=table_height,
                                     column_config=column_config if column_config else None,
@@ -9284,7 +9284,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             )
                             st.dataframe(
                                 fallback_df,
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                                 height=table_height,
                                 column_config=column_config if column_config else None,
@@ -9292,7 +9292,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         except Exception:
                             st.dataframe(
                                 normalize_display_df_for_streamlit(data),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                                 height=520,
                             )
@@ -9359,7 +9359,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
                                 st.dataframe(
                                     styled_view,
-                                    use_container_width=True,
+                                    width="stretch",
                                     hide_index=True,
                                     height=table_height,
                                     column_config=column_config if column_config else None,
@@ -9371,7 +9371,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         if not rendered_with_style:
                             st.dataframe(
                                 view_df,
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                                 height=table_height,
                                 column_config=column_config if column_config else None,
@@ -9389,7 +9389,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                         st.dataframe(
                             fallback_df,
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                             height=520,
                         )
@@ -9401,7 +9401,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     if st.button(
                         "이전표 접기",
                         key=f"hide_old_sims_table_{uid2}",
-                        use_container_width=False,
+                        width="content",
                     ):
                         before_force = _is_old_sims_table_force_rendered(item, meta, uid2)
                         _set_old_sims_table_force_rendered(item, meta, uid2, False)
@@ -9554,7 +9554,7 @@ def render_sims_context_controls() -> None:
 
         if st.button(
             "컨텍스트 리셋",
-            use_container_width=True,
+            width="stretch",
             key=f"__sims_ctx_reset_btn::{ns}",
         ):
             _clear_sims_only()
