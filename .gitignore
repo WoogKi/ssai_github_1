@@ -120,10 +120,35 @@ Zip_File/
 # Selective Git policy after Phase 3
 # =========================================================
 
-# docs: do not add whole docs folder
-docs/*
-!docs/phase3/
-!docs/phase3/**
+# docs: track only official Markdown source areas, ignore generated/binary artifacts
+docs/**
+!docs/
+!docs/README.md
+!docs/00_roadmap/
+!docs/00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.2_20260719.md
+!docs/00_roadmap/SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.1_20260719.md
+!docs/01_phase_reports/
+!docs/01_phase_reports/**/
+!docs/01_phase_reports/**/*.md
+!docs/02_design/
+!docs/02_design/**/
+!docs/02_design/**/*.md
+!docs/03_runbook/
+!docs/03_runbook/**/
+!docs/03_runbook/**/*.md
+!docs/04_test_results/
+!docs/04_test_results/**/
+!docs/04_test_results/**/*.md
+docs/**/*.docx
+docs/**/*.pdf
+docs/**/*.xlsx
+docs/**/*.xls
+docs/**/*.csv
+docs/**/*.png
+docs/**/*.jpg
+docs/**/*.jpeg
+docs/**/*.zip
+docs/**/*.log
 
 # app root: do not add old/test/root files blindly
 app/*.STABLE.py
