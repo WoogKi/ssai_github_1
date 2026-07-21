@@ -3,7 +3,7 @@
 
 VERSION = "chat_middleware/2025-11-01T-v1"
 
-import os, logging
+import os, logging, time
 from contextlib import contextmanager
 from urllib.parse import quote_plus
 import pyodbc
@@ -161,20 +161,8 @@ def _get_company_engine(company_id: int) -> Engine:
     if company_id in _COMPANY_ENGINES:
         return _COMPANY_ENGINES[company_id]
 
+    t0 = time.perf_counter()
     raw = _build_company_conn_str(company_id)
-
-    try:
-        masked = raw
-        # Pwd=...; 부분만 마스킹
-        import re as _re
-        masked = _re.sub(r"Pwd=\{?.*?\}?;", "Pwd=******;", masked)
-        logging.getLogger("ssai.sims.sql").info(
-            "ODBC company conn company_id=%s: %s",
-            company_id,
-            masked,
-        )
-    except Exception:
-        pass
 
     params = quote_plus(raw)
     echo = os.getenv("SQL_ECHO", "no").lower() == "yes"
@@ -190,6 +178,16 @@ def _get_company_engine(company_id: int) -> Engine:
     )
 
     _COMPANY_ENGINES[company_id] = engine
+    try:
+        logging.getLogger("ssai.sims.sql").info(
+            "[db.connection] company_id=%s connection_configured=%s connection_result=%s elapsed_ms=%s",
+            company_id,
+            bool(raw),
+            "engine_created",
+            int((time.perf_counter() - t0) * 1000),
+        )
+    except Exception:
+        pass
     return engine
 
 
@@ -216,18 +214,8 @@ def _get_engine() -> Engine:
     if _ENGINE is not None:
         return _ENGINE
 
+    t0 = time.perf_counter()
     raw = _build_conn_str()
-
-    # 비번 마스킹 로깅(1회)
-    try:
-        masked = raw
-        pw = os.getenv("MSSQL_PWD") or ""
-        if pw:
-            for needle in (f"Pwd={pw};", f"Pwd={{{pw}}};"):
-                masked = masked.replace(needle, "Pwd=******;")
-        logging.getLogger("ssai.sims.sql").info("ODBC conn: %s", masked)
-    except Exception:
-        pass
 
     params = quote_plus(raw)
     echo = os.getenv("SQL_ECHO", "no").lower() == "yes"
@@ -240,6 +228,16 @@ def _get_engine() -> Engine:
         connect_args={"timeout": 5}
     )
     _ENGINE = engine
+    try:
+        logging.getLogger("ssai.sims.sql").info(
+            "[db.connection] company_id=%s connection_configured=%s connection_result=%s elapsed_ms=%s",
+            "",
+            bool(raw),
+            "engine_created",
+            int((time.perf_counter() - t0) * 1000),
+        )
+    except Exception:
+        pass
     return engine
 
 def get_engine() -> Engine:
@@ -330,7 +328,7 @@ def health_check() -> dict:
             conn.execute(text("SELECT 1"))
         return True
     except Exception:
-        _sims.exception("[DB] health_check 실패")
+        _sims.warning("[DB] health_check failed")
         return False
 
 

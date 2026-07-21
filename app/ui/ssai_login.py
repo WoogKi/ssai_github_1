@@ -66,8 +66,7 @@ def _login_log_context(
     **extra,
 ) -> dict:
     """
-    인증/회원사 ERP DB 선택 로그용 식별 컨텍스트.
-    비밀번호/SIMS 비밀번호/질문 전문은 절대 포함하지 않는다.
+    인증/회원사 선택 로그용 비식별 컨텍스트.
     """
     try:
         user = user or st.session_state.get(SESSION_AUTH_USER)
@@ -81,24 +80,23 @@ def _login_log_context(
 
     ctx = {
         "user_id": getattr(user, "user_id", None),
-        "login_id": getattr(user, "login_id", None),
         "user_type": getattr(user, "user_type", None),
         "user_grade": getattr(user, "user_grade", None),
         "company_id": None,
-        "company_name": "",
-        "db_name": "",
     }
 
     if isinstance(company, dict):
         ctx.update(
             {
                 "company_id": company.get("company_id"),
-                "company_name": company.get("company_name"),
-                "db_name": company.get("db_name"),
             }
         )
 
-    ctx.update(extra)
+    blocked_keys = {
+        "api_key", "company_name", "connection_string", "db_name", "dsn", "login_id",
+        "password", "path", "server", "user", "username",
+    }
+    ctx.update({key: value for key, value in extra.items() if str(key).lower() not in blocked_keys})
     return ctx
 
 
@@ -110,12 +108,9 @@ def _login_log_kv(
     ctx = _login_log_context(user=user, company=company, **extra)
     order = [
         "user_id",
-        "login_id",
         "user_type",
         "user_grade",
         "company_id",
-        "company_name",
-        "db_name",
     ]
     order += [k for k in ctx.keys() if k not in order]
 
@@ -138,6 +133,13 @@ def _clear_company_dependent_state() -> None:
         st.cache_data.clear()
     except Exception:
         pass
+
+    try:
+        from app.sims.views.dashboard_lite import clear_dashboard_lite_session_state
+
+        clear_dashboard_lite_session_state(st.session_state)
+    except Exception:
+        log.warning("[auth.company] dashboard state clear failed error_type=DashboardStateClearError")
 
     # SIMS 현재표 / 분석 컨텍스트 / 다운로드 캐시 정리
     keys_to_clear = [
@@ -334,8 +336,8 @@ def _complete_login(result) -> bool:
     """
     if not result.success or result.user is None:
         log.warning(
-            "[auth.login] failed reason=%s",
-            _safe_log_value(getattr(result, "fail_reason", "")),
+            "[auth.login] failed reason_present=%s",
+            bool(getattr(result, "fail_reason", "")),
         )
         st.error(f"로그인 실패: {result.fail_reason}")
         return False
@@ -425,13 +427,11 @@ def _company_selector_label(company: dict) -> str:
     member_code = _member_code_of(company) or "-"
     erp_db_name = _erp_db_display_name_of(company) or "-"
     db_usage_type = str(company.get("db_usage_type") or company.get("company_type") or "").strip()
-    db_name = _db_name_of(company) or "-"
-
     middle = f"{member_name} ({member_code}) / ERP DB: {erp_db_name}"
     if db_usage_type:
         middle += f" / {db_usage_type}"
 
-    return f"{middle} / DB: {db_name}"
+    return middle
 
 
 def _after_company_selected(
@@ -628,10 +628,9 @@ def render_logout_box() -> None:
     except Exception as e:
         selectable_companies = []
         log.warning(
-            "[auth.company] sidebar company list failed login_id=%s error=%s: %s",
-            getattr(user, "login_id", ""),
+            "[auth.company] sidebar company list failed user_id=%s error_type=%s",
+            getattr(user, "user_id", None),
             type(e).__name__,
-            e,
         )
 
     with st.sidebar:
@@ -645,10 +644,6 @@ def render_logout_box() -> None:
             st.markdown("### 사용 회원사")
             st.write(f"회원사: **{_member_name_of(company) or '-'}**")
             st.write(f"ERP DB: **{_erp_db_display_name_of(company) or '-'}**")
-
-            db_name = _db_name_of(company)
-            if db_name and _can_show_physical_db_name(user):
-                st.write(f"DB명: `{db_name}`")
 
         if _can_change_member_erp_db(user, selectable_companies):
             if st.button("회원사 / ERP DB 변경", use_container_width=True):
@@ -723,8 +718,7 @@ def render_company_selector() -> bool:
 
     st.info(
         f"선택 예정 회원사: {_member_name_of(selected_company)} / "
-        f"ERP DB: {_erp_db_display_name_of(selected_company)} / "
-        f"DB명: {_db_name_of(selected_company)}"
+        f"ERP DB: {_erp_db_display_name_of(selected_company)}"
     )
 
     sims_change_password = ""
@@ -805,10 +799,10 @@ def render_company_selector() -> bool:
                 sims_user_id=sims_user_id_for_change,
             )
         except Exception as e:
-            log.exception(
-                "[auth.company] sims password check failed company_id=%s login_id=%s",
+            log.warning(
+                "[auth.company] sims password check failed company_id=%s error_type=%s",
                 selected_id,
-                user.login_id,
+                type(e).__name__,
             )
             st.error(f"SIMS 사용자 확인 중 오류가 발생했습니다: {type(e).__name__}: {e}")
             return False
@@ -1030,8 +1024,7 @@ def render_login_form() -> bool:
 
         if cancel_submitted:
             log.info(
-                "[auth.login] wholesale sims auth cancelled login_id=%s user_id=%s",
-                _safe_log_value(pending_auth.get("login_id")),
+                "[auth.login] wholesale sims auth cancelled user_id=%s",
                 _safe_log_value(pending_auth.get("user_id")),
             )
             _clear_pending_wholesale_auth()
@@ -1052,17 +1045,15 @@ def render_login_form() -> bool:
 
         if not result.success:
             log.warning(
-                "[auth.login] wholesale sims auth failed login_id=%s user_id=%s reason=%s",
-                _safe_log_value(pending_auth.get("login_id")),
+                "[auth.login] wholesale sims auth failed user_id=%s reason_present=%s",
                 _safe_log_value(pending_auth.get("user_id")),
-                _safe_log_value(result.fail_reason),
+                bool(result.fail_reason),
             )
             st.error(f"SIMS 인증 실패: {result.fail_reason}")
             return False
 
         log.info(
-            "[auth.login] wholesale sims auth success login_id=%s user_id=%s",
-            _safe_log_value(pending_auth.get("login_id")),
+            "[auth.login] wholesale sims auth success user_id=%s",
             _safe_log_value(pending_auth.get("user_id")),
         )
         return _complete_login(result)
@@ -1098,15 +1089,14 @@ def render_login_form() -> bool:
 
     if not result.success:
         log.warning(
-            "[auth.login] ssai auth failed login_id=%s reason=%s",
-            _safe_log_value(login_id),
-            _safe_log_value(result.fail_reason),
+            "[auth.login] ssai auth failed reason_present=%s",
+            bool(result.fail_reason),
         )
         st.error(f"SS AI 인증 실패: {result.fail_reason}")
         return False
 
     if result.user is None:
-        log.warning("[auth.login] user is none login_id=%s", _safe_log_value(login_id))
+        log.warning("[auth.login] user is none")
         st.error("로그인 사용자 정보를 읽지 못했습니다.")
         return False
 

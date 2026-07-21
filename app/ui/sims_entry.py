@@ -124,6 +124,9 @@ def _panel_sidebar() -> Dict[str, str]:
     }
 
     analytics_action_group_map = {
+        "대시보드": [
+            "Dashboard Lite v0.1",
+        ],
         "매출분석": [
             "제약사별 매출 추세 분석",
             "제약사별 매출 추세 분석 요약표",
@@ -158,6 +161,7 @@ def _panel_sidebar() -> Dict[str, str]:
     }
 
     analytics_group_key_map = {
+        "대시보드": "dashboard",
         "매출분석": "sales",
         "매출예상": "forecast",
         "재고부족": "shortage",

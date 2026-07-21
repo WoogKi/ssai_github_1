@@ -46,8 +46,14 @@ SALES_TREND_PUBLIC_COLUMNS = [
     "규격",
     "제조사코드",
     "제조사명",
+    "제품그룹Gcode",
+    "제품그룹코드",
     "제품그룹명",
+    "제품구분Gcode",
+    "제품구분코드",
     "제품구분명",
+    "제품분류Gcode",
+    "제품분류코드",
     "제품분류명",
     "매입처코드",
     "매입처명",
@@ -849,8 +855,14 @@ def _load_monthly_product_master_for_codes(product_codes: list[str]) -> pd.DataF
         "규격",
         "제조사코드",
         "제조사명",
+        "제품그룹Gcode",
+        "제품그룹코드",
         "제품그룹명",
+        "제품구분Gcode",
+        "제품구분코드",
         "제품구분명",
+        "제품분류Gcode",
+        "제품분류코드",
         "제품분류명",
     ]
     if not codes:
@@ -872,9 +884,15 @@ SELECT
     P.Rd04_Standard AS [규격],
     P.Rd04_Ven_Cd AS [제조사코드],
     Make_Ven.Rd03_Ven_Nm AS [제조사명],
+    P.Rd04_Physic_Group_Gcode AS [제품그룹Gcode],
+    P.Rd04_Physic_Group AS [제품그룹코드],
     Physic_Group_Nm.Rd01_Hnm AS [제품그룹명],
+    P.Rd04_Physic_Di_Gcode AS [제품구분Gcode],
+    P.Rd04_Physic_Di AS [제품구분코드],
     Physic_Di_Nm.Rd01_Hnm AS [제품구분명],
-    Physic_Gu_Nm.Rd01_Hnm AS [제품분류명]
+    P.Rd04_Physic_Tax_Gcode AS [제품분류Gcode],
+    P.Rd04_Physic_Tax AS [제품분류코드],
+    Physic_Tax_Nm.Rd01_Hnm AS [제품분류명]
 FROM dbo.Rddbc040 AS P WITH (NOLOCK)
 LEFT JOIN dbo.Rddbc030 AS Make_Ven WITH (NOLOCK)
     ON P.Rd04_Ven_Cd = Make_Ven.Rd03_Ven_Cd
@@ -884,9 +902,9 @@ LEFT JOIN dbo.Rddbc010 AS Physic_Group_Nm WITH (NOLOCK)
 LEFT JOIN dbo.Rddbc010 AS Physic_Di_Nm WITH (NOLOCK)
     ON Physic_Di_Nm.Rd01_Gcode = P.Rd04_Physic_Di_Gcode
    AND Physic_Di_Nm.Rd01_Tcode = P.Rd04_Physic_Di
-LEFT JOIN dbo.Rddbc010 AS Physic_Gu_Nm WITH (NOLOCK)
-    ON Physic_Gu_Nm.Rd01_Gcode = P.Rd04_Physic_Gu_Gcode
-   AND Physic_Gu_Nm.Rd01_Tcode = P.Rd04_Physic_Gu
+LEFT JOIN dbo.Rddbc010 AS Physic_Tax_Nm WITH (NOLOCK)
+    ON Physic_Tax_Nm.Rd01_Gcode = P.Rd04_Physic_Tax_Gcode
+   AND Physic_Tax_Nm.Rd01_Tcode = P.Rd04_Physic_Tax
 WHERE P.Rd04_Physic_Cd IN ({",".join(placeholders)})
 """
         df = query_to_df(sql, bind_params)
@@ -1101,8 +1119,14 @@ OPTION (RECOMPILE)
         "규격",
         "제조사코드",
         "제조사명",
+        "제품그룹Gcode",
+        "제품그룹코드",
         "제품그룹명",
+        "제품구분Gcode",
+        "제품구분코드",
         "제품구분명",
+        "제품분류Gcode",
+        "제품분류코드",
         "제품분류명",
         "매입처코드",
         "매입처명",
@@ -1176,9 +1200,15 @@ SELECT
     Physic_Cd.Rd04_Ven_Cd AS 제조사코드,
     Make_Ven.Rd03_Ven_Nm AS 제조사명,
 
+    Physic_Cd.Rd04_Physic_Group_Gcode AS 제품그룹Gcode,
+    Physic_Cd.Rd04_Physic_Group AS 제품그룹코드,
     Physic_Group_Nm.Rd01_Hnm AS 제품그룹명,
+    Physic_Cd.Rd04_Physic_Di_Gcode AS 제품구분Gcode,
+    Physic_Cd.Rd04_Physic_Di AS 제품구분코드,
     Physic_Di_Nm.Rd01_Hnm AS 제품구분명,
-    Physic_Gu_Nm.Rd01_Hnm AS 제품분류명,
+    Physic_Cd.Rd04_Physic_Tax_Gcode AS 제품분류Gcode,
+    Physic_Cd.Rd04_Physic_Tax AS 제품분류코드,
+    Physic_Tax_Nm.Rd01_Hnm AS 제품분류명,
 
     {a}.{p}_Ven_Cd AS 매입처코드,
     Buy_Ven.Rd03_Ven_Nm AS 매입처명,
@@ -1259,9 +1289,9 @@ LEFT JOIN dbo.Rddbc010 AS Physic_Di_Nm WITH (NOLOCK)
     ON Physic_Di_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Di_Gcode
    AND Physic_Di_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Di
 
-LEFT JOIN dbo.Rddbc010 AS Physic_Gu_Nm WITH (NOLOCK)
-    ON Physic_Gu_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Gu_Gcode
-   AND Physic_Gu_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Gu
+LEFT JOIN dbo.Rddbc010 AS Physic_Tax_Nm WITH (NOLOCK)
+    ON Physic_Tax_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Tax_Gcode
+   AND Physic_Tax_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Tax
 
 LEFT JOIN dbo.Rddbc010 AS Stock_Cd WITH (NOLOCK)
     ON {a}.{p}_Stock_Cd_Gcode = Stock_Cd.Rd01_Gcode
@@ -1280,9 +1310,15 @@ GROUP BY
     Physic_Cd.Rd04_Ven_Cd,
     Make_Ven.Rd03_Ven_Nm,
 
+    Physic_Cd.Rd04_Physic_Group_Gcode,
+    Physic_Cd.Rd04_Physic_Group,
     Physic_Group_Nm.Rd01_Hnm,
+    Physic_Cd.Rd04_Physic_Di_Gcode,
+    Physic_Cd.Rd04_Physic_Di,
     Physic_Di_Nm.Rd01_Hnm,
-    Physic_Gu_Nm.Rd01_Hnm,
+    Physic_Cd.Rd04_Physic_Tax_Gcode,
+    Physic_Cd.Rd04_Physic_Tax,
+    Physic_Tax_Nm.Rd01_Hnm,
 
     {a}.{p}_Ven_Cd,
     Buy_Ven.Rd03_Ven_Nm,
@@ -1515,9 +1551,15 @@ SELECT
     Physic_Cd.Rd04_Ven_Cd AS 제조사코드,
     Make_Ven.Rd03_Ven_Nm AS 제조사명,
 
+    Physic_Cd.Rd04_Physic_Group_Gcode AS 제품그룹Gcode,
+    Physic_Cd.Rd04_Physic_Group AS 제품그룹코드,
     Physic_Group_Nm.Rd01_Hnm AS 제품그룹명,
+    Physic_Cd.Rd04_Physic_Di_Gcode AS 제품구분Gcode,
+    Physic_Cd.Rd04_Physic_Di AS 제품구분코드,
     Physic_Di_Nm.Rd01_Hnm AS 제품구분명,
-    Physic_Gu_Nm.Rd01_Hnm AS 제품분류명,
+    Physic_Cd.Rd04_Physic_Tax_Gcode AS 제품분류Gcode,
+    Physic_Cd.Rd04_Physic_Tax AS 제품분류코드,
+    Physic_Tax_Nm.Rd01_Hnm AS 제품분류명,
 
     Out_Put.Rd12_Ven_Cd AS 거래처코드,
     Ven_Cd.Rd03_Ven_Nm AS 거래처명,
@@ -1603,9 +1645,9 @@ LEFT JOIN dbo.Rddbc010 AS Physic_Di_Nm WITH (NOLOCK)
     ON Physic_Di_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Di_Gcode
    AND Physic_Di_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Di
 
-LEFT JOIN dbo.Rddbc010 AS Physic_Gu_Nm WITH (NOLOCK)
-    ON Physic_Gu_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Gu_Gcode
-   AND Physic_Gu_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Gu
+LEFT JOIN dbo.Rddbc010 AS Physic_Tax_Nm WITH (NOLOCK)
+    ON Physic_Tax_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Tax_Gcode
+   AND Physic_Tax_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Tax
 
 LEFT JOIN dbo.Rddbc010 AS Stock_Cd WITH (NOLOCK)
     ON Out_Put.Rd12_Stock_Cd_Gcode = Stock_Cd.Rd01_Gcode
@@ -1631,9 +1673,15 @@ GROUP BY
     Physic_Cd.Rd04_Ven_Cd,
     Make_Ven.Rd03_Ven_Nm,
 
+    Physic_Cd.Rd04_Physic_Group_Gcode,
+    Physic_Cd.Rd04_Physic_Group,
     Physic_Group_Nm.Rd01_Hnm,
+    Physic_Cd.Rd04_Physic_Di_Gcode,
+    Physic_Cd.Rd04_Physic_Di,
     Physic_Di_Nm.Rd01_Hnm,
-    Physic_Gu_Nm.Rd01_Hnm,
+    Physic_Cd.Rd04_Physic_Tax_Gcode,
+    Physic_Cd.Rd04_Physic_Tax,
+    Physic_Tax_Nm.Rd01_Hnm,
 
     Out_Put.Rd12_Ven_Cd,
     Ven_Cd.Rd03_Ven_Nm,
@@ -2926,7 +2974,10 @@ def _forecast_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def get_sales_forecast_df(
+    params: Optional[Dict[str, Any]] = None,
+    raw_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """
     품목별 매출 예상.
     품목별 매출 추세 요약표를 기반으로 예상값을 계산한다.
@@ -2935,7 +2986,7 @@ def get_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
-    df = get_sales_trend_summary_df(params)
+    df = get_sales_trend_summary_df(params, raw_df=raw_df)
     t_summary = time.perf_counter()
     if df is None or df.empty:
         log.info(
@@ -3847,7 +3898,10 @@ def _build_qty_workforward_metrics_from_wide(
     return monthly.drop(columns=[c for c in ["_이전월수요"] if c in monthly.columns])
 
 
-def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def get_stock_shortage_df(
+    params: Optional[Dict[str, Any]] = None,
+    sales_raw_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     """
     품목별 재고부족현황 1차.
 
@@ -3865,7 +3919,7 @@ def get_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFra
     stock_label = _stock_mode_label(stock_mode)
     source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
 
-    base = get_sales_forecast_df(params)
+    base = get_sales_forecast_df(params, raw_df=sales_raw_df)
     t_base = time.perf_counter()
     if base is None or base.empty:
         log.info(
@@ -4295,11 +4349,14 @@ def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 
-def get_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def get_stock_shortage_result(
+    params: Optional[Dict[str, Any]] = None,
+    sales_raw_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
-    df = get_stock_shortage_df(params)
+    df = get_stock_shortage_df(params, sales_raw_df=sales_raw_df)
     row_count = 0 if df is None else int(len(df))
 
     log.info("[analytics.stock_shortage] rows=%s params=%r", row_count, params)

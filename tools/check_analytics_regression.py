@@ -33,7 +33,7 @@ import sys
 import tempfile
 import traceback
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -1562,7 +1562,7 @@ def run_basic_checks() -> list[CheckResult]:
                 ]
             )
 
-            setattr(mod, "get_sales_forecast_df", lambda params: stock_base_df.copy())
+            setattr(mod, "get_sales_forecast_df", lambda params, raw_df=None: stock_base_df.copy())
             setattr(mod, "_load_product_current_stock", lambda *args, **kwargs: stock_current_df.copy())
 
             stock_result = mod.get_stock_shortage_df(
@@ -1660,7 +1660,7 @@ def run_basic_checks() -> list[CheckResult]:
             )
             stock_base_df_changed = stock_base_df.copy()
             stock_base_df_changed.loc[stock_base_df_changed["제품코드"].astype(str) == "STK1", "2026-06 수량"] = 999
-            setattr(mod, "get_sales_forecast_df", lambda params: stock_base_df_changed.copy())
+            setattr(mod, "get_sales_forecast_df", lambda params, raw_df=None: stock_base_df_changed.copy())
             stock_past_month_end_changed = mod.get_stock_shortage_df(
                 {
                     "month_from": "202601",
@@ -1672,7 +1672,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "stock_mode": "book",
                 }
             )
-            setattr(mod, "get_sales_forecast_df", lambda params: stock_base_df.copy())
+            setattr(mod, "get_sales_forecast_df", lambda params, raw_df=None: stock_base_df.copy())
             past_stock_row1 = stock_past_month_end[stock_past_month_end["제품코드"].astype(str) == "STK1"].iloc[0].to_dict()
             past_stock_row1_changed = stock_past_month_end_changed[stock_past_month_end_changed["제품코드"].astype(str) == "STK1"].iloc[0].to_dict()
             if abs(float(past_stock_row1.get("당월 예상출고수량") or 0) - 46) > 1e-6:
@@ -4947,19 +4947,22 @@ def run_basic_checks() -> list[CheckResult]:
                     ):
                         st.session_state.pop(key, None)
 
-                def _fake_panel_push_boundary(*, run_seq: int, action: str, table_key: str) -> bool:
+                def _fake_panel_push_boundary(*, run_seq: int, submit_seq: int, action: str, table_key: str, condition: str) -> bool:
                     calls["entry"] += 1
                     st.session_state["__sims_run_seq"] = run_seq
+                    st.session_state["__sims_query_submit_seq"] = submit_seq
                     st.session_state["__sims_selected"] = {"category": "마스터", "action": action}
                     payload = {
                         "type": "table",
                         "action": action,
+                        "condition": condition,
                         "meta": {
                             "table_key": table_key,
                             "action": action,
-                            "_panel_source_sig": panel_mod._make_panel_source_sig(action),
+                            "query_summary": condition,
                         },
                     }
+                    payload["meta"]["_panel_source_sig"] = panel_mod._make_panel_source_sig(action, payload)
                     st.session_state["__sims_last_final_payload_for_chat"] = payload
                     st.session_state["__sims_panel_last_final_payload"] = payload
                     sig = str((payload.get("meta") or {}).get("_panel_source_sig") or "")
@@ -4974,11 +4977,12 @@ def run_basic_checks() -> list[CheckResult]:
                     return True
 
                 st.session_state["__sims_run_seq"] = 77
+                st.session_state["__sims_query_submit_seq"] = 1
                 st.session_state["__sims_selected"] = {"category": "마스터", "action": "거래처 목록"}
-                sig = panel_mod._make_panel_source_sig("거래처 목록")
-                first = _fake_panel_push_boundary(run_seq=77, action="거래처 목록", table_key="sims_vendor_b_once")
-                second = _fake_panel_push_boundary(run_seq=77, action="거래처 목록", table_key="sims_vendor_b_duplicate")
-                third = _fake_panel_push_boundary(run_seq=78, action="거래처 목록", table_key="sims_vendor_c_new_run")
+                first = _fake_panel_push_boundary(run_seq=77, submit_seq=1, action="거래처 목록", table_key="sims_vendor_first", condition="전체")
+                second = _fake_panel_push_boundary(run_seq=77, submit_seq=2, action="거래처 목록", table_key="sims_vendor_same_submit", condition="전체")
+                third = _fake_panel_push_boundary(run_seq=77, submit_seq=2, action="거래처 목록", table_key="sims_vendor_rerun", condition="전체")
+                fourth = _fake_panel_push_boundary(run_seq=77, submit_seq=3, action="거래처 목록", table_key="sims_vendor_changed", condition="변경조건")
                 cache_left = any(st.session_state.get(k) for k in (
                     "__sims_last_final_payload_for_chat",
                     "__sims_last_final_payload_for_chat_action",
@@ -4988,22 +4992,24 @@ def run_basic_checks() -> list[CheckResult]:
                 mismatches = []
                 if not first:
                     mismatches.append("first production boundary push skipped")
-                if second:
-                    mismatches.append("duplicate source push was not skipped")
-                if not third:
-                    mismatches.append("new run_seq push was blocked")
-                if calls != {"entry": 3, "push": 2, "save": 2}:
+                if not second:
+                    mismatches.append("explicit same-condition submit was blocked")
+                if third:
+                    mismatches.append("simple rerun was not skipped")
+                if not fourth:
+                    mismatches.append("changed-condition submit was blocked")
+                if calls != {"entry": 4, "push": 3, "save": 3}:
                     mismatches.append(f"unexpected calls={calls}")
-                if len(set(table_keys)) != 2 or table_keys != ["sims_vendor_b_once", "sims_vendor_c_new_run"]:
+                if len(set(table_keys)) != 3 or table_keys != ["sims_vendor_first", "sims_vendor_same_submit", "sims_vendor_changed"]:
                     mismatches.append(f"unexpected table_keys={table_keys}")
                 if cache_left:
                     mismatches.append("cached final payload was not cleaned")
-                if panel_mod._panel_chat_push_already_consumed(sig + "::other"):
+                if panel_mod._panel_chat_push_already_consumed("other-query-signature"):
                     mismatches.append("different panel source was incorrectly consumed")
                 if mismatches:
                     results.append(_fail("panel chat push lifecycle signature", "; ".join(mismatches)))
                 else:
-                    results.append(_ok("panel chat push lifecycle signature", "same run/action panel source pushes/saves once, duplicate skips and clears cache, new run pushes once"))
+                    results.append(_ok("panel chat push lifecycle signature", "explicit submit sequence and condition fingerprint create new chat results; simple reruns skip duplicate pushes"))
             finally:
                 for key in state_keys:
                     if key in missing_state:
@@ -6380,6 +6386,1209 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_ok("SIMS clicked table override fail-closed", "derived table override remains table-scoped; source/global fallback blocked on mismatch/expired"))
     except Exception as e:
         results.append(_fail("SIMS query-specific LLM analysis profiles", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}"))
+
+    try:
+        dash_mod = importlib.import_module("app.services.dashboard_lite_facts")
+        sales_df = pd.DataFrame(
+            [
+                {
+                    "제약사명": "A제약",
+                    "제품그룹명": "정상그룹",
+                    "제품그룹코드": "G_OK",
+                    "제품구분명": "정상구분",
+                    "제품구분코드": "D_OK",
+                    "제품분류명": "정상분류",
+                    "제품분류코드": "C_OK",
+                    "완료월총매출": 1000,
+                    "완료월수": 2,
+                    "당월 현재매출": 300,
+                    "당월 예상매출": 600,
+                    "최근3개월증감률": -20,
+                    "추세판정": "감소",
+                    "2026-05 매출": 500,
+                    "2026-06 매출": 500,
+                },
+                {
+                    "제약사명": "B제약",
+                    "제품그룹명": "정상그룹",
+                    "제품그룹코드": "G_OK",
+                    "제품구분명": "정상구분",
+                    "제품구분코드": "D_OK",
+                    "제품분류명": "정상분류",
+                    "제품분류코드": "C_OK",
+                    "완료월총매출": 3000,
+                    "완료월수": 2,
+                    "당월 현재매출": 1000,
+                    "당월 예상매출": 1200,
+                    "최근3개월증감률": 5,
+                    "추세판정": "안정",
+                    "2026-05 매출": 1500,
+                    "2026-06 매출": 1500,
+                },
+                {
+                    "제약사명": "C제약",
+                    "제품그룹명": "정상그룹",
+                    "제품그룹코드": "G_OK",
+                    "제품구분명": "정상구분",
+                    "제품구분코드": "D_OK",
+                    "제품분류명": "정상분류",
+                    "제품분류코드": "C_OK",
+                    "완료월총매출": 6000,
+                    "완료월수": 2,
+                    "당월 현재매출": 0,
+                    "당월 예상매출": 1000,
+                    "최근3개월증감률": -35,
+                    "추세판정": "감소",
+                    "2026-05 매출": 3000,
+                    "2026-06 매출": 3000,
+                },
+                {
+                    "제약사명": "D제약",
+                    "제품그룹명": "제외그룹",
+                    "제품그룹코드": "G_EX",
+                    "제품구분명": "정상구분",
+                    "제품구분코드": "D_OK",
+                    "제품분류명": "정상분류",
+                    "제품분류코드": "C_OK",
+                    "완료월총매출": 999999,
+                    "완료월수": 2,
+                    "당월 현재매출": 999999,
+                    "당월 예상매출": 999999,
+                    "최근3개월증감률": -99,
+                    "추세판정": "감소",
+                    "2026-05 매출": 999999,
+                    "2026-06 매출": 999999,
+                },
+                {
+                    "제약사명": "E제약",
+                    "제품그룹명": "정상그룹",
+                    "제품그룹코드": "G_OK",
+                    "제품구분명": "제외구분",
+                    "제품구분코드": "D_EX",
+                    "제품분류명": "정상분류",
+                    "제품분류코드": "C_OK",
+                    "완료월총매출": 888888,
+                    "완료월수": 2,
+                    "당월 현재매출": 888888,
+                    "당월 예상매출": 888888,
+                    "최근3개월증감률": -88,
+                    "추세판정": "감소",
+                    "2026-05 매출": 888888,
+                    "2026-06 매출": 888888,
+                },
+                {
+                    "제약사명": "F제약",
+                    "제품그룹명": "정상그룹",
+                    "제품그룹코드": "G_OK",
+                    "제품구분명": "정상구분",
+                    "제품구분코드": "D_OK",
+                    "제품분류명": "제외분류",
+                    "제품분류코드": "C_EX",
+                    "완료월총매출": 777777,
+                    "완료월수": 2,
+                    "당월 현재매출": 777777,
+                    "당월 예상매출": 777777,
+                    "최근3개월증감률": -77,
+                    "추세판정": "감소",
+                    "2026-05 매출": 777777,
+                    "2026-06 매출": 777777,
+                },
+            ]
+        )
+        stock_df = pd.DataFrame(
+            [
+                {
+                    "제품코드": "P001",
+                    "제품명": "부족품목",
+                    "제조사명": "A제약",
+                    "현재재고수량": 50,
+                    "당월 잔여예상출고수량": 100,
+                    "부족예상수량": 50,
+                    "부족예상금액": 500,
+                },
+                {
+                    "제품코드": "P001",
+                    "제품명": "부족품목",
+                    "제조사명": "A제약",
+                    "현재재고수량": 10,
+                    "당월 잔여예상출고수량": 30,
+                    "부족예상수량": 20,
+                    "부족예상금액": 200,
+                },
+                {
+                    "제품코드": "P002",
+                    "제품명": "충분품목",
+                    "제조사명": "B제약",
+                    "현재재고수량": 98,
+                    "당월 잔여예상출고수량": 100,
+                    "부족예상수량": 0,
+                    "부족예상금액": 0,
+                },
+                {
+                    "제품코드": "P003",
+                    "제품명": "수요없음",
+                    "제조사명": "C제약",
+                    "현재재고수량": 0,
+                    "당월 잔여예상출고수량": 0,
+                    "부족예상수량": 0,
+                    "부족예상금액": 0,
+                },
+                {
+                    "제품코드": "P004",
+                    "제품명": "제외품목",
+                    "제조사명": "D제약",
+                    "제품그룹명": "제외그룹",
+                    "제품그룹코드": "G_EX",
+                    "현재재고수량": 0,
+                    "당월 잔여예상출고수량": 1000,
+                    "부족예상수량": 1000,
+                    "부족예상금액": 100000,
+                },
+            ]
+        )
+        sales_df["제품그룹Gcode"] = "0013"
+        sales_df["제품구분Gcode"] = "0004"
+        sales_df["제품분류Gcode"] = "0031"
+        stock_df["제품그룹Gcode"] = "0013"
+        stock_df["제품구분Gcode"] = "0004"
+        stock_df["제품분류Gcode"] = "0031"
+        sales_original = sales_df.copy(deep=True)
+        stock_original = stock_df.copy(deep=True)
+        facts = dash_mod.build_dashboard_lite_facts(
+            {
+                "month_from": "202601",
+                "month_to": "202607",
+                "evaluation_month": "202607",
+                "date_from": "20260101",
+                "date_to": "20260719",
+                "stock_cd_list": ["00002", "00001"],
+                "stock_name_list": ["본사 창고", "전주 창고"],
+                "exclude_product_group_list": ["0013:G_EX"],
+                "exclude_product_group_nm_list": ["제외그룹"],
+                "exclude_product_di_list": ["0004:D_EX"],
+                "exclude_product_di_nm_list": ["제외구분"],
+                "exclude_product_class_list": ["0031:C_EX"],
+                "exclude_product_class_nm_list": ["제외분류"],
+            },
+            manufacturer_summary_payload={"df": sales_df, "meta": {"evaluation_month": "2026-07"}},
+            stock_shortage_payload={"df": stock_df, "meta": {}},
+        )
+        fact_errors: list[str] = []
+        required_fact_keys = {
+            "scope",
+            "period",
+            "partial_period",
+            "sales",
+            "purchase",
+            "inventory",
+            "stock_readiness",
+            "turnover_days",
+            "rankings",
+            "trend_counts",
+            "trend_amounts",
+            "trend_shares",
+            "risk_targets",
+            "today_actions",
+            "data_quality",
+            "comparison_rules",
+            "forbidden_comparisons",
+            "filters",
+            "additional_notes",
+        }
+        missing_fact_keys = required_fact_keys - set(facts.keys())
+        if missing_fact_keys:
+            fact_errors.append(f"missing_keys={sorted(missing_fact_keys)!r}")
+        if facts.get("kind") != "SIMS_DASHBOARD_FACTS_V01":
+            fact_errors.append("kind_mismatch")
+        sales_metrics = facts["sales"]["metrics"]
+        if round(float(sales_metrics["completed_month_avg_sales"]["value"]), 2) != 5000.0:
+            fact_errors.append("completed_avg_sales_wrong")
+        if round(float(sales_metrics["current_month_progress_pct"]["value"]), 2) != 46.43:
+            fact_errors.append("current_progress_wrong")
+        forbidden = " ".join(str(x) for x in facts.get("forbidden_comparisons") or [])
+        if "부분월" not in forbidden or "sample_records" not in forbidden:
+            fact_errors.append("forbidden_comparisons_missing")
+        chart_kinds = {str(r.get("kind")) for r in facts["sales"]["chart_rows"]}
+        if not {"완료월 실제", "당월 현재(부분월)", "당월 예상"}.issubset(chart_kinds):
+            fact_errors.append(f"chart_kinds={chart_kinds!r}")
+        if facts["trend_counts"].get("감소") != 2:
+            fact_errors.append("trend_count_wrong")
+
+        inv_metrics = facts["inventory"]["metrics"]
+        if int(inv_metrics["ready_sku_count"]["value"]) != 1:
+            fact_errors.append("ready_sku_count_wrong")
+        if int(inv_metrics["shortage_sku_count"]["value"]) != 1:
+            fact_errors.append("shortage_sku_count_wrong")
+        if round(float(inv_metrics["sku_readiness_pct"]["value"]), 2) != 50.0:
+            fact_errors.append("sku_readiness_pct_wrong")
+        risk_names = [r.get("product_name") for r in facts["inventory"]["risk_targets"]]
+        if risk_names != ["부족품목"]:
+            fact_errors.append(f"risk_names={risk_names!r}")
+        risk = facts["inventory"]["risk_targets"][0] if facts["inventory"]["risk_targets"] else {}
+        if round(float(risk.get("current_stock_qty") or 0), 2) != 60.0 or round(float(risk.get("remaining_expected_demand_qty") or 0), 2) != 130.0:
+            fact_errors.append(f"multi_stock_product_not_aggregated={risk!r}")
+        if round(float(risk.get("shortage_qty") or 0), 2) != 70.0:
+            fact_errors.append(f"shortage_formula_wrong={risk!r}")
+        if any(str(r.get("product_code")) == "P004" for r in facts["inventory"]["risk_targets"]):
+            fact_errors.append("excluded_product_in_risk_targets")
+        if not facts.get("today_actions"):
+            fact_errors.append("today_actions_empty")
+        if any(not action.get("product_code") for action in facts.get("today_actions") or []):
+            fact_errors.append("today_actions_contains_non_product_item")
+        if len({a.get("product_code") for a in facts.get("today_actions") or []}) != len(facts.get("today_actions") or []):
+            fact_errors.append("today_actions_duplicate_product")
+        if any(float(a.get("stock_readiness_pct") or 0) >= 98.0 for a in facts.get("today_actions") or []):
+            fact_errors.append("today_actions_contains_ready_product")
+        filter_facts = facts.get("filters") or {}
+        if [x.get("code") for x in filter_facts.get("included_stock_locations") or []] != ["00002", "00001"]:
+            fact_errors.append(f"filter_stock_locations={filter_facts!r}")
+        if [x.get("name") for x in filter_facts.get("excluded_product_groups") or []] != ["제외그룹"]:
+            fact_errors.append(f"filter_group={filter_facts!r}")
+        if [(x.get("gcode"), x.get("tcode")) for x in filter_facts.get("excluded_product_groups") or []] != [("0013", "G_EX")]:
+            fact_errors.append(f"filter_group_code={filter_facts!r}")
+        if [(x.get("gcode"), x.get("tcode")) for x in filter_facts.get("excluded_product_types") or []] != [("0004", "D_EX")]:
+            fact_errors.append(f"filter_di_code={filter_facts!r}")
+        if [(x.get("gcode"), x.get("tcode")) for x in filter_facts.get("excluded_product_classes") or []] != [("0031", "C_EX")]:
+            fact_errors.append(f"filter_class_code={filter_facts!r}")
+        if not facts.get("additional_notes") or "sales_decline_targets" not in facts.get("additional_notes"):
+            fact_errors.append("additional_notes_missing")
+        if facts["turnover_days"].get("status") != "자료부족":
+            fact_errors.append("turnover_status_wrong")
+        if not sales_df.equals(sales_original) or not stock_df.equals(stock_original):
+            fact_errors.append("input_df_mutated")
+        default_scope = dash_mod.default_dashboard_lite_scope(today=date(2026, 7, 20))
+        if default_scope.get("month_from") != "202601" or default_scope.get("month_to") != "202607" or default_scope.get("evaluation_month") != "202607":
+            fact_errors.append(f"default_scope={default_scope!r}")
+        try:
+            dash_mod.normalize_dashboard_lite_params({"month_from": "202501", "month_to": "202602", "evaluation_month": "202602"}, today=date(2026, 7, 20))
+            fact_errors.append("long_range_not_blocked")
+        except ValueError:
+            pass
+        try:
+            dash_mod.build_dashboard_lite_facts({})
+            fact_errors.append("empty_params_service_path_not_blocked")
+        except ValueError:
+            pass
+        try:
+            dash_mod.build_dashboard_lite_facts({"month_from": "202601", "month_to": "202607", "evaluation_month": "202607"})
+            fact_errors.append("missing_stock_locations_not_blocked")
+        except ValueError:
+            pass
+
+        if fact_errors:
+            results.append(_fail("Dashboard Lite deterministic facts", "; ".join(fact_errors)))
+        else:
+            results.append(_ok("Dashboard Lite deterministic facts", f"actions={len(facts.get('today_actions') or [])} risks={len(facts.get('risk_targets') or [])}"))
+
+        code_pair_errors: list[str] = []
+        code_pair_df = pd.DataFrame(
+            [
+                {"제품코드": "KEEP_CROSS_GCODE", "제품분류Gcode": "0001", "제품분류코드": "01", "제품분류명": "일반", "완료월총매출": 10},
+                {"제품코드": "DROP_CODE_PAIR", "제품분류Gcode": "0031", "제품분류코드": "01", "제품분류명": "이름변경", "완료월총매출": 20},
+                {"제품코드": "KEEP_SAME_NAME", "제품분류Gcode": "0031", "제품분류코드": "99", "제품분류명": "일반", "완료월총매출": 30},
+                {"제품코드": "KEEP_OTHER", "제품분류Gcode": "0031", "제품분류코드": "02", "제품분류명": "기타", "완료월총매출": 40},
+            ]
+        )
+        code_pair_original = code_pair_df.copy(deep=True)
+        code_pair_filtered = dash_mod._filter_sales_source_for_dashboard(
+            code_pair_df,
+            {"exclude_product_class_list": ["0031:01"], "exclude_product_class_nm_list": ["일반"]},
+        )
+        remaining_products = list(code_pair_filtered["제품코드"])
+        if remaining_products != ["KEEP_CROSS_GCODE", "KEEP_SAME_NAME", "KEEP_OTHER"]:
+            code_pair_errors.append(f"code_pair_remaining={remaining_products!r}")
+        code_pair_diag = code_pair_filtered.attrs.get("dashboard_filter_diagnostics") or []
+        class_diag = next((d for d in code_pair_diag if d.get("label") == "제품분류"), {})
+        if class_diag.get("filter_basis") != "code_pair":
+            code_pair_errors.append(f"filter_basis={class_diag!r}")
+        if class_diag.get("excluded_rows") != 1:
+            code_pair_errors.append(f"excluded_rows={class_diag!r}")
+        if not code_pair_df.equals(code_pair_original):
+            code_pair_errors.append("code_pair_input_mutated")
+
+        fallback_df = pd.DataFrame(
+            [
+                {"제품코드": "DROP_NAME", "제품분류명": "제외분류", "완료월총매출": 10},
+                {"제품코드": "KEEP_NAME", "제품분류명": "정상분류", "완료월총매출": 20},
+            ]
+        )
+        fallback_filtered = dash_mod._filter_sales_source_for_dashboard(
+            fallback_df,
+            {"exclude_product_class_list": ["0031:C_EX"], "exclude_product_class_nm_list": ["제외분류"]},
+        )
+        fallback_diag = fallback_filtered.attrs.get("dashboard_filter_diagnostics") or []
+        fallback_class_diag = next((d for d in fallback_diag if d.get("label") == "제품분류"), {})
+        if list(fallback_filtered["제품코드"]) != ["DROP_NAME", "KEEP_NAME"]:
+            code_pair_errors.append(f"missing_code_columns_mutated_rows={list(fallback_filtered['제품코드'])!r}")
+        if (
+            fallback_class_diag.get("filter_basis") != "not_applied"
+            or not fallback_class_diag.get("missing_code_columns")
+            or fallback_class_diag.get("selected_code_pair_count") != 1
+        ):
+            code_pair_errors.append(f"not_applied_diag={fallback_class_diag!r}")
+
+        stock_payload = {
+            "df": pd.DataFrame(
+                [
+                    {"제품코드": "DROP_CODE_PAIR", "현재재고": 1},
+                    {"제품코드": "KEEP_CROSS_GCODE", "현재재고": 2},
+                ]
+            )
+        }
+        enriched_stock = dash_mod._attach_dashboard_product_code_pairs(stock_payload, code_pair_df)
+        filtered_stock = dash_mod._filter_payload_df_for_dashboard(
+            enriched_stock,
+            {"exclude_product_class_list": ["0031:01"]},
+        )
+        stock_df = dash_mod._payload_df(filtered_stock)
+        stock_diag = stock_df.attrs.get("dashboard_filter_diagnostics") or []
+        stock_class_diag = next((d for d in stock_diag if d.get("label") == "제품분류"), {})
+        if list(stock_df["제품코드"]) != ["KEEP_CROSS_GCODE"]:
+            code_pair_errors.append(f"stock_code_pair_remaining={list(stock_df['제품코드'])!r}")
+        if stock_class_diag.get("filter_basis") != "code_pair":
+            code_pair_errors.append(f"stock_filter_basis={stock_class_diag!r}")
+
+        if code_pair_errors:
+            results.append(_fail("Dashboard Lite product code-pair filters", "; ".join(code_pair_errors)))
+        else:
+            results.append(_ok("Dashboard Lite product code-pair filters", "Gcode+Tcode excludes exact code pairs; same Tcode/different Gcode and same name/different code are preserved"))
+
+        import app.services.analytics_manufacturer_sales_trend_service as manufacturer_mod
+        import app.services.analytics_sales_trend_service as sales_mod
+
+        service_errors: list[str] = []
+        calls = {"shared_sales": 0, "manufacturer": 0, "stock": 0}
+        seen_params: list[dict] = []
+        preloaded_seen = {"manufacturer": False, "stock": False}
+        old_shared = getattr(sales_mod, "get_sales_trend_df")
+        old_manufacturer = getattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result")
+        old_stock = getattr(sales_mod, "get_stock_shortage_result")
+
+        def _fake_shared_sales_source(params=None):
+            calls["shared_sales"] += 1
+            seen_params.append(dict(params or {}))
+            return sales_df.copy()
+
+        def _fake_manufacturer_service(params=None, raw_df=None):
+            calls["manufacturer"] += 1
+            seen_params.append(dict(params or {}))
+            preloaded_seen["manufacturer"] = isinstance(raw_df, pd.DataFrame)
+            return {"df": sales_df.copy(), "meta": {"evaluation_month": "202607"}}
+
+        def _fake_stock_service(params=None, sales_raw_df=None):
+            calls["stock"] += 1
+            seen_params.append(dict(params or {}))
+            preloaded_seen["stock"] = isinstance(sales_raw_df, pd.DataFrame)
+            return {"df": stock_df.copy(), "meta": {}}
+
+        try:
+            setattr(sales_mod, "get_sales_trend_df", _fake_shared_sales_source)
+            setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", _fake_manufacturer_service)
+            setattr(sales_mod, "get_stock_shortage_result", _fake_stock_service)
+            built = dash_mod.build_dashboard_lite_facts(
+                {"month_from": "202601", "month_to": "202607", "evaluation_month": "202607", "stock_cd_list": ["00001"]},
+                today=date(2026, 7, 20),
+            )
+        finally:
+            setattr(sales_mod, "get_sales_trend_df", old_shared)
+            setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", old_manufacturer)
+            setattr(sales_mod, "get_stock_shortage_result", old_stock)
+        if calls != {"shared_sales": 1, "manufacturer": 1, "stock": 1}:
+            service_errors.append(f"service_calls={calls!r}")
+        if built.get("source_call_count") != 2:
+            service_errors.append(f"source_call_count={built.get('source_call_count')!r}")
+        if preloaded_seen != {"manufacturer": True, "stock": True}:
+            service_errors.append(f"preloaded_seen={preloaded_seen!r}")
+        if any(not p.get("month_from") or not p.get("month_to") for p in seen_params):
+            service_errors.append(f"missing_month_params={seen_params!r}")
+        if any(p == {} for p in seen_params):
+            service_errors.append("empty_params_sent")
+        if service_errors:
+            results.append(_fail("Dashboard Lite guarded service calls", "; ".join(service_errors)))
+        else:
+            results.append(_ok("Dashboard Lite guarded service calls", "shared sales source loads once, is passed to sales/stock facts, and stock source runs once"))
+
+        import app.sims.views.dashboard_lite as view_mod
+
+        render_errors: list[str] = []
+
+        class _FakeCtx:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_exc):
+                return False
+
+        class _FakeNumberColumnFactory:
+            def NumberColumn(self, label=None, **kwargs):
+                return {"label": label, **kwargs}
+
+        class _FakeStreamlit:
+            def __init__(self, *, submit_sequence: list[bool]):
+                self.session_state = {}
+                self._submit_sequence = list(submit_sequence)
+                self.calls: dict[str, int] = {}
+                self.markdowns: list[str] = []
+                self.captions: list[str] = []
+                self.column_config = _FakeNumberColumnFactory()
+            def _count(self, name: str) -> None:
+                self.calls[name] = self.calls.get(name, 0) + 1
+            def subheader(self, *_args, **_kwargs): self._count("subheader")
+            def caption(self, text, *_args, **_kwargs):
+                self._count("caption")
+                self.captions.append(str(text))
+            def info(self, *_args, **_kwargs): self._count("info")
+            def warning(self, *_args, **_kwargs): self._count("warning")
+            def error(self, *_args, **_kwargs): self._count("error")
+            def success(self, *_args, **_kwargs): self._count("success")
+            def write(self, *_args, **_kwargs): self._count("write")
+            def markdown(self, text, *_args, **_kwargs):
+                self._count("markdown")
+                self.markdowns.append(str(text))
+            def divider(self, *_args, **_kwargs): self._count("divider")
+            def json(self, *_args, **_kwargs): self._count("json")
+            def rerun(self, *_args, **_kwargs): self._count("rerun")
+            def altair_chart(self, *_args, **_kwargs): self._count("altair_chart")
+            def metric(self, *_args, **_kwargs): self._count("metric")
+            def dataframe(self, *_args, **_kwargs): self._count("dataframe")
+            def container(self, *_args, **_kwargs): return _FakeCtx()
+            def expander(self, *_args, **_kwargs): return _FakeCtx()
+            def spinner(self, *_args, **_kwargs): return _FakeCtx()
+            def form(self, *_args, **_kwargs): return _FakeCtx()
+            def columns(self, n, **_kwargs): return [_FakeCtx() for _ in range(int(n))]
+            def text_input(self, _label, value="", **_kwargs): return value
+            def multiselect(self, label, options=None, default=None, **_kwargs):
+                self._count(f"multiselect:{label}")
+                if label == "재고위치":
+                    return ["00001"]
+                if label == "제외할 제품그룹명":
+                    return ["0013:G_EX"]
+                if label == "제외할 제품구분명":
+                    return ["0004:D_EX"]
+                if label == "제외할 제품분류명":
+                    return ["0031:C_EX"]
+                return []
+            def form_submit_button(self, *_args, **_kwargs):
+                self._count("submit_button")
+                return self._submit_sequence.pop(0) if self._submit_sequence else False
+
+        old_st = getattr(view_mod, "st")
+        old_build = getattr(view_mod, "build_dashboard_lite_facts")
+        old_stock_options = getattr(view_mod, "_dashboard_stock_options")
+        old_code_options = getattr(view_mod, "_dashboard_code_name_options")
+        old_dashboard_target = getattr(view_mod, "_DASHBOARD_RENDER_TARGET")
+        build_calls: list[dict] = []
+        requested_gcodes: list[str] = []
+        option_calls = {"stock": 0, "code": 0}
+
+        class _FakeDashboardTarget:
+            def __init__(self):
+                self.container_calls = 0
+            def container(self):
+                self.container_calls += 1
+                return _FakeCtx()
+
+        def _fake_build(params=None):
+            build_calls.append(dict(params or {}))
+            return dict(facts)
+
+        def _fake_stock_options():
+            option_calls["stock"] += 1
+            return ["00001", "00002"], {"00001": "본사 창고", "00002": "전주 창고"}
+
+        def _fake_code_options(gcode):
+            option_calls["code"] += 1
+            requested_gcodes.append(str(gcode))
+            if str(gcode) == "0013":
+                return ["0013:G_EX"], {"0013:G_EX": "제외그룹"}
+            if str(gcode) == "0004":
+                return ["0004:D_EX"], {"0004:D_EX": "제외구분"}
+            if str(gcode) == "0031":
+                return ["0031:C_EX"], {"0031:C_EX": "제외분류"}
+            return [], {}
+
+        try:
+            fake_st = _FakeStreamlit(submit_sequence=[False])
+            setattr(view_mod, "st", fake_st)
+            setattr(view_mod, "build_dashboard_lite_facts", _fake_build)
+            setattr(view_mod, "_dashboard_stock_options", _fake_stock_options)
+            setattr(view_mod, "_dashboard_code_name_options", _fake_code_options)
+            primary_target = _FakeDashboardTarget()
+            view_mod.set_dashboard_lite_render_target(primary_target)
+            fake_st.session_state["__chat_current_room_id"] = "dashboard-room"
+            fake_st.session_state["chat_rooms"] = [{"id": "dashboard-room", "name": "새 대화", "auto_created": True}]
+            opened = view_mod.render_dashboard_lite()
+            if build_calls:
+                render_errors.append(f"open_called_service={len(build_calls)}")
+            if option_calls != {"stock": 1, "code": 3}:
+                render_errors.append(f"open_called_option_source={option_calls!r}")
+            if (opened.get("meta") or {}).get("status") != "condition_only":
+                render_errors.append(f"open_status={opened!r}")
+
+            rerendered = view_mod.render_dashboard_lite()
+            if build_calls or (rerendered.get("meta") or {}).get("status") != "condition_only":
+                render_errors.append(f"rerun_triggered_analysis={rerendered!r}|calls={len(build_calls)}")
+            if option_calls != {"stock": 1, "code": 3}:
+                render_errors.append(f"rerun_reloaded_option_source={option_calls!r}")
+            fake_st._submit_sequence = [True, False]
+            first = view_mod.render_dashboard_lite()
+            second = view_mod.render_dashboard_lite()
+            if len(build_calls) != 1:
+                render_errors.append(f"submit_rerun_build_calls={len(build_calls)}")
+            if option_calls != {"stock": 1, "code": 3}:
+                render_errors.append(f"submit_reloaded_option_source={option_calls!r}")
+            if build_calls and build_calls[0].get("stock_cd_list") != ["00001"]:
+                render_errors.append(f"stock_cd_list_not_passed={build_calls[0]!r}")
+            if build_calls and build_calls[0].get("exclude_product_group_list") != ["0013:G_EX"]:
+                render_errors.append(f"exclude_group_not_passed={build_calls[0]!r}")
+            if build_calls and build_calls[0].get("exclude_product_group_nm_list") != ["제외그룹"]:
+                render_errors.append(f"exclude_group_name_not_passed={build_calls[0]!r}")
+            if build_calls and build_calls[0].get("exclude_product_di_list") != ["0004:D_EX"]:
+                render_errors.append(f"exclude_di_not_passed={build_calls[0]!r}")
+            if build_calls and build_calls[0].get("exclude_product_class_list") != ["0031:C_EX"]:
+                render_errors.append(f"exclude_class_not_passed={build_calls[0]!r}")
+            if "0031" not in requested_gcodes or "0001" in requested_gcodes:
+                render_errors.append(f"product_class_gcode_wrong={requested_gcodes!r}")
+            if first.get("meta", {}).get("facts_kind") != "SIMS_DASHBOARD_FACTS_V01":
+                render_errors.append("submit_missing_facts_kind")
+            dashboard_cache = fake_st.session_state.get("__dashboard_lite_result") or {}
+            if not {"company_id", "query_fingerprint", "elapsed_seconds", "created_at"}.issubset(dashboard_cache):
+                render_errors.append(f"dashboard_result_metadata_missing={dashboard_cache!r}")
+            if fake_st.session_state["chat_rooms"][0].get("name") != "Dashboard Lite":
+                render_errors.append(f"dashboard_room_title={fake_st.session_state['chat_rooms'][0]!r}")
+            if fake_st.calls.get("rerun") != 1:
+                render_errors.append(f"dashboard_title_rerun={fake_st.calls.get('rerun')}")
+            if not any(text == "## Dashboard Lite" for text in fake_st.markdowns):
+                render_errors.append("dashboard_result_title_not_rendered")
+            if not any("조회기간:" in text and "평가월:" in text and "재고위치:" in text for text in fake_st.captions):
+                render_errors.append(f"dashboard_scope_header_missing={fake_st.captions!r}")
+            if not any(text.startswith("조회 완료 · ") and " · " in text for text in fake_st.captions):
+                render_errors.append(f"dashboard_completed_header_missing={fake_st.captions!r}")
+            if second.get("meta", {}).get("facts_kind") != "SIMS_DASHBOARD_FACTS_V01":
+                render_errors.append("rerun_cache_not_rendered")
+            if primary_target.container_calls != 1:
+                render_errors.append(f"dashboard_primary_render_count={primary_target.container_calls}")
+            fake_st.session_state["__dashboard_lite_primary_rendered_this_run"] = False
+            if not view_mod.render_cached_dashboard_lite_primary():
+                render_errors.append("cached_dashboard_primary_not_rendered")
+            if primary_target.container_calls != 2 or len(build_calls) != 1:
+                render_errors.append(f"cached_dashboard_primary_calls={primary_target.container_calls}|build={len(build_calls)}")
+            view_mod.clear_dashboard_lite_session_state(fake_st.session_state)
+            after_company_change = view_mod.render_dashboard_lite()
+            if len(build_calls) != 1:
+                render_errors.append(f"company_change_triggered_analysis={len(build_calls)}")
+            if option_calls != {"stock": 2, "code": 6}:
+                render_errors.append(f"company_change_did_not_reload_options={option_calls!r}")
+            if (after_company_change.get("meta") or {}).get("status") != "condition_only":
+                render_errors.append(f"company_change_open_status={after_company_change!r}")
+        finally:
+            setattr(view_mod, "st", old_st)
+            setattr(view_mod, "build_dashboard_lite_facts", old_build)
+            setattr(view_mod, "_dashboard_stock_options", old_stock_options)
+            setattr(view_mod, "_dashboard_code_name_options", old_code_options)
+            view_mod.set_dashboard_lite_render_target(old_dashboard_target)
+
+        if render_errors:
+            results.append(_fail("Dashboard Lite button-gated render cache", "; ".join(render_errors)))
+        else:
+            results.append(_ok("Dashboard Lite button-gated render cache", "open loads options once without facts; reruns reuse options; submit calls facts once; the dedicated result keeps scope/time metadata and names an empty Dashboard-only room"))
+
+        chart_errors: list[str] = []
+        try:
+            sales_chart_spec = view_mod._build_sales_bar_chart(facts).to_dict()
+            sales_chart_json = json.dumps(sales_chart_spec, ensure_ascii=False)
+            if '"type": "bar"' not in sales_chart_json:
+                chart_errors.append("sales_chart_not_bar")
+            if '"type": "line"' in sales_chart_json or '"type": "point"' in sales_chart_json:
+                chart_errors.append("sales_chart_contains_line_or_point")
+            if "#2563eb" not in sales_chart_json or "#f97316" not in sales_chart_json:
+                chart_errors.append("sales_chart_actual_forecast_colors_missing")
+            if "당월 현재(부분월)" not in sales_chart_json or "당월 예상" not in sales_chart_json:
+                chart_errors.append("sales_chart_current_month_rows_missing")
+        except Exception as exc:
+            chart_errors.append(f"sales_chart_build={type(exc).__name__}:{exc}")
+        if chart_errors:
+            results.append(_fail("Dashboard Lite monthly sales bar chart", "; ".join(chart_errors)))
+        else:
+            results.append(_ok("Dashboard Lite monthly sales bar chart", "completed/current actual and forecast sales render as same-axis bars without connected lines or points"))
+
+        preforecast_errors: list[str] = []
+        chart_source = pd.DataFrame(
+            [
+                {
+                    "제약사명": "검증제약",
+                    "2026-01 매출": 10,
+                    "2026-02 매출": 20,
+                    "2026-03 매출": 30,
+                    "2026-04 매출": 40,
+                    "2026-05 매출": 50,
+                    "2026-06 매출": 160,
+                    "당월 현재매출": 70,
+                    "당월 예상매출": 90,
+                }
+            ]
+        )
+        chart_source_changed_target = chart_source.copy(deep=True)
+        chart_source_changed_target.loc[0, "2026-04 매출"] = 40_000
+        chart_source_changed_history = chart_source.copy(deep=True)
+        chart_source_changed_history.loc[0, "2026-03 매출"] = 30_000
+        try:
+            chart_sales = dash_mod._build_sales_facts({"df": chart_source, "meta": {"evaluation_month": "202607"}})
+            target_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_target, "meta": {"evaluation_month": "202607"}})
+            history_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_history, "meta": {"evaluation_month": "202607"}})
+            chart_rows = chart_sales.get("chart_rows") or []
+            period_order = []
+            for row in chart_rows:
+                if row.get("period") not in period_order:
+                    period_order.append(row.get("period"))
+            expected_period_order = [f"2026-{month:02d}" for month in range(1, 8)]
+            if period_order != expected_period_order:
+                preforecast_errors.append(f"period_order={period_order!r}")
+            actual_periods = {
+                row.get("period")
+                for row in chart_rows
+                if row.get("kind") in {"완료월 실제", "당월 현재(부분월)"}
+            }
+            if actual_periods != set(expected_period_order):
+                preforecast_errors.append(f"actual_periods={sorted(actual_periods)!r}")
+            past_rows = [row for row in chart_rows if row.get("kind") == "완료월 사전예상"]
+            if [row.get("period") for row in past_rows] != ["2026-03", "2026-04", "2026-05", "2026-06"]:
+                preforecast_errors.append(f"past_forecast_periods={[row.get('period') for row in past_rows]!r}")
+            july_kinds = {row.get("kind") for row in chart_rows if row.get("period") == "2026-07"}
+            if july_kinds != {"당월 현재(부분월)", "당월 예상"}:
+                preforecast_errors.append(f"july_kinds={july_kinds!r}")
+            def _forecast_value(sales: dict[str, Any], period: str) -> float:
+                return float(next(row["value"] for row in sales.get("chart_rows") or [] if row.get("kind") == "완료월 사전예상" and row.get("period") == period))
+            if _forecast_value(chart_sales, "2026-04") != _forecast_value(target_changed_sales, "2026-04"):
+                preforecast_errors.append("target_month_actual_changed_its_preforecast")
+            if _forecast_value(chart_sales, "2026-04") == _forecast_value(history_changed_sales, "2026-04"):
+                preforecast_errors.append("prior_history_did_not_change_later_preforecast")
+            chart_spec = view_mod._build_sales_bar_chart({"sales": chart_sales}).to_dict()
+            layer_sorts = [layer.get("encoding", {}).get("x", {}).get("sort") for layer in chart_spec.get("layer", [])]
+            if not layer_sorts or any(sort != expected_period_order for sort in layer_sorts):
+                preforecast_errors.append(f"layer_period_sorts={layer_sorts!r}")
+            if any("xOffset" in layer.get("encoding", {}) for layer in chart_spec.get("layer", [])):
+                preforecast_errors.append("x_offset_side_by_side_remains")
+            if chart_spec.get("resolve", {}).get("scale", {}).get("y") != "shared":
+                preforecast_errors.append(f"y_scale_resolve={chart_spec.get('resolve')!r}")
+            layer_marks = [layer.get("mark") or {} for layer in chart_spec.get("layer", [])]
+            if [mark.get("size") for mark in layer_marks] != [28, 18]:
+                preforecast_errors.append(f"overlay_bar_widths={layer_marks!r}")
+            layer_stacks = [layer.get("encoding", {}).get("y", {}).get("stack") for layer in chart_spec.get("layer", [])]
+            if layer_stacks != [None, None]:
+                preforecast_errors.append(f"layer_y_stacks={layer_stacks!r}")
+            actual_values = {
+                row.get("period"): float(row.get("value") or 0)
+                for row in chart_rows
+                if row.get("kind") in {"완료월 실제", "당월 현재(부분월)"}
+            }
+            if actual_values.get("2026-06", 0) <= actual_values.get("2026-07", 0):
+                preforecast_errors.append(f"actual_height_fixture_invalid={actual_values!r}")
+        except Exception as exc:
+            preforecast_errors.append(f"preforecast_runtime={type(exc).__name__}:{exc}")
+        if preforecast_errors:
+            results.append(_fail("Dashboard Lite completed-month preforecast bars", "; ".join(preforecast_errors)))
+        else:
+            results.append(_ok("Dashboard Lite completed-month preforecast bars", "2026-03 is the first forecastable month under the production two-active-completed-month condition; target-month actual never feeds its own forecast"))
+
+        reset_errors: list[str] = []
+        session_fixture = {
+            "__dashboard_lite_result": {"facts": "cached"},
+            "__dashboard_lite_run_seq": 7,
+            "__dashboard_lite_styles_loaded": True,
+            "__dashboard_lite_stock_labels": ["00001"],
+            "__dashboard_lite_exclude_product_group_list": ["0013:G_EX"],
+            "__dashboard_lite_exclude_product_di_list": ["0004:D_EX"],
+            "__dashboard_lite_exclude_product_class_list": ["0031:C_EX"],
+            "__dashboard_lite_cache_key__widget_ns_1": "old",
+            "__dashboard_lite_result__another_ns": "old-other",
+            "__sims_widget_ns": "widget_ns_1",
+            "__sims_cat": "분석/KPI",
+            "__sims_action": "Dashboard Lite v0.1",
+            "__login_user": "keep-user",
+            "__selected_company_id": 4,
+            "__chat_current_room_id": "room-a",
+        }
+        removed_reset_keys = view_mod.clear_dashboard_lite_session_state(session_fixture, namespace="widget_ns_1")
+        if "__dashboard_lite_result" in session_fixture or "__dashboard_lite_result__another_ns" in session_fixture:
+            reset_errors.append(f"dashboard_keys_remaining={sorted(k for k in session_fixture if str(k).startswith('__dashboard_lite_'))!r}")
+        if not {"__dashboard_lite_result", "__dashboard_lite_cache_key__widget_ns_1"}.issubset(set(removed_reset_keys)):
+            reset_errors.append(f"removed_keys={removed_reset_keys!r}")
+        if session_fixture.get("__login_user") != "keep-user" or session_fixture.get("__selected_company_id") != 4 or session_fixture.get("__chat_current_room_id") != "room-a":
+            reset_errors.append(f"login_company_chat_mutated={session_fixture!r}")
+        try:
+            import ast
+            from types import SimpleNamespace
+
+            login_src_for_clear = Path("app/ui/ssai_login.py").read_text(encoding="utf-8")
+            login_tree_for_clear = ast.parse(login_src_for_clear)
+            clear_node = next(
+                node for node in login_tree_for_clear.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_clear_company_dependent_state"
+            )
+            company_change_state = {
+                "__dashboard_lite_scope_options": {"stock_codes": ["previous-company"]},
+                "__dashboard_lite_result": {"facts": "previous-company"},
+                "__dashboard_lite_run_seq": 9,
+                "__dashboard_lite_stock_labels": ["previous-company"],
+                "__login_user": "keep-user",
+                "ssai_selected_company": {"company_id": 5},
+                "__chat_current_room_id": "room-after-change",
+            }
+            cache_clears = {"count": 0}
+            fake_login_st = SimpleNamespace(
+                session_state=company_change_state,
+                cache_data=SimpleNamespace(clear=lambda: cache_clears.__setitem__("count", cache_clears["count"] + 1)),
+            )
+            clear_ns = {
+                "st": fake_login_st,
+                "log": SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+            }
+            exec(compile(ast.Module(body=[clear_node], type_ignores=[]), "company_state_clear", "exec"), clear_ns)
+            clear_ns["_clear_company_dependent_state"]()
+            if any(str(key).startswith("__dashboard_lite_") for key in company_change_state):
+                reset_errors.append(f"company_change_dashboard_state_remaining={company_change_state!r}")
+            if company_change_state.get("__login_user") != "keep-user" or company_change_state.get("ssai_selected_company") != {"company_id": 5} or company_change_state.get("__chat_current_room_id") != "room-after-change":
+                reset_errors.append(f"company_change_preserved_state_mutated={company_change_state!r}")
+            if cache_clears["count"] != 1:
+                reset_errors.append(f"company_change_cache_clear_count={cache_clears!r}")
+        except Exception as exc:
+            reset_errors.append(f"company_change_clear_runtime={type(exc).__name__}:{exc}")
+        main_src_for_reset = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+        if "clear_dashboard_lite_session_state(st.session_state, _ns)" not in main_src_for_reset:
+            reset_errors.append("main_reset_helper_not_called")
+        if reset_errors:
+            results.append(_fail("Dashboard Lite option reset clears real state", "; ".join(reset_errors)))
+        else:
+            results.append(_ok("Dashboard Lite option reset clears real state", "Dashboard-specific results/widgets/cache clear through helper while login/company/chat state remains"))
+
+        new_chat_errors: list[str] = []
+        try:
+            import ast
+            from types import SimpleNamespace
+
+            main_src_for_new_chat = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            main_tree_for_new_chat = ast.parse(main_src_for_new_chat)
+            clear_node = next(
+                node for node in main_tree_for_new_chat.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_clear_dashboard_lite_for_new_chat"
+            )
+            new_chat_state = {
+                "__dashboard_lite_result": {"facts": "cached"},
+                "__dashboard_lite_scope_options": {"stock": ["old"]},
+                "__dashboard_lite_run_seq": 3,
+                "__dashboard_lite_query_fingerprint": "old-query",
+                "__dashboard_lite_elapsed_seconds": 9.1,
+                "__dashboard_lite_created_at": "old-time",
+                "__chat_history": [{"id": "old-chat"}],
+                "__login_user": "keep-user",
+                "__selected_company_id": 4,
+            }
+            fake_main_st = SimpleNamespace(session_state=new_chat_state)
+            clear_ns = {"st": fake_main_st, "log": SimpleNamespace(debug=lambda *_args, **_kwargs: None)}
+            exec(compile(ast.Module(body=[clear_node], type_ignores=[]), "new_chat_dashboard_clear", "exec"), clear_ns)
+            removed = clear_ns["_clear_dashboard_lite_for_new_chat"]()
+            if not removed or any(str(key).startswith("__dashboard_lite_") for key in new_chat_state):
+                new_chat_errors.append(f"dashboard_state_remaining={new_chat_state!r}")
+            if new_chat_state.get("__login_user") != "keep-user" or new_chat_state.get("__selected_company_id") != 4:
+                new_chat_errors.append(f"login_company_mutated={new_chat_state!r}")
+            already_reset_state = {
+                "__dashboard_lite_result": {"facts": "cleared-by-option-reset"},
+                "__dashboard_lite_scope_options": {"stock": ["cleared-by-option-reset"]},
+                "__login_user": "keep-user",
+            }
+            view_mod.clear_dashboard_lite_session_state(already_reset_state)
+            fake_main_st.session_state = already_reset_state
+            clear_ns["_clear_dashboard_lite_for_new_chat"]()
+            if any(str(key).startswith("__dashboard_lite_") for key in already_reset_state):
+                new_chat_errors.append(f"option_reset_then_new_chat_remaining={already_reset_state!r}")
+            if already_reset_state.get("__login_user") != "keep-user":
+                new_chat_errors.append(f"option_reset_then_new_chat_login_mutated={already_reset_state!r}")
+            new_room_node = next(
+                node for node in ast.walk(main_tree_for_new_chat)
+                if isinstance(node, ast.FunctionDef) and node.name == "_new_room"
+            )
+            new_room_source = ast.get_source_segment(main_src_for_new_chat, new_room_node) or ""
+            if "_clear_dashboard_lite_for_new_chat()" not in new_room_source:
+                new_chat_errors.append("new_room_dashboard_clear_not_connected")
+        except Exception as exc:
+            new_chat_errors.append(f"new_chat_clear_runtime={type(exc).__name__}:{exc}")
+        if new_chat_errors:
+            results.append(_fail("Dashboard Lite new chat clears cached result", "; ".join(new_chat_errors)))
+        else:
+            results.append(_ok("Dashboard Lite new chat clears cached result", "new-chat initialization removes Dashboard-only state without reloading dashboard sources or altering login/company state"))
+
+        metric_errors: list[str] = []
+        captured_markdown: list[str] = []
+        try:
+            fake_st = _FakeStreamlit(submit_sequence=[])
+            fake_st.markdown = lambda text, **_kwargs: captured_markdown.append(str(text))
+            setattr(view_mod, "st", fake_st)
+            view_mod._metric_card("<script>alert(1)</script>", 1, suffix="<b>%</b>", help_text="<img src=x>")
+        finally:
+            setattr(view_mod, "st", old_st)
+        metric_html = "\n".join(captured_markdown)
+        if "<script>" in metric_html or "<b>" in metric_html or "<img" in metric_html:
+            metric_errors.append(f"raw_html={metric_html!r}")
+        if "&lt;script&gt;" not in metric_html or "&lt;b&gt;%&lt;/b&gt;" not in metric_html or "&lt;img src=x&gt;" not in metric_html:
+            metric_errors.append(f"escaped_html_missing={metric_html!r}")
+        if metric_errors:
+            results.append(_fail("Dashboard Lite KPI HTML escaping", "; ".join(metric_errors)))
+        else:
+            results.append(_ok("Dashboard Lite KPI HTML escaping", "metric label/value/help are escaped inside dashboard-scoped HTML"))
+
+        action_table_errors: list[str] = []
+        captured_tables: list[pd.DataFrame] = []
+
+        try:
+            fake_st = _FakeStreamlit(submit_sequence=[])
+            fake_st.column_config = _FakeNumberColumnFactory()
+            fake_st.dataframe = lambda df, **_kwargs: captured_tables.append(df.copy())
+            setattr(view_mod, "st", fake_st)
+            view_mod._render_today_actions(facts)
+        finally:
+            setattr(view_mod, "st", old_st)
+        if not captured_tables:
+            action_table_errors.append("today_action_table_not_rendered")
+        else:
+            action_table = captured_tables[0]
+            for col in ("우선순위", "현재 사용 가능 재고", "당월 잔여예상수요", "부족예상수량", "부족예상금액", "재고준비율"):
+                if col not in action_table.columns:
+                    action_table_errors.append(f"missing_col={col}")
+                elif not pd.api.types.is_numeric_dtype(action_table[col]):
+                    action_table_errors.append(f"non_numeric={col}:{action_table[col].dtype}")
+        if action_table_errors:
+            results.append(_fail("Dashboard Lite today action numeric table", "; ".join(action_table_errors)))
+        else:
+            results.append(_ok("Dashboard Lite today action numeric table", "priority/qty/amount/ratio columns remain numeric before st.dataframe"))
+
+        panel_src = Path("app/ui/sims_panel.py").read_text(encoding="utf-8")
+        entry_src = Path("app/ui/sims_entry.py").read_text(encoding="utf-8")
+        view_src = Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8")
+        main_dashboard_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+        sales_trend_src = Path("app/services/analytics_sales_trend_service.py").read_text(encoding="utf-8")
+        if (
+            '"Dashboard Lite v0.1": dashboard_lite.render_dashboard_lite' not in panel_src
+            or 'from app.sims.views import users, codes, vendors, goods, road_address, analytics_views, dashboard_lite, rddbc_io_views' not in panel_src
+            or '"대시보드": [\n            "Dashboard Lite v0.1",' not in entry_src
+            or '"대시보드": "dashboard",' not in entry_src
+            or 'st.altair_chart' not in view_src
+            or 'width="stretch"' not in view_src
+            or 'st.form("dashboard_lite_scope_form"' not in view_src
+            or 'st.multiselect(\n            "재고위치"' not in view_src
+            or '"exclude_product_group_list"' not in view_src
+            or '_dashboard_code_name_options("0031")' not in view_src
+            or '_dashboard_code_name_options("0001")' in view_src
+            or "format_func=lambda code: _option_label" not in view_src
+            or 'form_submit_button("대시보드 조회"' not in view_src
+            or 'build_dashboard_lite_facts(params)' not in view_src
+            or '"final": False' not in view_src
+            or 'render_cached_dashboard_lite_primary' not in view_src
+            or 'render_cached_dashboard_lite_primary()' not in main_dashboard_src
+            or 'set_dashboard_lite_render_target(dashboard_primary_area)' not in main_dashboard_src
+            or 'Dashboard facts / 비교 금지 규칙' in view_src
+            or 'with st.expander("추가 확인사항"' in view_src
+        ):
+            results.append(_fail("Dashboard Lite panel/view registration", "registry or non-chat view contract missing"))
+        else:
+            results.append(_ok("Dashboard Lite panel/view registration", "analysis/KPI dashboard group/action registered with Altair width='stretch' and final=False"))
+
+        dashboard_order_errors: list[str] = []
+        dashboard_anchor = main_dashboard_src.find("dashboard_primary_area = st.empty()")
+        history_anchor = main_dashboard_src.find("for idx, m in enumerate(merged_msgs):")
+        if dashboard_anchor < 0 or history_anchor < 0 or dashboard_anchor >= history_anchor:
+            dashboard_order_errors.append(f"dashboard_anchor={dashboard_anchor}|history_anchor={history_anchor}")
+        if '"__dashboard_lite_result"' not in view_src or '"final": False' not in view_src:
+            dashboard_order_errors.append("dashboard_not_dedicated_non_chat_state")
+        if dashboard_order_errors:
+            results.append(_fail("Dashboard Lite primary document order", "; ".join(dashboard_order_errors)))
+        else:
+            results.append(_ok("Dashboard Lite primary document order", "cached Dashboard result renders before normal history and remains outside chat table/message storage"))
+
+        sales_source_errors: list[str] = []
+        for token in (
+            "제품그룹Gcode",
+            "제품그룹코드",
+            "제품구분Gcode",
+            "제품구분코드",
+            "제품분류Gcode",
+            "제품분류코드",
+            "Rd04_Physic_Group_Gcode",
+            "Rd04_Physic_Di_Gcode",
+            "Rd04_Physic_Tax_Gcode",
+            "Rd04_Physic_Tax",
+            "Physic_Group_Nm.Rd01_Hnm",
+            "Physic_Di_Nm.Rd01_Hnm",
+            "Physic_Tax_Nm.Rd01_Hnm",
+        ):
+            if token not in sales_trend_src:
+                sales_source_errors.append(f"missing={token}")
+        if "Rd01_Hmn" in sales_trend_src:
+            sales_source_errors.append("wrong_rd01_hmn_column_present")
+        dashboard_class_blocks = [
+            sales_trend_src[sales_trend_src.find("def _load_monthly_product_master_for_codes"):sales_trend_src.find("def _load_monthly_vendor_names_for_codes")],
+            sales_trend_src[sales_trend_src.find("def _get_sales_trend_monthly_df_legacy"):sales_trend_src.find("def get_sales_trend_detail_df")],
+            sales_trend_src[sales_trend_src.find("def get_sales_trend_detail_df"):],
+        ]
+        for idx, block in enumerate(dashboard_class_blocks):
+            if "제품분류Gcode" in block and ("Rd04_Physic_Gu_Gcode AS 제품분류Gcode" in block or "Physic_Gu_Nm.Rd01_Hnm AS 제품분류명" in block):
+                sales_source_errors.append(f"dashboard_product_class_uses_gu_path={idx}")
+        if sales_source_errors:
+            results.append(_fail("Dashboard Lite sales source code-pair columns", "; ".join(sales_source_errors)))
+        else:
+            results.append(_ok("Dashboard Lite sales source code-pair columns", "monthly/detail sales sources expose product group/type/class Gcode+Tcode and Rd01_Hnm names"))
+
+        ui_security_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+        chat_middleware_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
+        panel_src_for_security = Path("app/ui/sims_panel.py").read_text(encoding="utf-8")
+        db_src = Path("app/db/mssql_client.py").read_text(encoding="utf-8")
+        login_src = Path("app/ui/ssai_login.py").read_text(encoding="utf-8")
+        security_errors: list[str] = []
+        forbidden_ui_tokens = [
+            '"LMSTUDIO_BASE_URL": os.getenv',
+            '"MSSQL_SERVER":',
+            '"MSSQL_DATABASE":',
+            "Base URL:",
+            "list_tables(20)",
+            "search_columns(",
+            '"BASE_DIR": str(',
+            '"CHAT_FILE": str(',
+            '"UPLOAD_DIR": str(',
+        ]
+        for token in forbidden_ui_tokens:
+            if token in ui_security_src:
+                security_errors.append(f"ui_token={token}")
+        forbidden_runtime_log_tokens = [
+            "env_file=%s",
+            "CHAT_FILE=%s",
+            "LOG_FILE=%s",
+            "sys_executable=%s",
+            "effective_user_chat_file=%s",
+            "partition_root=%s",
+            "root=%s",
+            "db_name=%s",
+            "legacy_file=%s",
+            "chat_file=%s",
+            "fallback legacy file=%s",
+        ]
+        for token in forbidden_runtime_log_tokens:
+            if token in ui_security_src or token in chat_middleware_src or token in db_src or token in login_src:
+                security_errors.append(f"runtime_log_token={token}")
+        for token in ("payload_db=%s", "current_db=%s"):
+            if token in ui_security_src or token in chat_middleware_src or token in panel_src_for_security:
+                security_errors.append(f"stale_payload_db_log_token={token}")
+        for token in ("login_id=%s", "company_name=%s", "db_name=%s", "[auth.company] sidebar company list failed login_id=%s"):
+            if token in login_src:
+                security_errors.append(f"auth_runtime_log_token={token}")
+        for token in ("DB명:", "return f\"{middle} / DB:"):
+            if token in login_src:
+                security_errors.append(f"physical_db_ui_token={token}")
+        if '"host": cfg.host' in ui_security_src or '"db": cfg.database' in ui_security_src or '"user": cfg.user' in ui_security_src:
+            security_errors.append("db_diagnostic_raw_config_present")
+        for token in ('log.exception("[chat.load]', 'log.exception("[chat.storage.save]'):
+            if token in ui_security_src:
+                security_errors.append(f"traceback_log_token={token}")
+        safe_startup_log = (
+            "[app.env] env_configured=%s loaded=%s APP_ENV=%s SSAI_INSTANCE_ID=%s chat_storage_configured=%s log_configured=%s venv_active=%s"
+            % (True, True, "dev", "HO1", True, True, True)
+        )
+        safe_user_path_log = "[app.env.user_paths] chat_storage_configured=%s partition_storage_configured=%s" % (True, True)
+        if any(fragment in safe_startup_log or fragment in safe_user_path_log for fragment in ("C:\\", "CHAT_FILE=", "LOG_FILE=", "sys_executable=", "Database=", "Pwd=")):
+            security_errors.append(f"safe_log_format_leaks={safe_startup_log!r}|{safe_user_path_log!r}")
+        forbidden_log_tokens = [
+            "ODBC conn: %s",
+            "ODBC company conn company_id=%s: %s",
+            "Pwd=******",
+        ]
+        for token in forbidden_log_tokens:
+            if token in db_src:
+                security_errors.append(f"log_token={token}")
+        if "[db.connection]" not in db_src or "connection_configured" not in db_src:
+            security_errors.append("safe_db_connection_log_missing")
+        chat_context_src = ui_security_src[ui_security_src.find("def _chat_log_context"):ui_security_src.find("def _chat_log_kv")]
+        chat_context_base = chat_context_src[:chat_context_src.find("blocked_keys =")]
+        if any(token in chat_context_base for token in ('"login_id"', '"company_name"', '"db_name"', '"chat_file"', '"legacy_file"', '"partition_root"')):
+            security_errors.append("chat_log_context_sensitive_key_present")
+        try:
+            import ast
+            from types import SimpleNamespace
+
+            main_tree = ast.parse(ui_security_src)
+            helper_nodes = [
+                node for node in main_tree.body
+                if isinstance(node, ast.FunctionDef) and node.name in {"_safe_log_value", "_chat_log_context", "_chat_log_kv"}
+            ]
+            helper_ns = {"Any": Any}
+            exec(compile(ast.Module(body=helper_nodes, type_ignores=[]), "chat_log_helpers", "exec"), helper_ns)
+            helper_ns["get_current_user"] = lambda: SimpleNamespace(user_id=7, login_id="hidden-login", user_type="SSART_ADMIN", user_grade="SUPER")
+            helper_ns["get_selected_company"] = lambda: {"company_id": 4, "company_name": "hidden-company", "db_name": "hidden-db"}
+            rendered_log = helper_ns["_chat_log_kv"](
+                {"id": "room-1"},
+                chat_file="C:\\hidden\\room.json",
+                legacy_file="C:\\hidden\\legacy.json",
+                db_name="hidden-db",
+                server="hidden-server",
+                password="hidden-password",
+                api_key="hidden-key",
+                message_count=3,
+            )
+            if any(value in rendered_log for value in ("hidden-login", "hidden-company", "hidden-db", "hidden-server", "hidden-password", "hidden-key", "C:\\hidden")):
+                security_errors.append(f"chat_log_helper_leak={rendered_log!r}")
+            if "user_id=7" not in rendered_log or "company_id=4" not in rendered_log or "message_count=3" not in rendered_log:
+                security_errors.append(f"chat_log_helper_state_missing={rendered_log!r}")
+        except Exception as exc:
+            security_errors.append(f"chat_log_helper_runtime={type(exc).__name__}:{exc}")
+        try:
+            login_tree = ast.parse(login_src)
+            login_helper_nodes = [
+                node for node in login_tree.body
+                if isinstance(node, ast.FunctionDef) and node.name in {"_safe_log_value", "_login_log_context", "_login_log_kv"}
+            ]
+            login_ns = {"Any": Any, "AuthUser": Any}
+            exec(compile(ast.Module(body=login_helper_nodes, type_ignores=[]), "login_log_helpers", "exec"), login_ns)
+            rendered_login_log = login_ns["_login_log_kv"](
+                user=SimpleNamespace(user_id=8, login_id="hidden-login", user_type="WHOLESALE_ADMIN", user_grade="MANAGER"),
+                company={"company_id": 5, "company_name": "hidden-company", "db_name": "hidden-db"},
+                login_id="hidden-login",
+                company_name="hidden-company",
+                db_name="hidden-db",
+                server="hidden-server",
+                password="hidden-password",
+                api_key="hidden-key",
+                permission_count=2,
+            )
+            if any(value in rendered_login_log for value in ("hidden-login", "hidden-company", "hidden-db", "hidden-server", "hidden-password", "hidden-key")):
+                security_errors.append(f"login_log_helper_leak={rendered_login_log!r}")
+            if "user_id=8" not in rendered_login_log or "company_id=5" not in rendered_login_log or "permission_count=2" not in rendered_login_log:
+                security_errors.append(f"login_log_helper_state_missing={rendered_login_log!r}")
+        except Exception as exc:
+            security_errors.append(f"login_log_helper_runtime={type(exc).__name__}:{exc}")
+        try:
+            import app.ui.chat_middleware as runtime_chat_mod
+            rendered_runtime_log = runtime_chat_mod._chat_runtime_log_kv(
+                {"id": "room-9"},
+                login_id="hidden-login",
+                company_name="hidden-company",
+                db_name="hidden-db",
+                chat_file="C:\\hidden\\room.json",
+                legacy_file="C:\\hidden\\legacy.json",
+                server="hidden-server",
+                password="hidden-password",
+                api_key="hidden-key",
+                table_key="sims_safe",
+                row_count=3,
+            )
+            if any(value in rendered_runtime_log for value in ("hidden-login", "hidden-company", "hidden-db", "hidden-server", "hidden-password", "hidden-key", "C:\\hidden")):
+                security_errors.append(f"runtime_chat_log_helper_leak={rendered_runtime_log!r}")
+            if "table_key=sims_safe" not in rendered_runtime_log or "row_count=3" not in rendered_runtime_log or "room_id=room-9" not in rendered_runtime_log:
+                security_errors.append(f"runtime_chat_log_helper_state_missing={rendered_runtime_log!r}")
+        except Exception as exc:
+            security_errors.append(f"runtime_chat_log_helper_runtime={type(exc).__name__}:{exc}")
+        try:
+            import app.ui.sims_panel as panel_security_mod
+
+            stale_log_state = panel_security_mod._panel_stale_payload_log_state(
+                {"company_id": 11, "db_name": "hidden-db-a", "company_name": "hidden-company-a", "login_id": "hidden-login"},
+                {"company_id": 12, "db_name": "hidden-db-b", "company_name": "hidden-company-b", "server": "hidden-server", "path": "C:\\hidden"},
+            )
+            rendered_stale_log = (
+                "[panel] stale action=safe-action payload_company_id=%s current_company_id=%s db_mismatch=%s"
+                % (
+                    stale_log_state.get("payload_company_id"),
+                    stale_log_state.get("current_company_id"),
+                    stale_log_state.get("db_mismatch"),
+                )
+            )
+            if any(
+                value in rendered_stale_log
+                for value in ("hidden-login", "hidden-company-a", "hidden-company-b", "hidden-db-a", "hidden-db-b", "hidden-server", "C:\\hidden")
+            ):
+                security_errors.append(f"panel_stale_log_helper_leak={rendered_stale_log!r}")
+            if stale_log_state != {"payload_company_id": 11, "current_company_id": 12, "db_mismatch": True}:
+                security_errors.append(f"panel_stale_log_state={stale_log_state!r}")
+            for marker in (
+                "skip stale table stash after company change",
+                "skip stale final payload after company change",
+            ):
+                start = panel_src_for_security.find(marker)
+                block = panel_src_for_security[start:start + 650] if start >= 0 else ""
+                if start < 0 or any(token in block for token in ("payload_stamp.get(\"db_name\")", "current_stamp.get(\"db_name\")", "payload_db=", "current_db=")):
+                    security_errors.append(f"panel_stale_log_template={marker}")
+        except Exception as exc:
+            security_errors.append(f"panel_stale_log_helper_runtime={type(exc).__name__}:{exc}")
+        for token in (
+            'log.exception("[chat] render pending item failed")',
+            'log.exception("[chat] normalize result failed")',
+            'log.exception("[chat] stash sims table/export table before json-safe failed")',
+        ):
+            if token in chat_middleware_src:
+                security_errors.append(f"chat_push_traceback_log={token}")
+        if security_errors:
+            results.append(_fail("Dashboard Lite env and connection secrecy", "; ".join(security_errors)))
+        else:
+            results.append(_ok("Dashboard Lite env and connection secrecy", "sidebar diagnostics and DB connection logs avoid raw endpoint/path/connection-string values"))
+
+        import app.ui.chat_middleware as chat_mod
+
+        action_errors: list[str] = []
+
+        class _FakeActionCtx:
+            def __enter__(self):
+                return self
+            def __exit__(self, *_exc):
+                return False
+
+        class _FakeActionStreamlit:
+            def __init__(self):
+                self.session_state = {}
+                self.downloads: list[dict] = []
+                self.buttons: list[dict] = []
+                self.captions: list[str] = []
+            def columns(self, n, **_kwargs):
+                return [_FakeActionCtx() for _ in range(int(n))]
+            def download_button(self, label, **kwargs):
+                self.downloads.append({"label": label, **kwargs})
+                return False
+            def button(self, label, **kwargs):
+                self.buttons.append({"label": label, **kwargs})
+                return False
+            def caption(self, text, **_kwargs):
+                self.captions.append(str(text))
+
+        old_chat_st = getattr(chat_mod, "st")
+        try:
+            fake_action_st = _FakeActionStreamlit()
+            setattr(chat_mod, "st", fake_action_st)
+            chat_mod._render_sims_result_actions_plain(
+                key_suffix="dashboard_excel_failed",
+                csv_bytes=b"col\n1\n",
+                csv_name="x.csv",
+                excel_bytes=None,
+                xlsx_name="x.xlsx",
+                prompt="분석",
+                table_key="sims_x",
+                clicked_action="Dashboard Lite v0.1",
+                download_df=pd.DataFrame({"col": [1]}),
+            )
+        finally:
+            setattr(chat_mod, "st", old_chat_st)
+        if [d.get("label") for d in fake_action_st.downloads] != ["CSV 저장"]:
+            action_errors.append(f"downloads={fake_action_st.downloads!r}")
+        if [b.get("label") for b in fake_action_st.buttons] != ["LLM 분석"]:
+            action_errors.append(f"buttons={fake_action_st.buttons!r}")
+        if not any("Excel" in c for c in fake_action_st.captions):
+            action_errors.append(f"captions={fake_action_st.captions!r}")
+        if action_errors:
+            results.append(_fail("SIMS action buttons independent Excel failure", "; ".join(action_errors)))
+        else:
+            results.append(_ok("SIMS action buttons independent Excel failure", "CSV and LLM controls render when Excel bytes are unavailable"))
+
+        facts_json = json.dumps(facts, ensure_ascii=False, default=str)
+        if "완료월 총매출과 당월 부분월 현재매출의 직접 우열 판단" not in facts_json or "sample_records 또는 화면 일부 행으로 전체 순위/총합 판단" not in facts_json:
+            results.append(_fail("Dashboard Lite comparison guardrails", "forbidden comparison guard missing"))
+        else:
+            results.append(_ok("Dashboard Lite comparison guardrails", "partial-month/sample/98-percent rules present in serialized facts"))
+    except Exception as e:
+        results.append(_fail("Dashboard Lite v0.1 facts", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}"))
 
     results.extend(_run_customer_sales_forecast_basic_checks())
     return results

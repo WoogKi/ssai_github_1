@@ -5,11 +5,13 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Mapping
 import io
 import re
 import os
 import uuid
+import hashlib
+import json
 
 import datetime as dt
 
@@ -26,6 +28,11 @@ def _mark_submitted() -> None:
     ss = st.session_state
     ss["__sims_form_submitted"] = True
     ss["__sims_submitted_form_id"] = ss.get("__sims_form_id")
+    ss["__sims_query_submit_seq"] = int(ss.get("__sims_query_submit_seq") or 0) + 1
+    selected = ss.get("__sims_selected") or {}
+    action = str(selected.get("action") or "").strip()
+    if action:
+        ss.pop(f"__sims_panel_query_fingerprint::{action}", None)
     log.debug("[panel.form] submitted=True (form_id=%s)", ss.get("__sims_form_id"))
 
 
@@ -1162,7 +1169,7 @@ def _prepare_sales_trend_display_df(
 # 🧩 외부 모듈
 #   - 뷰는 '표시 + payload 반환'만 담당 (컨텍스트 푸시는 여기서)
 # ==========================================================
-from app.sims.views import users, codes, vendors, goods, road_address, analytics_views, rddbc_io_views
+from app.sims.views import users, codes, vendors, goods, road_address, analytics_views, dashboard_lite, rddbc_io_views
 from app.sims.views.rddbc_io_shared import (
     _build_io_display_styler,
     _prepare_io_display_df,
@@ -1223,6 +1230,7 @@ _CATEGORIES: Dict[str, Dict[str, Any]] = {
     },
     "분석/KPI": {
         "actions": {
+            "Dashboard Lite v0.1": dashboard_lite.render_dashboard_lite,
             "제약사별 매출 추세 분석": analytics_views.render_manufacturer_sales_trend_analysis,
             "제약사별 매출 추세 분석 요약표": analytics_views.render_manufacturer_sales_trend_summary_analysis,
             "품목별 매출 추세 분석": analytics_views.render_sales_trend_analysis,
@@ -1460,6 +1468,22 @@ def _panel_payload_matches_current_company(payload: Dict[str, Any] | None) -> bo
     return True
 
 
+def _panel_stale_payload_log_state(
+    payload_stamp: Mapping[str, Any] | None,
+    current_stamp: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Return only non-identifying fields for stale-payload log records."""
+    payload = dict(payload_stamp or {})
+    current = dict(current_stamp or {})
+    payload_db_name = payload.get("db_name") or ""
+    current_db_name = current.get("db_name") or ""
+    return {
+        "payload_company_id": payload.get("company_id") or "",
+        "current_company_id": current.get("company_id") or "",
+        "db_mismatch": bool(payload_db_name and current_db_name and payload_db_name != current_db_name),
+    }
+
+
 def _panel_action_key(category: str, action: str) -> str:
     return f"{str(category or '').strip()}::{str(action or '').strip()}"
 
@@ -1564,7 +1588,7 @@ def _store_panel_final_payload_for_chat(payload: Dict[str, Any], action: str) ->
         try:
             meta = payload.setdefault("meta", {})
             if isinstance(meta, dict):
-                meta["_panel_source_sig"] = _make_panel_source_sig(action)
+                meta["_panel_source_sig"] = _make_panel_source_sig(action, payload)
         except Exception:
             pass
 
@@ -1659,15 +1683,42 @@ def _panel_compact_on_chat_rerun_enabled() -> bool:
     return _panel_bool_env("SIMS_PANEL_COMPACT_ON_CHAT_RERUN", True)
 
 
-def _make_panel_source_sig(action: str) -> str:
-    """패널 조회 결과 1회 승격/반복 렌더 판단용 signature."""
+def _panel_query_fingerprint(payload: Mapping[str, Any] | None) -> str:
+    """Return a deterministic fingerprint for actual submitted query conditions only."""
+    if not isinstance(payload, Mapping):
+        return ""
+    meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    material = {
+        "condition": payload.get("condition") or meta.get("condition"),
+        "query_summary": meta.get("query_summary"),
+        "source_query": meta.get("source_query"),
+        "params": meta.get("params") or payload.get("params"),
+        "filters": meta.get("filters"),
+    }
+    try:
+        encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        encoded = str(material)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def _make_panel_source_sig(action: str, payload: Mapping[str, Any] | None = None) -> str:
+    """Identify one explicit panel query execution without treating reruns as new results."""
     try:
         ss = st.session_state
         sel = ss.get("__sims_selected") or {}
-        return "{}::{}::{}".format(
+        action_name = str(sel.get("action") or action)
+        fingerprint = _panel_query_fingerprint(payload)
+        if fingerprint:
+            ss[f"__sims_panel_query_fingerprint::{action_name}"] = fingerprint
+        else:
+            fingerprint = str(ss.get(f"__sims_panel_query_fingerprint::{action_name}") or "")
+        return "{}::{}::{}::{}::{}".format(
             ss.get("__sims_run_seq"),
+            ss.get("__sims_query_submit_seq", 0),
             str(sel.get("category") or ""),
-            str(sel.get("action") or action),
+            action_name,
+            fingerprint or "no-condition",
         )
     except Exception:
         return str(action or "")
@@ -1961,13 +2012,13 @@ def _apply_panel_display_limit_to_payload(payload: Dict[str, Any], title: str = 
         if not _panel_payload_matches_current_company(payload):
             payload_stamp = _panel_payload_company_stamp(payload)
             current_stamp = _panel_current_company_stamp()
+            log_state = _panel_stale_payload_log_state(payload_stamp, current_stamp)
             log.info(
-                "[panel] skip stale table stash after company change action=%s payload_company_id=%s payload_db=%s current_company_id=%s current_db=%s",
+                "[panel] skip stale table stash after company change action=%s payload_company_id=%s current_company_id=%s db_mismatch=%s",
                 action,
-                payload_stamp.get("company_id"),
-                payload_stamp.get("db_name"),
-                current_stamp.get("company_id"),
-                current_stamp.get("db_name"),
+                log_state["payload_company_id"],
+                log_state["current_company_id"],
+                log_state["db_mismatch"],
             )
             return
 
@@ -3187,6 +3238,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
     if final and not _panel_payload_matches_current_company(payload):
         payload_stamp = _panel_payload_company_stamp(payload)
         current_stamp = _panel_current_company_stamp()
+        log_state = _panel_stale_payload_log_state(payload_stamp, current_stamp)
 
         _clear_panel_last_final_payload()
 
@@ -3204,12 +3256,11 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
         st.session_state["__sims_inner_submit"] = False
 
         log.info(
-            "[panel] skip stale final payload after company change action=%s payload_company_id=%s payload_db=%s current_company_id=%s current_db=%s",
+            "[panel] skip stale final payload after company change action=%s payload_company_id=%s current_company_id=%s db_mismatch=%s",
             action,
-            payload_stamp.get("company_id"),
-            payload_stamp.get("db_name"),
-            current_stamp.get("company_id"),
-            current_stamp.get("db_name"),
+            log_state["payload_company_id"],
+            log_state["current_company_id"],
+            log_state["db_mismatch"],
         )
         return
 
@@ -3377,13 +3428,15 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
             # 여기서 return 해버리면 메인에서 chat.panel.push skip: no df 가 발생한다.
             if _panel_result_target_chat_enabled():
                 try:
-                    panel_source_sig = _make_panel_source_sig(action)
+                    panel_source_sig = _make_panel_source_sig(action, payload)
                     if _panel_chat_push_already_consumed(panel_source_sig):
                         log.info(
-                            "[panel] skip compact chat payload store: already pushed action=%s sig=%s",
+                            "[panel] skip duplicate panel render: already pushed action=%s sig=%s",
                             action,
                             panel_source_sig,
                         )
+                        _render_panel_chat_only_done(payload, action)
+                        return
                     else:
                         df_for_meta: Optional[pd.DataFrame] = None
                         if isinstance(df_full, pd.DataFrame) and not df_full.empty:
@@ -3439,7 +3492,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
     ):
         try:
             ss = st.session_state
-            panel_source_sig = _make_panel_source_sig(action)
+            panel_source_sig = _make_panel_source_sig(action, payload)
 
             df_for_meta: Optional[pd.DataFrame] = None
             if isinstance(df_full, pd.DataFrame) and not df_full.empty:
@@ -3936,7 +3989,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
             if final:
                 try:
                     ss = st.session_state
-                    panel_source_sig = _make_panel_source_sig(action)
+                    panel_source_sig = _make_panel_source_sig(action, payload)
 
                     if ss.get("__sims_panel_source_promoted_sig") != panel_source_sig:
                         df_for_meta: Optional[pd.DataFrame] = None

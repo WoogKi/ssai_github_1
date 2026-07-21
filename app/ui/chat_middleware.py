@@ -169,28 +169,27 @@ def _chat_runtime_log_context(room: Optional[Dict[str, Any]] = None, **extra: An
 
     ctx: Dict[str, Any] = {
         "user_id": getattr(user, "user_id", None),
-        "login_id": getattr(user, "login_id", None),
         "user_type": getattr(user, "user_type", None),
         "user_grade": getattr(user, "user_grade", None),
         "company_id": None,
-        "company_name": "",
-        "db_name": "",
         "room_id": "",
     }
 
     if isinstance(company, dict):
         ctx.update(
-            {
-                "company_id": company.get("company_id"),
-                "company_name": company.get("company_name"),
-                "db_name": company.get("db_name"),
-            }
+            {"company_id": company.get("company_id")}
         )
 
     if isinstance(room, dict):
         ctx["room_id"] = room.get("id") or ""
 
-    ctx.update(extra)
+    blocked = {
+        "login_id", "user_name", "username", "company_name", "db_name",
+        "server", "host", "port", "path", "file", "chat_file", "legacy_file",
+        "partition_root", "connection_string", "dsn", "password", "pwd",
+        "api_key", "token", "secret",
+    }
+    ctx.update({key: value for key, value in extra.items() if str(key).lower() not in blocked})
     return ctx
 
 
@@ -198,12 +197,9 @@ def _chat_runtime_log_kv(room: Optional[Dict[str, Any]] = None, **extra: Any) ->
     ctx = _chat_runtime_log_context(room, **extra)
     order = [
         "user_id",
-        "login_id",
         "user_type",
         "user_grade",
         "company_id",
-        "company_name",
-        "db_name",
         "room_id",
     ]
     order += [k for k in ctx.keys() if k not in order]
@@ -4375,7 +4371,7 @@ def _make_table_downloads(df: pd.DataFrame) -> Tuple[io.BytesIO, io.BytesIO]:
     csv_buf.write(csv_text.encode("utf-8-sig")) # BOM 포함 UTF-8로 인코딩
     csv_buf.seek(0)
 
-    with pd.ExcelWriter(xlsx_buf, engine="xlsxwriter") as writer:
+    with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
         if not _write_supplier_stock_shortage_excel_if_any(writer, df):
             df.to_excel(writer, index=False, sheet_name="SIMS")
             _apply_sims_excel_number_formats(writer, df, "SIMS")
@@ -4556,7 +4552,7 @@ def _get_full_download_df_for_sims_item(
                 action,
             )
         except Exception:
-            log.exception("[chat] stash full export by table_key failed")
+            log.warning("[chat.stash.export] full export cache failed")
 
     full_df = _pick_payload_full_df_for_download(item, meta)
 
@@ -4724,7 +4720,7 @@ def _get_full_download_df_for_sims_item(
             return export_df
         
     except Exception:
-        log.exception("[chat] full download df build failed action=%s", action)
+        log.warning("[chat.stash.export] full download dataframe failed action=%s", action)
 
     return display_df
 
@@ -4905,7 +4901,7 @@ def _render_sims_result_actions_fragment(
     key_suffix: str,
     csv_bytes: bytes,
     csv_name: str,
-    excel_bytes: bytes,
+    excel_bytes: bytes | None,
     xlsx_name: str,
     prompt: str,
     table_key: str = "",
@@ -4935,14 +4931,17 @@ def _render_sims_result_actions_fragment(
         )
 
     with c2:
-        st.download_button(
-            "EXCEL 저장",
-            data=excel_bytes,
-            file_name=xlsx_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"sims_xlsx_{key_suffix}",
-            width="stretch",
-        )
+        if isinstance(excel_bytes, (bytes, bytearray)):
+            st.download_button(
+                "EXCEL 저장",
+                data=excel_bytes,
+                file_name=xlsx_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"sims_xlsx_{key_suffix}",
+                width="stretch",
+            )
+        else:
+            st.caption("Excel 다운로드를 준비하지 못했습니다.")
 
     with c3:
         run_llm = st.button(
@@ -5333,7 +5332,10 @@ def _render_sims_result_actions_lazy(
         and cached.get("cols") == col_count
         and tuple(cached.get("col_sig") or []) == col_sig
         and isinstance(cached.get("csv_bytes"), (bytes, bytearray))
-        and isinstance(cached.get("excel_bytes"), (bytes, bytearray))
+        and (
+            isinstance(cached.get("excel_bytes"), (bytes, bytearray))
+            or cached.get("excel_bytes") is None
+        )
     ):
         csv_bytes = cached["csv_bytes"]
         excel_bytes = cached["excel_bytes"]
@@ -5346,16 +5348,35 @@ def _render_sims_result_actions_lazy(
     else:
         t0 = time.perf_counter()
 
-        excel_download_df = _sanitize_dataframe_for_excel(download_df)
+        try:
+            csv_download_df = _sanitize_dataframe_for_excel(download_df)
+            csv_bytes = csv_download_df.to_csv(index=False).encode("utf-8-sig")
+        except Exception:
+            log.exception(
+                "[chat] CSV download bytes failed key=%s rows=%s cols=%s",
+                key_suffix,
+                row_count,
+                col_count,
+            )
+            csv_bytes = download_df.to_csv(index=False).encode("utf-8-sig")
 
-        csv_bytes = excel_download_df.to_csv(index=False).encode("utf-8-sig")
-
-        bio = io.BytesIO()
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            if not _write_supplier_stock_shortage_excel_if_any(writer, download_df):
-                excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
-                _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
-        excel_bytes = bio.getvalue()
+        excel_bytes: bytes | None = None
+        try:
+            excel_download_df = _sanitize_dataframe_for_excel(download_df)
+            bio = io.BytesIO()
+            with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+                if not _write_supplier_stock_shortage_excel_if_any(writer, download_df):
+                    excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
+                    _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
+            excel_bytes = bio.getvalue()
+        except Exception as exc:
+            log.warning(
+                "[chat] Excel download bytes failed key=%s rows=%s cols=%s error=%s",
+                key_suffix,
+                row_count,
+                col_count,
+                type(exc).__name__,
+            )
 
         ss[bytes_key] = {
             "rows": row_count,
@@ -5397,7 +5418,7 @@ def _render_sims_result_actions_plain(
     key_suffix: str,
     csv_bytes: bytes,
     csv_name: str,
-    excel_bytes: bytes,
+    excel_bytes: bytes | None,
     xlsx_name: str,
     prompt: str,
     table_key: str = "",
@@ -5431,14 +5452,17 @@ def _render_sims_result_actions_plain(
         )
 
     with c2:
-        st.download_button(
-            "EXCEL 저장",
-            data=excel_bytes,
-            file_name=xlsx_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key=f"sims_xlsx_{key_suffix}",
-            width="stretch",
-        )
+        if isinstance(excel_bytes, (bytes, bytearray)):
+            st.download_button(
+                "EXCEL 저장",
+                data=excel_bytes,
+                file_name=xlsx_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"sims_xlsx_{key_suffix}",
+                width="stretch",
+            )
+        else:
+            st.caption("Excel 다운로드를 준비하지 못했습니다.")
 
     with c3:
         run_llm = st.button(
@@ -6374,8 +6398,8 @@ def drain_inbox_to_chat(room: Optional[Dict[str, Any]] = None) -> None:
 
                 if not exists:
                     room_obj["history"].append(safe_item)
-        except Exception:
-            log.exception("[chat] persist sims item into current_room.history failed")
+        except Exception as exc:
+            log.warning("[chat.drain] persist history failed error_type=%s", type(exc).__name__)
 
         moved += 1
 
@@ -6426,8 +6450,8 @@ def render_pending_chat_items(area, room: Optional[Dict[str, Any]] = None) -> No
         for item in pending:
             try:
                 _render_chat_item(item, target=area)
-            except Exception:
-                log.exception("[chat] render pending item failed")
+            except Exception as exc:
+                log.warning("[chat.render.pending] item render failed error_type=%s", type(exc).__name__)
 
 def wssz(result: Any, action: Optional[str] = None) -> None:
     """
@@ -6448,8 +6472,8 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
             payload = _normalize_result_for_chat(result)
         else:
             payload = _normalize_result_for_chat(result)
-    except Exception:
-        log.exception("[chat] normalize result failed")
+    except Exception as exc:
+        log.warning("[chat.sims.push] normalize result failed error_type=%s", type(exc).__name__)
         return
 
     # 2) 액션명/타이틀 보강
@@ -6471,12 +6495,11 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         current_company_id, current_db_name = _chat_current_company_sig()
 
         log.info(
-            "[chat.sims.push] skip stale company payload action=%s payload_company_id=%s payload_db=%s current_company_id=%s current_db=%s",
+            "[chat.sims.push] skip stale company payload action=%s payload_company_id=%s current_company_id=%s db_mismatch=%s",
             action_name,
             payload_company_id,
-            payload_db_name,
             current_company_id,
-            current_db_name,
+            bool(payload_db_name and current_db_name and payload_db_name != current_db_name),
         )
         return
 
@@ -6654,11 +6677,11 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                         action_name,
                     )
 
-            except Exception:
-                log.exception("[chat] clear stale SIMS context after tableless result failed")
+            except Exception as exc:
+                log.warning("[chat.sims.push] clear stale context failed error_type=%s", type(exc).__name__)
 
-    except Exception:
-        log.exception("[chat] build SIMS context failed")
+    except Exception as exc:
+        log.warning("[chat.sims.push] build context failed error_type=%s", type(exc).__name__)
 
     # 3.5) (옵션) 컨텍스트만 갱신하고 채팅 푸시는 생략
     # - NLQ(자연어 자동조회) 등에서 "표는 채팅버블로 별도 렌더"할 때,
@@ -6825,8 +6848,8 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                                 expected_rows_for_followup,
                             )
 
-                except Exception:
-                    log.exception("[chat] stash full df for current followup failed")
+                except Exception as exc:
+                    log.warning("[chat.stash.export] followup full dataframe failed error_type=%s", type(exc).__name__)
 
 
                 ss["__sims_last_table_key"] = table_key
@@ -6876,8 +6899,8 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 payload["meta"] = meta
                 payload.setdefault("content", payload.get("title") or f"📊 {action_name}")
 
-    except Exception:
-        log.exception("[chat] stash sims table/export table before json-safe failed")
+    except Exception as exc:
+        log.warning("[chat.stash.export] table preparation failed error_type=%s", type(exc).__name__)
 
 
     # 3.56) JSON 저장/재렌더 안전화 (DataFrame → meta records/columns)
@@ -6929,8 +6952,8 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 payload.setdefault('content', payload.get('title') or f"📊 {action_name}")
                 payload.pop('df', None)
                 payload.pop('df_display', None)
-    except Exception:
-        log.exception('[chat] stash sims table failed')
+    except Exception as exc:
+        log.warning("[chat.stash.export] table stash failed error_type=%s", type(exc).__name__)
 
     # 4-2) 최소 필드 보강(정렬/렌더)
     if isinstance(payload, dict):
@@ -6950,8 +6973,8 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
             meta_for_display.setdefault("display_time", _coerce_sims_display_time(created_at) or now_dt.strftime("%H:%M:%S"))
             meta_for_display.setdefault("result_seq", int(ss.get("__sims_push_count", 0)) + 1)
             payload["meta"] = meta_for_display
-        except Exception:
-            log.exception("[chat.sims.push] failed to attach display meta")
+        except Exception as exc:
+            log.warning("[chat.sims.push] display metadata failed error_type=%s", type(exc).__name__)
 
     # 5) 인박스에 넣고 drain
     ss.setdefault("__chat_inbox", [])

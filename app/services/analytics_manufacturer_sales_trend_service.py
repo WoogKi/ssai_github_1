@@ -637,10 +637,13 @@ def _manufacturer_summary_meta(df: pd.DataFrame, *, months: list[str], policy: D
     }
 
 
-def get_manufacturer_sales_trend(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def get_manufacturer_sales_trend(
+    params: Optional[Dict[str, Any]] = None,
+    raw_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     t0 = time.perf_counter()
     params = _apply_period_source_policy_params(_apply_month_or_date_params(coalesce_params(params)))
-    raw = get_sales_trend_df(params)
+    raw = raw_df if raw_df is not None else get_sales_trend_df(params)
     t_source = time.perf_counter()
     if raw is None or raw.empty:
         log.info(
@@ -682,10 +685,13 @@ def get_manufacturer_sales_trend(params: Optional[Dict[str, Any]] = None) -> pd.
     return out
 
 
-def get_manufacturer_sales_trend_summary(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+def get_manufacturer_sales_trend_summary(
+    params: Optional[Dict[str, Any]] = None,
+    raw_df: Optional[pd.DataFrame] = None,
+) -> pd.DataFrame:
     t0 = time.perf_counter()
     params = _apply_period_source_policy_params(_apply_month_or_date_params(coalesce_params(params)))
-    detail = get_manufacturer_sales_trend(params)
+    detail = get_manufacturer_sales_trend(params, raw_df=raw_df)
     t_source = time.perf_counter()
     if detail is None or detail.empty:
         log.info(
@@ -814,9 +820,12 @@ def get_manufacturer_sales_trend_summary(params: Optional[Dict[str, Any]] = None
     return out
 
 
-def get_manufacturer_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def get_manufacturer_sales_trend_result(
+    params: Optional[Dict[str, Any]] = None,
+    raw_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
     params = _apply_month_or_date_params(coalesce_params(params))
-    df = get_manufacturer_sales_trend(params)
+    df = get_manufacturer_sales_trend(params, raw_df=raw_df)
     rows = 0 if df is None else int(len(df))
     log.info("[analytics.manufacturer_sales_trend] rows=%s params=%r", rows, params)
     source_label = str(getattr(df, "attrs", {}).get("source_label") or _effective_source_label(_resolve_source_mode(params), df))
@@ -854,9 +863,12 @@ def get_manufacturer_sales_trend_result(params: Optional[Dict[str, Any]] = None)
     return payload
 
 
-def get_manufacturer_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def get_manufacturer_sales_trend_summary_result(
+    params: Optional[Dict[str, Any]] = None,
+    raw_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
     params = _apply_month_or_date_params(coalesce_params(params))
-    df = get_manufacturer_sales_trend_summary(params)
+    df = get_manufacturer_sales_trend_summary(params, raw_df=raw_df)
     rows = 0 if df is None else int(len(df))
     log.info("[analytics.manufacturer_sales_trend_summary] rows=%s params=%r", rows, params)
     source_label = str(getattr(df, "attrs", {}).get("source_label") or _effective_source_label(_resolve_source_mode(params), df))

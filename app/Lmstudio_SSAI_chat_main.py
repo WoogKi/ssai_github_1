@@ -105,17 +105,16 @@ log = setup_rotating_logger(
 )
 
 log.info(
-    "[app.env] env_file=%s exists=%s loaded=%s APP_ENV=%s SSAI_INSTANCE_ID=%s CHAT_FILE=%s LOG_FILE=%s sys_executable=%s",
-    str(ROOT_ENV_PATH),
+    "[app.env] env_configured=%s loaded=%s APP_ENV=%s SSAI_INSTANCE_ID=%s chat_storage_configured=%s log_configured=%s venv_active=%s",
     bool(_ENV_LOAD_RESULT.exists),
     bool(_ENV_LOAD_RESULT.loaded),
     _app_env_name(),
     os.getenv("SSAI_INSTANCE_ID") or "",
-    str(_config_path("CHAT_FILE")),
-    _log_file,
-    sys.executable,
+    bool(os.getenv("CHAT_FILE")),
+    bool(os.getenv("LOG_FILE") or os.getenv("SIMS_LOG_FILE")),
+    "venv" in str(sys.executable).lower(),
 )
-log.debug("LOG INIT level=%s project_env=%s", _level_name, str(ROOT_ENV_PATH))
+log.debug("LOG INIT level=%s env_configured=%s", _level_name, bool(_ENV_LOAD_RESULT.exists))
 
 # (선택) SQLAlchemy 로깅 톤 정리는 초기화 이후에 설정
 _logging_init.getLogger("sqlalchemy.engine").setLevel(_logging_init.WARNING)
@@ -387,7 +386,7 @@ def _can_show_admin_diagnostics_sidebar() -> bool:
 
     운영 사용자에게는 내부 환경정보, Health Check, Debug 메뉴를 노출하지 않는다.
     표시 대상:
-    - SSART_ADMIN 만 표시
+    - dev 환경의 SSART_ADMIN + SUPER
 
     숨김 대상:
     - SSART_USER
@@ -400,9 +399,7 @@ def _can_show_admin_diagnostics_sidebar() -> bool:
     if not user:
         return False
 
-    user_type = str(getattr(user, "user_type", "") or "").strip().upper()
-
-    return user_type == "SSART_ADMIN"
+    return bool(_is_platform_super_admin_user(user)) and _app_env_name() == "dev"
 
 
 
@@ -712,14 +709,14 @@ def _clear_sims_runtime_for_company_change(reason: str = "company_change") -> No
         ss["__sims_ctx_dirty"] = True
 
         log.info(
-            "[company.change.clear_sims] reason=%s removed_table_keys=%s open=%s selected=%r",
+            "[company.change.clear_sims] reason=%s removed_table_count=%s open=%s selected_configured=%s",
             reason,
-            sorted(remove_table_keys),
+            len(remove_table_keys),
             ss.get("__sims_open"),
-            ss.get("__sims_selected"),
+            bool(ss.get("__sims_selected")),
         )
     except Exception:
-        log.exception("[company.change.clear_sims] failed reason=%s", reason)
+        log.warning("[company.change.clear_sims] failed reason=%s", reason)
 
 
 def _new_ui_event_id(prefix: str = "ui") -> str:
@@ -822,6 +819,17 @@ def _request_sims_close_for_new_pending_room() -> None:
         _clear_current_table_source_for_room_change()
     except Exception:
         log.exception("[chat.room] request SIMS close for new pending room failed")
+
+
+def _clear_dashboard_lite_for_new_chat() -> list[str]:
+    """Clear Dashboard-only state as part of the normal new-chat transition."""
+    try:
+        from app.sims.views.dashboard_lite import clear_dashboard_lite_session_state
+
+        return clear_dashboard_lite_session_state(st.session_state)
+    except Exception:
+        log.debug("[chat.room] dashboard_lite_clear_failed", exc_info=False)
+        return []
 
 
 def _clear_current_table_source_for_room_change() -> None:
@@ -1074,19 +1082,16 @@ def _diagnose_db() -> dict:
             "status": "FAIL",
             "reason": "load_mssql_config 실패",
             "info": None,
-            "detail": f"{type(e).__name__}: {e}",
+            "detail": type(e).__name__,
         }
 
     info = {
-        "host": cfg.host,
-        "port": cfg.port,
-        "db": cfg.database,
-        "user": cfg.user,
+        "configured": True,
         "encrypt": cfg.encrypt,
         "trust_cert": cfg.trust_cert,
         "timeout": cfg.timeout,
         # 있다면
-        "odbc_driver": getattr(cfg, "odbc_driver", None),
+        "odbc_driver_configured": bool(getattr(cfg, "odbc_driver", None)),
     }
 
     result = {
@@ -1102,7 +1107,7 @@ def _diagnose_db() -> dict:
     except Exception as e:
         result["status"] = "FAIL"
         result["reason"] = "health_check() 예외 발생"
-        result["detail"] = f"{type(e).__name__}: {e}"
+        result["detail"] = type(e).__name__
         return result
 
     if ok:
@@ -1618,13 +1623,14 @@ Path(CHAT_FILE).parent.mkdir(parents=True, exist_ok=True)
 Path(UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 
 log.info(
-    "[app.env.paths] env_file=%s exists=%s APP_ENV=%s SSAI_INSTANCE_ID=%s CHAT_FILE=%s sys_executable=%s",
-    str(ROOT_ENV_PATH),
+    "[app.env.paths] env_configured=%s APP_ENV=%s SSAI_INSTANCE_ID=%s chat_storage_configured=%s upload_configured=%s log_configured=%s venv_active=%s",
     bool(ROOT_ENV_PATH.exists()),
     _app_env_name(),
     os.getenv("SSAI_INSTANCE_ID") or "",
-    str(CHAT_FILE),
-    sys.executable,
+    bool(CHAT_FILE),
+    bool(UPLOAD_DIR),
+    bool(_log_file),
+    "venv" in str(sys.executable).lower(),
 )
 
 # =========================================================
@@ -6416,11 +6422,10 @@ def _push_panel_result_to_current_chat(
         ss.pop("__sims_panel_source_promoted_sig", None)
 
         log.info(
-            "[chat.panel.push] skip stale company payload payload_company_id=%s payload_db=%s current_company_id=%s current_db=%s run_seq=%s",
+            "[chat.panel.push] skip stale company payload payload_company_id=%s current_company_id=%s db_mismatch=%s run_seq=%s",
             payload_company_id,
-            payload_db_name,
             current_company_id,
-            current_db_name,
+            bool(payload_db_name and current_db_name and payload_db_name != current_db_name),
             run_seq or ss.get("__sims_run_seq"),
         )
         return False
@@ -6769,16 +6774,11 @@ def _consume_company_change_notice(room: dict[str, Any]) -> None:
 
     old_name = str(notice.get("old_company_name") or "이전 회사").strip()
     new_name = str(notice.get("new_company_name") or "변경 회사").strip()
-    new_db = str(notice.get("new_db_name") or "").strip()
-
     message = (
         f"사용 DB가 **{old_name}**에서 **{new_name}**으로 변경되었습니다.\n\n"
         "이전 DB 기준의 현재표/조회결과/후속분석 컨텍스트는 초기화되었습니다.\n"
         f"이후 조회와 분석은 **{new_name}** 기준으로 실행됩니다."
     )
-
-    if new_db:
-        message += f"\n\nDB: `{new_db}`"
 
     # 1) 화면에 즉시 표시
     st.info(message)
@@ -6794,11 +6794,9 @@ def _consume_company_change_notice(room: dict[str, Any]) -> None:
             and str(last.get("content") or "").strip() == message.strip()
         ):
             log.info(
-                "[company.change.notice] duplicated skip %s old=%s new=%s db=%s",
+                "[company.change.notice] duplicated skip %s company_changed=%s",
                 _chat_log_kv(room),
-                old_name,
-                new_name,
-                new_db,
+                bool(old_name != new_name),
             )
             return
 
@@ -6819,11 +6817,9 @@ def _consume_company_change_notice(room: dict[str, Any]) -> None:
     save_chat_rooms()
 
     log.info(
-        "[company.change.notice] saved %s old=%s new=%s db=%s",
+        "[company.change.notice] saved %s company_changed=%s",
         _chat_log_kv(room),
-        old_name,
-        new_name,
-        new_db,
+        bool(old_name != new_name),
     )
 
 
@@ -7618,8 +7614,8 @@ def _load_partitioned_chat_rooms(chat_file: str) -> list[dict[str, Any]] | None:
         _set_chat_storage_state("partitioned", root, rooms)
         total_elapsed = time.perf_counter() - t0
         log.info(
-            "[chat.storage.load] storage_mode=partitioned root=%s rooms=%s loaded_messages=%s loaded_bytes=%s metadata=%.3fs room_load=%.3fs payload_check=0.000s migration=0.000s fallback=False skipped_bad_lines=%s total=%.3fs",
-            str(root),
+            "[chat.storage.load] storage_mode=partitioned partition_configured=%s rooms=%s loaded_messages=%s loaded_bytes=%s metadata=%.3fs room_load=%.3fs payload_check=0.000s migration=0.000s fallback=False skipped_bad_lines=%s total=%.3fs",
+            True,
             len(rooms),
             sum(len(r.get(ch) or []) for r in rooms for ch in _CHAT_PARTITION_CHANNELS),
             loaded_bytes,
@@ -7630,7 +7626,7 @@ def _load_partitioned_chat_rooms(chat_file: str) -> list[dict[str, Any]] | None:
         )
         return rooms
     except Exception:
-        log.exception("[chat.storage.load] partitioned failed root=%s fallback=True", str(root))
+        log.exception("[chat.storage.load] partitioned failed partition_configured=%s fallback=True", bool(root))
         _set_chat_storage_state("legacy", root, None)
         return None
 
@@ -7701,9 +7697,9 @@ def _write_partitioned_store_from_rooms(rooms: list[dict[str, Any]], chat_file: 
         tmp_root.rename(root)
         _set_chat_storage_state("partitioned", root, rooms)
         log.info(
-            "[chat.storage.migration] legacy_file=%s root=%s rooms=%s messages=%s elapsed=%.3fs fallback=False",
-            str(chat_file),
-            str(root),
+            "[chat.storage.migration] legacy_configured=%s partition_configured=%s rooms=%s messages=%s elapsed=%.3fs fallback=False",
+            bool(chat_file),
+            bool(root),
             len(meta_rooms),
             message_count,
             time.perf_counter() - t0,
@@ -7716,9 +7712,9 @@ def _write_partitioned_store_from_rooms(rooms: list[dict[str, Any]], chat_file: 
         except Exception:
             pass
         log.exception(
-            "[chat.storage.migration] legacy_file=%s root=%s elapsed=%.3fs fallback=True",
-            str(chat_file),
-            str(root),
+            "[chat.storage.migration] legacy_configured=%s partition_configured=%s elapsed=%.3fs fallback=True",
+            bool(chat_file),
+            bool(root),
             time.perf_counter() - t0,
         )
         _set_chat_storage_state("legacy", root, None)
@@ -7738,10 +7734,9 @@ def _try_migrate_legacy_to_partitioned(rooms: list[dict[str, Any]], chat_file: s
         size = 0
         mtime = ""
     log.info(
-        "[chat.storage.migration.precheck] legacy_file=%s legacy_bytes=%s legacy_mtime=%s rooms=%s messages=%s",
-        str(chat_file),
+        "[chat.storage.migration.precheck] legacy_present=%s legacy_bytes=%s rooms=%s messages=%s",
+        bool(os.path.exists(chat_file)),
         size,
-        mtime,
         len(rooms or []),
         sum(len(r.get(ch) or []) for r in rooms or [] for ch in _CHAT_PARTITION_CHANNELS if isinstance(r, dict)),
     )
@@ -7844,7 +7839,7 @@ def _save_partitioned_chat_rooms(rooms_to_save: list[dict[str, Any]], chat_file:
     try:
         _write_rooms_index_csv(root, meta_rooms)
     except Exception:
-        log.exception("[chat.storage.index] write failed root=%s", str(root))
+        log.exception("[chat.storage.index] write failed partition_configured=%s", bool(root))
 
     detail = {
         "event_id": event_id,
@@ -7896,8 +7891,7 @@ def _safe_log_value(value: Any, limit: int = 120) -> str:
 
 def _chat_log_context(room: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
     """
-    여러 사용자가 동시에 사용할 때 로그만 보고도
-    사용자/회사/DB/채팅방/저장파일을 식별할 수 있게 하는 공통 컨텍스트.
+    사용자·회사 격리를 확인하는 데 필요한 비식별 상태만 제공한다.
     """
     try:
         user = get_current_user()
@@ -7911,34 +7905,28 @@ def _chat_log_context(room: dict[str, Any] | None = None, **extra: Any) -> dict[
 
     ctx: dict[str, Any] = {
         "user_id": getattr(user, "user_id", None),
-        "login_id": getattr(user, "login_id", None),
         "user_type": getattr(user, "user_type", None),
         "user_grade": getattr(user, "user_grade", None),
         "company_id": None,
-        "company_name": "",
-        "db_name": "",
         "room_id": "",
-        "chat_file": "",
     }
 
     if isinstance(company, dict):
         ctx.update(
             {
                 "company_id": company.get("company_id"),
-                "company_name": company.get("company_name"),
-                "db_name": company.get("db_name"),
             }
         )
 
     if isinstance(room, dict):
         ctx["room_id"] = room.get("id") or ""
 
-    try:
-        ctx["chat_file"] = _effective_chat_file()
-    except Exception:
-        ctx["chat_file"] = ""
-
-    ctx.update(extra)
+    blocked_keys = {
+        "api_key", "chat_file", "company_name", "connection_string", "db_name",
+        "dsn", "env_file", "legacy_file", "log_file", "login_id", "partition_root",
+        "password", "path", "root", "server", "uid", "user", "username",
+    }
+    ctx.update({key: value for key, value in extra.items() if str(key).lower() not in blocked_keys})
     return ctx
 
 
@@ -7946,14 +7934,10 @@ def _chat_log_kv(room: dict[str, Any] | None = None, **extra: Any) -> str:
     ctx = _chat_log_context(room, **extra)
     order = [
         "user_id",
-        "login_id",
         "user_type",
         "user_grade",
         "company_id",
-        "company_name",
-        "db_name",
         "room_id",
-        "chat_file",
     ]
     order += [k for k in ctx.keys() if k not in order]
 
@@ -7973,7 +7957,7 @@ def load_chat_rooms() -> List[Dict[str, Any]]:
             return rooms_partitioned
 
     if not os.path.exists(chat_file):
-        log.debug("[chat.load] missing %s", _chat_log_kv(chat_file=chat_file))
+        log.debug("[chat.load] missing %s", _chat_log_kv(chat_storage_configured=bool(chat_file)))
         if _chat_storage_mode_enabled():
             _set_chat_storage_state("partitioned", _partitioned_chat_root(chat_file), [])
         return []
@@ -7989,7 +7973,7 @@ def load_chat_rooms() -> List[Dict[str, Any]]:
         with open(chat_file, "r", encoding="utf-8") as f:
             raw = json.load(f)
     except Exception:
-        log.exception("[chat.load] failed %s", _chat_log_kv(chat_file=chat_file))
+        log.warning("[chat.load] failed %s", _chat_log_kv(chat_storage_configured=bool(chat_file)))
         _set_chat_storage_state("legacy", _partitioned_chat_root(chat_file), None)
         return []
 
@@ -8006,7 +7990,7 @@ def load_chat_rooms() -> List[Dict[str, Any]]:
         _set_chat_storage_state("legacy", _partitioned_chat_root(chat_file), rooms)
     log.info(
         "[chat.load] %s rooms=%s storage_mode=%s legacy_bytes=%s load_elapsed=%.3fs migration=%s",
-        _chat_log_kv(chat_file=chat_file),
+        _chat_log_kv(chat_storage_configured=bool(chat_file)),
         len(rooms),
         st.session_state.get("__chat_storage_mode") or "legacy",
         legacy_size,
@@ -8043,9 +8027,9 @@ def _reset_chat_session_when_user_changed() -> None:
     try:
         effective_chat_file = _effective_chat_file()
         log.info(
-            "[app.env.user_paths] effective_user_chat_file=%s partition_root=%s",
-            str(effective_chat_file),
-            str(_partitioned_chat_root(effective_chat_file)),
+            "[app.env.user_paths] effective_user_chat_file_configured=%s partition_root_configured=%s",
+            bool(effective_chat_file),
+            bool(_partitioned_chat_root(effective_chat_file)),
         )
     except Exception:
         log.exception("[app.env.user_paths] failed to resolve user chat paths")
@@ -8309,7 +8293,7 @@ def save_chat_rooms():
                 )
                 log.info(
                     "[chat.save] %s rooms=%s saved_rooms=%s compare_mode=%s storage_mode=partitioned",
-                    _chat_log_kv(chat_file=chat_file),
+                    _chat_log_kv(chat_storage_configured=bool(chat_file)),
                     len(st.session_state.get("chat_rooms") or []),
                     len(rooms_to_save),
                     save_detail["compare_mode"],
@@ -8329,7 +8313,7 @@ def save_chat_rooms():
                 )
                 return
             except Exception:
-                log.exception("[chat.storage.save] partitioned failed fallback legacy file=%s", chat_file)
+                log.warning("[chat.storage.save] partitioned failed fallback_legacy=True")
                 st.session_state["__chat_storage_mode"] = "legacy"
 
         tmp_dir = os.path.dirname(chat_file) or "."
@@ -8376,7 +8360,7 @@ def save_chat_rooms():
             )
             log.info(
                 "[chat.save] %s rooms=%s saved_rooms=%s compare_mode=%s",
-                _chat_log_kv(chat_file=chat_file),
+                _chat_log_kv(chat_storage_configured=bool(chat_file)),
                 len(st.session_state.get("chat_rooms") or []),
                 len(rooms_to_save),
                 save_detail["compare_mode"],
@@ -9338,6 +9322,7 @@ with st.sidebar:
     # ── (항상 보임) 핵심: 새 대화 + 목록 + 이름 변경 ────────────────
     def _new_room():
         # 사용자가 직접 누른 경우는 임시방이 아니라 정식 새 채팅방이다.
+        _clear_dashboard_lite_for_new_chat()
         new_room = _select_pending_new_room(close_sims_state=True)
         ss["__room_prev_selected"] = new_room["id"]
         ss["__room_rename_buf"] = new_room.get("name") or ""
@@ -9841,67 +9826,53 @@ with st.sidebar:
     if _can_show_admin_diagnostics_sidebar():
 
         # 6) 환경 요약/헬스체크/진단
-        def _mask(v: str | None, show: int = 3) -> str:
-            if not v: return "(미설정)"
-            v = str(v); return v if len(v) <= show else v[:show] + "…" + f"({len(v)} chars)"
-
         st.markdown("---")
         st.markdown("## ⚙️ 환경 요약")
         st.write({
-            "LMSTUDIO_BASE_URL": os.getenv("LMSTUDIO_BASE_URL"),
-            "MSSQL_SERVER":      os.getenv("MSSQL_SERVER"),
-            "MSSQL_DATABASE":    os.getenv("MSSQL_DATABASE"),
-            "LMSTUDIO_API_KEY":  _mask(os.getenv("LMSTUDIO_API_KEY", "")),
+            "APP_ENV": _app_env_name(),
+            "SSAI_INSTANCE_ID": os.getenv("SSAI_INSTANCE_ID") or "",
+            "LLM 설정 여부": bool(os.getenv("LMSTUDIO_BASE_URL") or os.getenv("LMSTUDIO_API_KEY")),
+            "DB 설정 여부": bool(os.getenv("MSSQL_SERVER") or os.getenv("SSAI_DB_SERVER")),
+            "로그 설정 여부": bool(os.getenv("LOG_FILE") or os.getenv("SIMS_LOG_LEVEL")),
         })
 
         st.markdown("---")
         st.markdown("## 🩺 Health Check")
-        if st.button("Check LLM & DB", use_container_width=True, key="btn_health_check"):
+        if st.button("Check LLM & DB", width="stretch", key="btn_health_check"):
             # LLM
             try:
                 from app.services.llm_health import check_llm
                 llm = check_llm(expected_model=EXPECTED_LM_MODEL, health_timeout_s=LLM_HEALTH_TIMEOUT_S)
                 if isinstance(llm, dict) and llm.get("ok"):
                     st.success(f"LLM OK ({llm.get('count', 0)} models)")
-                    with st.expander("Models (Top 20)", expanded=False):
-                        st.write(llm.get("models", []))
-                        st.caption(f"Base URL: {llm.get('base_url')}")
                 else:
-                    st.error(f"LLM 오류: {getattr(llm, 'get', lambda *_: None)('error') or llm}")
+                    st.error("LLM 상태를 확인하지 못했습니다.")
             except Exception as e:
-                st.error(f"LLM 연결 오류: {e}")
+                st.error("LLM 연결 상태를 확인하지 못했습니다.")
 
             # DB
             try:
-                from app.db.mssql_client import health_check, list_tables, search_columns
+                from app.db.mssql_client import health_check
                 info = health_check()
 
                 # ✅ health_check() 반환 형식 보정(dict / bool 모두 지원)
                 if isinstance(info, dict):
                     ok = info.get("ok", False)
                     if ok:
-                        st.success(f"DB OK: {info.get('database')}")
-                        with st.expander("DB Version", expanded=False):
-                            st.code(info.get("version", ""), language="text")
-                        with st.expander("샘플 테이블", expanded=False):
-                            st.dataframe(list_tables(20))
-                        with st.expander("컬럼 탐색(샘플: 'Code')", expanded=False):
-                            st.dataframe(search_columns("Code", 50).head(50))
+                        st.success("DB OK")
                     else:
-                        st.error(f"DB 오류: {info.get('error')}")
+                        st.error("DB 상태를 확인하지 못했습니다.")
                 elif isinstance(info, bool):
                     # 예전 스타일: True/False 만 리턴하는 health_check()
                     if info:
                         st.success("DB OK (health_check() → True)")
-                        with st.expander("샘플 테이블", expanded=False):
-                            st.dataframe(list_tables(20))
                     else:
                         st.error("DB 오류: health_check() → False")
                 else:
-                    st.error(f"DB health_check() 반환 형식을 알 수 없음: {info!r}")
+                    st.error("DB health_check() 반환 형식을 알 수 없습니다.")
 
             except Exception as e:
-                st.error(f"DB 체크 예외: {e}")
+                st.error("DB 상태 확인 중 오류가 발생했습니다.")
 
         st.markdown("---")
         # 7) 디버그
@@ -9970,19 +9941,17 @@ with st.sidebar:
                 MAX_FILE_SIZE_MB_val = _safe("MAX_FILE_SIZE_MB")
                 MAX_PREVIEW_CHARS_val = _safe("MAX_PREVIEW_CHARS")
 
-                base_dir = Path(__file__).resolve().parent.parent  # app/ 상위 디렉토리 기준
-
                 st.json(
                     {
                         "env": {
                             "APP_ENV": app_env,
-                            "LOG_LEVEL": log_level,
+                            "LOG_LEVEL": bool(log_level),
                             "TZ": os.getenv("TZ") or "Asia/Seoul",
                         },
                         "paths": {
-                            "BASE_DIR": str(base_dir),
-                            "CHAT_FILE": str(CHAT_FILE_val) if CHAT_FILE_val else None,
-                            "UPLOAD_DIR": str(UPLOAD_DIR_val) if UPLOAD_DIR_val else None,
+                            "BASE_DIR": True,
+                            "CHAT_FILE": bool(CHAT_FILE_val),
+                            "UPLOAD_DIR": bool(UPLOAD_DIR_val),
                         },
                         "limits": {
                             "MAX_FILE_SIZE_MB": MAX_FILE_SIZE_MB_val,
@@ -10502,6 +10471,11 @@ with st.container():
         )
         _ns = str(_ns) if _ns is not None else None
         log.info("[sims.reset] apply start ns=%s", _ns)
+        try:
+            from app.sims.views.dashboard_lite import clear_dashboard_lite_session_state
+            clear_dashboard_lite_session_state(st.session_state, _ns)
+        except Exception:
+            log.debug("[sims.reset] dashboard_lite_clear_failed", exc_info=True)
 
         # 1) SIMS 핵심 상태키 정리
         for k in [
@@ -10515,11 +10489,17 @@ with st.container():
             # 컨텍스트/결과/부가 상태
             "__sims_context", "__sims_context_note", "__sims_result", "__sims_last_push_sig",
             "__sims_flash", "__sims_flash_close", "__sims_flash_csv", "__sims_flash_xlsx",
+            # Dashboard Lite 전용 조건/결과/cache
+            "__dashboard_lite_result", "__dashboard_lite_run_seq", "__dashboard_lite_styles_loaded",
+            "__dashboard_lite_stock_labels",
+            "__dashboard_lite_exclude_product_group_list",
+            "__dashboard_lite_exclude_product_di_list",
+            "__dashboard_lite_exclude_product_class_list",
         ]:
             st.session_state.pop(k, None)
 
         # 2) ✅ 뷰별 옵션 위젯키 정리(현재 ns만)
-        prefixes = ("__vendors_", "__users_", "__codes_", "__rddbc")
+        prefixes = ("__vendors_", "__users_", "__codes_", "__rddbc", "__dashboard_lite_")
         for kk in list(st.session_state.keys()):
             if kk.startswith(prefixes):
                 if (_ns is None) or kk.endswith(f"__{_ns}"):
@@ -10842,6 +10822,20 @@ with st.container():
             st.error("LLM 분석 실행 중 오류가 발생했습니다.")
 
     st.session_state["__sims_llm_analysis_runner"] = _run_sims_llm_analysis_from_fragment
+
+    # Dashboard facts are intentionally separate from history and occupy the
+    # primary document position before ordinary SIMS/chat messages.
+    dashboard_primary_area = st.empty()
+    try:
+        from app.sims.views.dashboard_lite import (
+            render_cached_dashboard_lite_primary,
+            set_dashboard_lite_render_target,
+        )
+        st.session_state["__dashboard_lite_primary_rendered_this_run"] = False
+        set_dashboard_lite_render_target(dashboard_primary_area)
+        render_cached_dashboard_lite_primary()
+    except Exception:
+        log.debug("[dashboard] primary render target unavailable", exc_info=False)
 
     # (B) 채팅 렌더 — 각 메시지 위에 앵커 삽입
     for idx, m in enumerate(merged_msgs):
