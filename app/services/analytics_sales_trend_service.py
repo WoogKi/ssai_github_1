@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import calendar
 import logging
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -26,6 +27,10 @@ from app.services.rddbc_io_common import (
 
 TABLE = "analytics_sales_trend"
 log = logging.getLogger("ssai.sims.analytics_sales_trend")
+
+SQL_SERVER_PARAMETER_LIMIT = 2100
+SQL_PARAMETER_SAFETY_MARGIN = 32
+DEFAULT_STOCK_QUERY_BATCH_SIZE = 1800
 
 SOURCE_LABELS = {
     "monthly_book": "월집계-장부재고(Rddbc220)",
@@ -109,11 +114,13 @@ def _finalize_sales_trend_public_df(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     attrs = dict(getattr(df, "attrs", {}) or {})
+    attrs = dict(getattr(df, "attrs", {}) or {})
     out = df.copy()
     for col in SALES_TREND_PUBLIC_COLUMNS:
         if col not in out.columns:
             out[col] = ""
     out = out[SALES_TREND_PUBLIC_COLUMNS].copy()
+    out.attrs.update(attrs)
     out.attrs.update(attrs)
     return out
 
@@ -477,6 +484,31 @@ def _add_in_filter(
     return True
 
 
+def _add_dashboard_code_pair_filter(
+    clauses: list[str],
+    params: Dict[str, Any],
+    *,
+    gcode_sql: str,
+    tcode_sql: str,
+    key: str,
+) -> bool:
+    """Bind Dashboard Gcode:Tcode selections without SQL string values."""
+    pairs = []
+    for value in _clean_list_param(params.get(key)):
+        gcode, sep, tcode = value.partition(":")
+        if sep and gcode.strip() and tcode.strip():
+            pairs.append((gcode.strip(), tcode.strip()))
+    if not pairs:
+        return False
+    checks: list[str] = []
+    for index, (gcode, tcode) in enumerate(pairs):
+        gkey, tkey = f"{key}_g_{index}", f"{key}_t_{index}"
+        params[gkey], params[tkey] = gcode, tcode
+        checks.append(f"({gcode_sql} = %({gkey})s AND {tcode_sql} = %({tkey})s)")
+    _add_filter(clauses, "(" + " OR ".join(checks) + ")")
+    return True
+
+
 def _build_filters(params: Dict[str, Any]) -> str:
     clauses: list[str] = []
 
@@ -507,6 +539,14 @@ def _build_filters(params: Dict[str, Any]) -> str:
     # 제품
     if clean_text(params.get("physic_cd")):
         _add_filter(clauses, "Out_Put.Rd12_Physic_Cd = %(physic_cd)s")
+    if _add_in_filter(
+        clauses,
+        params,
+        "Physic_Cd.Rd04_Ven_Cd",
+        "dashboard_manufacturer",
+        _clean_list_param(params.get("dashboard_manufacturer_codes")),
+    ):
+        pass
 
     if like_value(params.get("physic_nm")):
         params["physic_nm_like"] = like_value(params.get("physic_nm"))
@@ -579,6 +619,16 @@ def _build_filters(params: Dict[str, Any]) -> str:
     elif like_value(params.get("product_class_nm")):
         params["product_class_nm_like"] = like_value(params.get("product_class_nm"))
         _add_filter(clauses, "Physic_Gu_Nm.Rd01_Hnm LIKE %(product_class_nm_like)s")
+
+    _add_dashboard_code_pair_filter(clauses, params, gcode_sql="Physic_Cd.Rd04_Physic_Group_Gcode", tcode_sql="Physic_Cd.Rd04_Physic_Group", key="dashboard_product_group_list")
+    _add_dashboard_code_pair_filter(clauses, params, gcode_sql="Physic_Cd.Rd04_Physic_Di_Gcode", tcode_sql="Physic_Cd.Rd04_Physic_Di", key="dashboard_product_di_list")
+    _add_dashboard_code_pair_filter(clauses, params, gcode_sql="Physic_Cd.Rd04_Physic_Tax_Gcode", tcode_sql="Physic_Cd.Rd04_Physic_Tax", key="dashboard_product_class_list")
+
+    for pair_key, gcol, tcol in (
+        ("vendor_group_list", "Ven_Cd.Rd03_Ven_Group_Gcode", "Ven_Cd.Rd03_Ven_Group"),
+        ("vendor_kind_list", "Ven_Cd.Rd03_Ven_Kind_Gcode", "Ven_Cd.Rd03_Ven_Kind"),
+    ):
+        _add_dashboard_code_pair_filter(clauses, params, gcode_sql=gcol, tcode_sql=tcol, key=pair_key)
 
 
     # 재고위치
@@ -722,6 +772,14 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
 
     if clean_text(params.get("physic_cd")):
         _add_filter(clauses, f"{a}.{p}_Physic_Cd = %(physic_cd)s")
+    if _add_in_filter(
+        clauses,
+        params,
+        "Physic_Cd.Rd04_Ven_Cd",
+        "dashboard_manufacturer_monthly",
+        _clean_list_param(params.get("dashboard_manufacturer_codes")),
+    ):
+        pass
 
     if like_value(params.get("physic_nm")):
         params["physic_nm_like"] = like_value(params.get("physic_nm"))
@@ -779,6 +837,10 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
         pass
     elif clean_text(params.get("stock_cd")):
         _add_filter(clauses, f"{a}.{p}_Stock_Cd = %(stock_cd)s")
+
+    _add_dashboard_code_pair_filter(clauses, params, gcode_sql="Physic_Cd.Rd04_Physic_Group_Gcode", tcode_sql="Physic_Cd.Rd04_Physic_Group", key="dashboard_product_group_list")
+    _add_dashboard_code_pair_filter(clauses, params, gcode_sql="Physic_Cd.Rd04_Physic_Di_Gcode", tcode_sql="Physic_Cd.Rd04_Physic_Di", key="dashboard_product_di_list")
+    _add_dashboard_code_pair_filter(clauses, params, gcode_sql="Physic_Cd.Rd04_Physic_Tax_Gcode", tcode_sql="Physic_Cd.Rd04_Physic_Tax", key="dashboard_product_class_list")
 
     if like_value(params.get("stock_nm")):
         params["stock_nm_like"] = like_value(params.get("stock_nm"))
@@ -967,6 +1029,18 @@ def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> t
 
     if clean_text(bind_params.get("physic_cd")):
         _add_filter(clauses, f"M.{p}_Physic_Cd = %(physic_cd)s")
+
+    manufacturer_codes = _clean_list_param(bind_params.get("dashboard_manufacturer_codes"))
+    if manufacturer_codes:
+        names: list[str] = []
+        for i, code in enumerate(manufacturer_codes):
+            key = f"fast_dashboard_manufacturer_{i}"
+            bind_params[key] = clean_text(code)
+            names.append(f"%({key})s")
+        _add_filter(
+            clauses,
+            f"M.{p}_Physic_Cd IN (SELECT P.Rd04_Physic_Cd FROM dbo.Rddbc040 AS P WITH (NOLOCK) WHERE P.Rd04_Ven_Cd IN ({','.join(names)}))",
+        )
 
     stock_codes = _clean_list_param(bind_params.get("stock_cd_list"))
     if stock_codes:
@@ -3447,6 +3521,40 @@ def _chunks(values: list[str], size: int):
         yield values[i:i + size]
 
 
+def _stock_query_batch_plan(
+    *,
+    stock_cd_count: int,
+    io_gu_count: int,
+    configured_value: Any = None,
+) -> Dict[str, int]:
+    """Keep stock-query product batches safely below SQL Server's bind limit."""
+    raw_value = configured_value
+    if raw_value is None:
+        raw_value = os.getenv("SIMS_STOCK_QUERY_BATCH_SIZE")
+    try:
+        configured = int(str(raw_value).strip()) if raw_value is not None else DEFAULT_STOCK_QUERY_BATCH_SIZE
+    except (TypeError, ValueError):
+        configured = DEFAULT_STOCK_QUERY_BATCH_SIZE
+    if configured <= 0:
+        configured = DEFAULT_STOCK_QUERY_BATCH_SIZE
+
+    # stock_month_to and io_gu_gcode are always bound.  Location and IO-code
+    # selections each add one parameter per selected value.
+    fixed_count = 2 + max(0, int(stock_cd_count)) + max(0, int(io_gu_count))
+    safe_product_count = SQL_SERVER_PARAMETER_LIMIT - fixed_count - SQL_PARAMETER_SAFETY_MARGIN
+    if safe_product_count < 1:
+        raise ValueError("stock query fixed parameter count exceeds the safe SQL Server limit")
+    effective = max(1, min(configured, safe_product_count))
+    return {
+        "configured_batch_size": configured,
+        "effective_chunk_size": effective,
+        "fixed_parameter_count": fixed_count,
+        "stock_cd_parameter_count": max(0, int(stock_cd_count)),
+        "io_gu_parameter_count": max(0, int(io_gu_count)),
+        "total_parameter_count": fixed_count + effective,
+    }
+
+
 def _load_product_current_month_stock_movements(
     product_codes: list[str],
     *,
@@ -3576,6 +3684,7 @@ def _load_product_current_stock(
     policy_date: Any = None,
     stock_cd_list: Any = None,
     stock_cd: Any = None,
+    io_gu_list: Any = None,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황의 현재고를 월집계 누계로 가져온다.
@@ -3586,6 +3695,13 @@ def _load_product_current_stock(
     t0 = time.perf_counter()
     codes = [str(x or "").strip() for x in product_codes if str(x or "").strip()]
     codes = sorted(set(codes))
+
+    stock_codes = _clean_list_param(stock_cd_list)
+    if not stock_codes and clean_text(stock_cd):
+        stock_codes = [clean_text(stock_cd)]
+    stock_codes = [clean_text(x) for x in stock_codes if clean_text(x)]
+    io_gu_codes = _clean_list_param(io_gu_list)
+    batch_plan = _stock_query_batch_plan(stock_cd_count=len(stock_codes), io_gu_count=len(io_gu_codes))
 
     spec = _stock_current_monthly_spec(stock_mode)
     table = spec["table"]
@@ -3602,7 +3718,14 @@ def _load_product_current_stock(
     if not monthly_stock_month_to:
         monthly_stock_month_to = stock_month_to
 
-    def _with_stock_attrs(df: pd.DataFrame, *, batches: int, elapsed: float) -> pd.DataFrame:
+    def _with_stock_attrs(
+        df: pd.DataFrame,
+        *,
+        batches: int,
+        elapsed: float,
+        sql_elapsed: float = 0.0,
+        aggregate_elapsed: float = 0.0,
+    ) -> pd.DataFrame:
         df.attrs["stock_source_table"] = spec["source_table"]
         df.attrs["stock_source_label"] = (
             f"전월말 {spec['source_label']} + 당월 입출고상세"
@@ -3613,6 +3736,9 @@ def _load_product_current_stock(
         df.attrs["stock_query_codes"] = len(codes)
         df.attrs["stock_query_batches"] = batches
         df.attrs["stock_query_elapsed_sec"] = elapsed
+        df.attrs["stock_sql_ms"] = int(sql_elapsed * 1000)
+        df.attrs["stock_aggregate_ms"] = int(aggregate_elapsed * 1000)
+        df.attrs.update(batch_plan)
         return df
 
     if not codes:
@@ -3630,11 +3756,6 @@ def _load_product_current_stock(
     else:
         in_qty_expr = f"CAST(ISNULL(M.{pfx}_In_Quantity, 0) AS FLOAT)"
         out_qty_expr = f"CAST(ISNULL(M.{pfx}_Out_Quantity, 0) AS FLOAT)"
-
-    stock_codes = _clean_list_param(stock_cd_list)
-    if not stock_codes and clean_text(stock_cd):
-        stock_codes = [clean_text(stock_cd)]
-    stock_codes = [clean_text(x) for x in stock_codes if clean_text(x)]
 
     def _query_batch(batch_codes: list[str]) -> pd.DataFrame:
         bind_params: Dict[str, Any] = {
@@ -3655,6 +3776,20 @@ def _load_product_current_stock(
                 bind_params[key] = cd
                 stock_names.append(f"%({key})s")
             stock_filter_sql = f"\n      AND M.{pfx}_Stock_Cd IN ({', '.join(stock_names)})"
+        bind_params["io_gu_gcode"] = "0012"
+        io_gu_filter_sql = ""
+        if io_gu_codes:
+            io_names: list[str] = []
+            for i, code in enumerate(io_gu_codes):
+                key = f"io_gu_{i}"
+                bind_params[key] = code
+                io_names.append(f"%({key})s")
+            io_gu_filter_sql = (
+                f"\n      AND M.{pfx}_Io_Gu IN ({', '.join(io_names)})"
+            )
+
+        if len(bind_params) >= SQL_SERVER_PARAMETER_LIMIT:
+            raise ValueError("stock query parameter count reached the SQL Server limit")
 
         sql = f"""
 WITH StockAgg AS (
@@ -3682,7 +3817,9 @@ WITH StockAgg AS (
 
     WHERE M.{pfx}_Physic_Cd IN ({",".join(placeholders)})
       AND M.{pfx}_Stock_YyMm <= %(stock_month_to)s
+      AND M.{pfx}_Io_Gu_Gcode = %(io_gu_gcode)s
       {stock_filter_sql}
+      {io_gu_filter_sql}
 
     GROUP BY
         M.{pfx}_Physic_Cd
@@ -3724,14 +3861,19 @@ OPTION (RECOMPILE)
             return pd.DataFrame()
         return batch_df
 
-    chunk_size = 1800
+    # The effective size accounts for every non-product parameter in the
+    # statement, rather than assuming a fixed product-only chunk size.
+    chunk_size = batch_plan["effective_chunk_size"]
     batches = list(_chunks(codes, chunk_size))
     frames: list[pd.DataFrame] = []
 
+    sql_started_at = time.perf_counter()
     for batch in batches:
         batch_df = _query_batch(batch)
         if batch_df is not None and not batch_df.empty:
             frames.append(batch_df)
+    sql_elapsed = time.perf_counter() - sql_started_at
+    aggregate_started_at = time.perf_counter()
 
     if frames:
         stock_df = pd.concat(frames, ignore_index=True)
@@ -3745,6 +3887,7 @@ OPTION (RECOMPILE)
             date_to=detail_date_to,
             stock_cd_list=stock_cd_list,
             stock_cd=stock_cd,
+            io_gu_list=io_gu_list,
         )
         if movement_df is not None and not movement_df.empty:
             if stock_df is None or stock_df.empty:
@@ -3772,17 +3915,31 @@ OPTION (RECOMPILE)
                 len(batches),
             )
 
+    aggregate_elapsed = time.perf_counter() - aggregate_started_at
     elapsed = time.perf_counter() - t0
-    stock_df = _with_stock_attrs(stock_df, batches=len(batches), elapsed=elapsed)
+    stock_df = _with_stock_attrs(
+        stock_df,
+        batches=len(batches),
+        elapsed=elapsed,
+        sql_elapsed=sql_elapsed,
+        aggregate_elapsed=aggregate_elapsed,
+    )
     log.info(
-        "[analytics.stock.load.perf] codes=%s batches=%s rows=%s elapsed=%.3fs stock_mode=%s stock_cutoff_month=%s stock_cd_count=%s",
+        "[analytics.stock.load.perf] codes=%s batches=%s rows=%s elapsed=%.3fs sql_ms=%s aggregate_ms=%s stock_mode=%s stock_cutoff_month=%s configured_batch_size=%s effective_chunk_size=%s fixed_parameter_count=%s stock_cd_parameter_count=%s io_gu_parameter_count=%s total_parameter_count=%s",
         len(codes),
         len(batches),
         len(stock_df),
         elapsed,
+        int(sql_elapsed * 1000),
+        int(aggregate_elapsed * 1000),
         stock_mode,
         detail_date_to if use_mid_month_detail else stock_month_to,
-        len(stock_codes),
+        batch_plan["configured_batch_size"],
+        batch_plan["effective_chunk_size"],
+        batch_plan["fixed_parameter_count"],
+        batch_plan["stock_cd_parameter_count"],
+        batch_plan["io_gu_parameter_count"],
+        batch_plan["total_parameter_count"],
     )
 
     return stock_df
@@ -3901,6 +4058,7 @@ def _build_qty_workforward_metrics_from_wide(
 def get_stock_shortage_df(
     params: Optional[Dict[str, Any]] = None,
     sales_raw_df: Optional[pd.DataFrame] = None,
+    sales_forecast_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황 1차.
@@ -3919,7 +4077,7 @@ def get_stock_shortage_df(
     stock_label = _stock_mode_label(stock_mode)
     source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
 
-    base = get_sales_forecast_df(params, raw_df=sales_raw_df)
+    base = sales_forecast_df.copy() if isinstance(sales_forecast_df, pd.DataFrame) else get_sales_forecast_df(params, raw_df=sales_raw_df)
     t_base = time.perf_counter()
     if base is None or base.empty:
         log.info(
@@ -3947,6 +4105,7 @@ def get_stock_shortage_df(
         policy_date=params.get("policy_date") or params.get("as_of_date") or params.get("today"),
         stock_cd_list=params.get("stock_cd_list"),
         stock_cd=params.get("stock_cd"),
+        io_gu_list=params.get("io_gu_list"),
     )
     t_stock = time.perf_counter()
 
@@ -4237,6 +4396,20 @@ def get_stock_shortage_df(
     out.attrs["use_hybrid_detail"] = bool(source_labels.get("use_hybrid_detail"))
     out.attrs["stock_cutoff_month"] = stock_cutoff_month
     out.attrs["stock_mode"] = stock_mode
+    # Preserve the loader timings through the public shortage result so the
+    # Dashboard can report SQL, aggregation, and build costs separately.
+    out.attrs["stock_sql_ms"] = int(getattr(stock_df, "attrs", {}).get("stock_sql_ms") or 0)
+    out.attrs["stock_query_batches"] = int(getattr(stock_df, "attrs", {}).get("stock_query_batches") or 0)
+    out.attrs["stock_aggregate_ms"] = int(getattr(stock_df, "attrs", {}).get("stock_aggregate_ms") or 0)
+    for key in (
+        "configured_batch_size",
+        "effective_chunk_size",
+        "fixed_parameter_count",
+        "stock_cd_parameter_count",
+        "io_gu_parameter_count",
+        "total_parameter_count",
+    ):
+        out.attrs[key] = int(getattr(stock_df, "attrs", {}).get(key) or 0)
 
     log.info(
         "[analytics.stock_shortage.source] evaluation_mode=%s use_hybrid_detail=%s display_source=%s stock_source=%s",
@@ -4247,6 +4420,8 @@ def get_stock_shortage_df(
     )
 
     t_done = time.perf_counter()
+    out.attrs["stock_shortage_build_ms"] = int((t_done - t_stock) * 1000)
+    out.attrs["stock_shortage_total_ms"] = int((t_done - t0) * 1000)
     log.info(
         "[analytics.stock_shortage.perf] base_rows=%s stock_rows=%s out_rows=%s base=%.3fs stock=%.3fs build=%.3fs total=%.3fs stock_mode=%s stock_cutoff_month=%s",
         len(base),
@@ -4352,11 +4527,16 @@ def _stock_shortage_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
 def get_stock_shortage_result(
     params: Optional[Dict[str, Any]] = None,
     sales_raw_df: Optional[pd.DataFrame] = None,
+    sales_forecast_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
 
-    df = get_stock_shortage_df(params, sales_raw_df=sales_raw_df)
+    df = get_stock_shortage_df(
+        params,
+        sales_raw_df=sales_raw_df,
+        sales_forecast_df=sales_forecast_df,
+    )
     row_count = 0 if df is None else int(len(df))
 
     log.info("[analytics.stock_shortage] rows=%s params=%r", row_count, params)
@@ -4427,6 +4607,21 @@ def get_stock_shortage_result(
 
     meta = dict(payload.get("meta") or {})
     meta.update(_stock_shortage_meta_from_df(df))
+    for key in (
+        "stock_sql_ms",
+        "stock_query_batches",
+        "stock_aggregate_ms",
+        "stock_shortage_build_ms",
+        "stock_shortage_total_ms",
+        "configured_batch_size",
+        "effective_chunk_size",
+        "fixed_parameter_count",
+        "stock_cd_parameter_count",
+        "io_gu_parameter_count",
+        "total_parameter_count",
+    ):
+        if key in getattr(df, "attrs", {}):
+            meta[key] = int(df.attrs.get(key) or 0)
 
     stock_source_table = df.attrs.get("stock_source_table", "")
     stock_source_label = df.attrs.get("stock_source_label", "") or stock_source_labels["stock_source"]

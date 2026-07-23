@@ -739,6 +739,194 @@ def _set_ui_event_started(event_name: str, *, event_id: str | None = None) -> st
         return str(event_id or "")
 
 
+_CHAT_ROOM_PENDING_SELECTOR_KEY = "__chat_room_pending_selector_id"
+_CHAT_ROOM_PERSISTED_SELECTOR_KEY = "__chat_room_persisted_selector_id"
+_CHAT_ROOM_SELECTOR_REQUEST_KEY = "__chat_room_selector_request"
+_CHAT_ROOM_SELECTOR_CONSUMED_TOKEN_KEY = "__chat_room_selector_consumed_token"
+_CHAT_ROOM_SELECTOR_VALID_IDS_KEY = "__chat_room_selector_valid_ids"
+
+
+def _is_chat_room_id(value: Any) -> bool:
+    try:
+        return bool(str(uuid.UUID(str(value or "").strip())))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _log_chat_room_selector(
+    phase: str,
+    *,
+    widget_key: str = "",
+    widget_room_id: Any = "",
+    canonical_room_id: Any = "",
+    requested_room_id: Any = "",
+    previous_room_id: Any = "",
+    page: Any = 0,
+    room_kind: str = "",
+    rerun_reason: str = "",
+    request_token: str = "",
+    stale_value_corrected: bool = False,
+    mismatch_detected: bool = False,
+    widget_value_type: str = "",
+    value_in_room_ids: bool = False,
+) -> None:
+    log.info(
+        "[chat.room.selector] phase=%s widget_key=%s widget_room_id=%s canonical_room_id=%s requested_room_id=%s previous_room_id=%s page=%s room_kind=%s rerun_reason=%s request_token=%s stale_value_corrected=%s mismatch_detected=%s widget_value_type=%s value_in_room_ids=%s",
+        phase,
+        widget_key,
+        str(widget_room_id or ""),
+        str(canonical_room_id or ""),
+        str(requested_room_id or ""),
+        str(previous_room_id or ""),
+        page,
+        room_kind,
+        rerun_reason,
+        request_token,
+        stale_value_corrected,
+        mismatch_detected,
+        widget_value_type,
+        value_in_room_ids,
+    )
+
+
+def _sync_chat_room_selector_state(
+    session: dict[str, Any],
+    *,
+    canonical_room_id: Any,
+    pending_ids: Iterable[Any],
+    persisted_ids: Iterable[Any],
+    queued_request: dict[str, Any] | None = None,
+    pending_widget_key: str = _CHAT_ROOM_PENDING_SELECTOR_KEY,
+    persisted_widget_key: str = _CHAT_ROOM_PERSISTED_SELECTOR_KEY,
+) -> dict[str, bool]:
+    """Align selector state to the canonical room ID before widgets render."""
+    canonical = str(canonical_room_id or "").strip()
+    pending = {str(value or "") for value in pending_ids if str(value or "")}
+    persisted = {str(value or "") for value in persisted_ids if str(value or "")}
+    queued_room_id = str((queued_request or {}).get("room_id") or "").strip()
+    queued_kind = str((queued_request or {}).get("room_kind") or "").strip()
+    changed = {"pending": False, "persisted": False}
+    for key, allowed, label in (
+        (pending_widget_key, pending, "pending"),
+        (persisted_widget_key, persisted, "persisted"),
+    ):
+        desired = canonical if canonical in allowed else ""
+        if queued_room_id in allowed and queued_kind == label:
+            desired = queued_room_id
+        previous = str(session.get(key) or "")
+        if desired:
+            if previous != desired:
+                session[key] = desired
+                changed[label] = True
+        elif key in session:
+            session.pop(key, None)
+            changed[label] = bool(previous)
+    return changed
+
+
+def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: str, room_kind: str) -> None:
+    requested = str(session.get(widget_key) or "").strip()
+    canonical = str(session.get("current_room") or "").strip()
+    page = int(session.get("__room_page") or 0)
+    existing_request = session.get(_CHAT_ROOM_SELECTOR_REQUEST_KEY)
+    existing_room_id = str((existing_request or {}).get("room_id") or "").strip()
+    valid_ids = {
+        str(room_id or "")
+        for room_id in (session.get(_CHAT_ROOM_SELECTOR_VALID_IDS_KEY) or [])
+        if _is_chat_room_id(room_id)
+    }
+    if not requested or not _is_chat_room_id(requested) or requested not in valid_ids:
+        _log_chat_room_selector(
+            "callback_invalid",
+            widget_key=widget_key,
+            widget_room_id=requested,
+            canonical_room_id=canonical,
+            requested_room_id="",
+            previous_room_id=canonical,
+            page=page,
+            room_kind=room_kind,
+            rerun_reason="not_room_id",
+            mismatch_detected=False,
+            widget_value_type=type(session.get(widget_key)).__name__,
+            value_in_room_ids=False,
+        )
+        return
+    if requested == canonical or requested == existing_room_id:
+        reason = "same_as_canonical" if requested == canonical else "already_queued"
+        _log_chat_room_selector(
+            "callback_noop",
+            widget_key=widget_key,
+            widget_room_id=requested,
+            canonical_room_id=canonical,
+            requested_room_id=requested,
+            previous_room_id=canonical,
+            page=page,
+            room_kind=room_kind,
+            rerun_reason=reason,
+            mismatch_detected=False,
+        )
+        return
+    token = _new_ui_event_id("room_select")
+    session[_CHAT_ROOM_SELECTOR_REQUEST_KEY] = {
+        "room_id": requested,
+        "room_kind": str(room_kind or ""),
+        "widget_key": str(widget_key or ""),
+        "token": token,
+        "previous_room_id": canonical,
+        "requested_at": str(time.time()),
+        "page": str(page),
+    }
+    _log_chat_room_selector(
+        "callback",
+        widget_key=widget_key,
+        widget_room_id=requested,
+        canonical_room_id=canonical,
+        requested_room_id=requested,
+        previous_room_id=canonical,
+        page=page,
+        room_kind=room_kind,
+        request_token=token,
+        mismatch_detected=bool(requested and requested != canonical),
+    )
+
+
+def _consume_chat_room_selector_request(
+    session: dict[str, Any],
+    *,
+    valid_room_ids: Iterable[Any],
+) -> dict[str, str] | None:
+    """Consume a selector callback once; passive radio values never select rooms."""
+    raw_request = session.pop(_CHAT_ROOM_SELECTOR_REQUEST_KEY, None)
+    if not isinstance(raw_request, dict):
+        return None
+    request = {key: str(value or "") for key, value in raw_request.items()}
+    room_id = request.get("room_id", "").strip()
+    token = request.get("token", "").strip()
+    valid_ids = {str(value or "") for value in valid_room_ids if str(value or "")}
+    if not room_id or not _is_chat_room_id(room_id) or room_id not in valid_ids or not token:
+        return None
+    if token == str(session.get(_CHAT_ROOM_SELECTOR_CONSUMED_TOKEN_KEY) or ""):
+        return None
+    session[_CHAT_ROOM_SELECTOR_CONSUMED_TOKEN_KEY] = token
+    request["room_id"] = room_id
+    return request
+
+
+def _clear_chat_room_selector_request_state(session: dict[str, Any]) -> None:
+    """Remove one-shot selector state without touching persisted room metadata."""
+    for key in (
+        _CHAT_ROOM_SELECTOR_REQUEST_KEY,
+        _CHAT_ROOM_SELECTOR_CONSUMED_TOKEN_KEY,
+        _CHAT_ROOM_PENDING_SELECTOR_KEY,
+        _CHAT_ROOM_PERSISTED_SELECTOR_KEY,
+        _CHAT_ROOM_SELECTOR_VALID_IDS_KEY,
+    ):
+        session.pop(key, None)
+    for key in list(session):
+        if str(key).startswith(f"{_CHAT_ROOM_PENDING_SELECTOR_KEY}_page_") or str(key).startswith(f"{_CHAT_ROOM_PERSISTED_SELECTOR_KEY}_page_"):
+            session.pop(key, None)
+
+
 def _log_sims_panel_room_close_state(phase: str, *, failed_key: str = "") -> None:
     try:
         ss = st.session_state
@@ -7196,6 +7384,13 @@ _CHAT_PARTITION_META_ALLOW_KEYS = {
     "supplier_detail_key",
     "supplier_detail_rows",
     "excel_sheet_names",
+    # Dashboard cards are not DataFrame tables. Keep their deterministic render
+    # cache so a room restore can dispatch the Dashboard-specific renderer.
+    "analysis_type",
+    "facts_kind",
+    "dashboard_cache",
+    "dashboard_event_id",
+    "room_id",
 }
 
 _CHAT_PARTITION_TEXT_LIMIT = int(os.getenv("SSAI_CHAT_MESSAGE_TEXT_LIMIT") or "20000")
@@ -7276,6 +7471,25 @@ def _partition_large_paths(obj: Any, prefix: str = "$", limit: int = 8) -> list[
     return rows[:limit]
 
 
+def _minimal_dashboard_partition_snapshot(cache: Any) -> dict[str, Any]:
+    """Fail closed when Dashboard snapshot construction cannot complete."""
+    source = cache if isinstance(cache, dict) else {}
+    params = source.get("params") if isinstance(source.get("params"), dict) else {}
+    return {
+        "snapshot_version": 1,
+        "snapshot_status": "minimal_fallback",
+        "params": {
+            "month_from": _clip_partition_text(params.get("month_from"), 16),
+            "month_to": _clip_partition_text(params.get("month_to"), 16),
+            "evaluation_month": _clip_partition_text(params.get("evaluation_month"), 16),
+            "manufacturer_scope_label": _clip_partition_text(params.get("manufacturer_scope_label") or "전체", 160),
+        },
+        "elapsed_ms": _clip_partition_text(source.get("elapsed_ms"), 32),
+        "elapsed_seconds": _clip_partition_text(source.get("elapsed_seconds"), 32),
+        "created_at": _clip_partition_text(source.get("created_at"), 32),
+    }
+
+
 def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
     """Return an allow-listed, JSON-safe message record without table payload bodies."""
     if not isinstance(message, dict):
@@ -7289,9 +7503,23 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
             value = _clip_partition_text(value, _CHAT_PARTITION_TEXT_LIMIT)
         elif key == "meta" and isinstance(value, dict):
             meta_out: dict[str, Any] = {}
+            is_dashboard = str(message.get("type") or "").strip().lower() == "dashboard_lite"
             for mk in _CHAT_PARTITION_META_ALLOW_KEYS:
                 if mk in value:
-                    meta_out[mk] = _compact_partition_value(value.get(mk))
+                    if is_dashboard and mk == "dashboard_cache":
+                        # Dashboard chat history must be restart-safe without
+                        # persisting the full stock readiness DataFrame.
+                        try:
+                            from app.sims.views.dashboard_lite import build_dashboard_lite_chat_snapshot
+                            meta_out[mk] = build_dashboard_lite_chat_snapshot(value.get(mk))
+                        except Exception as exc:
+                            log.warning(
+                                "[chat.storage.dashboard_snapshot] snapshot_ok=False fallback=minimal error_type=%s",
+                                type(exc).__name__,
+                            )
+                            meta_out[mk] = _minimal_dashboard_partition_snapshot(value.get(mk))
+                    else:
+                        meta_out[mk] = _compact_partition_value(value.get(mk))
             value = meta_out
         else:
             value = _compact_partition_value(value)
@@ -9323,6 +9551,7 @@ with st.sidebar:
     def _new_room():
         # 사용자가 직접 누른 경우는 임시방이 아니라 정식 새 채팅방이다.
         _clear_dashboard_lite_for_new_chat()
+        _clear_chat_room_selector_request_state(ss)
         new_room = _select_pending_new_room(close_sims_state=True)
         ss["__room_prev_selected"] = new_room["id"]
         ss["__room_rename_buf"] = new_room.get("name") or ""
@@ -9336,45 +9565,100 @@ with st.sidebar:
     st.button("➕ 새 대화 시작", use_container_width=True, key="__room_new_btn", on_click=_new_room)
 
     # 목록(라디오)
-    pending_ids = [r["id"] for r in pending_view]
-    pending_index = pending_ids.index(ss.current_room) if (pending_ids and ss.current_room in pending_ids) else None
-    pending_radio_key = f"__room_pending_radio_{str(ss.current_room or '')[:12]}"
+    pending_ids = [
+        str(room.get("id") or "")
+        for room in pending_view
+        if _is_chat_room_id(room.get("id"))
+    ]
+    options_ids = [
+        str(room.get("id") or "")
+        for room in view
+        if _is_chat_room_id(room.get("id"))
+    ]
+    all_room_ids = [
+        str(room.get("id") or "")
+        for room in ss.chat_rooms
+        if isinstance(room, dict) and _is_chat_room_id(room.get("id"))
+    ]
+    ss[_CHAT_ROOM_SELECTOR_VALID_IDS_KEY] = all_room_ids
+    selector_page = int(room_list_state["page"])
+    pending_radio_key = f"{_CHAT_ROOM_PENDING_SELECTOR_KEY}_page_{selector_page}"
+    room_radio_key = f"{_CHAT_ROOM_PERSISTED_SELECTOR_KEY}_page_{selector_page}"
+    for selector_prefix, active_key in (
+        (_CHAT_ROOM_PENDING_SELECTOR_KEY, pending_radio_key),
+        (_CHAT_ROOM_PERSISTED_SELECTOR_KEY, room_radio_key),
+    ):
+        for stale_key in list(ss):
+            if str(stale_key).startswith(f"{selector_prefix}_page_") and stale_key != active_key:
+                ss.pop(stale_key, None)
+    queued_selector_request = ss.get(_CHAT_ROOM_SELECTOR_REQUEST_KEY)
+    selector_sync = _sync_chat_room_selector_state(
+        ss,
+        canonical_room_id=ss.current_room,
+        pending_ids=pending_ids,
+        persisted_ids=options_ids,
+        queued_request=queued_selector_request if isinstance(queued_selector_request, dict) else None,
+        pending_widget_key=pending_radio_key,
+        persisted_widget_key=room_radio_key,
+    )
+    for selector_key, room_kind in (
+        (pending_radio_key, "pending"),
+        (room_radio_key, "persisted"),
+    ):
+        _log_chat_room_selector(
+            "before_render",
+            widget_key=selector_key,
+            widget_room_id=ss.get(selector_key),
+            canonical_room_id=ss.current_room,
+            page=room_list_state["page"],
+            room_kind=room_kind,
+            rerun_reason=str(ss.get("__ui_rerun_reason") or ""),
+            stale_value_corrected=bool(selector_sync.get(room_kind)),
+            mismatch_detected=bool(
+                ss.get(selector_key)
+                and str(ss.get(selector_key)) != str(ss.current_room or "")
+            ),
+        )
     picked_pending = None
     if pending_ids:
         picked_pending = st.radio(
             "새 대화 입력 대기",
             options=pending_ids,
             format_func=lambda rid: id_to_name.get(rid, rid),
-            index=pending_index,
+            index=None,
             label_visibility="collapsed",
             key=pending_radio_key,
+            on_change=_queue_chat_room_selector_request,
+            args=(ss,),
+            kwargs={"widget_key": pending_radio_key, "room_kind": "pending"},
         )
 
-    options_ids = [r["id"] for r in view]
-    picked_index = options_ids.index(ss.current_room) if (options_ids and ss.current_room in options_ids) else None
     # Streamlit radio는 같은 key를 쓰면 이전 선택값을 계속 기억한다.
     # 로그인 직후 기본값이 기존 방으로 되돌아가지 않도록 현재 방 ID 기반 key를 사용한다.
-    room_radio_key = f"__room_pick_radio_{str(ss.current_room or '')[:12]}"
     picked_persisted = None
     if options_ids:
         picked_persisted = st.radio(
             "채팅방 목록",
             options=options_ids,
             format_func=lambda rid: id_to_name.get(rid, rid),
-            index=picked_index,
+            index=None,
             label_visibility="collapsed",
             key=room_radio_key,
+            on_change=_queue_chat_room_selector_request,
+            args=(ss,),
+            kwargs={"widget_key": room_radio_key, "room_kind": "persisted"},
         )
     else:
         st.caption("표시할 저장된 채팅방이 없습니다.")
 
-    picked = _resolve_room_pick(
-        current_room_id=ss.current_room,
-        picked_pending=picked_pending,
-        picked_persisted=picked_persisted,
-        pending_ids=pending_ids,
-        persisted_ids=options_ids,
+    selector_request = _consume_chat_room_selector_request(
+        ss,
+        valid_room_ids=existing_room_ids,
     )
+    picked = str((selector_request or {}).get("room_id") or "").strip() or None
+    requested_widget_key = str((selector_request or {}).get("widget_key") or "")
+    requested_room_kind = str((selector_request or {}).get("room_kind") or "")
+    request_token = str((selector_request or {}).get("token") or "")
     if picked and picked != ss.current_room:
         switch_event_id = _set_ui_event_started("chat_room_change")
         ss["__chat_room_switch_event_id"] = switch_event_id
@@ -9393,7 +9677,7 @@ with st.sidebar:
             False,
             "radio",
         )
-        if not room_exists and picked_persisted:
+        if not room_exists:
             log.info(
                 "[chat.room_select] phase=consume requested_room_id=%s previous_kind=%s new_kind=%s page=%s room_exists=%s loaded_messages=%s load_elapsed=%.3fs request_consumed=%s switch_reason=%s",
                 picked,
@@ -9426,6 +9710,13 @@ with st.sidebar:
         save_elapsed = time.perf_counter() - save_started
 
         ss.current_room = picked
+        filtered_room_ids = [
+            str(room.get("id") or "")
+            for room in rooms_filtered
+            if str(room.get("id") or "")
+        ]
+        if picked in filtered_room_ids:
+            ss["__room_page"] = filtered_room_ids.index(picked) // PAGE_SIZE
         load_started = time.perf_counter()
         _ensure_partitioned_room_loaded(picked)
         load_elapsed = time.perf_counter() - load_started
@@ -9437,6 +9728,23 @@ with st.sidebar:
         ss["__chat_room_switch_started_at"] = ss.get("__ui_event_started_at")
         ss["__chat_room_switch_save_elapsed"] = save_elapsed
         ss["__chat_room_switch_rerun_count"] = int(ss.get("__chat_room_switch_rerun_count") or 0) + 1
+
+        _log_chat_room_selector(
+            "after_switch",
+            widget_key=requested_widget_key,
+            widget_room_id=ss.get(requested_widget_key),
+            canonical_room_id=ss.current_room,
+            requested_room_id=picked,
+            previous_room_id=old_room_id,
+            page=ss.get("__room_page", room_list_state["page"]),
+            room_kind=requested_room_kind,
+            rerun_reason="chat_room_change",
+            request_token=request_token,
+            mismatch_detected=bool(
+                requested_widget_key
+                and str(ss.get(requested_widget_key) or "") != str(ss.current_room or "")
+            ),
+        )
 
         # 채팅방 선택과 SIMS 패널 닫기를 하나의 app rerun으로 묶는다.
         _request_sims_close_for_chat_room_change()
@@ -9466,6 +9774,11 @@ with st.sidebar:
         )
         ss["__chat_room_select_render_ready"] = {
             "requested_room_id": picked,
+            "previous_room_id": old_room_id,
+            "widget_key": requested_widget_key,
+            "widget_room_id": ss.get(requested_widget_key),
+            "room_kind": requested_room_kind,
+            "request_token": request_token,
             "previous_kind": previous_kind,
             "new_kind": "persisted" if room_exists else "pending",
             "page": int(room_list_state["page"]),
@@ -10043,6 +10356,24 @@ if isinstance(_room_select_render_ready, dict):
         True,
         _room_select_render_ready.get("switch_reason", ""),
     )
+    _selector_widget_key = str(_room_select_render_ready.get("widget_key") or "")
+    _log_chat_room_selector(
+        "after_rerun",
+        widget_key=_selector_widget_key,
+        widget_room_id=st.session_state.get(_selector_widget_key) if _selector_widget_key else "",
+        canonical_room_id=st.session_state.get("current_room"),
+        requested_room_id=_room_select_render_ready.get("requested_room_id"),
+        previous_room_id=_room_select_render_ready.get("previous_room_id"),
+        page=_room_select_render_ready.get("page", 0),
+        room_kind=str(_room_select_render_ready.get("room_kind") or ""),
+        rerun_reason="chat_room_change",
+        request_token=str(_room_select_render_ready.get("request_token") or ""),
+        mismatch_detected=bool(
+            _selector_widget_key
+            and str(st.session_state.get(_selector_widget_key) or "")
+            != str(st.session_state.get("current_room") or "")
+        ),
+    )
 
 def _display_room_name(room: dict[str, Any] | None) -> str:
     if _is_empty_auto_room(room):
@@ -10588,6 +10919,15 @@ with st.container():
     def _render_message(m: dict) -> bool:
         meta = (m.get("meta") or {})
 
+        if str(m.get("type") or "").strip().lower() == "dashboard_lite":
+            dashboard_item = dict(m)
+            dashboard_item["role"] = "assistant"
+            dashboard_item["meta"] = meta
+            dashboard_item.setdefault("action", meta.get("action") or "Dashboard Lite v0.1")
+            dashboard_item.setdefault("title", m.get("title") or "Dashboard Lite")
+            render_sims_chat_item(dashboard_item)
+            return True
+
         if meta.get("kind") == "table" and meta.get("table_key"):
             table_key = meta.get("table_key")
             df = (st.session_state.get("sims_tables") or {}).get(table_key)
@@ -10822,20 +11162,6 @@ with st.container():
             st.error("LLM 분석 실행 중 오류가 발생했습니다.")
 
     st.session_state["__sims_llm_analysis_runner"] = _run_sims_llm_analysis_from_fragment
-
-    # Dashboard facts are intentionally separate from history and occupy the
-    # primary document position before ordinary SIMS/chat messages.
-    dashboard_primary_area = st.empty()
-    try:
-        from app.sims.views.dashboard_lite import (
-            render_cached_dashboard_lite_primary,
-            set_dashboard_lite_render_target,
-        )
-        st.session_state["__dashboard_lite_primary_rendered_this_run"] = False
-        set_dashboard_lite_render_target(dashboard_primary_area)
-        render_cached_dashboard_lite_primary()
-    except Exception:
-        log.debug("[dashboard] primary render target unavailable", exc_info=False)
 
     # (B) 채팅 렌더 — 각 메시지 위에 앵커 삽입
     for idx, m in enumerate(merged_msgs):

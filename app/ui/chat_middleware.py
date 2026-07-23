@@ -4748,6 +4748,24 @@ def _get_current_room_from_session() -> Optional[Dict[str, Any]]:
 
     return None
 
+
+def get_current_chat_room_id() -> str:
+    """Return the active persisted chat-room id, or an empty string when unavailable."""
+    room = _get_current_room_from_session()
+    room_id = str((room or {}).get("id") or "").strip()
+    if room_id:
+        return room_id
+
+    # ``__chat_current_room_id`` is only a compatibility mirror.  Do not use
+    # it unless it still points to an actual room in the current session.
+    candidate = str(st.session_state.get("__chat_current_room_id") or "").strip()
+    if not candidate:
+        return ""
+    for saved_room in st.session_state.get("chat_rooms") or []:
+        if isinstance(saved_room, dict) and str(saved_room.get("id") or "").strip() == candidate:
+            return candidate
+    return ""
+
 def clear_product_candidate_tables_from_chat() -> None:
     """
     제품 후보 선택 취소 시, 기존 후보표를 채팅 history/pending/session table에서 제거한다.
@@ -6521,6 +6539,16 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
 
     # ✅ 모든 push payload에 고유 id 부여 (스크롤/중복판정 안정화)
     payload.setdefault("id", str(uuid.uuid4()))
+    if str(payload.get("type") or "").strip().lower() == "dashboard_lite":
+        room_id = get_current_chat_room_id()
+        if not room_id:
+            log.warning("[dashboard.chat_push] room_resolved=False pushed=False")
+            return
+        dashboard_meta = dict(payload.get("meta") or {})
+        dashboard_meta["room_id"] = room_id
+        dashboard_meta.setdefault("dashboard_event_id", str(payload.get("id") or ""))
+        payload["meta"] = dashboard_meta
+        meta = dashboard_meta
 
     if isinstance(payload, dict) and payload.get("type") == "table":
         meta = dict(payload.get("meta") or {})
@@ -6594,7 +6622,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 params,
                 df_llm,
             )
-        else:
+        elif str(payload.get("type") or "").strip().lower() != "dashboard_lite":
             log.info(
                 "[chat] SIMS result has no DataFrame; skip context build (keys=%s)",
                 list(payload.keys()),
@@ -8479,6 +8507,13 @@ def _sims_render_dedupe_key(item: Dict[str, Any], meta: Dict[str, Any], data: An
         return ""
 
     item_type = str(item.get("type") or "").strip().lower()
+    if item_type == "dashboard_lite":
+        room_id = str(meta.get("room_id") or "").strip()
+        event_id = str(meta.get("dashboard_event_id") or item.get("id") or "").strip()
+        if room_id and event_id:
+            return f"dashboard:{room_id}:{event_id}"
+        return ""
+
     is_sims_like = (
         item_type in {"table", "text", "object"}
         and (
@@ -8654,6 +8689,21 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
     title = item.get("title") or ""
     meta = item.get("meta") or {}
     data = item.get("data")
+
+    if t == "dashboard_lite":
+        cache = meta.get("dashboard_cache") if isinstance(meta, dict) else None
+        if not isinstance(cache, dict):
+            return
+        if not _should_render_sims_message_once(item, meta, data):
+            return
+        role = (item.get("role") or "assistant").lower()
+        if role not in ("assistant", "user"):
+            role = "assistant"
+        with st.chat_message(role):
+            from app.sims.views.dashboard_lite import render_dashboard_lite_chat_item
+
+            render_dashboard_lite_chat_item(cache)
+        return
 
     if not _should_render_sims_message_once(item, meta, data):
         return

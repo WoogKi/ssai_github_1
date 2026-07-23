@@ -63,22 +63,27 @@ def _dashboard_month_count(month_from: str, month_to: str) -> int:
 
 
 def default_dashboard_lite_scope(today: date | None = None, evaluation_month: Any = None) -> dict[str, str]:
-    """Return recent 6 completed months plus the evaluation/current month."""
+    """Return six completed display months and a separate evaluation month."""
     today = today or date.today()
     eval_month = _normalize_yyyymm(evaluation_month) or f"{today.year:04d}{today.month:02d}"
     month_from = _add_months(eval_month, -6)
-    month_to = eval_month
-    today_ym = f"{today.year:04d}{today.month:02d}"
-    date_to = today.strftime("%Y%m%d") if month_to == today_ym else _last_day_yyyymm(month_to)
+    month_to = _add_months(eval_month, -1)
     return {
         "month_from": month_from,
         "month_to": month_to,
         "evaluation_month": eval_month,
         "date_from": f"{month_from}01",
-        "date_to": date_to,
+        "date_to": _last_day_yyyymm(month_to),
         "policy_date": today.strftime("%Y%m%d"),
         "source_mode": "monthly_book",
-        "stock_mode": "book",
+        "stock_mode": "real",
+        "io_gu_list": [],
+        "major_purchase_vendor_days": 90,
+        "risk_analysis_days": 90,
+        "overstock_inactive_days": 90,
+        "readiness_warning_pct": 98.0,
+        "risk_quick_view_count": 30,
+        "amount_display_unit": "auto",
     }
 
 
@@ -117,9 +122,17 @@ def normalize_dashboard_lite_params(
     out["policy_date"] = re.sub(r"\D", "", str(out.get("policy_date") or ""))[:8] or defaults["policy_date"]
     out["source_mode"] = str(out.get("source_mode") or defaults["source_mode"]).strip()
     out["stock_mode"] = str(out.get("stock_mode") or defaults["stock_mode"]).strip()
+    if out["stock_mode"] not in {"real", "book"}:
+        raise ValueError("재고기준은 실재고 또는 장부재고여야 합니다.")
     for key in (
         "stock_cd_list",
         "stock_name_list",
+        "vendor_group_list",
+        "vendor_kind_list",
+        "product_group_list",
+        "product_di_list",
+        "product_class_list",
+        "io_gu_list",
         "exclude_product_group_list",
         "exclude_product_group_nm_list",
         "exclude_product_di_list",
@@ -128,7 +141,92 @@ def normalize_dashboard_lite_params(
         "exclude_product_class_nm_list",
     ):
         out[key] = _clean_list_param(out.get(key))
+    out["io_gu_list"] = _clean_list_param(out.get("io_gu_list"))
+    for key in ("major_purchase_vendor_days", "risk_analysis_days", "overstock_inactive_days", "risk_quick_view_count"):
+        try:
+            value = int(out.get(key, defaults[key]))
+        except (TypeError, ValueError):
+            raise ValueError(f"{key}는 1 이상의 정수여야 합니다.")
+        if value < 1:
+            raise ValueError(f"{key}는 1 이상의 정수여야 합니다.")
+        out[key] = value
+    try:
+        readiness = float(out.get("readiness_warning_pct", defaults["readiness_warning_pct"]))
+    except (TypeError, ValueError):
+        raise ValueError("준비율 경고기준은 0 초과 100 이하의 숫자여야 합니다.")
+    if not 0 < readiness <= 100:
+        raise ValueError("준비율 경고기준은 0 초과 100 이하의 숫자여야 합니다.")
+    out["readiness_warning_pct"] = readiness
+    out["amount_display_unit"] = str(out.get("amount_display_unit") or "auto").strip().lower()
+    if out["amount_display_unit"] not in {"auto", "won", "thousand", "million"}:
+        raise ValueError("금액 표시단위가 올바르지 않습니다.")
+    if out["vendor_group_list"] or out["vendor_kind_list"]:
+        # Monthly stock aggregates do not carry the sales customer master;
+        # use the established detail source so the customer code pairs are exact.
+        out["source_mode"] = "detail"
+    out["dashboard_product_group_list"] = list(out["product_group_list"])
+    out["dashboard_product_di_list"] = list(out["product_di_list"])
+    out["dashboard_product_class_list"] = list(out["product_class_list"])
     return out
+
+
+def _dashboard_internal_source_params(params: Mapping[str, Any], *, today: date) -> dict[str, Any]:
+    """Expand only the raw source range needed for Dashboard trend history."""
+    display_from = str(params.get("month_from") or "")
+    display_to = str(params.get("month_to") or "")
+    evaluation_month = str(params.get("evaluation_month") or "")
+    trend_month_from = _add_months(display_from, -3)
+    today_ym = f"{today.year:04d}{today.month:02d}"
+    source = dict(params)
+    manufacturer_codes = _clean_list_param(params.get("manufacturer_test_codes"))
+    source.update(
+        {
+            "month_from": trend_month_from,
+            "month_to": evaluation_month,
+            "date_from": f"{trend_month_from}01",
+            "date_to": today.strftime("%Y%m%d") if evaluation_month == today_ym else _last_day_yyyymm(evaluation_month),
+            "dashboard_lite_display_month_from": display_from,
+            "dashboard_lite_display_month_to": display_to,
+            "dashboard_lite_trend_month_from": trend_month_from,
+            # Dashboard uses the explicit Gcode:Tcode keys below.  Do not let
+            # legacy single-code filters reinterpret Tax classification as Gu.
+            "product_di_list": [],
+            "product_class_list": [],
+            # This one-session test condition is resolved to product codes before
+            # the shared sales and stock SQL paths execute. It is never persisted.
+            "dashboard_manufacturer_codes": manufacturer_codes,
+        }
+    )
+    return source
+
+
+def _stock_timing_meta(stock_attrs: Mapping[str, Any] | None, *, fallback_total_ms: int) -> dict[str, int]:
+    """Forward SQL, aggregation, and shortage-build timings without conflation."""
+    attrs = dict(stock_attrs or {})
+    return {
+        "stock_sql_ms": int(attrs.get("stock_sql_ms") or 0),
+        "stock_batch_count": int(attrs.get("stock_query_batches") or 0),
+        "stock_aggregate_ms": int(attrs.get("stock_aggregate_ms") or 0),
+        "stock_shortage_build_ms": int(attrs.get("stock_shortage_build_ms") or 0),
+        "stock_shortage_total_ms": int(attrs.get("stock_shortage_total_ms") or fallback_total_ms or 0),
+        "configured_batch_size": int(attrs.get("configured_batch_size") or 0),
+        "effective_chunk_size": int(attrs.get("effective_chunk_size") or 0),
+        "fixed_parameter_count": int(attrs.get("fixed_parameter_count") or 0),
+        "stock_cd_parameter_count": int(attrs.get("stock_cd_parameter_count") or 0),
+        "io_gu_parameter_count": int(attrs.get("io_gu_parameter_count") or 0),
+        "total_parameter_count": int(attrs.get("total_parameter_count") or 0),
+    }
+
+
+def _dashboard_visible_sales_df(df: pd.DataFrame | None, params: Mapping[str, Any]) -> pd.DataFrame | None:
+    """Keep display completed months and the evaluation month for non-trend facts."""
+    if df is None or df.empty or "기준월" not in df.columns:
+        return df
+    month_from = str(params.get("month_from") or "")
+    evaluation_month = str(params.get("evaluation_month") or "")
+    out = df.copy()
+    months = out["기준월"].astype(str).str.replace(r"\D", "", regex=True).str[:6]
+    return out[(months >= month_from) & (months <= evaluation_month)].copy()
 
 
 def _clean_list_param(values: Any) -> list[str]:
@@ -215,7 +313,7 @@ def _dashboard_filter_mask(
             "filter_basis": "code_pair",
             "missing_code_columns": [],
             "selected_code_pair_count": selected_code_pair_count,
-            "excluded_rows": int(mask.sum()),
+            "filtered_rows": int(mask.sum()),
         }
 
     missing = []
@@ -228,71 +326,88 @@ def _dashboard_filter_mask(
         "filter_basis": "not_applied",
         "missing_code_columns": missing,
         "selected_code_pair_count": selected_code_pair_count,
-        "excluded_rows": 0,
+        "filtered_rows": 0,
     }
 
 
 def _filter_sales_source_for_dashboard(df: pd.DataFrame | None, params: Mapping[str, Any]) -> pd.DataFrame | None:
-    """Apply Dashboard-only product exclusion filters to a copied sales source."""
+    """Apply current inclusion filters or the legacy exclusion compatibility path."""
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df
+    inclusion_keys = (
+        "product_group_list",
+        "product_di_list",
+        "product_class_list",
+    )
+    legacy_exclusion_keys = (
+        "exclude_product_group_list",
+        "exclude_product_di_list",
+        "exclude_product_class_list",
+    )
+    use_inclusion = any(_clean_list_param(params.get(key)) for key in inclusion_keys)
+    active_keys = inclusion_keys if use_inclusion else legacy_exclusion_keys
     if not any(
         _clean_list_param(params.get(key))
-        for key in (
-            "exclude_product_group_list",
-            "exclude_product_di_list",
-            "exclude_product_class_list",
-        )
+        for key in active_keys
     ):
         return df
+    source_attrs = dict(getattr(df, "attrs", {}) or {})
     out = df.copy()
-    exclusion_specs = [
+    inclusion_specs = [
         {
             "label": "제품그룹",
             "gcode_columns": ("제품그룹Gcode", "제품그룹G코드", "product_group_gcode", "group_gcode"),
             "code_columns": ("제품그룹코드", "상품그룹코드", "품목그룹코드", "product_group_code", "product_group_cd", "group_code"),
-            "code_values": _clean_list_param(params.get("exclude_product_group_list")),
+            "code_values": _clean_list_param(params.get("product_group_list" if use_inclusion else "exclude_product_group_list")),
             "default_gcode": "0013",
             "name_columns": ("제품그룹명", "상품그룹명", "품목그룹명", "product_group_name", "group_name"),
-            "name_values": _clean_list_param(params.get("exclude_product_group_nm_list")),
+            "name_values": _clean_list_param(params.get("product_group_nm_list" if use_inclusion else "exclude_product_group_nm_list")),
         },
         {
             "label": "제품구분",
             "gcode_columns": ("제품구분Gcode", "제품구분G코드", "product_di_gcode", "product_type_gcode", "type_gcode"),
             "code_columns": ("제품구분코드", "상품구분코드", "품목구분코드", "product_di_code", "product_di_cd", "product_type_code", "type_code"),
-            "code_values": _clean_list_param(params.get("exclude_product_di_list")),
+            "code_values": _clean_list_param(params.get("product_di_list" if use_inclusion else "exclude_product_di_list")),
             "default_gcode": "0004",
             "name_columns": ("제품구분명", "상품구분명", "품목구분명", "product_di_name", "product_type_name", "type_name"),
-            "name_values": _clean_list_param(params.get("exclude_product_di_nm_list")),
+            "name_values": _clean_list_param(params.get("product_di_nm_list" if use_inclusion else "exclude_product_di_nm_list")),
         },
         {
             "label": "제품분류",
             "gcode_columns": ("제품분류Gcode", "제품분류G코드", "product_class_gcode", "class_gcode"),
             "code_columns": ("제품분류코드", "상품분류코드", "품목분류코드", "product_class_code", "product_class_cd", "class_code"),
-            "code_values": _clean_list_param(params.get("exclude_product_class_list")),
+            "code_values": _clean_list_param(params.get("product_class_list" if use_inclusion else "exclude_product_class_list")),
             "default_gcode": "0031",
             "name_columns": ("제품분류명", "상품분류명", "품목분류명", "product_class_name", "class_name"),
-            "name_values": _clean_list_param(params.get("exclude_product_class_nm_list")),
+            "name_values": _clean_list_param(params.get("product_class_nm_list" if use_inclusion else "exclude_product_class_nm_list")),
         },
     ]
-    mask = pd.Series(False, index=out.index)
+    keep_mask = pd.Series(True, index=out.index)
+    exclude_mask = pd.Series(False, index=out.index)
     diagnostics: list[dict[str, Any]] = []
-    for spec in exclusion_specs:
+    for spec in inclusion_specs:
         spec_mask, diag = _dashboard_filter_mask(out, **spec)
-        mask = mask | spec_mask
         selected_code_values = _clean_list_param(spec.get("code_values"))
         if diag and selected_code_values:
             diagnostics.append(diag)
+            if diag.get("filter_basis") == "code_pair":
+                if use_inclusion:
+                    keep_mask = keep_mask & spec_mask
+                else:
+                    exclude_mask = exclude_mask | spec_mask
             log.info(
-                "[dashboard.filter] label=%s filter_basis=%s missing_code_columns=%s selected_code_pair_count=%s excluded_rows=%s",
+                "[dashboard.filter] label=%s filter_basis=%s missing_code_columns=%s selected_code_pair_count=%s filtered_rows=%s",
                 diag.get("label") or "",
                 diag.get("filter_basis") or "",
                 ",".join(diag.get("missing_code_columns") or []),
                 int(diag.get("selected_code_pair_count") or 0),
                 int(spec_mask.sum()) if hasattr(spec_mask, "sum") else 0,
             )
-    if bool(mask.any()):
-        out = out.loc[~mask].copy()
+    if use_inclusion and not bool(keep_mask.all()):
+        out = out.loc[keep_mask].copy()
+    elif not use_inclusion and bool(exclude_mask.any()):
+        out = out.loc[~exclude_mask].copy()
+    out.attrs.update(source_attrs)
     out.attrs["dashboard_filter_diagnostics"] = diagnostics
     return out
 
@@ -323,12 +438,21 @@ def _filter_payload_df_for_dashboard(payload: Mapping[str, Any] | None, params: 
 def _dashboard_filter_facts(params: Mapping[str, Any]) -> dict[str, Any]:
     stock_codes = _clean_list_param(params.get("stock_cd_list"))
     stock_names = _clean_list_param(params.get("stock_name_list"))
-    group_codes = _clean_list_param(params.get("exclude_product_group_list"))
-    group_names = _clean_list_param(params.get("exclude_product_group_nm_list"))
-    di_codes = _clean_list_param(params.get("exclude_product_di_list"))
-    di_names = _clean_list_param(params.get("exclude_product_di_nm_list"))
-    class_codes = _clean_list_param(params.get("exclude_product_class_list"))
-    class_names = _clean_list_param(params.get("exclude_product_class_nm_list"))
+    group_codes = _clean_list_param(params.get("product_group_list"))
+    group_names = _clean_list_param(params.get("product_group_nm_list"))
+    di_codes = _clean_list_param(params.get("product_di_list"))
+    di_names = _clean_list_param(params.get("product_di_nm_list"))
+    class_codes = _clean_list_param(params.get("product_class_list"))
+    class_names = _clean_list_param(params.get("product_class_nm_list"))
+    vendor_group_codes = _clean_list_param(params.get("vendor_group_list"))
+    vendor_kind_codes = _clean_list_param(params.get("vendor_kind_list"))
+    manufacturer_test_codes = _clean_list_param(params.get("manufacturer_test_codes"))
+    legacy_group_codes = _clean_list_param(params.get("exclude_product_group_list"))
+    legacy_group_names = _clean_list_param(params.get("exclude_product_group_nm_list"))
+    legacy_di_codes = _clean_list_param(params.get("exclude_product_di_list"))
+    legacy_di_names = _clean_list_param(params.get("exclude_product_di_nm_list"))
+    legacy_class_codes = _clean_list_param(params.get("exclude_product_class_list"))
+    legacy_class_names = _clean_list_param(params.get("exclude_product_class_nm_list"))
     included_stock_locations = []
     for idx, code in enumerate(stock_codes):
         included_stock_locations.append(
@@ -339,9 +463,27 @@ def _dashboard_filter_facts(params: Mapping[str, Any]) -> dict[str, Any]:
         )
     return {
         "included_stock_locations": included_stock_locations,
-        "excluded_product_groups": _code_pair_items(group_codes, group_names, "0013"),
-        "excluded_product_types": _code_pair_items(di_codes, di_names, "0004"),
-        "excluded_product_classes": _code_pair_items(class_codes, class_names, "0031"),
+        "included_product_groups": _code_pair_items(group_codes, group_names, "0013"),
+        "included_product_types": _code_pair_items(di_codes, di_names, "0004"),
+        "included_product_classes": _code_pair_items(class_codes, class_names, "0031"),
+        "excluded_product_groups": _code_pair_items(legacy_group_codes, legacy_group_names, "0013"),
+        "excluded_product_types": _code_pair_items(legacy_di_codes, legacy_di_names, "0004"),
+        "excluded_product_classes": _code_pair_items(legacy_class_codes, legacy_class_names, "0031"),
+        "included_vendor_groups": _code_pair_items(vendor_group_codes, [], "0019"),
+        "included_vendor_types": _code_pair_items(vendor_kind_codes, [], "0009"),
+        # This is deliberately kept out of the shared saved profile. It is a
+        # one-run test scope but still belongs in facts provenance.
+        "manufacturer_test_codes": manufacturer_test_codes,
+        "io_gu_tcodes": _clean_list_param(params.get("io_gu_list")),
+        "stock_mode": str(params.get("stock_mode") or "real"),
+        "amount_display_unit": str(params.get("amount_display_unit") or "auto"),
+        "thresholds": {
+            "major_purchase_vendor_days": params.get("major_purchase_vendor_days"),
+            "risk_analysis_days": params.get("risk_analysis_days"),
+            "overstock_inactive_days": params.get("overstock_inactive_days"),
+            "readiness_warning_pct": params.get("readiness_warning_pct"),
+            "risk_quick_view_count": params.get("risk_quick_view_count"),
+        },
     }
 
 
@@ -394,6 +536,7 @@ def _attach_dashboard_product_code_pairs(
     def _enrich(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty or product_col not in df.columns:
             return df
+        attrs = dict(getattr(df, "attrs", {}) or {})
         out = df.copy()
         lookup = source_pairs.set_index(product_col)
         for column in available:
@@ -404,6 +547,7 @@ def _attach_dashboard_product_code_pairs(
                 existing = out[column]
                 missing = existing.isna() | existing.astype(str).str.strip().eq("")
                 out.loc[missing, column] = mapped.loc[missing]
+        out.attrs.update(attrs)
         return out
 
     out = dict(payload)
@@ -480,6 +624,27 @@ def _month_sales_columns(df: pd.DataFrame) -> list[str]:
     return sorted(cols)
 
 
+def _monthly_sales_actuals_from_source(df: pd.DataFrame | None) -> list[dict[str, Any]]:
+    """Aggregate the already-loaded sales source for chart forecast history."""
+    if not isinstance(df, pd.DataFrame) or df.empty or "기준월" not in df.columns:
+        return []
+    amount_col = next((col for col in ("매출합계", "총매출액", "합계금액") if col in df.columns), "")
+    if not amount_col:
+        return []
+    work = df.loc[:, ["기준월", amount_col]].copy()
+    work["기준월"] = work["기준월"].map(_normalize_yyyymm)
+    work[amount_col] = pd.to_numeric(work[amount_col], errors="coerce").fillna(0)
+    grouped = work[work["기준월"].ne("")].groupby("기준월", as_index=False)[amount_col].sum()
+    return [
+        {
+            "period": f"{str(row['기준월'])[:4]}-{str(row['기준월'])[4:6]}",
+            "period_sort": str(row["기준월"]),
+            "value": float(row[amount_col]),
+        }
+        for _, row in grouped.sort_values("기준월", kind="stable").iterrows()
+    ]
+
+
 def _chart_period(value: Any) -> tuple[str, str]:
     """Return the display month and its stable YYYYMM ordering value."""
     yyyymm = _normalize_yyyymm(value)
@@ -488,7 +653,11 @@ def _chart_period(value: Any) -> tuple[str, str]:
     return f"{yyyymm[:4]}-{yyyymm[4:6]}", yyyymm
 
 
-def _completed_month_pre_forecasts(monthly_actuals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _completed_month_pre_forecasts(
+    monthly_actuals: list[dict[str, Any]],
+    *,
+    history_actuals: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     """Calculate a target month's forecast from preceding completed months only."""
     if not monthly_actuals:
         return []
@@ -502,7 +671,11 @@ def _completed_month_pre_forecasts(monthly_actuals: list[dict[str, Any]]) -> lis
     )
 
     forecasts: list[dict[str, Any]] = []
-    history: list[float] = []
+    history = [
+        float(item.get("value") or 0)
+        for item in (history_actuals or [])
+        if str(item.get("period_sort") or "") < str(monthly_actuals[0].get("period_sort") or "")
+    ]
     for target in monthly_actuals:
         active_months = sum(1 for value in history if value != 0)
         if active_months > 1:
@@ -551,7 +724,11 @@ def _text_series(df: pd.DataFrame, col: str, default: str = "미지정") -> pd.S
     return out.where(out.ne(""), default)
 
 
-def _build_sales_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+def _build_sales_facts(
+    payload: Mapping[str, Any] | None,
+    *,
+    history_actuals: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     df = _payload_df(payload)
     meta = _payload_meta(payload)
     completed_total = _sum_col(df, "완료월총매출") or _num(meta.get("sum_completed_month_sales_amt"))
@@ -622,7 +799,7 @@ def _build_sales_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
             }
         )
     chart_rows.extend(completed_actuals)
-    chart_rows.extend(_completed_month_pre_forecasts(completed_actuals))
+    chart_rows.extend(_completed_month_pre_forecasts(completed_actuals, history_actuals=history_actuals))
     if current_sales or forecast_sales:
         period, period_sort = _chart_period(meta.get("evaluation_month") or meta.get("current_month") or "")
         if period_sort:
@@ -925,20 +1102,21 @@ def build_dashboard_lite_facts(
     needs_stock_source = stock_shortage_payload is None
     if needs_sales_source or needs_stock_source:
         service_params = normalize_dashboard_lite_params(params, today=today)
-        if not _clean_list_param(service_params.get("stock_cd_list")):
-            raise ValueError("Dashboard Lite 조회에는 재고위치 선택이 필요합니다.")
     else:
         try:
             service_params = normalize_dashboard_lite_params(params or default_dashboard_lite_scope(today=today), today=today)
         except Exception:
             service_params = default_dashboard_lite_scope(today=today)
 
+    source_params = _dashboard_internal_source_params(service_params, today=today)
+    manufacturer_test_codes = _clean_list_param(service_params.get("manufacturer_test_codes"))
     period = {
         "month_from": service_params.get("month_from"),
         "month_to": service_params.get("month_to"),
         "evaluation_month": service_params.get("evaluation_month"),
         "date_from": service_params.get("date_from"),
         "date_to": service_params.get("date_to"),
+        "trend_support_month_from": source_params.get("dashboard_lite_trend_month_from"),
         "basis": "조회 종료일 기준 당월은 부분월로 표시",
     }
     log.info(
@@ -951,20 +1129,23 @@ def build_dashboard_lite_facts(
     )
 
     shared_sales_df: pd.DataFrame | None = None
+    source_monthly_actuals: list[dict[str, Any]] = []
     filter_diagnostics: list[dict[str, Any]] = []
+    stock_timing = _stock_timing_meta({}, fallback_total_ms=0)
     if needs_sales_source or needs_stock_source:
         from app.services.analytics_sales_trend_service import get_sales_trend_df
 
         t_source = time.perf_counter()
-        shared_sales_df = get_sales_trend_df(dict(service_params))
+        shared_sales_df = get_sales_trend_df(dict(source_params))
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
         t_filter = time.perf_counter()
         shared_sales_df = _filter_sales_source_for_dashboard(shared_sales_df, service_params)
+        source_monthly_actuals = _monthly_sales_actuals_from_source(shared_sales_df)
         filter_elapsed_ms = int((time.perf_counter() - t_filter) * 1000)
         if isinstance(shared_sales_df, pd.DataFrame):
             filter_diagnostics.extend(list(shared_sales_df.attrs.get("dashboard_filter_diagnostics") or []))
         log.info(
-            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s source_elapsed_ms=%s filter_elapsed_ms=%s elapsed_ms=%s",
+            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s manufacturer_test_filter_enabled=%s manufacturer_test_product_count=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s elapsed_ms=%s",
             service_params.get("company_id") or "",
             service_params.get("month_from"),
             service_params.get("month_to"),
@@ -972,7 +1153,10 @@ def build_dashboard_lite_facts(
             0 if shared_sales_df is None else len(shared_sales_df),
             1,
             False,
+            bool(manufacturer_test_codes),
+            int(shared_sales_df["제품코드"].nunique()) if isinstance(shared_sales_df, pd.DataFrame) and "제품코드" in shared_sales_df.columns else 0,
             source_elapsed_ms,
+            0,
             filter_elapsed_ms,
             int((time.perf_counter() - t_source) * 1000),
         )
@@ -981,7 +1165,7 @@ def build_dashboard_lite_facts(
         from app.services.analytics_manufacturer_sales_trend_service import get_manufacturer_sales_trend_summary_result
 
         manufacturer_summary_payload = get_manufacturer_sales_trend_summary_result(
-            dict(service_params),
+            dict(source_params),
             raw_df=shared_sales_df,
         )
     else:
@@ -989,12 +1173,31 @@ def build_dashboard_lite_facts(
         payload_df = _payload_df(manufacturer_summary_payload)
         filter_diagnostics.extend(list(payload_df.attrs.get("dashboard_filter_diagnostics") or []))
     if stock_shortage_payload is None:
-        from app.services.analytics_sales_trend_service import get_stock_shortage_result
+        from app.services.analytics_sales_trend_service import (
+            get_sales_forecast_df,
+            get_stock_shortage_result,
+        )
 
+        visible_sales_df = _dashboard_visible_sales_df(shared_sales_df, service_params)
+        t_forecast = time.perf_counter()
+        shared_sales_forecast_df = get_sales_forecast_df(
+            {
+                **service_params,
+                "month_to": service_params.get("evaluation_month"),
+                "date_to": source_params.get("date_to"),
+            },
+            raw_df=visible_sales_df,
+        )
+        forecast_elapsed_ms = int((time.perf_counter() - t_forecast) * 1000)
         t_source = time.perf_counter()
         stock_shortage_payload = get_stock_shortage_result(
-            dict(service_params),
-            sales_raw_df=shared_sales_df,
+            {
+                **service_params,
+                "month_to": service_params.get("evaluation_month"),
+                "date_to": source_params.get("date_to"),
+            },
+            sales_raw_df=visible_sales_df,
+            sales_forecast_df=shared_sales_forecast_df,
         )
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
         t_master_merge = time.perf_counter()
@@ -1004,9 +1207,13 @@ def build_dashboard_lite_facts(
         stock_shortage_payload = _filter_payload_df_for_dashboard(stock_shortage_payload, service_params)
         filter_elapsed_ms = int((time.perf_counter() - t_filter) * 1000)
         source_df = _payload_df(stock_shortage_payload)
+        stock_attrs = dict(getattr(source_df, "attrs", {}) or {})
+        if isinstance(stock_shortage_payload, Mapping):
+            stock_attrs.update(dict(stock_shortage_payload.get("meta") or {}))
+        stock_timing = _stock_timing_meta(stock_attrs, fallback_total_ms=source_elapsed_ms)
         filter_diagnostics.extend(list(source_df.attrs.get("dashboard_filter_diagnostics") or []))
         log.info(
-            "[dashboard.source_load] source=stock company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s source_elapsed_ms=%s master_merge_elapsed_ms=%s filter_elapsed_ms=%s elapsed_ms=%s",
+            "[dashboard.source_load] source=stock company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s sales_forecast_calc_ms=%s sales_source_reused=%s stock_sql_ms=%s stock_batch_count=%s stock_aggregate_ms=%s stock_shortage_build_ms=%s stock_shortage_total_ms=%s configured_batch_size=%s effective_chunk_size=%s fixed_parameter_count=%s stock_cd_parameter_count=%s io_gu_parameter_count=%s total_parameter_count=%s master_merge_elapsed_ms=%s product_filter_ms=%s elapsed_ms=%s",
             service_params.get("company_id") or "",
             service_params.get("month_from"),
             service_params.get("month_to"),
@@ -1014,7 +1221,19 @@ def build_dashboard_lite_facts(
             len(source_df),
             1,
             False,
-            source_elapsed_ms,
+            forecast_elapsed_ms,
+            True,
+            stock_timing["stock_sql_ms"],
+            stock_timing["stock_batch_count"],
+            stock_timing["stock_aggregate_ms"],
+            stock_timing["stock_shortage_build_ms"],
+            stock_timing["stock_shortage_total_ms"],
+            stock_timing["configured_batch_size"],
+            stock_timing["effective_chunk_size"],
+            stock_timing["fixed_parameter_count"],
+            stock_timing["stock_cd_parameter_count"],
+            stock_timing["io_gu_parameter_count"],
+            stock_timing["total_parameter_count"],
             master_merge_elapsed_ms,
             filter_elapsed_ms,
             int((time.perf_counter() - t_source) * 1000),
@@ -1026,7 +1245,10 @@ def build_dashboard_lite_facts(
         filter_diagnostics.extend(list(source_df.attrs.get("dashboard_filter_diagnostics") or []))
 
     t_sales = time.perf_counter()
-    sales = _build_sales_facts(manufacturer_summary_payload)
+    sales = _build_sales_facts(
+        manufacturer_summary_payload,
+        history_actuals=source_monthly_actuals,
+    )
     log.info(
         "[dashboard.sales_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",
         service_params.get("company_id") or "",
@@ -1060,6 +1282,7 @@ def build_dashboard_lite_facts(
         "sales_decline_targets": sales.get("decline_targets", []),
         "turnover_status": turnover.get("status") or "",
         "data_quality": sales.get("data_quality", []) + inventory.get("data_quality", []) + turnover.get("data_quality", []) + filter_diagnostics,
+        "performance": stock_timing,
         "comparison_notes": [
             "제약사별 매출 감소, 거래 회전일 자료부족, 일반 데이터 품질 안내는 제품 조치 표와 분리",
         ],
@@ -1106,6 +1329,7 @@ def build_dashboard_lite_facts(
         "risk_targets": inventory.get("risk_targets", []) + sales.get("decline_targets", []),
         "today_actions": today_actions,
         "additional_notes": additional_notes,
+        "performance": stock_timing,
         "data_quality": sales.get("data_quality", []) + inventory.get("data_quality", []) + turnover.get("data_quality", []) + filter_diagnostics,
         "comparison_rules": [
             "완료월 평균매출은 완료월끼리 비교",
@@ -1121,12 +1345,13 @@ def build_dashboard_lite_facts(
     }
     facts["source_call_count"] = int(needs_sales_source) + int(needs_stock_source)
     log.info(
-        "[dashboard.finish] company_id=%s month_from=%s month_to=%s evaluation_month=%s source_call_count=%s elapsed_ms=%s",
+        "[dashboard.finish] company_id=%s month_from=%s month_to=%s evaluation_month=%s source_call_count=%s dashboard_total_ms=%s elapsed_ms=%s",
         service_params.get("company_id") or "",
         service_params.get("month_from"),
         service_params.get("month_to"),
         service_params.get("evaluation_month"),
         facts["source_call_count"],
+        int((time.perf_counter() - t0) * 1000),
         int((time.perf_counter() - t0) * 1000),
     )
     return facts

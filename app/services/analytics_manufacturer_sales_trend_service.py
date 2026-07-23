@@ -195,6 +195,13 @@ def _month_list(params: Dict[str, Any], raw: pd.DataFrame) -> list[str]:
     return []
 
 
+def _dashboard_display_months(params: Dict[str, Any]) -> list[str]:
+    """Return Dashboard's explicit completed-month display range, if present."""
+    month_from = _parse_yyyymm(params.get("dashboard_lite_display_month_from"))
+    month_to = _parse_yyyymm(params.get("dashboard_lite_display_month_to"))
+    return _iter_yyyymm(month_from, month_to) if month_from and month_to else []
+
+
 def _period_label_map(months: list[str], params: Dict[str, Any]) -> dict[str, str]:
     policy = _resolve_period_source_policy(params)
     evaluation_month = str(policy.get("evaluation_month") or "")
@@ -236,9 +243,17 @@ def _clean_public_columns(df: pd.DataFrame, columns: list[str], dynamic_cols: Op
     dynamic_cols = dynamic_cols or []
     keep = [c for c in columns if c in df.columns]
     keep += [c for c in dynamic_cols if c in df.columns and c not in keep]
+    # Dynamic monthly columns are public only when explicitly supplied by the
+    # caller.  This keeps Dashboard's evaluation/support months out of the
+    # displayed completed-month table.
+    def _is_dynamic_month_column(column: Any) -> bool:
+        text = str(column)
+        return len(text) == 10 and text[4:5] == "-" and text[7:8] == " " and text[:4].isdigit() and text[5:7].isdigit() and text.endswith("매출")
+
     rest = [
         c for c in df.columns
         if c not in keep
+        and not _is_dynamic_month_column(c)
         and not any(token in str(c) for token in MANUFACTURER_FORBIDDEN_TOKENS)
         and not str(c).endswith(("_x", "_y"))
         and not str(c).startswith("_")
@@ -280,6 +295,13 @@ def _prepare_manufacturer_monthly(raw: pd.DataFrame, params: Dict[str, Any]) -> 
     labels = _period_label_map(months, params)
     agg["기간구분"] = agg["기준월"].map(lambda m: labels.get(str(m), "완료월"))
     policy = _resolve_period_source_policy(params)
+    display_months = _dashboard_display_months(params)
+    if display_months:
+        evaluation_month = str(policy.get("evaluation_month") or "")
+        output_months = list(display_months)
+        if evaluation_month and evaluation_month not in output_months:
+            output_months.append(evaluation_month)
+        return agg, output_months, policy
     return agg, months, policy
 
 
@@ -656,6 +678,8 @@ def get_manufacturer_sales_trend(
     t_group = time.perf_counter()
     _period_log_values("trend", params, months, policy)
     out = _add_manufacturer_month_metrics(monthly, params)
+    if _dashboard_display_months(params):
+        out = out[out["기준월"].astype(str).isin(months)].copy()
     t_calc = time.perf_counter()
     out = _drop_zero_manufacturer_public_rows(out)
     out = out.sort_values(["제약사명", "기준월"], ascending=[True, True]).reset_index(drop=True)
@@ -703,6 +727,8 @@ def get_manufacturer_sales_trend_summary(
     work = detail.copy()
     months = list(getattr(detail, "attrs", {}).get("months") or sorted({_parse_yyyymm(v) for v in work["기준월"].tolist() if _parse_yyyymm(v)}))
     policy = _resolve_period_source_policy(params)
+    dashboard_display_months = _dashboard_display_months(params)
+    public_months = dashboard_display_months or months
     _period_log_values("summary", params, months, policy)
     t_group = time.perf_counter()
 
@@ -715,12 +741,13 @@ def get_manufacturer_sales_trend_summary(
             pivot[m] = 0
     if months:
         pivot = pivot[["제약사명"] + months]
-    month_cols = [f"{_fmt_yyyymm_col(m)} 매출" for m in months]
+    month_cols = [f"{_fmt_yyyymm_col(m)} 매출" for m in public_months]
     pivot = pivot.rename(columns={m: f"{_fmt_yyyymm_col(m)} 매출" for m in months})
     t_pivot = time.perf_counter()
 
+    base_work = work[work["기준월"].astype(str).isin(public_months)].copy() if dashboard_display_months else work
     base = (
-        work.groupby("제약사명", as_index=False)
+        base_work.groupby("제약사명", as_index=False)
         .agg(
             총매출공급가액=("매출공급가액", "sum"),
             총매출세액=("매출세액", "sum"),

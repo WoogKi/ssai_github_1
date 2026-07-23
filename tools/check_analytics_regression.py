@@ -5883,11 +5883,18 @@ def run_basic_checks() -> list[CheckResult]:
                 persisted_ids=[r["id"] for r in page2["view"]],
             )
             has_selection_resolver = (
-                "def _resolve_room_pick" in main_src
-                and "picked = _resolve_room_pick(" in main_src
-                and "picked = picked_persisted or picked_pending" not in main_src
+                "def _sync_chat_room_selector_state" in main_src
+                and "def _queue_chat_room_selector_request" in main_src
+                and "def _consume_chat_room_selector_request" in main_src
+                and "on_change=_queue_chat_room_selector_request" in main_src
+                and "picked = _resolve_room_pick(" not in main_src
             )
-            has_room_select_log = "[chat.room_select] phase=request" in main_src and "[chat.room_select] phase=render_ready" in main_src
+            has_room_select_log = (
+                "[chat.room_select] phase=request" in main_src
+                and "[chat.room_select] phase=render_ready" in main_src
+                and "[chat.room.selector]" in main_src
+                and '"after_rerun"' in main_src
+            )
             ok = (
                 len(page0["view"]) == 20
                 and page0["caption"] == "1-20 / 저장된 채팅방 총 22개"
@@ -6004,6 +6011,167 @@ def run_basic_checks() -> list[CheckResult]:
                 results.append(_fail("chat room sidebar pagination policy", f"failed_checks={failed_checks} initial={initial} page0={len(page0['view'])}/{page0['caption']} page1={len(page1['view'])}/{page1['caption']} page2={len(page2['view'])}/{page2['caption']} stale={stale} filter_changed={filter_changed} filter_cleared={filter_cleared} same_filter={same_filter} pending={pending} picks={[login_no_auto_pick, page0_pick, page1_pick, page2_pick, pending_pick]} loaded={[loaded_page0_message, loaded_page1_message, loaded_page2_message]} save_guard={has_save_current_room_guard} log={has_room_list_log} pager={has_visible_pager} resolver={has_selection_resolver}"))
         except Exception as e:
             results.append(_fail("chat room sidebar pagination policy", f"{type(e).__name__}: {e}"))
+
+        try:
+            import ast
+
+            main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            tree = ast.parse(main_src)
+            selector_names = {
+                "_log_chat_room_selector",
+                "_is_chat_room_id",
+                "_sync_chat_room_selector_state",
+                "_queue_chat_room_selector_request",
+                "_consume_chat_room_selector_request",
+                "_clear_chat_room_selector_request_state",
+            }
+            selector_nodes = [
+                node
+                for node in tree.body
+                if (
+                    isinstance(node, ast.FunctionDef) and node.name in selector_names
+                )
+                or (
+                    isinstance(node, ast.Assign)
+                    and any(
+                        isinstance(target, ast.Name)
+                        and target.id.startswith("_CHAT_ROOM_")
+                        for target in node.targets
+                    )
+                )
+            ]
+
+            class _SelectorLog:
+                def info(self, *args: Any, **kwargs: Any) -> None:
+                    return None
+
+            selector_ns: dict[str, Any] = {
+                "Any": Any,
+                "Iterable": Iterable,
+                "log": _SelectorLog(),
+                "time": __import__("time"),
+                "uuid": __import__("uuid"),
+                "_new_ui_event_id": lambda prefix="ui": f"{prefix}-token",
+            }
+            exec(
+                compile(
+                    ast.Module(body=selector_nodes, type_ignores=[]),
+                    "chat_room_selector_helpers",
+                    "exec",
+                ),
+                selector_ns,
+            )
+            sync_selector = selector_ns["_sync_chat_room_selector_state"]
+            queue_selector = selector_ns["_queue_chat_room_selector_request"]
+            consume_selector = selector_ns["_consume_chat_room_selector_request"]
+            clear_selector_state = selector_ns["_clear_chat_room_selector_request_state"]
+            pending_key = selector_ns["_CHAT_ROOM_PENDING_SELECTOR_KEY"]
+            persisted_key = selector_ns["_CHAT_ROOM_PERSISTED_SELECTOR_KEY"]
+
+            def _select_once(current: str, target: str, pending: list[str], persisted: list[str], kind: str) -> tuple[dict[str, Any], dict[str, str] | None]:
+                session: dict[str, Any] = {
+                    "current_room": current,
+                    "__chat_room_selector_valid_ids": [*pending, *persisted],
+                }
+                sync_selector(session, canonical_room_id=current, pending_ids=pending, persisted_ids=persisted)
+                key = pending_key if kind == "pending" else persisted_key
+                session[key] = target
+                queue_selector(session, widget_key=key, room_kind=kind)
+                request = consume_selector(session, valid_room_ids=[*pending, *persisted])
+                if request:
+                    session["current_room"] = request["room_id"]
+                sync_selector(
+                    session,
+                    canonical_room_id=session.get("current_room"),
+                    pending_ids=pending,
+                    persisted_ids=persisted,
+                )
+                return session, request
+
+            pending_room = "00000000-0000-0000-0000-000000000010"
+            room_a = "00000000-0000-0000-0000-000000000001"
+            room_b = "00000000-0000-0000-0000-000000000002"
+            dashboard_room = "00000000-0000-0000-0000-000000000003"
+            large_room = "00000000-0000-0000-0000-000000000004"
+            pending_ids_fixture = [pending_room]
+            persisted_ids_fixture = [room_a, room_b, dashboard_room, large_room]
+            ab_session, ab_request = _select_once(room_a, room_b, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            ba_session, ba_request = _select_once(room_b, room_a, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            pending_session, pending_request = _select_once(pending_room, room_a, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            dashboard_session, dashboard_request = _select_once(room_a, dashboard_room, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            large_session, large_request = _select_once(dashboard_room, large_room, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            duplicate_session = {"current_room": room_a, persisted_key: room_b, "__chat_room_selector_valid_ids": persisted_ids_fixture}
+            queue_selector(duplicate_session, widget_key=persisted_key, room_kind="persisted")
+            duplicate_first = consume_selector(duplicate_session, valid_room_ids=persisted_ids_fixture)
+            duplicate_second = consume_selector(duplicate_session, valid_room_ids=persisted_ids_fixture)
+            same_room_session = {"current_room": room_b, persisted_key: room_b, "__chat_room_selector_valid_ids": persisted_ids_fixture}
+            queue_selector(same_room_session, widget_key=persisted_key, room_kind="persisted")
+            same_room_request = consume_selector(same_room_session, valid_room_ids=persisted_ids_fixture)
+            queued_session = {"current_room": room_a, persisted_key: room_b, "__chat_room_selector_valid_ids": persisted_ids_fixture}
+            queue_selector(queued_session, widget_key=persisted_key, room_kind="persisted")
+            sync_selector(
+                queued_session,
+                canonical_room_id=room_a,
+                pending_ids=pending_ids_fixture,
+                persisted_ids=persisted_ids_fixture,
+                queued_request=queued_session.get("__chat_room_selector_request"),
+            )
+            stale_state = {
+                "__chat_room_selector_request": {"room_id": room_a},
+                "__chat_room_selector_consumed_token": "old-token",
+                pending_key: pending_room,
+                persisted_key: room_a,
+                "current_room": room_a,
+            }
+            clear_selector_state(stale_state)
+            title_value = "2026-07-19 14:50 제품수불현황 조회"
+            invalid_session = {
+                "current_room": room_a,
+                "__room_page": 3,
+                persisted_key: title_value,
+                "__chat_room_selector_valid_ids": persisted_ids_fixture,
+            }
+            queue_selector(invalid_session, widget_key=persisted_key, room_kind="persisted")
+            invalid_request = consume_selector(invalid_session, valid_room_ids=persisted_ids_fixture)
+            page3_key = f"{persisted_key}_page_3"
+            page3_session = {"current_room": room_a, page3_key: room_b}
+            sync_selector(
+                page3_session,
+                canonical_room_id=room_a,
+                pending_ids=[],
+                persisted_ids=[room_a, room_b],
+                persisted_widget_key=page3_key,
+            )
+            checks = {
+                "a_to_b_once": bool(ab_request) and ab_session.get("current_room") == room_b and ab_session.get(persisted_key) == room_b and pending_key not in ab_session,
+                "b_to_a_once": bool(ba_request) and ba_session.get("current_room") == room_a and ba_session.get(persisted_key) == room_a,
+                "pending_to_persisted_once": bool(pending_request) and pending_session.get("current_room") == room_a and pending_key not in pending_session and pending_session.get(persisted_key) == room_a,
+                "dashboard_to_general_once": bool(dashboard_request) and dashboard_session.get("current_room") == dashboard_room,
+                "large_room_guard_no_bounce": bool(large_request) and large_session.get("current_room") == large_room and large_session.get(persisted_key) == large_room,
+                "request_consumed_once": bool(duplicate_first) and duplicate_second is None,
+                "same_room_callback_noop": same_room_request is None and "__chat_room_selector_request" not in same_room_session,
+                "queued_target_not_overwritten": queued_session.get(persisted_key) == room_b,
+                "title_callback_invalid": invalid_request is None and "__chat_room_selector_request" not in invalid_session and invalid_session.get("current_room") == room_a and invalid_session.get("__room_page") == 3,
+                "page_key_keeps_room_id": page3_session.get(page3_key) == room_a,
+                "new_pending_clears_stale_request": "current_room" in stale_state and not any(
+                    key in stale_state
+                    for key in (
+                        "__chat_room_selector_request",
+                        "__chat_room_selector_consumed_token",
+                        pending_key,
+                        persisted_key,
+                    )
+                ),
+                "selector_logs_present": "[chat.room.selector]" in main_src and '"before_render"' in main_src and '"after_switch"' in main_src and '"after_rerun"' in main_src and '"callback_invalid"' in main_src,
+                "page_scoped_options": "_page_{selector_page}" in main_src and "options=options_ids" in main_src and "format_func=lambda rid" in main_src,
+            }
+            failed_checks = [name for name, passed in checks.items() if not passed]
+            if failed_checks:
+                results.append(_fail("chat room selector canonical synchronization", f"failed_checks={failed_checks}"))
+            else:
+                results.append(_ok("chat room selector canonical synchronization", "callback request is consumed once, canonical room ID and selector state remain aligned across persisted, pending, dashboard, and large-room transitions"))
+        except Exception as e:
+            results.append(_fail("chat room selector canonical synchronization", f"{type(e).__name__}: {e}"))
 
         try:
             login_src = Path("app/ui/ssai_login.py").read_text(encoding="utf-8")
@@ -6657,7 +6825,7 @@ def run_basic_checks() -> list[CheckResult]:
         if not sales_df.equals(sales_original) or not stock_df.equals(stock_original):
             fact_errors.append("input_df_mutated")
         default_scope = dash_mod.default_dashboard_lite_scope(today=date(2026, 7, 20))
-        if default_scope.get("month_from") != "202601" or default_scope.get("month_to") != "202607" or default_scope.get("evaluation_month") != "202607":
+        if default_scope.get("month_from") != "202601" or default_scope.get("month_to") != "202606" or default_scope.get("evaluation_month") != "202607":
             fact_errors.append(f"default_scope={default_scope!r}")
         try:
             dash_mod.normalize_dashboard_lite_params({"month_from": "202501", "month_to": "202602", "evaluation_month": "202602"}, today=date(2026, 7, 20))
@@ -6669,16 +6837,196 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append("empty_params_service_path_not_blocked")
         except ValueError:
             pass
-        try:
-            dash_mod.build_dashboard_lite_facts({"month_from": "202601", "month_to": "202607", "evaluation_month": "202607"})
-            fact_errors.append("missing_stock_locations_not_blocked")
-        except ValueError:
-            pass
+        all_stock_scope = dash_mod.normalize_dashboard_lite_params(
+            {"month_from": "202601", "month_to": "202606", "evaluation_month": "202607"},
+            today=date(2026, 7, 20),
+        )
+        if all_stock_scope.get("stock_cd_list") or all_stock_scope.get("stock_mode") != "real":
+            fact_errors.append(f"all_stock_default={all_stock_scope!r}")
 
         if fact_errors:
             results.append(_fail("Dashboard Lite deterministic facts", "; ".join(fact_errors)))
         else:
             results.append(_ok("Dashboard Lite deterministic facts", f"actions={len(facts.get('today_actions') or [])} risks={len(facts.get('risk_targets') or [])}"))
+
+        try:
+            import app.services.analytics_manufacturer_sales_trend_service as dashboard_trend_mod
+
+            dashboard_date_errors: list[str] = []
+            jan_scope = dash_mod.default_dashboard_lite_scope(today=date(2026, 1, 20))
+            if (
+                jan_scope.get("month_from") != "202507"
+                or jan_scope.get("month_to") != "202512"
+                or jan_scope.get("evaluation_month") != "202601"
+            ):
+                dashboard_date_errors.append(f"january_default_scope={jan_scope!r}")
+
+            visible_scope = {
+                "month_from": "202601",
+                "month_to": "202606",
+                "evaluation_month": "202607",
+                "date_from": "20260101",
+                "date_to": "20260630",
+                "policy_date": "20260720",
+            }
+            source_scope = dash_mod._dashboard_internal_source_params(visible_scope, today=date(2026, 7, 20))
+            if (
+                source_scope.get("month_from") != "202510"
+                or source_scope.get("month_to") != "202607"
+                or source_scope.get("dashboard_lite_display_month_from") != "202601"
+                or source_scope.get("dashboard_lite_display_month_to") != "202606"
+            ):
+                dashboard_date_errors.append(f"internal_trend_scope={source_scope!r}")
+
+            months = ["202510", "202511", "202512", "202601", "202602", "202603", "202604", "202605", "202606", "202607"]
+            amounts = [100, 200, 300, 10, 20, 30, 40, 50, 60, 70]
+            raw = pd.DataFrame(
+                [
+                    {
+                        "\uae30\uc900\uc6d4": month,
+                        "\uc81c\ud488\ucf54\ub4dc": "P1",
+                        "\uc81c\uc870\uc0ac\uba85": "M1",
+                        "\ub9e4\ucd9c\uacf5\uae09\uac00\uc561": amount,
+                        "\ub9e4\ucd9c\ud569\uacc4": amount,
+                    }
+                    for month, amount in zip(months, amounts)
+                ]
+            )
+            raw_before = raw.copy(deep=True)
+            detail = dashboard_trend_mod.get_manufacturer_sales_trend(source_scope, raw_df=raw)
+            summary = dashboard_trend_mod.get_manufacturer_sales_trend_summary(source_scope, raw_df=raw)
+            detail_months = list(detail["\uae30\uc900\uc6d4"].astype(str))
+            if detail_months != ["202601", "202602", "202603", "202604", "202605", "202606", "202607"]:
+                dashboard_date_errors.append(f"detail_months={detail_months!r}")
+            january_row = detail.loc[detail["\uae30\uc900\uc6d4"].astype(str) == "202601"].iloc[0]
+            if float(january_row["\ucd5c\uadfc3\uac1c\uc6d4\ud3c9\uade0\ub9e4\ucd9c"]) != 200.0:
+                dashboard_date_errors.append(f"first_display_month_trend={january_row['\ucd5c\uadfc3\uac1c\uc6d4\ud3c9\uade0\ub9e4\ucd9c']!r}")
+            summary_row = summary.iloc[0]
+            if int(summary_row["\uc644\ub8cc\uc6d4\uc218"]) != 6 or float(summary_row["\uc644\ub8cc\uc6d4\ucd1d\ub9e4\ucd9c"]) != 210.0:
+                dashboard_date_errors.append(f"completed_metrics={summary_row.to_dict()!r}")
+            if any(column.startswith(("2025-10", "2025-11", "2025-12", "2026-07")) for column in summary.columns):
+                dashboard_date_errors.append(f"support_or_evaluation_month_leaked={list(summary.columns)!r}")
+            if not raw.equals(raw_before):
+                dashboard_date_errors.append("internal_trend_source_mutated")
+
+            if dashboard_date_errors:
+                results.append(_fail("Dashboard Lite completed-month scope and trend support", "; ".join(dashboard_date_errors)))
+            else:
+                results.append(_ok("Dashboard Lite completed-month scope and trend support", "defaults, 3-month support, visible months, and completed metrics verified"))
+        except Exception as e:
+            results.append(_fail("Dashboard Lite completed-month scope and trend support", f"{type(e).__name__}: {e}"))
+
+        try:
+            import app.services.analytics_sales_trend_service as dashboard_sales_mod
+
+            condition_errors: list[str] = []
+            condition_params = dash_mod.normalize_dashboard_lite_params(
+                {
+                    "month_from": "202601",
+                    "month_to": "202606",
+                    "evaluation_month": "202607",
+                    "product_group_list": ["0013:A", "0013:B"],
+                    "product_di_list": ["0004:X"],
+                    "product_class_list": ["0031:C"],
+                    "vendor_group_list": ["0019:G"],
+                    "vendor_kind_list": ["0009:K"],
+                    "io_prefix_list": ["0", "5"],
+                    "stock_mode": "book",
+                },
+                today=date(2026, 7, 20),
+            )
+            if condition_params.get("source_mode") != "detail" or condition_params.get("stock_mode") != "book":
+                condition_errors.append(f"source_or_stock_mode={condition_params!r}")
+            where_sql = dashboard_sales_mod._build_filters(
+                dash_mod._dashboard_internal_source_params(condition_params, today=date(2026, 7, 20))
+            )
+            if "Rd04_Physic_Tax_Gcode" not in where_sql or "Rd03_Ven_Group_Gcode" not in where_sql:
+                condition_errors.append(f"bound_filter_missing={where_sql!r}")
+            try:
+                dash_mod.normalize_dashboard_lite_params({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "readiness_warning_pct": 101}, today=date(2026, 7, 20))
+                condition_errors.append("invalid_readiness_not_blocked")
+            except ValueError:
+                pass
+            if condition_errors:
+                results.append(_fail("Dashboard Lite additional condition normalization and SQL binding", "; ".join(condition_errors)))
+            else:
+                results.append(_ok("Dashboard Lite additional condition normalization and SQL binding", "all-scope defaults, code-pair AND/OR binding, IO prefixes, stock mode, and threshold validation verified"))
+        except Exception as e:
+            results.append(_fail("Dashboard Lite additional condition normalization and SQL binding", f"{type(e).__name__}: {e}"))
+
+        try:
+            import app.services.ssai_analysis_profile_service as profile_service_mod
+            from app.services.ssai_analysis_profile_service import profile_conditions_for_storage
+
+            stored = profile_conditions_for_storage(
+                {
+                    "month_from": "202601",
+                    "month_to": "202606",
+                    "stock_mode": "real",
+                    "stock_cd_list": ["00002", "00001"],
+                    "io_gu_list": ["000200", "000100"],
+                    "product_class_list": ["0031:01"],
+                    "manufacturer_test_codes": ["V001"],
+                }
+            )
+            if (
+                stored.get("stock_cd_list") != ["00001", "00002"]
+                or stored.get("io_gu_list") != ["000100", "000200"]
+                or "manufacturer_test_codes" in stored
+                or "month_from" in stored
+            ):
+                raise AssertionError(f"profile_storage_scope={stored!r}")
+            import app.sims.views.dashboard_lite as profile_view_mod
+            restored_io = profile_view_mod._dashboard_profile_widget_value("io_gu_list", ["001", "002", "051"])
+            if restored_io != ["0012:001", "0012:002", "0012:051"]:
+                raise AssertionError(f"profile_io_widget_restore={restored_io!r}")
+            class _ProfileCursor:
+                def __init__(self):
+                    self.calls = []
+                    self.rowcount = 1
+                    self._sql = ""
+
+                def execute(self, sql, *params):
+                    self._sql = str(sql)
+                    self.calls.append((self._sql, params))
+                    return self
+
+                def fetchone(self):
+                    if "profile_json" in self._sql:
+                        return ('{"io_gu_list": ["001", "002", "051"]}',)
+                    if "profile_id" in self._sql:
+                        return (1,)
+                    return None
+
+            class _ProfileConn:
+                def __init__(self): self.cursor_obj = _ProfileCursor()
+                def __enter__(self): return self
+                def __exit__(self, *_args): return False
+                def cursor(self): return self.cursor_obj
+                def commit(self): pass
+
+            profile_conn = _ProfileConn()
+            old_profile_connect = profile_service_mod.connect_ssai_db
+            profile_service_mod.connect_ssai_db = lambda: profile_conn
+            try:
+                loaded_for_user_a = profile_service_mod.load_dashboard_profile(company_id=4)
+                loaded_for_user_b = profile_service_mod.load_dashboard_profile(company_id=4)
+                profile_service_mod.save_dashboard_profile(company_id=4, params=stored, actor_user_id=99)
+            finally:
+                profile_service_mod.connect_ssai_db = old_profile_connect
+            if loaded_for_user_a != loaded_for_user_b or loaded_for_user_a.get("io_gu_list") != ["001", "002", "051"]:
+                raise AssertionError(f"company_shared_profile_load={loaded_for_user_a!r}/{loaded_for_user_b!r}")
+            calls_text = "\n".join(sql for sql, _params in profile_conn.cursor_obj.calls)
+            if "WHERE company_id = ?" not in calls_text or "WHERE user_id = ?" in calls_text:
+                raise AssertionError(f"company_scope_sql={calls_text!r}")
+            profile_src = Path("app/services/ssai_analysis_profile_service.py").read_text(encoding="utf-8")
+            migration_src = Path("tools/ssai_add_analysis_profile_schema.py").read_text(encoding="utf-8")
+            expected = ("ANALYSIS_PROFILE_MANAGE", "SSAI_ANALYSIS_PROFILES", "UQ_SSAI_ANALYSIS_PROFILES_COMPANY", "duplicate_company_count")
+            if not all(token in profile_src + migration_src for token in expected):
+                raise AssertionError("profile_schema_or_permission_missing")
+            results.append(_ok("Dashboard Lite saved profile scope", "same-company users restore one company profile; actor user is audit-only and migration targets company uniqueness"))
+        except Exception as e:
+            results.append(_fail("Dashboard Lite saved profile scope", f"{type(e).__name__}: {e}"))
 
         code_pair_errors: list[str] = []
         code_pair_df = pd.DataFrame(
@@ -6701,8 +7049,8 @@ def run_basic_checks() -> list[CheckResult]:
         class_diag = next((d for d in code_pair_diag if d.get("label") == "제품분류"), {})
         if class_diag.get("filter_basis") != "code_pair":
             code_pair_errors.append(f"filter_basis={class_diag!r}")
-        if class_diag.get("excluded_rows") != 1:
-            code_pair_errors.append(f"excluded_rows={class_diag!r}")
+        if class_diag.get("filtered_rows") != 1:
+            code_pair_errors.append(f"filtered_rows={class_diag!r}")
         if not code_pair_df.equals(code_pair_original):
             code_pair_errors.append("code_pair_input_mutated")
 
@@ -6748,6 +7096,21 @@ def run_basic_checks() -> list[CheckResult]:
         if stock_class_diag.get("filter_basis") != "code_pair":
             code_pair_errors.append(f"stock_filter_basis={stock_class_diag!r}")
 
+        inclusion_df = pd.DataFrame(
+            [
+                {"\uc81c\ud488\ucf54\ub4dc": "KEEP", "\uc81c\ud488\uadf8\ub8f9Gcode": "0013", "\uc81c\ud488\uadf8\ub8f9\ucf54\ub4dc": "A", "\uc81c\ud488\uad6c\ubd84Gcode": "0004", "\uc81c\ud488\uad6c\ubd84\ucf54\ub4dc": "X", "\uc81c\ud488\ubd84\ub958Gcode": "0031", "\uc81c\ud488\ubd84\ub958\ucf54\ub4dc": "C"},
+                {"\uc81c\ud488\ucf54\ub4dc": "DROP_GROUP", "\uc81c\ud488\uadf8\ub8f9Gcode": "0013", "\uc81c\ud488\uadf8\ub8f9\ucf54\ub4dc": "Z", "\uc81c\ud488\uad6c\ubd84Gcode": "0004", "\uc81c\ud488\uad6c\ubd84\ucf54\ub4dc": "X", "\uc81c\ud488\ubd84\ub958Gcode": "0031", "\uc81c\ud488\ubd84\ub958\ucf54\ub4dc": "C"},
+                {"\uc81c\ud488\ucf54\ub4dc": "DROP_DI", "\uc81c\ud488\uadf8\ub8f9Gcode": "0013", "\uc81c\ud488\uadf8\ub8f9\ucf54\ub4dc": "B", "\uc81c\ud488\uad6c\ubd84Gcode": "0004", "\uc81c\ud488\uad6c\ubd84\ucf54\ub4dc": "Y", "\uc81c\ud488\ubd84\ub958Gcode": "0031", "\uc81c\ud488\ubd84\ub958\ucf54\ub4dc": "C"},
+                {"\uc81c\ud488\ucf54\ub4dc": "KEEP_GROUP_OR", "\uc81c\ud488\uadf8\ub8f9Gcode": "0013", "\uc81c\ud488\uadf8\ub8f9\ucf54\ub4dc": "B", "\uc81c\ud488\uad6c\ubd84Gcode": "0004", "\uc81c\ud488\uad6c\ubd84\ucf54\ub4dc": "X", "\uc81c\ud488\ubd84\ub958Gcode": "0031", "\uc81c\ud488\ubd84\ub958\ucf54\ub4dc": "C"},
+            ]
+        )
+        inclusion_filtered = dash_mod._filter_sales_source_for_dashboard(
+            inclusion_df,
+            {"product_group_list": ["0013:A", "0013:B"], "product_di_list": ["0004:X"], "product_class_list": ["0031:C"]},
+        )
+        if list(inclusion_filtered["\uc81c\ud488\ucf54\ub4dc"]) != ["KEEP", "KEEP_GROUP_OR"]:
+            code_pair_errors.append(f"inclusion_and_or={list(inclusion_filtered['\uc81c\ud488\ucf54\ub4dc'])!r}")
+
         if code_pair_errors:
             results.append(_fail("Dashboard Lite product code-pair filters", "; ".join(code_pair_errors)))
         else:
@@ -6775,10 +7138,10 @@ def run_basic_checks() -> list[CheckResult]:
             preloaded_seen["manufacturer"] = isinstance(raw_df, pd.DataFrame)
             return {"df": sales_df.copy(), "meta": {"evaluation_month": "202607"}}
 
-        def _fake_stock_service(params=None, sales_raw_df=None):
+        def _fake_stock_service(params=None, sales_raw_df=None, sales_forecast_df=None):
             calls["stock"] += 1
             seen_params.append(dict(params or {}))
-            preloaded_seen["stock"] = isinstance(sales_raw_df, pd.DataFrame)
+            preloaded_seen["stock"] = isinstance(sales_raw_df, pd.DataFrame) and isinstance(sales_forecast_df, pd.DataFrame)
             return {"df": stock_df.copy(), "meta": {}}
 
         try:
@@ -6786,7 +7149,13 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", _fake_manufacturer_service)
             setattr(sales_mod, "get_stock_shortage_result", _fake_stock_service)
             built = dash_mod.build_dashboard_lite_facts(
-                {"month_from": "202601", "month_to": "202607", "evaluation_month": "202607", "stock_cd_list": ["00001"]},
+                {
+                    "month_from": "202601",
+                    "month_to": "202607",
+                    "evaluation_month": "202607",
+                    "stock_cd_list": ["00001"],
+                    "manufacturer_test_codes": ["V001"],
+                },
                 today=date(2026, 7, 20),
             )
         finally:
@@ -6803,6 +7172,10 @@ def run_basic_checks() -> list[CheckResult]:
             service_errors.append(f"missing_month_params={seen_params!r}")
         if any(p == {} for p in seen_params):
             service_errors.append("empty_params_sent")
+        if not any(p.get("dashboard_manufacturer_codes") == ["V001"] for p in seen_params):
+            service_errors.append(f"manufacturer_filter_not_bound={seen_params!r}")
+        if built.get("filters", {}).get("manufacturer_test_codes") != ["V001"]:
+            service_errors.append(f"manufacturer_filter_not_in_facts={built.get('filters')!r}")
         if service_errors:
             results.append(_fail("Dashboard Lite guarded service calls", "; ".join(service_errors)))
         else:
@@ -6827,6 +7200,7 @@ def run_basic_checks() -> list[CheckResult]:
                 self.session_state = {}
                 self._submit_sequence = list(submit_sequence)
                 self.calls: dict[str, int] = {}
+                self.column_specs: list[object] = []
                 self.markdowns: list[str] = []
                 self.captions: list[str] = []
                 self.column_config = _FakeNumberColumnFactory()
@@ -6854,8 +7228,13 @@ def run_basic_checks() -> list[CheckResult]:
             def expander(self, *_args, **_kwargs): return _FakeCtx()
             def spinner(self, *_args, **_kwargs): return _FakeCtx()
             def form(self, *_args, **_kwargs): return _FakeCtx()
-            def columns(self, n, **_kwargs): return [_FakeCtx() for _ in range(int(n))]
+            def columns(self, n, **_kwargs):
+                self.column_specs.append(n)
+                return [_FakeCtx() for _ in range(len(n) if isinstance(n, (list, tuple)) else int(n))]
             def text_input(self, _label, value="", **_kwargs): return value
+            def radio(self, _label, options=None, **_kwargs): return list(options or [""])[0]
+            def number_input(self, _label, value=0, **_kwargs): return value
+            def selectbox(self, _label, options=None, **_kwargs): return list(options or [""])[0]
             def multiselect(self, label, options=None, default=None, **_kwargs):
                 self._count(f"multiselect:{label}")
                 if label == "재고위치":
@@ -6875,6 +7254,7 @@ def run_basic_checks() -> list[CheckResult]:
         old_build = getattr(view_mod, "build_dashboard_lite_facts")
         old_stock_options = getattr(view_mod, "_dashboard_stock_options")
         old_code_options = getattr(view_mod, "_dashboard_code_name_options")
+        old_manufacturer_query = getattr(view_mod, "query_to_df")
         old_dashboard_target = getattr(view_mod, "_DASHBOARD_RENDER_TARGET")
         build_calls: list[dict] = []
         requested_gcodes: list[str] = []
@@ -6919,33 +7299,27 @@ def run_basic_checks() -> list[CheckResult]:
             opened = view_mod.render_dashboard_lite()
             if build_calls:
                 render_errors.append(f"open_called_service={len(build_calls)}")
-            if option_calls != {"stock": 1, "code": 3}:
+            if option_calls != {"stock": 1, "code": 6}:
                 render_errors.append(f"open_called_option_source={option_calls!r}")
+            if not fake_st.column_specs or fake_st.column_specs[0] != 4:
+                render_errors.append(f"date_manufacturer_row_not_four_columns={fake_st.column_specs!r}")
             if (opened.get("meta") or {}).get("status") != "condition_only":
                 render_errors.append(f"open_status={opened!r}")
 
             rerendered = view_mod.render_dashboard_lite()
             if build_calls or (rerendered.get("meta") or {}).get("status") != "condition_only":
                 render_errors.append(f"rerun_triggered_analysis={rerendered!r}|calls={len(build_calls)}")
-            if option_calls != {"stock": 1, "code": 3}:
+            if option_calls != {"stock": 1, "code": 6}:
                 render_errors.append(f"rerun_reloaded_option_source={option_calls!r}")
             fake_st._submit_sequence = [True, False]
             first = view_mod.render_dashboard_lite()
             second = view_mod.render_dashboard_lite()
             if len(build_calls) != 1:
                 render_errors.append(f"submit_rerun_build_calls={len(build_calls)}")
-            if option_calls != {"stock": 1, "code": 3}:
+            if option_calls != {"stock": 1, "code": 6}:
                 render_errors.append(f"submit_reloaded_option_source={option_calls!r}")
             if build_calls and build_calls[0].get("stock_cd_list") != ["00001"]:
                 render_errors.append(f"stock_cd_list_not_passed={build_calls[0]!r}")
-            if build_calls and build_calls[0].get("exclude_product_group_list") != ["0013:G_EX"]:
-                render_errors.append(f"exclude_group_not_passed={build_calls[0]!r}")
-            if build_calls and build_calls[0].get("exclude_product_group_nm_list") != ["제외그룹"]:
-                render_errors.append(f"exclude_group_name_not_passed={build_calls[0]!r}")
-            if build_calls and build_calls[0].get("exclude_product_di_list") != ["0004:D_EX"]:
-                render_errors.append(f"exclude_di_not_passed={build_calls[0]!r}")
-            if build_calls and build_calls[0].get("exclude_product_class_list") != ["0031:C_EX"]:
-                render_errors.append(f"exclude_class_not_passed={build_calls[0]!r}")
             if "0031" not in requested_gcodes or "0001" in requested_gcodes:
                 render_errors.append(f"product_class_gcode_wrong={requested_gcodes!r}")
             if first.get("meta", {}).get("facts_kind") != "SIMS_DASHBOARD_FACTS_V01":
@@ -6955,8 +7329,13 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append(f"dashboard_result_metadata_missing={dashboard_cache!r}")
             if fake_st.session_state["chat_rooms"][0].get("name") != "Dashboard Lite":
                 render_errors.append(f"dashboard_room_title={fake_st.session_state['chat_rooms'][0]!r}")
-            if fake_st.calls.get("rerun") != 1:
-                render_errors.append(f"dashboard_title_rerun={fake_st.calls.get('rerun')}")
+            if fake_st.calls.get("rerun"):
+                render_errors.append(f"dashboard_unexpected_rerun={fake_st.calls.get('rerun')}")
+            if first.get("type") != "dashboard_lite" or not first.get("final"):
+                render_errors.append(f"dashboard_chat_payload_missing={first!r}")
+            if not isinstance(first.get("meta", {}).get("dashboard_cache"), dict):
+                render_errors.append("dashboard_chat_cache_missing")
+            view_mod.render_dashboard_lite_chat_item(first["meta"]["dashboard_cache"])
             if not any(text == "## Dashboard Lite" for text in fake_st.markdowns):
                 render_errors.append("dashboard_result_title_not_rendered")
             if not any("조회기간:" in text and "평가월:" in text and "재고위치:" in text for text in fake_st.captions):
@@ -6965,26 +7344,67 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append(f"dashboard_completed_header_missing={fake_st.captions!r}")
             if second.get("meta", {}).get("facts_kind") != "SIMS_DASHBOARD_FACTS_V01":
                 render_errors.append("rerun_cache_not_rendered")
-            if primary_target.container_calls != 1:
-                render_errors.append(f"dashboard_primary_render_count={primary_target.container_calls}")
-            fake_st.session_state["__dashboard_lite_primary_rendered_this_run"] = False
-            if not view_mod.render_cached_dashboard_lite_primary():
-                render_errors.append("cached_dashboard_primary_not_rendered")
-            if primary_target.container_calls != 2 or len(build_calls) != 1:
-                render_errors.append(f"cached_dashboard_primary_calls={primary_target.container_calls}|build={len(build_calls)}")
+            if primary_target.container_calls:
+                render_errors.append(f"dashboard_panel_duplicate_render={primary_target.container_calls}")
             view_mod.clear_dashboard_lite_session_state(fake_st.session_state)
             after_company_change = view_mod.render_dashboard_lite()
             if len(build_calls) != 1:
                 render_errors.append(f"company_change_triggered_analysis={len(build_calls)}")
-            if option_calls != {"stock": 2, "code": 6}:
+            if option_calls != {"stock": 2, "code": 12}:
                 render_errors.append(f"company_change_did_not_reload_options={option_calls!r}")
             if (after_company_change.get("meta") or {}).get("status") != "condition_only":
                 render_errors.append(f"company_change_open_status={after_company_change!r}")
+
+            manufacturer_queries: list[tuple] = []
+            def _fake_manufacturer_query(_sql, bind=None):
+                bound = tuple(bind or ())
+                manufacturer_queries.append(bound)
+                if bound == ("10047",):
+                    return pd.DataFrame([{"manufacturer_code": "10047", "manufacturer_name": "삼진제약"}])
+                if bound == ("%삼진제약%",):
+                    return pd.DataFrame([{"manufacturer_code": "10047", "manufacturer_name": "삼진제약"}])
+                if bound == ("%동진%",):
+                    return pd.DataFrame([
+                        {"manufacturer_code": "20001", "manufacturer_name": "동진A"},
+                        {"manufacturer_code": "20002", "manufacturer_name": "동진B"},
+                    ])
+                return pd.DataFrame()
+            setattr(view_mod, "query_to_df", _fake_manufacturer_query)
+            fake_st.session_state["__dashboard_lite_manufacturer_text"] = "10047"
+            resolved_code = view_mod._resolve_dashboard_manufacturer("10047")
+            if resolved_code.get("codes") != ["10047"]:
+                render_errors.append(f"manufacturer_code_resolution={resolved_code!r}")
+            if "제약사: 삼진제약 [10047]" not in view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "manufacturer_scope_label": resolved_code.get("label")}):
+                render_errors.append("manufacturer_exact_scope_header_missing")
+            resolved_name = view_mod._resolve_dashboard_manufacturer("삼진제약")
+            if resolved_name.get("codes") != ["10047"]:
+                render_errors.append(f"manufacturer_name_resolution={resolved_name!r}")
+            resolved_multiple = view_mod._resolve_dashboard_manufacturer("동진")
+            if resolved_multiple.get("codes") != ["20001", "20002"] or resolved_multiple.get("match_mode") != "name_like":
+                render_errors.append(f"manufacturer_multi_like_resolution={resolved_multiple!r}")
+            if "제약사: '동진' 포함 2개사" not in view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "manufacturer_scope_label": resolved_multiple.get("label")}):
+                render_errors.append("manufacturer_multi_scope_header_missing")
+            if "__dashboard_lite_manufacturer_candidates" in fake_st.session_state:
+                render_errors.append("manufacturer_candidate_state_retained")
+            reset_all = view_mod._resolve_dashboard_manufacturer("전체")
+            if reset_all.get("codes") or any(fake_st.session_state.get(k) for k in ("__dashboard_lite_manufacturer_test_codes", "__dashboard_lite_manufacturer_resolved_code", "__dashboard_lite_manufacturer_resolved_name")):
+                render_errors.append(f"manufacturer_all_did_not_clear={fake_st.session_state!r}")
+            if "제약사: 전체" not in view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607"}):
+                render_errors.append("manufacturer_all_scope_header_missing")
+            missing = view_mod._resolve_dashboard_manufacturer("없는제약사")
+            if missing.get("status") != "missing" or fake_st.session_state.get("__dashboard_lite_manufacturer_test_codes"):
+                render_errors.append(f"manufacturer_missing_reused_previous={missing!r}")
+            too_short = view_mod._resolve_dashboard_manufacturer("가")
+            if too_short.get("status") != "too_short" or too_short.get("codes"):
+                render_errors.append(f"manufacturer_short_search_not_blocked={too_short!r}")
+            if not manufacturer_queries or any(not isinstance(query, tuple) or not query for query in manufacturer_queries):
+                render_errors.append(f"manufacturer_query_binding_missing={manufacturer_queries!r}")
         finally:
             setattr(view_mod, "st", old_st)
             setattr(view_mod, "build_dashboard_lite_facts", old_build)
             setattr(view_mod, "_dashboard_stock_options", old_stock_options)
             setattr(view_mod, "_dashboard_code_name_options", old_code_options)
+            setattr(view_mod, "query_to_df", old_manufacturer_query)
             view_mod.set_dashboard_lite_render_target(old_dashboard_target)
 
         if render_errors:
@@ -7032,9 +7452,14 @@ def run_basic_checks() -> list[CheckResult]:
         chart_source_changed_history = chart_source.copy(deep=True)
         chart_source_changed_history.loc[0, "2026-03 매출"] = 30_000
         try:
-            chart_sales = dash_mod._build_sales_facts({"df": chart_source, "meta": {"evaluation_month": "202607"}})
-            target_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_target, "meta": {"evaluation_month": "202607"}})
-            history_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_history, "meta": {"evaluation_month": "202607"}})
+            chart_history = [
+                {"period": "2025-10", "period_sort": "202510", "value": 7},
+                {"period": "2025-11", "period_sort": "202511", "value": 8},
+                {"period": "2025-12", "period_sort": "202512", "value": 9},
+            ]
+            chart_sales = dash_mod._build_sales_facts({"df": chart_source, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history)
+            target_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_target, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history)
+            history_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_history, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history)
             chart_rows = chart_sales.get("chart_rows") or []
             period_order = []
             for row in chart_rows:
@@ -7051,7 +7476,7 @@ def run_basic_checks() -> list[CheckResult]:
             if actual_periods != set(expected_period_order):
                 preforecast_errors.append(f"actual_periods={sorted(actual_periods)!r}")
             past_rows = [row for row in chart_rows if row.get("kind") == "완료월 사전예상"]
-            if [row.get("period") for row in past_rows] != ["2026-03", "2026-04", "2026-05", "2026-06"]:
+            if [row.get("period") for row in past_rows] != ["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06"]:
                 preforecast_errors.append(f"past_forecast_periods={[row.get('period') for row in past_rows]!r}")
             july_kinds = {row.get("kind") for row in chart_rows if row.get("period") == "2026-07"}
             if july_kinds != {"당월 현재(부분월)", "당월 예상"}:
@@ -7088,7 +7513,7 @@ def run_basic_checks() -> list[CheckResult]:
         if preforecast_errors:
             results.append(_fail("Dashboard Lite completed-month preforecast bars", "; ".join(preforecast_errors)))
         else:
-            results.append(_ok("Dashboard Lite completed-month preforecast bars", "2026-03 is the first forecastable month under the production two-active-completed-month condition; target-month actual never feeds its own forecast"))
+            results.append(_ok("Dashboard Lite completed-month preforecast bars", "internal support months produce preforecasts for every visible completed month; target-month actual never feeds its own forecast"))
 
         reset_errors: list[str] = []
         session_fixture = {
@@ -7265,6 +7690,7 @@ def run_basic_checks() -> list[CheckResult]:
         entry_src = Path("app/ui/sims_entry.py").read_text(encoding="utf-8")
         view_src = Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8")
         main_dashboard_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+        chat_middleware_dashboard_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
         sales_trend_src = Path("app/services/analytics_sales_trend_service.py").read_text(encoding="utf-8")
         if (
             '"Dashboard Lite v0.1": dashboard_lite.render_dashboard_lite' not in panel_src
@@ -7274,35 +7700,311 @@ def run_basic_checks() -> list[CheckResult]:
             or 'st.altair_chart' not in view_src
             or 'width="stretch"' not in view_src
             or 'st.form("dashboard_lite_scope_form"' not in view_src
-            or 'st.multiselect(\n            "재고위치"' not in view_src
-            or '"exclude_product_group_list"' not in view_src
+            or '"재고위치"' not in view_src
+            or '"product_group_list"' not in view_src
             or '_dashboard_code_name_options("0031")' not in view_src
             or '_dashboard_code_name_options("0001")' in view_src
-            or "format_func=lambda code: _option_label" not in view_src
+            or 'def _resolve_dashboard_manufacturer' not in view_src
+            or 'LEFT JOIN dbo.Rddbc030 AS V' not in view_src
+            or 'ORDER BY manufacturer_name, manufacturer_code' not in view_src
+            or 'cols = st.columns(4)' not in view_src
+            or 'st.text_input("제약사"' not in view_src
+            or 'st.selectbox("제약사 후보"' in view_src
+            or 'build_dashboard_lite_chat_snapshot' not in view_src
+            or 'manufacturer_codes = _clean_list(option_cache.get("manufacturer_codes"))' in view_src
             or 'form_submit_button("대시보드 조회"' not in view_src
             or 'build_dashboard_lite_facts(params)' not in view_src
-            or '"final": False' not in view_src
-            or 'render_cached_dashboard_lite_primary' not in view_src
-            or 'render_cached_dashboard_lite_primary()' not in main_dashboard_src
-            or 'set_dashboard_lite_render_target(dashboard_primary_area)' not in main_dashboard_src
+            or '"type": "dashboard_lite"' not in view_src
+            or 'render_dashboard_lite_chat_item' not in chat_middleware_dashboard_src
+            or 'elif str(payload.get("type") or "").strip().lower() != "dashboard_lite"' not in chat_middleware_dashboard_src
+            or '[dashboard.chat_push]' not in panel_src
+            or 'dashboard_item["role"] = "assistant"' not in main_dashboard_src
+            or 'dashboard_primary_area = st.empty()' in main_dashboard_src
             or 'Dashboard facts / 비교 금지 규칙' in view_src
             or 'with st.expander("추가 확인사항"' in view_src
         ):
             results.append(_fail("Dashboard Lite panel/view registration", "registry or non-chat view contract missing"))
         else:
-            results.append(_ok("Dashboard Lite panel/view registration", "analysis/KPI dashboard group/action registered with Altair width='stretch' and final=False"))
+            results.append(_ok("Dashboard Lite panel/view registration", "analysis/KPI dashboard group/action is rendered as a single final chat-history Dashboard message"))
 
         dashboard_order_errors: list[str] = []
-        dashboard_anchor = main_dashboard_src.find("dashboard_primary_area = st.empty()")
         history_anchor = main_dashboard_src.find("for idx, m in enumerate(merged_msgs):")
-        if dashboard_anchor < 0 or history_anchor < 0 or dashboard_anchor >= history_anchor:
-            dashboard_order_errors.append(f"dashboard_anchor={dashboard_anchor}|history_anchor={history_anchor}")
-        if '"__dashboard_lite_result"' not in view_src or '"final": False' not in view_src:
-            dashboard_order_errors.append("dashboard_not_dedicated_non_chat_state")
+        if history_anchor < 0:
+            dashboard_order_errors.append(f"history_anchor={history_anchor}")
+        if '"__dashboard_lite_result"' not in view_src or '"type": "dashboard_lite"' not in view_src:
+            dashboard_order_errors.append("dashboard_not_chat_history_state")
+        if 'dashboard_primary_area = st.empty()' in main_dashboard_src:
+            dashboard_order_errors.append("legacy_dashboard_primary_area_present")
         if dashboard_order_errors:
             results.append(_fail("Dashboard Lite primary document order", "; ".join(dashboard_order_errors)))
         else:
-            results.append(_ok("Dashboard Lite primary document order", "cached Dashboard result renders before normal history and remains outside chat table/message storage"))
+            results.append(_ok("Dashboard Lite primary document order", "each completed Dashboard is rendered once in chronological chat history without a panel or top-level duplicate"))
+
+        dashboard_roundtrip_errors: list[str] = []
+        try:
+            main_tree_for_dashboard = ast.parse(main_dashboard_src)
+            partition_node = next(
+                node for node in main_tree_for_dashboard.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_partition_message_payload"
+            )
+            minimal_snapshot_node = next(
+                node for node in main_tree_for_dashboard.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_minimal_dashboard_partition_snapshot"
+            )
+            partition_ns = {
+                "_CHAT_PARTITION_MESSAGE_ALLOW_KEYS": {"id", "type", "title", "action", "params", "meta"},
+                "_CHAT_PARTITION_META_ALLOW_KEYS": {"action", "analysis_type", "facts_kind", "dashboard_cache", "dashboard_event_id", "room_id"},
+                "_CHAT_PARTITION_TEXT_LIMIT": 20_000,
+                "_clip_partition_text": lambda value, _limit: value,
+                "_compact_partition_value": lambda value: value,
+                "_json_sanitize": lambda value: value,
+                "build_dashboard_lite_chat_snapshot": view_mod.build_dashboard_lite_chat_snapshot,
+                "Any": Any,
+                "log": type("Log", (), {"warning": staticmethod(lambda *_args, **_kwargs: None)})(),
+            }
+            exec(compile(ast.Module(body=[minimal_snapshot_node, partition_node], type_ignores=[]), "dashboard_partition", "exec"), partition_ns)
+            dashboard_payload = {
+                "id": "dashboard-event-1",
+                "type": "dashboard_lite",
+                "title": "Dashboard Lite",
+                "action": "Dashboard Lite v0.1",
+                "params": {"month_from": "202601"},
+                "meta": {
+                    "analysis_type": "dashboard_lite",
+                    "facts_kind": "SIMS_DASHBOARD_FACTS_V01",
+                    "room_id": "room-dashboard",
+                    "dashboard_event_id": "dashboard-event-1",
+                    "dashboard_cache": {"facts": {"sales": {"chart_rows": [{"period": "2026-01", "value": 1}]}}},
+                },
+            }
+            restored_dashboard = partition_ns["_partition_message_payload"](dashboard_payload)
+            restored_meta = restored_dashboard.get("meta") or {}
+            if restored_dashboard.get("type") != "dashboard_lite" or restored_dashboard.get("id") != "dashboard-event-1":
+                dashboard_roundtrip_errors.append(f"payload_identity={restored_dashboard!r}")
+            if restored_meta.get("room_id") != "room-dashboard" or not isinstance((restored_meta.get("dashboard_cache") or {}).get("facts"), dict):
+                dashboard_roundtrip_errors.append(f"payload_cache_lost={restored_meta!r}")
+            full_cache = {
+                "params": {
+                    "month_from": "202601", "month_to": "202606", "evaluation_month": "202607",
+                    "manufacturer_scope_label": "전체", "manufacturer_test_codes": [f"V{i:05d}" for i in range(1000)],
+                    "manufacturer_names": [f"제약사{i}" for i in range(1000)],
+                },
+                "facts": {
+                    "sales": {"metrics": {"amount": 1}, "chart_rows": [{"period": "2026-01", "value": 1}]},
+                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
+                    "today_actions": [{"priority": 1}],
+                },
+            }
+            compact_cache = view_mod.build_dashboard_lite_chat_snapshot(full_cache)
+            compact_json = json.dumps(compact_cache, ensure_ascii=False).encode("utf-8")
+            if "readiness_rows" in json.dumps(compact_cache, ensure_ascii=False) or len(compact_json) > 65_536:
+                dashboard_roundtrip_errors.append(f"dashboard_snapshot_not_compact bytes={len(compact_json)}")
+            if not (compact_cache.get("facts", {}).get("sales", {}).get("chart_rows") and compact_cache.get("facts", {}).get("inventory", {}).get("risk_targets")):
+                dashboard_roundtrip_errors.append("dashboard_snapshot_render_inputs_lost")
+            full_payload = {
+                "id": "dashboard-event-full",
+                "type": "dashboard_lite",
+                "title": "Dashboard Lite",
+                "action": "Dashboard Lite v0.1",
+                "meta": {
+                    "analysis_type": "dashboard_lite",
+                    "room_id": "room-dashboard",
+                    "dashboard_event_id": "dashboard-event-full",
+                    "dashboard_cache": full_cache,
+                },
+            }
+            partitioned_full = partition_ns["_partition_message_payload"](full_payload)
+            partitioned_json = json.dumps(partitioned_full, ensure_ascii=False).encode("utf-8")
+            if b"readiness_rows" in partitioned_json or len(partitioned_json) > 65_536:
+                dashboard_roundtrip_errors.append(f"partitioned_dashboard_payload_not_compact bytes={len(partitioned_json)}")
+
+            old_snapshot_builder = view_mod.build_dashboard_lite_chat_snapshot
+            try:
+                def _raise_snapshot(_cache):
+                    raise RuntimeError("test snapshot failure")
+                view_mod.build_dashboard_lite_chat_snapshot = _raise_snapshot
+                fallback_partitioned = partition_ns["_partition_message_payload"](full_payload)
+            finally:
+                view_mod.build_dashboard_lite_chat_snapshot = old_snapshot_builder
+            fallback_json = json.dumps(fallback_partitioned, ensure_ascii=False).encode("utf-8")
+            fallback_cache = (fallback_partitioned.get("meta") or {}).get("dashboard_cache") or {}
+            if (
+                b"readiness_rows" in fallback_json
+                or len(fallback_json) > 65_536
+                or fallback_cache.get("snapshot_status") != "minimal_fallback"
+                or "facts" in fallback_cache
+            ):
+                dashboard_roundtrip_errors.append(f"partitioned_dashboard_fallback_not_closed bytes={len(fallback_json)} cache={fallback_cache!r}")
+            if 'if str(m.get("type") or "").strip().lower() == "dashboard_lite"' not in main_dashboard_src:
+                dashboard_roundtrip_errors.append("renderer_dispatch_missing")
+        except Exception as exc:
+            dashboard_roundtrip_errors.append(f"roundtrip_runtime={type(exc).__name__}:{exc}")
+        if dashboard_roundtrip_errors:
+            results.append(_fail("Dashboard Lite chat payload round-trip", "; ".join(dashboard_roundtrip_errors)))
+        else:
+            results.append(_ok("Dashboard Lite chat payload round-trip", "Dashboard id, room id, meta cache, and nested chart facts survive partition storage and renderer dispatch"))
+
+        stock_timing_errors: list[str] = []
+        try:
+            timing = dash_mod._stock_timing_meta(
+                {
+                    "stock_sql_ms": 192,
+                    "stock_query_batches": 2,
+                    "stock_aggregate_ms": 3,
+                    "stock_shortage_build_ms": 176,
+                    "stock_shortage_total_ms": 374,
+                },
+                fallback_total_ms=999,
+            )
+            expected_timing = {
+                "stock_sql_ms": 192,
+                "stock_batch_count": 2,
+                "stock_aggregate_ms": 3,
+                "stock_shortage_build_ms": 176,
+                "stock_shortage_total_ms": 374,
+                "configured_batch_size": 0,
+                "effective_chunk_size": 0,
+                "fixed_parameter_count": 0,
+                "stock_cd_parameter_count": 0,
+                "io_gu_parameter_count": 0,
+                "total_parameter_count": 0,
+            }
+            if timing != expected_timing:
+                stock_timing_errors.append(f"timing_forward={timing!r}")
+            timing_frame = pd.DataFrame({"제품코드": ["P1"]})
+            timing_frame.attrs.update(
+                {
+                    "stock_sql_ms": 192,
+                    "stock_query_batches": 2,
+                    "stock_aggregate_ms": 3,
+                    "stock_shortage_build_ms": 176,
+                    "stock_shortage_total_ms": 374,
+                }
+            )
+            timing_filtered = dash_mod._filter_sales_source_for_dashboard(timing_frame, {})
+            timing_enriched = dash_mod._attach_dashboard_product_code_pairs(
+                {"df": timing_filtered},
+                pd.DataFrame({"제품코드": ["P1"]}),
+            )["df"]
+            if dash_mod._stock_timing_meta(timing_enriched.attrs, fallback_total_ms=999) != expected_timing:
+                stock_timing_errors.append(f"timing_attrs_lost={timing_enriched.attrs!r}")
+        except Exception as exc:
+            stock_timing_errors.append(f"timing_runtime={type(exc).__name__}:{exc}")
+        if stock_timing_errors:
+            results.append(_fail("Dashboard Lite stock timing forwarding", "; ".join(stock_timing_errors)))
+        else:
+            results.append(_ok("Dashboard Lite stock timing forwarding", "SQL, batch, aggregate, build, and total timings remain separate in Dashboard metadata"))
+
+        dashboard_delivery_errors: list[str] = []
+        try:
+            import app.ui.chat_middleware as dashboard_chat_mod
+            import app.ui.sims_panel as dashboard_panel_mod
+
+            class _FakeChatStreamlit:
+                def __init__(self):
+                    self.session_state = {
+                        "current_room": "room-a",
+                        "__chat_current_room_id": "room-a",
+                        "chat_rooms": [{"id": "room-a"}, {"id": "room-b"}],
+                    }
+
+            original_chat_st = dashboard_chat_mod.st
+            fake_chat_st = _FakeChatStreamlit()
+            dashboard_chat_mod.st = fake_chat_st
+            try:
+                pending_dashboard = {
+                    "id": "dashboard-event-a",
+                    "type": "dashboard_lite",
+                    "meta": {"room_id": "room-a", "dashboard_event_id": "dashboard-event-a"},
+                }
+                history_dashboard = dict(pending_dashboard)
+                next_dashboard = {
+                    "id": "dashboard-event-b",
+                    "type": "dashboard_lite",
+                    "meta": {"room_id": "room-a", "dashboard_event_id": "dashboard-event-b"},
+                }
+                if not dashboard_chat_mod._should_render_sims_message_once(pending_dashboard, pending_dashboard["meta"]):
+                    dashboard_delivery_errors.append("dashboard_first_render_blocked")
+                if dashboard_chat_mod._should_render_sims_message_once(history_dashboard, history_dashboard["meta"]):
+                    dashboard_delivery_errors.append("dashboard_pending_history_duplicate_not_blocked")
+                if not dashboard_chat_mod._should_render_sims_message_once(next_dashboard, next_dashboard["meta"]):
+                    dashboard_delivery_errors.append("dashboard_distinct_event_blocked")
+                if dashboard_chat_mod.get_current_chat_room_id() != "room-a":
+                    dashboard_delivery_errors.append("dashboard_current_room_id_missing")
+            finally:
+                dashboard_chat_mod.st = original_chat_st
+
+            session_state: dict[str, Any] = {}
+            dashboard_panel_mod._remember_dashboard_chat_push_signature(
+                session_state,
+                company_id="company-a",
+                room_id="room-a",
+                signature="same-query",
+            )
+            if not dashboard_panel_mod._dashboard_chat_push_is_duplicate(
+                session_state,
+                company_id="company-a",
+                room_id="room-a",
+                signature="same-query",
+            ):
+                dashboard_delivery_errors.append("dashboard_same_room_signature_not_deduped")
+            if dashboard_panel_mod._dashboard_chat_push_is_duplicate(
+                session_state,
+                company_id="company-a",
+                room_id="room-b",
+                signature="same-query",
+            ):
+                dashboard_delivery_errors.append("dashboard_cross_room_signature_blocked")
+        except Exception as exc:
+            dashboard_delivery_errors.append(f"dashboard_delivery_runtime={type(exc).__name__}:{exc}")
+        if dashboard_delivery_errors:
+            results.append(_fail("Dashboard Lite room-scoped chat delivery", "; ".join(dashboard_delivery_errors)))
+        else:
+            results.append(_ok("Dashboard Lite room-scoped chat delivery", "pending/history duplicates share one room+event render key, while the same query remains deliverable in another room"))
+
+        stock_batch_errors: list[str] = []
+        try:
+            import app.services.analytics_sales_trend_service as batch_sales_mod
+
+            default_plan = batch_sales_mod._stock_query_batch_plan(stock_cd_count=20, io_gu_count=80, configured_value=None)
+            normal_plan = batch_sales_mod._stock_query_batch_plan(stock_cd_count=20, io_gu_count=80, configured_value="1600")
+            oversized_plan = batch_sales_mod._stock_query_batch_plan(stock_cd_count=150, io_gu_count=100, configured_value="5000")
+            for invalid in ("text", "0", "-3"):
+                plan = batch_sales_mod._stock_query_batch_plan(stock_cd_count=20, io_gu_count=80, configured_value=invalid)
+                if plan["configured_batch_size"] != 1800:
+                    stock_batch_errors.append(f"batch_invalid_fallback={invalid}:{plan!r}")
+            if default_plan["configured_batch_size"] != 1800:
+                stock_batch_errors.append(f"batch_default={default_plan!r}")
+            if normal_plan["effective_chunk_size"] != 1600:
+                stock_batch_errors.append(f"batch_normal={normal_plan!r}")
+            if oversized_plan["effective_chunk_size"] >= batch_sales_mod.SQL_SERVER_PARAMETER_LIMIT:
+                stock_batch_errors.append(f"batch_oversized_not_capped={oversized_plan!r}")
+            plan_2000_products = batch_sales_mod._stock_query_batch_plan(stock_cd_count=120, io_gu_count=160, configured_value="2000")
+            if plan_2000_products["total_parameter_count"] >= batch_sales_mod.SQL_SERVER_PARAMETER_LIMIT:
+                stock_batch_errors.append(f"batch_parameter_limit={plan_2000_products!r}")
+        except Exception as exc:
+            stock_batch_errors.append(f"batch_plan_runtime={type(exc).__name__}:{exc}")
+        if stock_batch_errors:
+            results.append(_fail("Dashboard Lite stock SQL parameter batches", "; ".join(stock_batch_errors)))
+        else:
+            results.append(_ok("Dashboard Lite stock SQL parameter batches", "configured values fall back safely and every effective product batch remains below the SQL Server bind limit"))
+
+        profile_reentry_errors: list[str] = []
+        try:
+            profile_state = {
+                "__dashboard_lite_profile_loaded_for": "company-a",
+                "__dashboard_lite_manufacturer_text": "manufacturer-test",
+                "__dashboard_lite_result": {"facts": {}},
+            }
+            removed = view_mod.clear_dashboard_lite_session_state(profile_state)
+            if "__dashboard_lite_profile_loaded_for" not in removed or profile_state:
+                profile_reentry_errors.append(f"dashboard_profile_reset={removed!r}|{profile_state!r}")
+        except Exception as exc:
+            profile_reentry_errors.append(f"dashboard_profile_reset_runtime={type(exc).__name__}:{exc}")
+        if profile_reentry_errors:
+            results.append(_fail("Dashboard Lite profile re-entry reset", "; ".join(profile_reentry_errors)))
+        else:
+            results.append(_ok("Dashboard Lite profile re-entry reset", "Dashboard state clearing removes the profile-loaded marker and non-persistent manufacturer state before re-entry"))
 
         sales_source_errors: list[str] = []
         for token in (

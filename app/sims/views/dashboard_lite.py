@@ -9,6 +9,7 @@ import hashlib
 import html
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -21,7 +22,9 @@ from app.services.dashboard_lite_facts import (
     default_dashboard_lite_scope,
     normalize_dashboard_lite_params,
 )
+from app.services.ssai_analysis_profile_service import PROFILE_PERMISSION, load_dashboard_profile, save_dashboard_profile
 from app.services import rddbc010_service as C01
+from app.db.mssql_client import query_to_df
 from app.sims.views.rddbc_io_shared import _load_stock_code_options
 
 
@@ -30,14 +33,35 @@ log = logging.getLogger("ssai.sims.dashboard_lite")
 DASHBOARD_LITE_SESSION_KEYS = (
     "__dashboard_lite_result",
     "__dashboard_lite_run_seq",
+    "__dashboard_lite_profile_loaded_for",
     "__dashboard_lite_styles_loaded",
     "__dashboard_lite_stock_labels",
+    "__dashboard_lite_stock_mode",
+    "__dashboard_lite_vendor_group_list",
+    "__dashboard_lite_vendor_kind_list",
+    "__dashboard_lite_product_group_list",
+    "__dashboard_lite_product_di_list",
+    "__dashboard_lite_product_class_list",
+    "__dashboard_lite_io_gu_list",
+    "__dashboard_lite_major_purchase_vendor_days",
+    "__dashboard_lite_risk_analysis_days",
+    "__dashboard_lite_overstock_inactive_days",
+    "__dashboard_lite_readiness_warning_pct",
+    "__dashboard_lite_risk_quick_view_count",
+    "__dashboard_lite_amount_display_unit",
+    "__dashboard_lite_manufacturer_text",
+    "__dashboard_lite_manufacturer_test_codes",
+    "__dashboard_lite_manufacturer_resolved_code",
+    "__dashboard_lite_manufacturer_resolved_name",
+    "__dashboard_lite_manufacturer_candidates",
+    "__dashboard_lite_manufacturer_candidate_code",
     "__dashboard_lite_exclude_product_group_list",
     "__dashboard_lite_exclude_product_di_list",
     "__dashboard_lite_exclude_product_class_list",
 )
 
 DASHBOARD_LITE_OPTION_CACHE_KEY = "__dashboard_lite_scope_options"
+DASHBOARD_LITE_OPTION_CACHE_VERSION = 3
 _DASHBOARD_RENDER_TARGET: Any | None = None
 
 
@@ -118,8 +142,38 @@ def _fmt_number(value: Any, digits: int = 0) -> str:
     return f"{num:,.{digits}f}"
 
 
-def _metric_card(label: str, value: Any, suffix: str = "", *, help_text: str = "", digits: int = 0) -> None:
-    display_value = _fmt_number(value, digits)
+def _amount_display_spec(unit: str, value: Any) -> tuple[float, str]:
+    """Choose a presentation-only amount scale without changing facts values."""
+    normalized = str(unit or "auto").strip().lower()
+    if normalized == "thousand":
+        return 1_000.0, "천원"
+    if normalized == "million":
+        return 1_000_000.0, "백만원"
+    if normalized == "auto":
+        try:
+            magnitude = abs(float(value))
+        except Exception:
+            magnitude = 0.0
+        if magnitude >= 1_000_000:
+            return 1_000_000.0, "백만원"
+        if magnitude >= 1_000:
+            return 1_000.0, "천원"
+    return 1.0, "원"
+
+
+def _fmt_dashboard_amount(value: Any, unit: str) -> str:
+    if value is None:
+        return _fmt_number(value)
+    try:
+        divisor, label = _amount_display_spec(unit, value)
+        digits = 1 if divisor > 1 else 0
+        return f"{_fmt_number(float(value) / divisor, digits)} {label}"
+    except Exception:
+        return _fmt_number(value)
+
+
+def _metric_card(label: str, value: Any, suffix: str = "", *, help_text: str = "", digits: int = 0, amount_unit: str = "") -> None:
+    display_value = _fmt_dashboard_amount(value, amount_unit) if amount_unit else _fmt_number(value, digits)
     if display_value != "자료부족":
         display_value = f"{display_value}{suffix}"
     safe_label = html.escape(str(label or ""))
@@ -184,6 +238,7 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
     sales_metrics = (facts.get("sales") or {}).get("metrics") or {}
     inventory_metrics = (facts.get("inventory") or {}).get("metrics") or {}
     actions = facts.get("today_actions") or []
+    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
 
     cards = [
         sales_metrics.get("completed_month_avg_sales"),
@@ -200,6 +255,18 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
             "time_basis": "Dashboard deterministic action rules",
         },
     ]
+    if amount_unit == "auto":
+        amount_values = [
+            metric.get("value")
+            for metric in cards
+            if isinstance(metric, dict) and str(metric.get("unit") or "") in {"원", "금액"}
+        ]
+        try:
+            max_amount = max(abs(float(value)) for value in amount_values if value is not None)
+        except ValueError:
+            max_amount = 0.0
+        divisor, _label = _amount_display_spec("auto", max_amount)
+        amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
 
     for row in range(0, len(cards), 4):
         cols = st.columns(4)
@@ -208,6 +275,7 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
             unit = str(metric.get("unit") or "")
             suffix = "%" if unit == "%" else ("건" if unit == "건" else ("개" if unit == "개" else ""))
             digits = 1 if unit == "%" else 0
+            is_amount = unit in {"원", "금액"}
             with col:
                 _metric_card(
                     str(metric.get("label") or "-"),
@@ -215,6 +283,7 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
                     suffix,
                     help_text=str(metric.get("time_basis") or ""),
                     digits=digits,
+                    amount_unit=amount_unit if is_amount else "",
                 )
 
 
@@ -390,6 +459,60 @@ def _dashboard_context_identity() -> dict[str, str]:
         return {"user_id": "", "company_id": "", "db_sig": ""}
 
 
+def _apply_saved_dashboard_profile_once() -> None:
+    identity = _dashboard_context_identity()
+    profile_key = str(identity.get("company_id") or "")
+    if not identity.get("company_id"):
+        return
+    if st.session_state.get("__dashboard_lite_profile_loaded_for") == profile_key:
+        return
+    # Manufacturer is deliberately a non-persistent performance test filter.
+    # Reset it before applying the shared profile for a fresh Dashboard entry.
+    _clear_dashboard_manufacturer_state()
+    profile = load_dashboard_profile(company_id=int(identity["company_id"]))
+    if isinstance(profile, dict):
+        widget_values = {
+            "stock_mode": "__dashboard_lite_stock_mode",
+            "stock_cd_list": "__dashboard_lite_stock_labels",
+            "vendor_group_list": "__dashboard_lite_vendor_group_list",
+            "vendor_kind_list": "__dashboard_lite_vendor_kind_list",
+            "product_group_list": "__dashboard_lite_product_group_list",
+            "product_di_list": "__dashboard_lite_product_di_list",
+            "product_class_list": "__dashboard_lite_product_class_list",
+            "io_gu_list": "__dashboard_lite_io_gu_list",
+            "major_purchase_vendor_days": "__dashboard_lite_major_purchase_vendor_days",
+            "risk_analysis_days": "__dashboard_lite_risk_analysis_days",
+            "overstock_inactive_days": "__dashboard_lite_overstock_inactive_days",
+            "readiness_warning_pct": "__dashboard_lite_readiness_warning_pct",
+            "risk_quick_view_count": "__dashboard_lite_risk_quick_view_count",
+            "amount_display_unit": "__dashboard_lite_amount_display_unit",
+        }
+        for source_key, widget_key in widget_values.items():
+            if source_key in profile:
+                st.session_state[widget_key] = _dashboard_profile_widget_value(source_key, profile[source_key])
+        io_values = _clean_list(profile.get("io_gu_list"))
+        log.info(
+            "[dashboard.profile_restore] company_id=%s profile_found=True condition_keys=%s io_gu_count=%s io_gu_sample=%s",
+            identity["company_id"], ",".join(sorted(profile.keys())), len(io_values), ",".join(io_values[:3]),
+        )
+    else:
+        log.info(
+            "[dashboard.profile_restore] company_id=%s profile_found=False",
+            identity["company_id"],
+        )
+    st.session_state["__dashboard_lite_profile_loaded_for"] = profile_key
+
+
+def _dashboard_profile_widget_value(source_key: str, value: Any) -> Any:
+    """Adapt stored condition values to the concrete Streamlit widget values."""
+    if source_key != "io_gu_list":
+        return value
+    return [
+        item if ":" in str(item) else f"0012:{str(item).strip()}"
+        for item in _clean_list(value)
+    ]
+
+
 def _dashboard_cache_key(params: dict[str, Any], *, run_seq: int) -> str:
     identity = _dashboard_context_identity()
     payload = {
@@ -402,6 +525,19 @@ def _dashboard_cache_key(params: dict[str, Any], *, run_seq: int) -> str:
         "source_mode": params.get("source_mode"),
         "stock_mode": params.get("stock_mode"),
         "stock_cd_list": _normalized_key_list(params.get("stock_cd_list")),
+        "vendor_group_list": _normalized_key_list(params.get("vendor_group_list")),
+        "vendor_kind_list": _normalized_key_list(params.get("vendor_kind_list")),
+        "product_group_list": _normalized_key_list(params.get("product_group_list")),
+        "product_di_list": _normalized_key_list(params.get("product_di_list")),
+        "product_class_list": _normalized_key_list(params.get("product_class_list")),
+    "io_gu_list": _normalized_key_list(params.get("io_gu_list")),
+        "manufacturer_test_codes": _normalized_key_list(params.get("manufacturer_test_codes")),
+        "major_purchase_vendor_days": params.get("major_purchase_vendor_days"),
+        "risk_analysis_days": params.get("risk_analysis_days"),
+        "overstock_inactive_days": params.get("overstock_inactive_days"),
+        "readiness_warning_pct": params.get("readiness_warning_pct"),
+        "risk_quick_view_count": params.get("risk_quick_view_count"),
+        "amount_display_unit": params.get("amount_display_unit"),
         "exclude_product_group_list": _normalized_key_list(params.get("exclude_product_group_list")),
         "exclude_product_di_list": _normalized_key_list(params.get("exclude_product_di_list")),
         "exclude_product_class_list": _normalized_key_list(params.get("exclude_product_class_list")),
@@ -448,13 +584,124 @@ def _dashboard_code_name_options(gcode: str) -> tuple[list[str], dict[str, str]]
     return codes, code_to_name
 
 
+def _clear_dashboard_manufacturer_state(*, keep_text: bool = False) -> None:
+    """Clear only the non-persistent manufacturer test scope."""
+    for key in (
+        "__dashboard_lite_manufacturer_test_codes",
+        "__dashboard_lite_manufacturer_resolved_code",
+        "__dashboard_lite_manufacturer_resolved_name",
+        "__dashboard_lite_manufacturer_scope",
+        "__dashboard_lite_manufacturer_candidates",
+        "__dashboard_lite_manufacturer_candidate_code",
+    ):
+        st.session_state.pop(key, None)
+    if not keep_text:
+        st.session_state.pop("__dashboard_lite_manufacturer_text", None)
+
+
+def _resolve_dashboard_manufacturer(text: Any) -> dict[str, Any]:
+    """Resolve an explicit Dashboard-only manufacturer scope at query time."""
+    raw = " ".join(str(text or "").split())
+
+    def _scope(status: str, rows: list[dict[str, str]], *, match_mode: str, search_term: str = "") -> dict[str, Any]:
+        codes = [str(row.get("code") or "") for row in rows if str(row.get("code") or "")]
+        names = [str(row.get("name") or "") for row in rows]
+        if match_mode == "all":
+            label = "전체"
+        elif len(rows) == 1:
+            label = f"{names[0]} [{codes[0]}]" if names[0] else codes[0]
+        else:
+            label = f"'{search_term}' 포함 {len(rows)}개사"
+        state = {
+            "status": status,
+            "codes": codes,
+            "names": names,
+            "match_mode": match_mode,
+            "match_count": len(rows),
+            "search_term": search_term,
+            "label": label,
+        }
+        st.session_state["__dashboard_lite_manufacturer_test_codes"] = codes
+        st.session_state["__dashboard_lite_manufacturer_resolved_code"] = codes[0] if len(codes) == 1 else ""
+        st.session_state["__dashboard_lite_manufacturer_resolved_name"] = names[0] if len(names) == 1 else ""
+        st.session_state["__dashboard_lite_manufacturer_scope"] = state
+        log.info(
+            "[dashboard.manufacturer_scope] match_mode=%s match_count=%s filter_enabled=%s",
+            match_mode,
+            len(codes),
+            bool(codes),
+        )
+        return state
+
+    if not raw or raw == "전체":
+        _clear_dashboard_manufacturer_state(keep_text=True)
+        return _scope("all", [], match_mode="all")
+
+    code_match = re.match(r"^\s*([0-9A-Za-z]+)(?:\s*-.*)?$", raw)
+    exact_code = code_match.group(1).strip() if code_match else ""
+
+    def _normalize_rows(df: Any) -> list[dict[str, str]]:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        work = df.copy()
+        for col in ("manufacturer_code", "manufacturer_name"):
+            if col not in work.columns:
+                work[col] = ""
+            work[col] = work[col].fillna("").astype(str).str.strip()
+        work = work[work["manufacturer_code"] != ""].drop_duplicates("manufacturer_code", keep="first")
+        return [
+            {"code": str(row["manufacturer_code"]), "name": str(row["manufacturer_name"])}
+            for _, row in work.iterrows()
+        ]
+
+    base_sql = """
+        SELECT DISTINCT
+            LTRIM(RTRIM(P.Rd04_Ven_Cd)) AS manufacturer_code,
+            COALESCE(NULLIF(LTRIM(RTRIM(V.Rd03_Ven_Nm)), ''), LTRIM(RTRIM(P.Rd04_Ven_Cd))) AS manufacturer_name
+        FROM dbo.Rddbc040 AS P WITH (NOLOCK)
+        LEFT JOIN dbo.Rddbc030 AS V WITH (NOLOCK)
+            ON P.Rd04_Ven_Cd = V.Rd03_Ven_Cd
+        WHERE LTRIM(RTRIM(P.Rd04_Ven_Cd)) <> ''
+    """
+    try:
+        if exact_code:
+            exact_rows = _normalize_rows(query_to_df(
+                base_sql + " AND LTRIM(RTRIM(P.Rd04_Ven_Cd)) = ? ORDER BY manufacturer_name, manufacturer_code",
+                (exact_code,),
+            ))
+            if len(exact_rows) == 1:
+                _clear_dashboard_manufacturer_state(keep_text=True)
+                return _scope("resolved", exact_rows, match_mode="exact", search_term=raw)
+            _clear_dashboard_manufacturer_state(keep_text=True)
+            return _scope("missing", [], match_mode="exact", search_term=raw)
+        if len(raw) < 2:
+            _clear_dashboard_manufacturer_state(keep_text=True)
+            return _scope("too_short", [], match_mode="name_like", search_term=raw)
+        like_value = f"%{raw}%"
+        rows = _normalize_rows(query_to_df(
+            base_sql + " AND LTRIM(RTRIM(V.Rd03_Ven_Nm)) LIKE ? ORDER BY manufacturer_name, manufacturer_code",
+            (like_value,),
+        ))
+    except Exception as exc:
+        _clear_dashboard_manufacturer_state(keep_text=True)
+        log.warning("[dashboard.manufacturer_resolve] resolved=False error_type=%s", type(exc).__name__)
+        return _scope("error", [], match_mode="error", search_term=raw)
+
+    _clear_dashboard_manufacturer_state(keep_text=True)
+    return _scope("resolved" if rows else "missing", rows, match_mode="name_like", search_term=raw)
+
+
 def _load_dashboard_scope_options() -> dict[str, Any]:
     """Load dashboard condition choices once per session cache."""
     stock_codes, stock_code_to_name = _dashboard_stock_options()
     product_group_codes, product_group_code_to_name = _dashboard_code_name_options("0013")
     product_di_codes, product_di_code_to_name = _dashboard_code_name_options("0004")
     product_class_codes, product_class_code_to_name = _dashboard_code_name_options("0031")
+    vendor_group_codes, vendor_group_code_to_name = _dashboard_code_name_options("0019")
+    vendor_kind_codes, vendor_kind_code_to_name = _dashboard_code_name_options("0009")
+    io_gu_codes, io_gu_code_to_name = _dashboard_code_name_options("0012")
     return {
+        "cache_version": DASHBOARD_LITE_OPTION_CACHE_VERSION,
         "stock_codes": stock_codes,
         "stock_code_to_name": stock_code_to_name,
         "product_group_codes": product_group_codes,
@@ -463,13 +710,22 @@ def _load_dashboard_scope_options() -> dict[str, Any]:
         "product_di_code_to_name": product_di_code_to_name,
         "product_class_codes": product_class_codes,
         "product_class_code_to_name": product_class_code_to_name,
+        "vendor_group_codes": vendor_group_codes,
+        "vendor_group_code_to_name": vendor_group_code_to_name,
+        "vendor_kind_codes": vendor_kind_codes,
+        "vendor_kind_code_to_name": vendor_kind_code_to_name,
+        "io_gu_codes": io_gu_codes,
+        "io_gu_code_to_name": io_gu_code_to_name,
     }
 
 
-def _render_dashboard_scope_form() -> tuple[bool, dict[str, Any] | None]:
+def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
     defaults = default_dashboard_lite_scope()
     option_cache = st.session_state.get(DASHBOARD_LITE_OPTION_CACHE_KEY)
-    if not isinstance(option_cache, dict):
+    if (
+        not isinstance(option_cache, dict)
+        or option_cache.get("cache_version") != DASHBOARD_LITE_OPTION_CACHE_VERSION
+    ):
         option_cache = _load_dashboard_scope_options()
         st.session_state[DASHBOARD_LITE_OPTION_CACHE_KEY] = option_cache
     stock_codes = _clean_list(option_cache.get("stock_codes"))
@@ -480,82 +736,121 @@ def _render_dashboard_scope_form() -> tuple[bool, dict[str, Any] | None]:
     product_di_code_to_name = dict(option_cache.get("product_di_code_to_name") or {})
     product_class_codes = _clean_list(option_cache.get("product_class_codes"))
     product_class_code_to_name = dict(option_cache.get("product_class_code_to_name") or {})
+    vendor_group_codes = _clean_list(option_cache.get("vendor_group_codes"))
+    vendor_group_code_to_name = dict(option_cache.get("vendor_group_code_to_name") or {})
+    vendor_kind_codes = _clean_list(option_cache.get("vendor_kind_codes"))
+    vendor_kind_code_to_name = dict(option_cache.get("vendor_kind_code_to_name") or {})
+    io_gu_codes = _clean_list(option_cache.get("io_gu_codes"))
+    io_gu_code_to_name = dict(option_cache.get("io_gu_code_to_name") or {})
+    selected_stock_count = len(_clean_list(st.session_state.get("__dashboard_lite_stock_labels")))
+    stock_scope = "\uc804\uccb4" if selected_stock_count == 0 else f"{selected_stock_count}\uac1c"
+    stock_basis = "\uc2e4\uc7ac\uace0" if st.session_state.get("__dashboard_lite_stock_mode", "real") == "real" else "\uc7a5\ubd80\uc7ac\uace0"
+    risk_days = st.session_state.get("__dashboard_lite_risk_analysis_days", 90)
+    readiness = st.session_state.get("__dashboard_lite_readiness_warning_pct", 98)
+    io_count = len(_clean_list(st.session_state.get("__dashboard_lite_io_gu_list")))
+    io_summary = "\uc785\ucd9c\uace0 \uc804\uccb4" if io_count == 0 else f"\uc785\ucd9c\uace0 {io_count}\uac1c"
+    condition_summary = f"{stock_basis} \u00b7 \uc7ac\uace0\uc704\uce58 {stock_scope} \u00b7 {io_summary} \u00b7 \uc704\ud5d8 {risk_days}\uc77c \u00b7 \uc900\ube44\uc728 {readiness}%"
     with st.form("dashboard_lite_scope_form", clear_on_submit=False):
-        cols = st.columns(3)
+        cols = st.columns(4)
         with cols[0]:
             month_from = st.text_input("시작월", value=defaults["month_from"], max_chars=6, help="YYYYMM")
         with cols[1]:
             month_to = st.text_input("종료월", value=defaults["month_to"], max_chars=6, help="YYYYMM")
         with cols[2]:
             evaluation_month = st.text_input("평가월", value=defaults["evaluation_month"], max_chars=6, help="YYYYMM")
-        selected_stock_labels = st.multiselect(
-            "재고위치",
-            options=stock_codes,
-            default=[],
-            key="__dashboard_lite_stock_labels",
-            format_func=lambda code: _option_label(code, stock_code_to_name.get(str(code), "")),
-            help="선택한 재고위치의 매출·수요·재고만 분석합니다.",
-        )
-        st.caption("선택한 재고위치의 매출·수요·재고만 분석합니다.")
-        filter_cols = st.columns(3)
-        with filter_cols[0]:
-            exclude_product_groups = st.multiselect(
-                "제외할 제품그룹명",
-                options=product_group_codes,
-                default=[],
-                key="__dashboard_lite_exclude_product_group_list",
-                format_func=lambda code: _option_label(code, product_group_code_to_name.get(str(code), "")),
-                help="선택한 항목은 Dashboard 분석 대상에서 제외합니다.",
-            )
-        with filter_cols[1]:
-            exclude_product_di = st.multiselect(
-                "제외할 제품구분명",
-                options=product_di_codes,
-                default=[],
-                key="__dashboard_lite_exclude_product_di_list",
-                format_func=lambda code: _option_label(code, product_di_code_to_name.get(str(code), "")),
-                help="선택한 항목은 Dashboard 분석 대상에서 제외합니다.",
-            )
-        with filter_cols[2]:
-            exclude_product_class = st.multiselect(
-                "제외할 제품분류명",
-                options=product_class_codes,
-                default=[],
-                key="__dashboard_lite_exclude_product_class_list",
-                format_func=lambda code: _option_label(code, product_class_code_to_name.get(str(code), "")),
-                help="선택한 항목은 Dashboard 분석 대상에서 제외합니다.",
-            )
-        st.caption("선택한 항목은 Dashboard 분석 대상에서 제외합니다.")
+        with cols[3]:
+            manufacturer_text = st.text_input("제약사", key="__dashboard_lite_manufacturer_text")
+        with st.expander(f"\ucd94\uac00 \ubd84\uc11d\uc870\uac74 \u00b7 {condition_summary}", expanded=False):
+            row1 = st.columns([1, 3, 1])
+            with row1[0]:
+                stock_mode = st.radio("재고기준", options=["real", "book"], horizontal=True, format_func=lambda value: "실재고" if value == "real" else "장부재고", key="__dashboard_lite_stock_mode")
+            with row1[1]:
+                selected_stock_labels = st.multiselect("재고위치", options=stock_codes, default=[], key="__dashboard_lite_stock_labels", format_func=lambda code: _option_label(code, stock_code_to_name.get(str(code), "")), help="미선택 시 전체 재고위치를 사용합니다.")
+            with row1[2]:
+                amount_display_unit = st.selectbox("금액 표시단위", options=["auto", "won", "thousand", "million"], format_func=lambda value: {"auto": "자동", "won": "원", "thousand": "천원", "million": "백만원"}[value], key="__dashboard_lite_amount_display_unit")
+
+            row2 = st.columns(2)
+            with row2[0]:
+                vendor_groups = st.multiselect("거래처그룹", options=vendor_group_codes, key="__dashboard_lite_vendor_group_list", format_func=lambda code: _option_label(code, vendor_group_code_to_name.get(str(code), "")))
+            with row2[1]:
+                vendor_kinds = st.multiselect("거래처종류", options=vendor_kind_codes, key="__dashboard_lite_vendor_kind_list", format_func=lambda code: _option_label(code, vendor_kind_code_to_name.get(str(code), "")))
+
+            row3 = st.columns(4)
+            with row3[0]:
+                product_groups = st.multiselect("제품그룹", options=product_group_codes, default=[], key="__dashboard_lite_product_group_list", format_func=lambda code: _option_label(code, product_group_code_to_name.get(str(code), "")), help="미선택 시 전체 제품그룹을 포함합니다.")
+            with row3[1]:
+                product_di = st.multiselect("제품구분", options=product_di_codes, default=[], key="__dashboard_lite_product_di_list", format_func=lambda code: _option_label(code, product_di_code_to_name.get(str(code), "")), help="미선택 시 전체 제품구분을 포함합니다.")
+            with row3[2]:
+                product_class = st.multiselect("제품분류", options=product_class_codes, default=[], key="__dashboard_lite_product_class_list", format_func=lambda code: _option_label(code, product_class_code_to_name.get(str(code), "")), help="미선택 시 전체 제품분류를 포함합니다.")
+            with row3[3]:
+                io_gu = st.multiselect("입출고구분", options=io_gu_codes, key="__dashboard_lite_io_gu_list", format_func=lambda code: _option_label(code, io_gu_code_to_name.get(str(code), "")), help="미선택 시 0012 업무코드 전체를 사용합니다.")
+
+            row4 = st.columns(5)
+            with row4[0]:
+                major_purchase_vendor_days = st.number_input("대표 매입처 기준기간(일)", min_value=1, value=90, step=1, key="__dashboard_lite_major_purchase_vendor_days")
+            with row4[1]:
+                risk_analysis_days = st.number_input("위험 분석기간(일)", min_value=1, value=90, step=1, key="__dashboard_lite_risk_analysis_days")
+            with row4[2]:
+                overstock_inactive_days = st.number_input("과잉·저활성 기준(일)", min_value=1, value=90, step=1, key="__dashboard_lite_overstock_inactive_days")
+            with row4[3]:
+                readiness_warning_pct = st.number_input("준비율 경고기준(%)", min_value=0.1, max_value=100.0, value=98.0, step=0.1, key="__dashboard_lite_readiness_warning_pct")
+            with row4[4]:
+                risk_quick_view_count = st.number_input("위험품목 바로보기", min_value=1, value=30, step=1, key="__dashboard_lite_risk_quick_view_count")
         submitted = st.form_submit_button("대시보드 조회", type="primary", width="stretch")
+        try:
+            from app.ui.ssai_login import has_permission
+            save_requested = st.form_submit_button("저장", width="stretch") if has_permission(PROFILE_PERMISSION) else False
+        except Exception:
+            save_requested = False
+    manufacturer_result = {"status": "all", "codes": []}
+    if submitted:
+        manufacturer_result = _resolve_dashboard_manufacturer(manufacturer_text)
+        if manufacturer_result.get("status") == "too_short":
+            st.warning("제약사명 검색은 두 글자 이상 입력해 주세요.")
+            return False, False, None
+        if manufacturer_result.get("status") in {"missing", "error"}:
+            st.warning("해당 제약사를 찾을 수 없습니다.")
+            return False, False, None
+    elif not str(manufacturer_text or "").strip() or str(manufacturer_text or "").strip() == "전체":
+        _clear_dashboard_manufacturer_state(keep_text=True)
     stock_cd_list = _clean_list(selected_stock_labels)
     stock_name_list = [stock_code_to_name.get(code, "") for code in stock_cd_list]
-    exclude_product_group_codes = _clean_list(exclude_product_groups)
-    exclude_product_di_codes = _clean_list(exclude_product_di)
-    exclude_product_class_codes = _clean_list(exclude_product_class)
+    product_group_codes_selected = _clean_list(product_groups)
+    product_di_codes_selected = _clean_list(product_di)
+    product_class_codes_selected = _clean_list(product_class)
     raw_params = {
         "month_from": month_from,
         "month_to": month_to,
         "evaluation_month": evaluation_month,
         "source_mode": defaults["source_mode"],
-        "stock_mode": defaults["stock_mode"],
+        "stock_mode": stock_mode,
         "stock_cd_list": stock_cd_list,
         "stock_name_list": stock_name_list,
-        "exclude_product_group_list": exclude_product_group_codes,
-        "exclude_product_group_nm_list": [product_group_code_to_name.get(code, "") for code in exclude_product_group_codes],
-        "exclude_product_di_list": exclude_product_di_codes,
-        "exclude_product_di_nm_list": [product_di_code_to_name.get(code, "") for code in exclude_product_di_codes],
-        "exclude_product_class_list": exclude_product_class_codes,
-        "exclude_product_class_nm_list": [product_class_code_to_name.get(code, "") for code in exclude_product_class_codes],
+        "vendor_group_list": _clean_list(vendor_groups),
+        "vendor_kind_list": _clean_list(vendor_kinds),
+        "product_group_list": product_group_codes_selected,
+        "product_di_list": product_di_codes_selected,
+        "product_class_list": product_class_codes_selected,
+        "io_gu_list": [str(value).split(":", 1)[-1] for value in _clean_list(io_gu)],
+        "manufacturer_test_codes": _clean_list(st.session_state.get("__dashboard_lite_manufacturer_test_codes")),
+        "manufacturer_scope_label": str((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("label") or "전체"),
+        "manufacturer_search_term": str((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("search_term") or ""),
+        "manufacturer_match_mode": str((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("match_mode") or "all"),
+        "manufacturer_match_count": int((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("match_count") or 0),
+        "manufacturer_names": _clean_list((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("names")),
+        "major_purchase_vendor_days": major_purchase_vendor_days,
+        "risk_analysis_days": risk_analysis_days,
+        "overstock_inactive_days": overstock_inactive_days,
+        "readiness_warning_pct": readiness_warning_pct,
+        "risk_quick_view_count": risk_quick_view_count,
+        "amount_display_unit": amount_display_unit,
     }
     try:
         params = normalize_dashboard_lite_params(raw_params, today=date.today())
     except Exception as exc:
         st.warning(str(exc))
-        return False, None
-    if submitted and not params.get("stock_cd_list"):
-        st.warning("분석에 사용할 재고위치를 1개 이상 선택해 주세요.")
-        return False, params
-    return submitted, params
+        return False, False, None
+    return submitted, save_requested, params
 
 
 def _dashboard_scope_header(params: dict[str, Any]) -> str:
@@ -564,6 +859,8 @@ def _dashboard_scope_header(params: dict[str, Any]) -> str:
         f"조회기간: {params.get('month_from') or '-'}~{params.get('month_to') or '-'}",
         f"평가월: {params.get('evaluation_month') or '-'}",
     ]
+    manufacturer_label = str(params.get("manufacturer_scope_label") or "전체").strip() or "전체"
+    parts.append(f"제약사: {manufacturer_label}")
     stock_codes = _clean_list(params.get("stock_cd_list"))
     stock_names = _clean_list(params.get("stock_name_list"))
     stock_labels = [
@@ -574,14 +871,69 @@ def _dashboard_scope_header(params: dict[str, Any]) -> str:
         parts.append(f"재고위치: {', '.join(stock_labels)}")
 
     for label, name_key, code_key in (
-        ("제외 제품그룹", "exclude_product_group_nm_list", "exclude_product_group_list"),
-        ("제외 제품구분", "exclude_product_di_nm_list", "exclude_product_di_list"),
-        ("제외 제품분류", "exclude_product_class_nm_list", "exclude_product_class_list"),
+        ("제품그룹", "product_group_nm_list", "product_group_list"),
+        ("제품구분", "product_di_nm_list", "product_di_list"),
+        ("제품분류", "product_class_nm_list", "product_class_list"),
     ):
         selected = _clean_list(params.get(name_key)) or _clean_list(params.get(code_key))
         if selected:
             parts.append(f"{label}: {', '.join(selected)}")
     return " · ".join(parts)
+
+
+def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
+    """Keep the immutable chat rendering contract without persisting full readiness rows."""
+    source = dict(cache or {}) if isinstance(cache, dict) else {}
+    params = dict(source.get("params") or {})
+    facts = dict(source.get("facts") or {})
+    sales = dict(facts.get("sales") or {})
+    inventory = dict(facts.get("inventory") or {})
+    try:
+        requested_limit = int(params.get("risk_quick_view_count") or 10)
+    except (TypeError, ValueError):
+        requested_limit = 10
+    row_limit = max(10, min(requested_limit, 30))
+    compact_params = {
+        key: params.get(key)
+        for key in (
+            "month_from", "month_to", "evaluation_month", "stock_mode", "stock_cd_list", "stock_name_list",
+            "product_group_list", "product_di_list", "product_class_list", "amount_display_unit",
+            "manufacturer_scope_label", "manufacturer_search_term", "manufacturer_match_mode", "manufacturer_match_count",
+        )
+        if key in params
+    }
+    compact_params["manufacturer_scope_label"] = str(compact_params.get("manufacturer_scope_label") or "전체")
+    compact_params["manufacturer_codes"] = _clean_list(params.get("manufacturer_test_codes"))[:row_limit]
+    compact_params["manufacturer_names"] = _clean_list(params.get("manufacturer_names"))[:row_limit]
+    compact_facts = {
+        "kind": facts.get("kind"),
+        "period": facts.get("period"),
+        "sales": {
+            "metrics": dict(sales.get("metrics") or {}),
+            "chart_rows": list(sales.get("chart_rows") or []),
+            "decline_targets": list(sales.get("decline_targets") or [])[:row_limit],
+        },
+        "inventory": {
+            "metrics": dict(inventory.get("metrics") or {}),
+            "risk_targets": list(inventory.get("risk_targets") or [])[:row_limit],
+            "data_quality": list(inventory.get("data_quality") or [])[:row_limit],
+        },
+        "turnover_days": dict(facts.get("turnover_days") or {}),
+        "today_actions": list(facts.get("today_actions") or [])[:row_limit],
+        "data_quality": list(facts.get("data_quality") or [])[:row_limit],
+        "performance": dict(facts.get("performance") or {}),
+    }
+    return {
+        "snapshot_version": 1,
+        "cache_key": source.get("cache_key"),
+        "query_fingerprint": source.get("query_fingerprint"),
+        "company_id": source.get("company_id"),
+        "params": compact_params,
+        "facts": compact_facts,
+        "elapsed_ms": source.get("elapsed_ms"),
+        "elapsed_seconds": source.get("elapsed_seconds"),
+        "created_at": source.get("created_at"),
+    }
 
 
 def _mark_dashboard_room_title() -> bool:
@@ -670,12 +1022,19 @@ def render_cached_dashboard_lite_primary() -> bool:
     return True
 
 
+def render_dashboard_lite_chat_item(cache: dict[str, Any]) -> None:
+    """Render one immutable Dashboard result inside its chat history message."""
+    _render_dashboard_result_header(cache)
+    _render_dashboard_facts(dict(cache.get("facts") or {}))
+
+
 def render_dashboard_lite() -> dict[str, Any]:
     """Render Dashboard Lite without changing current-table routing."""
     st.subheader("Dashboard Lite v0.1")
     st.caption("상태 → 근거 → 무엇을 해야 하나 순서로 읽는 운영 브리핑입니다.")
 
-    submitted, params = _render_dashboard_scope_form()
+    _apply_saved_dashboard_profile_once()
+    submitted, save_requested, params = _render_dashboard_scope_form()
     run_seq = int(st.session_state.get("__dashboard_lite_run_seq") or 0)
     cache = st.session_state.get("__dashboard_lite_result")
 
@@ -685,13 +1044,28 @@ def render_dashboard_lite() -> dict[str, Any]:
         st.session_state.pop("__dashboard_lite_result", None)
         cache = None
 
+    if save_requested and params:
+        identity = _dashboard_context_identity()
+        try:
+            from app.ui.ssai_login import has_permission
+            allowed = bool(has_permission(PROFILE_PERMISSION))
+        except Exception:
+            allowed = False
+        if not allowed or not identity.get("user_id") or not identity.get("company_id"):
+            st.error("저장 권한이 없습니다.")
+        else:
+            try:
+                action = save_dashboard_profile(company_id=int(identity["company_id"]), params=params, actor_user_id=int(identity["user_id"]))
+                st.success("조회조건을 저장했습니다." if action else "조회조건을 저장했습니다.")
+            except Exception as exc:
+                log.warning("[dashboard.profile_save] user_id=%s company_id=%s saved=False error_type=%s", identity.get("user_id"), identity.get("company_id"), type(exc).__name__)
+                st.error("조회조건을 저장할 수 없습니다. 관리자에게 migration 적용 여부를 확인해 주세요.")
+
     cache_key = _dashboard_cache_key(params, run_seq=run_seq) if params else ""
     # Editing the form must not hide the last completed Dashboard. It is replaced
     # only by another submit, company change, logout, or the explicit option reset.
     if cache:
         facts = cache.get("facts") or {}
-        if not st.session_state.get("__dashboard_lite_primary_rendered_this_run"):
-            _render_dashboard_result_in_primary_area(cache)
         return {
             "final": False,
             "type": "text",
@@ -762,19 +1136,18 @@ def render_dashboard_lite() -> dict[str, Any]:
         "elapsed_seconds": round(elapsed_ms / 1000.0, 3),
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
-    room_title_changed = _mark_dashboard_room_title()
-    if room_title_changed:
-        rerun = getattr(st, "rerun", None)
-        if callable(rerun):
-            rerun()
-    _render_dashboard_result_in_primary_area(st.session_state["__dashboard_lite_result"])
-    st.session_state["__dashboard_lite_primary_rendered_this_run"] = True
-
+    _mark_dashboard_room_title()
     return {
-        "final": False,
-        "type": "text",
-        "title": "Dashboard Lite v0.1",
+        "final": True,
+        "type": "dashboard_lite",
+        "title": "Dashboard Lite",
         "action": "Dashboard Lite v0.1",
-        "data": "Dashboard Lite v0.1 화면을 표시했습니다.",
-        "meta": {"analysis_type": "dashboard_lite", "facts_kind": facts.get("kind")},
+        "params": dict(params),
+        "data": None,
+        "meta": {
+            "analysis_type": "dashboard_lite",
+            "facts_kind": facts.get("kind"),
+            "dashboard_cache": build_dashboard_lite_chat_snapshot(st.session_state["__dashboard_lite_result"]),
+            "query_summary": _dashboard_scope_header(params),
+        },
     }

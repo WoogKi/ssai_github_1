@@ -1178,6 +1178,7 @@ from app.sims.views.rddbc_io_shared import (
 from app.ui.chat_middleware import (
     render_sims_context_controls,
     push_sims_result_to_chat,
+    get_current_chat_room_id,
     _build_sims_detail_analysis_prompt,
     _expected_analysis_row_count,
     _get_full_download_df_for_sims_item,
@@ -1482,6 +1483,42 @@ def _panel_stale_payload_log_state(
         "current_company_id": current.get("company_id") or "",
         "db_mismatch": bool(payload_db_name and current_db_name and payload_db_name != current_db_name),
     }
+
+
+def _dashboard_chat_push_scope(company_id: str, room_id: str) -> str:
+    """Build the session-local dedupe scope for one company and chat room."""
+    return f"{str(company_id or '').strip()}::{str(room_id or '').strip()}"
+
+
+def _dashboard_chat_push_is_duplicate(
+    session_state: Mapping[str, Any],
+    *,
+    company_id: str,
+    room_id: str,
+    signature: str,
+) -> bool:
+    if not signature or not company_id or not room_id:
+        return False
+    seen = session_state.get("__dashboard_lite_chat_push_sigs") or {}
+    if not isinstance(seen, Mapping):
+        return False
+    return str(seen.get(_dashboard_chat_push_scope(company_id, room_id)) or "") == signature
+
+
+def _remember_dashboard_chat_push_signature(
+    session_state: Dict[str, Any],
+    *,
+    company_id: str,
+    room_id: str,
+    signature: str,
+) -> None:
+    if not signature or not company_id or not room_id:
+        return
+    seen = session_state.get("__dashboard_lite_chat_push_sigs")
+    if not isinstance(seen, dict):
+        seen = {}
+        session_state["__dashboard_lite_chat_push_sigs"] = seen
+    seen[_dashboard_chat_push_scope(company_id, room_id)] = signature
 
 
 def _panel_action_key(category: str, action: str) -> str:
@@ -3266,6 +3303,71 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
 
     if final:
         _panel_stamp_payload_company(payload)
+
+    # Dashboard is a chat-history result, not a panel result. Keep the panel
+    # focused on its conditions while preserving every completed Dashboard as
+    # an independently renderable message in the active room.
+    if final and str(payload.get("type") or "").strip().lower() == "dashboard_lite":
+        ss = st.session_state
+        meta = dict(payload.get("meta") or {})
+        cache = meta.get("dashboard_cache") if isinstance(meta.get("dashboard_cache"), dict) else {}
+        signature = str(cache.get("cache_key") or cache.get("query_fingerprint") or "")
+        company_id = str(_panel_current_company_stamp().get("company_id") or "").strip()
+        room_id = get_current_chat_room_id()
+        if not room_id:
+            log.warning("[dashboard.chat_push] room_resolved=False pushed=False")
+            ss["__sims_inner_submit"] = False
+            return
+        duplicate_skip = _dashboard_chat_push_is_duplicate(
+            ss,
+            company_id=company_id,
+            room_id=room_id,
+            signature=signature,
+        )
+        # A completed Dashboard payload is produced only by its explicit form
+        # submit path.  Do not require the panel's generic submit flag here:
+        # Dashboard owns its form and the signature prevents rerun duplicates.
+        if not duplicate_skip:
+            try:
+                ss.pop("__sims_silent_push", None)
+                meta["room_id"] = room_id
+                meta["dashboard_event_id"] = str(payload.get("id") or "")
+                payload["meta"] = meta
+                push_sims_result_to_chat(payload, action)
+                _remember_dashboard_chat_push_signature(
+                    ss,
+                    company_id=company_id,
+                    room_id=room_id,
+                    signature=signature,
+                )
+                event_id = str(payload.get("id") or ss.get("__sims_last_msg_id") or "")
+                if event_id:
+                    payload["meta"]["dashboard_event_id"] = event_id
+                log.info(
+                    "[dashboard.chat_push] room_id=%s event_id=%s render_target=chat duplicate_skip=False",
+                    room_id,
+                    event_id,
+                )
+                # History was already rendered when the Dashboard form submitted.
+                # One protected rerun renders this new chat item at the normal
+                # newest-message position without panel duplication.
+                rerun_marker = str(ss.get("__dashboard_lite_chat_rerun_event_id") or "")
+                if event_id and rerun_marker != event_id:
+                    ss["__dashboard_lite_chat_rerun_event_id"] = event_id
+                    rerun = getattr(st, "rerun", None)
+                    if callable(rerun):
+                        rerun()
+            except Exception as exc:
+                log.warning("[dashboard.chat_push] render_target=chat pushed=False error_type=%s", type(exc).__name__)
+        else:
+            log.info(
+                "[dashboard.chat_push] room_id=%s event_id= render_target=chat duplicate_skip=%s",
+                room_id,
+                duplicate_skip,
+            )
+        ss["__sims_inner_submit"] = False
+        ss["__sims_last_render_run_seq"] = ss.get("__sims_run_seq")
+        return
 
     # 메인 컨테이너에서 이번 프레임이 '최종 조회'였는지 판단할 수 있도록 플래그 반영
     st.session_state["__sims_was_final"] = final
