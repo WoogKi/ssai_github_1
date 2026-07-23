@@ -18,3 +18,4 @@ python-dotenv>=1.0     # .env 로드
 # pillow>=10            # 이미지 썸네일 등 필요할 때
 # tenacity>=8           # 재시도 로직이 필요할 때
 # rich>=13              # 예쁜 콘솔 로그 출력
+XlsxWriter==3.2.9

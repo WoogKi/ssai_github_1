@@ -16,3 +16,4 @@ wheel==0.45.1
 streamlit==1.59.0
 openai==2.44.0
 cryptography==49.0.0
+XlsxWriter==3.2.9
