@@ -64,6 +64,23 @@ DASHBOARD_LITE_OPTION_CACHE_KEY = "__dashboard_lite_scope_options"
 DASHBOARD_LITE_OPTION_CACHE_VERSION = 3
 _DASHBOARD_RENDER_TARGET: Any | None = None
 
+_DASHBOARD_PROFILE_WIDGETS = {
+    "stock_mode": "__dashboard_lite_stock_mode",
+    "stock_cd_list": "__dashboard_lite_stock_labels",
+    "vendor_group_list": "__dashboard_lite_vendor_group_list",
+    "vendor_kind_list": "__dashboard_lite_vendor_kind_list",
+    "product_group_list": "__dashboard_lite_product_group_list",
+    "product_di_list": "__dashboard_lite_product_di_list",
+    "product_class_list": "__dashboard_lite_product_class_list",
+    "io_gu_list": "__dashboard_lite_io_gu_list",
+    "major_purchase_vendor_days": "__dashboard_lite_major_purchase_vendor_days",
+    "risk_analysis_days": "__dashboard_lite_risk_analysis_days",
+    "overstock_inactive_days": "__dashboard_lite_overstock_inactive_days",
+    "readiness_warning_pct": "__dashboard_lite_readiness_warning_pct",
+    "risk_quick_view_count": "__dashboard_lite_risk_quick_view_count",
+    "amount_display_unit": "__dashboard_lite_amount_display_unit",
+}
+
 
 def set_dashboard_lite_render_target(target: Any | None) -> None:
     """Set the main-page container used for the one Dashboard result render."""
@@ -103,6 +120,16 @@ def _clean_list(values: Any) -> list[str]:
         if text and text != "전체" and text not in out:
             out.append(text)
     return out
+
+
+def _prepare_dashboard_multiselect_state(widget_key: str, options: Any) -> list[str]:
+    """Keep restored selections, dropping only values absent from current options."""
+    valid_options = set(_clean_list(options))
+    current_values = _clean_list(st.session_state.get(widget_key))
+    st.session_state[widget_key] = [
+        value for value in current_values if value in valid_options
+    ]
+    return list(st.session_state[widget_key])
 
 
 def _normalized_key_list(values: Any) -> list[str]:
@@ -464,41 +491,56 @@ def _apply_saved_dashboard_profile_once() -> None:
     profile_key = str(identity.get("company_id") or "")
     if not identity.get("company_id"):
         return
-    if st.session_state.get("__dashboard_lite_profile_loaded_for") == profile_key:
+
+    loaded_for = str(st.session_state.get("__dashboard_lite_profile_loaded_for") or "")
+    missing_widget_keys = [
+        widget_key
+        for widget_key in _DASHBOARD_PROFILE_WIDGETS.values()
+        if widget_key not in st.session_state
+    ]
+    if loaded_for == profile_key and not missing_widget_keys:
+        log.info(
+            "[dashboard.profile_restore] company_id=%s reason=preserve_live_state "
+            "profile_found=unknown restored_widget_count=0 skipped_existing_widget_count=%s",
+            identity["company_id"],
+            len(_DASHBOARD_PROFILE_WIDGETS),
+        )
         return
+
+    if not loaded_for:
+        restore_reason = "initial_entry"
+    elif loaded_for != profile_key:
+        restore_reason = "company_change"
+    else:
+        restore_reason = "action_reentry"
+
     # Manufacturer is deliberately a non-persistent performance test filter.
     # Reset it before applying the shared profile for a fresh Dashboard entry.
     _clear_dashboard_manufacturer_state()
     profile = load_dashboard_profile(company_id=int(identity["company_id"]))
+    restored_widget_count = 0
+    skipped_existing_widget_count = 0
     if isinstance(profile, dict):
-        widget_values = {
-            "stock_mode": "__dashboard_lite_stock_mode",
-            "stock_cd_list": "__dashboard_lite_stock_labels",
-            "vendor_group_list": "__dashboard_lite_vendor_group_list",
-            "vendor_kind_list": "__dashboard_lite_vendor_kind_list",
-            "product_group_list": "__dashboard_lite_product_group_list",
-            "product_di_list": "__dashboard_lite_product_di_list",
-            "product_class_list": "__dashboard_lite_product_class_list",
-            "io_gu_list": "__dashboard_lite_io_gu_list",
-            "major_purchase_vendor_days": "__dashboard_lite_major_purchase_vendor_days",
-            "risk_analysis_days": "__dashboard_lite_risk_analysis_days",
-            "overstock_inactive_days": "__dashboard_lite_overstock_inactive_days",
-            "readiness_warning_pct": "__dashboard_lite_readiness_warning_pct",
-            "risk_quick_view_count": "__dashboard_lite_risk_quick_view_count",
-            "amount_display_unit": "__dashboard_lite_amount_display_unit",
-        }
-        for source_key, widget_key in widget_values.items():
+        for source_key, widget_key in _DASHBOARD_PROFILE_WIDGETS.items():
+            if widget_key in st.session_state:
+                skipped_existing_widget_count += 1
+                continue
             if source_key in profile:
                 st.session_state[widget_key] = _dashboard_profile_widget_value(source_key, profile[source_key])
+                restored_widget_count += 1
         io_values = _clean_list(profile.get("io_gu_list"))
         log.info(
-            "[dashboard.profile_restore] company_id=%s profile_found=True condition_keys=%s io_gu_count=%s io_gu_sample=%s",
-            identity["company_id"], ",".join(sorted(profile.keys())), len(io_values), ",".join(io_values[:3]),
+            "[dashboard.profile_restore] company_id=%s reason=%s profile_found=True "
+            "condition_keys=%s io_gu_count=%s io_gu_sample=%s restored_widget_count=%s "
+            "skipped_existing_widget_count=%s",
+            identity["company_id"], restore_reason, ",".join(sorted(profile.keys())), len(io_values), ",".join(io_values[:3]),
+            restored_widget_count, skipped_existing_widget_count,
         )
     else:
         log.info(
-            "[dashboard.profile_restore] company_id=%s profile_found=False",
-            identity["company_id"],
+            "[dashboard.profile_restore] company_id=%s reason=%s profile_found=False "
+            "restored_widget_count=0 skipped_existing_widget_count=%s",
+            identity["company_id"], restore_reason, len(_DASHBOARD_PROFILE_WIDGETS) - len(missing_widget_keys),
         )
     st.session_state["__dashboard_lite_profile_loaded_for"] = profile_key
 
@@ -742,6 +784,14 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
     vendor_kind_code_to_name = dict(option_cache.get("vendor_kind_code_to_name") or {})
     io_gu_codes = _clean_list(option_cache.get("io_gu_codes"))
     io_gu_code_to_name = dict(option_cache.get("io_gu_code_to_name") or {})
+    stock_widget_key = "__dashboard_lite_stock_labels"
+    _prepare_dashboard_multiselect_state(stock_widget_key, stock_codes)
+    _prepare_dashboard_multiselect_state("__dashboard_lite_vendor_group_list", vendor_group_codes)
+    _prepare_dashboard_multiselect_state("__dashboard_lite_vendor_kind_list", vendor_kind_codes)
+    _prepare_dashboard_multiselect_state("__dashboard_lite_product_group_list", product_group_codes)
+    _prepare_dashboard_multiselect_state("__dashboard_lite_product_di_list", product_di_codes)
+    _prepare_dashboard_multiselect_state("__dashboard_lite_product_class_list", product_class_codes)
+    _prepare_dashboard_multiselect_state("__dashboard_lite_io_gu_list", io_gu_codes)
     selected_stock_count = len(_clean_list(st.session_state.get("__dashboard_lite_stock_labels")))
     stock_scope = "\uc804\uccb4" if selected_stock_count == 0 else f"{selected_stock_count}\uac1c"
     stock_basis = "\uc2e4\uc7ac\uace0" if st.session_state.get("__dashboard_lite_stock_mode", "real") == "real" else "\uc7a5\ubd80\uc7ac\uace0"
@@ -765,7 +815,7 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
             with row1[0]:
                 stock_mode = st.radio("재고기준", options=["real", "book"], horizontal=True, format_func=lambda value: "실재고" if value == "real" else "장부재고", key="__dashboard_lite_stock_mode")
             with row1[1]:
-                selected_stock_labels = st.multiselect("재고위치", options=stock_codes, default=[], key="__dashboard_lite_stock_labels", format_func=lambda code: _option_label(code, stock_code_to_name.get(str(code), "")), help="미선택 시 전체 재고위치를 사용합니다.")
+                selected_stock_labels = st.multiselect("재고위치", options=stock_codes, key=stock_widget_key, format_func=lambda code: _option_label(code, stock_code_to_name.get(str(code), "")), help="미선택 시 전체 재고위치를 사용합니다.")
             with row1[2]:
                 amount_display_unit = st.selectbox("금액 표시단위", options=["auto", "won", "thousand", "million"], format_func=lambda value: {"auto": "자동", "won": "원", "thousand": "천원", "million": "백만원"}[value], key="__dashboard_lite_amount_display_unit")
 
@@ -777,11 +827,11 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
 
             row3 = st.columns(4)
             with row3[0]:
-                product_groups = st.multiselect("제품그룹", options=product_group_codes, default=[], key="__dashboard_lite_product_group_list", format_func=lambda code: _option_label(code, product_group_code_to_name.get(str(code), "")), help="미선택 시 전체 제품그룹을 포함합니다.")
+                product_groups = st.multiselect("제품그룹", options=product_group_codes, key="__dashboard_lite_product_group_list", format_func=lambda code: _option_label(code, product_group_code_to_name.get(str(code), "")), help="미선택 시 전체 제품그룹을 포함합니다.")
             with row3[1]:
-                product_di = st.multiselect("제품구분", options=product_di_codes, default=[], key="__dashboard_lite_product_di_list", format_func=lambda code: _option_label(code, product_di_code_to_name.get(str(code), "")), help="미선택 시 전체 제품구분을 포함합니다.")
+                product_di = st.multiselect("제품구분", options=product_di_codes, key="__dashboard_lite_product_di_list", format_func=lambda code: _option_label(code, product_di_code_to_name.get(str(code), "")), help="미선택 시 전체 제품구분을 포함합니다.")
             with row3[2]:
-                product_class = st.multiselect("제품분류", options=product_class_codes, default=[], key="__dashboard_lite_product_class_list", format_func=lambda code: _option_label(code, product_class_code_to_name.get(str(code), "")), help="미선택 시 전체 제품분류를 포함합니다.")
+                product_class = st.multiselect("제품분류", options=product_class_codes, key="__dashboard_lite_product_class_list", format_func=lambda code: _option_label(code, product_class_code_to_name.get(str(code), "")), help="미선택 시 전체 제품분류를 포함합니다.")
             with row3[3]:
                 io_gu = st.multiselect("입출고구분", options=io_gu_codes, key="__dashboard_lite_io_gu_list", format_func=lambda code: _option_label(code, io_gu_code_to_name.get(str(code), "")), help="미선택 시 0012 업무코드 전체를 사용합니다.")
 

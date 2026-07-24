@@ -739,11 +739,16 @@ def _set_ui_event_started(event_name: str, *, event_id: str | None = None) -> st
         return str(event_id or "")
 
 
-_CHAT_ROOM_PENDING_SELECTOR_KEY = "__chat_room_pending_selector_id"
-_CHAT_ROOM_PERSISTED_SELECTOR_KEY = "__chat_room_persisted_selector_id"
+_CHAT_ROOM_PENDING_SELECTOR_KEY = "__chat_room_pending_selector_v2_id"
+_CHAT_ROOM_PERSISTED_SELECTOR_KEY = "__chat_room_persisted_selector_v2_id"
 _CHAT_ROOM_SELECTOR_REQUEST_KEY = "__chat_room_selector_request"
 _CHAT_ROOM_SELECTOR_CONSUMED_TOKEN_KEY = "__chat_room_selector_consumed_token"
 _CHAT_ROOM_SELECTOR_VALID_IDS_KEY = "__chat_room_selector_valid_ids"
+_CHAT_ROOM_SELECTOR_APP_RERUN_TOKEN_KEY = "__chat_room_selector_app_rerun_token"
+_CHAT_ROOM_LEGACY_SELECTOR_PREFIXES = (
+    "__chat_room_pending_selector_id",
+    "__chat_room_persisted_selector_id",
+)
 
 
 def _is_chat_room_id(value: Any) -> bool:
@@ -824,6 +829,14 @@ def _sync_chat_room_selector_state(
     return changed
 
 
+def _request_chat_room_selector_app_rerun() -> None:
+    """Leave a selector callback through the app-level room-switch consumer."""
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        st.rerun()
+
+
 def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: str, room_kind: str) -> None:
     requested = str(session.get(widget_key) or "").strip()
     canonical = str(session.get("current_room") or "").strip()
@@ -864,6 +877,8 @@ def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: st
             room_kind=room_kind,
             rerun_reason=reason,
             mismatch_detected=False,
+            widget_value_type=type(session.get(widget_key)).__name__,
+            value_in_room_ids=True,
         )
         return
     token = _new_ui_event_id("room_select")
@@ -876,6 +891,7 @@ def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: st
         "requested_at": str(time.time()),
         "page": str(page),
     }
+    session[_CHAT_ROOM_SELECTOR_APP_RERUN_TOKEN_KEY] = token
     _log_chat_room_selector(
         "callback",
         widget_key=widget_key,
@@ -887,7 +903,10 @@ def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: st
         room_kind=room_kind,
         request_token=token,
         mismatch_detected=bool(requested and requested != canonical),
+        widget_value_type=type(session.get(widget_key)).__name__,
+        value_in_room_ids=True,
     )
+    _request_chat_room_selector_app_rerun()
 
 
 def _consume_chat_room_selector_request(
@@ -897,6 +916,7 @@ def _consume_chat_room_selector_request(
 ) -> dict[str, str] | None:
     """Consume a selector callback once; passive radio values never select rooms."""
     raw_request = session.pop(_CHAT_ROOM_SELECTOR_REQUEST_KEY, None)
+    session.pop(_CHAT_ROOM_SELECTOR_APP_RERUN_TOKEN_KEY, None)
     if not isinstance(raw_request, dict):
         return None
     request = {key: str(value or "") for key, value in raw_request.items()}
@@ -920,10 +940,23 @@ def _clear_chat_room_selector_request_state(session: dict[str, Any]) -> None:
         _CHAT_ROOM_PENDING_SELECTOR_KEY,
         _CHAT_ROOM_PERSISTED_SELECTOR_KEY,
         _CHAT_ROOM_SELECTOR_VALID_IDS_KEY,
+        _CHAT_ROOM_SELECTOR_APP_RERUN_TOKEN_KEY,
     ):
         session.pop(key, None)
     for key in list(session):
         if str(key).startswith(f"{_CHAT_ROOM_PENDING_SELECTOR_KEY}_page_") or str(key).startswith(f"{_CHAT_ROOM_PERSISTED_SELECTOR_KEY}_page_"):
+            session.pop(key, None)
+    _clear_legacy_chat_room_selector_state(session)
+
+
+def _clear_legacy_chat_room_selector_state(session: dict[str, Any]) -> None:
+    """Discard v1 selector widget values without changing the selected room."""
+    for key in list(session):
+        key_text = str(key)
+        if any(
+            key_text == prefix or key_text.startswith(f"{prefix}_page_")
+            for prefix in _CHAT_ROOM_LEGACY_SELECTOR_PREFIXES
+        ):
             session.pop(key, None)
 
 
@@ -8282,6 +8315,7 @@ def _reset_chat_session_when_user_changed() -> None:
         "__sims_auto_user_input",
     ]:
         st.session_state.pop(key, None)
+    _clear_chat_room_selector_request_state(st.session_state)
 
     st.session_state["__chat_owner_user_id"] = owner_id
 
@@ -9148,6 +9182,7 @@ _reset_chat_session_when_user_changed()
 if "chat_rooms" not in st.session_state:
     _chat_rooms_load_started = time.perf_counter()
     st.session_state.chat_rooms = load_chat_rooms()
+    _clear_legacy_chat_room_selector_state(st.session_state)
     _script_perf_add("chat_rooms", time.perf_counter() - _chat_rooms_load_started)
 
     # ✅ 2-채널 히스토리 마이그레이션(기존 rooms.json 호환)
@@ -9450,6 +9485,7 @@ with st.sidebar:
     st.markdown("## 💬 채팅방")
 
     ss = st.session_state
+    _clear_legacy_chat_room_selector_state(ss)
 
     # ── 안전 기본값 ───────────────────────────────────────────
     # 로그인 직후 채팅방이 없으면 임시 자동 대화방 1개만 만든다.
@@ -9618,6 +9654,12 @@ with st.sidebar:
                 ss.get(selector_key)
                 and str(ss.get(selector_key)) != str(ss.current_room or "")
             ),
+            widget_value_type=type(ss.get(selector_key)).__name__ if selector_key in ss else "",
+            value_in_room_ids=bool(
+                ss.get(selector_key)
+                and _is_chat_room_id(ss.get(selector_key))
+                and str(ss.get(selector_key)) in all_room_ids
+            ),
         )
     picked_pending = None
     if pending_ids:
@@ -9743,6 +9785,15 @@ with st.sidebar:
             mismatch_detected=bool(
                 requested_widget_key
                 and str(ss.get(requested_widget_key) or "") != str(ss.current_room or "")
+            ),
+            widget_value_type=(
+                type(ss.get(requested_widget_key)).__name__
+                if requested_widget_key in ss else ""
+            ),
+            value_in_room_ids=bool(
+                requested_widget_key
+                and _is_chat_room_id(ss.get(requested_widget_key))
+                and str(ss.get(requested_widget_key)) in all_room_ids
             ),
         )
 
@@ -10372,6 +10423,20 @@ if isinstance(_room_select_render_ready, dict):
             _selector_widget_key
             and str(st.session_state.get(_selector_widget_key) or "")
             != str(st.session_state.get("current_room") or "")
+        ),
+        widget_value_type=(
+            type(st.session_state.get(_selector_widget_key)).__name__
+            if _selector_widget_key in st.session_state else ""
+        ),
+        value_in_room_ids=bool(
+            _selector_widget_key
+            and _is_chat_room_id(st.session_state.get(_selector_widget_key))
+            and str(st.session_state.get(_selector_widget_key))
+            in {
+                str((room or {}).get("id") or "")
+                for room in (st.session_state.get("chat_rooms") or [])
+                if isinstance(room, dict)
+            }
         ),
     )
 

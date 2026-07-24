@@ -6021,9 +6021,11 @@ def run_basic_checks() -> list[CheckResult]:
                 "_log_chat_room_selector",
                 "_is_chat_room_id",
                 "_sync_chat_room_selector_state",
+                "_request_chat_room_selector_app_rerun",
                 "_queue_chat_room_selector_request",
                 "_consume_chat_room_selector_request",
                 "_clear_chat_room_selector_request_state",
+                "_clear_legacy_chat_room_selector_state",
             }
             selector_nodes = [
                 node
@@ -6045,12 +6047,22 @@ def run_basic_checks() -> list[CheckResult]:
                 def info(self, *args: Any, **kwargs: Any) -> None:
                     return None
 
+            class _SelectorStreamlit:
+                def __init__(self) -> None:
+                    self.rerun_count = 0
+
+                def rerun(self, *_args: Any, **_kwargs: Any) -> None:
+                    self.rerun_count += 1
+
+            selector_st = _SelectorStreamlit()
+
             selector_ns: dict[str, Any] = {
                 "Any": Any,
                 "Iterable": Iterable,
                 "log": _SelectorLog(),
                 "time": __import__("time"),
                 "uuid": __import__("uuid"),
+                "st": selector_st,
                 "_new_ui_event_id": lambda prefix="ui": f"{prefix}-token",
             }
             exec(
@@ -6062,11 +6074,15 @@ def run_basic_checks() -> list[CheckResult]:
                 selector_ns,
             )
             sync_selector = selector_ns["_sync_chat_room_selector_state"]
+            is_room_id = selector_ns["_is_chat_room_id"]
             queue_selector = selector_ns["_queue_chat_room_selector_request"]
             consume_selector = selector_ns["_consume_chat_room_selector_request"]
             clear_selector_state = selector_ns["_clear_chat_room_selector_request_state"]
+            clear_legacy_selector_state = selector_ns["_clear_legacy_chat_room_selector_state"]
             pending_key = selector_ns["_CHAT_ROOM_PENDING_SELECTOR_KEY"]
             persisted_key = selector_ns["_CHAT_ROOM_PERSISTED_SELECTOR_KEY"]
+            legacy_pending_key = "__chat_room_pending_selector_id_page_0"
+            legacy_persisted_key = "__chat_room_persisted_selector_id_page_0"
 
             def _select_once(current: str, target: str, pending: list[str], persisted: list[str], kind: str) -> tuple[dict[str, Any], dict[str, str] | None]:
                 session: dict[str, Any] = {
@@ -6095,9 +6111,13 @@ def run_basic_checks() -> list[CheckResult]:
             large_room = "00000000-0000-0000-0000-000000000004"
             pending_ids_fixture = [pending_room]
             persisted_ids_fixture = [room_a, room_b, dashboard_room, large_room]
+            reruns_before = selector_st.rerun_count
             ab_session, ab_request = _select_once(room_a, room_b, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            ab_rerun_count = selector_st.rerun_count - reruns_before
             ba_session, ba_request = _select_once(room_b, room_a, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            reruns_before = selector_st.rerun_count
             pending_session, pending_request = _select_once(pending_room, room_a, pending_ids_fixture, persisted_ids_fixture, "persisted")
+            pending_rerun_count = selector_st.rerun_count - reruns_before
             dashboard_session, dashboard_request = _select_once(room_a, dashboard_room, pending_ids_fixture, persisted_ids_fixture, "persisted")
             large_session, large_request = _select_once(dashboard_room, large_room, pending_ids_fixture, persisted_ids_fixture, "persisted")
             duplicate_session = {"current_room": room_a, persisted_key: room_b, "__chat_room_selector_valid_ids": persisted_ids_fixture}
@@ -6133,6 +6153,38 @@ def run_basic_checks() -> list[CheckResult]:
             }
             queue_selector(invalid_session, widget_key=persisted_key, room_kind="persisted")
             invalid_request = consume_selector(invalid_session, valid_room_ids=persisted_ids_fixture)
+            renamed_current_session = {
+                "current_room": room_a,
+                persisted_key: room_a,
+                "__chat_room_selector_valid_ids": persisted_ids_fixture,
+            }
+            # The title can change, but selector identity must stay the room UUID.
+            sync_selector(
+                renamed_current_session,
+                canonical_room_id=room_a,
+                pending_ids=pending_ids_fixture,
+                persisted_ids=persisted_ids_fixture,
+            )
+            renamed_click_session = dict(renamed_current_session)
+            renamed_click_session[persisted_key] = room_b
+            queue_selector(renamed_click_session, widget_key=persisted_key, room_kind="persisted")
+            renamed_click_request = consume_selector(renamed_click_session, valid_room_ids=persisted_ids_fixture)
+            if renamed_click_request:
+                renamed_click_session["current_room"] = renamed_click_request["room_id"]
+            sync_selector(
+                renamed_click_session,
+                canonical_room_id=renamed_click_session.get("current_room"),
+                pending_ids=pending_ids_fixture,
+                persisted_ids=persisted_ids_fixture,
+            )
+            legacy_title_state = {
+                "current_room": room_a,
+                "__room_page": 0,
+                legacy_pending_key: title_value,
+                legacy_persisted_key: title_value,
+                persisted_key: room_a,
+            }
+            clear_legacy_selector_state(legacy_title_state)
             page3_key = f"{persisted_key}_page_3"
             page3_session = {"current_room": room_a, page3_key: room_b}
             sync_selector(
@@ -6144,14 +6196,20 @@ def run_basic_checks() -> list[CheckResult]:
             )
             checks = {
                 "a_to_b_once": bool(ab_request) and ab_session.get("current_room") == room_b and ab_session.get(persisted_key) == room_b and pending_key not in ab_session,
+                "a_to_b_requests_app_rerun_once": ab_rerun_count == 1 and "__chat_room_selector_app_rerun_token" not in ab_session,
                 "b_to_a_once": bool(ba_request) and ba_session.get("current_room") == room_a and ba_session.get(persisted_key) == room_a,
                 "pending_to_persisted_once": bool(pending_request) and pending_session.get("current_room") == room_a and pending_key not in pending_session and pending_session.get(persisted_key) == room_a,
+                "pending_to_persisted_requests_app_rerun_once": pending_rerun_count == 1 and "__chat_room_selector_app_rerun_token" not in pending_session,
                 "dashboard_to_general_once": bool(dashboard_request) and dashboard_session.get("current_room") == dashboard_room,
                 "large_room_guard_no_bounce": bool(large_request) and large_session.get("current_room") == large_room and large_session.get(persisted_key) == large_room,
                 "request_consumed_once": bool(duplicate_first) and duplicate_second is None,
                 "same_room_callback_noop": same_room_request is None and "__chat_room_selector_request" not in same_room_session,
                 "queued_target_not_overwritten": queued_session.get(persisted_key) == room_b,
                 "title_callback_invalid": invalid_request is None and "__chat_room_selector_request" not in invalid_session and invalid_session.get("current_room") == room_a and invalid_session.get("__room_page") == 3,
+                "renamed_current_room_keeps_uuid": renamed_current_session.get(persisted_key) == room_a and is_room_id(renamed_current_session.get(persisted_key)),
+                "renamed_room_click_once": bool(renamed_click_request) and renamed_click_session.get("current_room") == room_b and renamed_click_session.get(persisted_key) == room_b,
+                "legacy_title_state_removed": legacy_pending_key not in legacy_title_state and legacy_persisted_key not in legacy_title_state and legacy_title_state.get("current_room") == room_a,
+                "selector_v2_keys": "_selector_v2_id" in pending_key and "_selector_v2_id" in persisted_key,
                 "page_key_keeps_room_id": page3_session.get(page3_key) == room_a,
                 "new_pending_clears_stale_request": "current_room" in stale_state and not any(
                     key in stale_state
@@ -6162,7 +6220,8 @@ def run_basic_checks() -> list[CheckResult]:
                         persisted_key,
                     )
                 ),
-                "selector_logs_present": "[chat.room.selector]" in main_src and '"before_render"' in main_src and '"after_switch"' in main_src and '"after_rerun"' in main_src and '"callback_invalid"' in main_src,
+                "selector_logs_present": "[chat.room.selector]" in main_src and '"before_render"' in main_src and '"after_switch"' in main_src and '"after_rerun"' in main_src and '"callback_invalid"' in main_src and "widget_value_type=" in main_src and "value_in_room_ids=" in main_src,
+                "selector_callback_requests_app_rerun": "_request_chat_room_selector_app_rerun()" in main_src and 'st.rerun(scope="app")' in main_src,
                 "page_scoped_options": "_page_{selector_page}" in main_src and "options=options_ids" in main_src and "format_func=lambda rid" in main_src,
             }
             failed_checks = [name for name, passed in checks.items() if not passed]
@@ -7284,6 +7343,12 @@ def run_basic_checks() -> list[CheckResult]:
                 return ["0004:D_EX"], {"0004:D_EX": "제외구분"}
             if str(gcode) == "0031":
                 return ["0031:C_EX"], {"0031:C_EX": "제외분류"}
+            if str(gcode) == "0019":
+                return ["0019:G_EX"], {"0019:G_EX": "vendor-group"}
+            if str(gcode) == "0009":
+                return ["0009:K_EX"], {"0009:K_EX": "vendor-kind"}
+            if str(gcode) == "0012":
+                return ["0012:I_EX"], {"0012:I_EX": "io-gu"}
             return [], {}
 
         try:
@@ -7311,6 +7376,23 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append(f"rerun_triggered_analysis={rerendered!r}|calls={len(build_calls)}")
             if option_calls != {"stock": 1, "code": 6}:
                 render_errors.append(f"rerun_reloaded_option_source={option_calls!r}")
+            stale_widget_values = {
+                "__dashboard_lite_stock_labels": ["00001", "stale-stock"],
+                "__dashboard_lite_vendor_group_list": ["0019:G_EX", "stale-vendor-group"],
+                "__dashboard_lite_vendor_kind_list": ["0009:K_EX", "stale-vendor-kind"],
+                "__dashboard_lite_product_group_list": ["0013:G_EX", "stale-product-group"],
+                "__dashboard_lite_product_di_list": ["0004:D_EX", "stale-product-di"],
+                "__dashboard_lite_product_class_list": ["0031:C_EX", "stale-product-class"],
+                "__dashboard_lite_io_gu_list": ["0012:I_EX", "stale-io-gu"],
+            }
+            fake_st.session_state.update(stale_widget_values)
+            stale_stock_rerender = view_mod.render_dashboard_lite()
+            for widget_key, values in stale_widget_values.items():
+                expected_values = [value for value in values if not value.startswith("stale-")]
+                if fake_st.session_state.get(widget_key) != expected_values:
+                    render_errors.append(f"stale_multiselect_value_not_pruned={widget_key}:{fake_st.session_state.get(widget_key)!r}")
+            if (stale_stock_rerender.get("meta") or {}).get("status") != "condition_only" or build_calls:
+                render_errors.append("stock_widget_state_rerun_triggered_analysis")
             fake_st._submit_sequence = [True, False]
             first = view_mod.render_dashboard_lite()
             second = view_mod.render_dashboard_lite()
@@ -7692,6 +7774,29 @@ def run_basic_checks() -> list[CheckResult]:
         main_dashboard_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
         chat_middleware_dashboard_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
         sales_trend_src = Path("app/services/analytics_sales_trend_service.py").read_text(encoding="utf-8")
+        dashboard_multiselect_keys = (
+            "__dashboard_lite_stock_labels",
+            "__dashboard_lite_product_group_list",
+            "__dashboard_lite_product_di_list",
+            "__dashboard_lite_product_class_list",
+            "__dashboard_lite_vendor_group_list",
+            "__dashboard_lite_vendor_kind_list",
+            "__dashboard_lite_io_gu_list",
+        )
+        dashboard_multiselect_lines = [
+            line for line in view_src.splitlines() if "st.multiselect(" in line
+        ]
+        dashboard_multiselect_default_conflicts = [
+            key
+            for key in dashboard_multiselect_keys
+            if any(key in line and "default=" in line for line in dashboard_multiselect_lines)
+        ]
+        dashboard_multiselect_state_missing = [
+            key
+            for key in dashboard_multiselect_keys
+            if f'_prepare_dashboard_multiselect_state("{key}"' not in view_src
+            and key != "__dashboard_lite_stock_labels"
+        ]
         if (
             '"Dashboard Lite v0.1": dashboard_lite.render_dashboard_lite' not in panel_src
             or 'from app.sims.views import users, codes, vendors, goods, road_address, analytics_views, dashboard_lite, rddbc_io_views' not in panel_src
@@ -7720,6 +7825,10 @@ def run_basic_checks() -> list[CheckResult]:
             or '[dashboard.chat_push]' not in panel_src
             or 'dashboard_item["role"] = "assistant"' not in main_dashboard_src
             or 'dashboard_primary_area = st.empty()' in main_dashboard_src
+            or bool(dashboard_multiselect_default_conflicts)
+            or 'stock_widget_key = "__dashboard_lite_stock_labels"' not in view_src
+            or '_prepare_dashboard_multiselect_state(stock_widget_key, stock_codes)' not in view_src
+            or bool(dashboard_multiselect_state_missing)
             or 'Dashboard facts / 비교 금지 규칙' in view_src
             or 'with st.expander("추가 확인사항"' in view_src
         ):
@@ -8005,6 +8114,75 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard Lite profile re-entry reset", "; ".join(profile_reentry_errors)))
         else:
             results.append(_ok("Dashboard Lite profile re-entry reset", "Dashboard state clearing removes the profile-loaded marker and non-persistent manufacturer state before re-entry"))
+
+        profile_restore_errors: list[str] = []
+        old_profile_st = getattr(view_mod, "st")
+        old_profile_identity = getattr(view_mod, "_dashboard_context_identity")
+        old_profile_loader = getattr(view_mod, "load_dashboard_profile")
+        profile_load_calls: list[str] = []
+        saved_profile = {
+            "stock_mode": "book",
+            "stock_cd_list": ["00001", "stale-stock"],
+            "vendor_group_list": ["0019:G_EX"],
+            "vendor_kind_list": ["0009:K_EX"],
+            "product_group_list": ["0013:G_EX", "stale-product"],
+            "product_di_list": ["0004:D_EX"],
+            "product_class_list": ["0031:C_EX"],
+            "io_gu_list": ["I_EX"],
+            "major_purchase_vendor_days": 75,
+            "risk_analysis_days": 60,
+            "overstock_inactive_days": 45,
+            "readiness_warning_pct": 97.5,
+            "risk_quick_view_count": 20,
+            "amount_display_unit": "million",
+        }
+        try:
+            profile_st = _FakeStreamlit(submit_sequence=[])
+            setattr(view_mod, "st", profile_st)
+            setattr(view_mod, "_dashboard_context_identity", lambda: {"user_id": "user-a", "company_id": "4", "db_sig": "safe"})
+
+            def _fake_profile_loader(*, company_id):
+                profile_load_calls.append(str(company_id))
+                return dict(saved_profile)
+
+            setattr(view_mod, "load_dashboard_profile", _fake_profile_loader)
+            view_mod._apply_saved_dashboard_profile_once()
+            if profile_st.session_state.get("__dashboard_lite_stock_mode") != "book":
+                profile_restore_errors.append("initial_profile_stock_mode_not_restored")
+            if profile_st.session_state.get("__dashboard_lite_io_gu_list") != ["0012:I_EX"]:
+                profile_restore_errors.append(f"initial_profile_io_gu_not_restored={profile_st.session_state!r}")
+            if profile_st.session_state.get("__dashboard_lite_risk_analysis_days") != 60:
+                profile_restore_errors.append("initial_profile_numeric_not_restored")
+
+            profile_st.session_state["__dashboard_lite_product_group_list"] = ["live-product"]
+            view_mod._apply_saved_dashboard_profile_once()
+            if len(profile_load_calls) != 1 or profile_st.session_state.get("__dashboard_lite_product_group_list") != ["live-product"]:
+                profile_restore_errors.append(f"live_state_overwritten={profile_load_calls!r}|{profile_st.session_state!r}")
+
+            for widget_key in view_mod._DASHBOARD_PROFILE_WIDGETS.values():
+                profile_st.session_state.pop(widget_key, None)
+            saved_profile["risk_analysis_days"] = 30
+            view_mod._apply_saved_dashboard_profile_once()
+            if len(profile_load_calls) != 2:
+                profile_restore_errors.append(f"action_reentry_profile_not_reloaded={profile_load_calls!r}")
+            if profile_st.session_state.get("__dashboard_lite_risk_analysis_days") != 30:
+                profile_restore_errors.append(f"action_reentry_profile_not_restored={profile_st.session_state!r}")
+            view_mod._prepare_dashboard_multiselect_state("__dashboard_lite_stock_labels", ["00001"])
+            view_mod._prepare_dashboard_multiselect_state("__dashboard_lite_product_group_list", ["0013:G_EX"])
+            if profile_st.session_state.get("__dashboard_lite_stock_labels") != ["00001"]:
+                profile_restore_errors.append("stale_stock_option_not_pruned")
+            if profile_st.session_state.get("__dashboard_lite_product_group_list") != ["0013:G_EX"]:
+                profile_restore_errors.append("stale_product_option_not_pruned")
+        except Exception as exc:
+            profile_restore_errors.append(f"profile_restore_runtime={type(exc).__name__}:{exc}")
+        finally:
+            setattr(view_mod, "st", old_profile_st)
+            setattr(view_mod, "_dashboard_context_identity", old_profile_identity)
+            setattr(view_mod, "load_dashboard_profile", old_profile_loader)
+        if profile_restore_errors:
+            results.append(_fail("Dashboard Lite action re-entry profile restore", "; ".join(profile_restore_errors)))
+        else:
+            results.append(_ok("Dashboard Lite action re-entry profile restore", "missing Dashboard widget keys reload the saved company profile, while ordinary reruns preserve live widget state"))
 
         sales_source_errors: list[str] = []
         for token in (
