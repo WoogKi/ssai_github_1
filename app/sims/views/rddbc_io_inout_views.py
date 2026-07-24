@@ -581,7 +581,7 @@ ORDER BY LTRIM(RTRIM(Rd03_Ven_Nm)), LTRIM(RTRIM(Rd03_Ven_Cd))
                 st.caption("")
                 maker_vendor_search = st.form_submit_button(
                     "제약사 후보",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         with c7b:
@@ -684,7 +684,7 @@ ORDER BY LTRIM(RTRIM(Rd03_Ven_Nm)), LTRIM(RTRIM(Rd03_Ven_Cd))
         submitted = st.form_submit_button(
             "조회",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_run,
         )
 

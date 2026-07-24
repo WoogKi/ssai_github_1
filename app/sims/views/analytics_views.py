@@ -1096,7 +1096,7 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     if not submitted:
         return {
@@ -1361,7 +1361,7 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     if not submitted:
         return {
@@ -1616,7 +1616,7 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     if not submitted:
         return {
@@ -1806,7 +1806,7 @@ def _render_customer_sales_forecast_form(action_key: str) -> tuple[bool, Dict[st
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     if not submitted:
         log.info(
@@ -2077,7 +2077,7 @@ def _render_manufacturer_sales_trend_form(action_key: str) -> tuple[bool, Dict[s
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     source_mode = {
         "자동": "auto",
@@ -2329,7 +2329,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         with c15:
             sales_man_nm = st.text_input("영업사원명", value="", key=f"__analytics_stock_shortage_sales_man_nm__{ns}")
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     if not submitted:
         return {
@@ -2524,7 +2524,7 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
         with c15:
             sales_man_nm = st.text_input("영업사원명", value="", key=f"__analytics_supplier_stock_shortage_sales_man_nm__{ns}")
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     if not submitted:
         return {

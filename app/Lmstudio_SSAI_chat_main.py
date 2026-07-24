@@ -9386,7 +9386,7 @@ def _render_sims_sidebar_fragment() -> None:
 
         clicked = st.button(
             "SIMS 작업 열기",
-            use_container_width=True,
+            width="stretch",
             type="primary",
             key="__sims_run_btn",
         )
@@ -9434,7 +9434,7 @@ def _render_sims_sidebar_fragment() -> None:
             # 옵션 초기화는 메인 상태까지 정리해야 하므로 전체 앱 rerun.
             st.rerun()
 
-        st.button("옵션 초기화", use_container_width=True, on_click=_sims_reset)
+        st.button("옵션 초기화", width="stretch", on_click=_sims_reset)
 
 # =========================
 # 사이드바 (통합본)
@@ -9600,7 +9600,7 @@ with st.sidebar:
 
         log.info("[chat.room] new pending room selected %s", _chat_log_kv(new_room))
 
-    st.button("➕ 새 대화 시작", use_container_width=True, key="__room_new_btn", on_click=_new_room)
+    st.button("➕ 새 대화 시작", width="stretch", key="__room_new_btn", on_click=_new_room)
 
     # 목록(라디오)
     pending_ids = [
@@ -9873,7 +9873,7 @@ with st.sidebar:
             save_chat_rooms()
         st.rerun()
 
-    st.button("이름 적용", use_container_width=True, key="__room_rename_apply", on_click=_apply_rename)
+    st.button("이름 적용", width="stretch", key="__room_rename_apply", on_click=_apply_rename)
 
     # 간단한 현황(현재 페이지 범위/총개수)
     st.caption(str(room_list_state["caption"]))
@@ -9914,7 +9914,7 @@ with st.sidebar:
         with c_prev:
             st.button(
                 "이전",
-                use_container_width=True,
+                width="stretch",
                 disabled=bool(room_list_state["prev_disabled"]),
                 key="__room_prev",
                 on_click=_room_prev_page,
@@ -9924,7 +9924,7 @@ with st.sidebar:
         with c_next:
             st.button(
                 "다음",
-                use_container_width=True,
+                width="stretch",
                 disabled=bool(room_list_state["next_disabled"]),
                 key="__room_next",
                 on_click=_room_next_page,
@@ -9940,7 +9940,7 @@ with st.sidebar:
         # 삭제(확인 단계)
         ss.setdefault("__room_delete_ask", False)
         def _ask_delete(): ss.update(__room_delete_ask=True)
-        st.button("🗑️ 현재 채팅방 삭제", use_container_width=True, key="__room_delete_btn", on_click=_ask_delete)
+        st.button("🗑️ 현재 채팅방 삭제", width="stretch", key="__room_delete_btn", on_click=_ask_delete)
 
         if ss.__room_delete_ask:
             st.warning("정말로 이 채팅방을 삭제할까요? (되돌릴 수 없음)", icon="⚠️")
@@ -9957,10 +9957,10 @@ with st.sidebar:
                 st.rerun()
 
             with c_ok:
-                st.button("삭제 확인", type="primary", use_container_width=True,
+                st.button("삭제 확인", type="primary", width="stretch",
                         key="__room_delete_confirm", on_click=_do_delete)
             with c_cancel:
-                st.button("취소", use_container_width=True,
+                st.button("취소", width="stretch",
                         key="__room_delete_cancel",
                         on_click=lambda: ss.update(__room_delete_ask=False))
 
@@ -9975,7 +9975,7 @@ with st.sidebar:
                 zipf.writestr(f"{safe}.json", json.dumps(_json_sanitize(room), ensure_ascii=False, indent=2))
         buf_zip.seek(0)
         st.download_button("💾 모든 대화 ZIP", data=buf_zip, file_name="chat_rooms.zip",
-                        mime="application/zip", use_container_width=True, key="__dl_all_rooms_zip")
+                        mime="application/zip", width="stretch", key="__dl_all_rooms_zip")
 
         # 현재 JSON
         cur_room = next((r for r in ss.chat_rooms if r["id"] == ss.current_room), ss.chat_rooms[0])
@@ -9986,7 +9986,7 @@ with st.sidebar:
         ).encode("utf-8")
         st.download_button("⬇️ 현재 대화(JSON)", data=cur_json,
                         file_name=f"{re.sub(r'[^a-zA-Z0-9가-힣]+','_', cur_room['name'])}.json",
-                        mime="application/json", use_container_width=True, key="__dl_current_json")
+                        mime="application/json", width="stretch", key="__dl_current_json")
         # --- 현재 대화 Markdown / HTML 내보내기 ---
         def _room_to_markdown(room: dict) -> str:
             lines = [f"# 대화방: {room.get('name','')}", ""]
@@ -10012,7 +10012,7 @@ with st.sidebar:
             data=md_bytes,
             file_name=f"{re.sub(r'[^a-zA-Z0-9가-힣]+','_', cur_room['name'])}.md",
             mime="text/markdown",
-            use_container_width=True,
+            width="stretch",
             key="__dl_current_md",
         )
         st.download_button(
@@ -10020,7 +10020,7 @@ with st.sidebar:
             data=html_bytes,
             file_name=f"{re.sub(r'[^a-zA-Z0-9가-힣]+','_', cur_room['name'])}.html",
             mime="text/html",
-            use_container_width=True,
+            width="stretch",
             key="__dl_current_html",
         )
     # =========================
@@ -10083,7 +10083,7 @@ with st.sidebar:
                 st.rerun()
 
             st.button("검색 초기화", key="__search_clear",
-                    use_container_width=True, on_click=_queue_search_reset)
+                    width="stretch", on_click=_queue_search_reset)
 
     # =========================
     # 4) SIMS 모드
@@ -10150,9 +10150,9 @@ with st.sidebar:
             )
 
             st.markdown("**프리셋**")
-            st.button("🇰🇷+🇺🇸 일반",   use_container_width=True, on_click=_ocr_preset, args=("kor+eng",))
-            st.button("🇺🇸 영어전용",   use_container_width=True, on_click=_ocr_preset, args=("eng",))
-            st.button("🇯🇵 영수증",     use_container_width=True, on_click=_ocr_preset, args=("jpn_receipt",))
+            st.button("🇰🇷+🇺🇸 일반",   width="stretch", on_click=_ocr_preset, args=("kor+eng",))
+            st.button("🇺🇸 영어전용",   width="stretch", on_click=_ocr_preset, args=("eng",))
+            st.button("🇯🇵 영수증",     width="stretch", on_click=_ocr_preset, args=("jpn_receipt",))
 
 
         with st.expander("고급", expanded=False):
@@ -10177,8 +10177,8 @@ with st.sidebar:
             except Exception:
                 pass
             st.markdown("**동작**")
-            st.button("초기화", use_container_width=True, on_click=_ocr_reset)
-            st.button("추천(🇰🇷+🇺🇸)", use_container_width=True, on_click=_ocr_preset, args=("kor+eng",))
+            st.button("초기화", width="stretch", on_click=_ocr_reset)
+            st.button("추천(🇰🇷+🇺🇸)", width="stretch", on_click=_ocr_preset, args=("kor+eng",))
             st.caption("변경 즉시 적용됩니다.")
 
         # 상태/요약
@@ -10384,7 +10384,7 @@ with st.sidebar:
                         st.json(summary, expanded=False)
                         if "df_preview" in locals() and df_preview is not None:
                             st.write("미리보기 (상위 3행):")
-                            st.dataframe(df_preview, use_container_width=True)
+                            st.dataframe(df_preview, width="stretch")
                         else:
                             st.caption("표 형태로 변환할 수 없어서 미리보기를 생략합니다.")
                     else:
@@ -11876,7 +11876,7 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
 
                     if _df is not None:
                         with st.expander(title, expanded=expanded_now):
-                            st.dataframe(_df, use_container_width=True)
+                            st.dataframe(_df, width="stretch")
 
                             # CSV / Excel 다운로드 권한 체크
                             can_export_excel = require_permission("EXPORT_EXCEL", show_error=False)
@@ -12112,7 +12112,7 @@ if uploaded_files:
             "🔒 파일 분석",
             disabled=True,
             key="__btn_analyze_disabled",
-            use_container_width=True,
+            width="stretch",
             help=_upload_unavailable_help(),
         )
     else:
@@ -12124,12 +12124,12 @@ if uploaded_files:
         st.button(
             "⏹️ 분석 취소",
             key="__an_cancel_btn",
-            use_container_width=True,
+            width="stretch",
             on_click=lambda: st.session_state.__setitem__("__an_cancel", True),
         )
 
     # 분석 시작 버튼
-    elif st.button("🔍 파일 분석하기", use_container_width=True, key="__btn_analyze"):
+    elif st.button("🔍 파일 분석하기", width="stretch", key="__btn_analyze"):
         # ── 작업 시작 플래그/메타 ─────────────────────────────────
         st.session_state["__an_busy"] = True
         st.session_state["__an_cancel"] = False

@@ -186,7 +186,7 @@ def render_road_address_list() -> Dict[str, Any]:
         with c6:
             st.caption(f"조회상한: 최대 {master_max_rows:,}건")
 
-        submitted = st.form_submit_button("조회", type="primary", use_container_width=True)
+        submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
     if not submitted:
         return {

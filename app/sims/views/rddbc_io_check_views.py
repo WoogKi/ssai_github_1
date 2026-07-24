@@ -355,7 +355,7 @@ def _render_check_form(
         with c10:
             vendor_search = st.form_submit_button(
                 "거래처 후보검색",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c11:
@@ -397,7 +397,7 @@ def _render_check_form(
         with c14:
             product_search = st.form_submit_button(
                 "제품 후보검색",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c15:
@@ -436,7 +436,7 @@ def _render_check_form(
         submitted = st.form_submit_button(
             "조회",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_run,
         )
 

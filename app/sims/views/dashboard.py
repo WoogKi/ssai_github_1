@@ -18,7 +18,7 @@ def render_monthly_sales():
     start, end = _date_range_inputs()
     try:
         df = read_df(qt.MONTHLY_SALES_SUMMARY, (start, end))
-        st.dataframe(df, use_container_width=True, height=320)
+        st.dataframe(df, width="stretch", height=320)
         if "YearMonth" in df.columns and "SalesAmount" in df.columns:
             st.line_chart(df.set_index("YearMonth")["SalesAmount"])
     except Exception as e:
@@ -39,7 +39,7 @@ def render_inout_trend():
     start, end = _date_range_inputs()
     try:
         df = read_df(qt.INOUT_BY_DATE_RANGE, (start, end))
-        st.dataframe(df, use_container_width=True, height=320)
+        st.dataframe(df, width="stretch", height=320)
         if {"IoDate","InQty","OutQty"}.issubset(df.columns):
             st.line_chart(df.set_index("IoDate")[["InQty","OutQty"]])
     except Exception as e:

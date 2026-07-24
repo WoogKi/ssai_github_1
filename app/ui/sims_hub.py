@@ -303,14 +303,14 @@ def render():
             # DataFrame을 불리언 평가 없이 안전하게 선택
             df = _pick_df(last)
             if isinstance(df, pd.DataFrame) and not df.empty:
-                st.dataframe(df, use_container_width=True, height=520)
+                st.dataframe(df, width="stretch", height=520)
                 return
             recs = last.get("records")
             cols = last.get("columns")
             if isinstance(recs, list):
                 try:
                     _df = pd.DataFrame(recs, columns=cols if isinstance(cols, list) else None)
-                    st.dataframe(_df, use_container_width=True, height=520)
+                    st.dataframe(_df, width="stretch", height=520)
                     return
                 except Exception:
                     pass

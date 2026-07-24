@@ -74,7 +74,7 @@ def view_rddbc040(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         submitted = st.form_submit_button(
             "조회",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_run,
         )
 

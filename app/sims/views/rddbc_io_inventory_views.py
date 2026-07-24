@@ -387,7 +387,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         with c10:
             product_search = st.form_submit_button(
                 "제품\n후보",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c11:
@@ -448,7 +448,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         with c17:
             maker_search = st.form_submit_button(
                 "제조사\n후보",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c18:
@@ -467,7 +467,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         with c21:
             order_search = st.form_submit_button(
                 "발주처\n후보",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c22:
@@ -486,7 +486,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         with c25:
             buy_search = st.form_submit_button(
                 "매입처\n후보",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c26:
@@ -511,7 +511,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         submitted = st.form_submit_button(
             "조회",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_run,
         )
 

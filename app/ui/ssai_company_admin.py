@@ -256,7 +256,7 @@ def _render_company_list_tab() -> None:
     refresh_col, _ = st.columns([1, 4])
 
     with refresh_col:
-        if st.button("목록 새로고침", use_container_width=True, key="__ssai_company_admin_refresh_list"):
+        if st.button("목록 새로고침", width="stretch", key="__ssai_company_admin_refresh_list"):
             st.rerun()
 
     try:
@@ -305,7 +305,7 @@ def _render_company_list_tab() -> None:
     try:
         grid_event = st.dataframe(
             display_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             key="__ssai_company_admin_db_grid",
             on_select="rerun",
@@ -334,7 +334,7 @@ def _render_company_list_tab() -> None:
     except TypeError:
         st.dataframe(
             display_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "company_id": "ID",
@@ -404,7 +404,7 @@ def _render_company_list_tab() -> None:
     b1, b2, b3, b4 = st.columns(4)
 
     with b1:
-        if st.button("선택 회원사 ERP DB 접속 테스트", use_container_width=True, key="__ssai_company_admin_test_saved"):
+        if st.button("선택 회원사 ERP DB 접속 테스트", width="stretch", key="__ssai_company_admin_test_saved"):
             try:
                 result = test_saved_company_connection(company_code)
 
@@ -436,7 +436,7 @@ def _render_company_list_tab() -> None:
                 st.error(f"접속 테스트 중 오류가 발생했습니다: {type(e).__name__}: {e}")
 
     with b2:
-        if st.button("등록/수정 폼에 불러오기", use_container_width=True, key="__ssai_company_admin_load_form"):
+        if st.button("등록/수정 폼에 불러오기", width="stretch", key="__ssai_company_admin_load_form"):
             _load_company_to_form(selected_company)
             st.success(f"등록/수정 폼에 불러왔습니다: {company_code}")
             st.caption("두 번째 탭인 '회원사 ERP DB 등록 / 수정'에서 수정 후 저장하세요.")
@@ -444,7 +444,7 @@ def _render_company_list_tab() -> None:
     with b3:
         if st.button(
             "선택 회원사 회원사 ERP DB 비활성화",
-            use_container_width=True,
+            width="stretch",
             disabled=not is_active,
             key="__ssai_company_admin_deactivate",
         ):
@@ -474,7 +474,7 @@ def _render_company_list_tab() -> None:
         if st.button(
             "선택 회원사 회원사 ERP DB 활성화",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=is_active,
             key="__ssai_company_admin_activate",
         ):
@@ -520,7 +520,7 @@ def _render_company_form_tab() -> None:
             st.session_state[key] = value
 
 
-    if st.button("신규 등록용으로 폼 초기화", use_container_width=True, key="__ssai_company_admin_clear_form"):
+    if st.button("신규 등록용으로 폼 초기화", width="stretch", key="__ssai_company_admin_clear_form"):
         _clear_form()
         st.rerun()
 
@@ -671,18 +671,18 @@ def _render_company_form_tab() -> None:
 
         test_sql_clicked = st.form_submit_button(
             "SQL DB 접속 테스트",
-            use_container_width=True,
+            width="stretch",
         )
 
         test_sims_admin_clicked = st.form_submit_button(
             "SIMS admin 인증 / 회사명 읽기",
-            use_container_width=True,
+            width="stretch",
         )
 
         save_clicked = st.form_submit_button(
             "저장",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -699,7 +699,7 @@ def _render_company_form_tab() -> None:
             st.caption("사업자등록번호는 저장하지 않습니다. 회원사명 기준 후보만 보여주고, 최종 선택/수정은 관리자가 합니다.")
             st.dataframe(
                 pd.DataFrame(candidates),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "customer_code": "회원사코드",

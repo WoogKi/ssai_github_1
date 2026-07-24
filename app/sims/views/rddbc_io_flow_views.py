@@ -540,7 +540,7 @@ ORDER BY
         with c10:
             product_search = st.form_submit_button(
                 "제품\n후보",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c11:
@@ -566,7 +566,7 @@ ORDER BY
         with c13:
             maker_vendor_search = st.form_submit_button(
                 "제조사\n후보",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c14:
@@ -639,7 +639,7 @@ ORDER BY
         with c20:
             vendor_search = st.form_submit_button(
                 "거래처\n후보",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c21:
@@ -674,7 +674,7 @@ ORDER BY
         submitted = st.form_submit_button(
             "조회",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_run,
         )
 

@@ -385,7 +385,7 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
         with c9:
             vendor_search = st.form_submit_button(
                 "후보검색",
-                use_container_width=True,
+                width="stretch",
             )
 
         with c10:
@@ -424,7 +424,7 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
         submitted = st.form_submit_button(
             "조회",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             on_click=_trigger_panel_run,
         )
 

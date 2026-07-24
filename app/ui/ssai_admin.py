@@ -152,7 +152,7 @@ def render_ssai_admin_sidebar() -> None:
             else "회원사 사용자 관리"
         )
 
-        if st.button(admin_user_menu_label, use_container_width=True, key="__ssai_admin_user_approval_btn"):
+        if st.button(admin_user_menu_label, width="stretch", key="__ssai_admin_user_approval_btn"):
             st.session_state[SESSION_ADMIN_PAGE] = "user_approval"
 
             if not _can_approve_signup_users():
@@ -165,17 +165,17 @@ def render_ssai_admin_sidebar() -> None:
             or has_permission("SIMS_DB_MANAGE")
             or has_permission("USER_MANAGE_ALL")
         ):
-            if st.button("회원사 ERP DB 관리", use_container_width=True, key="__ssai_admin_company_db_btn"):
+            if st.button("회원사 ERP DB 관리", width="stretch", key="__ssai_admin_company_db_btn"):
                 st.session_state[SESSION_ADMIN_PAGE] = "company_admin"
                 st.rerun()
 
         if _can_view_audit_logs():
-            if st.button("감사 로그 조회", use_container_width=True, key="__ssai_admin_audit_logs_btn"):
+            if st.button("감사 로그 조회", width="stretch", key="__ssai_admin_audit_logs_btn"):
                 st.session_state[SESSION_ADMIN_PAGE] = "audit_logs"
                 st.rerun()
 
         if st.session_state.get(SESSION_ADMIN_PAGE):
-            if st.button("일반 화면으로 돌아가기", use_container_width=True, key="__ssai_admin_back_btn"):
+            if st.button("일반 화면으로 돌아가기", width="stretch", key="__ssai_admin_back_btn"):
                 st.session_state.pop(SESSION_ADMIN_PAGE, None)
                 st.rerun()
 
@@ -838,7 +838,7 @@ def _render_pending_user_card(
         b1, b2, b3 = st.columns([1, 1, 2])
 
         with b1:
-            if st.button("승인", type="primary", use_container_width=True, key=f"__approve_btn_{key_base}"):
+            if st.button("승인", type="primary", width="stretch", key=f"__approve_btn_{key_base}"):
                 try:
                     result = approve_user(
                         login_id=login_id,
@@ -865,7 +865,7 @@ def _render_pending_user_card(
                     st.error(f"승인 중 오류가 발생했습니다: {type(e).__name__}: {e}")
 
         with b2:
-            if st.button("거절", use_container_width=True, key=f"__reject_btn_{key_base}"):
+            if st.button("거절", width="stretch", key=f"__reject_btn_{key_base}"):
                 try:
                     result = reject_user(
                         login_id=login_id,
@@ -1083,7 +1083,7 @@ def _render_user_policy_update_box(
         if st.button(
             "사용자 정책 저장",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key=f"__policy_save_{target_login_id}",
         ):
             try:
@@ -1164,7 +1164,7 @@ def render_user_approval_page() -> None:
     t2.metric("활성 회원사 ERP DB", len(companies))
     t3.metric("관리 기능", "사용 가능")
 
-    if st.button("승인 대기 새로고침", use_container_width=True, key="__admin_pending_refresh_btn"):
+    if st.button("승인 대기 새로고침", width="stretch", key="__admin_pending_refresh_btn"):
         st.rerun()
 
     st.divider()
@@ -1190,7 +1190,7 @@ def render_user_approval_page() -> None:
             if st.button(
                 "승인 대기",
                 type="primary" if subtab == "승인 대기" else "secondary",
-                use_container_width=True,
+                width="stretch",
                 key="__admin_nav_pending",
             ):
                 _admin_keep_pending_tab()
@@ -1200,7 +1200,7 @@ def render_user_approval_page() -> None:
             if st.button(
                 "회원사 사용자 관리",
                 type="primary" if subtab == "회사 사용자 관리" else "secondary",
-                use_container_width=True,
+                width="stretch",
                 key="__admin_nav_company_users",
             ):
                 _admin_keep_company_user_tab()
@@ -1320,7 +1320,7 @@ def render_company_user_management_page() -> None:
         st.write("")
         if st.button(
             "현재 범위 재조회",
-            use_container_width=True,
+            width="stretch",
             key=f"__admin_company_user_refresh_{selected_company_key}",
         ):
             _admin_keep_company_user_tab()
@@ -1396,7 +1396,7 @@ def render_company_user_management_page() -> None:
     try:
         event = st.dataframe(
             table_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             selection_mode="single-row",
             on_select="rerun",
@@ -1408,7 +1408,7 @@ def render_company_user_management_page() -> None:
         # Streamlit 구버전 호환용 fallback
         st.dataframe(
             table_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         st.caption("현재 Streamlit 버전에서는 표 행 선택을 지원하지 않아 아래 선택박스로 대상을 선택합니다.")
@@ -1508,7 +1508,7 @@ def render_company_user_management_page() -> None:
         if st.button(
             "역할 변경 적용",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=role_change_disabled,
             key="__admin_company_user_role_change_btn",
             help="자기 자신, 사용 중지 사용자, 신성아트컴 사용자는 이 빠른 역할 변경을 사용할 수 없습니다." if role_change_disabled else None,
@@ -1547,7 +1547,7 @@ def render_company_user_management_page() -> None:
         if target_is_active:
             if st.button(
                 "사용 중지",
-                use_container_width=True,
+                width="stretch",
                 disabled=is_self,
                 key="__admin_company_user_disable_btn",
                 help="자기 자신은 사용 중지할 수 없습니다." if is_self else None,
@@ -1576,7 +1576,7 @@ def render_company_user_management_page() -> None:
             if st.button(
                 "재사용",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
                 disabled=is_self,
                 key="__admin_company_user_enable_btn",
                 help="자기 자신은 이 화면에서 재사용 처리할 수 없습니다." if is_self else None,
@@ -1617,7 +1617,7 @@ def render_company_user_management_page() -> None:
 
         if st.button(
             "승인 취소 / 권한 회수",
-            use_container_width=True,
+            width="stretch",
             disabled=revoke_disabled,
             key="__admin_company_user_revoke_btn",
             help="자기 자신이거나 이미 승인 취소된 사용자는 처리할 수 없습니다." if revoke_disabled else None,
@@ -1663,7 +1663,7 @@ def render_user_lookup_debug() -> None:
     with st.expander("승인 결과 확인", expanded=False):
         login_id = st.text_input("확인할 로그인 ID", value="", key="__admin_lookup_login_id")
 
-        if st.button("확인", use_container_width=True, key="__admin_lookup_btn"):
+        if st.button("확인", width="stretch", key="__admin_lookup_btn"):
             if not login_id.strip():
                 st.warning("로그인 ID를 입력하세요.")
                 return
@@ -1768,7 +1768,7 @@ def render_audit_log_page() -> None:
         if st.button(
             "감사 로그 재조회",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             key="__audit_refresh_btn",
         ):
             st.rerun()
@@ -1802,7 +1802,7 @@ def render_audit_log_page() -> None:
                 data=excel_bytes,
                 file_name=f"ssai_audit_logs_{date.today().strftime('%Y%m%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
                 key="__audit_excel_download_btn",
             )
 
@@ -1830,7 +1830,7 @@ def render_audit_log_page() -> None:
 
     st.dataframe(
         df[display_cols],
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 

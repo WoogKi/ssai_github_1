@@ -646,11 +646,11 @@ def render_logout_box() -> None:
             st.write(f"ERP DB: **{_erp_db_display_name_of(company) or '-'}**")
 
         if _can_change_member_erp_db(user, selectable_companies):
-            if st.button("회원사 / ERP DB 변경", use_container_width=True):
+            if st.button("회원사 / ERP DB 변경", width="stretch"):
                 st.session_state[SESSION_COMPANY_PICK_MODE] = True
                 st.rerun()
 
-        if st.button("로그아웃", use_container_width=True):
+        if st.button("로그아웃", width="stretch"):
             logout()
 
 def render_company_selector() -> bool:
@@ -763,14 +763,14 @@ def render_company_selector() -> bool:
             company_change_submitted = st.form_submit_button(
                 "이 회원사 ERP DB로 접속",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
 
         with col2:
             if current_company is not None:
                 company_change_cancelled = st.form_submit_button(
                     "취소",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
 
@@ -939,7 +939,7 @@ def render_signup_request_box() -> None:
             submitted = st.form_submit_button(
                 "가입 신청",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
 
         if not submitted:
@@ -1013,13 +1013,13 @@ def render_login_form() -> bool:
                     sims_submitted = st.form_submit_button(
                         "SIMS 인증 후 로그인",
                         type="primary",
-                        use_container_width=True,
+                        width="stretch",
                     )
 
                 with c2:
                     cancel_submitted = st.form_submit_button(
                         "처음으로",
-                        use_container_width=True,
+                        width="stretch",
                     )
 
         if cancel_submitted:
@@ -1063,7 +1063,7 @@ def render_login_form() -> bool:
     with st.form("ssai_login_form", clear_on_submit=False):
         login_id = st.text_input("로그인 ID", value="", placeholder="아이디를 입력하세요")
         password = st.text_input("SS AI Password", type="password")
-        submitted = st.form_submit_button("다음", use_container_width=True)
+        submitted = st.form_submit_button("다음", width="stretch")
 
     # 로그인 버튼을 누르지 않아도 가입 신청 UI는 항상 보여야 한다.
     st.divider()

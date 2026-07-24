@@ -24,6 +24,7 @@ NLQ 라우팅까지 확인:
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib
 import json
 import logging
@@ -32,6 +33,7 @@ import re
 import sys
 import tempfile
 import traceback
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -681,6 +683,67 @@ def run_basic_checks() -> list[CheckResult]:
         ]
         for name, ok in source_checks:
             results.append(_ok(name) if ok else _fail(name, "source guard failed"))
+
+        try:
+            width_migration_targets = (
+                "app/Lmstudio_SSAI_chat_main.py",
+                "app/sims/views/analytics_views.py",
+                "app/sims/views/dashboard.py",
+                "app/sims/views/rddbc_io_check_views.py",
+                "app/sims/views/rddbc_io_doc_views.py",
+                "app/sims/views/rddbc_io_flow_views.py",
+                "app/sims/views/rddbc_io_goods_views.py",
+                "app/sims/views/rddbc_io_inout_views.py",
+                "app/sims/views/rddbc_io_inventory_views.py",
+                "app/sims/views/rddbc_io_stock_views.py",
+                "app/sims/views/road_address.py",
+                "app/ui/sims_hub.py",
+                "app/ui/ssai_admin.py",
+                "app/ui/ssai_company_admin.py",
+                "app/ui/ssai_login.py",
+            )
+            migrated_widgets = {"button", "form_submit_button", "dataframe", "download_button"}
+            deprecated_width_calls: list[str] = []
+            stretch_width_counts: Counter[str] = Counter()
+            for relative_path in width_migration_targets:
+                source_tree = ast.parse((PROJECT_ROOT / relative_path).read_text(encoding="utf-8"))
+                for node in ast.walk(source_tree):
+                    if not (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "st"
+                        and node.func.attr in migrated_widgets
+                    ):
+                        continue
+                    for keyword in node.keywords:
+                        if keyword.arg == "use_container_width":
+                            deprecated_width_calls.append(f"{relative_path}:{node.lineno}:{node.func.attr}")
+                        if keyword.arg == "width" and isinstance(keyword.value, ast.Constant) and keyword.value.value == "stretch":
+                            stretch_width_counts[node.func.attr] += 1
+
+            expected_stretch_width_counts = {
+                "button": 44,
+                "form_submit_button": 38,
+                "dataframe": 12,
+                "download_button": 5,
+            }
+            if deprecated_width_calls or dict(stretch_width_counts) != expected_stretch_width_counts:
+                results.append(
+                    _fail(
+                        "Streamlit width migration for active UI calls",
+                        f"deprecated={deprecated_width_calls!r}; stretch={dict(stretch_width_counts)!r}",
+                    )
+                )
+            else:
+                results.append(
+                    _ok(
+                        "Streamlit width migration for active UI calls",
+                        "15 active tracked files use width=stretch for 99 direct button/form/dataframe/download calls; helper and test compatibility patterns are excluded",
+                    )
+                )
+        except Exception as exc:
+            results.append(_fail("Streamlit width migration for active UI calls", f"{type(exc).__name__}: {exc}"))
 
         try:
             from streamlit.elements.lib.layout_utils import validate_height
@@ -6056,8 +6119,6 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("chat room sidebar pagination policy", f"{type(e).__name__}: {e}"))
 
         try:
-            import ast
-
             main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
             tree = ast.parse(main_src)
             selector_names = {
@@ -7672,7 +7733,6 @@ def run_basic_checks() -> list[CheckResult]:
         if session_fixture.get("__login_user") != "keep-user" or session_fixture.get("__selected_company_id") != 4 or session_fixture.get("__chat_current_room_id") != "room-a":
             reset_errors.append(f"login_company_chat_mutated={session_fixture!r}")
         try:
-            import ast
             from types import SimpleNamespace
 
             login_src_for_clear = Path("app/ui/ssai_login.py").read_text(encoding="utf-8")
@@ -7719,7 +7779,6 @@ def run_basic_checks() -> list[CheckResult]:
 
         new_chat_errors: list[str] = []
         try:
-            import ast
             from types import SimpleNamespace
 
             main_src_for_new_chat = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
@@ -8398,7 +8457,6 @@ def run_basic_checks() -> list[CheckResult]:
         if any(token in chat_context_base for token in ('"login_id"', '"company_name"', '"db_name"', '"chat_file"', '"legacy_file"', '"partition_root"')):
             security_errors.append("chat_log_context_sensitive_key_present")
         try:
-            import ast
             from types import SimpleNamespace
 
             main_tree = ast.parse(ui_security_src)
