@@ -658,14 +658,17 @@ def run_basic_checks() -> list[CheckResult]:
                 "import streamlit.components.v1" not in main_src
                 and "stc.html(" not in main_src
                 and main_src.count("st.iframe(") == 2
-                and "height=0, tab_index=-1" in scroll_helper_block
-                and "height=0," in inline_scroll_block
+                and "height=0" not in main_src
+                and "height=1, tab_index=-1" in scroll_helper_block
+                and "height=1," in inline_scroll_block
                 and "tab_index=-1" in inline_scroll_block
                 and "window.parent.document" in scroll_helper_block
                 and "window.parent.document" in inline_scroll_block
                 and "scrollIntoView" in scroll_helper_block
                 and "scrollIntoView" in inline_scroll_block
-                and "MutationObserver" in scroll_helper_block,
+                and "MutationObserver" in scroll_helper_block
+                and "except Exception:" in scroll_helper_block
+                and "scroll anchor iframe failed" in scroll_helper_block,
             ),
             ("db cwd dotenv search removed", "find_dotenv" not in mssql_src),
             ("auth root env parser priority", "p = ENV_PATH" in auth_src and "return env.get(name) or os.environ.get(name) or default" in auth_src),
@@ -678,6 +681,20 @@ def run_basic_checks() -> list[CheckResult]:
         ]
         for name, ok in source_checks:
             results.append(_ok(name) if ok else _fail(name, "source guard failed"))
+
+        try:
+            from streamlit.elements.lib.layout_utils import validate_height
+            from streamlit.errors import StreamlitInvalidHeightError
+
+            validate_height(1)
+            try:
+                validate_height(0)
+            except StreamlitInvalidHeightError:
+                results.append(_ok("Streamlit iframe height validation", "height=1 is accepted and height=0 is rejected by the installed Streamlit validator"))
+            else:
+                results.append(_fail("Streamlit iframe height validation", "height=0 was accepted"))
+        except Exception as exc:
+            results.append(_fail("Streamlit iframe height validation", f"{type(exc).__name__}: {exc}"))
 
         try:
             class _FakeLog:
@@ -7317,9 +7334,15 @@ def run_basic_checks() -> list[CheckResult]:
                 self.column_specs.append(n)
                 return [_FakeCtx() for _ in range(len(n) if isinstance(n, (list, tuple)) else int(n))]
             def text_input(self, _label, value="", **_kwargs): return value
-            def radio(self, _label, options=None, **_kwargs): return list(options or [""])[0]
-            def number_input(self, _label, value=0, **_kwargs): return value
-            def selectbox(self, _label, options=None, **_kwargs): return list(options or [""])[0]
+            def radio(self, _label, options=None, **kwargs):
+                key = kwargs.get("key")
+                return self.session_state.get(key, list(options or [""])[0])
+            def number_input(self, _label, value=0, **kwargs):
+                key = kwargs.get("key")
+                return self.session_state.get(key, value)
+            def selectbox(self, _label, options=None, **kwargs):
+                key = kwargs.get("key")
+                return self.session_state.get(key, list(options or [""])[0])
             def multiselect(self, label, options=None, default=None, **_kwargs):
                 self._count(f"multiselect:{label}")
                 if label == "재고위치":
@@ -7823,6 +7846,28 @@ def run_basic_checks() -> list[CheckResult]:
             if f'_prepare_dashboard_multiselect_state("{key}"' not in view_src
             and key != "__dashboard_lite_stock_labels"
         ]
+        dashboard_scalar_keys = (
+            "__dashboard_lite_stock_mode",
+            "__dashboard_lite_major_purchase_vendor_days",
+            "__dashboard_lite_risk_analysis_days",
+            "__dashboard_lite_overstock_inactive_days",
+            "__dashboard_lite_readiness_warning_pct",
+            "__dashboard_lite_risk_quick_view_count",
+            "__dashboard_lite_amount_display_unit",
+        )
+        dashboard_scalar_widget_lines = [
+            line
+            for line in view_src.splitlines()
+            if "st.number_input(" in line or "st.selectbox(" in line or "st.radio(" in line
+        ]
+        dashboard_scalar_default_conflicts = [
+            key
+            for key in dashboard_scalar_keys
+            if any(
+                key in line and re.search(r"(?<![A-Za-z_])(?:value|index|default)\s*=(?!=)", line)
+                for line in dashboard_scalar_widget_lines
+            )
+        ]
         if (
             '"Dashboard Lite v0.1": dashboard_lite.render_dashboard_lite' not in panel_src
             or 'from app.sims.views import users, codes, vendors, goods, road_address, analytics_views, dashboard_lite, rddbc_io_views' not in panel_src
@@ -7852,9 +7897,14 @@ def run_basic_checks() -> list[CheckResult]:
             or 'dashboard_item["role"] = "assistant"' not in main_dashboard_src
             or 'dashboard_primary_area = st.empty()' in main_dashboard_src
             or bool(dashboard_multiselect_default_conflicts)
+            or bool(dashboard_scalar_default_conflicts)
             or 'stock_widget_key = "__dashboard_lite_stock_labels"' not in view_src
             or '_prepare_dashboard_multiselect_state(stock_widget_key, stock_codes)' not in view_src
             or bool(dashboard_multiselect_state_missing)
+            or "_DASHBOARD_PROFILE_SCALAR_DEFAULTS" not in view_src
+            or "_prepare_dashboard_profile_scalar_state()" not in view_src
+            or "min_value=1, step=1, key=\"__dashboard_lite_major_purchase_vendor_days\"" not in view_src
+            or "min_value=0.1, max_value=100.0, step=0.1, key=\"__dashboard_lite_readiness_warning_pct\"" not in view_src
             or 'Dashboard facts / 비교 금지 규칙' in view_src
             or 'with st.expander("추가 확인사항"' in view_src
         ):
@@ -8173,16 +8223,19 @@ def run_basic_checks() -> list[CheckResult]:
 
             setattr(view_mod, "load_dashboard_profile", _fake_profile_loader)
             view_mod._apply_saved_dashboard_profile_once()
-            if profile_st.session_state.get("__dashboard_lite_stock_mode") != "book":
-                profile_restore_errors.append("initial_profile_stock_mode_not_restored")
-            if profile_st.session_state.get("__dashboard_lite_io_gu_list") != ["0012:I_EX"]:
-                profile_restore_errors.append(f"initial_profile_io_gu_not_restored={profile_st.session_state!r}")
-            if profile_st.session_state.get("__dashboard_lite_risk_analysis_days") != 60:
-                profile_restore_errors.append("initial_profile_numeric_not_restored")
+            for source_key, widget_key in view_mod._DASHBOARD_PROFILE_WIDGETS.items():
+                expected_value = view_mod._dashboard_profile_widget_value(source_key, saved_profile[source_key])
+                if profile_st.session_state.get(widget_key) != expected_value:
+                    profile_restore_errors.append(f"initial_profile_widget_not_restored={source_key}:{profile_st.session_state.get(widget_key)!r}")
 
             profile_st.session_state["__dashboard_lite_product_group_list"] = ["live-product"]
+            profile_st.session_state["__dashboard_lite_risk_analysis_days"] = 12
             view_mod._apply_saved_dashboard_profile_once()
-            if len(profile_load_calls) != 1 or profile_st.session_state.get("__dashboard_lite_product_group_list") != ["live-product"]:
+            if (
+                len(profile_load_calls) != 1
+                or profile_st.session_state.get("__dashboard_lite_product_group_list") != ["live-product"]
+                or profile_st.session_state.get("__dashboard_lite_risk_analysis_days") != 12
+            ):
                 profile_restore_errors.append(f"live_state_overwritten={profile_load_calls!r}|{profile_st.session_state!r}")
 
             for widget_key in view_mod._DASHBOARD_PROFILE_WIDGETS.values():
@@ -8199,6 +8252,36 @@ def run_basic_checks() -> list[CheckResult]:
                 profile_restore_errors.append("stale_stock_option_not_pruned")
             if profile_st.session_state.get("__dashboard_lite_product_group_list") != ["0013:G_EX"]:
                 profile_restore_errors.append("stale_product_option_not_pruned")
+
+            empty_profile_st = _FakeStreamlit(submit_sequence=[])
+            setattr(view_mod, "st", empty_profile_st)
+            setattr(view_mod, "_dashboard_context_identity", lambda: {"user_id": "user-b", "company_id": "5", "db_sig": "safe"})
+            setattr(view_mod, "load_dashboard_profile", lambda **_kwargs: None)
+            view_mod._apply_saved_dashboard_profile_once()
+            view_mod._prepare_dashboard_profile_scalar_state()
+            for source_key, default_value in view_mod._DASHBOARD_PROFILE_SCALAR_DEFAULTS.items():
+                widget_key = view_mod._DASHBOARD_PROFILE_WIDGETS[source_key]
+                if empty_profile_st.session_state.get(widget_key) != default_value:
+                    profile_restore_errors.append(f"empty_profile_default_missing={source_key}:{empty_profile_st.session_state!r}")
+
+            company_profile_st = _FakeStreamlit(submit_sequence=[])
+            identities = {"company_id": "4"}
+            company_profiles = {
+                "4": dict(saved_profile),
+                "5": {**saved_profile, "stock_mode": "real", "risk_analysis_days": 45, "amount_display_unit": "won"},
+            }
+            setattr(view_mod, "st", company_profile_st)
+            setattr(view_mod, "_dashboard_context_identity", lambda: {"user_id": "user-c", "company_id": identities["company_id"], "db_sig": "safe"})
+            setattr(view_mod, "load_dashboard_profile", lambda *, company_id: dict(company_profiles[str(company_id)]))
+            view_mod._apply_saved_dashboard_profile_once()
+            identities["company_id"] = "5"
+            view_mod._apply_saved_dashboard_profile_once()
+            if (
+                company_profile_st.session_state.get("__dashboard_lite_stock_mode") != "real"
+                or company_profile_st.session_state.get("__dashboard_lite_risk_analysis_days") != 45
+                or company_profile_st.session_state.get("__dashboard_lite_amount_display_unit") != "won"
+            ):
+                profile_restore_errors.append(f"company_profile_mixed={company_profile_st.session_state!r}")
         except Exception as exc:
             profile_restore_errors.append(f"profile_restore_runtime={type(exc).__name__}:{exc}")
         finally:

@@ -1740,7 +1740,8 @@ def _scroll_to_anchor_js(anchor_id: str, *, center: bool = True) -> None:
     js_id   = _json.dumps(anchor_id) if _json else f'"{anchor_id}"'
     js_block= _json.dumps(block) if _json else f'"{block}"'
 
-    st.iframe(f"""
+    try:
+        st.iframe(f"""
     <script>
     (function(){{
       const ID = {js_id};
@@ -1797,7 +1798,9 @@ def _scroll_to_anchor_js(anchor_id: str, *, center: bool = True) -> None:
       setTimeout(() => obs.disconnect(), 2500);
     }})();
     </script>
-    """, height=0, tab_index=-1)
+    """, height=1, tab_index=-1)
+    except Exception:
+        log.exception("[ui] scroll anchor iframe failed")
 ## ===================================================
 ## CSV/엑셀 파일명에 액션명 반영
 ## =====================================================
@@ -11462,7 +11465,7 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
 }})();
 </script>
 """,
-                height=0,
+                height=1,
                 tab_index=-1,
             )
         else:

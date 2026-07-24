@@ -81,6 +81,16 @@ _DASHBOARD_PROFILE_WIDGETS = {
     "amount_display_unit": "__dashboard_lite_amount_display_unit",
 }
 
+_DASHBOARD_PROFILE_SCALAR_DEFAULTS = {
+    "stock_mode": "real",
+    "major_purchase_vendor_days": 90,
+    "risk_analysis_days": 90,
+    "overstock_inactive_days": 90,
+    "readiness_warning_pct": 98.0,
+    "risk_quick_view_count": 30,
+    "amount_display_unit": "auto",
+}
+
 
 def set_dashboard_lite_render_target(target: Any | None) -> None:
     """Set the main-page container used for the one Dashboard result render."""
@@ -130,6 +140,14 @@ def _prepare_dashboard_multiselect_state(widget_key: str, options: Any) -> list[
         value for value in current_values if value in valid_options
     ]
     return list(st.session_state[widget_key])
+
+
+def _prepare_dashboard_profile_scalar_state() -> None:
+    """Initialize profile-managed scalar widgets before Streamlit creates them."""
+    for source_key, default_value in _DASHBOARD_PROFILE_SCALAR_DEFAULTS.items():
+        widget_key = _DASHBOARD_PROFILE_WIDGETS[source_key]
+        if widget_key not in st.session_state:
+            st.session_state[widget_key] = default_value
 
 
 def _normalized_key_list(values: Any) -> list[str]:
@@ -514,6 +532,11 @@ def _apply_saved_dashboard_profile_once() -> None:
     else:
         restore_reason = "action_reentry"
 
+    if restore_reason == "company_change":
+        for widget_key in _DASHBOARD_PROFILE_WIDGETS.values():
+            st.session_state.pop(widget_key, None)
+        missing_widget_keys = list(_DASHBOARD_PROFILE_WIDGETS.values())
+
     # Manufacturer is deliberately a non-persistent performance test filter.
     # Reset it before applying the shared profile for a fresh Dashboard entry.
     _clear_dashboard_manufacturer_state()
@@ -763,6 +786,7 @@ def _load_dashboard_scope_options() -> dict[str, Any]:
 
 def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
     defaults = default_dashboard_lite_scope()
+    _prepare_dashboard_profile_scalar_state()
     option_cache = st.session_state.get(DASHBOARD_LITE_OPTION_CACHE_KEY)
     if (
         not isinstance(option_cache, dict)
@@ -837,15 +861,15 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
 
             row4 = st.columns(5)
             with row4[0]:
-                major_purchase_vendor_days = st.number_input("대표 매입처 기준기간(일)", min_value=1, value=90, step=1, key="__dashboard_lite_major_purchase_vendor_days")
+                major_purchase_vendor_days = st.number_input("대표 매입처 기준기간(일)", min_value=1, step=1, key="__dashboard_lite_major_purchase_vendor_days")
             with row4[1]:
-                risk_analysis_days = st.number_input("위험 분석기간(일)", min_value=1, value=90, step=1, key="__dashboard_lite_risk_analysis_days")
+                risk_analysis_days = st.number_input("위험 분석기간(일)", min_value=1, step=1, key="__dashboard_lite_risk_analysis_days")
             with row4[2]:
-                overstock_inactive_days = st.number_input("과잉·저활성 기준(일)", min_value=1, value=90, step=1, key="__dashboard_lite_overstock_inactive_days")
+                overstock_inactive_days = st.number_input("과잉·저활성 기준(일)", min_value=1, step=1, key="__dashboard_lite_overstock_inactive_days")
             with row4[3]:
-                readiness_warning_pct = st.number_input("준비율 경고기준(%)", min_value=0.1, max_value=100.0, value=98.0, step=0.1, key="__dashboard_lite_readiness_warning_pct")
+                readiness_warning_pct = st.number_input("준비율 경고기준(%)", min_value=0.1, max_value=100.0, step=0.1, key="__dashboard_lite_readiness_warning_pct")
             with row4[4]:
-                risk_quick_view_count = st.number_input("위험품목 바로보기", min_value=1, value=30, step=1, key="__dashboard_lite_risk_quick_view_count")
+                risk_quick_view_count = st.number_input("위험품목 바로보기", min_value=1, step=1, key="__dashboard_lite_risk_quick_view_count")
         submitted = st.form_submit_button("대시보드 조회", type="primary", width="stretch")
         try:
             from app.ui.ssai_login import has_permission
