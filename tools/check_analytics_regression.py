@@ -619,6 +619,18 @@ def run_basic_checks() -> list[CheckResult]:
             re.S,
         )
         korean_doc_block = korean_doc_block_match.group(0) if korean_doc_block_match else ""
+        scroll_helper_match = re.search(
+            r"def _scroll_to_anchor_js\(.*?(?=\n# ={5,}|\ndef )",
+            main_src,
+            re.S,
+        )
+        scroll_helper_block = scroll_helper_match.group(0) if scroll_helper_match else ""
+        inline_scroll_match = re.search(
+            r"if _jump_to:\s*\n\s*st\.iframe\(.*?(?=\n\s*else:)",
+            main_src,
+            re.S,
+        )
+        inline_scroll_block = inline_scroll_match.group(0) if inline_scroll_match else ""
         source_checks = [
             ("main auto dotenv removed", "load_dotenv(override=True)" not in main_src and 'ENV_PATH = APP_DIR / ".env"' not in main_src and "_DEFAULT_ENV_TEXT" not in main_src),
             ("main chat paths require config_path", 'CHAT_FILE         = str(_config_path("CHAT_FILE"))' in main_src and 'UPLOAD_DIR        = str(_config_path("UPLOAD_DIR"))' in main_src),
@@ -640,6 +652,20 @@ def run_basic_checks() -> list[CheckResult]:
                 and korean_doc_call_pos < login_check_pos
                 and "user_input" not in korean_doc_block
                 and "stc.html(" not in korean_doc_block
+            ),
+            (
+                "Streamlit iframe scroll migration",
+                "import streamlit.components.v1" not in main_src
+                and "stc.html(" not in main_src
+                and main_src.count("st.iframe(") == 2
+                and "height=0, tab_index=-1" in scroll_helper_block
+                and "height=0," in inline_scroll_block
+                and "tab_index=-1" in inline_scroll_block
+                and "window.parent.document" in scroll_helper_block
+                and "window.parent.document" in inline_scroll_block
+                and "scrollIntoView" in scroll_helper_block
+                and "scrollIntoView" in inline_scroll_block
+                and "MutationObserver" in scroll_helper_block,
             ),
             ("db cwd dotenv search removed", "find_dotenv" not in mssql_src),
             ("auth root env parser priority", "p = ENV_PATH" in auth_src and "return env.get(name) or os.environ.get(name) or default" in auth_src),

@@ -124,7 +124,6 @@ _logging_init.getLogger("sqlalchemy.dialects").setLevel(_logging_init.WARNING)
 # =========================
 # Third-party
 # =========================
-import streamlit.components.v1 as stc
 import streamlit as st
 
 # =========================================================
@@ -1741,7 +1740,7 @@ def _scroll_to_anchor_js(anchor_id: str, *, center: bool = True) -> None:
     js_id   = _json.dumps(anchor_id) if _json else f'"{anchor_id}"'
     js_block= _json.dumps(block) if _json else f'"{block}"'
 
-    stc.html(f"""
+    st.iframe(f"""
     <script>
     (function(){{
       const ID = {js_id};
@@ -1798,7 +1797,7 @@ def _scroll_to_anchor_js(anchor_id: str, *, center: bool = True) -> None:
       setTimeout(() => obs.disconnect(), 2500);
     }})();
     </script>
-    """, height=0)
+    """, height=0, tab_index=-1)
 ## ===================================================
 ## CSV/엑셀 파일명에 액션명 반영
 ## =====================================================
@@ -11454,7 +11453,7 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
     # ✅ 검색 점프 / 입력 후 바닥 유지 (Streamlit rerun 스크롤 튐 보정)
     try:
         if _jump_to:
-            stc.html(
+            st.iframe(
                 f"""
 <script>
 (function(){{
@@ -11464,6 +11463,7 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
 </script>
 """,
                 height=0,
+                tab_index=-1,
             )
         else:
             st.session_state.pop("__did_user_input", None)
