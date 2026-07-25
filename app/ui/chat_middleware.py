@@ -8694,15 +8694,22 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
         cache = meta.get("dashboard_cache") if isinstance(meta, dict) else None
         if not isinstance(cache, dict):
             return
+        from app.sims.views.dashboard_lite import dashboard_lite_chat_render_decision
+
         if not _should_render_sims_message_once(item, meta, data):
             return
+        decision = dashboard_lite_chat_render_decision(cache, meta)
+        render_mode = str(decision.get("render_mode") or "chat")
+        render_cache = decision.get("render_cache")
+        if not isinstance(render_cache, dict):
+            render_cache = cache
         role = (item.get("role") or "assistant").lower()
         if role not in ("assistant", "user"):
             role = "assistant"
         with st.chat_message(role):
             from app.sims.views.dashboard_lite import render_dashboard_lite_chat_item
 
-            render_dashboard_lite_chat_item(cache)
+            render_dashboard_lite_chat_item(render_cache, render_mode=render_mode)
         return
 
     if not _should_render_sims_message_once(item, meta, data):

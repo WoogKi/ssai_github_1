@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from typing import Any
 
 import altair as alt
@@ -20,12 +21,16 @@ import streamlit as st
 from app.services.dashboard_lite_facts import (
     build_dashboard_lite_facts,
     default_dashboard_lite_scope,
+    filter_dashboard_risk_detail_rows,
     normalize_dashboard_lite_params,
 )
+from app.services.dashboard_risk_detail_export import build_dashboard_risk_detail_excel_bytes
 from app.services.ssai_analysis_profile_service import PROFILE_PERMISSION, load_dashboard_profile, save_dashboard_profile
 from app.services import rddbc010_service as C01
 from app.db.mssql_client import query_to_df
 from app.sims.views.rddbc_io_shared import _load_stock_code_options
+from app.ui.chat_middleware import get_current_chat_room_id
+from app.ui.ssai_login import require_permission
 
 
 log = logging.getLogger("ssai.sims.dashboard_lite")
@@ -58,6 +63,7 @@ DASHBOARD_LITE_SESSION_KEYS = (
     "__dashboard_lite_exclude_product_group_list",
     "__dashboard_lite_exclude_product_di_list",
     "__dashboard_lite_exclude_product_class_list",
+    "__dashboard_lite_risk_detail_excel_cache",
 )
 
 DASHBOARD_LITE_OPTION_CACHE_KEY = "__dashboard_lite_scope_options"
@@ -113,6 +119,96 @@ def clear_dashboard_lite_session_state(session_state: Any, namespace: str | None
         session_state.pop(key, None)
         removed.append(text)
     return removed
+
+
+def clear_dashboard_lite_active_result(session_state: Any) -> list[str]:
+    """Drop only the room-bound interactive Dashboard result on room changes."""
+    removed: list[str] = []
+    for key in list(session_state.keys()):
+        text = str(key)
+        if text == "__dashboard_lite_result" or text.startswith("__dashboard_lite_risk_detail_"):
+            session_state.pop(key, None)
+            removed.append(text)
+    return removed
+
+
+def dashboard_lite_primary_cache_matches_context(
+    cache: Any,
+    *,
+    current_room_id: Any,
+    current_company_id: Any,
+) -> dict[str, bool]:
+    """Fail closed unless an interactive Dashboard belongs to this room/company."""
+    source = cache if isinstance(cache, dict) else {}
+    cache_room_id = str(source.get("room_id") or "").strip()
+    cache_company_id = str(source.get("company_id") or "").strip()
+    room_id = str(current_room_id or "").strip()
+    company_id = str(current_company_id or "").strip()
+    return {
+        "cache_available": bool(source),
+        "room_match": bool(cache_room_id and room_id and cache_room_id == room_id),
+        "company_match": bool(cache_company_id and company_id and cache_company_id == company_id),
+    }
+
+
+def dashboard_lite_chat_render_decision(chat_cache: Any, chat_meta: Any) -> dict[str, Any]:
+    """Choose primary or compact rendering at the message's chronological position."""
+    cache = chat_cache if isinstance(chat_cache, dict) else {}
+    meta = chat_meta if isinstance(chat_meta, dict) else {}
+    primary = st.session_state.get("__dashboard_lite_result")
+    primary_available = isinstance(primary, dict) and isinstance(primary.get("facts"), dict)
+    primary = primary if primary_available else {}
+
+    chat_room_id = str(meta.get("room_id") or cache.get("room_id") or "").strip()
+    primary_room_id = str(primary.get("room_id") or "").strip()
+    room_match = bool(chat_room_id and primary_room_id and chat_room_id == primary_room_id)
+
+    chat_event_id = str(meta.get("dashboard_event_id") or cache.get("dashboard_event_id") or "").strip()
+    primary_event_id = str(primary.get("dashboard_event_id") or "").strip()
+    event_match = bool(chat_event_id and primary_event_id and chat_event_id == primary_event_id)
+
+    chat_fingerprint = str(cache.get("query_fingerprint") or cache.get("cache_key") or "").strip()
+    primary_fingerprint = str(primary.get("query_fingerprint") or primary.get("cache_key") or "").strip()
+    fingerprint_match = bool(chat_fingerprint and primary_fingerprint and chat_fingerprint == primary_fingerprint)
+    company_match = bool(
+        str(cache.get("company_id") or "").strip()
+        and str(primary.get("company_id") or "").strip()
+        and str(cache.get("company_id") or "").strip() == str(primary.get("company_id") or "").strip()
+    )
+    fallback_match = (
+        (not chat_event_id or not primary_event_id)
+        and company_match
+        and fingerprint_match
+    )
+    render_primary = bool(
+        primary_available
+        and room_match
+        and company_match
+        and (event_match or fallback_match)
+    )
+    action = "render_active_primary" if render_primary else "render_snapshot"
+    render_mode = "primary" if render_primary else "chat"
+    log.info(
+        "[dashboard.chat_render] action=%s primary_available=%s room_match=%s event_match=%s "
+        "fingerprint_match=%s render_mode=%s skipped=False",
+        action,
+        primary_available,
+        room_match,
+        event_match,
+        fingerprint_match,
+        render_mode,
+    )
+    return {
+        "action": action,
+        "primary_available": primary_available,
+        "room_match": room_match,
+        "company_match": company_match,
+        "event_match": event_match,
+        "fingerprint_match": fingerprint_match,
+        "render_mode": render_mode,
+        "render_cache": primary if render_primary else cache,
+        "skipped": False,
+    }
 
 
 def _clean_list(values: Any) -> list[str]:
@@ -684,6 +780,236 @@ def _render_today_actions(facts: dict[str, Any]) -> None:
             },
         )
 
+
+def _risk_detail_instance_key(cache: dict[str, Any]) -> str:
+    params = dict(cache.get("params") or {})
+    room_id = get_current_chat_room_id()
+    source = "|".join(
+        (
+            str(cache.get("company_id") or ""),
+            room_id,
+            str(cache.get("cache_key") or cache.get("query_fingerprint") or ""),
+            str(params.get("month_from") or ""),
+            str(params.get("month_to") or ""),
+            str(params.get("evaluation_month") or ""),
+            str(params.get("manufacturer_scope_label") or "전체"),
+        )
+    )
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+
+
+def _clear_stale_risk_detail_export_cache(instance_key: str) -> None:
+    prefix = "__dashboard_lite_risk_detail_excel::"
+    for key in list(st.session_state.keys()):
+        if str(key).startswith(prefix) and not str(key).endswith(instance_key):
+            st.session_state.pop(key, None)
+
+
+def _risk_detail_vendor_options(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str, str]]:
+    labels = {"전체": "전체", "recent_purchase_none": "최근 매입 없음", "vendor_unknown": "매입처 미확인"}
+    for row in rows:
+        key = str(row.get("_주요매입처필터키") or "")
+        if not key.startswith("assigned:"):
+            continue
+        code = str(row.get("주요매입처코드") or "").strip()
+        name = str(row.get("주요매입처명") or "").strip() or code
+        if code:
+            labels[key] = f"{name} [{code}]"
+    assigned_keys = sorted(key for key in labels if key.startswith("assigned:"))
+    options = ["전체", *assigned_keys]
+    if any(str(row.get("_주요매입처필터키") or "") == "recent_purchase_none" for row in rows):
+        options.append("recent_purchase_none")
+    if any(str(row.get("_주요매입처필터키") or "") == "vendor_unknown" for row in rows):
+        options.append("vendor_unknown")
+    return options, labels
+
+
+def _risk_detail_query_conditions(
+    cache: dict[str, Any],
+    facts: dict[str, Any],
+    *,
+    excel_created_at: str,
+) -> list[dict[str, str]]:
+    params = dict(cache.get("params") or {})
+    inventory = facts.get("inventory") or {}
+    stock_codes = _clean_list(params.get("stock_cd_list"))
+    stock_names = _clean_list(params.get("stock_name_list"))
+    stock_labels = [
+        f"{stock_names[index]} [{code}]" if index < len(stock_names) and stock_names[index] else code
+        for index, code in enumerate(stock_codes)
+    ]
+    stock_mode = "장부재고" if str(params.get("stock_mode") or "") == "book" else "실재고"
+    threshold = _fmt_threshold_pct((facts.get("stock_readiness") or {}).get("threshold_pct") or params.get("readiness_warning_pct") or 98)
+    vendor_summary = inventory.get("vendor_stock_risk_summary") or {}
+    return [
+        {"조건명": "시작월", "값": str(params.get("month_from") or "")},
+        {"조건명": "종료월", "값": str(params.get("month_to") or "")},
+        {"조건명": "평가월", "값": str(params.get("evaluation_month") or "")},
+        {"조건명": "제약사 범위", "값": str(params.get("manufacturer_scope_label") or "전체")},
+        {"조건명": "재고기준", "값": stock_mode},
+        {"조건명": "대상 재고위치", "값": ", ".join(stock_labels) if stock_labels else "전체"},
+        {"조건명": "재고준비율 경고기준", "값": f"{threshold}%"},
+        {"조건명": "주요매입처 기준 시작월", "값": str(vendor_summary.get("basis_month_from") or "")},
+        {"조건명": "주요매입처 기준 종료월", "값": str(vendor_summary.get("basis_month_to") or "")},
+        {"조건명": "주요매입처 기준", "값": "최근 6완료월"},
+        {"조건명": "조회완료시각", "값": str(cache.get("created_at") or "")},
+        {"조건명": "Excel생성시각", "값": str(excel_created_at or "")},
+    ]
+
+
+def _render_risk_detail(
+    facts: dict[str, Any],
+    cache: dict[str, Any],
+    *,
+    render_mode: str,
+) -> None:
+    inventory = facts.get("inventory") or {}
+    summary = inventory.get("risk_detail_summary") or {}
+    rows = inventory.get("risk_detail_rows") or []
+    if not summary:
+        return
+    st.markdown("### 위험 품목 상세")
+    summary_cols = st.columns(5)
+    for column, (label, key) in zip(summary_cols, (
+        ("전체 위험품목", "source_rows"), ("긴급 부족", "emergency_rows"), ("부족 주의", "warning_rows"),
+        ("금액 양수", "amount_positive_rows"), ("금액 0", "zero_amount_rows"),
+    )):
+        with column:
+            _metric_card(label, summary.get(key, 0), "개")
+
+    source_rows = int(summary.get("source_rows") or 0)
+    detail_rows_available = int(len(rows))
+    if render_mode != "primary":
+        log.info(
+            "[dashboard.risk_detail.render] render_mode=%s source_rows=%s detail_rows_available=%s toggle_rendered=False export_controls_allowed=False",
+            render_mode,
+            source_rows,
+            detail_rows_available,
+        )
+        st.caption("위험 상세표와 Excel은 현재 Dashboard 조회 세션에서만 사용할 수 있습니다.")
+        return
+    if not rows:
+        log.info(
+            "[dashboard.risk_detail.render] render_mode=primary source_rows=%s detail_rows_available=0 toggle_rendered=False export_controls_allowed=False",
+            source_rows,
+        )
+        st.caption("위험 상세표와 Excel은 현재 Dashboard 조회 세션에서만 사용할 수 있습니다.")
+        return
+
+    instance_key = _risk_detail_instance_key(cache)
+    _clear_stale_risk_detail_export_cache(instance_key)
+    toggle = getattr(st, "toggle", None)
+    if not callable(toggle):
+        log.info(
+            "[dashboard.risk_detail.render] render_mode=primary source_rows=%s detail_rows_available=%s toggle_rendered=False export_controls_allowed=False",
+            source_rows,
+            detail_rows_available,
+        )
+        return
+    show_detail = toggle("상세표 보기", value=False, key=f"__dashboard_lite_risk_detail_toggle::{instance_key}")
+    if not show_detail:
+        log.info(
+            "[dashboard.risk_detail.render] render_mode=primary source_rows=%s detail_rows_available=%s toggle_rendered=True export_controls_allowed=False",
+            source_rows,
+            detail_rows_available,
+        )
+        return
+    export_controls_allowed = bool(require_permission("EXPORT_EXCEL", show_error=False))
+    log.info(
+        "[dashboard.risk_detail.render] render_mode=primary source_rows=%s detail_rows_available=%s toggle_rendered=True export_controls_allowed=%s",
+        source_rows,
+        detail_rows_available,
+        export_controls_allowed,
+    )
+
+    vendor_options, vendor_labels = _risk_detail_vendor_options(rows)
+    filter_cols = st.columns((1, 2, 1, 1, 2))
+    with filter_cols[0]:
+        risk_status = st.selectbox("위험상태", ["전체 위험", "긴급 부족", "부족 주의"], key=f"__dashboard_lite_risk_detail_status::{instance_key}")
+    with filter_cols[1]:
+        vendor_key = st.selectbox("주요매입처", vendor_options, format_func=lambda value: vendor_labels.get(value, "매입처 미확인"), key=f"__dashboard_lite_risk_detail_vendor::{instance_key}")
+    with filter_cols[2]:
+        surge_filter = st.selectbox("수요급증", ["전체", "수요급증", "일반"], key=f"__dashboard_lite_risk_detail_surge::{instance_key}")
+    with filter_cols[3]:
+        include_zero_amount = st.toggle("금액 0 포함", value=True, key=f"__dashboard_lite_risk_detail_zero::{instance_key}")
+    with filter_cols[4]:
+        search_text = st.text_input("제품 검색", key=f"__dashboard_lite_risk_detail_search::{instance_key}")
+
+    filtered, filter_summary, elapsed_ms = filter_dashboard_risk_detail_rows(
+        rows,
+        risk_status=risk_status,
+        vendor_key=vendor_key,
+        surge_filter=surge_filter,
+        include_zero_amount=include_zero_amount,
+        search_text=search_text,
+    )
+    display_limit = st.selectbox("화면 표시 행 수", [100, 300, 500], index=0, key=f"__dashboard_lite_risk_detail_limit::{instance_key}")
+    display = filtered.head(int(display_limit)).copy()
+    display.insert(0, "순번", range(1, len(display) + 1))
+    display_columns = [
+        "순번", "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "주요매입처명", "현재재고수량",
+        "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액", "위험보정재고준비율", "수요급증세부분류",
+    ]
+    display = display[[column for column in display_columns if column in display.columns]]
+    log.info(
+        "[dashboard.risk_detail] source_rows=%s filtered_rows=%s displayed_rows=%s emergency_rows=%s warning_rows=%s zero_amount_rows=%s vendor_filter_applied=%s surge_filter_applied=%s search_filter_applied=%s include_zero_amount=%s display_limit=%s elapsed_ms=%s",
+        filter_summary["source_rows"], filter_summary["filtered_rows"], len(display), filter_summary["emergency_rows"], filter_summary["warning_rows"], filter_summary["zero_amount_rows"],
+        vendor_key != "전체", surge_filter != "전체", bool(str(search_text or "").strip()), include_zero_amount, display_limit, elapsed_ms,
+    )
+    st.caption(f"필터 결과 {filter_summary['filtered_rows']:,}건 중 상위 {len(display):,}건 표시")
+    st.dataframe(
+        display,
+        width="stretch",
+        height=min(560, max(220, 72 + len(display) * 35)),
+        hide_index=True,
+        column_config={
+            "순번": st.column_config.NumberColumn("순번", format="%d"),
+            "현재재고수량": st.column_config.NumberColumn("현재재고수량", format="%,.2f"),
+            "위험보정잔여예상수요": st.column_config.NumberColumn("위험보정잔여예상수요", format="%,.2f"),
+            "위험보정부족예상수량": st.column_config.NumberColumn("위험보정부족예상수량", format="%,.2f"),
+            "위험보정부족예상금액": st.column_config.NumberColumn("위험보정부족예상금액", format="%,.0f"),
+            "위험보정재고준비율": st.column_config.NumberColumn("위험보정재고준비율", format="%.2f%%"),
+        },
+    )
+
+    if not export_controls_allowed:
+        log.info(
+            "[dashboard.risk_detail_export] permission_allowed=False export_rows=%s vendor_summary_rows=%s",
+            len(rows),
+            len(inventory.get("vendor_stock_risk_rows") or []),
+        )
+        st.warning("다운로드 권한이 없습니다. 필요 권한: EXPORT_EXCEL (엑셀/CSV 다운로드)")
+        return
+    excel_key = f"__dashboard_lite_risk_detail_excel::{instance_key}"
+    cache_entry = st.session_state.get(excel_key)
+    if not isinstance(cache_entry, dict) or not isinstance(cache_entry.get("bytes"), (bytes, bytearray)):
+        if st.button("전체 위험품목 Excel 준비", key=f"__dashboard_lite_risk_detail_prepare::{instance_key}", width="stretch"):
+            try:
+                bytes_value, export_info = build_dashboard_risk_detail_excel_bytes(
+                    rows,
+                    inventory.get("vendor_stock_risk_rows") or [],
+                    _risk_detail_query_conditions(
+                        cache,
+                        facts,
+                        excel_created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ),
+                )
+                st.session_state[excel_key] = {"bytes": bytes_value, "export_info": export_info}
+                st.rerun()
+            except Exception as exc:
+                log.warning("[dashboard.risk_detail_export] export_rows=%s vendor_summary_rows=%s sheet_count=0 bytes_size=0 permission_allowed=True elapsed_ms=0 success=False error_type=%s", len(rows), len(inventory.get("vendor_stock_risk_rows") or []), type(exc).__name__)
+                st.warning("위험 품목 Excel을 준비하지 못했습니다.")
+        return
+    st.download_button(
+        "위험 품목 Excel 다운로드",
+        data=cache_entry["bytes"],
+        file_name="dashboard_risk_detail.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"__dashboard_lite_risk_detail_download::{instance_key}",
+        width="stretch",
+    )
+
+
 def _dashboard_context_identity() -> dict[str, str]:
     try:
         from app.ui.ssai_login import get_current_user, get_selected_company
@@ -1191,6 +1517,10 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
             "stock_demand_surge_summary": dict(inventory.get("stock_demand_surge_summary") or {}),
             "vendor_stock_risk_summary": dict(inventory.get("vendor_stock_risk_summary") or {}),
+            "risk_detail_summary": {
+                key: (inventory.get("risk_detail_summary") or {}).get(key)
+                for key in ("source_rows", "emergency_rows", "warning_rows", "amount_positive_rows", "zero_amount_rows")
+            },
             "data_quality": list(inventory.get("data_quality") or [])[:row_limit],
         },
         "turnover_days": dict(facts.get("turnover_days") or {}),
@@ -1203,6 +1533,8 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
         "cache_key": source.get("cache_key"),
         "query_fingerprint": source.get("query_fingerprint"),
         "company_id": source.get("company_id"),
+        "room_id": source.get("room_id"),
+        "dashboard_event_id": source.get("dashboard_event_id"),
         "params": compact_params,
         "facts": compact_facts,
         "elapsed_ms": source.get("elapsed_ms"),
@@ -1214,7 +1546,12 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
 def _mark_dashboard_room_title() -> bool:
     """Name only a still-empty auto-created room; never replace a normal query title."""
     ss = st.session_state
-    room_id = str(ss.get("__chat_current_room_id") or "").strip()
+    room_id = str(
+        ss.get("__chat_current_room_id")
+        or get_current_chat_room_id()
+        or ss.get("current_room")
+        or ""
+    ).strip()
     if not room_id:
         return False
     rooms = ss.get("chat_rooms") or []
@@ -1222,17 +1559,38 @@ def _mark_dashboard_room_title() -> bool:
         if not isinstance(room, dict) or str(room.get("id") or "") != room_id:
             continue
         has_messages = any(bool(room.get(key)) for key in ("messages", "history", "sims_messages", "gen_messages"))
-        if room.get("auto_created") is not True or has_messages:
+        if (
+            room.get("auto_created") is not True
+            or room.get("name_auto") is not True
+            or room.get("title_initialized") is True
+            or has_messages
+        ):
             return False
-        room["name"] = "Dashboard Lite"
+        created_at = str(room.get("created_at") or "").strip()
+        created_title_time = created_at.replace("T", " ")[:16]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", created_title_time):
+            title_time = created_title_time
+            title_source = "room_created_at"
+        else:
+            title_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+            title_source = "current_time"
+        room_title = f"{title_time} Dashboard Lite"
+        # Preserve this fact before the title mutation.  The panel uses it to
+        # create the persisted-room navigation request before it pushes the
+        # first Dashboard message.
+        ss["__dashboard_lite_pending_room_id"] = room_id
+        room["name"] = room_title
         room["auto_created"] = False
         room["name_auto"] = False
         room["title_initialized"] = True
         room["title_source"] = "dashboard_lite"
         room["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         ss["__chat_room_title_changed_room_id"] = room_id
-        ss["__chat_room_title_changed_name"] = "Dashboard Lite"
-        log.info("[dashboard.room_title] room_title_set=True")
+        ss["__chat_room_title_changed_name"] = room_title
+        log.info(
+            "[dashboard.room_title] room_title_set=True title_has_timestamp=True title_source=%s",
+            title_source,
+        )
         return True
     return False
 
@@ -1249,7 +1607,12 @@ def _render_dashboard_result_header(cache: dict[str, Any]) -> None:
         st.caption(f"조회 완료 · {max(0, elapsed_ms) / 1000:.1f}초")
 
 
-def _render_dashboard_facts(facts: dict[str, Any]) -> None:
+def _render_dashboard_facts(
+    facts: dict[str, Any],
+    cache: dict[str, Any] | None = None,
+    *,
+    render_mode: str,
+) -> None:
     filter_issues = [
         item
         for item in (facts.get("data_quality") or [])
@@ -1279,33 +1642,86 @@ def _render_dashboard_facts(facts: dict[str, Any]) -> None:
 
     st.markdown("### 오늘의 조치")
     _render_today_actions(facts)
+    _render_risk_detail(facts, cache or {}, render_mode=render_mode)
 
 def _render_dashboard_result_in_primary_area(cache: dict[str, Any]) -> None:
-    target = _DASHBOARD_RENDER_TARGET
-    if target is not None and hasattr(target, "container"):
-        with target.container():
-            _render_dashboard_result_header(cache)
-            _render_dashboard_facts(dict(cache.get("facts") or {}))
-        return
+    """Render the active result inline at its chat-history message position."""
     _render_dashboard_result_header(cache)
-    _render_dashboard_facts(dict(cache.get("facts") or {}))
+    _render_dashboard_facts(dict(cache.get("facts") or {}), cache, render_mode="primary")
 
 
-def render_cached_dashboard_lite_primary() -> bool:
-    """Re-render cached facts in the main result area without any source reload."""
-    cache = st.session_state.get("__dashboard_lite_result")
-    facts = cache.get("facts") if isinstance(cache, dict) else None
-    if not isinstance(facts, dict) or not facts:
+def reset_dashboard_lite_primary_render_guard() -> None:
+    """Reset the one-shot primary renderer at the beginning of a script rerun."""
+    st.session_state["__dashboard_lite_primary_rendered_this_run"] = False
+
+
+def _try_render_dashboard_primary_once(cache: dict[str, Any], *, caller: str, reason: str) -> bool:
+    """Render one interactive Dashboard at most once in the current rerun."""
+    if bool(st.session_state.get("__dashboard_lite_primary_rendered_this_run")):
+        log.info(
+            "[dashboard.primary_render] action=skip_already_rendered caller=%s reason=%s guard_before=True guard_after=True cache_available=True target_available=%s detail_rows_available=%s",
+            caller,
+            reason,
+            _DASHBOARD_RENDER_TARGET is not None,
+            len((((cache.get("facts") or {}).get("inventory") or {}).get("risk_detail_rows") or [])),
+        )
         return False
-    _render_dashboard_result_in_primary_area(cache)
+
     st.session_state["__dashboard_lite_primary_rendered_this_run"] = True
+    log.info(
+        "[dashboard.primary_render] action=render caller=%s reason=%s guard_before=False guard_after=True cache_available=True target_available=%s detail_rows_available=%s",
+        caller,
+        reason,
+        _DASHBOARD_RENDER_TARGET is not None,
+        len((((cache.get("facts") or {}).get("inventory") or {}).get("risk_detail_rows") or [])),
+    )
+    _render_dashboard_result_in_primary_area(cache)
     return True
 
 
-def render_dashboard_lite_chat_item(cache: dict[str, Any]) -> None:
-    """Render one immutable Dashboard result inside its chat history message."""
+def render_cached_dashboard_lite_primary(*, caller: str = "main_top", reason: str = "cached_rerun") -> bool:
+    """Re-render cached facts in the main result area without any source reload."""
+    cache = st.session_state.get("__dashboard_lite_result")
+    identity = _dashboard_context_identity()
+    ownership = dashboard_lite_primary_cache_matches_context(
+        cache,
+        current_room_id=get_current_chat_room_id(),
+        current_company_id=identity.get("company_id"),
+    )
+    if ownership["cache_available"] and not (ownership["room_match"] and ownership["company_match"]):
+        clear_dashboard_lite_active_result(st.session_state)
+        log.info(
+            "[dashboard.primary_render] action=skip_room_mismatch caller=%s cache_available=True room_match=%s company_match=%s cache_cleared=True",
+            caller,
+            ownership["room_match"],
+            ownership["company_match"],
+        )
+        return False
+    facts = cache.get("facts") if isinstance(cache, dict) else None
+    if not isinstance(facts, dict) or not facts:
+        log.info(
+            "[dashboard.primary_render] action=no_cache caller=%s reason=%s guard_before=%s guard_after=%s cache_available=False target_available=%s detail_rows_available=0",
+            caller,
+            reason,
+            bool(st.session_state.get("__dashboard_lite_primary_rendered_this_run")),
+            bool(st.session_state.get("__dashboard_lite_primary_rendered_this_run")),
+            _DASHBOARD_RENDER_TARGET is not None,
+        )
+        return False
+    return _try_render_dashboard_primary_once(cache, caller=caller, reason=reason)
+
+
+def render_dashboard_lite_chat_item(cache: dict[str, Any], *, render_mode: str = "chat") -> bool:
+    """Render a Dashboard once at its chronological chat-message position."""
+    if render_mode == "primary":
+        return _try_render_dashboard_primary_once(
+            cache,
+            caller="chat_history",
+            reason="active_message",
+        )
     _render_dashboard_result_header(cache)
-    _render_dashboard_facts(dict(cache.get("facts") or {}))
+    _render_dashboard_facts(dict(cache.get("facts") or {}), cache, render_mode="chat")
+    return True
 
 
 def render_dashboard_lite() -> dict[str, Any]:
@@ -1321,6 +1737,9 @@ def render_dashboard_lite() -> dict[str, Any]:
     if submitted:
         st.session_state["__dashboard_lite_run_seq"] = run_seq + 1
         run_seq += 1
+        for key in list(st.session_state.keys()):
+            if str(key).startswith("__dashboard_lite_risk_detail_excel::"):
+                st.session_state.pop(key, None)
         st.session_state.pop("__dashboard_lite_result", None)
         cache = None
 
@@ -1406,18 +1825,23 @@ def render_dashboard_lite() -> dict[str, Any]:
         }
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
-    st.session_state["__dashboard_lite_result"] = {
+    result_cache = {
         "cache_key": cache_key,
         "query_fingerprint": _dashboard_cache_key(params, run_seq=0),
         "company_id": identity.get("company_id") or "",
+        "room_id": get_current_chat_room_id(),
         "params": params,
         "facts": facts,
         "elapsed_ms": elapsed_ms,
         "elapsed_seconds": round(elapsed_ms / 1000.0, 3),
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
+    event_id = str(uuid.uuid4())
+    result_cache["dashboard_event_id"] = event_id
+    st.session_state["__dashboard_lite_result"] = result_cache
     _mark_dashboard_room_title()
     return {
+        "id": event_id,
         "final": True,
         "type": "dashboard_lite",
         "title": "Dashboard Lite",
@@ -1427,7 +1851,9 @@ def render_dashboard_lite() -> dict[str, Any]:
         "meta": {
             "analysis_type": "dashboard_lite",
             "facts_kind": facts.get("kind"),
-            "dashboard_cache": build_dashboard_lite_chat_snapshot(st.session_state["__dashboard_lite_result"]),
+            "room_id": result_cache["room_id"],
+            "dashboard_event_id": event_id,
+            "dashboard_cache": build_dashboard_lite_chat_snapshot(result_cache),
             "query_summary": _dashboard_scope_header(params),
         },
     }

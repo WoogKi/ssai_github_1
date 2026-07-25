@@ -1521,6 +1521,21 @@ def _remember_dashboard_chat_push_signature(
     seen[_dashboard_chat_push_scope(company_id, room_id)] = signature
 
 
+def _dashboard_event_id_for_push(
+    payload: dict[str, Any],
+    meta: dict[str, Any],
+    cache: dict[str, Any],
+) -> str:
+    """Reuse the pre-push Dashboard event; generate only for malformed legacy input."""
+    existing = str(
+        payload.get("id")
+        or meta.get("dashboard_event_id")
+        or cache.get("dashboard_event_id")
+        or ""
+    ).strip()
+    return existing or str(uuid.uuid4())
+
+
 def _panel_action_key(category: str, action: str) -> str:
     return f"{str(category or '').strip()}::{str(action or '').strip()}"
 
@@ -3329,34 +3344,91 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
         # Dashboard owns its form and the signature prevents rerun duplicates.
         if not duplicate_skip:
             try:
+                room_before_push = next(
+                    (
+                        room
+                        for room in (ss.get("chat_rooms") or [])
+                        if isinstance(room, dict) and str(room.get("id") or "") == room_id
+                    ),
+                    {},
+                )
+                # Dashboard title generation may already have changed
+                # auto_created.  Use the pre-mutation marker instead of
+                # inferring pending state from the changed room object.
+                was_pending_room = (
+                    str(ss.get("__dashboard_lite_pending_room_id") or "") == room_id
+                    or bool(room_before_push.get("auto_created"))
+                )
                 ss.pop("__sims_silent_push", None)
+                # Reuse the event created by Dashboard before push. The UUID
+                # fallback is only for malformed/legacy payloads.
+                event_id = _dashboard_event_id_for_push(payload, meta, cache)
+                payload["id"] = event_id
                 meta["room_id"] = room_id
-                meta["dashboard_event_id"] = str(payload.get("id") or "")
+                meta["dashboard_event_id"] = event_id
+                if isinstance(cache, dict):
+                    cache["room_id"] = room_id
+                    cache["dashboard_event_id"] = event_id
+                    meta["dashboard_cache"] = cache
+                active_cache = ss.get("__dashboard_lite_result")
+                if isinstance(active_cache, dict):
+                    active_cache["room_id"] = room_id
+                    active_cache["dashboard_event_id"] = event_id
                 payload["meta"] = meta
+                if was_pending_room:
+                    ss["__chat_room_nav_request"] = {
+                        "target_room_id": room_id,
+                        "reason": "pending_to_persisted",
+                        "request_id": event_id,
+                    }
+                # push_sims_result_to_chat drains into the in-memory history.
+                # The main entrypoint consumes this marker immediately after
+                # panel rendering and uses its normal partition save path.
+                ss["__dashboard_lite_pending_persist"] = {
+                    "room_id": room_id,
+                    "event_id": event_id,
+                    "was_pending_room": was_pending_room,
+                }
+                ss["__chat_save_perf_event_id"] = event_id
+                ss["__chat_save_dirty_reason"] = "content_changed"
                 push_sims_result_to_chat(payload, action)
+                primary_event_id = str(
+                    active_cache.get("dashboard_event_id")
+                    if isinstance(active_cache, dict)
+                    else ""
+                ).strip()
+                payload_event_id = str(payload.get("id") or "").strip()
+                meta_event_id = str(meta.get("dashboard_event_id") or "").strip()
+                snapshot_event_id = str(
+                    cache.get("dashboard_event_id")
+                    if isinstance(cache, dict)
+                    else ""
+                ).strip()
+                linked_events = (
+                    primary_event_id,
+                    payload_event_id,
+                    meta_event_id,
+                    snapshot_event_id,
+                )
+                log.info(
+                    "[dashboard.event_link] stage=push primary_event_present=%s payload_event_present=%s snapshot_event_present=%s partition_event_present=%s all_equal=%s",
+                    bool(primary_event_id),
+                    bool(payload_event_id and meta_event_id),
+                    bool(snapshot_event_id),
+                    False,
+                    bool(all(linked_events) and len(set(linked_events)) == 1),
+                )
                 _remember_dashboard_chat_push_signature(
                     ss,
                     company_id=company_id,
                     room_id=room_id,
                     signature=signature,
                 )
-                event_id = str(payload.get("id") or ss.get("__sims_last_msg_id") or "")
-                if event_id:
-                    payload["meta"]["dashboard_event_id"] = event_id
                 log.info(
                     "[dashboard.chat_push] room_id=%s event_id=%s render_target=chat duplicate_skip=False",
                     room_id,
                     event_id,
                 )
-                # History was already rendered when the Dashboard form submitted.
-                # One protected rerun renders this new chat item at the normal
-                # newest-message position without panel duplication.
-                rerun_marker = str(ss.get("__dashboard_lite_chat_rerun_event_id") or "")
-                if event_id and rerun_marker != event_id:
-                    ss["__dashboard_lite_chat_rerun_event_id"] = event_id
-                    rerun = getattr(st, "rerun", None)
-                    if callable(rerun):
-                        rerun()
             except Exception as exc:
                 log.warning("[dashboard.chat_push] render_target=chat pushed=False error_type=%s", type(exc).__name__)
         else:

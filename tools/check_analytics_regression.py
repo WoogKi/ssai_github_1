@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import io
 import importlib
 import json
 import logging
@@ -33,6 +34,8 @@ import re
 import sys
 import tempfile
 import traceback
+import warnings
+import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -5905,6 +5908,196 @@ def run_basic_checks() -> list[CheckResult]:
 
         try:
             main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            module_ast = ast.parse(main_src)
+            helper_names = {
+                "_discard_stale_sims_close_for_panel_open",
+                "_consume_sims_close_for_chat_room_change",
+            }
+            helper_nodes = [
+                node
+                for node in module_ast.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in helper_names
+            ]
+            if {node.name for node in helper_nodes} != helper_names:
+                raise AssertionError("panel-close helper extraction failed")
+
+            class _PanelCloseTestLog:
+                def info(self, *_args: Any, **_kwargs: Any) -> None:
+                    return None
+
+                def exception(self, *_args: Any, **_kwargs: Any) -> None:
+                    return None
+
+            class _PanelCloseTestSt:
+                session_state: dict[str, Any] = {}
+
+            close_calls: list[str] = []
+
+            def _fake_close() -> None:
+                close_calls.append("close")
+                _PanelCloseTestSt.session_state["__sims_open"] = False
+                _PanelCloseTestSt.session_state["__sims_panel_active"] = False
+                _PanelCloseTestSt.session_state["__sims_force_open"] = False
+                _PanelCloseTestSt.session_state["__sims_run_flag"] = False
+
+            helper_ns: dict[str, Any] = {
+                "st": _PanelCloseTestSt,
+                "log": _PanelCloseTestLog(),
+                "_close_sims_panel_for_room_change": _fake_close,
+            }
+            exec(
+                compile(
+                    ast.fix_missing_locations(ast.Module(body=helper_nodes, type_ignores=[])),
+                    "panel_close_helpers",
+                    "exec",
+                ),
+                helper_ns,
+            )
+            consume_close = helper_ns["_consume_sims_close_for_chat_room_change"]
+            discard_stale = helper_ns["_discard_stale_sims_close_for_panel_open"]
+
+            state = _PanelCloseTestSt.session_state
+            state.clear()
+            state.update(
+                {
+                    "__ui_event_name": "chat_room_change",
+                    "__ui_event_id": "room-event-a-b",
+                    "__sims_close_for_chat_room_change": {
+                        "token": "request-a-b",
+                        "close_room_id": "room-a",
+                        "current_room_id": "room-b",
+                        "event_id": "room-event-a-b",
+                        "rerun_reason": "chat_room_change",
+                    },
+                    "__sims_open": True,
+                    "__sims_panel_active": True,
+                    "__sims_force_open": True,
+                    "__sims_run_flag": True,
+                }
+            )
+            first_switch_consumed = consume_close(
+                expected_event_id="room-event-a-b",
+                expected_current_room_id="room-b",
+            )
+            first_switch_ok = (
+                first_switch_consumed
+                and "__sims_close_for_chat_room_change" not in state
+                and len(close_calls) == 1
+                and state.get("__sims_open") is False
+                and state.get("__sims_panel_active") is False
+                and state.get("__sims_force_open") is False
+                and state.get("__sims_run_flag") is False
+            )
+
+            state.update(
+                {
+                    "__ui_event_name": "chat_room_change",
+                    "__ui_event_id": "room-event-b-a",
+                    "__sims_close_for_chat_room_change": {
+                        "token": "request-b-a",
+                        "close_room_id": "room-b",
+                        "current_room_id": "room-a",
+                        "event_id": "room-event-b-a",
+                        "rerun_reason": "chat_room_change",
+                    },
+                }
+            )
+            return_switch_consumed = consume_close(
+                expected_event_id="room-event-b-a",
+                expected_current_room_id="room-a",
+            )
+            return_switch_ok = (
+                return_switch_consumed
+                and "__sims_close_for_chat_room_change" not in state
+                and len(close_calls) == 2
+            )
+
+            state.update(
+                {
+                    "__sims_close_for_chat_room_change": {
+                        "token": "stale-room-request",
+                        "close_room_id": "room-b",
+                        "current_room_id": "room-a",
+                        "event_id": "old-room-event",
+                        "rerun_reason": "chat_room_change",
+                    },
+                    "__ui_event_name": "sims_panel_open",
+                    "__ui_event_id": "sims-panel-open-event",
+                }
+            )
+            stale_present, stale_discarded = discard_stale(
+                current_event_id="sims-panel-open-event"
+            )
+            state["__sims_open"] = True
+            state["__sims_panel_active"] = True
+            state["__sims_force_open"] = True
+            state["__sims_run_flag"] = True
+            first_click_open_ok = (
+                stale_present
+                and stale_discarded
+                and "__sims_close_for_chat_room_change" not in state
+                and len(close_calls) == 2
+                and state.get("__sims_open") is True
+                and state.get("__sims_panel_active") is True
+                and state.get("__sims_force_open") is True
+                and state.get("__sims_run_flag") is True
+            )
+
+            room_switch_start = main_src.index(
+                "# 채팅방 선택과 SIMS 패널 닫기를 같은 room-change 흐름에서 완료한다."
+            )
+            room_switch_end = main_src.index(
+                "_clear_current_table_source_for_room_change()", room_switch_start
+            )
+            same_flow_src = main_src[room_switch_start:room_switch_end]
+            same_flow_order_ok = (
+                same_flow_src.find("_request_sims_close_for_chat_room_change(") >= 0
+                and same_flow_src.find("_consume_sims_close_for_chat_room_change(")
+                > same_flow_src.find("_request_sims_close_for_chat_room_change(")
+            )
+            callback_nodes = [
+                node
+                for node in module_ast.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in {
+                    "_queue_chat_room_selector_request",
+                    "_new_room",
+                    "_apply_rename",
+                }
+            ]
+            explicit_callback_reruns = 0
+            for callback_node in callback_nodes:
+                for child in ast.walk(callback_node):
+                    if not isinstance(child, ast.Call):
+                        continue
+                    func = child.func
+                    if (
+                        isinstance(func, ast.Attribute)
+                        and isinstance(func.value, ast.Name)
+                        and func.value.id == "st"
+                        and func.attr in {"rerun", "experimental_rerun"}
+                    ):
+                        explicit_callback_reruns += 1
+
+            if not first_switch_ok:
+                results.append(_fail("SIMS panel first-click room close flow", "room A -> B close was not consumed exactly once"))
+            elif not return_switch_ok:
+                results.append(_fail("SIMS panel first-click room close flow", "room B -> A close was not consumed exactly once"))
+            elif not first_click_open_ok:
+                results.append(_fail("SIMS panel first-click room close flow", "stale room close cancelled the first panel-open event"))
+            elif not same_flow_order_ok:
+                results.append(_fail("SIMS panel first-click room close flow", "room-change request/consume are not in the same flow"))
+            elif explicit_callback_reruns:
+                results.append(_fail("SIMS panel first-click room close flow", f"callback explicit reruns={explicit_callback_reruns}"))
+            else:
+                results.append(_ok("SIMS panel first-click room close flow", "room changes consume panel-close once; stale close is discarded before first panel-open; callbacks have no explicit rerun"))
+        except Exception as e:
+            results.append(_fail("SIMS panel first-click room close flow", f"{type(e).__name__}: {e}"))
+
+        try:
+            main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            panel_src = Path("app/ui/sims_panel.py").read_text(encoding="utf-8")
             helper_start = main_src.index("def _room_has_any_messages")
             start = main_src.index("def _compute_room_sidebar_state")
             end = main_src.index("\ndef _ensure_sims_panel_room_title", start)
@@ -5926,6 +6119,25 @@ def run_basic_checks() -> list[CheckResult]:
             pending_rooms = rooms + [{"id": "pending", "name": "새 대화", "auto_created": True, "messages": []}]
             initial = compute(pending_rooms, current_room_id="pending", filter_text="", page=0, previous_filter="", page_size=10, initial_to_last=True)
             pending = compute(pending_rooms, current_room_id="pending", filter_text="", page=0, previous_filter="", page_size=10, initial_to_last=True)
+            rooms_51 = [{"id": f"persisted-{i:02d}", "name": f"persisted {i:02d}"} for i in range(51)]
+            pending_to_persisted = compute(
+                rooms_51,
+                current_room_id="persisted-50",
+                filter_text="",
+                page=4,
+                previous_filter="",
+                page_size=10,
+                target_room_id="persisted-50",
+            )
+            filtered_target = compute(
+                rooms_51,
+                current_room_id="persisted-50",
+                filter_text="50",
+                page=0,
+                previous_filter="50",
+                page_size=10,
+                target_room_id="persisted-50",
+            )
             has_save_current_room_guard = (
                 "def _valid_current_room_id_for_rooms" in main_src
                 and "current_room_for_meta = _valid_current_room_id_for_rooms(rooms_to_save)" in main_src
@@ -6105,6 +6317,8 @@ def run_basic_checks() -> list[CheckResult]:
                 "page0_request": page0_pick == "room-00",
                 "pending_return_request": pending_pick == "pending",
                 "room_select_phase_logs": has_room_select_log,
+                "pending_to_persisted_moves_to_exact_page": pending_to_persisted["page"] == 5 and pending_to_persisted["target_room_found"] and pending_to_persisted["target_room_index"] == 50 and pending_to_persisted["current_room_visible"],
+                "filtered_target_uses_filtered_page": filtered_target["page"] == 0 and filtered_target["target_room_found"] and filtered_target["target_room_index"] == 0 and filtered_target["current_room_visible"],
                 "selected_page2_history_message": loaded_page2_message == "history-message-room-21",
                 "selected_page1_history_message": loaded_page1_message == "history-message-room-10",
                 "selected_page0_history_message": loaded_page0_message == "history-message-room-00",
@@ -6121,11 +6335,32 @@ def run_basic_checks() -> list[CheckResult]:
         try:
             main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
             tree = ast.parse(main_src)
+            chat_callback_names = {
+                "_queue_chat_room_selector_request",
+                "_queue_search_reset",
+                "_apply_rename",
+                "_room_prev_page",
+                "_room_next_page",
+                "_do_delete",
+            }
+            chat_callback_defs = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name in chat_callback_names
+            ]
+            callback_rerun_calls = [
+                node
+                for function_node in chat_callback_defs
+                for node in ast.walk(function_node)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"rerun", "experimental_rerun"}
+            ]
             selector_names = {
                 "_log_chat_room_selector",
                 "_is_chat_room_id",
                 "_sync_chat_room_selector_state",
-                "_request_chat_room_selector_app_rerun",
                 "_queue_chat_room_selector_request",
                 "_consume_chat_room_selector_request",
                 "_clear_chat_room_selector_request_state",
@@ -6298,12 +6533,25 @@ def run_basic_checks() -> list[CheckResult]:
                 persisted_ids=[room_a, room_b],
                 persisted_widget_key=page3_key,
             )
+            page5_key = f"{persisted_key}_page_5"
+            page5_session = {"current_room": room_a, page5_key: room_a}
+            sync_selector(
+                page5_session,
+                canonical_room_id=room_a,
+                pending_ids=[],
+                persisted_ids=[room_b],
+                persisted_widget_key=page5_key,
+            )
+            sentinel_value = selector_ns["_CHAT_ROOM_SELECT_SENTINEL"]
+            page5_session[page5_key] = sentinel_value
+            queue_selector(page5_session, widget_key=page5_key, room_kind="persisted")
+            page5_empty_request = consume_selector(page5_session, valid_room_ids=[room_b])
             checks = {
-                "a_to_b_once": bool(ab_request) and ab_session.get("current_room") == room_b and ab_session.get(persisted_key) == room_b and pending_key not in ab_session,
-                "a_to_b_requests_app_rerun_once": ab_rerun_count == 1 and "__chat_room_selector_app_rerun_token" not in ab_session,
+                "a_to_b_once": bool(ab_request) and ab_session.get("current_room") == room_b and ab_session.get(persisted_key) == room_b and ab_session.get(pending_key, sentinel_value) == sentinel_value,
+                "a_to_b_callback_has_no_explicit_rerun": ab_rerun_count == 0 and "__chat_room_selector_app_rerun_token" not in ab_session,
                 "b_to_a_once": bool(ba_request) and ba_session.get("current_room") == room_a and ba_session.get(persisted_key) == room_a,
-                "pending_to_persisted_once": bool(pending_request) and pending_session.get("current_room") == room_a and pending_key not in pending_session and pending_session.get(persisted_key) == room_a,
-                "pending_to_persisted_requests_app_rerun_once": pending_rerun_count == 1 and "__chat_room_selector_app_rerun_token" not in pending_session,
+                "pending_to_persisted_once": bool(pending_request) and pending_session.get("current_room") == room_a and pending_session.get(pending_key) == sentinel_value and pending_session.get(persisted_key) == room_a,
+                "pending_to_persisted_callback_has_no_explicit_rerun": pending_rerun_count == 0 and "__chat_room_selector_app_rerun_token" not in pending_session,
                 "dashboard_to_general_once": bool(dashboard_request) and dashboard_session.get("current_room") == dashboard_room,
                 "large_room_guard_no_bounce": bool(large_request) and large_session.get("current_room") == large_room and large_session.get(persisted_key) == large_room,
                 "request_consumed_once": bool(duplicate_first) and duplicate_second is None,
@@ -6315,6 +6563,7 @@ def run_basic_checks() -> list[CheckResult]:
                 "legacy_title_state_removed": legacy_pending_key not in legacy_title_state and legacy_persisted_key not in legacy_title_state and legacy_title_state.get("current_room") == room_a,
                 "selector_v2_keys": "_selector_v2_id" in pending_key and "_selector_v2_id" in persisted_key,
                 "page_key_keeps_room_id": page3_session.get(page3_key) == room_a,
+                "page_change_clears_out_of_view_selector": page5_session.get(page5_key) == sentinel_value and page5_empty_request is None and page5_session.get("current_room") == room_a,
                 "new_pending_clears_stale_request": "current_room" in stale_state and not any(
                     key in stale_state
                     for key in (
@@ -6325,8 +6574,10 @@ def run_basic_checks() -> list[CheckResult]:
                     )
                 ),
                 "selector_logs_present": "[chat.room.selector]" in main_src and '"before_render"' in main_src and '"after_switch"' in main_src and '"after_rerun"' in main_src and '"callback_invalid"' in main_src and "widget_value_type=" in main_src and "value_in_room_ids=" in main_src,
-                "selector_callback_requests_app_rerun": "_request_chat_room_selector_app_rerun()" in main_src and 'st.rerun(scope="app")' in main_src,
-                "page_scoped_options": "_page_{selector_page}" in main_src and "options=options_ids" in main_src and "format_func=lambda rid" in main_src,
+                "selector_callback_uses_streamlit_auto_rerun": "_request_chat_room_selector_app_rerun" not in main_src,
+                "chat_widget_callbacks_have_no_explicit_rerun": not callback_rerun_calls,
+                "page_scoped_options": "_page_{selector_page}" in main_src and "options=[_CHAT_ROOM_SELECT_SENTINEL, *options_ids]" in main_src and "채팅방을 선택하세요" in main_src,
+                "pending_nav_request_consumed": "__chat_room_nav_request" in main_src and "request_consumed=%s" in main_src and "target_room_id" in panel_src,
             }
             failed_checks = [name for name, passed in checks.items() if not passed]
             if failed_checks:
@@ -6335,6 +6586,80 @@ def run_basic_checks() -> list[CheckResult]:
                 results.append(_ok("chat room selector canonical synchronization", "callback request is consumed once, canonical room ID and selector state remain aligned across persisted, pending, dashboard, and large-room transitions"))
         except Exception as e:
             results.append(_fail("chat room selector canonical synchronization", f"{type(e).__name__}: {e}"))
+
+        try:
+            main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            main_tree = ast.parse(main_src)
+            zip_helper = next(
+                node
+                for node in main_tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_make_unique_chat_zip_entry_name"
+            )
+            zip_ns: dict[str, Any] = {"re": re}
+            exec(
+                compile(
+                    ast.Module(body=[zip_helper], type_ignores=[]),
+                    "chat_zip_entry_helper",
+                    "exec",
+                ),
+                zip_ns,
+            )
+            make_entry_name = zip_ns["_make_unique_chat_zip_entry_name"]
+            room_titles = [
+                "Dashboard Lite",
+                "Dashboard Lite",
+                "Dashboard Lite",
+                "A/B",
+                "A B",
+                "Room",
+                "room",
+                "",
+            ]
+            used_names: set[str] = set()
+            entry_names = [make_entry_name(title, used_names) for title in room_titles]
+            zip_buffer = io.BytesIO()
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for index, entry_name in enumerate(entry_names):
+                        archive.writestr(
+                            entry_name,
+                            json.dumps({"index": index}, ensure_ascii=False),
+                        )
+            with zipfile.ZipFile(io.BytesIO(zip_buffer.getvalue()), "r") as archive:
+                stored_names = archive.namelist()
+            duplicate_warnings = [
+                warning
+                for warning in caught
+                if "Duplicate name" in str(warning.message)
+            ]
+            checks = {
+                "same_title_sequence": entry_names[:3] == [
+                    "Dashboard_Lite.json",
+                    "Dashboard_Lite_2.json",
+                    "Dashboard_Lite_3.json",
+                ],
+                "sanitized_collision_sequence": entry_names[3:5] == [
+                    "A_B.json",
+                    "A_B_2.json",
+                ],
+                "case_insensitive_collision": entry_names[5:7] == [
+                    "Room.json",
+                    "room_2.json",
+                ],
+                "empty_title_fallback": entry_names[7] == "chat_room.json",
+                "all_entries_preserved": len(stored_names) == len(room_titles),
+                "casefold_unique": len({name.casefold() for name in stored_names}) == len(stored_names),
+                "no_duplicate_name_warning": not duplicate_warnings,
+            }
+            failed_checks = [name for name, passed in checks.items() if not passed]
+            if failed_checks:
+                results.append(_fail("chat room ZIP unique entry names", f"failed_checks={failed_checks} names={entry_names}"))
+            else:
+                results.append(_ok("chat room ZIP unique entry names", f"entries={len(stored_names)} casefold_unique=True duplicate_warnings=0"))
+        except Exception as e:
+            results.append(_fail("chat room ZIP unique entry names", f"{type(e).__name__}: {e}"))
 
         try:
             login_src = Path("app/ui/ssai_login.py").read_text(encoding="utf-8")
@@ -7708,6 +8033,10 @@ def run_basic_checks() -> list[CheckResult]:
             def radio(self, _label, options=None, **kwargs):
                 key = kwargs.get("key")
                 return self.session_state.get(key, list(options or [""])[0])
+            def toggle(self, _label, value=False, **kwargs):
+                self._count("toggle")
+                key = kwargs.get("key")
+                return self.session_state.get(key, value)
             def number_input(self, _label, value=0, **kwargs):
                 key = kwargs.get("key")
                 return self.session_state.get(key, value)
@@ -7735,6 +8064,8 @@ def run_basic_checks() -> list[CheckResult]:
         old_code_options = getattr(view_mod, "_dashboard_code_name_options")
         old_manufacturer_query = getattr(view_mod, "query_to_df")
         old_dashboard_target = getattr(view_mod, "_DASHBOARD_RENDER_TARGET")
+        old_dashboard_identity = getattr(view_mod, "_dashboard_context_identity")
+        old_current_chat_room_id = getattr(view_mod, "get_current_chat_room_id")
         build_calls: list[dict] = []
         requested_gcodes: list[str] = []
         option_calls = {"stock": 0, "code": 0}
@@ -7777,10 +8108,20 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(view_mod, "build_dashboard_lite_facts", _fake_build)
             setattr(view_mod, "_dashboard_stock_options", _fake_stock_options)
             setattr(view_mod, "_dashboard_code_name_options", _fake_code_options)
+            setattr(view_mod, "_dashboard_context_identity", lambda: {"user_id": "8", "company_id": "4", "db_sig": ""})
+            setattr(view_mod, "get_current_chat_room_id", lambda: "dashboard-room")
             primary_target = _FakeDashboardTarget()
             view_mod.set_dashboard_lite_render_target(primary_target)
+            fake_st.session_state["current_room"] = "dashboard-room"
             fake_st.session_state["__chat_current_room_id"] = "dashboard-room"
-            fake_st.session_state["chat_rooms"] = [{"id": "dashboard-room", "name": "새 대화", "auto_created": True}]
+            fake_st.session_state["chat_rooms"] = [{
+                "id": "dashboard-room",
+                "name": "새 대화",
+                "created_at": "2026-07-25T17:49:31+09:00",
+                "auto_created": True,
+                "name_auto": True,
+                "title_initialized": False,
+            }]
             opened = view_mod.render_dashboard_lite()
             if build_calls:
                 render_errors.append(f"open_called_service={len(build_calls)}")
@@ -7829,15 +8170,97 @@ def run_basic_checks() -> list[CheckResult]:
             dashboard_cache = fake_st.session_state.get("__dashboard_lite_result") or {}
             if not {"company_id", "query_fingerprint", "elapsed_seconds", "created_at"}.issubset(dashboard_cache):
                 render_errors.append(f"dashboard_result_metadata_missing={dashboard_cache!r}")
-            if fake_st.session_state["chat_rooms"][0].get("name") != "Dashboard Lite":
+            if fake_st.session_state["chat_rooms"][0].get("name") != "2026-07-25 17:49 Dashboard Lite":
                 render_errors.append(f"dashboard_room_title={fake_st.session_state['chat_rooms'][0]!r}")
+            if (
+                fake_st.session_state["chat_rooms"][0].get("auto_created") is not False
+                or fake_st.session_state["chat_rooms"][0].get("name_auto") is not False
+                or fake_st.session_state["chat_rooms"][0].get("title_initialized") is not True
+            ):
+                render_errors.append(f"dashboard_room_title_flags={fake_st.session_state['chat_rooms'][0]!r}")
+            title_after_first_submit = fake_st.session_state["chat_rooms"][0].get("name")
+            if view_mod._mark_dashboard_room_title() is not False or fake_st.session_state["chat_rooms"][0].get("name") != title_after_first_submit:
+                render_errors.append("dashboard_room_title_changed_on_repeat")
+
+            protected_rooms = [
+                {
+                    "id": "dashboard-room",
+                    "name": "사용자 지정 제목",
+                    "created_at": "2026-07-25T17:50:00",
+                    "auto_created": True,
+                    "name_auto": False,
+                    "title_initialized": True,
+                },
+                {
+                    "id": "saved-dashboard-room",
+                    "name": "Dashboard Lite",
+                    "created_at": "2026-07-24T10:00:00",
+                    "auto_created": False,
+                    "name_auto": False,
+                    "title_initialized": True,
+                },
+            ]
+            fake_st.session_state["chat_rooms"] = protected_rooms
+            fake_st.session_state["current_room"] = "dashboard-room"
+            fake_st.session_state["__chat_current_room_id"] = "dashboard-room"
+            if view_mod._mark_dashboard_room_title() is not False or protected_rooms[0]["name"] != "사용자 지정 제목":
+                render_errors.append(f"dashboard_user_title_overwritten={protected_rooms[0]!r}")
+            fake_st.session_state["current_room"] = "saved-dashboard-room"
+            fake_st.session_state["__chat_current_room_id"] = "saved-dashboard-room"
+            setattr(view_mod, "get_current_chat_room_id", lambda: "saved-dashboard-room")
+            if view_mod._mark_dashboard_room_title() is not False or protected_rooms[1]["name"] != "Dashboard Lite":
+                render_errors.append(f"dashboard_saved_title_rewritten={protected_rooms[1]!r}")
+            fake_st.session_state["chat_rooms"] = [{
+                "id": "dashboard-room",
+                "name": title_after_first_submit,
+                "created_at": "2026-07-25T17:49:31+09:00",
+                "auto_created": False,
+                "name_auto": False,
+                "title_initialized": True,
+            }]
+            fake_st.session_state["current_room"] = "dashboard-room"
+            fake_st.session_state["__chat_current_room_id"] = "dashboard-room"
+            setattr(view_mod, "get_current_chat_room_id", lambda: "dashboard-room")
             if fake_st.calls.get("rerun"):
                 render_errors.append(f"dashboard_unexpected_rerun={fake_st.calls.get('rerun')}")
             if first.get("type") != "dashboard_lite" or not first.get("final"):
                 render_errors.append(f"dashboard_chat_payload_missing={first!r}")
             if not isinstance(first.get("meta", {}).get("dashboard_cache"), dict):
                 render_errors.append("dashboard_chat_cache_missing")
-            view_mod.render_dashboard_lite_chat_item(first["meta"]["dashboard_cache"])
+            if (
+                not dashboard_cache.get("dashboard_event_id")
+                or first.get("id") != dashboard_cache.get("dashboard_event_id")
+                or first.get("meta", {}).get("dashboard_event_id") != dashboard_cache.get("dashboard_event_id")
+                or first.get("meta", {}).get("dashboard_cache", {}).get("dashboard_event_id") != dashboard_cache.get("dashboard_event_id")
+            ):
+                render_errors.append("dashboard_event_id_not_created_before_snapshot")
+            render_tree = ast.parse(Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8"))
+            render_node = next(
+                node
+                for node in render_tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "render_dashboard_lite"
+            )
+            dashboard_uuid_calls = [
+                node
+                for node in ast.walk(render_node)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "uuid"
+                and node.func.attr == "uuid4"
+            ]
+            if len(dashboard_uuid_calls) != 1:
+                render_errors.append(f"dashboard_event_uuid_create_count={len(dashboard_uuid_calls)}")
+            if primary_target.container_calls != 0:
+                render_errors.append(f"dashboard_panel_rendered_primary={primary_target.container_calls}")
+            view_mod.reset_dashboard_lite_primary_render_guard()
+            if view_mod.render_dashboard_lite_chat_item(dashboard_cache, render_mode="primary") is not True:
+                render_errors.append("dashboard_primary_message_render_missing")
+            primary_detail_rows = ((dashboard_cache.get("facts") or {}).get("inventory") or {}).get("risk_detail_rows") or []
+            primary_toggle_before_chat = fake_st.calls.get("toggle", 0)
+            if view_mod.render_dashboard_lite_chat_item(dashboard_cache, render_mode="primary") is not False:
+                render_errors.append("dashboard_same_rerun_primary_not_guarded")
+            view_mod.render_dashboard_lite_chat_item(first["meta"]["dashboard_cache"], render_mode="chat")
             if not any(text == "## Dashboard Lite" for text in fake_st.markdowns):
                 render_errors.append("dashboard_result_title_not_rendered")
             if not any("조회기간:" in text and "평가월:" in text and "재고위치:" in text for text in fake_st.captions):
@@ -7846,8 +8269,14 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append(f"dashboard_completed_header_missing={fake_st.captions!r}")
             if second.get("meta", {}).get("facts_kind") != "SIMS_DASHBOARD_FACTS_V01":
                 render_errors.append("rerun_cache_not_rendered")
-            if primary_target.container_calls:
-                render_errors.append(f"dashboard_panel_duplicate_render={primary_target.container_calls}")
+            if primary_target.container_calls != 0:
+                render_errors.append(f"dashboard_primary_render_escaped_message_position={primary_target.container_calls}")
+            if primary_detail_rows and primary_toggle_before_chat < 1:
+                render_errors.append("dashboard_primary_detail_toggle_missing")
+            if fake_st.calls.get("toggle", 0) != primary_toggle_before_chat:
+                render_errors.append("dashboard_chat_snapshot_rendered_detail_toggle")
+            if len((((fake_st.session_state.get("__dashboard_lite_result") or {}).get("facts") or {}).get("inventory") or {}).get("risk_detail_rows") or []) != len(primary_detail_rows):
+                render_errors.append("dashboard_chat_push_mutated_primary_detail_rows")
             view_mod.clear_dashboard_lite_session_state(fake_st.session_state)
             after_company_change = view_mod.render_dashboard_lite()
             if len(build_calls) != 1:
@@ -7907,6 +8336,8 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(view_mod, "_dashboard_stock_options", old_stock_options)
             setattr(view_mod, "_dashboard_code_name_options", old_code_options)
             setattr(view_mod, "query_to_df", old_manufacturer_query)
+            setattr(view_mod, "_dashboard_context_identity", old_dashboard_identity)
+            setattr(view_mod, "get_current_chat_room_id", old_current_chat_room_id)
             view_mod.set_dashboard_lite_render_target(old_dashboard_target)
 
         if render_errors:
@@ -8313,12 +8744,101 @@ def run_basic_checks() -> list[CheckResult]:
             dashboard_order_errors.append(f"history_anchor={history_anchor}")
         if '"__dashboard_lite_result"' not in view_src or '"type": "dashboard_lite"' not in view_src:
             dashboard_order_errors.append("dashboard_not_chat_history_state")
-        if 'dashboard_primary_area = st.empty()' in main_dashboard_src:
-            dashboard_order_errors.append("legacy_dashboard_primary_area_present")
+        if '_dashboard_primary_target = st.empty()' in main_dashboard_src:
+            dashboard_order_errors.append("dashboard_top_primary_target_remaining")
+        if 'render_cached_dashboard_lite_primary()' in main_dashboard_src:
+            dashboard_order_errors.append("dashboard_top_cached_render_remaining")
+        if '_render_dashboard_primary_after_panel_if_requested' in main_dashboard_src:
+            dashboard_order_errors.append("dashboard_post_panel_primary_render_remaining")
+        if 'render_mode = str(decision.get("render_mode") or "chat")' not in chat_middleware_dashboard_src:
+            dashboard_order_errors.append("dashboard_message_position_mode_dispatch_missing")
+        try:
+            order_tree = ast.parse(main_dashboard_src)
+            order_nodes = [
+                node
+                for node in order_tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name in {
+                    "normalize_ts",
+                    "_message_time_key",
+                    "_message_dedupe_key",
+                    "_build_room_render_messages",
+                }
+            ]
+            order_ns: dict[str, Any] = {"re": re}
+            exec(
+                compile(
+                    ast.Module(body=order_nodes, type_ignores=[]),
+                    "dashboard_chronological_order",
+                    "exec",
+                ),
+                order_ns,
+            )
+            build_render_messages = order_ns["_build_room_render_messages"]
+            mixed_room = {
+                "messages": [
+                    {"id": "user-list", "type": "table", "title": "사용자목록", "time": "2026-07-25 23:10:00"},
+                ],
+                "history": [
+                    {"id": "dashboard-a", "type": "dashboard_lite", "title": "Dashboard Lite", "time": "2026-07-25 22:17:00"},
+                    {"id": "dashboard-b", "type": "dashboard_lite", "title": "Dashboard Lite", "time": "2026-07-25 22:57:00"},
+                    {"id": "dashboard-c", "type": "dashboard_lite", "title": "Dashboard Lite", "time": "2026-07-25 23:20:00"},
+                    {"id": "dashboard-d", "type": "dashboard_lite", "title": "Dashboard Lite", "time": "2026-07-25 23:20:00"},
+                ],
+            }
+            chronological = build_render_messages(mixed_room)
+            chronological_ids = [item.get("id") for item in chronological]
+            if chronological_ids != ["dashboard-a", "dashboard-b", "user-list", "dashboard-c", "dashboard-d"]:
+                dashboard_order_errors.append(f"mixed_dashboard_sims_order={chronological_ids!r}")
+
+            active_primary = {
+                "company_id": "company-a",
+                "room_id": "room-a",
+                "dashboard_event_id": "dashboard-c",
+                "query_fingerprint": "same-query",
+                "facts": {"inventory": {"risk_detail_rows": [{"제품코드": "P1"}]}},
+            }
+            original_view_st = view_mod.st
+            mode_st = type("ModeSt", (), {"session_state": {"__dashboard_lite_result": active_primary}})()
+            view_mod.st = mode_st
+            try:
+                event_modes = [
+                    view_mod.dashboard_lite_chat_render_decision(
+                        {
+                            "company_id": "company-a",
+                            "room_id": "room-a",
+                            "dashboard_event_id": event_id,
+                            "query_fingerprint": "same-query",
+                        },
+                        {"room_id": "room-a", "dashboard_event_id": event_id},
+                    ).get("render_mode")
+                    for event_id in ("dashboard-a", "dashboard-b", "dashboard-c")
+                ]
+                if event_modes != ["chat", "chat", "primary"]:
+                    dashboard_order_errors.append(f"same_room_primary_modes={event_modes!r}")
+                mode_st.session_state.pop("__dashboard_lite_result", None)
+                return_modes = [
+                    view_mod.dashboard_lite_chat_render_decision(
+                        {
+                            "company_id": "company-a",
+                            "room_id": "room-a",
+                            "dashboard_event_id": event_id,
+                            "query_fingerprint": "same-query",
+                        },
+                        {"room_id": "room-a", "dashboard_event_id": event_id},
+                    ).get("render_mode")
+                    for event_id in ("dashboard-a", "dashboard-b", "dashboard-c")
+                ]
+                if return_modes != ["chat", "chat", "chat"]:
+                    dashboard_order_errors.append(f"room_return_compact_modes={return_modes!r}")
+            finally:
+                view_mod.st = original_view_st
+        except Exception as exc:
+            dashboard_order_errors.append(f"chronological_runtime={type(exc).__name__}:{exc}")
         if dashboard_order_errors:
             results.append(_fail("Dashboard Lite primary document order", "; ".join(dashboard_order_errors)))
         else:
-            results.append(_ok("Dashboard Lite primary document order", "each completed Dashboard is rendered once in chronological chat history without a panel or top-level duplicate"))
+            results.append(_ok("Dashboard Lite primary document order", "chronological chat history owns Dashboard rendering; only the active event uses primary controls and older events stay compact"))
 
         dashboard_roundtrip_errors: list[str] = []
         try:
@@ -8340,7 +8860,10 @@ def run_basic_checks() -> list[CheckResult]:
                 "_json_sanitize": lambda value: value,
                 "build_dashboard_lite_chat_snapshot": view_mod.build_dashboard_lite_chat_snapshot,
                 "Any": Any,
-                "log": type("Log", (), {"warning": staticmethod(lambda *_args, **_kwargs: None)})(),
+                "log": type("Log", (), {
+                    "warning": staticmethod(lambda *_args, **_kwargs: None),
+                    "info": staticmethod(lambda *_args, **_kwargs: None),
+                })(),
             }
             exec(compile(ast.Module(body=[minimal_snapshot_node, partition_node], type_ignores=[]), "dashboard_partition", "exec"), partition_ns)
             dashboard_payload = {
@@ -8361,7 +8884,15 @@ def run_basic_checks() -> list[CheckResult]:
             restored_meta = restored_dashboard.get("meta") or {}
             if restored_dashboard.get("type") != "dashboard_lite" or restored_dashboard.get("id") != "dashboard-event-1":
                 dashboard_roundtrip_errors.append(f"payload_identity={restored_dashboard!r}")
-            if restored_meta.get("room_id") != "room-dashboard" or not isinstance((restored_meta.get("dashboard_cache") or {}).get("facts"), dict):
+            restored_cache = restored_meta.get("dashboard_cache") or {}
+            if (
+                restored_meta.get("room_id") != "room-dashboard"
+                or restored_dashboard.get("id") != restored_meta.get("dashboard_event_id")
+                or restored_cache.get("room_id") != "room-dashboard"
+                or restored_dashboard.get("id") != restored_cache.get("dashboard_event_id")
+                or restored_cache.get("dashboard_event_id") != "dashboard-event-1"
+                or not isinstance(restored_cache.get("facts"), dict)
+            ):
                 dashboard_roundtrip_errors.append(f"payload_cache_lost={restored_meta!r}")
             full_cache = {
                 "params": {
@@ -8421,6 +8952,15 @@ def run_basic_checks() -> list[CheckResult]:
                 or "facts" in fallback_cache
             ):
                 dashboard_roundtrip_errors.append(f"partitioned_dashboard_fallback_not_closed bytes={len(fallback_json)} cache={fallback_cache!r}")
+            # Exercise the final compact message record as written by the
+            # partition pipeline, not only the snapshot builder.
+            tmp_partition = Path(tempfile.mkdtemp(prefix="dashboard_partition_")) / "messages.jsonl"
+            tmp_partition.write_text(json.dumps(partitioned_full, ensure_ascii=False) + "\n", encoding="utf-8")
+            restored_records = [json.loads(line) for line in tmp_partition.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if len(restored_records) != 1 or len(tmp_partition.read_bytes()) > 65_536:
+                dashboard_roundtrip_errors.append("partitioned_dashboard_record_roundtrip_failed")
+            if "readiness_rows" in json.dumps(restored_records, ensure_ascii=False):
+                dashboard_roundtrip_errors.append("partitioned_dashboard_record_contains_readiness_rows")
             if 'if str(m.get("type") or "").strip().lower() == "dashboard_lite"' not in main_dashboard_src:
                 dashboard_roundtrip_errors.append("renderer_dispatch_missing")
         except Exception as exc:
@@ -8495,8 +9035,10 @@ def run_basic_checks() -> list[CheckResult]:
                     }
 
             original_chat_st = dashboard_chat_mod.st
+            original_view_st = view_mod.st
             fake_chat_st = _FakeChatStreamlit()
             dashboard_chat_mod.st = fake_chat_st
+            view_mod.st = fake_chat_st
             try:
                 pending_dashboard = {
                     "id": "dashboard-event-a",
@@ -8517,8 +9059,152 @@ def run_basic_checks() -> list[CheckResult]:
                     dashboard_delivery_errors.append("dashboard_distinct_event_blocked")
                 if dashboard_chat_mod.get_current_chat_room_id() != "room-a":
                     dashboard_delivery_errors.append("dashboard_current_room_id_missing")
+
+                active_primary = {
+                    "company_id": "company-a",
+                    "room_id": "room-a",
+                    "dashboard_event_id": "dashboard-event-a",
+                    "query_fingerprint": "same-query",
+                    "facts": {},
+                }
+                fake_chat_st.session_state["__dashboard_lite_result"] = active_primary
+                active_cache = {"company_id": "company-a", "room_id": "room-a", "query_fingerprint": "same-query"}
+                active_meta = {"room_id": "room-a", "dashboard_event_id": "dashboard-event-a"}
+                active_decision = view_mod.dashboard_lite_chat_render_decision(active_cache, active_meta)
+                if (
+                    active_decision.get("skipped")
+                    or active_decision.get("action") != "render_active_primary"
+                    or active_decision.get("render_mode") != "primary"
+                    or active_decision.get("render_cache") is not active_primary
+                ):
+                    dashboard_delivery_errors.append(f"dashboard_active_message_not_primary={active_decision!r}")
+                exact_event_snapshot = view_mod.build_dashboard_lite_chat_snapshot(
+                    {
+                        "company_id": "company-a",
+                        "room_id": "room-a",
+                        "dashboard_event_id": "dashboard-event-a",
+                        "query_fingerprint": "same-query",
+                        "facts": {},
+                    }
+                )
+                if exact_event_snapshot.get("room_id") != "room-a" or exact_event_snapshot.get("dashboard_event_id") != "dashboard-event-a":
+                    dashboard_delivery_errors.append(f"dashboard_snapshot_event_not_preserved={exact_event_snapshot!r}")
+
+                previous_decision = view_mod.dashboard_lite_chat_render_decision(
+                    active_cache,
+                    {"room_id": "room-a", "dashboard_event_id": "dashboard-event-previous"},
+                )
+                other_room_decision = view_mod.dashboard_lite_chat_render_decision(
+                    active_cache,
+                    {"room_id": "room-b", "dashboard_event_id": "dashboard-event-a"},
+                )
+                if (
+                    previous_decision.get("render_mode") != "chat"
+                    or other_room_decision.get("render_mode") != "chat"
+                ):
+                    dashboard_delivery_errors.append("dashboard_history_snapshot_not_compact")
+
+                fake_chat_st.session_state.pop("__dashboard_lite_result", None)
+                no_primary_decision = view_mod.dashboard_lite_chat_render_decision(active_cache, active_meta)
+                if no_primary_decision.get("render_mode") != "chat":
+                    dashboard_delivery_errors.append("dashboard_snapshot_without_primary_not_compact")
+
+                primary_cleanup_state = {
+                    "__dashboard_lite_result": {"facts": {}},
+                    "__dashboard_lite_risk_detail_excel::active": {"bytes": b"x"},
+                    "__dashboard_lite_product_group_list": ["0013:A"],
+                }
+                view_mod.clear_dashboard_lite_active_result(primary_cleanup_state)
+                if (
+                    "__dashboard_lite_result" in primary_cleanup_state
+                    or "__dashboard_lite_risk_detail_excel::active" in primary_cleanup_state
+                    or "__dashboard_lite_product_group_list" not in primary_cleanup_state
+                ):
+                    dashboard_delivery_errors.append(f"dashboard_room_switch_primary_cleanup={primary_cleanup_state!r}")
+
+                ownership_same_room = view_mod.dashboard_lite_primary_cache_matches_context(
+                    active_primary,
+                    current_room_id="room-a",
+                    current_company_id="company-a",
+                )
+                ownership_other_room = view_mod.dashboard_lite_primary_cache_matches_context(
+                    active_primary,
+                    current_room_id="room-b",
+                    current_company_id="company-a",
+                )
+                ownership_other_company = view_mod.dashboard_lite_primary_cache_matches_context(
+                    active_primary,
+                    current_room_id="room-a",
+                    current_company_id="company-b",
+                )
+                if not (ownership_same_room["room_match"] and ownership_same_room["company_match"]):
+                    dashboard_delivery_errors.append(f"dashboard_primary_same_room_rejected={ownership_same_room!r}")
+                if ownership_other_room["room_match"] or not ownership_other_room["company_match"]:
+                    dashboard_delivery_errors.append(f"dashboard_primary_room_mismatch_not_detected={ownership_other_room!r}")
+                if ownership_other_company["company_match"] or not ownership_other_company["room_match"]:
+                    dashboard_delivery_errors.append(f"dashboard_primary_company_mismatch_not_detected={ownership_other_company!r}")
+
+                mismatch_cleanup_state = {
+                    "__dashboard_lite_result": active_primary,
+                    "__dashboard_lite_risk_detail_excel::room-a": {"bytes": b"x"},
+                    "__dashboard_lite_product_group_list": ["0013:A"],
+                }
+                if ownership_other_room["room_match"] or not ownership_other_room["company_match"]:
+                    dashboard_delivery_errors.append("dashboard_primary_room_mismatch_policy_invalid")
+                else:
+                    view_mod.clear_dashboard_lite_active_result(mismatch_cleanup_state)
+                    if "__dashboard_lite_result" in mismatch_cleanup_state or "__dashboard_lite_risk_detail_excel::room-a" in mismatch_cleanup_state:
+                        dashboard_delivery_errors.append(f"dashboard_primary_room_mismatch_not_cleared={mismatch_cleanup_state!r}")
+
+                middleware_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
+                for token in ("dashboard_lite_chat_render_decision", "_should_render_sims_message_once"):
+                    if token not in middleware_src:
+                        dashboard_delivery_errors.append(f"dashboard_snapshot_render_guard={token}")
+                view_src_for_delivery = Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8")
+                if "render_active_primary" not in view_src_for_delivery:
+                    dashboard_delivery_errors.append("dashboard_active_primary_dispatch_log_missing")
+                for token in (
+                    "dashboard_lite_primary_cache_matches_context",
+                    "action=skip_room_mismatch",
+                    "current_room_id=get_current_chat_room_id()",
+                    "clear_dashboard_lite_active_result(st.session_state)",
+                ):
+                    if token not in view_src_for_delivery:
+                        dashboard_delivery_errors.append(f"dashboard_primary_room_ownership_guard_missing={token}")
+                panel_src_for_delivery = Path("app/ui/sims_panel.py").read_text(encoding="utf-8")
+                if 'payload["id"] = event_id' not in panel_src_for_delivery or 'cache["dashboard_event_id"] = event_id' not in panel_src_for_delivery:
+                    dashboard_delivery_errors.append("dashboard_event_id_not_linked_before_push")
+                if (
+                    '"__dashboard_lite_pending_persist"' not in panel_src_for_delivery
+                    or '"__chat_save_dirty_reason"] = "content_changed"' not in panel_src_for_delivery
+                    or '"__chat_room_nav_request"' not in panel_src_for_delivery
+                    or 'def _flush_pending_dashboard_chat_persistence()' not in main_dashboard_src
+                    or 'save_chat_rooms()' not in main_dashboard_src[main_dashboard_src.find("def _flush_pending_dashboard_chat_persistence()"):]
+                    or '"messages_jsonl" in changed_fields' not in main_dashboard_src
+                ):
+                    dashboard_delivery_errors.append("dashboard_partition_save_pipeline_missing")
+                if not hasattr(view_mod, "reset_dashboard_lite_primary_render_guard"):
+                    dashboard_delivery_errors.append("dashboard_primary_guard_runtime_missing")
             finally:
                 dashboard_chat_mod.st = original_chat_st
+                view_mod.st = original_view_st
+
+            original_panel_uuid4 = dashboard_panel_mod.uuid.uuid4
+            try:
+                dashboard_panel_mod.uuid.uuid4 = lambda: (_ for _ in ()).throw(
+                    AssertionError("normal Dashboard push reached UUID fallback")
+                )
+                precreated_event = dashboard_panel_mod._dashboard_event_id_for_push(
+                    {"id": "dashboard-event-precreated"},
+                    {"dashboard_event_id": "dashboard-event-precreated"},
+                    {"dashboard_event_id": "dashboard-event-precreated"},
+                )
+                if precreated_event != "dashboard-event-precreated":
+                    dashboard_delivery_errors.append(f"dashboard_precreated_event_not_reused={precreated_event!r}")
+            except Exception as exc:
+                dashboard_delivery_errors.append(f"dashboard_event_fallback_reached={type(exc).__name__}:{exc}")
+            finally:
+                dashboard_panel_mod.uuid.uuid4 = original_panel_uuid4
 
             session_state: dict[str, Any] = {}
             dashboard_panel_mod._remember_dashboard_chat_push_signature(
@@ -8833,6 +9519,142 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard Lite vendor stock risk", "; ".join(vendor_stock_risk_errors)))
         else:
             results.append(_ok("Dashboard Lite vendor stock risk", "one major vendor per product, recent-six priority/fallback, risk reconciliation, compact snapshot, and two-source contract verified"))
+
+        risk_detail_errors: list[str] = []
+        try:
+            risk_detail_mod = importlib.import_module("app.services.dashboard_risk_detail_export")
+            key = {
+                "state": "\uc7ac\uace0\uc704\ud5d8\uc0c1\ud0dc",
+                "reason": "\uc7ac\uace0\uc704\ud5d8\uc0ac\uc720",
+                "amount": "\uc704\ud5d8\ubcf4\uc815\ubd80\uc871\uc608\uc0c1\uae08\uc561",
+                "qty": "\uc704\ud5d8\ubcf4\uc815\ubd80\uc871\uc608\uc0c1\uc218\ub7c9",
+                "surge": "\uc218\uc694\uae09\uc99d\uc5ec\ubd80",
+                "vendor_code": "\uc8fc\uc694\ub9e4\uc785\ucc98\ucf54\ub4dc",
+                "vendor_name": "\uc8fc\uc694\ub9e4\uc785\ucc98\uba85",
+                "vendor_status": "\uc8fc\uc694\ub9e4\uc785\ucc98\uc0c1\ud0dc",
+                "stock_qty": "\ud604\uc7ac\uc7ac\uace0\uc218\ub7c9",
+                "stock_amt": "\ud604\uc7ac\uc7ac\uace0\uae08\uc561",
+                "readiness": "\uc704\ud5d8\ubcf4\uc815\uc7ac\uace0\uc900\ube44\uc728",
+            }
+            detail_source = [
+                {
+                    "product_code": "P-001", "product_name": "Alpha", "specification": "10", "manufacturer_name": "M1",
+                    key["state"]: "\uae34\uae09 \ubd80\uc871", key["reason"]: "\ubd80\uc871", key["amount"]: 500.0, key["qty"]: 5.0,
+                    key["surge"]: True, key["vendor_code"]: "A", key["vendor_name"]: "Vendor A", key["vendor_status"]: "assigned",
+                    key["stock_qty"]: 1.0, key["stock_amt"]: 100.0, key["readiness"]: 20.0,
+                },
+                {
+                    "product_code": "P-002", "product_name": "Beta", key["state"]: "\ubd80\uc871 \uc8fc\uc758", key["reason"]: "\uc8fc\uc758",
+                    key["amount"]: 0.0, key["qty"]: 1.0, key["surge"]: False,
+                    key["vendor_code"]: "", key["vendor_name"]: "", key["vendor_status"]: "vendor_unknown",
+                },
+                {
+                    "product_code": "P-003", "product_name": "Gamma", key["state"]: "\uc801\uc815", key["amount"]: 900.0,
+                },
+            ]
+            detail_rows, detail_summary = dash_mod._build_dashboard_risk_detail(detail_source, stock_mode="real")
+            if len(detail_rows) != 2 or int(detail_summary.get("emergency_rows") or 0) != 1 or int(detail_summary.get("warning_rows") or 0) != 1:
+                risk_detail_errors.append(f"detail_status_summary={detail_summary!r}")
+            filtered_df, filtered_summary, _ = dash_mod.filter_dashboard_risk_detail_rows(
+                detail_rows,
+                risk_status="\uae34\uae09 \ubd80\uc871",
+                vendor_key="assigned:A",
+                surge_filter="\uc218\uc694\uae09\uc99d",
+                include_zero_amount=True,
+                search_text="P-001",
+            )
+            if len(filtered_df) != 1 or int(filtered_summary.get("filtered_rows") or 0) != 1:
+                risk_detail_errors.append(f"detail_filter={filtered_summary!r}")
+            nonzero_df, _, _ = dash_mod.filter_dashboard_risk_detail_rows(detail_rows, include_zero_amount=False)
+            if len(nonzero_df) != 1:
+                risk_detail_errors.append(f"detail_zero_exclusion={len(nonzero_df)}")
+
+            detail_rows[0]["_\uc8fc\uc694\ub9e4\uc785\ucc98\ud544\ud130\ud0a4"] = "assigned:A"
+            excel_bytes, excel_info = risk_detail_mod.build_dashboard_risk_detail_excel_bytes(
+                detail_rows,
+                [{"\uc8fc\uc694\ub9e4\uc785\ucc98\uba85": "Vendor A", "\uc804\uccb4\uc704\ud5d8\ubcf4\uc815\ubd80\uc871\uae08\uc561": 500.0}],
+                [
+                    {"\uc870\ud68c\uc870\uac74": "\uc870\ud68c\uc644\ub8cc\uc2dc\uac01", "\uc801\uc6a9\uac12": "query-finished"},
+                    {"\uc870\ud68c\uc870\uac74": "Excel\uc0dd\uc131\uc2dc\uac01", "\uc801\uc6a9\uac12": "excel-created"},
+                ],
+            )
+            from io import BytesIO
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(BytesIO(excel_bytes), read_only=False)
+            if set(workbook.sheetnames) != {risk_detail_mod.DETAIL_SHEET_NAME, risk_detail_mod.VENDOR_SHEET_NAME, risk_detail_mod.SCOPE_SHEET_NAME}:
+                risk_detail_errors.append(f"excel_sheets={workbook.sheetnames!r}")
+            detail_sheet = workbook[risk_detail_mod.DETAIL_SHEET_NAME]
+            detail_headers = [str(cell.value or "") for cell in detail_sheet[1]]
+            readiness_column = detail_headers.index(key["readiness"]) + 1 if key["readiness"] in detail_headers else 0
+            readiness_cell = detail_sheet.cell(row=2, column=readiness_column) if readiness_column else None
+            if (
+                int(excel_info.get("export_rows") or 0) != 2
+                or detail_sheet.freeze_panes != "A2"
+                or any(header.startswith("_") for header in detail_headers)
+                or "_\uc8fc\uc694\ub9e4\uc785\ucc98\ud544\ud130\ud0a4" in detail_headers
+                or not {"\uc81c\ud488\ucf54\ub4dc", key["amount"], key["vendor_name"]}.issubset(set(detail_headers))
+                or readiness_cell is None
+                or readiness_cell.value != 20.0
+                or readiness_cell.number_format != r"0.00\%"
+            ):
+                risk_detail_errors.append(f"excel_contract={excel_info!r}")
+            scope_sheet = workbook[risk_detail_mod.SCOPE_SHEET_NAME]
+            scope_pairs = {
+                str(scope_sheet.cell(row=row_index, column=1).value or ""): str(scope_sheet.cell(row=row_index, column=2).value or "")
+                for row_index in range(2, scope_sheet.max_row + 1)
+            }
+            if scope_pairs.get("\uc870\ud68c\uc644\ub8cc\uc2dc\uac01") != "query-finished" or scope_pairs.get("Excel\uc0dd\uc131\uc2dc\uac01") != "excel-created":
+                risk_detail_errors.append(f"scope_timestamps={scope_pairs!r}")
+
+            primary_detail_count = len(detail_rows)
+            detail_cache = {
+                "params": {"month_from": "202601", "month_to": "202606", "evaluation_month": "202607"},
+                "facts": {"inventory": {"risk_detail_summary": detail_summary, "risk_detail_rows": detail_rows, "readiness_rows": detail_rows}},
+            }
+            detail_snapshot = view_mod.build_dashboard_lite_chat_snapshot(detail_cache)
+            snapshot_json = json.dumps(detail_snapshot, ensure_ascii=False)
+            primary_detail_after_snapshot = len(
+                (((detail_cache.get("facts") or {}).get("inventory") or {}).get("risk_detail_rows") or [])
+            )
+            if (
+                "risk_detail_rows" in snapshot_json
+                or "risk_detail_summary" not in snapshot_json
+                or primary_detail_after_snapshot != primary_detail_count
+            ):
+                risk_detail_errors.append("risk_detail_snapshot_contract")
+            detail_view_segment = view_src[view_src.find("def _render_risk_detail"):view_src.find("def _render_today_actions")]
+            for token in ("filter_dashboard_risk_detail_rows", "build_dashboard_risk_detail_excel_bytes", 'require_permission("EXPORT_EXCEL"', "__dashboard_lite_risk_detail_excel::"):
+                if token not in view_src:
+                    risk_detail_errors.append(f"risk_detail_ui_token={token}")
+            detail_filter_source = dashboard_facts_src[
+                dashboard_facts_src.find("def filter_dashboard_risk_detail_rows"):
+                dashboard_facts_src.find("def _attach_major_purchase_vendors")
+            ]
+            if "build_dashboard_lite_facts(" in detail_filter_source:
+                risk_detail_errors.append("risk_detail_filter_reloads_facts")
+            risk_detail_render_source = view_src[view_src.find("def _render_risk_detail"):view_src.find("def _dashboard_context_identity")]
+            no_rows_index = risk_detail_render_source.find("if not rows:")
+            toggle_index = risk_detail_render_source.find("toggle(")
+            if no_rows_index < 0 or toggle_index < 0 or no_rows_index > toggle_index:
+                risk_detail_errors.append("snapshot_toggle_not_blocked_before_render")
+            for token in ('render_mode="primary"', 'render_mode="chat"', 'render_mode != "primary"', "[dashboard.risk_detail.render]"):
+                if token not in view_src:
+                    risk_detail_errors.append(f"risk_detail_render_mode_missing={token}")
+            query_conditions = view_mod._risk_detail_query_conditions(
+                {"created_at": "query-finished", "params": {}},
+                {"inventory": {}},
+                excel_created_at="excel-created",
+            )
+            query_condition_values = {str(row.get("\uc870\uac74\uba85") or ""): str(row.get("\uac12") or "") for row in query_conditions}
+            if query_condition_values.get("\uc870\ud68c\uc644\ub8cc\uc2dc\uac01") != "query-finished" or query_condition_values.get("Excel\uc0dd\uc131\uc2dc\uac01") != "excel-created":
+                risk_detail_errors.append(f"query_condition_timestamps={query_condition_values!r}")
+        except Exception as exc:
+            risk_detail_errors.append(f"risk_detail_runtime={type(exc).__name__}:{exc}")
+        if risk_detail_errors:
+            results.append(_fail("Dashboard Lite risk detail and Excel export", "; ".join(risk_detail_errors)))
+        else:
+            results.append(_ok("Dashboard Lite risk detail and Excel export", "risk filters run on cached facts, Excel has three sheets, and detail rows stay outside the chat snapshot"))
 
         ui_security_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
         chat_middleware_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")

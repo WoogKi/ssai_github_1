@@ -744,6 +744,7 @@ _CHAT_ROOM_SELECTOR_REQUEST_KEY = "__chat_room_selector_request"
 _CHAT_ROOM_SELECTOR_CONSUMED_TOKEN_KEY = "__chat_room_selector_consumed_token"
 _CHAT_ROOM_SELECTOR_VALID_IDS_KEY = "__chat_room_selector_valid_ids"
 _CHAT_ROOM_SELECTOR_APP_RERUN_TOKEN_KEY = "__chat_room_selector_app_rerun_token"
+_CHAT_ROOM_SELECT_SENTINEL = "__select_room__"
 _CHAT_ROOM_LEGACY_SELECTOR_PREFIXES = (
     "__chat_room_pending_selector_id",
     "__chat_room_persisted_selector_id",
@@ -814,26 +815,17 @@ def _sync_chat_room_selector_state(
         (pending_widget_key, pending, "pending"),
         (persisted_widget_key, persisted, "persisted"),
     ):
-        desired = canonical if canonical in allowed else ""
+        # A page can legitimately not include the room that is currently open.
+        # Keep the canonical room unchanged, but never leave a previous page's
+        # room id inside this page's widget state.
+        desired = canonical if canonical in allowed else _CHAT_ROOM_SELECT_SENTINEL
         if queued_room_id in allowed and queued_kind == label:
             desired = queued_room_id
         previous = str(session.get(key) or "")
-        if desired:
-            if previous != desired:
-                session[key] = desired
-                changed[label] = True
-        elif key in session:
-            session.pop(key, None)
-            changed[label] = bool(previous)
+        if previous != desired:
+            session[key] = desired
+            changed[label] = True
     return changed
-
-
-def _request_chat_room_selector_app_rerun() -> None:
-    """Leave a selector callback through the app-level room-switch consumer."""
-    try:
-        st.rerun(scope="app")
-    except TypeError:
-        st.rerun()
 
 
 def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: str, room_kind: str) -> None:
@@ -847,6 +839,22 @@ def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: st
         for room_id in (session.get(_CHAT_ROOM_SELECTOR_VALID_IDS_KEY) or [])
         if _is_chat_room_id(room_id)
     }
+    if requested == _CHAT_ROOM_SELECT_SENTINEL:
+        _log_chat_room_selector(
+            "callback_noop",
+            widget_key=widget_key,
+            widget_room_id=requested,
+            canonical_room_id=canonical,
+            requested_room_id="",
+            previous_room_id=canonical,
+            page=page,
+            room_kind=room_kind,
+            rerun_reason="empty_selection",
+            mismatch_detected=False,
+            widget_value_type=type(session.get(widget_key)).__name__,
+            value_in_room_ids=False,
+        )
+        return
     if not requested or not _is_chat_room_id(requested) or requested not in valid_ids:
         _log_chat_room_selector(
             "callback_invalid",
@@ -905,9 +913,6 @@ def _queue_chat_room_selector_request(session: dict[str, Any], *, widget_key: st
         widget_value_type=type(session.get(widget_key)).__name__,
         value_in_room_ids=True,
     )
-    _request_chat_room_selector_app_rerun()
-
-
 def _consume_chat_room_selector_request(
     session: dict[str, Any],
     *,
@@ -978,11 +983,34 @@ def _log_sims_panel_room_close_state(phase: str, *, failed_key: str = "") -> Non
         pass
 
 
-def _request_sims_close_for_chat_room_change() -> None:
+def _request_sims_close_for_chat_room_change(
+    *,
+    close_request_token: str = "",
+    close_room_id: str = "",
+    current_room_id: str = "",
+    event_id: str = "",
+    rerun_reason: str = "chat_room_change",
+) -> dict[str, str]:
+    request = {
+        "token": str(close_request_token or event_id or _new_ui_event_id("panel_close")).strip(),
+        "close_room_id": str(close_room_id or "").strip(),
+        "current_room_id": str(current_room_id or "").strip(),
+        "event_id": str(event_id or "").strip(),
+        "rerun_reason": str(rerun_reason or "chat_room_change").strip(),
+    }
     try:
-        st.session_state["__sims_close_for_chat_room_change"] = True
+        st.session_state["__sims_close_for_chat_room_change"] = request
+        log.info(
+            "[chat.room.panel_close] action=request close_requested=True close_consumed=False close_request_token=%s close_room_id=%s current_room_id=%s rerun_reason=%s event_id=%s",
+            request["token"],
+            request["close_room_id"],
+            request["current_room_id"],
+            request["rerun_reason"],
+            request["event_id"],
+        )
     except Exception:
-        pass
+        log.exception("[chat.room.panel_close] request failed")
+    return request
 
 
 def _request_sims_close_for_new_pending_room() -> None:
@@ -995,7 +1023,14 @@ def _request_sims_close_for_new_pending_room() -> None:
     실제 panel key 정리는 다음 rerun 최상단의 guard 소비 지점에서 수행한다.
     """
     try:
-        st.session_state["__sims_close_for_chat_room_change"] = True
+        current_room_id = str(st.session_state.get("current_room") or "").strip()
+        event_id = str(st.session_state.get("__ui_event_id") or "").strip()
+        _request_sims_close_for_chat_room_change(
+            close_request_token=event_id,
+            current_room_id=current_room_id,
+            event_id=event_id,
+            rerun_reason="chat_room_change",
+        )
         st.session_state["__ui_rerun_reason"] = "chat_room_change"
         st.session_state["__sims_panel_active"] = False
         st.session_state["__sims_force_open"] = False
@@ -1099,6 +1134,13 @@ def _close_sims_panel_for_room_change() -> None:
         ss["__sims_rendered"] = False
         ss["__sims_was_final"] = False
 
+        try:
+            from app.sims.views.dashboard_lite import clear_dashboard_lite_active_result
+
+            clear_dashboard_lite_active_result(ss)
+        except Exception:
+            log.debug("[chat.room] dashboard_lite_primary_clear_failed", exc_info=False)
+
         for key in [
             "__sims_result",
             "__sims_context",
@@ -1131,11 +1173,81 @@ def _close_sims_panel_for_room_change() -> None:
         log.exception("[chat.room] close SIMS panel state failed")
 
 
-def _consume_sims_close_for_chat_room_change() -> bool:
+def _discard_stale_sims_close_for_panel_open(*, current_event_id: str) -> tuple[bool, bool]:
+    """Discard a previous room-change close before applying a new panel-open event."""
     try:
-        if not st.session_state.pop("__sims_close_for_chat_room_change", False):
+        raw_request = st.session_state.pop("__sims_close_for_chat_room_change", None)
+        if not raw_request:
+            return False, False
+        request = raw_request if isinstance(raw_request, dict) else {}
+        log.info(
+            "[chat.room.panel_close] action=discard_stale_close stale_request_token=%s stale_room_id=%s current_event=sims_panel_open current_event_id=%s",
+            str(request.get("token") or ""),
+            str(request.get("close_room_id") or ""),
+            str(current_event_id or ""),
+        )
+        return True, True
+    except Exception:
+        log.exception("[chat.room.panel_close] stale discard failed")
+        return True, False
+
+
+def _consume_sims_close_for_chat_room_change(
+    *,
+    expected_event_id: str = "",
+    expected_current_room_id: str = "",
+) -> bool:
+    try:
+        raw_request = st.session_state.get("__sims_close_for_chat_room_change")
+        if not raw_request:
             return False
+        request = raw_request if isinstance(raw_request, dict) else {}
+        current_event = str(
+            st.session_state.get("__ui_event_name")
+            or st.session_state.get("__ui_rerun_reason")
+            or ""
+        ).strip()
+        current_event_id = str(st.session_state.get("__ui_event_id") or "").strip()
+        request_event_id = str(request.get("event_id") or "").strip()
+        request_current_room_id = str(request.get("current_room_id") or "").strip()
+
+        stale_for_panel_open = (
+            current_event == "sims_panel_open"
+            and (not request_event_id or request_event_id != current_event_id)
+        )
+        event_mismatch = bool(
+            expected_event_id
+            and request_event_id
+            and request_event_id != str(expected_event_id)
+        )
+        room_mismatch = bool(
+            expected_current_room_id
+            and request_current_room_id
+            and request_current_room_id != str(expected_current_room_id)
+        )
+        if stale_for_panel_open or event_mismatch or room_mismatch:
+            st.session_state.pop("__sims_close_for_chat_room_change", None)
+            log.info(
+                "[chat.room.panel_close] action=discard_stale_close stale_request_token=%s stale_room_id=%s current_event=%s current_event_id=%s event_mismatch=%s room_mismatch=%s",
+                str(request.get("token") or ""),
+                str(request.get("close_room_id") or ""),
+                current_event,
+                current_event_id,
+                event_mismatch,
+                room_mismatch,
+            )
+            return False
+
+        st.session_state.pop("__sims_close_for_chat_room_change", None)
         _close_sims_panel_for_room_change()
+        log.info(
+            "[chat.room.panel_close] action=consume close_requested=True close_consumed=True close_request_token=%s close_room_id=%s current_room_id=%s rerun_reason=%s event_id=%s",
+            str(request.get("token") or ""),
+            str(request.get("close_room_id") or ""),
+            str(request.get("current_room_id") or ""),
+            str(request.get("rerun_reason") or ""),
+            request_event_id,
+        )
         return True
     except Exception:
         log.exception("[chat.room.panel_close] consume failed")
@@ -1470,7 +1582,6 @@ def search_messages_in_room(room: dict, pattern: re.Pattern, roles: set[str]):
     return results
 def _queue_search_reset():
     st.session_state["__search_reset"] = True
-    st.rerun()
 
 # =========================================================
 # --- LM Studio용 메시지 정규화 ---
@@ -2200,6 +2311,19 @@ def _bytes_len(uploaded_file) -> int:
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[^a-zA-Z0-9가-힣._-]', '_', name)
 
+def _make_unique_chat_zip_entry_name(room_name: str, used_names: set[str]) -> str:
+    base_name = re.sub(r"[^a-zA-Z0-9가-힣]+", "_", str(room_name or "")).strip("._ ")
+    if not base_name:
+        base_name = "chat_room"
+
+    sequence = 1
+    entry_name = f"{base_name}.json"
+    while entry_name.casefold() in used_names:
+        sequence += 1
+        entry_name = f"{base_name}_{sequence}.json"
+    used_names.add(entry_name.casefold())
+    return entry_name
+
 def _effective_upload_dir() -> Path:
     """
     실제 첨부 저장 폴더.
@@ -2424,6 +2548,9 @@ def _message_dedupe_key(message: dict) -> tuple:
     if not isinstance(message, dict):
         return ("object", id(message))
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    msg_id = str(message.get("id") or "").strip()
+    if str(message.get("type") or "").strip().lower() == "dashboard_lite" and msg_id:
+        return ("dashboard", msg_id)
     table_key = str(meta.get("table_key") or message.get("table_key") or "").strip()
     if table_key:
         return ("table", table_key, str(meta.get("action") or message.get("action") or ""))
@@ -2435,7 +2562,6 @@ def _message_dedupe_key(message: dict) -> tuple:
             _message_time_key(message),
             content_sig,
         )
-    msg_id = str(message.get("id") or "").strip()
     if msg_id:
         return ("id", msg_id)
     return (
@@ -6421,11 +6547,20 @@ def _drop_empty_auto_rooms(*, keep_room_id: str = "") -> int:
     kept = []
     removed = 0
     keep_room_id = str(keep_room_id or "")
+    pending_nav = ss.get("__chat_room_nav_request")
+    protected_ids = {
+        str(ss.get("__dashboard_lite_pending_room_id") or "").strip(),
+        str((pending_nav or {}).get("target_room_id") or "").strip() if isinstance(pending_nav, dict) else "",
+    }
 
     for room in rooms:
         rid = str(room.get("id") or "") if isinstance(room, dict) else ""
 
         if rid == keep_room_id:
+            kept.append(room)
+            continue
+
+        if rid and rid in protected_ids:
             kept.append(room)
             continue
 
@@ -6454,6 +6589,7 @@ def _compute_room_sidebar_state(
     page_size: int = CHAT_ROOM_PAGE_SIZE,
     force_reset_reason: str = "",
     initial_to_last: bool = False,
+    target_room_id: str = "",
 ) -> dict[str, Any]:
     """Return the persisted sidebar room slice without mutating room data."""
 
@@ -6463,6 +6599,7 @@ def _compute_room_sidebar_state(
     persisted_ids = {str(room.get("id") or "") for room in persisted_rooms if str(room.get("id") or "")}
     pending_ids = {str(room.get("id") or "") for room in pending_rooms if str(room.get("id") or "")}
     current_id = str(current_room_id or "").strip()
+    target_id = str(target_room_id or "").strip()
     q = str(filter_text or "").strip().lower()
     prev_q = None if previous_filter is None else str(previous_filter or "").strip().lower()
     filter_changed = prev_q is not None and q != prev_q
@@ -6506,9 +6643,18 @@ def _compute_room_sidebar_state(
     else:
         page_int = max(0, min(page_int, max_page))
 
+    target_room_index = next(
+        (index for index, room in enumerate(filtered) if str(room.get("id") or "") == target_id),
+        -1,
+    )
+    target_room_found = target_room_index >= 0
+    if target_room_found:
+        page_int = target_room_index // page_size
+
     start = page_int * page_size
     end = start + page_size
     view = filtered[start:end]
+    current_room_visible = bool(current_id and any(str(room.get("id") or "") == current_id for room in view))
     range_start = start + 1 if filtered_persisted_rooms else 0
     range_end = min(end, filtered_persisted_rooms)
     if q:
@@ -6540,6 +6686,9 @@ def _compute_room_sidebar_state(
         "current_kind": current_kind,
         "current_in_rooms": current_in_persisted,
         "current_in_persisted": current_in_persisted,
+        "current_room_visible": current_room_visible,
+        "target_room_found": target_room_found,
+        "target_room_index": target_room_index,
         "page_reset_reason": page_reset_reason,
         "caption": caption,
         "prev_disabled": page_int <= 0,
@@ -6974,6 +7123,8 @@ def _sync_room_meta(
         room["auto_created"] = False
         room["name_auto"] = False
         room["title_initialized"] = True
+        if was_pending:
+            st.session_state["__chat_room_pending_to_persisted_room_id"] = str(room.get("id") or "")
 
     room["updated_at"] = make_ts()
 
@@ -7513,6 +7664,8 @@ def _minimal_dashboard_partition_snapshot(cache: Any) -> dict[str, Any]:
     return {
         "snapshot_version": 1,
         "snapshot_status": "minimal_fallback",
+        "room_id": _clip_partition_text(source.get("room_id"), 80),
+        "dashboard_event_id": _clip_partition_text(source.get("dashboard_event_id"), 80),
         "params": {
             "month_from": _clip_partition_text(params.get("month_from"), 16),
             "month_to": _clip_partition_text(params.get("month_to"), 16),
@@ -7544,15 +7697,31 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
                     if is_dashboard and mk == "dashboard_cache":
                         # Dashboard chat history must be restart-safe without
                         # persisting the full stock readiness DataFrame.
+                        snapshot_source = dict(value.get(mk) or {}) if isinstance(value.get(mk), dict) else {}
+                        snapshot_source["room_id"] = value.get("room_id")
+                        snapshot_source["dashboard_event_id"] = value.get("dashboard_event_id")
                         try:
                             from app.sims.views.dashboard_lite import build_dashboard_lite_chat_snapshot
-                            meta_out[mk] = build_dashboard_lite_chat_snapshot(value.get(mk))
+                            meta_out[mk] = build_dashboard_lite_chat_snapshot(snapshot_source)
                         except Exception as exc:
                             log.warning(
                                 "[chat.storage.dashboard_snapshot] snapshot_ok=False fallback=minimal error_type=%s",
                                 type(exc).__name__,
                             )
-                            meta_out[mk] = _minimal_dashboard_partition_snapshot(value.get(mk))
+                            meta_out[mk] = _minimal_dashboard_partition_snapshot(snapshot_source)
+                        snapshot = meta_out.get(mk) if isinstance(meta_out.get(mk), dict) else {}
+                        message_event = str(message.get("id") or "").strip()
+                        payload_event = str(value.get("dashboard_event_id") or "").strip()
+                        snapshot_event = str(snapshot.get("dashboard_event_id") or "").strip()
+                        linked_events = (message_event, payload_event, snapshot_event)
+                        log.info(
+                            "[dashboard.event_link] stage=partition primary_event_present=%s payload_event_present=%s snapshot_event_present=%s partition_event_present=%s all_equal=%s",
+                            False,
+                            bool(payload_event),
+                            bool(snapshot_event),
+                            bool(message_event),
+                            bool(all(linked_events) and len(set(linked_events)) == 1),
+                        )
                     else:
                         meta_out[mk] = _compact_partition_value(value.get(mk))
             value = meta_out
@@ -8649,7 +8818,49 @@ def save_chat_rooms():
         except Exception:
             pass
         raise
-# =========================
+
+
+def _flush_pending_dashboard_chat_persistence() -> bool:
+    """Persist a Dashboard push before its protected post-submit rerun."""
+    pending = st.session_state.get("__dashboard_lite_pending_persist")
+    if not isinstance(pending, dict):
+        return False
+
+    room_id = str(pending.get("room_id") or "").strip()
+    event_id = str(pending.get("event_id") or "").strip()
+    if not room_id or not event_id:
+        st.session_state.pop("__dashboard_lite_pending_persist", None)
+        return False
+
+    save_chat_rooms()
+    detail = st.session_state.get("__chat_save_last_perf")
+    detail = detail if isinstance(detail, dict) else {}
+    changed_fields = detail.get("changed_fields") or []
+    append_count = int(detail.get("append_count") or 0)
+    saved = bool("messages_jsonl" in changed_fields or append_count > 0)
+    log.info(
+        "[dashboard.chat_persist] room_id_present=%s event_present=%s saved=%s append_count=%s messages_jsonl_changed=%s",
+        bool(room_id),
+        bool(event_id),
+        saved,
+        append_count,
+        "messages_jsonl" in changed_fields,
+    )
+    if not saved and str(st.session_state.get("__chat_storage_mode") or "partitioned") == "partitioned":
+        return False
+
+    st.session_state.pop("__dashboard_lite_pending_persist", None)
+    st.session_state.pop("__dashboard_lite_pending_room_id", None)
+    st.session_state.pop("__chat_save_perf_event_id", None)
+    st.session_state.pop("__chat_save_dirty_reason", None)
+    rerun_marker = str(st.session_state.get("__dashboard_lite_chat_rerun_event_id") or "")
+    if rerun_marker == event_id:
+        return True
+    st.session_state["__dashboard_lite_chat_rerun_event_id"] = event_id
+    rerun = getattr(st, "rerun", None)
+    if callable(rerun):
+        rerun()
+    return True
 
 
 def migrate_rooms_seq_if_needed(rooms: List[Dict[str, Any]], *, chat_file: str, logger) -> int:
@@ -9392,7 +9603,13 @@ def _render_sims_sidebar_fragment() -> None:
         )
 
         if clicked:
+            open_before = bool(st.session_state.get("__sims_open"))
+            panel_active_before = bool(st.session_state.get("__sims_panel_active"))
+            force_open_before = bool(st.session_state.get("__sims_force_open"))
             sims_open_event_id = _set_ui_event_started("sims_panel_open")
+            stale_close_present, stale_close_discarded = _discard_stale_sims_close_for_panel_open(
+                current_event_id=sims_open_event_id
+            )
             st.session_state["__sims_panel_open_fragment_elapsed"] = 0.0
             st.session_state["__ui_rerun_reason"] = "sims_panel_open"
             st.session_state["__sims_force_open"] = True
@@ -9407,6 +9624,18 @@ def _render_sims_sidebar_fragment() -> None:
             st.session_state["__sims_run_seq"] += 1
             st.session_state["__sims_selected_snapshot"] = dict(
                 st.session_state.get("__sims_selected") or {}
+            )
+            log.info(
+                "[sims.panel_open.state] event_id=%s open_before=%s open_after=%s panel_active_before=%s panel_active_after=%s force_open_before=%s force_open_after=%s stale_close_present=%s stale_close_discarded=%s",
+                sims_open_event_id,
+                open_before,
+                bool(st.session_state.get("__sims_open")),
+                panel_active_before,
+                bool(st.session_state.get("__sims_panel_active")),
+                force_open_before,
+                bool(st.session_state.get("__sims_force_open")),
+                stale_close_present,
+                stale_close_discarded,
             )
             log.info(
                 "[sims.panel_open.perf] event_id=%s fragment=%.3fs",
@@ -9513,6 +9742,13 @@ with st.sidebar:
     ss.setdefault("__room_filter_prev", str(ss.get("__room_filter") or "").strip().lower())
     room_page_before = ss.get("__room_page", 0)
     room_page_was_initialized = bool(ss.get("__room_page_initialized"))
+    pending_nav_request = ss.get("__chat_room_nav_request")
+    pending_nav_request = pending_nav_request if isinstance(pending_nav_request, dict) else {}
+    pending_to_persisted_room_id = str(
+        pending_nav_request.get("target_room_id")
+        or ss.get("__chat_room_pending_to_persisted_room_id", "")
+        or ""
+    ).strip()
     PAGE_SIZE = CHAT_ROOM_PAGE_SIZE
 
     # ── 필터/페이지 계산(옵션 패널을 안 열어도 상태는 반영됨) ──────────
@@ -9525,6 +9761,7 @@ with st.sidebar:
         page_size=PAGE_SIZE,
         force_reset_reason="stale_current_room" if stale_current_room_id else "",
         initial_to_last=not room_page_was_initialized and not stale_current_room_id,
+        target_room_id=pending_to_persisted_room_id,
     )
     ss["__room_page"] = int(room_list_state["page"])
     ss["__room_page_initialized"] = True
@@ -9569,6 +9806,24 @@ with st.sidebar:
             room_list_state["max_page"],
             False,
             False,
+        )
+
+    pending_nav_consumed = bool(
+        pending_to_persisted_room_id and room_list_state["target_room_found"]
+    )
+    if pending_nav_consumed:
+        ss.pop("__chat_room_nav_request", None)
+        ss.pop("__chat_room_pending_to_persisted_room_id", None)
+    if pending_to_persisted_room_id:
+        log.info(
+            "[chat.room_nav] action=pending_to_persisted page_before=%s page_after=%s target_room_found=%s target_room_index=%s max_page=%s current_room_visible=%s request_consumed=%s",
+            room_page_before,
+            room_list_state["page"],
+            room_list_state["target_room_found"],
+            room_list_state["target_room_index"],
+            room_list_state["max_page"],
+            room_list_state["current_room_visible"],
+            pending_nav_consumed,
         )
 
     # 최조 대화 등록 하기 전
@@ -9667,8 +9922,8 @@ with st.sidebar:
     if pending_ids:
         picked_pending = st.radio(
             "새 대화 입력 대기",
-            options=pending_ids,
-            format_func=lambda rid: id_to_name.get(rid, rid),
+            options=[_CHAT_ROOM_SELECT_SENTINEL, *pending_ids],
+            format_func=lambda rid: "채팅방을 선택하세요" if rid == _CHAT_ROOM_SELECT_SENTINEL else id_to_name.get(rid, rid),
             index=None,
             label_visibility="collapsed",
             key=pending_radio_key,
@@ -9683,8 +9938,8 @@ with st.sidebar:
     if options_ids:
         picked_persisted = st.radio(
             "채팅방 목록",
-            options=options_ids,
-            format_func=lambda rid: id_to_name.get(rid, rid),
+            options=[_CHAT_ROOM_SELECT_SENTINEL, *options_ids],
+            format_func=lambda rid: "채팅방을 선택하세요" if rid == _CHAT_ROOM_SELECT_SENTINEL else id_to_name.get(rid, rid),
             index=None,
             label_visibility="collapsed",
             key=room_radio_key,
@@ -9799,8 +10054,18 @@ with st.sidebar:
             ),
         )
 
-        # 채팅방 선택과 SIMS 패널 닫기를 하나의 app rerun으로 묶는다.
-        _request_sims_close_for_chat_room_change()
+        # 채팅방 선택과 SIMS 패널 닫기를 같은 room-change 흐름에서 완료한다.
+        _request_sims_close_for_chat_room_change(
+            close_request_token=request_token or switch_event_id,
+            close_room_id=str(old_room_id or ""),
+            current_room_id=str(picked or ""),
+            event_id=str(switch_event_id or ""),
+            rerun_reason="chat_room_change",
+        )
+        _consume_sims_close_for_chat_room_change(
+            expected_event_id=str(switch_event_id or ""),
+            expected_current_room_id=str(picked or ""),
+        )
 
         _clear_current_table_source_for_room_change()
         _restore_current_table_source_for_room(picked)
@@ -9871,7 +10136,6 @@ with st.sidebar:
                     r["title_source"] = "manual"
                     break                
             save_chat_rooms()
-        st.rerun()
 
     st.button("이름 적용", width="stretch", key="__room_rename_apply", on_click=_apply_rename)
 
@@ -9954,7 +10218,6 @@ with st.sidebar:
                 ss.current_room = ss.chat_rooms[0]["id"]
                 ss["__room_delete_ask"] = False
                 save_chat_rooms()
-                st.rerun()
 
             with c_ok:
                 st.button("삭제 확인", type="primary", width="stretch",
@@ -9970,9 +10233,10 @@ with st.sidebar:
         # 전체 ZIP
         buf_zip = io.BytesIO()
         with zipfile.ZipFile(buf_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
+            used_entry_names: set[str] = set()
             for room in ss.chat_rooms:
-                safe = re.sub(r"[^a-zA-Z0-9가-힣]+", "_", room["name"])
-                zipf.writestr(f"{safe}.json", json.dumps(_json_sanitize(room), ensure_ascii=False, indent=2))
+                entry_name = _make_unique_chat_zip_entry_name(room.get("name", ""), used_entry_names)
+                zipf.writestr(entry_name, json.dumps(_json_sanitize(room), ensure_ascii=False, indent=2))
         buf_zip.seek(0)
         st.download_button("💾 모든 대화 ZIP", data=buf_zip, file_name="chat_rooms.zip",
                         mime="application/zip", width="stretch", key="__dl_all_rooms_zip")
@@ -10077,10 +10341,9 @@ with st.sidebar:
             if st.session_state["__search_regex"]:
                 st.caption(r"예: \bERROR\b  /  ^Hello")
 
-            # 초기화 버튼 (on_click에서 플래그만 세우고 rerun)
+            # 초기화 버튼 (콜백에서는 플래그만 설정하고 Streamlit 자동 rerun 사용)
             def _queue_search_reset():
                 st.session_state["__search_reset"] = True
-                st.rerun()
 
             st.button("검색 초기화", key="__search_clear",
                     width="stretch", on_click=_queue_search_reset)
@@ -11073,6 +11336,7 @@ with st.container():
     # history/pending/immediate render가 같은 table_key를 동시에 잡아도 중복 출력하지 않기 위한 set.
     try:
         st.session_state["__chat_rendered_sims_keys_this_run"] = set()
+        st.session_state["__dashboard_lite_primary_rendered_this_run"] = False
     except Exception:
         pass
 
@@ -11593,6 +11857,9 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
                         selected=selected_for_render
                     )
 
+                    if _flush_pending_dashboard_chat_persistence():
+                        st.stop()
+
                     # SIMS 패널 직접 조회 결과도 현재 채팅방 정책에 맞춰 저장한다.
                     # - 방 선택 없음: 새 대화 대기방을 정식 방으로 전환 후 저장
                     # - 기존 방 선택: 선택 방에 저장
@@ -11800,6 +12067,8 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
                         selected=selected_for_render
                     )                    
                     log.info("[app.main] after render_sims_main() Hub(B)")
+                    if _flush_pending_dashboard_chat_persistence():
+                        st.stop()
                     if st.session_state.get("__sims_was_final"):
                         st.session_state["__sims_rendered"] = True
 

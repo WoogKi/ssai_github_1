@@ -1605,6 +1605,156 @@ def _attach_major_purchase_vendors(
     return {"summary": summary, "rows": vendor_rows, "top_rows": vendor_rows[:10], "aggregate_ms": aggregate_ms, "rank_ms": rank_ms, "group_ms": vendor_risk_group_ms}
 
 
+_RISK_DETAIL_COLUMNS = (
+    "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "제품그룹명", "제품구분명", "제품분류명",
+    "주요매입처코드", "주요매입처명", "주요매입처상태", "주요매입처선정기준", "재고기준",
+    "현재재고수량", "현재재고금액", "재고평가단가", "당월현재출고수량", "당월기준예상출고수량",
+    "진행속도기준월말예상출고수량", "위험보정예상출고수량", "위험보정잔여예상수요", "위험보정재고준비율",
+    "위험보정부족예상수량", "위험보정부족예상금액", "수요급증여부", "수요급증상위분류", "수요급증세부분류",
+    "수요급증사유", "최근6완료월순매입금액", "최근6완료월순입고수량", "최근6완료월최근매입월",
+)
+
+
+def _risk_detail_vendor_key(row: Mapping[str, Any]) -> str:
+    status = str(row.get("주요매입처상태") or "").strip()
+    code = str(row.get("주요매입처코드") or "").strip()
+    if status == "assigned" and code:
+        return f"assigned:{code}"
+    if status == "recent_purchase_none":
+        return "recent_purchase_none"
+    return "vendor_unknown"
+
+
+def _build_dashboard_risk_detail(
+    rows: list[dict[str, Any]],
+    *,
+    stock_mode: str,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Build the minimal, status-based risk-detail rows without duplicating readiness facts."""
+    stock_basis = "장부재고" if str(stock_mode or "").strip() == "book" else "실재고"
+    detail_rows: list[dict[str, Any]] = []
+    for row in rows:
+        risk_status = str(row.get("재고위험상태") or "")
+        if risk_status not in {"긴급 부족", "부족 주의"}:
+            continue
+        detail = {
+            "위험상태": risk_status,
+            "위험사유": str(row.get("재고위험사유") or ""),
+            "제품코드": str(row.get("product_code") or ""),
+            "제품명": str(row.get("product_name") or ""),
+            "규격": str(row.get("규격") or ""),
+            "제조사명": str(row.get("manufacturer_name") or ""),
+            "제품그룹명": str(row.get("제품그룹명") or ""),
+            "제품구분명": str(row.get("제품구분명") or ""),
+            "제품분류명": str(row.get("제품분류명") or ""),
+            "주요매입처코드": str(row.get("주요매입처코드") or ""),
+            "주요매입처명": str(row.get("주요매입처명") or ""),
+            "주요매입처상태": str(row.get("주요매입처상태") or ""),
+            "주요매입처선정기준": str(row.get("주요매입처선정기준") or ""),
+            "재고기준": stock_basis,
+            "현재재고수량": float(row.get("current_stock_qty") or 0),
+            "현재재고금액": float(row.get("current_stock_amt") or 0),
+            "재고평가단가": float(row.get("stock_valuation_unit_price") or 0),
+            "당월현재출고수량": float(row.get("당월현재출고수량") or 0),
+            "당월기준예상출고수량": float(row.get("당월기준예상출고수량") or 0),
+            "진행속도기준월말예상출고수량": float(row.get("진행속도기준월말예상출고수량") or 0),
+            "위험보정예상출고수량": float(row.get("위험보정예상출고수량") or 0),
+            "위험보정잔여예상수요": float(row.get("위험보정잔여예상수요") or 0),
+            "위험보정재고준비율": float(row.get("위험보정재고준비율") or 0),
+            "위험보정부족예상수량": float(row.get("위험보정부족예상수량") or 0),
+            "위험보정부족예상금액": float(row.get("위험보정부족예상금액") or 0),
+            "수요급증여부": bool(row.get("수요급증여부")),
+            "수요급증상위분류": str(row.get("수요급증상위분류") or ""),
+            "수요급증세부분류": str(row.get("수요급증세부분류") or ""),
+            "수요급증사유": str(row.get("수요급증사유") or ""),
+            "최근6완료월순매입금액": float(row.get("최근6완료월순매입금액") or 0),
+            "최근6완료월순입고수량": float(row.get("최근6완료월순입고수량") or 0),
+            "최근6완료월최근매입월": str(row.get("최근6완료월최근매입월") or ""),
+        }
+        detail["_주요매입처필터키"] = _risk_detail_vendor_key(detail)
+        detail_rows.append(detail)
+
+    if detail_rows:
+        frame = pd.DataFrame(detail_rows)
+        frame["_위험상태정렬"] = frame["위험상태"].map({"긴급 부족": 1, "부족 주의": 2}).fillna(99)
+        frame = frame.sort_values(
+            ["_위험상태정렬", "위험보정부족예상금액", "위험보정부족예상수량", "제품코드"],
+            ascending=[True, False, False, True],
+            kind="stable",
+        ).drop(columns=["_위험상태정렬"])
+        detail_rows = frame.to_dict("records")
+
+    detail_frame = pd.DataFrame(detail_rows)
+    summary = {
+        "source_rows": int(len(detail_rows)),
+        "emergency_rows": int((detail_frame.get("위험상태", pd.Series(dtype="object")) == "긴급 부족").sum()),
+        "warning_rows": int((detail_frame.get("위험상태", pd.Series(dtype="object")) == "부족 주의").sum()),
+        "amount_positive_rows": int((pd.to_numeric(detail_frame.get("위험보정부족예상금액", pd.Series(dtype="float64")), errors="coerce").fillna(0) > 0).sum()),
+        "zero_amount_rows": int((pd.to_numeric(detail_frame.get("위험보정부족예상금액", pd.Series(dtype="float64")), errors="coerce").fillna(0) <= 0).sum()),
+        "surge_rows": int(detail_frame.get("수요급증여부", pd.Series(dtype="bool")).fillna(False).astype(bool).sum()),
+        "assigned_vendor_rows": int((detail_frame.get("주요매입처상태", pd.Series(dtype="object")) == "assigned").sum()),
+        "unassigned_vendor_rows": int((detail_frame.get("주요매입처상태", pd.Series(dtype="object")) != "assigned").sum()),
+        "default_display_limit": 100,
+    }
+    return detail_rows, summary
+
+
+def filter_dashboard_risk_detail_rows(
+    rows: Any,
+    *,
+    risk_status: str = "전체 위험",
+    vendor_key: str = "전체",
+    surge_filter: str = "전체",
+    include_zero_amount: bool = True,
+    search_text: str = "",
+) -> tuple[pd.DataFrame, dict[str, int], int]:
+    """Filter already-calculated Dashboard risk rows without any source reload."""
+    started = time.perf_counter()
+    frame = pd.DataFrame(rows or [])
+    if frame.empty:
+        return frame, {"source_rows": 0, "filtered_rows": 0, "emergency_rows": 0, "warning_rows": 0, "zero_amount_rows": 0}, 0
+    for column in _RISK_DETAIL_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = 0.0 if column.endswith(("수량", "금액", "단가", "준비율")) else ""
+    if "_주요매입처필터키" not in frame.columns:
+        frame["_주요매입처필터키"] = frame.apply(_risk_detail_vendor_key, axis=1)
+
+    source_rows = int(len(frame))
+    if risk_status in {"긴급 부족", "부족 주의"}:
+        frame = frame.loc[frame["위험상태"].eq(risk_status)]
+    if vendor_key and vendor_key != "전체":
+        frame = frame.loc[frame["_주요매입처필터키"].eq(vendor_key)]
+    if surge_filter == "수요급증":
+        frame = frame.loc[frame["수요급증여부"].fillna(False).astype(bool)]
+    elif surge_filter == "일반":
+        frame = frame.loc[~frame["수요급증여부"].fillna(False).astype(bool)]
+    amount = pd.to_numeric(frame["위험보정부족예상금액"], errors="coerce").fillna(0)
+    if not include_zero_amount:
+        frame = frame.loc[amount.gt(0)]
+    search = str(search_text or "").strip().casefold()
+    if search:
+        search_mask = (
+            frame["제품코드"].fillna("").astype(str).str.casefold().str.contains(search, regex=False)
+            | frame["제품명"].fillna("").astype(str).str.casefold().str.contains(search, regex=False)
+        )
+        frame = frame.loc[search_mask]
+    frame = frame.copy()
+    frame["_위험상태정렬"] = frame["위험상태"].map({"긴급 부족": 1, "부족 주의": 2}).fillna(99)
+    frame = frame.sort_values(
+        ["_위험상태정렬", "위험보정부족예상금액", "위험보정부족예상수량", "제품코드"],
+        ascending=[True, False, False, True],
+        kind="stable",
+    ).drop(columns=["_위험상태정렬"], errors="ignore")
+    summary = {
+        "source_rows": source_rows,
+        "filtered_rows": int(len(frame)),
+        "emergency_rows": int(frame["위험상태"].eq("긴급 부족").sum()),
+        "warning_rows": int(frame["위험상태"].eq("부족 주의").sum()),
+        "zero_amount_rows": int(pd.to_numeric(frame["위험보정부족예상금액"], errors="coerce").fillna(0).le(0).sum()),
+    }
+    return frame, summary, int((time.perf_counter() - started) * 1000)
+
+
 def _build_inventory_facts(
     payload: Mapping[str, Any] | None,
     *,
@@ -1615,6 +1765,7 @@ def _build_inventory_facts(
     purchase_vendor_df: pd.DataFrame | None = None,
     purchase_history_month_from: str = "",
     source_call_count: int = 0,
+    stock_mode: str = "real",
 ) -> dict[str, Any]:
     started = time.perf_counter()
     df = _payload_df(payload)
@@ -1646,6 +1797,10 @@ def _build_inventory_facts(
                     "product_code": product_code,
                     "product_name": str(row.get(name_col) or "").strip() or "미지정",
                     "manufacturer_name": _first_text(row, maker_cols),
+                    "specification": str(row.get("규격") or "").strip(),
+                    "product_group_name": str(row.get("제품그룹명") or "").strip(),
+                    "product_di_name": str(row.get("제품구분명") or "").strip(),
+                    "product_class_name": str(row.get("제품분류명") or "").strip(),
                     "current_stock_qty": stock,
                     "current_stock_amt": _num(row.get("현재재고금액")),
                     "remaining_expected_demand_qty": remaining,
@@ -1671,6 +1826,10 @@ def _build_inventory_facts(
                     "product_code": item["product_code"],
                     "product_name": item["product_name"],
                     "manufacturer_name": item["manufacturer_name"],
+                    "specification": item["specification"],
+                    "product_group_name": item["product_group_name"],
+                    "product_di_name": item["product_di_name"],
+                    "product_class_name": item["product_class_name"],
                     "current_stock_qty": 0.0,
                     "current_stock_amt": 0.0,
                     "remaining_expected_demand_qty": 0.0,
@@ -1685,6 +1844,9 @@ def _build_inventory_facts(
             )
             if not acc.get("manufacturer_name") and item.get("manufacturer_name"):
                 acc["manufacturer_name"] = item["manufacturer_name"]
+            for field in ("specification", "product_group_name", "product_di_name", "product_class_name"):
+                if not acc.get(field) and item.get(field):
+                    acc[field] = str(item[field])
             acc["current_stock_qty"] += float(item.get("current_stock_qty") or 0)
             acc["current_stock_amt"] += float(item.get("current_stock_amt") or 0)
             acc["remaining_expected_demand_qty"] += float(item.get("remaining_expected_demand_qty") or 0)
@@ -1723,6 +1885,10 @@ def _build_inventory_facts(
                     "product_code": str(row.get("product_code") or "").strip(),
                     "product_name": str(row.get("product_name") or "").strip() or "미지정",
                     "manufacturer_name": str(row.get("manufacturer_name") or "").strip(),
+                    "규격": str(row.get("specification") or "").strip(),
+                    "제품그룹명": str(row.get("product_group_name") or "").strip(),
+                    "제품구분명": str(row.get("product_di_name") or "").strip(),
+                    "제품분류명": str(row.get("product_class_name") or "").strip(),
                     "current_stock_qty": stock,
                     "current_stock_amt": float(row.get("current_stock_amt") or 0),
                     "remaining_expected_demand_qty": remaining,
@@ -1760,6 +1926,7 @@ def _build_inventory_facts(
         history_month_from=purchase_history_month_from,
         source_call_count=source_call_count,
     )
+    risk_detail_rows, risk_detail_summary = _build_dashboard_risk_detail(rows, stock_mode=stock_mode)
     demand_rows = [r for r in rows if r.get("재고위험상태") != "판정 제외"]
     ready_rows = [r for r in rows if r.get("재고위험상태") == "적정"]
     shortage_rows = [r for r in rows if r.get("재고위험상태") in {"긴급 부족", "부족 주의"}]
@@ -1877,6 +2044,8 @@ def _build_inventory_facts(
         "vendor_stock_risk_summary": vendor_stock_risk["summary"],
         "vendor_stock_risk_rows": vendor_stock_risk["rows"],
         "vendor_stock_risk_top_rows": vendor_stock_risk["top_rows"],
+        "risk_detail_summary": risk_detail_summary,
+        "risk_detail_rows": risk_detail_rows,
         "data_quality": [] if rows else ["재고준비율 산정 자료 없음"],
     }
 
@@ -2157,6 +2326,7 @@ def build_dashboard_lite_facts(
         purchase_vendor_df=purchase_vendor_df,
         purchase_history_month_from=str(source_params.get("dashboard_lite_history_month_from") or ""),
         source_call_count=int(needs_sales_source) + int(needs_stock_source),
+        stock_mode=str(service_params.get("stock_mode") or "real"),
     )
     log.info(
         "[dashboard.stock_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",
