@@ -187,6 +187,15 @@ def _fmt_number(value: Any, digits: int = 0) -> str:
     return f"{num:,.{digits}f}"
 
 
+def _fmt_threshold_pct(value: Any) -> str:
+    """Format an operational threshold without inventing trailing precision."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "자료부족"
+    return f"{number:.6f}".rstrip("0").rstrip(".")
+
+
 def _amount_display_spec(unit: str, value: Any) -> tuple[float, str]:
     """Choose a presentation-only amount scale without changing facts values."""
     normalized = str(unit or "auto").strip().lower()
@@ -409,28 +418,116 @@ def _render_sales_chart(facts: dict[str, Any]) -> None:
 
 
 def _render_stock_chart(facts: dict[str, Any]) -> None:
-    rows = (facts.get("inventory") or {}).get("risk_targets") or []
+    inventory = facts.get("inventory") or {}
+    rows = inventory.get("risk_targets") or []
+    threshold_value = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
+    threshold_text = _fmt_threshold_pct(threshold_value)
     if not rows:
-        st.info("98% 미만 재고준비율 조치 대상이 없습니다.")
+        st.info(f"준비율 경고기준 {threshold_text}% 미만 재고준비율 조치 대상이 없습니다.")
         return
     df = pd.DataFrame(rows).head(10).copy()
-    threshold = pd.DataFrame({"threshold": [98.0]})
+    df["display_readiness_pct"] = pd.to_numeric(
+        df.get("위험보정재고준비율", df.get("stock_readiness_pct")), errors="coerce"
+    ).fillna(pd.to_numeric(df.get("stock_readiness_pct"), errors="coerce"))
+    df["display_remaining_demand_qty"] = pd.to_numeric(
+        df.get("위험보정잔여예상수요", df.get("remaining_expected_demand_qty")), errors="coerce"
+    ).fillna(pd.to_numeric(df.get("remaining_expected_demand_qty"), errors="coerce"))
+    df["display_shortage_qty"] = pd.to_numeric(
+        df.get("위험보정부족예상수량", df.get("shortage_qty")), errors="coerce"
+    ).fillna(pd.to_numeric(df.get("shortage_qty"), errors="coerce"))
+    df["display_shortage_amt"] = pd.to_numeric(
+        df.get("위험보정부족예상금액", df.get("shortage_amt")), errors="coerce"
+    ).fillna(pd.to_numeric(df.get("shortage_amt"), errors="coerce"))
+    threshold = pd.DataFrame({"threshold": [threshold_value]})
     bars = (
         alt.Chart(df)
         .mark_bar(color="#ef4444")
         .encode(
-            x=alt.X("stock_readiness_pct:Q", title="재고준비율(%)", scale=alt.Scale(domain=[0, 100])),
+            x=alt.X("display_readiness_pct:Q", title="재고준비율(%)", scale=alt.Scale(domain=[0, 100])),
             y=alt.Y("product_name:N", title="제품", sort="-x"),
             tooltip=[
                 alt.Tooltip("product_name:N", title="제품"),
-                alt.Tooltip("stock_readiness_pct:Q", title="준비율", format=".1f"),
-                alt.Tooltip("remaining_expected_demand_qty:Q", title="잔여예상수요", format=",.0f"),
-                alt.Tooltip("shortage_qty:Q", title="부족수량", format=",.0f"),
+                alt.Tooltip("display_readiness_pct:Q", title="준비율", format=".1f"),
+                alt.Tooltip("display_remaining_demand_qty:Q", title="잔여예상수요", format=",.0f"),
+                alt.Tooltip("display_shortage_qty:Q", title="부족수량", format=",.0f"),
+                alt.Tooltip("display_shortage_amt:Q", title="부족금액", format=",.0f"),
+                alt.Tooltip("수요급증여부:N", title="수요급증"),
+                alt.Tooltip("위험보정기준:N", title="위험보정기준"),
             ],
         )
     )
     rule = alt.Chart(threshold).mark_rule(color="#0f766e", strokeDash=[4, 4]).encode(x="threshold:Q")
     st.altair_chart((bars + rule).properties(height=280), width="stretch")
+
+
+def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
+    rows = (facts.get("inventory") or {}).get("stock_risk_summary") or []
+    by_status = {str(row.get("재고위험상태") or ""): row for row in rows if isinstance(row, dict)}
+    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
+    readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
+    threshold_text = _fmt_threshold_pct(readiness_threshold)
+    ordered = (
+        ("긴급 부족", "부족예상금액", True),
+        ("부족 주의", "품목수", False),
+        ("적정", "품목수", False),
+        ("판정 제외", "품목수", False),
+    )
+    amount_values = [
+        float((by_status.get(status) or {}).get(field) or 0)
+        for status, field, is_amount in ordered
+        if is_amount
+    ]
+    if amount_unit == "auto":
+        divisor, _label = _amount_display_spec("auto", max([abs(value) for value in amount_values], default=0.0))
+        amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
+
+    st.markdown("### 재고위험 요약")
+    cols = st.columns(4)
+    for col, (status, value_field, is_amount) in zip(cols, ordered):
+        row = by_status.get(status) or {}
+        with col:
+            _metric_card(
+                status,
+                row.get(value_field, 0),
+                "" if is_amount else "개",
+                help_text=(
+                    f"품목 수 {_fmt_number(row.get('품목수', 0))}개 · 수요급증 반영 {_fmt_number((facts.get('inventory') or {}).get('stock_demand_surge_summary', {}).get('긴급부족품목수', 0))}개"
+                    if is_amount
+                    else (
+                        f"준비율 {threshold_text}% 미만" if status == "부족 주의" else
+                        f"준비율 {threshold_text}% 이상" if status == "적정" else
+                        "수요없음 또는 필수값 누락" if status == "판정 제외" else
+                        "품목 수"
+                    )
+                ),
+                amount_unit=amount_unit if is_amount else "",
+            )
+
+    demand_surge = (facts.get("inventory") or {}).get("stock_demand_surge_summary") or {}
+    if int(demand_surge.get("품목수") or 0) > 0:
+        st.info(
+            f"수요급증 {int(demand_surge.get('품목수') or 0)}개 품목은 현재 출고속도를 기준으로 평가월 잔여수요를 다시 계산했습니다."
+        )
+
+    overstock = (facts.get("inventory") or {}).get("stock_overstock_summary") or {}
+    st.markdown("#### 적정 중 과잉 후보")
+    overstock_cols = st.columns(2)
+    with overstock_cols[0]:
+        _metric_card(
+            "과잉후보금액",
+            overstock.get("과잉후보금액", 0),
+            "",
+            help_text="현재재고가 3개월 필요수량 초과",
+            amount_unit=amount_unit,
+        )
+    with overstock_cols[1]:
+        _metric_card(
+            "과잉 후보 품목 수",
+            overstock.get("품목수", 0),
+            "개",
+            help_text="기본 상태 적정 품목만 포함",
+        )
+    st.caption("과잉 후보는 적정 품목의 보조 관찰지표이며 기본 재고위험 상태에는 중복 반영하지 않습니다.")
 
 
 def _render_turnover(facts: dict[str, Any]) -> None:
@@ -990,6 +1087,9 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
         "inventory": {
             "metrics": dict(inventory.get("metrics") or {}),
             "risk_targets": list(inventory.get("risk_targets") or [])[:row_limit],
+            "stock_risk_summary": list(inventory.get("stock_risk_summary") or []),
+            "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
+            "stock_demand_surge_summary": dict(inventory.get("stock_demand_surge_summary") or {}),
             "data_quality": list(inventory.get("data_quality") or [])[:row_limit],
         },
         "turnover_days": dict(facts.get("turnover_days") or {}),
@@ -1065,8 +1165,11 @@ def _render_dashboard_facts(facts: dict[str, Any]) -> None:
     _render_sales_chart(facts)
 
     st.markdown("### 재고 그래프")
-    st.caption("98% 미만 SKU만 기본 조치 대상으로 표시합니다.")
+    readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
+    st.caption(f"준비율 경고기준 {_fmt_threshold_pct(readiness_threshold)}% 미만 SKU를 기본 조치 대상으로 표시합니다.")
     _render_stock_chart(facts)
+
+    _render_stock_risk_summary(facts)
 
     st.markdown("### 매입·매출 거래 회전일")
     _render_turnover(facts)

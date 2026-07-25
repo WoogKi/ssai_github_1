@@ -6952,6 +6952,22 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append("shortage_sku_count_wrong")
         if round(float(inv_metrics["sku_readiness_pct"]["value"]), 2) != 50.0:
             fact_errors.append("sku_readiness_pct_wrong")
+        expected_stock_meta_terms = {"위험보정 잔여예상수요", "수요급증", "진행속도 보정"}
+        for metric_name in ("ready_sku_count", "shortage_sku_count", "sku_readiness_pct", "shortage_qty"):
+            metric = inv_metrics.get(metric_name) or {}
+            metadata_text = " ".join(
+                [str(metric.get("time_basis") or "")]
+                + [str(value) for value in metric.get("source_columns") or []]
+            )
+            if not expected_stock_meta_terms.issubset(set(term for term in expected_stock_meta_terms if term in metadata_text)):
+                fact_errors.append(f"stock_metric_provenance={metric_name}:{metadata_text}")
+        stock_readiness_meta = facts.get("stock_readiness") or {}
+        if (
+            "위험보정 잔여예상수요" not in str(stock_readiness_meta.get("policy") or "")
+            or "수요급증" not in str(stock_readiness_meta.get("adjustment_policy") or "")
+            or "진행속도" not in str(stock_readiness_meta.get("adjustment_policy") or "")
+        ):
+            fact_errors.append(f"stock_readiness_provenance={stock_readiness_meta!r}")
         risk_names = [r.get("product_name") for r in facts["inventory"]["risk_targets"]]
         if risk_names != ["부족품목"]:
             fact_errors.append(f"risk_names={risk_names!r}")
@@ -6985,6 +7001,204 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append("additional_notes_missing")
         if facts["turnover_days"].get("status") != "자료부족":
             fact_errors.append("turnover_status_wrong")
+        stock_risk_rows = [
+            {"product_code": "MISSING", "current_stock_qty": 0, "current_stock_amt": 0, "remaining_expected_demand_qty": 10, "shortage_qty": 10, "shortage_amt": 100, "stock_readiness_pct": 0, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": False},
+            {"product_code": "NO_DEMAND", "current_stock_qty": 100, "current_stock_amt": 1000, "remaining_expected_demand_qty": 0, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "SHORTAGE", "current_stock_qty": 20, "current_stock_amt": 200, "remaining_expected_demand_qty": 100, "shortage_qty": 80, "shortage_amt": 800, "stock_readiness_pct": 20, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "SHORTAGE", "product_name": "중복 제품코드", "current_stock_qty": 20, "current_stock_amt": 200, "remaining_expected_demand_qty": 100, "shortage_qty": 80, "shortage_amt": 800, "stock_readiness_pct": 20, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "", "product_name": "무코드 제품", "current_stock_qty": 20, "current_stock_amt": 200, "remaining_expected_demand_qty": 100, "shortage_qty": 80, "shortage_amt": 800, "stock_readiness_pct": 20, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "WARNING", "current_stock_qty": 90, "current_stock_amt": 900, "remaining_expected_demand_qty": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 90, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "OVER", "current_stock_qty": 150, "current_stock_amt": 750, "remaining_expected_demand_qty": 100, "3개월필요수량": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 5, "_stock_risk_required_values_present": True},
+            {"product_code": "NORMAL", "current_stock_qty": 100, "current_stock_amt": 500, "remaining_expected_demand_qty": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 5, "_stock_risk_required_values_present": True},
+            {"product_code": "", "product_name": "", "current_stock_qty": 0, "current_stock_amt": 0, "remaining_expected_demand_qty": 10, "shortage_qty": 10, "shortage_amt": 100, "stock_readiness_pct": 0, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": False},
+        ]
+        stock_risk_summary = dash_mod._classify_stock_risk_rows(stock_risk_rows, readiness_warning_pct=98.0)
+        stock_risk_by_code = {row.get("product_code"): row for row in stock_risk_rows}
+        stock_risk_by_status = {row.get("재고위험상태"): row for row in stock_risk_summary}
+        expected_risk_statuses = {
+            "MISSING": "판정 제외",
+            "NO_DEMAND": "판정 제외",
+            "SHORTAGE": "긴급 부족",
+            "WARNING": "부족 주의",
+            "OVER": "적정",
+            "NORMAL": "적정",
+        }
+        if {code: stock_risk_by_code[code].get("재고위험상태") for code in expected_risk_statuses} != expected_risk_statuses:
+            fact_errors.append(f"stock_risk_priority={stock_risk_by_code!r}")
+        if not pd.isna(stock_risk_by_code["NO_DEMAND"].get("재고커버리지율")):
+            fact_errors.append("stock_risk_no_demand_coverage_not_null")
+        if (
+            float(stock_risk_by_code["OVER"].get("과잉후보수량") or 0) != 50
+            or float(stock_risk_by_code["OVER"].get("과잉후보금액") or 0) != 250
+        ):
+            fact_errors.append(f"stock_risk_overstock_formula={stock_risk_by_code['OVER']!r}")
+        if sum(int(row.get("품목수") or 0) for row in stock_risk_summary) != 8:
+            fact_errors.append(f"stock_risk_summary_count={stock_risk_summary!r}")
+        if (
+            int(stock_risk_by_status.get("긴급 부족", {}).get("품목수") or 0) != 2
+            or int(stock_risk_by_status.get("부족 주의", {}).get("품목수") or 0) != 1
+            or int(stock_risk_by_status.get("적정", {}).get("품목수") or 0) != 2
+            or int(stock_risk_by_status.get("판정 제외", {}).get("품목수") or 0) != 3
+        ):
+            fact_errors.append(f"stock_risk_summary_values={stock_risk_summary!r}")
+        threshold_rows = [
+            {"product_code": "THRESHOLD", "current_stock_qty": 90, "current_stock_amt": 900, "remaining_expected_demand_qty": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 90, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+        ]
+        dash_mod._classify_stock_risk_rows([dict(row) for row in threshold_rows], readiness_warning_pct=98.0)
+        threshold_at_98 = dash_mod._classify_stock_risk_rows(threshold_rows, readiness_warning_pct=98.0)
+        threshold_at_80_rows = [dict(row) for row in threshold_rows]
+        dash_mod._classify_stock_risk_rows(threshold_at_80_rows, readiness_warning_pct=80.0)
+        if threshold_rows[0].get("재고위험상태") != "부족 주의" or threshold_at_80_rows[0].get("재고위험상태") != "적정":
+            fact_errors.append(f"stock_risk_warning_threshold={threshold_rows!r}/{threshold_at_80_rows!r}/{threshold_at_98!r}")
+        boundary_rows = [
+            {"product_code": "EMERGENCY_40", "current_stock_qty": 40, "current_stock_amt": 400, "remaining_expected_demand_qty": 100, "shortage_qty": 60, "shortage_amt": 600, "stock_readiness_pct": 40, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "EMERGENCY_49_9", "current_stock_qty": 49.9, "current_stock_amt": 499, "remaining_expected_demand_qty": 100, "shortage_qty": 50.1, "shortage_amt": 501, "stock_readiness_pct": 49.9, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "WARNING_50", "current_stock_qty": 50, "current_stock_amt": 500, "remaining_expected_demand_qty": 100, "shortage_qty": 50, "shortage_amt": 500, "stock_readiness_pct": 50, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "WARNING_97_9", "current_stock_qty": 97.9, "current_stock_amt": 979, "remaining_expected_demand_qty": 100, "shortage_qty": 2.1, "shortage_amt": 21, "stock_readiness_pct": 97.9, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "NORMAL_98", "current_stock_qty": 98, "current_stock_amt": 980, "remaining_expected_demand_qty": 100, "shortage_qty": 2, "shortage_amt": 20, "stock_readiness_pct": 98, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+        ]
+        dash_mod._classify_stock_risk_rows(boundary_rows, readiness_warning_pct=98.0)
+        expected_boundary_statuses = {
+            "EMERGENCY_40": "긴급 부족",
+            "EMERGENCY_49_9": "긴급 부족",
+            "WARNING_50": "부족 주의",
+            "WARNING_97_9": "부족 주의",
+            "NORMAL_98": "적정",
+        }
+        if {row.get("product_code"): row.get("재고위험상태") for row in boundary_rows} != expected_boundary_statuses:
+            fact_errors.append(f"stock_risk_boundaries={boundary_rows!r}")
+        overstock_rows = [row for row in stock_risk_rows if row.get("과잉후보여부")]
+        if (
+            any(row.get("재고위험상태") != "적정" for row in overstock_rows)
+            or len(overstock_rows) != 1
+            or float(overstock_rows[0].get("과잉후보수량") or 0) != 50
+            or float(overstock_rows[0].get("과잉후보금액") or 0) != 250
+        ):
+            fact_errors.append(f"stock_risk_overstock_subset={overstock_rows!r}")
+        demand_surge_rows = [
+            {"product_code": "NORMAL_DEMAND", "current_stock_qty": 60, "current_stock_amt": 600, "remaining_expected_demand_qty": 60, "당월현재출고수량": 40, "당월기준예상출고수량": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "SURGE_EMERGENCY", "current_stock_qty": 90, "current_stock_amt": 900, "remaining_expected_demand_qty": 0, "당월현재출고수량": 120, "당월기준예상출고수량": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "SURGE_WARNING", "current_stock_qty": 95, "current_stock_amt": 950, "remaining_expected_demand_qty": 0, "당월현재출고수량": 120, "당월기준예상출고수량": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "SURGE_OVERSTOCK_BLOCK", "current_stock_qty": 400, "current_stock_amt": 4000, "remaining_expected_demand_qty": 0, "당월현재출고수량": 120, "당월기준예상출고수량": 100, "3개월필요수량": 300, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "EQUAL_FORECAST", "current_stock_qty": 0, "current_stock_amt": 0, "remaining_expected_demand_qty": 0, "당월현재출고수량": 100, "당월기준예상출고수량": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "ZERO_FORECAST_SURGE", "current_stock_qty": 10, "current_stock_amt": 100, "remaining_expected_demand_qty": 0, "당월현재출고수량": 1, "당월기준예상출고수량": 0, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+        ]
+        dash_mod._apply_current_month_demand_surge(
+            demand_surge_rows,
+            evaluation_month="202607",
+            policy_date="20260712",
+        )
+        dash_mod._classify_stock_risk_rows(demand_surge_rows, readiness_warning_pct=98.0)
+        demand_surge_by_code = {row.get("product_code"): row for row in demand_surge_rows}
+        normal_demand = demand_surge_by_code["NORMAL_DEMAND"]
+        surge_emergency = demand_surge_by_code["SURGE_EMERGENCY"]
+        surge_warning = demand_surge_by_code["SURGE_WARNING"]
+        surge_overstock = demand_surge_by_code["SURGE_OVERSTOCK_BLOCK"]
+        equal_forecast = demand_surge_by_code["EQUAL_FORECAST"]
+        zero_forecast_surge = demand_surge_by_code["ZERO_FORECAST_SURGE"]
+        if (
+            normal_demand.get("수요급증여부")
+            or float(normal_demand.get("위험보정잔여예상수요") or 0) != 60
+            or float(normal_demand.get("remaining_expected_demand_qty") or 0) != 60
+            or not surge_emergency.get("수요급증여부")
+            or float(surge_emergency.get("진행속도기준월말예상출고수량") or 0) != 310
+            or float(surge_emergency.get("위험보정잔여예상수요") or 0) != 190
+            or surge_emergency.get("위험보정기준") != "진행속도 보정"
+            or surge_emergency.get("재고위험상태") != "긴급 부족"
+            or surge_warning.get("재고위험상태") != "부족 주의"
+            or bool(surge_overstock.get("과잉후보여부"))
+            or equal_forecast.get("수요급증여부")
+            or not zero_forecast_surge.get("수요급증여부")
+        ):
+            fact_errors.append(f"stock_risk_demand_surge={demand_surge_rows!r}")
+        surge_actions = dash_mod._build_today_actions(
+            {},
+            {"risk_targets": [surge_emergency, surge_warning]},
+            {},
+        )
+        surge_action = next((item for item in surge_actions if item.get("product_code") == "SURGE_EMERGENCY"), {})
+        if (
+            surge_emergency.get("재고위험사유") != "수요급증 후 잔여수요 절반 미만"
+            or float(surge_action.get("remaining_expected_demand_qty") or 0) != 190
+            or float(surge_action.get("shortage_qty") or 0) != 100
+            or float(surge_action.get("shortage_amt") or 0) != 1000
+            or round(float(surge_action.get("stock_readiness_pct") or 0), 2) != 47.37
+            or "수요급증" not in str(surge_action.get("evidence") or "")
+            or "진행속도 보정" not in str(surge_action.get("evidence") or "")
+        ):
+            fact_errors.append(f"stock_risk_demand_surge_actions={surge_actions!r}")
+        stock_risk_log_records: list[tuple[str, tuple[Any, ...]]] = []
+
+        class _StockRiskLogCapture:
+            def info(self, message: str, *args: Any) -> None:
+                stock_risk_log_records.append((message, args))
+
+        original_stock_risk_log = dash_mod.log
+        dash_mod.log = _StockRiskLogCapture()
+        try:
+            dash_mod._classify_stock_risk_rows([dict(row) for row in demand_surge_rows], readiness_warning_pct=98.0)
+        finally:
+            dash_mod.log = original_stock_risk_log
+        surge_log_args = stock_risk_log_records[-1][1] if stock_risk_log_records else ()
+        if len(surge_log_args) < 8 or float(surge_log_args[6] or 0) != 1000 or float(surge_log_args[7] or 0) != 950:
+            fact_errors.append(f"stock_risk_demand_surge_log={stock_risk_log_records!r}")
+        past_period_rows = [dict(surge_emergency)]
+        dash_mod._apply_current_month_demand_surge(
+            past_period_rows,
+            evaluation_month="202606",
+            policy_date="20260712",
+        )
+        month_end_rows = [dict(surge_emergency)]
+        dash_mod._apply_current_month_demand_surge(
+            month_end_rows,
+            evaluation_month="202607",
+            policy_date="20260731",
+        )
+        if (
+            past_period_rows[0].get("수요급증여부")
+            or past_period_rows[0].get("위험보정기준") != "현재월 아님"
+            or float(month_end_rows[0].get("위험보정잔여예상수요") or 0) != 0
+        ):
+            fact_errors.append(f"stock_risk_demand_surge_period={past_period_rows!r}/{month_end_rows!r}")
+        stock_risk_log_records = []
+
+        class _StockRiskLogCapture:
+            def info(self, message: str, *args: Any) -> None:
+                stock_risk_log_records.append((message, args))
+
+        original_stock_risk_log = dash_mod.log
+        dash_mod.log = _StockRiskLogCapture()
+        try:
+            empty_stock_risk_summary = dash_mod._classify_stock_risk_rows([], readiness_warning_pct=98.0)
+        finally:
+            dash_mod.log = original_stock_risk_log
+        if (
+            len(empty_stock_risk_summary) != 4
+            or not stock_risk_log_records
+            or "total_rows=0" not in stock_risk_log_records[0][0]
+            or "warning_rows=0" not in stock_risk_log_records[0][0]
+            or "overstock_candidate_amount=0" not in stock_risk_log_records[0][0]
+            or "readiness_warning_pct=" not in stock_risk_log_records[0][0]
+        ):
+            fact_errors.append(f"stock_risk_empty_log={stock_risk_log_records!r}")
+        if "stock_risk_summary" not in (facts.get("inventory") or {}):
+            fact_errors.append("stock_risk_summary_missing")
+        if "stock_overstock_summary" not in (facts.get("inventory") or {}):
+            fact_errors.append("stock_overstock_summary_missing")
+        facts_stock_risk_by_status = {
+            str(row.get("재고위험상태") or ""): row
+            for row in (facts.get("inventory") or {}).get("stock_risk_summary") or []
+        }
+        facts_emergency_warning = sum(
+            int((facts_stock_risk_by_status.get(status) or {}).get("품목수") or 0)
+            for status in ("긴급 부족", "부족 주의")
+        )
+        facts_normal = int((facts_stock_risk_by_status.get("적정") or {}).get("품목수") or 0)
+        if (
+            int((facts.get("inventory") or {}).get("metrics", {}).get("shortage_sku_count", {}).get("value") or 0) != facts_emergency_warning
+            or int((facts.get("inventory") or {}).get("metrics", {}).get("ready_sku_count", {}).get("value") or 0) != facts_normal
+        ):
+            fact_errors.append(f"stock_risk_kpi_reconciliation={facts.get('inventory')!r}")
         if not sales_df.equals(sales_original) or not stock_df.equals(stock_original):
             fact_errors.append("input_df_mutated")
         default_scope = dash_mod.default_dashboard_lite_scope(today=date(2026, 7, 20))
@@ -7879,6 +8093,7 @@ def run_basic_checks() -> list[CheckResult]:
         panel_src = Path("app/ui/sims_panel.py").read_text(encoding="utf-8")
         entry_src = Path("app/ui/sims_entry.py").read_text(encoding="utf-8")
         view_src = Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8")
+        dashboard_facts_src = Path("app/services/dashboard_lite_facts.py").read_text(encoding="utf-8")
         main_dashboard_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
         chat_middleware_dashboard_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
         sales_trend_src = Path("app/services/analytics_sales_trend_service.py").read_text(encoding="utf-8")
@@ -7927,6 +8142,17 @@ def run_basic_checks() -> list[CheckResult]:
                 for line in dashboard_scalar_widget_lines
             )
         ]
+        threshold_format_cases = {
+            98.0: "98",
+            97.5: "97.5",
+            97.25: "97.25",
+            80.0: "80",
+        }
+        threshold_format_errors = {
+            value: view_mod._fmt_threshold_pct(value)
+            for value, expected in threshold_format_cases.items()
+            if view_mod._fmt_threshold_pct(value) != expected
+        }
         if (
             '"Dashboard Lite v0.1": dashboard_lite.render_dashboard_lite' not in panel_src
             or 'from app.sims.views import users, codes, vendors, goods, road_address, analytics_views, dashboard_lite, rddbc_io_views' not in panel_src
@@ -7964,6 +8190,20 @@ def run_basic_checks() -> list[CheckResult]:
             or "_prepare_dashboard_profile_scalar_state()" not in view_src
             or "min_value=1, step=1, key=\"__dashboard_lite_major_purchase_vendor_days\"" not in view_src
             or "min_value=0.1, max_value=100.0, step=0.1, key=\"__dashboard_lite_readiness_warning_pct\"" not in view_src
+            or 'threshold_value = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)' not in view_src
+            or "display_readiness_pct" not in view_src
+            or "display_remaining_demand_qty" not in view_src
+            or "display_shortage_amt" not in view_src
+            or "수요급증여부:N" not in view_src
+            or "위험보정기준:N" not in view_src
+            or "98% 미만 SKU만 기본 조치 대상으로 표시합니다." in view_src
+            or "threshold_value:.0f" in view_src
+            or "readiness_threshold:.0f" in view_src
+            or bool(threshold_format_errors)
+            or '"위험보정부족예상금액", r.get("shortage_amt")' not in dashboard_facts_src
+            or '"위험보정부족예상수량", r.get("shortage_qty")' not in dashboard_facts_src
+            or '"위험보정재고준비율", r.get("stock_readiness_pct")' not in dashboard_facts_src
+            or '"수요급증 후 잔여수요 절반 미만"' not in dashboard_facts_src
             or 'Dashboard facts / 비교 금지 규칙' in view_src
             or 'with st.expander("추가 확인사항"' in view_src
         ):
@@ -8035,7 +8275,7 @@ def run_basic_checks() -> list[CheckResult]:
                 },
                 "facts": {
                     "sales": {"metrics": {"amount": 1}, "chart_rows": [{"period": "2026-01", "value": 1}]},
-                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
+                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
                     "today_actions": [{"priority": 1}],
                 },
             }
@@ -8045,6 +8285,12 @@ def run_basic_checks() -> list[CheckResult]:
                 dashboard_roundtrip_errors.append(f"dashboard_snapshot_not_compact bytes={len(compact_json)}")
             if not (compact_cache.get("facts", {}).get("sales", {}).get("chart_rows") and compact_cache.get("facts", {}).get("inventory", {}).get("risk_targets")):
                 dashboard_roundtrip_errors.append("dashboard_snapshot_render_inputs_lost")
+            if "stock_risk_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
+                dashboard_roundtrip_errors.append("dashboard_stock_risk_summary_missing")
+            if "stock_overstock_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
+                dashboard_roundtrip_errors.append("dashboard_stock_overstock_summary_missing")
+            if "stock_demand_surge_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
+                dashboard_roundtrip_errors.append("dashboard_stock_demand_surge_summary_missing")
             full_payload = {
                 "id": "dashboard-event-full",
                 "type": "dashboard_lite",

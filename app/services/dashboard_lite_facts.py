@@ -724,6 +724,248 @@ def _text_series(df: pd.DataFrame, col: str, default: str = "미지정") -> pd.S
     return out.where(out.ne(""), default)
 
 
+STOCK_RISK_STATUS_ORDER = ("긴급 부족", "부족 주의", "적정", "판정 제외")
+
+
+def _stock_risk_item_identity(work: pd.DataFrame) -> pd.Series:
+    """Return the stable item identity used only for stock-risk summary counts."""
+    product_codes = work.get("product_code", pd.Series("", index=work.index, dtype="object"))
+    product_names = work.get("product_name", pd.Series("", index=work.index, dtype="object"))
+    product_codes = product_codes.fillna("").astype(str).str.strip()
+    product_names = product_names.fillna("").astype(str).str.strip()
+
+    identities: list[str] = []
+    for row_index, product_code, product_name in zip(work.index, product_codes, product_names):
+        if product_code:
+            identities.append(f"code:{product_code}")
+        elif product_name:
+            identities.append(f"name:{product_name}")
+        else:
+            identities.append(f"row:{row_index}")
+    return pd.Series(identities, index=work.index, dtype="object")
+
+
+def _apply_current_month_demand_surge(
+    rows: list[dict[str, Any]],
+    *,
+    evaluation_month: str,
+    policy_date: str,
+) -> dict[str, Any]:
+    """Add risk-only demand-surge fields without changing source shortage facts."""
+    policy_digits = re.sub(r"\D", "", str(policy_date or ""))[:8]
+    current_month = bool(policy_digits and evaluation_month == policy_digits[:6])
+    elapsed_days = 0
+    total_days = 0
+    remaining_days = 0
+    if current_month:
+        year, month = int(policy_digits[:4]), int(policy_digits[4:6])
+        total_days = monthrange(year, month)[1]
+        elapsed_days = min(max(int(policy_digits[6:8]), 1), total_days)
+        remaining_days = max(total_days - elapsed_days, 0)
+
+    for row in rows:
+        current_shipment = float(row.get("당월현재출고수량") or 0)
+        base_forecast = float(row.get("당월기준예상출고수량") or 0)
+        base_remaining = float(row.get("remaining_expected_demand_qty") or 0)
+        stock = float(row.get("current_stock_qty") or 0)
+        unit_price = float(row.get("stock_valuation_unit_price") or 0)
+        demand_surge = bool(current_month and current_shipment > base_forecast)
+        pace_month_end = (current_shipment / elapsed_days * total_days) if demand_surge else base_forecast
+        adjusted_forecast = max(base_forecast, pace_month_end) if demand_surge else base_forecast
+        adjusted_remaining = max(adjusted_forecast - current_shipment, 0.0) if demand_surge else base_remaining
+        adjusted_shortage_qty = max(adjusted_remaining - stock, 0.0)
+        adjusted_shortage_amt = adjusted_shortage_qty * unit_price
+        adjusted_readiness = (
+            min(max(stock, 0.0), adjusted_remaining) / adjusted_remaining * 100.0
+            if adjusted_remaining > 0
+            else float("nan")
+        )
+        row.update(
+            {
+                "수요급증여부": demand_surge,
+                "수요급증사유": "당월 현재출고수량이 기준 예상출고수량 초과" if demand_surge else "",
+                "평가월경과일수": elapsed_days,
+                "평가월총일수": total_days,
+                "평가월잔여일수": remaining_days,
+                "진행속도기준월말예상출고수량": pace_month_end if demand_surge else None,
+                "위험보정예상출고수량": adjusted_forecast,
+                "위험보정잔여예상수요": adjusted_remaining,
+                "위험보정재고준비율": adjusted_readiness,
+                "위험보정부족예상수량": adjusted_shortage_qty,
+                "위험보정부족예상금액": adjusted_shortage_amt,
+                "위험보정기준": "진행속도 보정" if demand_surge else ("현재월 아님" if not current_month else "기존 예상"),
+            }
+        )
+    return {
+        "current_month": current_month,
+        "evaluation_elapsed_days": elapsed_days,
+        "evaluation_total_days": total_days,
+        "evaluation_remaining_days": remaining_days,
+    }
+
+
+def _classify_stock_risk_rows(
+    rows: list[dict[str, Any]],
+    *,
+    readiness_warning_pct: float,
+) -> list[dict[str, Any]]:
+    """Add v0.2 stock-risk facts without changing the existing shortage facts."""
+    started = time.perf_counter()
+    if not rows:
+        summary = [
+            {
+                "재고위험상태": status,
+                "품목수": 0,
+                "부족예상금액": 0.0,
+                "과잉후보금액": 0.0,
+                "현재재고금액": 0.0,
+            }
+            for status in STOCK_RISK_STATUS_ORDER
+        ]
+        log.info(
+            "[dashboard.stock_risk] total_rows=0 emergency_rows=0 warning_rows=0 normal_rows=0 excluded_rows=0 overstock_candidate_rows=0 emergency_amount=0 warning_shortage_amount=0 overstock_candidate_amount=0 demand_surge_rows=0 demand_surge_emergency_rows=0 demand_surge_warning_rows=0 demand_surge_normal_rows=0 adjusted_remaining_demand_qty=0 adjusted_shortage_qty=0 adjusted_shortage_amount=0 evaluation_elapsed_days=0 evaluation_total_days=0 readiness_warning_pct=%s elapsed_ms=%s",
+            float(readiness_warning_pct),
+            int((time.perf_counter() - started) * 1000),
+        )
+        return summary
+
+    work = pd.DataFrame(rows)
+    numeric_cols = [
+        "current_stock_qty",
+        "current_stock_amt",
+        "remaining_expected_demand_qty",
+        "shortage_qty",
+        "shortage_amt",
+        "stock_readiness_pct",
+        "stock_valuation_unit_price",
+        "3개월필요수량",
+        "위험보정잔여예상수요",
+        "위험보정재고준비율",
+        "위험보정부족예상수량",
+        "위험보정부족예상금액",
+    ]
+    numeric = pd.DataFrame(
+        {
+            col: pd.to_numeric(
+                work.get(col, pd.Series(float("nan"), index=work.index, dtype="float64")),
+                errors="coerce",
+            )
+            for col in numeric_cols
+        },
+        index=work.index,
+    )
+    required_present = work.get("_stock_risk_required_values_present", pd.Series(True, index=work.index))
+    required_numeric_cols = [
+        col
+        for col in numeric_cols
+        if col not in {"3개월필요수량", "위험보정잔여예상수요", "위험보정재고준비율", "위험보정부족예상수량", "위험보정부족예상금액"}
+    ]
+    required_present = required_present.fillna(False).astype(bool) & numeric[required_numeric_cols].notna().all(axis=1)
+    demand = numeric["위험보정잔여예상수요"].where(
+        numeric["위험보정잔여예상수요"].notna(),
+        numeric["remaining_expected_demand_qty"],
+    )
+    stock = numeric["current_stock_qty"]
+    demand_surge = work.get("수요급증여부", pd.Series(False, index=work.index)).fillna(False).astype(bool)
+    coverage = numeric["위험보정재고준비율"].where(
+        numeric["위험보정재고준비율"].notna(),
+        (stock.clip(lower=0) / demand * 100.0).where(demand > 0),
+    )
+    excess_qty = (stock - demand).clip(lower=0).where(demand > 0, 0.0)
+    excess_amt = excess_qty * numeric["stock_valuation_unit_price"]
+
+    status = pd.Series("판정 제외", index=work.index, dtype="object")
+    reason = pd.Series("필수값 누락", index=work.index, dtype="object")
+    no_demand = required_present & demand.le(0)
+    status.loc[no_demand] = "판정 제외"
+    reason.loc[no_demand] = "수요없음"
+
+    eligible = required_present & demand.gt(0)
+    emergency = eligible & stock.lt(demand / 2.0)
+    status.loc[emergency] = "긴급 부족"
+    emergency_reasons = pd.Series("", index=work.index, dtype="object")
+    emergency_reasons.loc[emergency & stock.le(0)] = "재고없음"
+    emergency_reasons.loc[emergency & stock.gt(0) & demand_surge] = "수요급증 후 잔여수요 절반 미만"
+    emergency_reasons.loc[emergency & emergency_reasons.eq("")] = "잔여수요 절반 미만"
+    reason.loc[emergency] = emergency_reasons.loc[emergency]
+
+    warning = eligible & ~emergency & coverage.lt(float(readiness_warning_pct))
+    status.loc[warning] = "부족 주의"
+    reason.loc[warning] = "준비율 경고기준 미만"
+    reason.loc[warning & demand_surge] = "수요급증 후 준비율 경고기준 미만"
+
+    normal = eligible & ~emergency & ~warning
+    status.loc[normal] = "적정"
+    reason.loc[normal] = "준비율 경고기준 이상"
+
+    three_month_required_qty = numeric["3개월필요수량"].fillna(0.0)
+    overstock_candidate = normal & ~demand_surge & three_month_required_qty.gt(0) & stock.gt(three_month_required_qty)
+    overstock_candidate_qty = (stock - three_month_required_qty).clip(lower=0).where(overstock_candidate, 0.0)
+    overstock_candidate_amt = overstock_candidate_qty * numeric["stock_valuation_unit_price"]
+
+    work["재고위험상태"] = status
+    work["재고위험사유"] = reason
+    work["재고커버리지율"] = coverage
+    work["과잉후보여부"] = overstock_candidate.fillna(False).astype(bool)
+    work["과잉후보수량"] = overstock_candidate_qty.fillna(0.0)
+    work["과잉후보금액"] = overstock_candidate_amt.fillna(0.0)
+    work["과잉후보사유"] = pd.Series("", index=work.index, dtype="object")
+    work.loc[overstock_candidate, "과잉후보사유"] = "현재재고가 3개월 필요수량 초과"
+    rows[:] = work.drop(columns=["_stock_risk_required_values_present"], errors="ignore").to_dict("records")
+
+    item_identity = _stock_risk_item_identity(work)
+    summary: list[dict[str, Any]] = []
+    for risk_status in STOCK_RISK_STATUS_ORDER:
+        subset = work.loc[work["재고위험상태"].eq(risk_status)]
+        item_count = int(item_identity.loc[subset.index].nunique())
+        adjusted_shortage_amt = pd.to_numeric(
+            subset.get("위험보정부족예상금액", subset.get("shortage_amt", pd.Series(0, index=subset.index))),
+            errors="coerce",
+        ).fillna(0)
+        summary.append(
+            {
+                "재고위험상태": risk_status,
+                "품목수": item_count,
+                "부족예상금액": float(adjusted_shortage_amt.sum()),
+                "과잉후보금액": float(pd.to_numeric(subset.get("과잉후보금액"), errors="coerce").fillna(0).sum()),
+                "현재재고금액": float(pd.to_numeric(subset.get("current_stock_amt"), errors="coerce").fillna(0).sum()),
+            }
+        )
+
+    for adjusted_col in (
+        "위험보정잔여예상수요",
+        "위험보정부족예상수량",
+        "위험보정부족예상금액",
+    ):
+        if adjusted_col not in work.columns:
+            work[adjusted_col] = 0.0
+
+    log.info(
+        "[dashboard.stock_risk] total_rows=%s emergency_rows=%s warning_rows=%s normal_rows=%s excluded_rows=%s overstock_candidate_rows=%s emergency_amount=%s warning_shortage_amount=%s overstock_candidate_amount=%s demand_surge_rows=%s demand_surge_emergency_rows=%s demand_surge_warning_rows=%s demand_surge_normal_rows=%s adjusted_remaining_demand_qty=%s adjusted_shortage_qty=%s adjusted_shortage_amount=%s evaluation_elapsed_days=%s evaluation_total_days=%s readiness_warning_pct=%s elapsed_ms=%s",
+        len(work),
+        int(status.eq("긴급 부족").sum()),
+        int(status.eq("부족 주의").sum()),
+        int(status.eq("적정").sum()),
+        int(status.eq("판정 제외").sum()),
+        int(overstock_candidate.sum()),
+        float(pd.to_numeric(work.loc[status.eq("긴급 부족"), "위험보정부족예상금액"], errors="coerce").fillna(0).sum()),
+        float(pd.to_numeric(work.loc[status.eq("부족 주의"), "위험보정부족예상금액"], errors="coerce").fillna(0).sum()),
+        float(pd.to_numeric(work.loc[overstock_candidate, "과잉후보금액"], errors="coerce").fillna(0).sum()),
+        int(demand_surge.sum()),
+        int((demand_surge & status.eq("긴급 부족")).sum()),
+        int((demand_surge & status.eq("부족 주의")).sum()),
+        int((demand_surge & status.eq("적정")).sum()),
+        float(pd.to_numeric(work.loc[demand_surge, "위험보정잔여예상수요"], errors="coerce").fillna(0).sum()),
+        float(pd.to_numeric(work.loc[demand_surge, "위험보정부족예상수량"], errors="coerce").fillna(0).sum()),
+        float(pd.to_numeric(work.loc[demand_surge, "위험보정부족예상금액"], errors="coerce").fillna(0).sum()),
+        int(pd.to_numeric(work.get("평가월경과일수", pd.Series(0, index=work.index)), errors="coerce").fillna(0).max()),
+        int(pd.to_numeric(work.get("평가월총일수", pd.Series(0, index=work.index)), errors="coerce").fillna(0).max()),
+        float(readiness_warning_pct),
+        int((time.perf_counter() - started) * 1000),
+    )
+    return summary
+
+
 def _build_sales_facts(
     payload: Mapping[str, Any] | None,
     *,
@@ -898,7 +1140,13 @@ def _build_sales_facts(
     }
 
 
-def _build_inventory_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+def _build_inventory_facts(
+    payload: Mapping[str, Any] | None,
+    *,
+    readiness_warning_pct: float = STOCK_READY_THRESHOLD_PCT,
+    evaluation_month: str = "",
+    policy_date: str = "",
+) -> dict[str, Any]:
     df = _payload_df(payload)
     meta = _payload_meta(payload)
     rows: list[dict[str, Any]] = []
@@ -916,16 +1164,31 @@ def _build_inventory_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
             unit_price = _safe_div(source_shortage_amt, source_shortage_qty, 0.0) if source_shortage_qty > 0 else 0.0
             if not unit_price:
                 unit_price = _num(row.get("재고평가단가")) or _num(row.get("평가단가")) or _num(row.get("장부재고평가단가"))
+            required_values = [
+                row.get("현재재고수량"),
+                row.get("당월 잔여예상출고수량"),
+                row.get("부족예상수량"),
+                row.get("부족예상금액"),
+                unit_price,
+            ]
             work_rows.append(
                 {
                     "product_code": product_code,
                     "product_name": str(row.get(name_col) or "").strip() or "미지정",
                     "manufacturer_name": _first_text(row, maker_cols),
                     "current_stock_qty": stock,
+                    "current_stock_amt": _num(row.get("현재재고금액")),
                     "remaining_expected_demand_qty": remaining,
+                    "당월현재출고수량": _num(row.get("당월 현재출고수량")),
+                    "당월기준예상출고수량": _num(row.get("당월 예상출고수량")),
+                    "3개월필요수량": _num(row.get("3개월필요수량")),
                     "_source_shortage_qty": source_shortage_qty,
                     "_source_shortage_amt": source_shortage_amt,
                     "_unit_price": unit_price,
+                    "_stock_risk_required_values_present": all(
+                        value is not None and pd.notna(value) and str(value).strip() != ""
+                        for value in required_values
+                    ),
                 }
             )
 
@@ -939,20 +1202,30 @@ def _build_inventory_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
                     "product_name": item["product_name"],
                     "manufacturer_name": item["manufacturer_name"],
                     "current_stock_qty": 0.0,
+                    "current_stock_amt": 0.0,
                     "remaining_expected_demand_qty": 0.0,
+                    "당월현재출고수량": 0.0,
+                    "당월기준예상출고수량": 0.0,
+                    "3개월필요수량": 0.0,
                     "_source_shortage_qty": 0.0,
                     "_source_shortage_amt": 0.0,
                     "_unit_price_values": [],
+                    "_stock_risk_required_values_present": True,
                 },
             )
             if not acc.get("manufacturer_name") and item.get("manufacturer_name"):
                 acc["manufacturer_name"] = item["manufacturer_name"]
             acc["current_stock_qty"] += float(item.get("current_stock_qty") or 0)
+            acc["current_stock_amt"] += float(item.get("current_stock_amt") or 0)
             acc["remaining_expected_demand_qty"] += float(item.get("remaining_expected_demand_qty") or 0)
+            acc["당월현재출고수량"] += float(item.get("당월현재출고수량") or 0)
+            acc["당월기준예상출고수량"] += float(item.get("당월기준예상출고수량") or 0)
+            acc["3개월필요수량"] += float(item.get("3개월필요수량") or 0)
             acc["_source_shortage_qty"] += float(item.get("_source_shortage_qty") or 0)
             acc["_source_shortage_amt"] += float(item.get("_source_shortage_amt") or 0)
             if float(item.get("_unit_price") or 0) > 0:
                 acc["_unit_price_values"].append(float(item.get("_unit_price") or 0))
+            acc["_stock_risk_required_values_present"] = bool(acc["_stock_risk_required_values_present"]) and bool(item.get("_stock_risk_required_values_present"))
 
         for row in grouped.values():
             stock = float(row.get("current_stock_qty") or 0)
@@ -981,31 +1254,70 @@ def _build_inventory_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
                     "product_name": str(row.get("product_name") or "").strip() or "미지정",
                     "manufacturer_name": str(row.get("manufacturer_name") or "").strip(),
                     "current_stock_qty": stock,
+                    "current_stock_amt": float(row.get("current_stock_amt") or 0),
                     "remaining_expected_demand_qty": remaining,
+                    "당월현재출고수량": float(row.get("당월현재출고수량") or 0),
+                    "당월기준예상출고수량": float(row.get("당월기준예상출고수량") or 0),
+                    "3개월필요수량": float(row.get("3개월필요수량") or 0),
                     "stock_readiness_pct": readiness,
                     "shortage_qty": shortage_qty,
                     "shortage_amt": shortage_amt,
+                    "stock_valuation_unit_price": unit_price,
+                    "_stock_risk_required_values_present": bool(row.get("_stock_risk_required_values_present")),
                     "has_demand": has_demand,
                     "status": status,
                 }
             )
 
-    demand_rows = [r for r in rows if r["has_demand"]]
-    ready_rows = [r for r in demand_rows if r["stock_readiness_pct"] >= STOCK_READY_THRESHOLD_PCT]
-    shortage_rows = [r for r in demand_rows if r["stock_readiness_pct"] < STOCK_READY_THRESHOLD_PCT]
-    total_demand_skus = len(demand_rows)
-    ready_count = len(ready_rows)
-    shortage_count = len(shortage_rows)
+    demand_surge_context = _apply_current_month_demand_surge(
+        rows,
+        evaluation_month=evaluation_month,
+        policy_date=policy_date,
+    )
+    stock_risk_summary = _classify_stock_risk_rows(
+        rows,
+        readiness_warning_pct=readiness_warning_pct,
+    )
+    demand_rows = [r for r in rows if r.get("재고위험상태") != "판정 제외"]
+    ready_rows = [r for r in rows if r.get("재고위험상태") == "적정"]
+    shortage_rows = [r for r in rows if r.get("재고위험상태") in {"긴급 부족", "부족 주의"}]
+    summary_by_status = {str(row.get("재고위험상태") or ""): row for row in stock_risk_summary}
+    ready_count = int((summary_by_status.get("적정") or {}).get("품목수") or 0)
+    shortage_count = sum(
+        int((summary_by_status.get(status) or {}).get("품목수") or 0)
+        for status in ("긴급 부족", "부족 주의")
+    )
+    total_demand_skus = ready_count + shortage_count
     sku_readiness_pct = _safe_div(ready_count * 100.0, total_demand_skus, 100.0)
     risk_targets = sorted(
         shortage_rows,
         key=lambda r: (
-            -float(r.get("shortage_amt") or 0),
-            -float(r.get("shortage_qty") or 0),
-            float(r.get("stock_readiness_pct") or 0),
+            -float(r.get("위험보정부족예상금액", r.get("shortage_amt")) or 0),
+            -float(r.get("위험보정부족예상수량", r.get("shortage_qty")) or 0),
+            float(r.get("위험보정재고준비율", r.get("stock_readiness_pct")) or 0),
             str(r.get("product_code") or ""),
         ),
     )[:10]
+    stock_overstock_rows = [row for row in rows if bool(row.get("과잉후보여부"))]
+    stock_overstock_summary = {
+        "품목수": int(_stock_risk_item_identity(pd.DataFrame(stock_overstock_rows)).nunique()) if stock_overstock_rows else 0,
+        "과잉후보수량": float(sum(float(row.get("과잉후보수량") or 0) for row in stock_overstock_rows)),
+        "과잉후보금액": float(sum(float(row.get("과잉후보금액") or 0) for row in stock_overstock_rows)),
+        "기준": "현재재고 > 3개월 필요수량",
+        "포함상태": "적정",
+    }
+    demand_surge_rows = [row for row in rows if bool(row.get("수요급증여부"))]
+    demand_surge_summary = {
+        "품목수": int(_stock_risk_item_identity(pd.DataFrame(demand_surge_rows)).nunique()) if demand_surge_rows else 0,
+        "긴급부족품목수": sum(1 for row in demand_surge_rows if row.get("재고위험상태") == "긴급 부족"),
+        "부족주의품목수": sum(1 for row in demand_surge_rows if row.get("재고위험상태") == "부족 주의"),
+        "적정품목수": sum(1 for row in demand_surge_rows if row.get("재고위험상태") == "적정"),
+        "진행속도보정잔여수요": float(sum(float(row.get("위험보정잔여예상수요") or 0) for row in demand_surge_rows)),
+        "위험보정부족예상수량": float(sum(float(row.get("위험보정부족예상수량") or 0) for row in demand_surge_rows)),
+        "위험보정부족예상금액": float(sum(float(row.get("위험보정부족예상금액") or 0) for row in demand_surge_rows)),
+        "평가월경과일수": demand_surge_context["evaluation_elapsed_days"],
+        "평가월총일수": demand_surge_context["evaluation_total_days"],
+    }
 
     return {
         "metrics": {
@@ -1015,8 +1327,8 @@ def _build_inventory_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
                 unit="개",
                 aggregation="count",
                 grain="제품",
-                time_basis="당월 잔여예상수요 기준",
-                source_columns=["현재재고수량", "당월 잔여예상출고수량"],
+                time_basis="위험보정 잔여예상수요 기준 (수요급증 시 진행속도 보정, 그 외 기존 예상)",
+                source_columns=["현재재고수량", "위험보정잔여예상수요", "위험보정재고준비율", "당월 잔여예상출고수량", "재고준비율"],
                 comparable_with=["재고부족 SKU 수"],
             ),
             "shortage_sku_count": _fact(
@@ -1025,8 +1337,8 @@ def _build_inventory_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
                 unit="개",
                 aggregation="count",
                 grain="제품",
-                time_basis="당월 잔여예상수요 기준",
-                source_columns=["현재재고수량", "당월 잔여예상출고수량"],
+                time_basis="위험보정 잔여예상수요 기준 (수요급증 시 진행속도 보정, 그 외 기존 예상)",
+                source_columns=["현재재고수량", "위험보정잔여예상수요", "위험보정재고준비율", "당월 잔여예상출고수량", "재고준비율"],
                 comparable_with=["재고충분 SKU 수"],
             ),
             "sku_readiness_pct": _fact(
@@ -1035,21 +1347,24 @@ def _build_inventory_facts(payload: Mapping[str, Any] | None) -> dict[str, Any]:
                 unit="%",
                 aggregation="ready_sku / demand_sku",
                 grain="제품",
-                time_basis="당월 잔여예상수요 기준",
-                source_columns=["현재재고수량", "당월 잔여예상출고수량"],
+                time_basis="위험보정 잔여예상수요 기준 (수요급증 시 진행속도 보정, 그 외 기존 예상)",
+                source_columns=["현재재고수량", "위험보정잔여예상수요", "위험보정재고준비율", "당월 잔여예상출고수량", "재고준비율"],
             ),
             "shortage_qty": _fact(
                 "부족수량",
-                sum(float(r.get("shortage_qty") or 0) for r in rows) or _num(meta.get("sum_expected_shortage_qty")),
+                sum(float(r.get("위험보정부족예상수량", r.get("shortage_qty")) or 0) for r in rows),
                 unit="수량",
                 aggregation="sum",
                 grain="제품",
-                time_basis="당월 잔여예상수요 기준",
-                source_columns=["부족예상수량"],
+                time_basis="위험보정 잔여예상수요 기준 (수요급증 시 진행속도 보정, 그 외 기존 예상)",
+                source_columns=["위험보정잔여예상수요", "위험보정부족예상수량", "부족예상수량"],
             ),
         },
         "readiness_rows": rows,
         "risk_targets": risk_targets,
+        "stock_risk_summary": stock_risk_summary,
+        "stock_overstock_summary": stock_overstock_summary,
+        "stock_demand_surge_summary": demand_surge_summary,
         "data_quality": [] if rows else ["재고준비율 산정 자료 없음"],
     }
 
@@ -1063,6 +1378,15 @@ def _build_today_actions(sales: dict[str, Any], inventory: dict[str, Any], turno
         if not dedupe_key or dedupe_key in seen_products:
             continue
         seen_products.add(dedupe_key)
+        remaining = float(row.get("위험보정잔여예상수요", row.get("remaining_expected_demand_qty")) or 0)
+        shortage_qty = float(row.get("위험보정부족예상수량", row.get("shortage_qty")) or 0)
+        shortage_amt = float(row.get("위험보정부족예상금액", row.get("shortage_amt")) or 0)
+        readiness_pct = float(row.get("위험보정재고준비율", row.get("stock_readiness_pct")) or 0)
+        demand_surge = bool(row.get("수요급증여부"))
+        adjustment_basis = str(row.get("위험보정기준") or "")
+        evidence = f"잔여수요 {remaining:,.0f}, 부족 {shortage_qty:,.0f}"
+        if demand_surge:
+            evidence = f"수요급증 · {adjustment_basis or '진행속도 보정'} · {evidence}"
         actions.append(
             {
                 "rank": len(actions) + 1,
@@ -1073,12 +1397,12 @@ def _build_today_actions(sales: dict[str, Any], inventory: dict[str, Any], turno
                 "product_name": row.get("product_name") or "",
                 "manufacturer_name": row.get("manufacturer_name") or "",
                 "current_stock_qty": float(row.get("current_stock_qty") or 0),
-                "remaining_expected_demand_qty": float(row.get("remaining_expected_demand_qty") or 0),
-                "shortage_qty": float(row.get("shortage_qty") or 0),
-                "shortage_amt": float(row.get("shortage_amt") or 0),
-                "stock_readiness_pct": float(row.get("stock_readiness_pct") or 0),
-                "status": f"준비율 {row.get('stock_readiness_pct', 0):.1f}%",
-                "evidence": f"잔여수요 {row.get('remaining_expected_demand_qty', 0):,.0f}, 부족 {row.get('shortage_qty', 0):,.0f}",
+                "remaining_expected_demand_qty": remaining,
+                "shortage_qty": shortage_qty,
+                "shortage_amt": shortage_amt,
+                "stock_readiness_pct": readiness_pct,
+                "status": f"준비율 {readiness_pct:.1f}%",
+                "evidence": evidence,
                 "recommended_action": "발주·재고이동·대체공급 확인",
                 "drill_down": "품목별 재고부족현황",
             }
@@ -1259,7 +1583,12 @@ def build_dashboard_lite_facts(
         int((time.perf_counter() - t_sales) * 1000),
     )
     t_stock = time.perf_counter()
-    inventory = _build_inventory_facts(stock_shortage_payload)
+    inventory = _build_inventory_facts(
+        stock_shortage_payload,
+        readiness_warning_pct=float(service_params.get("readiness_warning_pct") or STOCK_READY_THRESHOLD_PCT),
+        evaluation_month=str(service_params.get("evaluation_month") or ""),
+        policy_date=str(service_params.get("policy_date") or ""),
+    )
     log.info(
         "[dashboard.stock_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",
         service_params.get("company_id") or "",
@@ -1314,8 +1643,9 @@ def build_dashboard_lite_facts(
         },
         "inventory": inventory,
         "stock_readiness": {
-            "threshold_pct": STOCK_READY_THRESHOLD_PCT,
-            "policy": "제품별 준비가능수량=min(max(현재재고,0), 당월 잔여예상수요)",
+            "threshold_pct": float(service_params.get("readiness_warning_pct") or STOCK_READY_THRESHOLD_PCT),
+            "policy": "제품별 준비가능수량=min(max(현재재고,0), 위험보정 잔여예상수요)",
+            "adjustment_policy": "수요급증 품목은 현재 출고속도 기준 진행속도 보정 월말예상을 사용하고, 일반 품목은 기존 당월 예상수요를 사용",
             "sku_readiness_pct": inventory["metrics"]["sku_readiness_pct"],
         },
         "turnover_days": turnover,
