@@ -530,6 +530,69 @@ def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
     st.caption("과잉 후보는 적정 품목의 보조 관찰지표이며 기본 재고위험 상태에는 중복 반영하지 않습니다.")
 
 
+def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
+    inventory = facts.get("inventory") or {}
+    summary = inventory.get("vendor_stock_risk_summary") or {}
+    rows = inventory.get("vendor_stock_risk_top_rows") or []
+    if not summary:
+        return
+    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
+    total_amount = float(summary.get("total_adjusted_shortage_amount") or 0)
+    if amount_unit == "auto":
+        divisor, _ = _amount_display_spec("auto", abs(total_amount))
+        amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
+
+    st.markdown("### 최근 6완료월 주요 매입처별 재고위험")
+    st.caption("제품별 주요 매입처는 평가월 직전 최근 6완료월의 순매입금액·순입고수량·최근 매입월 순으로 1개를 선정합니다.")
+    st.caption("본 기준은 월집계 자료를 사용하며, 저장 조건의 ‘주요 매입처 판정기간(일)’을 적용한 결과가 아닙니다.")
+    summary_cols = st.columns(4)
+    with summary_cols[0]:
+        _metric_card("정상 귀속 위험품목", summary.get("assigned_rows", 0), "개", amount_unit="")
+    with summary_cols[1]:
+        _metric_card("정상 귀속 위험금액", summary.get("assigned_adjusted_shortage_amount", 0), "", amount_unit=amount_unit)
+    with summary_cols[2]:
+        _metric_card("최근 매입 없음", summary.get("recent_purchase_none_rows", 0), "개", help_text=f"위험금액 {_fmt_dashboard_amount(summary.get('recent_purchase_none_amount', 0), amount_unit)}")
+    with summary_cols[3]:
+        _metric_card("매입처 미확인", summary.get("vendor_unknown_rows", 0), "개", help_text=f"위험금액 {_fmt_dashboard_amount(summary.get('vendor_unknown_amount', 0), amount_unit)}")
+
+    if not rows:
+        st.caption("정상 귀속된 긴급 부족·부족 주의 매입처가 없습니다.")
+        return
+    frame = pd.DataFrame(rows).copy()
+    if frame.empty:
+        return
+    divisor, unit_label = _amount_display_spec(amount_unit, total_amount)
+    frame["표시매입처"] = frame.apply(
+        lambda row: str(row.get("주요매입처명") or "").strip()
+        if str(row.get("주요매입처명") or "").strip() and frame["주요매입처명"].astype(str).eq(str(row.get("주요매입처명") or "")).sum() == 1
+        else f"{str(row.get('주요매입처명') or '').strip() or '미확인'} [{str(row.get('주요매입처코드') or '').strip()}]",
+        axis=1,
+    )
+    order = frame["표시매입처"].tolist()
+    chart_rows: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        for label, key, color in (("긴급 부족금액", "긴급부족금액", "#dc2626"), ("부족 주의 금액", "부족주의금액", "#f59e0b")):
+            chart_rows.append({
+                "표시매입처": row["표시매입처"], "구분": label, "금액": float(row.get(key) or 0) / divisor,
+                "전체위험금액": float(row.get("전체위험보정부족금액") or 0), "긴급부족품목수": int(row.get("긴급부족품목수") or 0),
+                "부족주의품목수": int(row.get("부족주의품목수") or 0), "위험품목수": int(row.get("위험품목수") or 0),
+                "수요급증품목수": int(row.get("수요급증품목수") or 0), "주요매입처코드": str(row.get("주요매입처코드") or ""),
+            })
+    chart_df = pd.DataFrame(chart_rows)
+    chart = alt.Chart(chart_df).mark_bar().encode(
+        y=alt.Y("표시매입처:N", sort=order, title=None),
+        x=alt.X("금액:Q", stack="zero", title=f"위험보정 부족금액 ({unit_label})", axis=alt.Axis(format=",.0f")),
+        color=alt.Color("구분:N", scale=alt.Scale(domain=["긴급 부족금액", "부족 주의 금액"], range=["#dc2626", "#f59e0b"])),
+        tooltip=[
+            alt.Tooltip("표시매입처:N", title="주요 매입처"), alt.Tooltip("주요매입처코드:N", title="코드"),
+            alt.Tooltip("긴급부족품목수:Q", title="긴급 부족 품목", format=",.0f"), alt.Tooltip("부족주의품목수:Q", title="부족 주의 품목", format=",.0f"),
+            alt.Tooltip("위험품목수:Q", title="위험 품목", format=",.0f"), alt.Tooltip("수요급증품목수:Q", title="수요급증 품목", format=",.0f"),
+            alt.Tooltip("전체위험금액:Q", title="전체 위험금액", format=",.0f"), alt.Tooltip("금액:Q", title="구분 금액", format=",.0f"),
+        ],
+    ).properties(height=max(180, min(360, len(order) * 30)))
+    st.altair_chart(chart, width="stretch")
+
+
 def _render_demand_surge_detail_summary(facts: dict[str, Any]) -> None:
     """Render aggregate surge-detail facts without exposing product rows."""
     summary = (facts.get("inventory") or {}).get("stock_demand_surge_summary") or {}
@@ -1127,6 +1190,7 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "stock_risk_summary": list(inventory.get("stock_risk_summary") or []),
             "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
             "stock_demand_surge_summary": dict(inventory.get("stock_demand_surge_summary") or {}),
+            "vendor_stock_risk_summary": dict(inventory.get("vendor_stock_risk_summary") or {}),
             "data_quality": list(inventory.get("data_quality") or [])[:row_limit],
         },
         "turnover_days": dict(facts.get("turnover_days") or {}),
@@ -1207,6 +1271,7 @@ def _render_dashboard_facts(facts: dict[str, Any]) -> None:
     _render_stock_chart(facts)
 
     _render_stock_risk_summary(facts)
+    _render_vendor_stock_risk(facts)
     _render_demand_surge_detail_summary(facts)
 
     st.markdown("### 매입·매출 거래 회전일")

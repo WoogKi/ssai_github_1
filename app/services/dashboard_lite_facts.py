@@ -1367,6 +1367,244 @@ def _build_sales_facts(
     }
 
 
+def _attach_major_purchase_vendors(
+    rows: list[dict[str, Any]],
+    purchase_vendor_df: pd.DataFrame | None,
+    *,
+    evaluation_month: str,
+    history_month_from: str,
+    source_call_count: int,
+) -> dict[str, Any]:
+    """Assign exactly one completed-month purchase vendor to each product row."""
+    started = time.perf_counter()
+    recent_from = _add_months(evaluation_month, -6)
+    recent_to = _add_months(evaluation_month, -1)
+    columns = ["기준월", "제품코드", "매입처코드", "매입처명", "입고수량", "매입금액", "매입발생건수"]
+    source = purchase_vendor_df if isinstance(purchase_vendor_df, pd.DataFrame) else pd.DataFrame(columns=columns)
+    work = source[[c for c in columns if c in source.columns]].copy()
+    for col in columns:
+        if col not in work.columns:
+            work[col] = "" if col in {"기준월", "제품코드", "매입처코드", "매입처명"} else 0.0
+    for col in ("기준월", "제품코드", "매입처코드", "매입처명"):
+        work[col] = work[col].fillna("").astype(str).str.strip()
+    numeric_invalid = pd.Series(False, index=work.index)
+    for col in ("입고수량", "매입금액", "매입발생건수"):
+        raw_value = work[col]
+        numeric_value = pd.to_numeric(raw_value, errors="coerce")
+        nonempty_value = raw_value.notna() & raw_value.astype(str).str.strip().ne("")
+        numeric_invalid |= nonempty_value & numeric_value.isna()
+        work[col] = numeric_value.fillna(0.0)
+
+    product_missing = work["제품코드"].eq("")
+    month_missing = work["기준월"].eq("")
+    month_valid = work["기준월"].str.fullmatch(r"\d{6}", na=False)
+    period_valid = (
+        month_valid
+        & work["기준월"].between(str(history_month_from or "000000"), str(evaluation_month or "999999"))
+        & work["기준월"].lt(str(evaluation_month or ""))
+    )
+    classification = pd.Series("classified", index=work.index, dtype="object")
+    classification.loc[product_missing] = "missing_product_code"
+    classification.loc[classification.eq("classified") & month_missing] = "missing_month"
+    classification.loc[classification.eq("classified") & numeric_invalid] = "invalid_numeric"
+    classification.loc[classification.eq("classified") & ~period_valid] = "other_excluded"
+    purchase_unclassified_rows = int(classification.ne("classified").sum())
+    missing_product_code_rows = int(classification.eq("missing_product_code").sum())
+    missing_month_rows = int(classification.eq("missing_month").sum())
+    invalid_numeric_rows = int(classification.eq("invalid_numeric").sum())
+    other_excluded_rows = int(classification.eq("other_excluded").sum())
+    work = work.loc[classification.eq("classified")].copy()
+    aggregate_started = time.perf_counter()
+    purchase_positive_rows = 0
+    purchase_nonpositive_rows = 0
+    if not work.empty:
+        work["_positive_purchase"] = (work["매입금액"] > 1e-9) | (work["입고수량"] > 1e-9)
+        purchase_positive_rows = int(work["_positive_purchase"].sum())
+        purchase_nonpositive_rows = int(len(work) - purchase_positive_rows)
+        recent_mask = work["기준월"].between(recent_from, recent_to)
+        # 최근 6완료월 합계는 사전에 만든 최소 수치 열만 집계한다.
+        # groupby 안에서 원본 전체 frame을 다시 인덱싱하지 않아도 된다.
+        work["_recent_purchase_amount"] = work["매입금액"].where(recent_mask, 0.0)
+        work["_recent_inbound_qty"] = work["입고수량"].where(recent_mask, 0.0)
+        work["_recent_purchase_event_count"] = work["매입발생건수"].where(recent_mask, 0.0)
+        grouped = (
+            work.groupby(["제품코드", "매입처코드", "매입처명"], dropna=False, as_index=False)
+            .agg(
+                최근6완료월순매입금액=("_recent_purchase_amount", "sum"),
+                최근6완료월순입고수량=("_recent_inbound_qty", "sum"),
+                최근6완료월매입발생건수=("_recent_purchase_event_count", "sum"),
+                지원기간순매입금액=("매입금액", "sum"),
+                지원기간순입고수량=("입고수량", "sum"),
+                지원기간매입발생건수=("매입발생건수", "sum"),
+            )
+        )
+        positive = work.loc[work["_positive_purchase"]].copy()
+        if not positive.empty:
+            latest = positive.groupby(["제품코드", "매입처코드", "매입처명"], dropna=False)["기준월"].max().rename("지원기간최근매입월").reset_index()
+            recent_latest = positive.loc[positive["기준월"].between(recent_from, recent_to)].groupby(["제품코드", "매입처코드", "매입처명"], dropna=False)["기준월"].max().rename("최근6완료월최근매입월").reset_index()
+            grouped = grouped.merge(latest, on=["제품코드", "매입처코드", "매입처명"], how="left")
+            grouped = grouped.merge(recent_latest, on=["제품코드", "매입처코드", "매입처명"], how="left")
+        else:
+            grouped["지원기간최근매입월"] = ""
+            grouped["최근6완료월최근매입월"] = ""
+    else:
+        grouped = pd.DataFrame(columns=["제품코드", "매입처코드", "매입처명"])
+    aggregate_ms = int((time.perf_counter() - aggregate_started) * 1000)
+
+    assignments: dict[str, dict[str, Any]] = {}
+    rank_started = time.perf_counter()
+    if not grouped.empty:
+        for col in ("최근6완료월순매입금액", "최근6완료월순입고수량", "지원기간순매입금액", "지원기간순입고수량"):
+            grouped[col] = pd.to_numeric(grouped.get(col, 0), errors="coerce").fillna(0.0)
+        grouped["_recent_positive"] = (grouped["최근6완료월순매입금액"] > 1e-9) | (grouped["최근6완료월순입고수량"] > 1e-9)
+        grouped["_history_positive"] = (grouped["지원기간순매입금액"] > 1e-9) | (grouped["지원기간순입고수량"] > 1e-9)
+        grouped["매입처코드"] = grouped["매입처코드"].fillna("").astype(str).str.strip()
+        grouped["_vendor_code_present"] = grouped["매입처코드"].ne("")
+        product_group = grouped.groupby("제품코드", sort=False)
+        grouped["_recent_positive_exists"] = product_group["_recent_positive"].transform("any")
+        grouped["_history_positive_exists"] = product_group["_history_positive"].transform("any")
+        grouped["_recent_coded_positive_exists"] = (
+            (grouped["_recent_positive"] & grouped["_vendor_code_present"])
+            .groupby(grouped["제품코드"], sort=False)
+            .transform("any")
+        )
+        grouped["_history_coded_positive_exists"] = (
+            (grouped["_history_positive"] & grouped["_vendor_code_present"])
+            .groupby(grouped["제품코드"], sort=False)
+            .transform("any")
+        )
+        recent_candidate = grouped["_recent_positive"] & (
+            ~grouped["_recent_coded_positive_exists"] | grouped["_vendor_code_present"]
+        )
+        history_candidate = (
+            ~grouped["_recent_positive_exists"]
+            & grouped["_history_positive"]
+            & (~grouped["_history_coded_positive_exists"] | grouped["_vendor_code_present"])
+        )
+        grouped["_candidate_tier"] = 0
+        grouped.loc[history_candidate, "_candidate_tier"] = 2
+        grouped.loc[recent_candidate, "_candidate_tier"] = 1
+        candidates = grouped.loc[grouped["_candidate_tier"].gt(0)].copy()
+        if not candidates.empty:
+            recent_tier = candidates["_candidate_tier"].eq(1)
+            candidates["_amount_rank"] = candidates["최근6완료월순매입금액"].where(
+                recent_tier,
+                candidates["지원기간순매입금액"],
+            ).clip(lower=0)
+            candidates["_qty_rank"] = candidates["최근6완료월순입고수량"].where(
+                recent_tier,
+                candidates["지원기간순입고수량"],
+            ).clip(lower=0)
+            candidates["_month_rank"] = candidates["최근6완료월최근매입월"].where(
+                recent_tier,
+                candidates["지원기간최근매입월"],
+            ).fillna("").astype(str)
+            candidates["주요매입처선정기준"] = candidates["_candidate_tier"].map(
+                {1: "최근 6완료월", 2: "지원기간 fallback"}
+            )
+            winners = candidates.sort_values(
+                ["제품코드", "_candidate_tier", "_amount_rank", "_qty_rank", "_month_rank", "매입처코드"],
+                ascending=[True, True, False, False, False, True],
+                kind="stable",
+            ).drop_duplicates(subset=["제품코드"], keep="first")
+            assignments = {
+                str(product_code or "").strip(): winner
+                for product_code, winner in winners.set_index("제품코드").to_dict("index").items()
+            }
+    rank_ms = int((time.perf_counter() - rank_started) * 1000)
+
+    status_risk_rows: list[dict[str, Any]] = []
+    risk_rows: list[dict[str, Any]] = []
+    for row in rows:
+        product_code = str(row.get("product_code") or "").strip()
+        winner = assignments.get(product_code) if product_code else None
+        if not product_code:
+            status = "product_code_missing"
+            vendor_name = "매입처 미확인"
+        elif not winner:
+            status = "recent_purchase_none"
+            vendor_name = "최근 매입 없음"
+        elif not str(winner.get("매입처코드") or "").strip():
+            status = "vendor_unknown"
+            vendor_name = "매입처 미확인"
+        else:
+            status = "assigned"
+            vendor_name = str(winner.get("매입처명") or "").strip() or str(winner.get("매입처코드") or "").strip()
+        row.update(
+            {
+                "주요매입처코드": str((winner or {}).get("매입처코드") or "").strip(),
+                "주요매입처명": vendor_name,
+                "주요매입처상태": status,
+                "주요매입처선정기준": str((winner or {}).get("주요매입처선정기준") or ""),
+                "최근6완료월순매입금액": float((winner or {}).get("최근6완료월순매입금액") or 0),
+                "최근6완료월순입고수량": float((winner or {}).get("최근6완료월순입고수량") or 0),
+                "최근6완료월최근매입월": str((winner or {}).get("최근6완료월최근매입월") or ""),
+                "지원기간순매입금액": float((winner or {}).get("지원기간순매입금액") or 0),
+                "지원기간순입고수량": float((winner or {}).get("지원기간순입고수량") or 0),
+                "지원기간최근매입월": str((winner or {}).get("지원기간최근매입월") or ""),
+                "주요매입처자료완전": bool(winner and status == "assigned"),
+                "주요매입처미확인사유": "" if status == "assigned" else status,
+            }
+        )
+        if row.get("재고위험상태") in {"긴급 부족", "부족 주의"}:
+            status_risk_rows.append(row)
+            if float(row.get("위험보정부족예상금액") or 0) > 0:
+                risk_rows.append(row)
+
+    vendor_group_started = time.perf_counter()
+    assigned = [r for r in risk_rows if r.get("주요매입처상태") == "assigned"]
+    unassigned = [r for r in risk_rows if r.get("주요매입처상태") != "assigned"]
+    vendor_rows: list[dict[str, Any]] = []
+    if assigned:
+        vendor_df = pd.DataFrame(assigned)
+        for (code, name), group in vendor_df.groupby(["주요매입처코드", "주요매입처명"], dropna=False, sort=False):
+            emergency = group.loc[group["재고위험상태"].eq("긴급 부족")]
+            warning = group.loc[group["재고위험상태"].eq("부족 주의")]
+            vendor_rows.append(
+                {
+                    "주요매입처코드": str(code or ""),
+                    "주요매입처명": str(name or ""),
+                    "긴급부족품목수": int(len(emergency)),
+                    "부족주의품목수": int(len(warning)),
+                    "위험품목수": int(len(group)),
+                    "긴급부족금액": float(emergency["위험보정부족예상금액"].sum()),
+                    "부족주의금액": float(warning["위험보정부족예상금액"].sum()),
+                    "전체위험보정부족금액": float(group["위험보정부족예상금액"].sum()),
+                    "위험보정부족예상수량": float(group["위험보정부족예상수량"].sum()),
+                    "수요급증품목수": int(group.get("수요급증여부", pd.Series(False, index=group.index)).fillna(False).astype(bool).sum()),
+                    "과잉후보품목수": int(group.get("과잉후보여부", pd.Series(False, index=group.index)).fillna(False).astype(bool).sum()),
+                    "과잉후보금액": float(pd.to_numeric(group.get("과잉후보금액", 0), errors="coerce").fillna(0).sum()),
+                }
+            )
+    vendor_rows.sort(key=lambda r: (-float(r["전체위험보정부족금액"]), -float(r["긴급부족금액"]), -int(r["위험품목수"]), str(r["주요매입처코드"])))
+    vendor_risk_group_ms = int((time.perf_counter() - vendor_group_started) * 1000)
+    total_amount = float(sum(float(r.get("위험보정부족예상금액") or 0) for r in risk_rows))
+    assigned_amount = float(sum(float(r.get("위험보정부족예상금액") or 0) for r in assigned))
+    status_emergency_rows = [row for row in status_risk_rows if row.get("재고위험상태") == "긴급 부족"]
+    status_warning_rows = [row for row in status_risk_rows if row.get("재고위험상태") == "부족 주의"]
+    amount_positive_emergency_rows = [row for row in risk_rows if row.get("재고위험상태") == "긴급 부족"]
+    amount_positive_warning_rows = [row for row in risk_rows if row.get("재고위험상태") == "부족 주의"]
+    summary = {
+        "inventory_rows": int(len(rows)), "risk_rows": int(len(risk_rows)), "assigned_rows": int(len(assigned)), "unassigned_rows": int(len(unassigned)),
+        "vendor_count": int(len(vendor_rows)), "top_vendor_count": int(min(10, len(vendor_rows))),
+        "emergency_rows": int(len(amount_positive_emergency_rows)), "warning_rows": int(len(amount_positive_warning_rows)),
+        "status_risk_rows": int(len(status_risk_rows)), "status_emergency_rows": int(len(status_emergency_rows)), "status_warning_rows": int(len(status_warning_rows)),
+        "amount_positive_risk_rows": int(len(risk_rows)), "amount_positive_emergency_rows": int(len(amount_positive_emergency_rows)), "amount_positive_warning_rows": int(len(amount_positive_warning_rows)),
+        "amount_zero_risk_rows": int(len(status_risk_rows) - len(risk_rows)),
+        "amount_zero_emergency_rows": int(len(status_emergency_rows) - len(amount_positive_emergency_rows)),
+        "amount_zero_warning_rows": int(len(status_warning_rows) - len(amount_positive_warning_rows)),
+        "total_adjusted_shortage_amount": total_amount, "assigned_adjusted_shortage_amount": assigned_amount, "unassigned_adjusted_shortage_amount": total_amount - assigned_amount,
+        "recent_purchase_none_rows": int(sum(r.get("주요매입처상태") == "recent_purchase_none" for r in unassigned)), "recent_purchase_none_amount": float(sum(float(r.get("위험보정부족예상금액") or 0) for r in unassigned if r.get("주요매입처상태") == "recent_purchase_none")),
+        "vendor_unknown_rows": int(sum(r.get("주요매입처상태") in {"vendor_unknown", "product_code_missing"} for r in unassigned)), "vendor_unknown_amount": float(sum(float(r.get("위험보정부족예상금액") or 0) for r in unassigned if r.get("주요매입처상태") in {"vendor_unknown", "product_code_missing"})),
+        "basis_completed_month_count": 6, "basis_month_from": recent_from, "basis_month_to": recent_to,
+        "purchase_source_rows": int(len(source)), "purchase_positive_rows": int(purchase_positive_rows), "purchase_nonpositive_rows": int(purchase_nonpositive_rows),
+        "purchase_unclassified_rows": int(purchase_unclassified_rows), "missing_product_code_rows": int(missing_product_code_rows),
+        "missing_month_rows": int(missing_month_rows), "invalid_numeric_rows": int(invalid_numeric_rows), "other_excluded_rows": int(other_excluded_rows),
+    }
+    log.info("[dashboard.vendor_stock_risk] inventory_rows=%s risk_rows=%s assigned_rows=%s unassigned_rows=%s vendor_rows=%s status_risk_rows=%s status_emergency_rows=%s status_warning_rows=%s amount_positive_risk_rows=%s amount_positive_emergency_rows=%s amount_positive_warning_rows=%s amount_zero_risk_rows=%s amount_zero_emergency_rows=%s amount_zero_warning_rows=%s total_adjusted_shortage_amount=%s assigned_adjusted_shortage_amount=%s unassigned_adjusted_shortage_amount=%s recent_purchase_none_rows=%s vendor_unknown_rows=%s top_vendor_count=%s purchase_source_rows=%s purchase_positive_rows=%s purchase_nonpositive_rows=%s purchase_unclassified_rows=%s missing_product_code_rows=%s missing_month_rows=%s invalid_numeric_rows=%s other_excluded_rows=%s major_vendor_aggregate_ms=%s major_vendor_rank_ms=%s vendor_risk_group_ms=%s basis_month_from=%s basis_month_to=%s source_call_count=%s elapsed_ms=%s", summary["inventory_rows"], summary["risk_rows"], summary["assigned_rows"], summary["unassigned_rows"], summary["vendor_count"], summary["status_risk_rows"], summary["status_emergency_rows"], summary["status_warning_rows"], summary["amount_positive_risk_rows"], summary["amount_positive_emergency_rows"], summary["amount_positive_warning_rows"], summary["amount_zero_risk_rows"], summary["amount_zero_emergency_rows"], summary["amount_zero_warning_rows"], summary["total_adjusted_shortage_amount"], summary["assigned_adjusted_shortage_amount"], summary["unassigned_adjusted_shortage_amount"], summary["recent_purchase_none_rows"], summary["vendor_unknown_rows"], summary["top_vendor_count"], summary["purchase_source_rows"], summary["purchase_positive_rows"], summary["purchase_nonpositive_rows"], summary["purchase_unclassified_rows"], summary["missing_product_code_rows"], summary["missing_month_rows"], summary["invalid_numeric_rows"], summary["other_excluded_rows"], aggregate_ms, rank_ms, vendor_risk_group_ms, recent_from, recent_to, int(source_call_count), int((time.perf_counter() - started) * 1000))
+    return {"summary": summary, "rows": vendor_rows, "top_rows": vendor_rows[:10], "aggregate_ms": aggregate_ms, "rank_ms": rank_ms, "group_ms": vendor_risk_group_ms}
+
+
 def _build_inventory_facts(
     payload: Mapping[str, Any] | None,
     *,
@@ -1374,6 +1612,9 @@ def _build_inventory_facts(
     evaluation_month: str = "",
     policy_date: str = "",
     demand_surge_history: Mapping[str, Any] | None = None,
+    purchase_vendor_df: pd.DataFrame | None = None,
+    purchase_history_month_from: str = "",
+    source_call_count: int = 0,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     df = _payload_df(payload)
@@ -1512,6 +1753,13 @@ def _build_inventory_facts(
         rows,
         readiness_warning_pct=readiness_warning_pct,
     )
+    vendor_stock_risk = _attach_major_purchase_vendors(
+        rows,
+        purchase_vendor_df,
+        evaluation_month=evaluation_month,
+        history_month_from=purchase_history_month_from,
+        source_call_count=source_call_count,
+    )
     demand_rows = [r for r in rows if r.get("재고위험상태") != "판정 제외"]
     ready_rows = [r for r in rows if r.get("재고위험상태") == "적정"]
     shortage_rows = [r for r in rows if r.get("재고위험상태") in {"긴급 부족", "부족 주의"}]
@@ -1626,6 +1874,9 @@ def _build_inventory_facts(
         "stock_risk_summary": stock_risk_summary,
         "stock_overstock_summary": stock_overstock_summary,
         "stock_demand_surge_summary": demand_surge_summary,
+        "vendor_stock_risk_summary": vendor_stock_risk["summary"],
+        "vendor_stock_risk_rows": vendor_stock_risk["rows"],
+        "vendor_stock_risk_top_rows": vendor_stock_risk["top_rows"],
         "data_quality": [] if rows else ["재고준비율 산정 자료 없음"],
     }
 
@@ -1728,14 +1979,22 @@ def build_dashboard_lite_facts(
     range_slice_elapsed_ms = 0
     history_aggregate_elapsed_ms = 0
     stock_timing = _stock_timing_meta({}, fallback_total_ms=0)
+    purchase_vendor_df: pd.DataFrame | None = None
+    purchase_bundle_perf: dict[str, Any] = {}
     if needs_sales_source or needs_stock_source:
-        from app.services.analytics_sales_trend_service import get_sales_trend_df
+        from app.services.analytics_sales_trend_service import get_dashboard_sales_source_bundle
 
         t_source = time.perf_counter()
-        expanded_sales_source_df = get_sales_trend_df(dict(source_params))
+        source_bundle = get_dashboard_sales_source_bundle(dict(source_params))
+        expanded_sales_source_df = source_bundle.get("sales_df")
+        purchase_vendor_df = source_bundle.get("purchase_vendor_df")
+        purchase_bundle_perf = dict(source_bundle.get("perf") or {})
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
         t_filter = time.perf_counter()
         expanded_sales_source_df = _filter_sales_source_for_dashboard(expanded_sales_source_df, service_params)
+        if isinstance(purchase_vendor_df, pd.DataFrame) and isinstance(expanded_sales_source_df, pd.DataFrame) and "제품코드" in purchase_vendor_df.columns and "제품코드" in expanded_sales_source_df.columns:
+            allowed_product_codes = set(expanded_sales_source_df["제품코드"].fillna("").astype(str).str.strip())
+            purchase_vendor_df = purchase_vendor_df.loc[purchase_vendor_df["제품코드"].fillna("").astype(str).str.strip().isin(allowed_product_codes)].copy()
         product_filter_elapsed_ms = int((time.perf_counter() - t_filter) * 1000)
         t_ranges = time.perf_counter()
         source_months = _dashboard_source_months(expanded_sales_source_df)
@@ -1766,7 +2025,7 @@ def build_dashboard_lite_facts(
         if isinstance(expanded_sales_source_df, pd.DataFrame):
             filter_diagnostics.extend(list(expanded_sales_source_df.attrs.get("dashboard_filter_diagnostics") or []))
         log.info(
-            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s manufacturer_test_filter_enabled=%s manufacturer_test_product_count=%s expanded_history_month_from=%s expanded_history_month_to=%s expanded_history_rows=%s existing_support_rows=%s visible_rows=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s range_slice_ms=%s history_aggregate_ms=%s elapsed_ms=%s",
+            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s manufacturer_test_filter_enabled=%s manufacturer_test_product_count=%s expanded_history_month_from=%s expanded_history_month_to=%s expanded_history_rows=%s existing_support_rows=%s visible_rows=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s range_slice_ms=%s history_aggregate_ms=%s purchase_source_rows=%s purchase_source_sql_included=%s purchase_min_frame_ms=%s elapsed_ms=%s",
             service_params.get("company_id") or "",
             service_params.get("month_from"),
             service_params.get("month_to"),
@@ -1786,6 +2045,9 @@ def build_dashboard_lite_facts(
             product_filter_elapsed_ms,
             range_slice_elapsed_ms,
             history_aggregate_elapsed_ms,
+            0 if purchase_vendor_df is None else len(purchase_vendor_df),
+            bool(purchase_bundle_perf.get("purchase_source_sql_included")),
+            int(purchase_bundle_perf.get("purchase_min_frame_ms") or 0),
             int((time.perf_counter() - t_source) * 1000),
         )
 
@@ -1892,6 +2154,9 @@ def build_dashboard_lite_facts(
         evaluation_month=str(service_params.get("evaluation_month") or ""),
         policy_date=str(service_params.get("policy_date") or ""),
         demand_surge_history=demand_surge_history,
+        purchase_vendor_df=purchase_vendor_df,
+        purchase_history_month_from=str(source_params.get("dashboard_lite_history_month_from") or ""),
+        source_call_count=int(needs_sales_source) + int(needs_stock_source),
     )
     log.info(
         "[dashboard.stock_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",

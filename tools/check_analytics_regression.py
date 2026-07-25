@@ -7586,6 +7586,7 @@ def run_basic_checks() -> list[CheckResult]:
         seen_params: list[dict] = []
         preloaded_seen = {"manufacturer": False, "stock": False}
         old_shared = getattr(sales_mod, "get_sales_trend_df")
+        old_dashboard_bundle = getattr(sales_mod, "get_dashboard_sales_source_bundle")
         old_manufacturer = getattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result")
         old_stock = getattr(sales_mod, "get_stock_shortage_result")
 
@@ -7593,6 +7594,14 @@ def run_basic_checks() -> list[CheckResult]:
             calls["shared_sales"] += 1
             seen_params.append(dict(params or {}))
             return sales_df.copy()
+
+        def _fake_dashboard_sales_bundle(params=None):
+            shared = _fake_shared_sales_source(params)
+            return {
+                "sales_df": shared,
+                "purchase_vendor_df": pd.DataFrame(columns=["기준월", "제품코드", "매입처코드", "매입처명", "입고수량", "매입금액", "매입발생건수"]),
+                "perf": {"purchase_source_sql_included": True, "purchase_source_rows": 0, "purchase_min_frame_ms": 0},
+            }
 
         def _fake_manufacturer_service(params=None, raw_df=None):
             calls["manufacturer"] += 1
@@ -7608,6 +7617,7 @@ def run_basic_checks() -> list[CheckResult]:
 
         try:
             setattr(sales_mod, "get_sales_trend_df", _fake_shared_sales_source)
+            setattr(sales_mod, "get_dashboard_sales_source_bundle", _fake_dashboard_sales_bundle)
             setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", _fake_manufacturer_service)
             setattr(sales_mod, "get_stock_shortage_result", _fake_stock_service)
             built = dash_mod.build_dashboard_lite_facts(
@@ -7622,6 +7632,7 @@ def run_basic_checks() -> list[CheckResult]:
             )
         finally:
             setattr(sales_mod, "get_sales_trend_df", old_shared)
+            setattr(sales_mod, "get_dashboard_sales_source_bundle", old_dashboard_bundle)
             setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", old_manufacturer)
             setattr(sales_mod, "get_stock_shortage_result", old_stock)
         if calls != {"shared_sales": 1, "manufacturer": 1, "stock": 1}:
@@ -8715,6 +8726,113 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard Lite sales source code-pair columns", "; ".join(sales_source_errors)))
         else:
             results.append(_ok("Dashboard Lite sales source code-pair columns", "monthly/detail sales sources expose product group/type/class Gcode+Tcode and Rd01_Hnm names"))
+
+        vendor_stock_risk_errors: list[str] = []
+        try:
+            vendor_rows = [
+                {"product_code": code, "재고위험상태": "긴급 부족" if index == 0 else "부족 주의", "위험보정부족예상금액": float((index + 1) * 100), "위험보정부족예상수량": float(index + 1), "수요급증여부": index == 1, "과잉후보여부": index == 2, "과잉후보금액": float(index)}
+                for index, code in enumerate(["P1", "P2", "P3", "P4", "P5", "P6", "P7", ""])
+            ]
+            vendor_rows.append(
+                {"product_code": "P8", "재고위험상태": "긴급 부족", "위험보정부족예상금액": 0.0, "위험보정부족예상수량": 1.0, "수요급증여부": False, "과잉후보여부": False, "과잉후보금액": 0.0}
+            )
+            purchase_vendor_df = pd.DataFrame([
+                {"기준월": "202601", "제품코드": "P1", "매입처코드": "A", "매입처명": "공급처 A", "입고수량": 1, "매입금액": 100, "매입발생건수": 1},
+                {"기준월": "202602", "제품코드": "P1", "매입처코드": "B", "매입처명": "공급처 B", "입고수량": 1, "매입금액": 200, "매입발생건수": 1},
+                {"기준월": "202603", "제품코드": "P2", "매입처코드": "C", "매입처명": "공급처 C", "입고수량": 1, "매입금액": 100, "매입발생건수": 1},
+                {"기준월": "202603", "제품코드": "P2", "매입처코드": "D", "매입처명": "공급처 D", "입고수량": 2, "매입금액": 100, "매입발생건수": 1},
+                {"기준월": "202603", "제품코드": "P3", "매입처코드": "E", "매입처명": "공급처 E", "입고수량": 1, "매입금액": 100, "매입발생건수": 1},
+                {"기준월": "202606", "제품코드": "P3", "매입처코드": "F", "매입처명": "공급처 F", "입고수량": 1, "매입금액": 100, "매입발생건수": 1},
+                {"기준월": "202505", "제품코드": "P4", "매입처코드": "G", "매입처명": "공급처 G", "입고수량": 1, "매입금액": 50, "매입발생건수": 1},
+                {"기준월": "202604", "제품코드": "P5", "매입처코드": "R", "매입처명": "반품처", "입고수량": -1, "매입금액": -50, "매입발생건수": 1},
+                {"기준월": "202605", "제품코드": "P6", "매입처코드": "", "매입처명": "", "입고수량": 1, "매입금액": 50, "매입발생건수": 1},
+                {"기준월": "202606", "제품코드": "P7", "매입처코드": "A", "매입처명": "공급처 A", "입고수량": 1, "매입금액": 100, "매입발생건수": 1},
+                {"기준월": "202606", "제품코드": "P7", "매입처코드": "", "매입처명": "", "입고수량": 1, "매입금액": 200, "매입발생건수": 1},
+                {"기준월": "202606", "제품코드": "", "매입처코드": "X", "매입처명": "", "입고수량": 1, "매입금액": 10, "매입발생건수": 1},
+                {"기준월": "", "제품코드": "PM", "매입처코드": "X", "매입처명": "", "입고수량": 1, "매입금액": 10, "매입발생건수": 1},
+                {"기준월": "202606", "제품코드": "PI", "매입처코드": "X", "매입처명": "", "입고수량": 1, "매입금액": "invalid", "매입발생건수": 1},
+                {"기준월": "202701", "제품코드": "PO", "매입처코드": "X", "매입처명": "", "입고수량": 1, "매입금액": 10, "매입발생건수": 1},
+            ])
+            vendor_result = dash_mod._attach_major_purchase_vendors(
+                vendor_rows,
+                purchase_vendor_df,
+                evaluation_month="202607",
+                history_month_from="202501",
+                source_call_count=2,
+            )
+            by_product = {str(row.get("product_code") or ""): row for row in vendor_rows}
+            expected_winners = {"P1": "B", "P2": "D", "P3": "F", "P4": "G", "P7": "A"}
+            for product_code, vendor_code in expected_winners.items():
+                if by_product[product_code].get("주요매입처코드") != vendor_code:
+                    vendor_stock_risk_errors.append(f"winner={product_code}:{by_product[product_code]!r}")
+            if by_product["P4"].get("주요매입처선정기준") != "지원기간 fallback":
+                vendor_stock_risk_errors.append(f"fallback_basis={by_product['P4']!r}")
+            if by_product["P5"].get("주요매입처상태") != "recent_purchase_none":
+                vendor_stock_risk_errors.append(f"return_only_status={by_product['P5']!r}")
+            if by_product["P6"].get("주요매입처상태") != "vendor_unknown":
+                vendor_stock_risk_errors.append(f"blank_vendor_status={by_product['P6']!r}")
+            if by_product["P7"].get("주요매입처상태") != "assigned":
+                vendor_stock_risk_errors.append(f"mixed_blank_vendor_status={by_product['P7']!r}")
+            if by_product[""].get("주요매입처상태") != "product_code_missing":
+                vendor_stock_risk_errors.append(f"missing_product_status={by_product['']!r}")
+            summary = vendor_result.get("summary") or {}
+            if int(summary.get("assigned_rows") or 0) + int(summary.get("unassigned_rows") or 0) != int(summary.get("risk_rows") or 0):
+                vendor_stock_risk_errors.append(f"assignment_count_mismatch={summary!r}")
+            for status_key, positive_key, zero_key in (
+                ("status_risk_rows", "amount_positive_risk_rows", "amount_zero_risk_rows"),
+                ("status_emergency_rows", "amount_positive_emergency_rows", "amount_zero_emergency_rows"),
+                ("status_warning_rows", "amount_positive_warning_rows", "amount_zero_warning_rows"),
+            ):
+                if int(summary.get(status_key) or 0) != int(summary.get(positive_key) or 0) + int(summary.get(zero_key) or 0):
+                    vendor_stock_risk_errors.append(f"status_amount_count_mismatch={status_key}:{summary!r}")
+            if int(summary.get("risk_rows") or 0) != int(summary.get("amount_positive_risk_rows") or 0) or int(summary.get("amount_zero_emergency_rows") or 0) != 1:
+                vendor_stock_risk_errors.append(f"zero_amount_vendor_exclusion={summary!r}")
+            if abs(float(summary.get("assigned_adjusted_shortage_amount") or 0) + float(summary.get("unassigned_adjusted_shortage_amount") or 0) - float(summary.get("total_adjusted_shortage_amount") or 0)) > 1e-9:
+                vendor_stock_risk_errors.append(f"assignment_amount_mismatch={summary!r}")
+            if int(summary.get("purchase_positive_rows") or 0) + int(summary.get("purchase_nonpositive_rows") or 0) + int(summary.get("purchase_unclassified_rows") or 0) != int(summary.get("purchase_source_rows") or 0):
+                vendor_stock_risk_errors.append(f"purchase_classification_mismatch={summary!r}")
+            if not all(int(summary.get(key) or 0) >= 1 for key in ("missing_product_code_rows", "missing_month_rows", "invalid_numeric_rows", "other_excluded_rows")):
+                vendor_stock_risk_errors.append(f"purchase_unclassified_reason_missing={summary!r}")
+            if len(vendor_result.get("top_rows") or []) > 10 or any(not str(row.get("주요매입처코드") or "") for row in (vendor_result.get("rows") or [])):
+                vendor_stock_risk_errors.append(f"vendor_rows_invalid={vendor_result!r}")
+            if any(int(vendor_result.get(key) or 0) < 0 for key in ("aggregate_ms", "rank_ms", "group_ms")):
+                vendor_stock_risk_errors.append(f"vendor_timing_invalid={vendor_result!r}")
+            required_facts_tokens = (
+                "get_dashboard_sales_source_bundle",
+                "purchase_vendor_df",
+                "vendor_stock_risk_summary",
+                "vendor_stock_risk_top_rows",
+                "[dashboard.vendor_stock_risk]",
+                "source_call_count=%s",
+            )
+            for token in required_facts_tokens:
+                if token not in dashboard_facts_src and token not in sales_trend_src:
+                    vendor_stock_risk_errors.append(f"missing_source_token={token}")
+            if "analytics_supplier_stock_shortage_service" in dashboard_facts_src:
+                vendor_stock_risk_errors.append("dashboard_vendor_risk_uses_supplier_service")
+            if "'sales' AS [_dashboard_source_kind]" not in sales_trend_src or "'purchase_vendor' AS [_dashboard_source_kind]" not in sales_trend_src:
+                vendor_stock_risk_errors.append("dashboard_source_bundle_branch_missing")
+            for token in ("raw_bundle_rows", "sales_finalize_ms", "purchase_min_frame_ms", "source_scan_mode", "union_branches"):
+                if token not in sales_trend_src:
+                    vendor_stock_risk_errors.append(f"bundle_timing_missing={token}")
+            attach_vendor_src = dashboard_facts_src[
+                dashboard_facts_src.find("def _attach_major_purchase_vendors"):
+                dashboard_facts_src.find("def _build_inventory_facts")
+            ]
+            for token in ("transform(\"any\")", "_candidate_tier", "drop_duplicates(subset=[\"제품코드\"]", "purchase_unclassified_rows", "amount_positive_risk_rows"):
+                if token not in attach_vendor_src:
+                    vendor_stock_risk_errors.append(f"vendor_vectorization_missing={token}")
+            for forbidden in ("for product_code, candidates", ".groupby.apply", ".iterrows()"):
+                if forbidden in attach_vendor_src:
+                    vendor_stock_risk_errors.append(f"vendor_vectorization_forbidden={forbidden}")
+            if "vendor_stock_risk_summary" not in view_src or "vendor_stock_risk_rows" in view_src[view_src.find("def build_dashboard_lite_chat_snapshot"):view_src.find("def _dashboard_scope_header")]:
+                vendor_stock_risk_errors.append("dashboard_snapshot_vendor_contract")
+        except Exception as exc:
+            vendor_stock_risk_errors.append(f"vendor_stock_risk_runtime={type(exc).__name__}:{exc}")
+        if vendor_stock_risk_errors:
+            results.append(_fail("Dashboard Lite vendor stock risk", "; ".join(vendor_stock_risk_errors)))
+        else:
+            results.append(_ok("Dashboard Lite vendor stock risk", "one major vendor per product, recent-six priority/fallback, risk reconciliation, compact snapshot, and two-source contract verified"))
 
         ui_security_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
         chat_middleware_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")

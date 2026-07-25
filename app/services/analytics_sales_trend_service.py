@@ -1239,6 +1239,210 @@ OPTION (RECOMPILE)
     return df
 
 
+def _build_dashboard_purchase_vendor_where(params: Dict[str, Any], spec: Dict[str, str]) -> tuple[str, Dict[str, Any]]:
+    """Build the purchase branch filters without changing the sales fast-path filters."""
+    clauses: list[str] = []
+    bind_params = dict(params)
+    p = spec["prefix"]
+
+    if clean_text(bind_params.get("month_from")):
+        _add_filter(clauses, f"M.{p}_Stock_YyMm >= %(month_from)s")
+    if clean_text(bind_params.get("month_to")):
+        _add_filter(clauses, f"M.{p}_Stock_YyMm <= %(month_to)s")
+    if clean_text(bind_params.get("physic_cd")):
+        _add_filter(clauses, f"M.{p}_Physic_Cd = %(physic_cd)s")
+
+    manufacturer_codes = _clean_list_param(bind_params.get("dashboard_manufacturer_codes"))
+    if manufacturer_codes:
+        names: list[str] = []
+        for i, code in enumerate(manufacturer_codes):
+            key = f"dashboard_purchase_manufacturer_{i}"
+            bind_params[key] = clean_text(code)
+            names.append(f"%({key})s")
+        _add_filter(
+            clauses,
+            f"M.{p}_Physic_Cd IN (SELECT P.Rd04_Physic_Cd FROM dbo.Rddbc040 AS P WITH (NOLOCK) WHERE P.Rd04_Ven_Cd IN ({','.join(names)}))",
+        )
+
+    stock_codes = _clean_list_param(bind_params.get("stock_cd_list"))
+    if stock_codes:
+        names = []
+        for i, code in enumerate(stock_codes):
+            key = f"dashboard_purchase_stock_cd_{i}"
+            bind_params[key] = clean_text(code)
+            names.append(f"%({key})s")
+        _add_filter(clauses, f"M.{p}_Stock_Cd IN ({','.join(names)})")
+    elif clean_text(bind_params.get("stock_cd")):
+        bind_params["stock_cd"] = clean_text(bind_params.get("stock_cd"))
+        _add_filter(clauses, f"M.{p}_Stock_Cd = %(stock_cd)s")
+
+    if clean_text(bind_params.get("buy_cd")):
+        _add_filter(clauses, f"M.{p}_Ven_Cd = %(buy_cd)s")
+    return ("\n  AND " + "\n  AND ".join(clauses)) if clauses else "", bind_params
+
+
+def get_dashboard_sales_source_bundle(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Load Dashboard sales and purchase-vendor candidates in one monthly SQL result.
+
+    The normal public sales-trend API remains unchanged.  Dashboard alone splits
+    the union result so purchase evidence cannot enter sales/forecast calculations.
+    """
+    t0 = time.perf_counter()
+    params = coalesce_params(params)
+    params = _apply_month_or_date_params(params)
+    params = _apply_period_source_policy_params(params)
+    source_policy = params.get("_period_source_policy") or {}
+    source_mode = _resolve_source_mode(params)
+    if source_mode not in {"monthly_book", "monthly_real"}:
+        sales_df = get_sales_trend_df(params)
+        return {
+            "sales_df": sales_df,
+            "purchase_vendor_df": pd.DataFrame(columns=["기준월", "제품코드", "매입처코드", "매입처명", "입고수량", "매입금액", "매입발생건수"]),
+            "perf": {"purchase_source_sql_included": False, "purchase_source_rows": 0, "elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+        }
+
+    spec = _monthly_spec(source_mode)
+    p = spec["prefix"]
+    sales_where, sales_bind = _build_monthly_fast_where(params, spec)
+    purchase_where, purchase_bind = _build_dashboard_purchase_vendor_where(params, spec)
+    bind_params = dict(sales_bind)
+    for key, value in purchase_bind.items():
+        if key not in bind_params:
+            bind_params[key] = value
+
+    real_mode = source_mode == "monthly_real"
+    in_qty_expr = (
+        f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT) + CAST(ISNULL(M.{p}_In_Oquantity, 0) AS FLOAT)"
+        if real_mode
+        else f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)"
+    )
+    sql = f"""
+SELECT
+    'sales' AS [_dashboard_source_kind],
+    LEFT(M.{p}_Stock_YyMm, 6) AS [기준월],
+    M.{p}_Physic_Cd AS [제품코드],
+    M.{p}_Ven_Cd AS [매입처코드],
+    M.{p}_Stock_Apply_Cd AS [재고적용처코드],
+    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Quantity, 0) ELSE COALESCE(M.{p}_Out_Quantity, 0) END) AS [출고수량],
+    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Oquantity, 0) ELSE COALESCE(M.{p}_Out_Oquantity, 0) END) AS [출고할증수량],
+    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Supply_Price, 0) ELSE COALESCE(M.{p}_Out_Supply_Price, 0) END) AS [매출공급가액],
+    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Tax_Price, 0) ELSE COALESCE(M.{p}_Out_Tax_Price, 0) END) AS [매출세액],
+    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * (COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) ELSE (COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) END) AS [매출합계],
+    COUNT(*) AS [집계건수],
+    COUNT(DISTINCT M.{p}_Ven_Cd) AS [매입처수],
+    CAST(0 AS FLOAT) AS [입고수량],
+    CAST(0 AS FLOAT) AS [매입금액],
+    CAST(0 AS INT) AS [매입발생건수],
+    '{spec["title"]}' AS [분석자료원]
+FROM {spec["table"]} AS M WITH (NOLOCK)
+WHERE 1 = 1
+{sales_where}
+GROUP BY LEFT(M.{p}_Stock_YyMm, 6), M.{p}_Physic_Cd, M.{p}_Ven_Cd, M.{p}_Stock_Apply_Cd
+
+UNION ALL
+
+SELECT
+    'purchase_vendor' AS [_dashboard_source_kind],
+    LEFT(M.{p}_Stock_YyMm, 6) AS [기준월],
+    M.{p}_Physic_Cd AS [제품코드],
+    M.{p}_Ven_Cd AS [매입처코드],
+    '' AS [재고적용처코드],
+    CAST(0 AS FLOAT) AS [출고수량],
+    CAST(0 AS FLOAT) AS [출고할증수량],
+    CAST(0 AS FLOAT) AS [매출공급가액],
+    CAST(0 AS FLOAT) AS [매출세액],
+    CAST(0 AS FLOAT) AS [매출합계],
+    CAST(0 AS INT) AS [집계건수],
+    CAST(0 AS INT) AS [매입처수],
+    SUM({in_qty_expr}) AS [입고수량],
+    SUM(CAST(ISNULL(M.{p}_In_Supply_Price, 0) AS FLOAT)) AS [매입금액],
+    SUM(CASE WHEN CAST(ISNULL(M.{p}_In_Supply_Price, 0) AS FLOAT) > 0 OR {in_qty_expr} > 0 THEN 1 ELSE 0 END) AS [매입발생건수],
+    '{spec["title"]}' AS [분석자료원]
+FROM {spec["table"]} AS M WITH (NOLOCK)
+WHERE 1 = 1
+{purchase_where}
+GROUP BY LEFT(M.{p}_Stock_YyMm, 6), M.{p}_Physic_Cd, M.{p}_Ven_Cd
+OPTION (RECOMPILE)
+"""
+    raw_df = query_to_df(sql, bind_params)
+    t_sql = time.perf_counter()
+    if raw_df is None:
+        raw_df = pd.DataFrame()
+    raw_bundle_rows = int(len(raw_df))
+    t_purchase_min = time.perf_counter()
+    sales_raw = raw_df.loc[raw_df.get("_dashboard_source_kind", pd.Series(index=raw_df.index, dtype="object")).eq("sales")].copy()
+    purchase_df = raw_df.loc[raw_df.get("_dashboard_source_kind", pd.Series(index=raw_df.index, dtype="object")).eq("purchase_vendor")].copy()
+    purchase_min_frame_ms = int((time.perf_counter() - t_purchase_min) * 1000)
+
+    product_codes = sales_raw.get("제품코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().tolist()
+    product_df = _load_monthly_product_master_for_codes(product_codes)
+    vendor_codes: set[str] = set()
+    for frame in (sales_raw, purchase_df):
+        if "매입처코드" in frame.columns:
+            vendor_codes.update(frame["매입처코드"].fillna("").astype(str).str.strip().tolist())
+        if "재고적용처코드" in frame.columns:
+            vendor_codes.update(frame["재고적용처코드"].fillna("").astype(str).str.strip().tolist())
+    vendor_codes.discard("")
+    vendor_df = _load_monthly_vendor_names_for_codes(list(vendor_codes))
+
+    t_sales_finalize = time.perf_counter()
+    merged = sales_raw.copy()
+    if not merged.empty and product_df is not None and not product_df.empty:
+        merged["제품코드"] = merged["제품코드"].fillna("").astype(str).str.strip()
+        merged = merged.merge(product_df, on="제품코드", how="left")
+    if vendor_df is not None and not vendor_df.empty:
+        for col in ["매입처코드", "재고적용처코드"]:
+            if col in merged.columns:
+                merged[col] = merged[col].fillna("").astype(str).str.strip()
+        merged = merged.merge(vendor_df.rename(columns={"거래처코드": "매입처코드", "거래처명": "매입처명"}), on="매입처코드", how="left")
+        merged = merged.merge(vendor_df.rename(columns={"거래처코드": "재고적용처코드", "거래처명": "재고적용처명"}), on="재고적용처코드", how="left")
+
+    final_cols = [
+        "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명",
+        "제품그룹Gcode", "제품그룹코드", "제품그룹명", "제품구분Gcode", "제품구분코드", "제품구분명",
+        "제품분류Gcode", "제품분류코드", "제품분류명", "매입처코드", "매입처명", "재고적용처코드", "재고적용처명",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수", "매입처수", "분석자료원",
+    ]
+    for col in final_cols:
+        if col not in merged.columns:
+            merged[col] = ""
+    sales_df = _normalize_analytics_numeric_columns(_add_trend_columns(merged[final_cols]))
+    sales_df = _apply_monthly_current_detail_mix(sales_df, params, source_mode=source_mode, source_policy=source_policy)
+    sales_finalize_ms = int((time.perf_counter() - t_sales_finalize) * 1000)
+
+    t_purchase_min = time.perf_counter()
+    if vendor_df is not None and not vendor_df.empty and "매입처코드" in purchase_df.columns:
+        purchase_df["매입처코드"] = purchase_df["매입처코드"].fillna("").astype(str).str.strip()
+        purchase_df = purchase_df.merge(
+            vendor_df.rename(columns={"거래처코드": "매입처코드", "거래처명": "매입처명"}),
+            on="매입처코드",
+            how="left",
+        )
+    purchase_cols = ["기준월", "제품코드", "매입처코드", "매입처명", "입고수량", "매입금액", "매입발생건수"]
+    for col in purchase_cols:
+        if col not in purchase_df.columns:
+            purchase_df[col] = "" if col in {"기준월", "제품코드", "매입처코드", "매입처명"} else 0
+    purchase_df = purchase_df[purchase_cols]
+    for col in ("입고수량", "매입금액", "매입발생건수"):
+        purchase_df[col] = pd.to_numeric(purchase_df[col], errors="coerce").fillna(0)
+    purchase_min_frame_ms += int((time.perf_counter() - t_purchase_min) * 1000)
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    perf = {
+        "purchase_source_sql_included": True,
+        "source_scan_mode": "union_branches",
+        "raw_bundle_rows": raw_bundle_rows,
+        "sales_rows": int(len(sales_df)),
+        "purchase_source_rows": int(len(purchase_df)),
+        "sales_finalize_ms": sales_finalize_ms,
+        "purchase_min_frame_ms": purchase_min_frame_ms,
+        "sql_ms": int((t_sql - t0) * 1000),
+        "elapsed_ms": elapsed_ms,
+    }
+    sales_df.attrs.update(perf)
+    log.info("[analytics.sales_trend.dashboard_bundle] source_mode=%s source_scan_mode=%s raw_bundle_rows=%s sales_rows=%s purchase_source_rows=%s purchase_source_sql_included=True sql_ms=%s sales_finalize_ms=%s purchase_min_frame_ms=%s elapsed_ms=%s", source_mode, perf["source_scan_mode"], raw_bundle_rows, len(sales_df), len(purchase_df), perf["sql_ms"], sales_finalize_ms, purchase_min_frame_ms, elapsed_ms)
+    return {"sales_df": sales_df, "purchase_vendor_df": purchase_df, "perf": perf}
+
+
 def get_sales_trend_monthly_df(params: Optional[Dict[str, Any]] = None, source_mode: str = "monthly_book") -> pd.DataFrame:
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
