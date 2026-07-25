@@ -530,6 +530,43 @@ def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
     st.caption("과잉 후보는 적정 품목의 보조 관찰지표이며 기본 재고위험 상태에는 중복 반영하지 않습니다.")
 
 
+def _render_demand_surge_detail_summary(facts: dict[str, Any]) -> None:
+    """Render aggregate surge-detail facts without exposing product rows."""
+    summary = (facts.get("inventory") or {}).get("stock_demand_surge_summary") or {}
+    total = int(summary.get("전체수요급증품목수", summary.get("품목수", 0)) or 0)
+    if total <= 0:
+        return
+
+    st.markdown("#### 수요급증 세부")
+    top_cols = st.columns(3)
+    for col, (label, value) in zip(top_cols, (
+        ("전체 수요급증", total),
+        ("기존 예상 초과", int(summary.get("기존예상초과품목수") or 0)),
+        ("예상외 출고 발생", int(summary.get("예상외출고발생품목수") or 0)),
+    )):
+        with col:
+            _metric_card(label, value, "개")
+
+    detail_cols = st.columns(5)
+    for col, (label, value) in zip(detail_cols, (
+        ("예상 누락", int(summary.get("예상누락품목수") or 0)),
+        ("계절성 재발생 후보", int(summary.get("계절성재발생후보품목수") or 0)),
+        ("3개월 이상 재출고", int(summary.get("3개월이상재출고품목수") or 0)),
+        ("신규 출고 후보", int(summary.get("신규출고후보품목수") or 0)),
+        ("분류자료부족", int(summary.get("분류자료부족품목수") or 0)),
+    )):
+        with col:
+            _metric_card(label, value, "개")
+
+    start_month = str(summary.get("이력지원시작월") or "")
+    end_month = str(summary.get("이력지원종료월") or "")
+    if start_month and end_month:
+        st.caption(
+            f"신규 출고 후보는 지원기간 {start_month}~{end_month} 완료월에 양의 순출고 이력이 없는 경우이며, ERP 전체 최초 출고 확정은 아닙니다."
+        )
+    st.caption("계절성 재발생 후보는 최근 3개월 무출고이면서 전년 동월 ±1개월에 양의 순출고 이력이 있는 품목입니다.")
+
+
 def _render_turnover(facts: dict[str, Any]) -> None:
     turnover = facts.get("turnover_days") or {}
     st.caption("매입/매출 거래 회전일")
@@ -1170,6 +1207,7 @@ def _render_dashboard_facts(facts: dict[str, Any]) -> None:
     _render_stock_chart(facts)
 
     _render_stock_risk_summary(facts)
+    _render_demand_surge_detail_summary(facts)
 
     st.markdown("### 매입·매출 거래 회전일")
     _render_turnover(facts)

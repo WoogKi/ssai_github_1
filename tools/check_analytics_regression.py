@@ -7160,6 +7160,78 @@ def run_basic_checks() -> list[CheckResult]:
             or float(month_end_rows[0].get("위험보정잔여예상수요") or 0) != 0
         ):
             fact_errors.append(f"stock_risk_demand_surge_period={past_period_rows!r}/{month_end_rows!r}")
+        detail_history_source = pd.DataFrame(
+            [
+                {"기준월": month, "제품코드": code, "출고수량": qty}
+                for code, quantities in {
+                    "FORECAST_EXCEEDED": {"202604": 0, "202605": 0, "202606": 0},
+                    "FORECAST_OMISSION": {"202604": 5, "202605": 0, "202606": 0},
+                    "SEASONAL": {"202506": 0, "202507": 5, "202508": 0, "202604": 0, "202605": 0, "202606": 0},
+                    "REACTIVATED": {"202510": 7, "202506": 0, "202507": 0, "202508": 0, "202604": 0, "202605": 0, "202606": 0},
+                    "NEW_CANDIDATE": {"202506": 0, "202507": 0, "202508": 0, "202604": 0, "202605": 0, "202606": 0},
+                    "RETURN_ONLY": {"202604": -5, "202605": 0, "202606": 0},
+                    "NETTED_ZERO": {"202604": 0, "202605": 0, "202606": 0},
+                }.items()
+                for month, qty in quantities.items()
+            ]
+        )
+        detail_history = dash_mod._build_demand_surge_history_by_product(
+            detail_history_source,
+            evaluation_month="202607",
+            history_month_from="202506",
+        )
+        detail_rows = [
+            {"product_code": "FORECAST_EXCEEDED", "수요급증여부": True, "당월현재출고수량": 120, "당월기준예상출고수량": 100},
+            {"product_code": "FORECAST_OMISSION", "수요급증여부": True, "당월현재출고수량": 10, "당월기준예상출고수량": 0},
+            {"product_code": "SEASONAL", "수요급증여부": True, "당월현재출고수량": 10, "당월기준예상출고수량": 0},
+            {"product_code": "REACTIVATED", "수요급증여부": True, "당월현재출고수량": 10, "당월기준예상출고수량": 0},
+            {"product_code": "NEW_CANDIDATE", "수요급증여부": True, "당월현재출고수량": 10, "당월기준예상출고수량": 0},
+            {"product_code": "RETURN_ONLY", "수요급증여부": True, "당월현재출고수량": 10, "당월기준예상출고수량": 0},
+            {"product_code": "NETTED_ZERO", "수요급증여부": True, "당월현재출고수량": 10, "당월기준예상출고수량": 0},
+            {"product_code": "", "수요급증여부": True, "당월현재출고수량": 10, "당월기준예상출고수량": 0},
+        ]
+        detail_summary = dash_mod._apply_demand_surge_detail(
+            detail_rows,
+            history=detail_history,
+            evaluation_month="202607",
+        )
+        detail_by_code = {str(row.get("product_code") or "<missing>"): row for row in detail_rows}
+        expected_detail_categories = {
+            "FORECAST_EXCEEDED": "기존 예상 초과",
+            "FORECAST_OMISSION": "예상 누락",
+            "SEASONAL": "계절성 재발생 후보",
+            "REACTIVATED": "3개월 이상 재출고",
+            "NEW_CANDIDATE": "신규 출고 후보",
+            "RETURN_ONLY": "신규 출고 후보",
+            "NETTED_ZERO": "신규 출고 후보",
+            "<missing>": "분류자료부족",
+        }
+        actual_detail_categories = {
+            code: str(row.get("수요급증세부분류") or "")
+            for code, row in detail_by_code.items()
+        }
+        if (
+            actual_detail_categories != expected_detail_categories
+            or int(detail_by_code["FORECAST_OMISSION"].get("최근3개월양의출고발생월수") or 0) != 1
+            or bool(detail_by_code["RETURN_ONLY"].get("최근3개월출고여부"))
+            or bool(detail_by_code["NETTED_ZERO"].get("최근3개월출고여부"))
+            or int(detail_summary.get("forecast_exceeded_rows") or 0) != 1
+            or int(detail_summary.get("unexpected_outbound_rows") or 0) != 7
+            or int(detail_summary.get("total_rows") or 0) != len(detail_rows)
+            or int(detail_summary.get("forecast_exceeded_rows") or 0) + int(detail_summary.get("unexpected_outbound_rows") or 0) != int(detail_summary.get("total_rows") or 0)
+            or sum(
+                int(detail_summary.get(key) or 0)
+                for key in (
+                    "forecast_exceeded_rows",
+                    "forecast_omission_rows",
+                    "seasonal_recurrence_candidate_rows",
+                    "reactivated_after_3m_rows",
+                    "new_outbound_candidate_rows",
+                    "insufficient_history_rows",
+                )
+            ) != int(detail_summary.get("total_rows") or 0)
+        ):
+            fact_errors.append(f"demand_surge_detail={actual_detail_categories!r}/{detail_summary!r}")
         stock_risk_log_records = []
 
         class _StockRiskLogCapture:
@@ -7248,12 +7320,25 @@ def run_basic_checks() -> list[CheckResult]:
             }
             source_scope = dash_mod._dashboard_internal_source_params(visible_scope, today=date(2026, 7, 20))
             if (
-                source_scope.get("month_from") != "202510"
+                source_scope.get("month_from") != "202506"
                 or source_scope.get("month_to") != "202607"
+                or source_scope.get("date_from") != "20250601"
                 or source_scope.get("dashboard_lite_display_month_from") != "202601"
                 or source_scope.get("dashboard_lite_display_month_to") != "202606"
+                or source_scope.get("dashboard_lite_trend_month_from") != "202510"
+                or source_scope.get("dashboard_lite_history_month_from") != "202506"
             ):
                 dashboard_date_errors.append(f"internal_trend_scope={source_scope!r}")
+            existing_support_scope = {
+                **source_scope,
+                "month_from": source_scope.get("dashboard_lite_trend_month_from"),
+                "date_from": f"{source_scope.get('dashboard_lite_trend_month_from')}01",
+            }
+            if (
+                existing_support_scope.get("month_from") != "202510"
+                or existing_support_scope.get("date_from") != "20251001"
+            ):
+                dashboard_date_errors.append(f"existing_support_scope={existing_support_scope!r}")
 
             months = ["202510", "202511", "202512", "202601", "202602", "202603", "202604", "202605", "202606", "202607"]
             amounts = [100, 200, 300, 10, 20, 30, 40, 50, 60, 70]

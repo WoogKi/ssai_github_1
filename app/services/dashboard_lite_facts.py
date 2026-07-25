@@ -171,23 +171,28 @@ def normalize_dashboard_lite_params(
 
 
 def _dashboard_internal_source_params(params: Mapping[str, Any], *, today: date) -> dict[str, Any]:
-    """Expand only the raw source range needed for Dashboard trend history."""
+    """Load one shared source for legacy facts and demand-surge history."""
     display_from = str(params.get("month_from") or "")
     display_to = str(params.get("month_to") or "")
     evaluation_month = str(params.get("evaluation_month") or "")
     trend_month_from = _add_months(display_from, -3)
+    # Keep the existing support range intact for legacy facts.  The expanded
+    # history is used only for the demand-surge detail classification.
+    history_month_from = _add_months(evaluation_month, -13)
+    source_month_from = min(trend_month_from, history_month_from)
     today_ym = f"{today.year:04d}{today.month:02d}"
     source = dict(params)
     manufacturer_codes = _clean_list_param(params.get("manufacturer_test_codes"))
     source.update(
         {
-            "month_from": trend_month_from,
+            "month_from": source_month_from,
             "month_to": evaluation_month,
-            "date_from": f"{trend_month_from}01",
+            "date_from": f"{source_month_from}01",
             "date_to": today.strftime("%Y%m%d") if evaluation_month == today_ym else _last_day_yyyymm(evaluation_month),
             "dashboard_lite_display_month_from": display_from,
             "dashboard_lite_display_month_to": display_to,
             "dashboard_lite_trend_month_from": trend_month_from,
+            "dashboard_lite_history_month_from": history_month_from,
             # Dashboard uses the explicit Gcode:Tcode keys below.  Do not let
             # legacy single-code filters reinterpret Tax classification as Gu.
             "product_di_list": [],
@@ -227,6 +232,207 @@ def _dashboard_visible_sales_df(df: pd.DataFrame | None, params: Mapping[str, An
     out = df.copy()
     months = out["기준월"].astype(str).str.replace(r"\D", "", regex=True).str[:6]
     return out[(months >= month_from) & (months <= evaluation_month)].copy()
+
+
+def _dashboard_sales_df_for_month_range(
+    df: pd.DataFrame | None,
+    *,
+    month_from: str,
+    month_to: str,
+) -> pd.DataFrame | None:
+    """Return a month slice without changing the already-filtered source."""
+    if df is None or df.empty or "기준월" not in df.columns:
+        return df
+    out = df.copy()
+    months = out["기준월"].astype(str).str.replace(r"\D", "", regex=True).str[:6]
+    return out[(months >= month_from) & (months <= month_to)].copy()
+
+
+def _dashboard_source_months(df: pd.DataFrame | None) -> pd.Series | None:
+    """Normalize source months once for all Dashboard-only range slices."""
+    if df is None or df.empty or "기준월" not in df.columns:
+        return None
+    return df["기준월"].astype(str).str.replace(r"\D", "", regex=True).str[:6]
+
+
+def _build_demand_surge_history_by_product(
+    df: pd.DataFrame | None,
+    *,
+    evaluation_month: str,
+    history_month_from: str,
+    source_months: pd.Series | None = None,
+) -> dict[str, Any]:
+    """Build product-month net outbound history from the already-loaded source."""
+    required = {"기준월", "제품코드", "출고수량"}
+    source_ready = isinstance(df, pd.DataFrame) and required.issubset(set(df.columns))
+    history_month_to = _add_months(evaluation_month, -1)
+    context: dict[str, Any] = {
+        "source_ready": source_ready,
+        "history_month_from": history_month_from,
+        "history_month_to": history_month_to,
+        "months": [],
+        "by_product": {},
+    }
+    if not source_ready:
+        return context
+
+    months = []
+    cursor = history_month_from
+    while cursor <= history_month_to:
+        months.append(cursor)
+        cursor = _add_months(cursor, 1)
+    context["months"] = months
+    months_series = source_months if isinstance(source_months, pd.Series) else _dashboard_source_months(df)
+    if months_series is None:
+        return context
+    history_mask = months_series.between(history_month_from, history_month_to)
+    work = df.loc[history_mask, ["제품코드", "출고수량"]].copy()
+    work["기준월"] = months_series.loc[history_mask].to_numpy()
+    work["제품코드"] = work["제품코드"].fillna("").astype(str).str.strip()
+    work["출고수량"] = pd.to_numeric(work["출고수량"], errors="coerce").fillna(0.0)
+    work = work[
+        work["제품코드"].ne("")
+        & work["기준월"].between(history_month_from, history_month_to)
+    ]
+    if work.empty:
+        return context
+
+    grouped = work.groupby(["제품코드", "기준월"], as_index=False)["출고수량"].sum()
+    for product_code, part in grouped.groupby("제품코드", sort=False):
+        amounts = {str(row["기준월"]): float(row["출고수량"] or 0.0) for _, row in part.iterrows()}
+        context["by_product"][str(product_code)] = amounts
+    return context
+
+
+def _apply_demand_surge_detail(
+    rows: list[dict[str, Any]],
+    *,
+    history: Mapping[str, Any],
+    evaluation_month: str,
+) -> dict[str, Any]:
+    """Attach mutually exclusive detail reasons to already-adjusted surge rows."""
+    epsilon = 1e-9
+    history_month_from = str(history.get("history_month_from") or "")
+    history_month_to = str(history.get("history_month_to") or "")
+    source_ready = bool(history.get("source_ready"))
+    by_product = history.get("by_product") if isinstance(history.get("by_product"), Mapping) else {}
+    recent_months = [_add_months(evaluation_month, offset) for offset in (-3, -2, -1)]
+    seasonal_months = [_add_months(evaluation_month, offset) for offset in (-13, -12, -11)]
+    seasonal_complete = bool(
+        source_ready
+        and history_month_from
+        and history_month_to
+        and history_month_from <= seasonal_months[0]
+        and history_month_to >= seasonal_months[-1]
+    )
+    counts = {
+        "forecast_exceeded_rows": 0,
+        "unexpected_outbound_rows": 0,
+        "forecast_omission_rows": 0,
+        "seasonal_recurrence_candidate_rows": 0,
+        "reactivated_after_3m_rows": 0,
+        "new_outbound_candidate_rows": 0,
+        "insufficient_history_rows": 0,
+    }
+
+    for row in rows:
+        current = float(row.get("당월현재출고수량") or 0.0)
+        forecast = float(row.get("당월기준예상출고수량") or 0.0)
+        product_code = str(row.get("product_code") or "").strip()
+        top_category = ""
+        detail_category = ""
+        reason = ""
+        history_values: Mapping[str, Any] = by_product.get(product_code, {}) if product_code else {}
+        history_available = bool(product_code and source_ready)
+        recent_values = [float(history_values.get(month) or 0.0) for month in recent_months]
+        seasonal_values = [float(history_values.get(month) or 0.0) for month in seasonal_months]
+        prior_positive_months = [
+            month for month, value in history_values.items()
+            if str(month) < recent_months[0] and float(value or 0.0) > epsilon
+        ]
+        history_positive_months = [
+            month for month, value in history_values.items()
+            if float(value or 0.0) > epsilon
+        ]
+        recent_positive_count = sum(value > epsilon for value in recent_values)
+        row.update(
+            {
+                "최근1개월순출고수량": recent_values[2],
+                "최근2개월순출고수량": recent_values[1],
+                "최근3개월순출고수량": recent_values[0],
+                "최근3개월순출고합계": float(sum(recent_values)),
+                "최근3개월양의출고발생월수": int(recent_positive_count),
+                "최근3개월출고여부": bool(recent_positive_count > 0),
+                "전년동월순출고수량": seasonal_values[1],
+                "전년동월전1개월순출고수량": seasonal_values[0],
+                "전년동월후1개월순출고수량": seasonal_values[2],
+                "계절성기준출고여부": bool(any(value > epsilon for value in seasonal_values)) if seasonal_complete else False,
+                "계절성기준자료완전": seasonal_complete,
+                "지원기간과거양의출고여부": bool(prior_positive_months),
+                "지원기간과거양의출고월수": int(len(prior_positive_months)),
+                "이력지원시작월": history_month_from,
+                "이력지원종료월": history_month_to,
+                "수요급증상위분류": "",
+                "수요급증세부분류": "",
+                "수요급증세부분류사유": "",
+            }
+        )
+        if not bool(row.get("수요급증여부")):
+            continue
+        if forecast > epsilon and current > forecast + epsilon:
+            top_category = "기존 예상 초과"
+            detail_category = top_category
+            reason = "당월 현재출고수량이 기준 예상출고수량 초과"
+            counts["forecast_exceeded_rows"] += 1
+        elif abs(forecast) <= epsilon and current > epsilon:
+            top_category = "예상외 출고 발생"
+            counts["unexpected_outbound_rows"] += 1
+            if not history_available:
+                detail_category = "분류자료부족"
+                reason = "제품코드 또는 출고 이력 원천 없음"
+                counts["insufficient_history_rows"] += 1
+            elif recent_positive_count > 0:
+                detail_category = "예상 누락"
+                reason = "최근 3개월 완료월 출고 이력이 있으나 당월 기준예상은 0"
+                counts["forecast_omission_rows"] += 1
+            elif not seasonal_complete:
+                detail_category = "분류자료부족"
+                reason = "계절성 판단에 필요한 전년 동월 ±1개월 이력 부족"
+                counts["insufficient_history_rows"] += 1
+            elif any(value > epsilon for value in seasonal_values):
+                detail_category = "계절성 재발생 후보"
+                reason = "최근 3개월 무출고이며 전년 동월 ±1개월 양의 순출고 이력 존재"
+                counts["seasonal_recurrence_candidate_rows"] += 1
+            elif prior_positive_months:
+                detail_category = "3개월 이상 재출고"
+                reason = "최근 3개월 무출고 후 지원기간 과거 양의 순출고 이력 존재"
+                counts["reactivated_after_3m_rows"] += 1
+            elif not history_positive_months:
+                detail_category = "신규 출고 후보"
+                reason = "지원기간 완료월에 양의 순출고 이력 없음"
+                counts["new_outbound_candidate_rows"] += 1
+            else:
+                detail_category = "분류자료부족"
+                reason = "수요급증 이력 분류에 필요한 사실값 부족"
+                counts["insufficient_history_rows"] += 1
+        else:
+            top_category = "예상외 출고 발생"
+            counts["unexpected_outbound_rows"] += 1
+            detail_category = "분류자료부족"
+            reason = "수요급증 조건과 세부 분류 조건 불일치"
+            counts["insufficient_history_rows"] += 1
+        row["수요급증상위분류"] = top_category
+        row["수요급증세부분류"] = detail_category
+        row["수요급증세부분류사유"] = reason
+
+    return {
+        **counts,
+        "total_rows": int(counts["forecast_exceeded_rows"] + counts["unexpected_outbound_rows"]),
+        "history_month_from": history_month_from,
+        "history_month_to": history_month_to,
+        "recent_month_count": 3,
+        "seasonality_rule": "전년 동월 ±1개월",
+    }
 
 
 def _clean_list_param(values: Any) -> list[str]:
@@ -352,7 +558,7 @@ def _filter_sales_source_for_dashboard(df: pd.DataFrame | None, params: Mapping[
     ):
         return df
     source_attrs = dict(getattr(df, "attrs", {}) or {})
-    out = df.copy()
+    out = df
     inclusion_specs = [
         {
             "label": "제품그룹",
@@ -382,11 +588,25 @@ def _filter_sales_source_for_dashboard(df: pd.DataFrame | None, params: Mapping[
             "name_values": _clean_list_param(params.get("product_class_nm_list" if use_inclusion else "exclude_product_class_nm_list")),
         },
     ]
-    keep_mask = pd.Series(True, index=out.index)
-    exclude_mask = pd.Series(False, index=out.index)
+    product_col = "제품코드" if "제품코드" in out.columns else ""
+    dimension_columns = [product_col] if product_col else []
+    for spec in inclusion_specs:
+        for columns_key in ("gcode_columns", "code_columns"):
+            column = next((candidate for candidate in spec[columns_key] if candidate in out.columns), "")
+            if column and column not in dimension_columns:
+                dimension_columns.append(column)
+    # Product dimensions are repeated for every month.  Resolve the selected
+    # product universe once, then reuse that set against the expanded source.
+    filter_df = (
+        out.loc[:, dimension_columns].drop_duplicates(subset=[product_col], keep="last")
+        if product_col and dimension_columns
+        else out
+    )
+    keep_mask = pd.Series(True, index=filter_df.index)
+    exclude_mask = pd.Series(False, index=filter_df.index)
     diagnostics: list[dict[str, Any]] = []
     for spec in inclusion_specs:
-        spec_mask, diag = _dashboard_filter_mask(out, **spec)
+        spec_mask, diag = _dashboard_filter_mask(filter_df, **spec)
         selected_code_values = _clean_list_param(spec.get("code_values"))
         if diag and selected_code_values:
             diagnostics.append(diag)
@@ -403,7 +623,14 @@ def _filter_sales_source_for_dashboard(df: pd.DataFrame | None, params: Mapping[
                 int(diag.get("selected_code_pair_count") or 0),
                 int(spec_mask.sum()) if hasattr(spec_mask, "sum") else 0,
             )
-    if use_inclusion and not bool(keep_mask.all()):
+    if product_col:
+        if use_inclusion and not bool(keep_mask.all()):
+            selected_products = set(filter_df.loc[keep_mask, product_col].dropna().astype(str))
+            out = out.loc[out[product_col].astype(str).isin(selected_products)].copy()
+        elif not use_inclusion and bool(exclude_mask.any()):
+            excluded_products = set(filter_df.loc[exclude_mask, product_col].dropna().astype(str))
+            out = out.loc[~out[product_col].astype(str).isin(excluded_products)].copy()
+    elif use_inclusion and not bool(keep_mask.all()):
         out = out.loc[keep_mask].copy()
     elif not use_inclusion and bool(exclude_mask.any()):
         out = out.loc[~exclude_mask].copy()
@@ -1146,7 +1373,9 @@ def _build_inventory_facts(
     readiness_warning_pct: float = STOCK_READY_THRESHOLD_PCT,
     evaluation_month: str = "",
     policy_date: str = "",
+    demand_surge_history: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    started = time.perf_counter()
     df = _payload_df(payload)
     meta = _payload_meta(payload)
     rows: list[dict[str, Any]] = []
@@ -1274,6 +1503,11 @@ def _build_inventory_facts(
         evaluation_month=evaluation_month,
         policy_date=policy_date,
     )
+    demand_surge_detail = _apply_demand_surge_detail(
+        rows,
+        history=demand_surge_history or {},
+        evaluation_month=evaluation_month,
+    )
     stock_risk_summary = _classify_stock_risk_rows(
         rows,
         readiness_warning_pct=readiness_warning_pct,
@@ -1309,6 +1543,18 @@ def _build_inventory_facts(
     demand_surge_rows = [row for row in rows if bool(row.get("수요급증여부"))]
     demand_surge_summary = {
         "품목수": int(_stock_risk_item_identity(pd.DataFrame(demand_surge_rows)).nunique()) if demand_surge_rows else 0,
+        "전체수요급증품목수": int(_stock_risk_item_identity(pd.DataFrame(demand_surge_rows)).nunique()) if demand_surge_rows else 0,
+        "기존예상초과품목수": int(demand_surge_detail["forecast_exceeded_rows"]),
+        "예상외출고발생품목수": int(demand_surge_detail["unexpected_outbound_rows"]),
+        "예상누락품목수": int(demand_surge_detail["forecast_omission_rows"]),
+        "계절성재발생후보품목수": int(demand_surge_detail["seasonal_recurrence_candidate_rows"]),
+        "3개월이상재출고품목수": int(demand_surge_detail["reactivated_after_3m_rows"]),
+        "신규출고후보품목수": int(demand_surge_detail["new_outbound_candidate_rows"]),
+        "분류자료부족품목수": int(demand_surge_detail["insufficient_history_rows"]),
+        "이력지원시작월": demand_surge_detail["history_month_from"],
+        "이력지원종료월": demand_surge_detail["history_month_to"],
+        "최근판정개월수": int(demand_surge_detail["recent_month_count"]),
+        "계절성판정기준": demand_surge_detail["seasonality_rule"],
         "긴급부족품목수": sum(1 for row in demand_surge_rows if row.get("재고위험상태") == "긴급 부족"),
         "부족주의품목수": sum(1 for row in demand_surge_rows if row.get("재고위험상태") == "부족 주의"),
         "적정품목수": sum(1 for row in demand_surge_rows if row.get("재고위험상태") == "적정"),
@@ -1318,6 +1564,21 @@ def _build_inventory_facts(
         "평가월경과일수": demand_surge_context["evaluation_elapsed_days"],
         "평가월총일수": demand_surge_context["evaluation_total_days"],
     }
+    log.info(
+        "[dashboard.demand_surge_detail] inventory_rows=%s total_rows=%s forecast_exceeded_rows=%s unexpected_outbound_rows=%s forecast_omission_rows=%s seasonal_recurrence_candidate_rows=%s reactivated_after_3m_rows=%s new_outbound_candidate_rows=%s insufficient_history_rows=%s history_month_from=%s history_month_to=%s elapsed_ms=%s",
+        len(rows),
+        demand_surge_detail["total_rows"],
+        demand_surge_detail["forecast_exceeded_rows"],
+        demand_surge_detail["unexpected_outbound_rows"],
+        demand_surge_detail["forecast_omission_rows"],
+        demand_surge_detail["seasonal_recurrence_candidate_rows"],
+        demand_surge_detail["reactivated_after_3m_rows"],
+        demand_surge_detail["new_outbound_candidate_rows"],
+        demand_surge_detail["insufficient_history_rows"],
+        demand_surge_detail["history_month_from"],
+        demand_surge_detail["history_month_to"],
+        int((time.perf_counter() - started) * 1000),
+    )
 
     return {
         "metrics": {
@@ -1433,6 +1694,11 @@ def build_dashboard_lite_facts(
             service_params = default_dashboard_lite_scope(today=today)
 
     source_params = _dashboard_internal_source_params(service_params, today=today)
+    existing_support_params = {
+        **source_params,
+        "month_from": source_params.get("dashboard_lite_trend_month_from"),
+        "date_from": f"{source_params.get('dashboard_lite_trend_month_from')}01",
+    }
     manufacturer_test_codes = _clean_list_param(service_params.get("manufacturer_test_codes"))
     period = {
         "month_from": service_params.get("month_from"),
@@ -1452,36 +1718,74 @@ def build_dashboard_lite_facts(
         int((time.perf_counter() - t0) * 1000),
     )
 
-    shared_sales_df: pd.DataFrame | None = None
+    expanded_sales_source_df: pd.DataFrame | None = None
+    existing_support_sales_df: pd.DataFrame | None = None
+    visible_sales_df: pd.DataFrame | None = None
     source_monthly_actuals: list[dict[str, Any]] = []
+    demand_surge_history: dict[str, Any] = {}
     filter_diagnostics: list[dict[str, Any]] = []
+    product_filter_elapsed_ms = 0
+    range_slice_elapsed_ms = 0
+    history_aggregate_elapsed_ms = 0
     stock_timing = _stock_timing_meta({}, fallback_total_ms=0)
     if needs_sales_source or needs_stock_source:
         from app.services.analytics_sales_trend_service import get_sales_trend_df
 
         t_source = time.perf_counter()
-        shared_sales_df = get_sales_trend_df(dict(source_params))
+        expanded_sales_source_df = get_sales_trend_df(dict(source_params))
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
         t_filter = time.perf_counter()
-        shared_sales_df = _filter_sales_source_for_dashboard(shared_sales_df, service_params)
-        source_monthly_actuals = _monthly_sales_actuals_from_source(shared_sales_df)
-        filter_elapsed_ms = int((time.perf_counter() - t_filter) * 1000)
-        if isinstance(shared_sales_df, pd.DataFrame):
-            filter_diagnostics.extend(list(shared_sales_df.attrs.get("dashboard_filter_diagnostics") or []))
+        expanded_sales_source_df = _filter_sales_source_for_dashboard(expanded_sales_source_df, service_params)
+        product_filter_elapsed_ms = int((time.perf_counter() - t_filter) * 1000)
+        t_ranges = time.perf_counter()
+        source_months = _dashboard_source_months(expanded_sales_source_df)
+        if isinstance(expanded_sales_source_df, pd.DataFrame) and source_months is not None:
+            support_mask = source_months.between(
+                str(source_params.get("dashboard_lite_trend_month_from") or ""),
+                str(service_params.get("evaluation_month") or ""),
+            )
+            visible_mask = source_months.between(
+                str(service_params.get("month_from") or ""),
+                str(service_params.get("evaluation_month") or ""),
+            )
+            existing_support_sales_df = expanded_sales_source_df.loc[support_mask].copy()
+            visible_sales_df = expanded_sales_source_df.loc[visible_mask].copy()
+        else:
+            existing_support_sales_df = expanded_sales_source_df
+            visible_sales_df = expanded_sales_source_df
+        range_slice_elapsed_ms = int((time.perf_counter() - t_ranges) * 1000)
+        source_monthly_actuals = _monthly_sales_actuals_from_source(existing_support_sales_df)
+        t_history = time.perf_counter()
+        demand_surge_history = _build_demand_surge_history_by_product(
+            expanded_sales_source_df,
+            evaluation_month=str(service_params.get("evaluation_month") or ""),
+            history_month_from=str(source_params.get("dashboard_lite_history_month_from") or ""),
+            source_months=source_months,
+        )
+        history_aggregate_elapsed_ms = int((time.perf_counter() - t_history) * 1000)
+        if isinstance(expanded_sales_source_df, pd.DataFrame):
+            filter_diagnostics.extend(list(expanded_sales_source_df.attrs.get("dashboard_filter_diagnostics") or []))
         log.info(
-            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s manufacturer_test_filter_enabled=%s manufacturer_test_product_count=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s elapsed_ms=%s",
+            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s manufacturer_test_filter_enabled=%s manufacturer_test_product_count=%s expanded_history_month_from=%s expanded_history_month_to=%s expanded_history_rows=%s existing_support_rows=%s visible_rows=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s range_slice_ms=%s history_aggregate_ms=%s elapsed_ms=%s",
             service_params.get("company_id") or "",
             service_params.get("month_from"),
             service_params.get("month_to"),
             service_params.get("evaluation_month"),
-            0 if shared_sales_df is None else len(shared_sales_df),
+            0 if expanded_sales_source_df is None else len(expanded_sales_source_df),
             1,
             False,
             bool(manufacturer_test_codes),
-            int(shared_sales_df["제품코드"].nunique()) if isinstance(shared_sales_df, pd.DataFrame) and "제품코드" in shared_sales_df.columns else 0,
+            int(expanded_sales_source_df["제품코드"].nunique()) if isinstance(expanded_sales_source_df, pd.DataFrame) and "제품코드" in expanded_sales_source_df.columns else 0,
+            source_params.get("dashboard_lite_history_month_from") or "",
+            service_params.get("evaluation_month") or "",
+            0 if expanded_sales_source_df is None else len(expanded_sales_source_df),
+            0 if existing_support_sales_df is None else len(existing_support_sales_df),
+            0 if visible_sales_df is None else len(visible_sales_df),
             source_elapsed_ms,
             0,
-            filter_elapsed_ms,
+            product_filter_elapsed_ms,
+            range_slice_elapsed_ms,
+            history_aggregate_elapsed_ms,
             int((time.perf_counter() - t_source) * 1000),
         )
 
@@ -1489,8 +1793,8 @@ def build_dashboard_lite_facts(
         from app.services.analytics_manufacturer_sales_trend_service import get_manufacturer_sales_trend_summary_result
 
         manufacturer_summary_payload = get_manufacturer_sales_trend_summary_result(
-            dict(source_params),
-            raw_df=shared_sales_df,
+            dict(existing_support_params),
+            raw_df=existing_support_sales_df,
         )
     else:
         manufacturer_summary_payload = _filter_payload_df_for_dashboard(manufacturer_summary_payload, service_params)
@@ -1502,7 +1806,6 @@ def build_dashboard_lite_facts(
             get_stock_shortage_result,
         )
 
-        visible_sales_df = _dashboard_visible_sales_df(shared_sales_df, service_params)
         t_forecast = time.perf_counter()
         shared_sales_forecast_df = get_sales_forecast_df(
             {
@@ -1525,7 +1828,7 @@ def build_dashboard_lite_facts(
         )
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
         t_master_merge = time.perf_counter()
-        stock_shortage_payload = _attach_dashboard_product_code_pairs(stock_shortage_payload, shared_sales_df)
+        stock_shortage_payload = _attach_dashboard_product_code_pairs(stock_shortage_payload, existing_support_sales_df)
         master_merge_elapsed_ms = int((time.perf_counter() - t_master_merge) * 1000)
         t_filter = time.perf_counter()
         stock_shortage_payload = _filter_payload_df_for_dashboard(stock_shortage_payload, service_params)
@@ -1563,7 +1866,7 @@ def build_dashboard_lite_facts(
             int((time.perf_counter() - t_source) * 1000),
         )
     else:
-        stock_shortage_payload = _attach_dashboard_product_code_pairs(stock_shortage_payload, shared_sales_df)
+        stock_shortage_payload = _attach_dashboard_product_code_pairs(stock_shortage_payload, existing_support_sales_df)
         stock_shortage_payload = _filter_payload_df_for_dashboard(stock_shortage_payload, service_params)
         source_df = _payload_df(stock_shortage_payload)
         filter_diagnostics.extend(list(source_df.attrs.get("dashboard_filter_diagnostics") or []))
@@ -1588,6 +1891,7 @@ def build_dashboard_lite_facts(
         readiness_warning_pct=float(service_params.get("readiness_warning_pct") or STOCK_READY_THRESHOLD_PCT),
         evaluation_month=str(service_params.get("evaluation_month") or ""),
         policy_date=str(service_params.get("policy_date") or ""),
+        demand_surge_history=demand_surge_history,
     )
     log.info(
         "[dashboard.stock_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",
