@@ -10,6 +10,10 @@ import os
 
 import importlib
 import pandas as pd
+from app.services.ssai_analysis_profile_service import (
+    normalize_business_code,
+    normalize_business_code_pair,
+)
  
 # =============================================================================
 # 키보드 보정(2벌식): 영문으로 잘못 입력된 한글을 한글로 변환
@@ -1127,7 +1131,45 @@ def _strip_analytics_tail(value: Any) -> str:
     return s
 
 
-def _cleanup_analytics_named_params(params: Dict[str, Any]) -> Dict[str, Any]:
+_ANALYTICS_GROUP_ACTIONS = {
+    "제약사별 매출 추세 분석",
+    "제약사별 매출 추세 분석 요약표",
+    "품목별 매출 추세 분석",
+    "품목별 매출 추세 요약표",
+    "품목별 매출 예상",
+    "매입처별 재고부족 현황",
+    "매출처별 매출 예상",
+    "영업사원별 매출 예상",
+    "지역별 매출 예상",
+}
+
+
+def _explicit_manufacturer_before_group_action(text: str, action: str) -> str:
+    """Read only a token immediately before a grouped analytics action."""
+    if action not in _ANALYTICS_GROUP_ACTIONS:
+        return ""
+    action_pattern = re.escape(action).replace(r"\ ", r"\s*")
+    match = re.search(action_pattern, str(text or ""))
+    if not match:
+        return ""
+    prefix = str(text or "")[:match.start()].strip(" ,")
+    candidate = re.search(r"([가-힣A-Za-z0-9_-]+)\s*$", prefix)
+    if not candidate:
+        return ""
+    value = candidate.group(1).strip()
+    if value in {"조회", "분석", "현황", "요약", "요약표", "예상", "추세", "매출", "실재고", "장부재고"}:
+        return ""
+    if re.fullmatch(r"\d{1,8}(?:년|월|일)?", value):
+        return ""
+    return value if any(token in value for token in ("제약", "약품")) else ""
+
+
+def _cleanup_analytics_named_params(
+    params: Dict[str, Any],
+    *,
+    text: str = "",
+    action: str = "",
+) -> Dict[str, Any]:
     """
     분석/KPI NLQ 조건값 후처리.
     io_nlq.extract_params()가 액션 문구까지 같이 잡는 경우를 보정한다.
@@ -1157,6 +1199,25 @@ def _cleanup_analytics_named_params(params: Dict[str, Any]) -> Dict[str, Any]:
     for key in named_keys:
         if key in out:
             out[key] = _strip_analytics_tail(out.get(key))
+
+    # Group action words contain labels such as "제약사별".  They are not
+    # manufacturer conditions, but a valid explicit manufacturer must survive.
+    if action in _ANALYTICS_GROUP_ACTIONS:
+        maker = str(out.get("maker_nm") or "").strip()
+        product_maker = str(out.get("product_ven_nm") or "").strip()
+        explicit_maker = _explicit_manufacturer_before_group_action(text, action)
+        if action.startswith("제약사별"):
+            maker = maker if maker and maker != "별" else explicit_maker
+            product_maker = product_maker if product_maker and product_maker != "별" else maker
+        elif not maker and not product_maker and explicit_maker:
+            maker = explicit_maker
+            product_maker = explicit_maker
+        if maker == "별":
+            maker = ""
+        if product_maker == "별":
+            product_maker = ""
+        out["maker_nm"] = maker
+        out["product_ven_nm"] = product_maker
 
     # 제조사명은 서비스 쪽에서 product_ven_nm을 주로 사용하므로 동기화
     if out.get("maker_nm") and not out.get("product_ven_nm"):
@@ -1215,7 +1276,8 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     except Exception:
         params = {}
 
-    params = _cleanup_analytics_named_params(params)
+    params = _cleanup_analytics_named_params(params, text=txt, action=action)
+    params = _apply_analytics_condition_aliases(params, txt)
     params = _apply_analytics_period_defaults(params, txt)
 
     params = _apply_analytics_source_params(params, txt, action)
@@ -1232,6 +1294,487 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     params["top"] = _extract_analytics_top(txt)
 
     return params
+
+
+def _apply_analytics_condition_aliases(params: Dict[str, Any], txt: str) -> Dict[str, Any]:
+    """Fill analytics-only name/code aliases without coercing names to codes."""
+    out = dict(params or {})
+    text = str(txt or "")
+
+    if not _analytics_nlq_code_values(out, "stock_cd_list"):
+        stock_match = re.search(r"(?<!\d)(\d{1,6})\s*창고", text)
+        if stock_match:
+            code = stock_match.group(1)
+            out["stock_cds"] = [code]
+            out["stock_cd"] = code
+    if not _analytics_nlq_name_values(out, "stock_cd_list") and not _analytics_nlq_code_values(out, "stock_cd_list"):
+        stock_name_match = re.search(r"([가-힣A-Za-z][가-힣A-Za-z0-9_-]*)\s*창고", text)
+        if stock_name_match and stock_name_match.group(1) != "전체":
+            out["stock_nm"] = stock_name_match.group(1)
+
+    for code_key, name_key, label in (
+        ("product_di_list", "product_di_nm", "제품구분"),
+        ("product_class_list", "product_class_nm", "제품분류"),
+    ):
+        if _analytics_nlq_code_values(out, code_key) or _analytics_nlq_name_values(out, code_key):
+            continue
+        match = re.search(rf"([가-힣A-Za-z][가-힣A-Za-z0-9_-]*)\s*{label}", text)
+        if match and match.group(1) != "전체":
+            out[name_key] = match.group(1)
+    return out
+
+
+_ANALYTICS_NLQ_DEFAULT_KEYS = {
+    "품목별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "품목별 매출 추세 요약표": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "품목별 매출 예상": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "제약사별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "제약사별 매출 추세 분석 요약표": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "품목별 재고부족현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
+    "매입처별 재고부족 현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
+}
+
+
+def _profile_tcodes(values: Any) -> list[str]:
+    normalized: list[str] = []
+    for value in (values or []):
+        raw = normalize_business_code(value)
+        if not raw:
+            continue
+        pair = normalize_business_code_pair(raw) if ":" in raw else ""
+        normalized.append(pair.rsplit(":", 1)[-1] if pair else raw)
+    return list(dict.fromkeys(normalized))
+
+
+def _profile_code_pairs(values: Any) -> list[str]:
+    """Normalize profile code pairs without collapsing their Gcode portion."""
+    return list(dict.fromkeys(
+        normalize_business_code_pair(value)
+        for value in (values or [])
+        if normalize_business_code_pair(value)
+    ))
+
+
+def _analytics_nlq_values(params: Dict[str, Any], *keys: str) -> list[str]:
+    """Read one alias family without converting names into codes."""
+    for key in keys:
+        value = params.get(key)
+        if isinstance(value, (list, tuple, set)):
+            values = [str(item).strip() for item in value if str(item).strip()]
+        else:
+            text = str(value or "").strip()
+            values = [text] if text else []
+        if values:
+            return list(dict.fromkeys(values))
+    return []
+
+
+def _analytics_nlq_code_values(params: Dict[str, Any], key: str) -> list[str]:
+    aliases = {
+        "stock_cd_list": ("stock_cd_list", "stock_cds", "stock_cd"),
+        "product_di_list": ("dashboard_product_di_list", "product_di_list", "product_di"),
+        "product_class_list": ("dashboard_product_class_list", "product_class_list", "product_class"),
+    }
+    values = _analytics_nlq_values(params, *aliases.get(key, ()))
+    normalized: list[str] = []
+    for value in values:
+        code = normalize_business_code_pair(value) if ":" in value else normalize_business_code(value)
+        if code:
+            normalized.append(code)
+    return list(dict.fromkeys(normalized))
+
+
+def _analytics_nlq_name_values(params: Dict[str, Any], key: str) -> list[str]:
+    aliases = {
+        "stock_cd_list": ("stock_nm", "stock_nm_list"),
+        "product_di_list": ("product_di_nm", "product_di_nm_list"),
+        "product_class_list": ("product_class_nm", "product_class_nm_list"),
+    }
+    return _analytics_nlq_values(params, *aliases.get(key, ()))
+
+
+def _analytics_nlq_option_codes(field: str) -> list[str]:
+    """Reuse the KPI option universe for Default full-selection handling."""
+    gcode = {
+        "stock_cd_list": "0018",
+        "product_di_list": "0004",
+        "product_class_list": "0031",
+    }.get(str(field or ""))
+    if not gcode:
+        return []
+    try:
+        from app.sims.views.analytics_views import get_analytics_code_option_codes
+
+        return list(get_analytics_code_option_codes(gcode) or [])
+    except Exception:
+        # Do not infer a company-specific universe from a Default profile.
+        return []
+
+
+def _context_business_code_pairs(text: str, labels: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Read only pairs directly adjacent to a condition label."""
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    code_pattern = r"([A-Za-z0-9_-]+)\s*:\s*([A-Za-z0-9_-]+)"
+    found: list[tuple[str, str]] = []
+    for pattern in (
+        rf"(?<![A-Za-z0-9_-]){code_pattern}\s*(?:{label_pattern})",
+        rf"(?:{label_pattern})\s*{code_pattern}(?![A-Za-z0-9_-])",
+    ):
+        for match in re.finditer(pattern, str(text or "")):
+            gcode = normalize_business_code(match.group(1))
+            tcode = normalize_business_code(match.group(2))
+            if gcode and tcode:
+                found.append((gcode, tcode))
+    return list(dict.fromkeys(found))
+
+
+def _resolve_explicit_product_di_contract(text: str) -> list[str]:
+    return [f"{gcode}:{tcode}" for gcode, tcode in _context_business_code_pairs(text, ("제품구분",)) if gcode == "0004"]
+
+
+def _resolve_explicit_product_class_contract(params: Dict[str, Any], text: str) -> dict[str, Any]:
+    """Route only product-class-context pairs to 0031 Tax or 0028 legacy."""
+    raw_text = str(text or "")
+    tax_pairs: list[str] = []
+    legacy_codes: list[str] = []
+    for gcode, tcode in _context_business_code_pairs(text, ("제품분류", "특수관리제품")):
+        if gcode == "0031":
+            tax_pairs.append(f"{gcode}:{tcode}")
+        elif gcode == "0028":
+            legacy_codes.append(tcode)
+    if tax_pairs or legacy_codes:
+        return {
+            "tax_pairs": list(dict.fromkeys(tax_pairs)),
+            "legacy_codes": list(dict.fromkeys(legacy_codes)),
+        }
+
+    code_match = re.search(r"(?<!\d)(\d{1,6})\s*제품분류", raw_text)
+    if code_match:
+        tcode = normalize_business_code(code_match.group(1))
+        if tcode:
+            return {"tax_pairs": [f"0031:{tcode}"], "legacy_codes": []}
+
+    name_values = _analytics_nlq_name_values(params, "product_class_list")
+    if not name_values:
+        return {}
+    try:
+        from app.sims.views.analytics_views import _load_code_options
+
+        options = _load_code_options("0031")
+    except Exception:
+        return {}
+    name = name_values[0]
+    for option in options:
+        if str(option.get("name") or "").strip() != name:
+            continue
+        tcode = normalize_business_code(option.get("code"))
+        if tcode:
+            return {"tax_pairs": [f"0031:{tcode}"], "legacy_codes": []}
+    return {}
+
+
+def _clear_legacy_product_class_aliases(params: Dict[str, Any]) -> None:
+    params["product_class_list"] = []
+    params["product_class"] = ""
+    params["product_class_nm"] = ""
+    params["product_class_nm_list"] = []
+
+
+def _analytics_nlq_condition_sources(params: Dict[str, Any], sources: Dict[str, Any]) -> str:
+    """Build a user-facing summary from applied conditions only."""
+    labels = {
+        "stock_mode": "재고기준",
+        "stock_cd_list": "재고위치",
+        "product_di_list": "제품구분",
+        "product_class_list": "제품분류",
+    }
+    values = {
+        "stock_mode": {"real": "실재고", "book": "장부재고"}.get(str(params.get("stock_mode") or ""), str(params.get("stock_mode") or "")),
+        "stock_cd_list": _analytics_nlq_code_values(params, "stock_cd_list")
+        or _analytics_nlq_name_values(params, "stock_cd_list"),
+        "product_di_list": _analytics_nlq_code_values(params, "product_di_list")
+        or _analytics_nlq_name_values(params, "product_di_list"),
+        "product_class_list": _analytics_nlq_code_values(params, "product_class_list")
+        or _analytics_nlq_name_values(params, "product_class_list"),
+    }
+    parts = []
+    for key in labels:
+        source = dict(sources or {}).get(key)
+        if not source:
+            continue
+        value = values.get(key)
+        if source == "explicit_clear":
+            text = "전체"
+        elif isinstance(value, list):
+            display_values = [str(item) for item in value if str(item).strip()]
+            if not display_values:
+                # An explicit parser condition with no display-safe alias must
+                # not be presented as an explicit "전체" condition.
+                if source == "explicit":
+                    continue
+                text = "전체"
+            else:
+                text = ", ".join(display_values)
+        else:
+            text = str(value or "")
+            if not text:
+                if source == "explicit":
+                    continue
+                text = "전체"
+        source_label = "질문에서 지정" if source == "explicit" else (
+            "전체 조건" if source == "explicit_clear" else "회사 Default"
+        )
+        parts.append(f"{labels[key]}: {text} ({source_label})")
+    return " / ".join(parts)
+
+
+def _merge_analytics_nlq_condition_summary(
+    existing_summary: str,
+    source_summary: str,
+) -> str:
+    """Append only missing condition values; add provenance for duplicates."""
+    existing = str(existing_summary or "").strip()
+    if not existing:
+        return str(source_summary or "").strip()
+    missing: list[str] = []
+    provenance: list[str] = []
+    for part in (item.strip() for item in str(source_summary or "").split(" / ")):
+        if not part:
+            continue
+        label, separator, rest = part.partition(":")
+        if not separator:
+            missing.append(part)
+            continue
+        source_label = rest.rsplit("(", 1)[-1].rstrip(")").strip() if "(" in rest else ""
+        if label.strip() and label.strip() in existing:
+            provenance.append(f"{label.strip()} {source_label}".strip())
+        else:
+            missing.append(part)
+    suffixes = list(missing)
+    if provenance:
+        suffixes.append(f"조건 출처: {' / '.join(provenance)}")
+    return " / ".join([existing, *suffixes])
+
+
+def _analytics_nlq_param_log_summary(params: Dict[str, Any], sources: Dict[str, Any]) -> dict[str, Any]:
+    """Return only non-identifying parameter shape/counts for NLQ logs."""
+    source_values = list(dict(sources or {}).values())
+    return {
+        "stock_mode_present": bool(str(params.get("stock_mode") or "").strip()),
+        "stock_cd_count": len(_analytics_nlq_code_values(params, "stock_cd_list")),
+        "product_di_count": len(_analytics_nlq_code_values(params, "product_di_list")),
+        "product_class_count": len(_analytics_nlq_code_values(params, "product_class_list")),
+        "default_condition_count": source_values.count("default"),
+        "explicit_condition_count": source_values.count("explicit"),
+        "explicit_clear_count": source_values.count("explicit_clear"),
+    }
+
+
+def _apply_company_default_to_analytics_nlq(
+    params: Dict[str, Any],
+    *,
+    text: str,
+    action: str,
+    session_state: Dict[str, Any],
+    logger,
+) -> Dict[str, Any]:
+    """Apply only code-safe company Defaults to an analytics NLQ request."""
+    supported = set(_ANALYTICS_NLQ_DEFAULT_KEYS.get(action, set()))
+    if not supported:
+        return params
+
+    try:
+        from app.services.ssai_analysis_profile_service import (
+            build_company_default_adapter,
+            load_dashboard_profile,
+            normalize_analytics_multi_code_filter,
+        )
+        from app.ui.ssai_login import get_selected_company
+
+        company_id = str((get_selected_company() or {}).get("company_id") or "").strip()
+    except Exception:
+        company_id = ""
+    if not company_id:
+        return params
+
+    out = dict(params or {})
+    text_compact = re.sub(r"\s+", "", str(text or ""))
+    explicit_keys: set[str] = set()
+    clear_keys: set[str] = set()
+    if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"} and any(
+        token in text_compact for token in ("실재고", "장부재고")
+    ):
+        explicit_keys.add("stock_mode")
+    stock_code_values = _analytics_nlq_code_values(out, "stock_cd_list")
+    stock_name_values = _analytics_nlq_name_values(out, "stock_cd_list")
+    if stock_code_values or stock_name_values:
+        explicit_keys.add("stock_cd_list")
+    if stock_code_values:
+        out["stock_cd_list"] = list(stock_code_values)
+        out["stock_cds"] = list(stock_code_values)
+        out["stock_cd"] = stock_code_values[0] if len(stock_code_values) == 1 else ""
+    if any(token in text_compact for token in ("전체창고", "전창고", "모든창고", "창고전체")):
+        clear_keys.add("stock_cd_list")
+    if any(token in text_compact for token in ("전체제품구분", "전제품구분", "모든제품구분")):
+        clear_keys.add("product_di_list")
+    if any(token in text_compact for token in ("전체제품분류", "전제품분류", "모든제품분류")):
+        clear_keys.add("product_class_list")
+    product_di_code_values = _analytics_nlq_code_values(out, "product_di_list")
+    product_di_name_values = _analytics_nlq_name_values(out, "product_di_list")
+    explicit_product_di_pairs = _resolve_explicit_product_di_contract(text)
+    if explicit_product_di_pairs:
+        explicit_keys.add("product_di_list")
+        out["product_di_list"] = [pair.rsplit(":", 1)[-1] for pair in explicit_product_di_pairs]
+        out["dashboard_product_di_list"] = list(explicit_product_di_pairs)
+        out["product_di"] = ""
+        out["product_di_nm"] = ""
+        out["product_di_nm_list"] = []
+    elif product_di_code_values or product_di_name_values:
+        explicit_keys.add("product_di_list")
+    if product_di_code_values and not explicit_product_di_pairs:
+        out["product_di_list"] = list(product_di_code_values)
+        out["dashboard_product_di_list"] = list(product_di_code_values)
+    explicit_product_class = _resolve_explicit_product_class_contract(out, text)
+    product_class_code_values = _analytics_nlq_code_values(out, "product_class_list")
+    product_class_name_values = _analytics_nlq_name_values(out, "product_class_list")
+    if explicit_product_class:
+        explicit_keys.add("product_class_list")
+        tax_pairs = list(explicit_product_class.get("tax_pairs") or [])
+        legacy_codes = list(explicit_product_class.get("legacy_codes") or [])
+        if tax_pairs and not legacy_codes:
+            _clear_legacy_product_class_aliases(out)
+        else:
+            out["product_class_list"] = legacy_codes
+            out["product_class"] = ""
+            out["product_class_nm"] = ""
+            out["product_class_nm_list"] = []
+        out["dashboard_product_class_list"] = tax_pairs
+    elif product_class_code_values or product_class_name_values:
+        explicit_keys.add("product_class_list")
+    if product_class_code_values and not explicit_product_class:
+        out["product_class_list"] = list(product_class_code_values)
+        out["dashboard_product_class_list"] = list(product_class_code_values)
+    if str(out.get("product_group_nm") or "").strip():
+        # The target has a legacy single-value product-group field.  Never
+        # squeeze a multi-code Default into it.
+        supported.discard("product_group_list")
+
+    try:
+        from app.services.ssai_analysis_profile_service import invalidate_analysis_profile_cache
+
+        last_company_key = "__analysis_profile_last_company_id"
+        previous_company = str(session_state.get(last_company_key) or "")
+        if previous_company and previous_company != company_id:
+            invalidate_analysis_profile_cache(session_state, company_id=previous_company)
+            invalidate_analysis_profile_cache(session_state, company_id=company_id)
+        session_state[last_company_key] = company_id
+    except Exception:
+        pass
+
+    cache = session_state.setdefault("__analysis_profile_company_cache", {})
+    profile = cache.get(company_id) if isinstance(cache, dict) else None
+    cache_used = isinstance(profile, dict)
+    if not cache_used:
+        profile = load_dashboard_profile(company_id=int(company_id))
+        if isinstance(cache, dict):
+            cache[company_id] = dict(profile or {})
+
+    adapter = build_company_default_adapter(
+        profile,
+        supported_keys=supported,
+        explicit=out,
+        explicit_keys=explicit_keys,
+        clear_keys=clear_keys,
+    )
+    for key, value in dict(adapter.get("effective") or {}).items():
+        source = (adapter.get("sources") or {}).get(key)
+        if source == "explicit":
+            continue
+        if key == "stock_cd_list":
+            values = [] if source == "explicit_clear" else _profile_tcodes(value)
+            normalized = normalize_analytics_multi_code_filter(
+                values, _analytics_nlq_option_codes(key), expected_gcode="0018"
+            )
+            values = list(normalized["effective_codes"])
+            out["stock_cd_list"] = values
+            out["stock_cds"] = values
+            out["stock_cd"] = values[0] if len(values) == 1 else ""
+            if normalized["is_full_selection"]:
+                adapter_sources = adapter.get("sources")
+                if isinstance(adapter_sources, dict):
+                    adapter_sources.pop(key, None)
+            logger.info(
+                "[analysis_profile.filter_normalize] action=%s field=%s selected_count=%s available_count=%s "
+                "full_selection=%s effective_count=%s source=%s",
+                action, key, normalized["selected_count"], normalized["available_count"],
+                normalized["is_full_selection"], len(values), source,
+            )
+        elif key in {"product_di_list", "product_class_list"}:
+            pairs = [] if source == "explicit_clear" else _profile_code_pairs(value)
+            normalized = normalize_analytics_multi_code_filter(
+                _profile_tcodes(pairs),
+                _analytics_nlq_option_codes(key),
+                pairs,
+                "0004" if key == "product_di_list" else "0031",
+            )
+            if key == "product_class_list" and normalized.get("pair_gcode_matches"):
+                # Dashboard Company Default product classification is 0031
+                # (Rd04_Physic_Tax).  The legacy product_class aliases retain
+                # their 0028/Rd04_Physic_Gu meaning and must stay empty.
+                out[key] = []
+                out["dashboard_product_class_list"] = list(normalized["effective_pairs"])
+                out["product_class"] = ""
+                out["product_class_nm"] = ""
+                out["product_class_nm_list"] = []
+            else:
+                out[key] = list(normalized["effective_codes"])
+                out[f"dashboard_{key}"] = list(normalized["effective_pairs"])
+            if normalized["is_full_selection"]:
+                legacy_key = key.replace("_list", "")
+                out[legacy_key] = ""
+                out[f"{legacy_key}_nm"] = ""
+                out[f"{legacy_key}_nm_list"] = []
+                adapter_sources = adapter.get("sources")
+                if isinstance(adapter_sources, dict):
+                    adapter_sources.pop(key, None)
+            logger.info(
+                "[analysis_profile.filter_normalize] action=%s field=%s selected_count=%s available_count=%s "
+                "full_selection=%s effective_count=%s source=%s",
+                action, key, normalized["selected_count"], normalized["available_count"],
+                normalized["is_full_selection"], len(out[key]), source,
+            )
+        else:
+            out[key] = value
+
+    # Clear every legacy alias too.  Some services still inspect the older
+    # name/code fields, so clearing only the adapter key is not sufficient.
+    if "stock_cd_list" in clear_keys:
+        for key in ("stock_cd_list", "stock_cds", "stock_cd", "stock_nm", "stock_nm_list"):
+            out[key] = [] if key in {"stock_cd_list", "stock_cds", "stock_nm_list"} else ""
+    if "product_di_list" in clear_keys:
+        for key in ("product_di_list", "dashboard_product_di_list", "product_di", "product_di_nm", "product_di_nm_list"):
+            out[key] = [] if key.endswith("_list") else ""
+    if "product_class_list" in clear_keys:
+        for key in ("product_class_list", "dashboard_product_class_list", "product_class", "product_class_nm", "product_class_nm_list"):
+            out[key] = [] if key.endswith("_list") else ""
+
+    out["__analysis_default_sources"] = dict(adapter.get("sources") or {})
+
+    logger.info(
+        "[analysis_profile.adapter] company_id_present=True profile_found=%s target_context=nlq "
+        "supported_key_count=%s applied_default_count=%s explicit_override_count=%s explicit_clear_count=%s "
+        "unsupported_key_count=%s cache_used=%s reason=nlq_request",
+        bool(adapter.get("profile_found")), len(supported), adapter.get("applied_default_count", 0),
+        adapter.get("explicit_override_count", 0), adapter.get("explicit_clear_count", 0),
+        len(adapter.get("unsupported_default_keys") or []), cache_used,
+    )
+    logger.info(
+        "[NLQ profile 적용] target_action=%s explicit_condition_count=%s default_condition_count=%s "
+        "explicit_override_count=%s explicit_clear_count=%s",
+        action, len(explicit_keys), adapter.get("applied_default_count", 0),
+        adapter.get("explicit_override_count", 0), adapter.get("explicit_clear_count", 0),
+    )
+    return out
 
 
 def _get_analytics_handler(action: str):
@@ -1320,18 +1863,37 @@ def _try_handle_analytics_nlq(
         return False
 
     params = _build_analytics_params(t, action)
+    params = _apply_company_default_to_analytics_nlq(
+        params,
+        text=t,
+        action=action,
+        session_state=session_state,
+        logger=logger,
+    )
+    adapter_sources = dict(params.pop("__analysis_default_sources", {}) or {})
+    service_params = dict(params)
+    log_summary = _analytics_nlq_param_log_summary(service_params, adapter_sources)
 
     try:
-        payload = fn(params)
+        payload = fn(service_params)
     except Exception as e:
-        logger.exception("[nlq.router] analytics service failed action=%r params=%r", action, params)
+        logger.exception(
+            "[nlq.router] analytics service failed action=%r stock_mode_present=%s stock_cd_count=%s "
+            "product_di_count=%s product_class_count=%s default_condition_count=%s "
+            "explicit_condition_count=%s explicit_clear_count=%s",
+            action,
+            log_summary["stock_mode_present"], log_summary["stock_cd_count"],
+            log_summary["product_di_count"], log_summary["product_class_count"],
+            log_summary["default_condition_count"], log_summary["explicit_condition_count"],
+            log_summary["explicit_clear_count"],
+        )
 
         payload = {
             "final": True,
             "type": "text",
             "title": f"{action} 오류",
             "action": action,
-            "params": params,
+            "params": service_params,
             "data": f"{action} 처리 중 오류가 발생했습니다: {e}",
             "message": f"{action} 처리 중 오류가 발생했습니다: {e}",
             "meta": {
@@ -1366,9 +1928,17 @@ def _try_handle_analytics_nlq(
 
     payload.setdefault("title", action)
     payload.setdefault("action", action)
-    payload.setdefault("params", params)
+    payload_params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    effective_params = {**service_params, **payload_params}
+    payload["params"] = effective_params
 
     meta = dict(payload.get("meta") or {})
+    source_summary = _analytics_nlq_condition_sources(effective_params, adapter_sources)
+    if source_summary:
+        existing_summary = str(meta.get("query_summary") or meta.get("condition") or "").strip()
+        merged_summary = _merge_analytics_nlq_condition_summary(existing_summary, source_summary)
+        meta["query_summary"] = merged_summary
+        meta["condition"] = merged_summary
     meta.update({
         "nlq": True,
         "nlq_query": txt,
@@ -1385,12 +1955,22 @@ def _try_handle_analytics_nlq(
         return False
 
     session_state["__sims_last_nlq_action"] = action
-    session_state["__sims_last_nlq_params"] = params
+    session_state["__sims_last_nlq_params"] = effective_params
     session_state["__scroll_to_msg"] = (
         session_state.get("__sims_last_msg_id") or session_state.get("__scroll_to_msg")
     )
 
-    logger.info("[nlq.router] analytics handled action=%r params=%r", action, params)
+    log_summary = _analytics_nlq_param_log_summary(effective_params, adapter_sources)
+    logger.info(
+        "[nlq.router] analytics handled action=%r stock_mode_present=%s stock_cd_count=%s "
+        "product_di_count=%s product_class_count=%s default_condition_count=%s "
+        "explicit_condition_count=%s explicit_clear_count=%s",
+        action,
+        log_summary["stock_mode_present"], log_summary["stock_cd_count"],
+        log_summary["product_di_count"], log_summary["product_class_count"],
+        log_summary["default_condition_count"], log_summary["explicit_condition_count"],
+        log_summary["explicit_clear_count"],
+    )
     return True
 
 def _io_has_period_params(params: Dict[str, Any]) -> bool:

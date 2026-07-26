@@ -24,6 +24,10 @@ from app.services.rddbc_io_common import (
     like_value,
     query_to_df,
 )
+from app.services.ssai_analysis_profile_service import (
+    normalize_business_code,
+    normalize_business_code_pair,
+)
 
 TABLE = "analytics_sales_trend"
 log = logging.getLogger("ssai.sims.analytics_sales_trend")
@@ -461,7 +465,7 @@ def _clean_list_param(value: Any) -> list[str]:
         raw_values = list(value)
     else:
         return []
-    return [str(v).strip() for v in raw_values if str(v).strip()]
+    return [normalize_business_code(v) for v in raw_values if normalize_business_code(v)]
 
 
 def _add_in_filter(
@@ -495,9 +499,10 @@ def _add_dashboard_code_pair_filter(
     """Bind Dashboard Gcode:Tcode selections without SQL string values."""
     pairs = []
     for value in _clean_list_param(params.get(key)):
-        gcode, sep, tcode = value.partition(":")
-        if sep and gcode.strip() and tcode.strip():
-            pairs.append((gcode.strip(), tcode.strip()))
+        pair = normalize_business_code_pair(value)
+        gcode, sep, tcode = pair.partition(":")
+        if sep:
+            pairs.append((gcode, tcode))
     if not pairs:
         return False
     checks: list[str] = []
@@ -869,6 +874,9 @@ _MONTHLY_FAST_MASTER_FILTER_KEYS = (
     "product_class",
     "product_class_nm",
     "product_class_list",
+    "dashboard_product_group_list",
+    "dashboard_product_di_list",
+    "dashboard_product_class_list",
     "buy_nm",
     "ven_nm",
     "real_ven_nm",

@@ -25,7 +25,14 @@ from app.services.dashboard_lite_facts import (
     normalize_dashboard_lite_params,
 )
 from app.services.dashboard_risk_detail_export import build_dashboard_risk_detail_excel_bytes
-from app.services.ssai_analysis_profile_service import PROFILE_PERMISSION, load_dashboard_profile, save_dashboard_profile
+from app.services.ssai_analysis_profile_service import (
+    COMPANY_DEFAULT_KEYS,
+    PROFILE_PERMISSION,
+    build_company_default_adapter,
+    mark_analysis_profile_saved,
+    load_dashboard_profile,
+    save_dashboard_profile,
+)
 from app.services import rddbc010_service as C01
 from app.db.mssql_client import query_to_df
 from app.sims.views.rddbc_io_shared import _load_stock_code_options
@@ -1286,6 +1293,18 @@ def _apply_saved_dashboard_profile_once() -> None:
     # Reset it before applying the shared profile for a fresh Dashboard entry.
     _clear_dashboard_manufacturer_state()
     profile = load_dashboard_profile(company_id=int(identity["company_id"]))
+    adapter = build_company_default_adapter(
+        profile,
+        supported_keys=COMPANY_DEFAULT_KEYS,
+    )
+    profile_values = dict(adapter.get("effective") or {})
+    log.info(
+        "[analysis_profile.adapter] company_id_present=True profile_found=%s target_context=dashboard "
+        "supported_key_count=%s applied_default_count=%s explicit_override_count=0 explicit_clear_count=0 "
+        "unsupported_key_count=%s cache_used=False reason=%s",
+        bool(adapter.get("profile_found")), len(COMPANY_DEFAULT_KEYS), adapter.get("applied_default_count", 0),
+        len(adapter.get("unsupported_default_keys") or []), restore_reason,
+    )
     restored_widget_count = 0
     skipped_existing_widget_count = 0
     if isinstance(profile, dict):
@@ -1293,15 +1312,15 @@ def _apply_saved_dashboard_profile_once() -> None:
             if widget_key in st.session_state:
                 skipped_existing_widget_count += 1
                 continue
-            if source_key in profile:
-                st.session_state[widget_key] = _dashboard_profile_widget_value(source_key, profile[source_key])
+            if source_key in profile_values:
+                st.session_state[widget_key] = _dashboard_profile_widget_value(source_key, profile_values[source_key])
                 restored_widget_count += 1
-        io_values = _clean_list(profile.get("io_gu_list"))
+        io_values = _clean_list(profile_values.get("io_gu_list"))
         log.info(
             "[dashboard.profile_restore] company_id=%s reason=%s profile_found=True "
             "condition_keys=%s io_gu_count=%s io_gu_sample=%s restored_widget_count=%s "
             "skipped_existing_widget_count=%s",
-            identity["company_id"], restore_reason, ",".join(sorted(profile.keys())), len(io_values), ",".join(io_values[:3]),
+            identity["company_id"], restore_reason, ",".join(sorted(profile_values.keys())), len(io_values), ",".join(io_values[:3]),
             restored_widget_count, skipped_existing_widget_count,
         )
     else:
@@ -1978,6 +1997,7 @@ def render_dashboard_lite() -> dict[str, Any]:
         else:
             try:
                 action = save_dashboard_profile(company_id=int(identity["company_id"]), params=params, actor_user_id=int(identity["user_id"]))
+                mark_analysis_profile_saved(st.session_state, company_id=identity["company_id"])
                 st.success("조회조건을 저장했습니다." if action else "조회조건을 저장했습니다.")
             except Exception as exc:
                 log.warning("[dashboard.profile_save] user_id=%s company_id=%s saved=False error_type=%s", identity.get("user_id"), identity.get("company_id"), type(exc).__name__)

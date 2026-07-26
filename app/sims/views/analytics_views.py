@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 import datetime as dt
 import logging
 import os
@@ -36,6 +36,14 @@ from app.services.analytics_customer_sales_forecast_service import (
 )
 from app.services.analytics_supplier_stock_shortage_service import (
     get_supplier_stock_shortage_result,
+)
+from app.services.ssai_analysis_profile_service import (
+    build_company_default_adapter,
+    get_analysis_profile_generation,
+    invalidate_analysis_profile_cache,
+    load_dashboard_profile,
+    normalize_business_code,
+    normalize_analytics_multi_code_filter,
 )
 
 log = logging.getLogger("ssai")
@@ -166,6 +174,291 @@ def _ns() -> str:
     return str(st.session_state.get("__sims_widget_ns", "0"))
 
 
+_ANALYTICS_DEFAULT_KEYS = {
+    "sales_trend": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "sales_forecast": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "manufacturer_sales_trend": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "manufacturer_sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list"},
+    "stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
+    "supplier_stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
+}
+
+_ANALYTICS_DEFAULT_OPTION_GCODES = {
+    action_key: {
+        "stock_cd_list": "0018",
+        "product_di_list": "0004",
+        "product_class_list": "0031",
+    }
+    for action_key in _ANALYTICS_DEFAULT_KEYS
+}
+
+# Keep the action-level contract in one place.  The registry regression reads
+# this mapping rather than assuming similarly named views share a service.
+KPI_DEFAULT_ACTION_SPECS = {
+    "품목별 매출 추세 분석": {
+        "adapter_key": "sales_trend",
+        "view": "render_sales_trend_analysis",
+        "service": "get_sales_trend_result",
+    },
+    "품목별 매출 추세 요약표": {
+        "adapter_key": "sales_trend_summary",
+        "view": "render_sales_trend_summary_analysis",
+        "service": "get_sales_trend_summary_result",
+    },
+    "품목별 매출 예상": {
+        "adapter_key": "sales_forecast",
+        "view": "render_sales_forecast_analysis",
+        "service": "get_sales_forecast_result",
+    },
+    "제약사별 매출 추세 분석": {
+        "adapter_key": "manufacturer_sales_trend",
+        "view": "render_manufacturer_sales_trend_analysis",
+        "service": "get_manufacturer_sales_trend_result",
+    },
+    "제약사별 매출 추세 분석 요약표": {
+        "adapter_key": "manufacturer_sales_trend_summary",
+        "view": "render_manufacturer_sales_trend_summary_analysis",
+        "service": "get_manufacturer_sales_trend_summary_result",
+    },
+    "품목별 재고부족현황": {
+        "adapter_key": "stock_shortage",
+        "view": "render_stock_shortage_analysis",
+        "service": "get_stock_shortage_result",
+    },
+    "매입처별 재고부족 현황": {
+        "adapter_key": "supplier_stock_shortage",
+        "view": "render_supplier_stock_shortage_analysis",
+        "service": "get_supplier_stock_shortage_result",
+    },
+}
+
+
+def _analytics_company_id() -> str:
+    try:
+        from app.ui.ssai_login import get_selected_company
+
+        return str((get_selected_company() or {}).get("company_id") or "").strip()
+    except Exception:
+        return ""
+
+
+def _analytics_default_codes(values: Any) -> list[str]:
+    """Convert profile pairs only while seeding legacy KPI widget options."""
+    out = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        out.append(text.rsplit(":", 1)[-1])
+    return list(dict.fromkeys(out))
+
+
+def _analytics_normalized_selection(values: Any) -> list[str]:
+    """Compare multi-select codes independently of UI order or duplicates."""
+    return sorted({str(value or "").strip() for value in values or [] if str(value or "").strip()})
+
+
+def _analytics_default_pair_key(widget_key: str) -> str:
+    return f"__analytics_dashboard_default_pairs::{widget_key}"
+
+
+def _attach_analytics_default_code_pairs(
+    params: Dict[str, Any],
+    *,
+    action_key: str,
+    ns: str,
+) -> Dict[str, Any]:
+    """Keep exact Gcode:Tcode pairs for service filters after UI conversion.
+
+    Existing KPI widgets expose Tcode options.  A company Default can be more
+    precise, so retain it in the established ``dashboard_*`` filter fields
+    only while the user has not changed the corresponding widget selection.
+    """
+    out = dict(params or {})
+    if action_key not in _ANALYTICS_DEFAULT_KEYS:
+        return out
+    for profile_key, target_key in (
+        ("product_di_list", "dashboard_product_di_list"),
+        ("product_class_list", "dashboard_product_class_list"),
+    ):
+        widget_key = f"__analytics_{action_key}_{profile_key.replace('_list', '')}__{ns}"
+        pairs = st.session_state.get(_analytics_default_pair_key(widget_key))
+        selected = _analytics_normalized_selection(out.get(profile_key))
+        if isinstance(pairs, list) and selected == _analytics_normalized_selection(_analytics_default_codes(pairs)):
+            out[target_key] = list(pairs)
+        elif profile_key == "product_class_list" and selected:
+            # KPI product-class widgets expose the 0031 Tax code universe.
+            # Legacy product_class* fields still mean 0028 Physic_Gu, so a
+            # live widget change must retain its own 0031 pairs as well.
+            out[target_key] = [f"0031:{code}" for code in selected]
+    return out
+
+
+def _normalize_analytics_multi_code_params(
+    params: Dict[str, Any],
+    *,
+    action_key: str,
+    sources: Mapping[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Use the KPI option universe to turn a full selection into no filter."""
+    out = dict(params or {})
+    option_gcodes = _ANALYTICS_DEFAULT_OPTION_GCODES.get(action_key)
+    if not option_gcodes:
+        return out
+    for field, gcode in option_gcodes.items():
+        if field not in out:
+            continue
+        pair_key = f"dashboard_{field}"
+        pair_present = pair_key in out
+        normalized = normalize_analytics_multi_code_filter(
+            out.get(field), get_analytics_code_option_codes(gcode), out.get(pair_key), gcode
+        )
+        effective_codes = list(normalized["effective_codes"])
+        out[field] = effective_codes
+        if field == "stock_cd_list":
+            out["stock_cds"] = list(effective_codes)
+            out["stock_cd"] = effective_codes[0] if len(effective_codes) == 1 else ""
+        else:
+            if pair_present:
+                out[pair_key] = list(normalized["effective_pairs"])
+            if field == "product_class_list" and normalized.get("pair_gcode_matches"):
+                # 0031 is Rd04_Physic_Tax.  Do not also reuse its Tcodes in
+                # the legacy 0028/Rd04_Physic_Gu product_class contract.
+                out[field] = []
+                out["product_class"] = ""
+                out["product_class_nm"] = ""
+                out["product_class_nm_list"] = []
+            if normalized["is_full_selection"]:
+                legacy_key = field.replace("_list", "")
+                out[legacy_key] = ""
+                out[f"{legacy_key}_nm"] = ""
+                out[f"{legacy_key}_nm_list"] = []
+        log.info(
+            "[analysis_profile.filter_normalize] action=%s field=%s selected_count=%s available_count=%s "
+            "full_selection=%s effective_count=%s source=%s",
+            action_key, field, normalized["selected_count"], normalized["available_count"],
+            normalized["is_full_selection"], len(effective_codes),
+            str((sources or {}).get(field) or "panel"),
+        )
+    return out
+
+
+def _prepare_analytics_company_defaults(action_key: str, ns: str) -> dict[str, Any]:
+    """Seed only missing KPI widgets from the current company's Default.
+
+    KPI forms intentionally do not expose every Dashboard condition.  Applying
+    only the action's declared keys prevents silent conversion of multi-code
+    Defaults into legacy single-select controls.
+    """
+    supported = _ANALYTICS_DEFAULT_KEYS.get(action_key, set())
+    company_id = _analytics_company_id()
+    if not company_id or not supported:
+        return {
+            "effective": {}, "sources": {}, "unsupported_default_keys": [],
+            "default_supported_keys": [], "restored_keys": [],
+            "preserved_keys": [], "profile_found": False, "reason": "no_company",
+        }
+
+    widget_keys = {
+        "stock_mode": f"__analytics_{action_key}_stock_mode__{ns}",
+        "stock_cd_list": f"__analytics_{action_key}_stock__{ns}",
+        "product_di_list": f"__analytics_{action_key}_product_di__{ns}",
+        "product_class_list": f"__analytics_{action_key}_product_class__{ns}",
+    }
+    previous_company_key = f"__analytics_profile_loaded_company::{action_key}::{ns}"
+    applied_generation_key = f"__analytics_profile_applied_generation::{company_id}::{action_key}::{ns}"
+    previous_company = str(st.session_state.get(previous_company_key) or "")
+    current_generation = get_analysis_profile_generation(st.session_state, company_id)
+    applied_generation = st.session_state.get(applied_generation_key)
+    force_refresh = applied_generation is not None and applied_generation != current_generation
+    if previous_company and previous_company != company_id:
+        invalidate_analysis_profile_cache(st.session_state, company_id=previous_company)
+        invalidate_analysis_profile_cache(st.session_state, company_id=company_id)
+        force_refresh = True
+    if force_refresh:
+        for key in widget_keys.values():
+            st.session_state.pop(key, None)
+            st.session_state.pop(f"__analytics_dashboard_prefill_codes::{key}", None)
+            st.session_state.pop(_analytics_default_pair_key(key), None)
+        st.session_state.pop(applied_generation_key, None)
+
+    cache_key = "__analysis_profile_company_cache"
+    cache = st.session_state.setdefault(cache_key, {})
+    profile = cache.get(company_id) if isinstance(cache, dict) else None
+    cache_used = isinstance(profile, dict)
+    if not cache_used:
+        profile = load_dashboard_profile(company_id=int(company_id))
+        if isinstance(cache, dict):
+            cache[company_id] = dict(profile or {})
+
+    adapter = build_company_default_adapter(profile, supported_keys=supported)
+
+    restored_keys: list[str] = []
+    preserved_keys: list[str] = []
+    for profile_key, value in dict(adapter.get("effective") or {}).items():
+        widget_key = widget_keys.get(profile_key)
+        if not widget_key:
+            continue
+        if widget_key in st.session_state:
+            preserved_keys.append(profile_key)
+            continue
+        if profile_key == "stock_mode":
+            st.session_state[widget_key] = "실재고" if str(value) == "real" else "장부재고"
+        else:
+            st.session_state[f"__analytics_dashboard_prefill_codes::{widget_key}"] = _analytics_default_codes(value)
+            if profile_key in {"product_di_list", "product_class_list"}:
+                st.session_state[_analytics_default_pair_key(widget_key)] = list(value)
+        restored_keys.append(profile_key)
+
+    st.session_state[previous_company_key] = company_id
+    st.session_state[applied_generation_key] = current_generation
+    reason = "company_change" if previous_company and previous_company != company_id else (
+        "profile_generation_changed" if force_refresh else (
+        "preserve_live_state" if preserved_keys else "initial_entry"
+        )
+    )
+    default_supported_keys = sorted(
+        key for key, source in dict(adapter.get("sources") or {}).items()
+        if source == "default" and key in supported
+    )
+    adapter.update({
+        "default_supported_keys": default_supported_keys,
+        "restored_keys": restored_keys,
+        "preserved_keys": preserved_keys,
+        "reason": reason,
+    })
+    log.info(
+        "[analysis_profile.adapter] company_id_present=True profile_found=%s target_context=kpi "
+        "supported_key_count=%s applied_default_count=%s explicit_override_count=0 explicit_clear_count=0 "
+        "unsupported_key_count=%s cache_used=%s reason=%s",
+        bool(adapter.get("profile_found")), len(supported), len(restored_keys),
+        len(adapter.get("unsupported_default_keys") or []), cache_used,
+        reason,
+    )
+    log.info(
+        "[KPI profile 적용] target_action=%s applied_default_count=%s preserved_widget_count=%s explicit_widget_count=0",
+        action_key, len(restored_keys), len(preserved_keys),
+    )
+    return adapter
+
+
+def _render_analytics_default_caption(adapter: Mapping[str, Any] | None) -> None:
+    """Show only supported company Default inputs as an initial-value hint."""
+    if not isinstance(adapter, Mapping) or not adapter.get("profile_found"):
+        return
+    labels = {
+        "stock_mode": "재고기준",
+        "stock_cd_list": "재고위치",
+        "product_di_list": "제품구분",
+        "product_class_list": "제품분류",
+    }
+    applied = set(adapter.get("default_supported_keys") or [])
+    names = [labels[key] for key in ("stock_mode", "stock_cd_list", "product_di_list", "product_class_list") if key in applied]
+    if names:
+        st.caption(f"회사 Default 초기값: {' · '.join(names)} / 현재 화면에서 조건을 변경할 수 있습니다.")
+
+
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -223,7 +516,7 @@ def _load_code_options(gcode: str) -> list[dict[str, str]]:
 
     if df is not None and not df.empty:
         for _, r in df.iterrows():
-            code = str(r.get("code") or "").strip()
+            code = normalize_business_code(r.get("code"))
             name = str(r.get("name") or "").strip()
             if not code and not name:
                 continue
@@ -231,6 +524,15 @@ def _load_code_options(gcode: str) -> list[dict[str, str]]:
             opts.append({"code": code, "name": name, "label": label})
 
     return opts
+
+
+def get_analytics_code_option_codes(gcode: str) -> list[str]:
+    """Return the existing KPI option universe without a new SQL shape."""
+    return [
+        normalize_business_code(option.get("code"))
+        for option in _load_code_options(gcode)
+        if normalize_business_code(option.get("code"))
+    ]
 
 # Rddbc010에서 gcode에 해당하는 코드 옵션을 selectbox로 보여주고 선택된 옵션의 code/name/label을 반환하는 함수입니다.
 # 예를 들어 gcode가 "SOME_CODE"라면 Rddbc010에서 Rd01_Gcode가 "SOME_CODE"인 레코드들을 불러와서 selectbox로 보여주고, 사용자가 선택한 옵션의 code/name/label을 딕셔너리로 반환합니다. 선택된 옵션이 없으면 {"code": "", "name": "", "label": "전체"}를 반환합니다.
@@ -254,7 +556,7 @@ def _select_code_option(label: str, gcode: str, key: str) -> dict[str, str]:
 
 def _select_code_options(label: str, gcode: str, key: str) -> list[dict[str, str]]:
     opts = _load_code_options(gcode)
-    selectable = [x for x in opts if str(x.get("code") or "").strip()]
+    selectable = [x for x in opts if normalize_business_code(x.get("code"))]
     _apply_dashboard_code_prefill(key, selectable, multiple=True)
     labels = [x["label"] for x in selectable]
 
@@ -265,7 +567,7 @@ def _select_code_options(label: str, gcode: str, key: str) -> list[dict[str, str
 
 
 def _selected_codes(options: list[dict[str, str]]) -> list[str]:
-    return [str(x.get("code") or "").strip() for x in options if str(x.get("code") or "").strip()]
+    return [normalize_business_code(x.get("code")) for x in options if normalize_business_code(x.get("code"))]
 
 
 def _selected_names(options: list[dict[str, str]]) -> list[str]:
@@ -1068,6 +1370,8 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
     st.caption("Rddbc120 출고명세 기준으로 월별 품목 매출 추세를 분석합니다.")
 
     ns = _ns()
+    default_adapter = _prepare_analytics_company_defaults("sales_trend", ns)
+    _render_analytics_default_caption(default_adapter)
 
     with st.form(
         key=f"__analytics_sales_trend_form__{ns}",
@@ -1145,7 +1449,7 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
         with c9:
             product_class_opts = _select_code_options(
                 "제품분류명",
-                "0028",
+                "0031",
                 key=f"__analytics_sales_trend_product_class__{ns}",
             )
         with c10:
@@ -1256,6 +1560,8 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
 
         "top": int(top),
     }
+    params = _attach_analytics_default_code_pairs(params, action_key="sales_trend", ns=ns)
+    params = _normalize_analytics_multi_code_params(params, action_key="sales_trend")
     try:
 
         result = get_sales_trend_result(params)
@@ -1328,6 +1634,8 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
     st.caption("품목별 매출 추세 분석 결과를 제품 1줄 단위로 요약합니다.")
 
     ns = _ns()
+    default_adapter = _prepare_analytics_company_defaults("sales_trend_summary", ns)
+    _render_analytics_default_caption(default_adapter)
 
     with st.form(
         key=f"__analytics_sales_trend_summary_form__{ns}",
@@ -1408,7 +1716,7 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
         with c10:
             product_class_opts = _select_code_options(
                 "제품분류명",
-                "0028",
+                "0031",
                 key=f"__analytics_sales_trend_summary_product_class__{ns}",
             )
         with c11:
@@ -1518,6 +1826,8 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
         "trend_judge": "" if trend_judge == "전체" else trend_judge,        
         "top": int(top),
     }
+    params = _attach_analytics_default_code_pairs(params, action_key="sales_trend_summary", ns=ns)
+    params = _normalize_analytics_multi_code_params(params, action_key="sales_trend_summary")
     try:
         result = get_sales_trend_summary_result(params)
 
@@ -1586,6 +1896,8 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
     st.caption("품목별 매출 추세 요약표를 기반으로 다음월/3개월/6개월 예상 매출을 계산합니다.")
 
     ns = _ns()
+    default_adapter = _prepare_analytics_company_defaults("sales_forecast", ns)
+    _render_analytics_default_caption(default_adapter)
 
     with st.form(
         key=f"__analytics_sales_forecast_form__{ns}",
@@ -1663,7 +1975,7 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
         with c10:
             product_class_opts = _select_code_options(
                 "제품분류명",
-                "0028",
+                "0031",
                 key=f"__analytics_sales_forecast_product_class__{ns}",
             )
         with c11:
@@ -1769,6 +2081,8 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
         "top": int(top),
     }
 
+    params = _attach_analytics_default_code_pairs(params, action_key="sales_forecast", ns=ns)
+    params = _normalize_analytics_multi_code_params(params, action_key="sales_forecast")
     try:
         result = get_sales_forecast_result(params)
 
@@ -1936,7 +2250,8 @@ def _render_customer_sales_forecast_form(action_key: str) -> tuple[bool, Dict[st
         "forecast_grade": "" if forecast_grade == "전체" else forecast_grade,
         "top": int(top),
     }
-    return submitted, params
+    params = _attach_analytics_default_code_pairs(params, action_key=action_key, ns=ns)
+    return submitted, _normalize_analytics_multi_code_params(params, action_key=action_key)
 
 
 def _finish_customer_group_forecast_result(
@@ -2073,6 +2388,8 @@ def render_region_sales_forecast_analysis() -> Dict[str, Any]:
 
 def _render_manufacturer_sales_trend_form(action_key: str) -> tuple[bool, Dict[str, Any]]:
     ns = _ns()
+    default_adapter = _prepare_analytics_company_defaults(action_key, ns)
+    _render_analytics_default_caption(default_adapter)
 
     with st.form(
         key=f"__analytics_{action_key}_form__{ns}",
@@ -2144,7 +2461,7 @@ def _render_manufacturer_sales_trend_form(action_key: str) -> tuple[bool, Dict[s
         with c10:
             product_class_opts = _select_code_options(
                 "제품분류명",
-                "0028",
+                "0031",
                 key=f"__analytics_{action_key}_product_class__{ns}",
             )
         with c11:
@@ -2217,6 +2534,15 @@ def _render_manufacturer_sales_trend_form(action_key: str) -> tuple[bool, Dict[s
         "trend_judge": "" if trend_judge == "전체" else trend_judge,
         "top": int(top),
     }
+    params = _attach_analytics_default_code_pairs(
+        params,
+        action_key=action_key,
+        ns=ns,
+    )
+    params = _normalize_analytics_multi_code_params(
+        params,
+        action_key=action_key,
+    )
     return submitted, params
 
 
@@ -2343,6 +2669,8 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
     st.caption("품목별 출고 추세와 현재재고를 비교하여 부족 가능 품목을 계산합니다.")
 
     ns = _ns()
+    default_adapter = _prepare_analytics_company_defaults("stock_shortage", ns)
+    _render_analytics_default_caption(default_adapter)
     dashboard_handoff = _dashboard_stock_shortage_handoff(ns)
 
     with st.form(
@@ -2383,12 +2711,11 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
 
         c_stock, c6, c7, c8 = st.columns(4)
         with c_stock:
-            stock_label = st.selectbox(
-                "재고기준",
-                ["장부재고", "실재고"],
-                index=0,
-                key=f"__analytics_stock_shortage_stock_mode__{ns}",
-            )
+            stock_mode_key = f"__analytics_stock_shortage_stock_mode__{ns}"
+            if stock_mode_key in st.session_state:
+                stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], key=stock_mode_key)
+            else:
+                stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], index=0, key=stock_mode_key)
         with c6:
             physic_cd = st.text_input("제품코드", value="", key=f"__analytics_stock_shortage_physic_cd__{ns}")
         with c7:
@@ -2412,7 +2739,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         with c11:
             product_class_opts = _select_code_options(
                 "제품분류명",
-                "0028",
+                "0031",
                 key=f"__analytics_stock_shortage_product_class__{ns}",
             )
         with c12:
@@ -2490,6 +2817,8 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         "top": int(top),
     }
     params = _apply_dashboard_stock_shortage_params(params, dashboard_handoff)
+    params = _attach_analytics_default_code_pairs(params, action_key="stock_shortage", ns=ns)
+    params = _normalize_analytics_multi_code_params(params, action_key="stock_shortage")
 
     try:
         result = get_stock_shortage_result(params)
@@ -2547,6 +2876,8 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
     st.caption("품목별 공식 부족금액을 매입처별 매입/재고 비중으로 배분하여 매입처 단위 부족 현황을 계산합니다.")
 
     ns = _ns()
+    default_adapter = _prepare_analytics_company_defaults("supplier_stock_shortage", ns)
+    _render_analytics_default_caption(default_adapter)
 
     with st.form(
         key=f"__analytics_supplier_stock_shortage_form__{ns}",
@@ -2586,12 +2917,11 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
 
         c_stock, c6, c7, c8 = st.columns(4)
         with c_stock:
-            stock_label = st.selectbox(
-                "재고기준",
-                ["장부재고", "실재고"],
-                index=0,
-                key=f"__analytics_supplier_stock_shortage_stock_mode__{ns}",
-            )
+            stock_mode_key = f"__analytics_supplier_stock_shortage_stock_mode__{ns}"
+            if stock_mode_key in st.session_state:
+                stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], key=stock_mode_key)
+            else:
+                stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], index=0, key=stock_mode_key)
         with c6:
             physic_cd = st.text_input("제품코드", value="", key=f"__analytics_supplier_stock_shortage_physic_cd__{ns}")
         with c7:
@@ -2615,7 +2945,7 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
         with c11:
             product_class_opts = _select_code_options(
                 "제품분류명",
-                "0028",
+                "0031",
                 key=f"__analytics_supplier_stock_shortage_product_class__{ns}",
             )
         with c12:
@@ -2689,6 +3019,8 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
         "top": int(top),
     }
 
+    params = _attach_analytics_default_code_pairs(params, action_key="supplier_stock_shortage", ns=ns)
+    params = _normalize_analytics_multi_code_params(params, action_key="supplier_stock_shortage")
     try:
         result = get_supplier_stock_shortage_result(params)
 

@@ -7754,6 +7754,46 @@ def run_basic_checks() -> list[CheckResult]:
             )
             if "Rd04_Physic_Tax_Gcode" not in where_sql or "Rd03_Ven_Group_Gcode" not in where_sql:
                 condition_errors.append(f"bound_filter_missing={where_sql!r}")
+            class_pair_params = {
+                "month_from": "202601",
+                "month_to": "202606",
+                "product_class_list": [],
+                "dashboard_product_class_list": ["0031:01", "0031:03"],
+            }
+            detail_class_params = dict(class_pair_params)
+            detail_class_sql = dashboard_sales_mod._build_filters(detail_class_params)
+            monthly_class_params = dict(class_pair_params)
+            monthly_class_sql = dashboard_sales_mod._build_monthly_filters(
+                monthly_class_params,
+                dashboard_sales_mod._monthly_spec("monthly_book"),
+            )
+            if (
+                "Rd04_Physic_Tax_Gcode" not in detail_class_sql
+                or "Rd04_Physic_Tax_Gcode" not in monthly_class_sql
+                or "product_class_in_0" in detail_class_params
+                or "product_class_monthly_in_0" in monthly_class_params
+                or dashboard_sales_mod._monthly_fast_path_reason(class_pair_params, "monthly_book") != "master_code_filter"
+            ):
+                condition_errors.append(
+                    f"0031_tax_contract={detail_class_sql!r}/{monthly_class_sql!r}/"
+                    f"{detail_class_params!r}/{monthly_class_params!r}"
+                )
+            legacy_class_params = {
+                "month_from": "202601",
+                "month_to": "202606",
+                "product_class_list": ["01"],
+            }
+            legacy_class_sql = dashboard_sales_mod._build_filters(legacy_class_params)
+            if (
+                "product_class_in_0" not in legacy_class_params
+                or "dashboard_product_class_list_g_0" in legacy_class_params
+            ):
+                condition_errors.append(f"0028_legacy_contract={legacy_class_sql!r}/{legacy_class_params!r}")
+            empty_class_sql = dashboard_sales_mod._build_filters(
+                {"month_from": "202601", "month_to": "202606", "product_class_list": [], "dashboard_product_class_list": []}
+            )
+            if "dashboard_product_class_list_g_0" in empty_class_sql or "product_class_in_0" in empty_class_sql:
+                condition_errors.append(f"empty_0031_contract={empty_class_sql!r}")
             try:
                 dash_mod.normalize_dashboard_lite_params({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "readiness_warning_pct": 101}, today=date(2026, 7, 20))
                 condition_errors.append("invalid_readiness_not_blocked")
@@ -7768,7 +7808,11 @@ def run_basic_checks() -> list[CheckResult]:
 
         try:
             import app.services.ssai_analysis_profile_service as profile_service_mod
-            from app.services.ssai_analysis_profile_service import profile_conditions_for_storage
+            from app.services.ssai_analysis_profile_service import (
+                build_company_default_adapter,
+                normalize_company_default_conditions,
+                profile_conditions_for_storage,
+            )
 
             stored = profile_conditions_for_storage(
                 {
@@ -7788,6 +7832,45 @@ def run_basic_checks() -> list[CheckResult]:
                 or "month_from" in stored
             ):
                 raise AssertionError(f"profile_storage_scope={stored!r}")
+            default_fixture = {
+                "stock_mode": "real",
+                "stock_cd_list": ["00247", "00001", "00001"],
+                "product_di_list": ["0004:2", "0004:1"],
+                "product_class_list": ["0031:01"],
+                "io_gu_list": ["501", "001"],
+                "readiness_warning_pct": 98,
+                "amount_display_unit": "thousand",
+                "month_from": "202601",
+                "manufacturer_test_codes": ["not-persistent"],
+            }
+            normalized_default = normalize_company_default_conditions(default_fixture)
+            if (
+                normalized_default.get("stock_cd_list") != ["00001", "00247"]
+                or "month_from" in normalized_default
+                or "manufacturer_test_codes" in normalized_default
+                or default_fixture["stock_cd_list"] != ["00247", "00001", "00001"]
+            ):
+                raise AssertionError(f"profile_default_normalization={normalized_default!r}")
+            adapter = build_company_default_adapter(
+                default_fixture,
+                supported_keys={"stock_mode", "stock_cd_list", "product_di_list"},
+                explicit={"stock_mode": "book", "stock_cd_list": ["00247"]},
+                explicit_keys={"stock_mode", "stock_cd_list"},
+            )
+            if (
+                adapter["effective"].get("stock_mode") != "book"
+                or adapter["effective"].get("stock_cd_list") != ["00247"]
+                or adapter["sources"].get("stock_mode") != "explicit"
+                or "product_class_list" not in adapter["unsupported_default_keys"]
+            ):
+                raise AssertionError(f"profile_adapter_override={adapter!r}")
+            clear_adapter = build_company_default_adapter(
+                default_fixture,
+                supported_keys={"stock_cd_list"},
+                clear_keys={"stock_cd_list"},
+            )
+            if clear_adapter["effective"].get("stock_cd_list") != [] or clear_adapter["sources"].get("stock_cd_list") != "explicit_clear":
+                raise AssertionError(f"profile_adapter_clear={clear_adapter!r}")
             import app.sims.views.dashboard_lite as profile_view_mod
             restored_io = profile_view_mod._dashboard_profile_widget_value("io_gu_list", ["001", "002", "051"])
             if restored_io != ["0012:001", "0012:002", "0012:051"]:
@@ -7839,6 +7922,858 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_ok("Dashboard Lite saved profile scope", "same-company users restore one company profile; actor user is audit-only and migration targets company uniqueness"))
         except Exception as e:
             results.append(_fail("Dashboard Lite saved profile scope", f"{type(e).__name__}: {e}"))
+
+        try:
+            import app.services.ssai_analysis_profile_service as company_profile_mod
+            import app.services.analytics_sales_trend_service as analytics_service_mod
+            import app.sims.nlq.nlq_router as nlq_router_mod
+            import app.sims.views.analytics_views as analytics_view_mod
+            import app.ui.ssai_login as login_mod
+
+            full_pair = company_profile_mod.normalize_analytics_multi_code_filter(
+                ["01", "02"], ["01", "02"], ["0031:01", "0031:02"], "0031"
+            )
+            wrong_group_pair = company_profile_mod.normalize_analytics_multi_code_filter(
+                ["01", "02"], ["01", "02"], ["0031:01", "0031:02"], "0028"
+            )
+            partial_pair = company_profile_mod.normalize_analytics_multi_code_filter(
+                ["01"], ["01", "02"], ["0031:01"], "0031"
+            )
+            empty_universe = company_profile_mod.normalize_analytics_multi_code_filter(
+                ["01"], [], ["0031:01"], "0031"
+            )
+            if (
+                not full_pair["is_full_selection"]
+                or wrong_group_pair["is_full_selection"]
+                or partial_pair["effective_pairs"] != ["0031:01"]
+                or empty_universe["is_full_selection"]
+            ):
+                raise AssertionError(
+                    f"pair_aware_full_selection={full_pair!r}/{wrong_group_pair!r}/"
+                    f"{partial_pair!r}/{empty_universe!r}"
+                )
+
+            string_profile = company_profile_mod.profile_conditions_for_storage({
+                "stock_cd_list": ["00001", "01", "1", 1, None],
+                "product_class_list": ["0031:01", "0031:1", "31:01", 31],
+            })
+            normalized_codes = company_profile_mod.normalize_analytics_multi_code_filter(
+                ["01", "1"], ["01", "1"], ["0031:01", "0031:1"], "0031"
+            )
+            if (
+                string_profile.get("stock_cd_list") != ["00001", "01", "1"]
+                or string_profile.get("product_class_list") != ["0031:01", "0031:1", "31:01"]
+                or normalized_codes.get("effective_pairs") != []
+                or company_profile_mod.normalize_business_code(1) != ""
+                or company_profile_mod.normalize_business_code_pair("0031:01") != "0031:01"
+            ):
+                raise AssertionError(f"business_code_string_contract={string_profile!r}/{normalized_codes!r}")
+
+            profile_by_company = {
+                "41": {
+                    "stock_mode": "real",
+                    "stock_cd_list": ["00247", "00001"],
+                    "product_di_list": ["0004:2", "0004:1"],
+                    "product_class_list": ["0031:01"],
+                    "risk_analysis_days": 90,
+                    "manufacturer_test_codes": ["must-not-apply"],
+                },
+                "42": {
+                    "stock_mode": "real",
+                    "stock_cd_list": ["00999"],
+                    "product_di_list": ["0004:7"],
+                },
+            }
+            current_company = {"id": "41"}
+            old_profile_loader = company_profile_mod.load_dashboard_profile
+            old_analytics_loader = analytics_view_mod.load_dashboard_profile
+            old_analytics_st = analytics_view_mod.st
+            old_company_getter = login_mod.get_selected_company
+            old_nlq_option_codes = nlq_router_mod._analytics_nlq_option_codes
+            try:
+                company_profile_mod.load_dashboard_profile = lambda *, company_id: dict(profile_by_company.get(str(company_id)) or {})
+                analytics_view_mod.load_dashboard_profile = company_profile_mod.load_dashboard_profile
+                login_mod.get_selected_company = lambda: {"company_id": current_company["id"]}
+                nlq_router_mod._analytics_nlq_option_codes = lambda field: {
+                    "stock_cd_list": ["00001", "00247", "00901"],
+                    "product_di_list": ["1", "2", "3", "5", "6", "7", "J"],
+                    "product_class_list": ["01", "02", "03", "08"],
+                }.get(field, [])
+
+                nlq_state: dict[str, Any] = {}
+                nlq_default = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {"date_from": "20260101", "date_to": "20260131"},
+                    text="품목별 재고부족현황",
+                    action="품목별 재고부족현황",
+                    session_state=nlq_state,
+                    logger=logging.getLogger("ssai.regression"),
+                )
+                if (
+                    nlq_default.get("stock_mode") != "real"
+                    or nlq_default.get("stock_cds") != ["00001", "00247"]
+                    or nlq_default.get("product_di_list") != ["1", "2"]
+                    or nlq_default.get("dashboard_product_di_list") != ["0004:1", "0004:2"]
+                    or nlq_default.get("product_class_list") != []
+                    or nlq_default.get("dashboard_product_class_list") != ["0031:01"]
+                    or "manufacturer_test_codes" in nlq_default
+                    or nlq_default.get("date_from") != "20260101"
+                ):
+                    raise AssertionError(f"nlq_default_apply={nlq_default!r}")
+                nlq_explicit = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {"stock_mode": "book", "stock_cds": ["00247"], "stock_cd": "00247"},
+                    text="장부재고 00247 창고 품목별 재고부족현황",
+                    action="품목별 재고부족현황",
+                    session_state={},
+                    logger=logging.getLogger("ssai.regression"),
+                )
+                if nlq_explicit.get("stock_mode") != "book" or nlq_explicit.get("stock_cds") != ["00247"]:
+                    raise AssertionError(f"nlq_explicit_override={nlq_explicit!r}")
+                nlq_clear = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {}, text="전체 창고 품목별 재고부족현황", action="품목별 재고부족현황",
+                    session_state={}, logger=logging.getLogger("ssai.regression"),
+                )
+                if nlq_clear.get("stock_cds") != []:
+                    raise AssertionError(f"nlq_explicit_clear={nlq_clear!r}")
+
+                full_profile = dict(profile_by_company["41"])
+                full_profile["product_class_list"] = ["0031:01", "0031:02", "0031:03", "0031:08"]
+                old_company_profile = profile_by_company["41"]
+                profile_by_company["41"] = full_profile
+                nlq_full_class = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {}, text="full class default", action="품목별 매출 추세 요약표",
+                    session_state={}, logger=logging.getLogger("ssai.regression"),
+                )
+                profile_by_company["41"] = old_company_profile
+                full_sources = nlq_full_class.get("__analysis_default_sources") or {}
+                if (
+                    nlq_full_class.get("product_class_list") != []
+                    or nlq_full_class.get("dashboard_product_class_list") != []
+                    or any(nlq_full_class.get(key) not in ([], "") for key in ("product_class", "product_class_nm", "product_class_nm_list"))
+                    or "product_class_list" in full_sources
+                ):
+                    raise AssertionError(f"nlq_full_class_normalization={nlq_full_class!r}")
+                partial_profile = dict(profile_by_company["41"])
+                partial_profile["product_class_list"] = ["0031:01", "0031:03"]
+                profile_by_company["41"] = partial_profile
+                nlq_partial_class = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {}, text="partial class default", action="품목별 매출 추세 요약표",
+                    session_state={}, logger=logging.getLogger("ssai.regression"),
+                )
+                profile_by_company["41"] = old_company_profile
+                if (
+                    nlq_partial_class.get("product_class_list") != []
+                    or nlq_partial_class.get("dashboard_product_class_list") != ["0031:01", "0031:03"]
+                    or (nlq_partial_class.get("__analysis_default_sources") or {}).get("product_class_list") != "default"
+                ):
+                    raise AssertionError(f"nlq_partial_class_normalization={nlq_partial_class!r}")
+                nlq_product_clear = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {}, text="전체 제품구분 품목별 재고부족현황", action="품목별 재고부족현황",
+                    session_state={}, logger=logging.getLogger("ssai.regression"),
+                )
+                if (
+                    nlq_product_clear.get("product_di_list") != []
+                    or nlq_product_clear.get("dashboard_product_di_list") != []
+                    or (nlq_product_clear.get("__analysis_default_sources") or {}).get("product_di_list") != "explicit_clear"
+                ):
+                    raise AssertionError(f"nlq_product_explicit_clear={nlq_product_clear!r}")
+
+                class _ProfileStateStreamlit:
+                    def __init__(self):
+                        self.session_state = {"__sims_widget_ns": "profile-test"}
+
+                analytics_st = _ProfileStateStreamlit()
+                analytics_view_mod.st = analytics_st
+                analytics_view_mod._prepare_analytics_company_defaults("stock_shortage", "profile-test")
+                stock_key = "__analytics_stock_shortage_stock_mode__profile-test"
+                di_prefill = "__analytics_dashboard_prefill_codes::__analytics_stock_shortage_product_di__profile-test"
+                if analytics_st.session_state.get(stock_key) != "실재고" or analytics_st.session_state.get(di_prefill) != ["1", "2"]:
+                    raise AssertionError(f"kpi_default_initial={analytics_st.session_state!r}")
+                analytics_st.session_state[stock_key] = "장부재고"
+                analytics_view_mod._prepare_analytics_company_defaults("stock_shortage", "profile-test")
+                if analytics_st.session_state.get(stock_key) != "장부재고":
+                    raise AssertionError("kpi_live_value_overwritten")
+                current_company["id"] = "42"
+                analytics_view_mod._prepare_analytics_company_defaults("stock_shortage", "profile-test")
+                stock_prefill = "__analytics_dashboard_prefill_codes::__analytics_stock_shortage_stock__profile-test"
+                di_prefill = "__analytics_dashboard_prefill_codes::__analytics_stock_shortage_product_di__profile-test"
+                if (
+                    analytics_st.session_state.get(stock_key) != "실재고"
+                    or analytics_st.session_state.get(stock_prefill) != ["00999"]
+                    or analytics_st.session_state.get(di_prefill) != ["7"]
+                ):
+                    raise AssertionError(f"kpi_company_isolation={analytics_st.session_state!r}")
+
+                current_company["id"] = "41"
+                summary_ns = "summary-profile-test"
+                analytics_view_mod._prepare_analytics_company_defaults("sales_trend_summary", summary_ns)
+                summary_di_key = f"__analytics_sales_trend_summary_product_di__{summary_ns}"
+                analytics_view_mod._apply_dashboard_code_prefill(
+                    summary_di_key,
+                    [{"code": "1", "label": "1 - A"}, {"code": "2", "label": "2 - B"}],
+                    multiple=True,
+                )
+                if analytics_st.session_state.get(summary_di_key) != ["1 - A", "2 - B"]:
+                    raise AssertionError(f"summary_widget_prefill={analytics_st.session_state!r}")
+                summary_params = analytics_view_mod._attach_analytics_default_code_pairs(
+                    {"product_di_list": ["1", "2"], "product_class_list": ["01"], "stock_cd_list": ["00001", "00247"]},
+                    action_key="sales_trend_summary",
+                    ns=summary_ns,
+                )
+                if summary_params.get("dashboard_product_di_list") != ["0004:1", "0004:2"]:
+                    raise AssertionError(f"summary_pair_params={summary_params!r}")
+                summary_order_params = analytics_view_mod._attach_analytics_default_code_pairs(
+                    {"product_di_list": ["2", "1"], "product_class_list": ["01"]},
+                    action_key="sales_trend_summary",
+                    ns=summary_ns,
+                )
+                summary_changed_params = analytics_view_mod._attach_analytics_default_code_pairs(
+                    {"product_di_list": ["1", "3"], "product_class_list": ["01"]},
+                    action_key="sales_trend_summary",
+                    ns=summary_ns,
+                )
+                if (
+                    summary_order_params.get("dashboard_product_di_list") != ["0004:1", "0004:2"]
+                    or "dashboard_product_di_list" in summary_changed_params
+                ):
+                    raise AssertionError(f"summary_pair_order_independence={summary_order_params!r}/{summary_changed_params!r}")
+                captured_summary_params: dict[str, Any] = {}
+                old_summary_service = analytics_view_mod.get_sales_trend_summary_result
+                analytics_view_mod.get_sales_trend_summary_result = lambda params: captured_summary_params.update(dict(params)) or {"meta": {}}
+                try:
+                    analytics_view_mod.get_sales_trend_summary_result(summary_params)
+                finally:
+                    analytics_view_mod.get_sales_trend_summary_result = old_summary_service
+                if captured_summary_params.get("dashboard_product_di_list") != ["0004:1", "0004:2"]:
+                    raise AssertionError(f"summary_service_params={captured_summary_params!r}")
+
+                class _SummaryFormCtx:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *_args):
+                        return False
+
+                class _SummaryViewStreamlit:
+                    def __init__(self, state):
+                        self.session_state = state
+                        self.captions: list[str] = []
+                    def subheader(self, *_args, **_kwargs): pass
+                    def caption(self, text, *_args, **_kwargs): self.captions.append(str(text))
+                    def form(self, *_args, **_kwargs): return _SummaryFormCtx()
+                    def columns(self, count, **_kwargs):
+                        size = len(count) if isinstance(count, (list, tuple)) else int(count)
+                        return [_SummaryFormCtx() for _ in range(size)]
+                    def selectbox(self, _label, options, *, key=None, **_kwargs):
+                        return self.session_state.get(key, options[0] if options else "")
+                    def multiselect(self, _label, _options, *, key=None, **_kwargs):
+                        return self.session_state.get(key, [])
+                    def text_input(self, _label, value="", *, key=None, **_kwargs):
+                        return self.session_state.get(key, value)
+                    def date_input(self, _label, value, *, key=None, **_kwargs):
+                        return self.session_state.get(key, value)
+                    def form_submit_button(self, *_args, **_kwargs): return True
+
+                summary_view_state = {"__sims_widget_ns": "summary-view"}
+                summary_view_st = _SummaryViewStreamlit(summary_view_state)
+                old_view_st = analytics_view_mod.st
+                old_code_loader = analytics_view_mod._load_code_options
+                old_summary_service = analytics_view_mod.get_sales_trend_summary_result
+                summary_view_capture: dict[str, Any] = {}
+                try:
+                    analytics_view_mod.st = summary_view_st
+                    analytics_view_mod._load_code_options = lambda gcode: {
+                        "0004": [{"code": "1", "name": "A", "label": "1 - A"}, {"code": "2", "name": "B", "label": "2 - B"}],
+                        "0031": [{"code": "01", "name": "C", "label": "01 - C"}],
+                        "0018": [{"code": "00001", "name": "창고", "label": "00001 - 창고"}, {"code": "00247", "name": "창고2", "label": "00247 - 창고2"}],
+                    }.get(str(gcode), [])
+                    analytics_view_mod.get_sales_trend_summary_result = lambda params: summary_view_capture.update(dict(params)) or {"meta": {}}
+                    analytics_view_mod.render_sales_trend_summary_analysis()
+                finally:
+                    analytics_view_mod.st = old_view_st
+                    analytics_view_mod._load_code_options = old_code_loader
+                    analytics_view_mod.get_sales_trend_summary_result = old_summary_service
+                if (
+                    not any("회사 Default 초기값: 재고위치 · 제품구분 · 제품분류" in caption for caption in summary_view_st.captions)
+                    or summary_view_capture.get("stock_cd_list") != []
+                    or summary_view_capture.get("product_di_list") != []
+                    or summary_view_capture.get("dashboard_product_di_list") != []
+                    or summary_view_capture.get("product_class_list") != []
+                    or summary_view_capture.get("dashboard_product_class_list") != []
+                ):
+                    raise AssertionError(f"summary_view_default_path={summary_view_st.captions!r}/{summary_view_capture!r}")
+
+                manufacturer_options = {
+                    "0004": [
+                        {"code": code, "name": f"DI{code}", "label": f"{code} - DI{code}"}
+                        for code in ["1", "2", "3", "5", "6", "7", "J"]
+                    ],
+                    "0031": [
+                        {"code": code, "name": f"CLASS{code}", "label": f"{code} - CLASS{code}"}
+                        for code in ["01", "02", "03", "08"]
+                    ],
+                    "0018": [
+                        {"code": code, "name": f"STOCK{code}", "label": f"{code} - STOCK{code}"}
+                        for code in ["00001", "00247", "00901"]
+                    ],
+                }
+
+                def _capture_manufacturer_form(
+                    action_key: str,
+                    render_func,
+                    service_name: str,
+                    profile: dict[str, Any],
+                    state: dict[str, Any] | None = None,
+                ) -> dict[str, Any]:
+                    captured: dict[str, Any] = {}
+                    view_state = {"__sims_widget_ns": f"manufacturer-{action_key}"}
+                    view_state.update(state or {})
+                    view_st = _SummaryViewStreamlit(view_state)
+                    old_form_st = analytics_view_mod.st
+                    old_form_loader = analytics_view_mod._load_code_options
+                    old_form_service = getattr(analytics_view_mod, service_name)
+                    old_profile = profile_by_company["41"]
+                    try:
+                        profile_by_company["41"] = dict(profile)
+                        analytics_view_mod.st = view_st
+                        analytics_view_mod._load_code_options = lambda gcode: manufacturer_options.get(str(gcode), [])
+                        setattr(
+                            analytics_view_mod,
+                            service_name,
+                            lambda params: captured.update(dict(params)) or {"meta": {}},
+                        )
+                        render_func()
+                    finally:
+                        profile_by_company["41"] = old_profile
+                        analytics_view_mod.st = old_form_st
+                        analytics_view_mod._load_code_options = old_form_loader
+                        setattr(analytics_view_mod, service_name, old_form_service)
+                    return captured
+
+                manufacturer_full_profile = dict(profile_by_company["41"])
+                manufacturer_full_profile["product_class_list"] = [
+                    "0031:01", "0031:02", "0031:03", "0031:08"
+                ]
+                manufacturer_detail_full = _capture_manufacturer_form(
+                    "manufacturer_sales_trend",
+                    analytics_view_mod.render_manufacturer_sales_trend_analysis,
+                    "get_manufacturer_sales_trend_result",
+                    manufacturer_full_profile,
+                )
+                manufacturer_summary_full = _capture_manufacturer_form(
+                    "manufacturer_sales_trend_summary",
+                    analytics_view_mod.render_manufacturer_sales_trend_summary_analysis,
+                    "get_manufacturer_sales_trend_summary_result",
+                    manufacturer_full_profile,
+                )
+                for captured in (manufacturer_detail_full, manufacturer_summary_full):
+                    if (
+                        captured.get("product_class_list") != []
+                        or captured.get("dashboard_product_class_list") != []
+                        or captured.get("stock_cd_list") != ["00001", "00247"]
+                        or captured.get("dashboard_product_di_list") != ["0004:1", "0004:2"]
+                    ):
+                        raise AssertionError(f"manufacturer_full_class_service_params={captured!r}")
+
+                manufacturer_partial_profile = dict(profile_by_company["41"])
+                manufacturer_partial_profile["product_class_list"] = ["0031:01", "0031:03"]
+                manufacturer_partial = _capture_manufacturer_form(
+                    "manufacturer_sales_trend",
+                    analytics_view_mod.render_manufacturer_sales_trend_analysis,
+                    "get_manufacturer_sales_trend_result",
+                    manufacturer_partial_profile,
+                )
+                if (
+                    manufacturer_partial.get("product_class_list") != []
+                    or manufacturer_partial.get("dashboard_product_class_list") != ["0031:01", "0031:03"]
+                ):
+                    raise AssertionError(f"manufacturer_partial_class_service_params={manufacturer_partial!r}")
+
+                manufacturer_changed = _capture_manufacturer_form(
+                    "manufacturer_sales_trend_summary",
+                    analytics_view_mod.render_manufacturer_sales_trend_summary_analysis,
+                    "get_manufacturer_sales_trend_summary_result",
+                    manufacturer_partial_profile,
+                    {
+                        "__analytics_manufacturer_sales_trend_summary_product_class__manufacturer-manufacturer_sales_trend_summary": [
+                            "02 - CLASS02"
+                        ],
+                    },
+                )
+                if (
+                    manufacturer_changed.get("product_class_list") != []
+                    or manufacturer_changed.get("dashboard_product_class_list") != ["0031:02"]
+                ):
+                    raise AssertionError(f"manufacturer_user_class_override={manufacturer_changed!r}")
+
+                old_code_loader = analytics_view_mod._load_code_options
+                try:
+                    analytics_view_mod._load_code_options = lambda gcode: {
+                        "0004": [{"code": code} for code in ["1", "2", "3", "5", "6", "7", "J"]],
+                        "0031": [{"code": code} for code in ["01", "02", "03", "08"]],
+                        "0018": [{"code": code} for code in ["00001", "00247", "00901"]],
+                    }.get(str(gcode), [])
+                    panel_full = analytics_view_mod._normalize_analytics_multi_code_params(
+                        {
+                            "stock_cd_list": ["00001", "00247"],
+                            "product_di_list": ["1", "2"],
+                            "dashboard_product_di_list": ["0004:1", "0004:2"],
+                            "product_class_list": ["01", "02", "03", "08"],
+                            "dashboard_product_class_list": ["0031:01", "0031:02", "0031:03", "0031:08"],
+                        },
+                        action_key="sales_trend_summary",
+                    )
+                finally:
+                    analytics_view_mod._load_code_options = old_code_loader
+                if (
+                    panel_full.get("product_class_list") != []
+                    or panel_full.get("dashboard_product_class_list") != []
+                    or panel_full.get("stock_cd_list") != ["00001", "00247"]
+                    or panel_full.get("dashboard_product_di_list") != ["0004:1", "0004:2"]
+                ):
+                    raise AssertionError(f"panel_full_selection_normalization={panel_full!r}")
+                for key in (
+                    "stock_cd_list", "product_di_list", "dashboard_product_di_list",
+                    "product_class_list", "dashboard_product_class_list",
+                ):
+                    if panel_full.get(key) != nlq_full_class.get(key):
+                        raise AssertionError(
+                            f"panel_nlq_default_param_mismatch key={key} "
+                            f"panel={panel_full.get(key)!r} nlq={nlq_full_class.get(key)!r}"
+                        )
+                unsupported_action_params = analytics_view_mod._attach_analytics_default_code_pairs(
+                    {"product_di_list": ["1"], "product_class_list": ["01"]},
+                    action_key="customer_sales_forecast",
+                    ns=summary_ns,
+                )
+                unsupported_action_params = analytics_view_mod._normalize_analytics_multi_code_params(
+                    unsupported_action_params,
+                    action_key="customer_sales_forecast",
+                )
+                if any(key.startswith("dashboard_") for key in unsupported_action_params):
+                    raise AssertionError(f"unsupported_action_default_scope_leak={unsupported_action_params!r}")
+
+                import app.ui.sims_panel as panel_mod
+                registry_actions = dict(panel_mod._CATEGORIES["분석/KPI"]["actions"])
+                target_actions = set(analytics_view_mod.KPI_DEFAULT_ACTION_SPECS)
+                registry_default_actions = {
+                    action for action, view in registry_actions.items()
+                    if getattr(view, "__name__", "") in {
+                        spec["view"] for spec in analytics_view_mod.KPI_DEFAULT_ACTION_SPECS.values()
+                    }
+                }
+                adapter_actions = {
+                    action for action, spec in analytics_view_mod.KPI_DEFAULT_ACTION_SPECS.items()
+                    if spec["adapter_key"] in analytics_view_mod._ANALYTICS_DEFAULT_KEYS
+                }
+                nlq_actions = set(nlq_router_mod._ANALYTICS_NLQ_DEFAULT_KEYS)
+                if registry_default_actions != target_actions or adapter_actions != target_actions or not target_actions.issubset(nlq_actions):
+                    raise AssertionError(
+                        f"default_action_sets={registry_default_actions!r}/{adapter_actions!r}/{nlq_actions!r}"
+                    )
+
+                captured_nlq_params: dict[str, Any] = {}
+                captured_nlq_payload: dict[str, Any] = {}
+                old_action_resolver = nlq_router_mod._resolve_analytics_action
+                old_handler_getter = nlq_router_mod._get_analytics_handler
+                old_param_builder = nlq_router_mod._build_analytics_params
+                import app.ui.chat_middleware as chat_middleware_mod
+                old_push = chat_middleware_mod.push_sims_result_to_chat
+                try:
+                    nlq_router_mod._resolve_analytics_action = lambda _text: "품목별 재고부족현황"
+                    nlq_router_mod._get_analytics_handler = lambda _action: (
+                        lambda params: captured_nlq_params.update(dict(params)) or {"meta": {}, "params": dict(params)}
+                    )
+                    chat_middleware_mod.push_sims_result_to_chat = lambda payload, _action: captured_nlq_payload.update(dict(payload))
+                    nlq_router_mod._build_analytics_params = lambda _text, _action: {"date_from": "20260101", "date_to": "20260131"}
+                    if not nlq_router_mod._try_handle_analytics_nlq(
+                        "품목별 재고부족현황",
+                        room={}, session_state={}, make_ts=lambda: "", next_seq=lambda: 1,
+                        logger=logging.getLogger("ssai.regression"),
+                    ):
+                        raise AssertionError("nlq_handler_not_handled")
+                finally:
+                    nlq_router_mod._resolve_analytics_action = old_action_resolver
+                    nlq_router_mod._get_analytics_handler = old_handler_getter
+                    nlq_router_mod._build_analytics_params = old_param_builder
+                    chat_middleware_mod.push_sims_result_to_chat = old_push
+                if (
+                    captured_nlq_params.get("dashboard_product_di_list") != ["0004:1", "0004:2"]
+                    or "회사 Default" not in str((captured_nlq_payload.get("meta") or {}).get("query_summary") or "")
+                ):
+                    raise AssertionError(f"nlq_handler_params_or_sources={captured_nlq_params!r}/{captured_nlq_payload!r}")
+
+                def _run_nlq_case(question: str, action: str, parsed: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+                    captured_params: dict[str, Any] = {}
+                    captured_payload: dict[str, Any] = {}
+                    old_resolver = nlq_router_mod._resolve_analytics_action
+                    old_handler = nlq_router_mod._get_analytics_handler
+                    old_builder = nlq_router_mod._build_analytics_params
+                    old_case_push = chat_middleware_mod.push_sims_result_to_chat
+                    try:
+                        nlq_router_mod._resolve_analytics_action = lambda _text: action
+                        nlq_router_mod._build_analytics_params = lambda _text, _action: dict(parsed)
+                        nlq_router_mod._get_analytics_handler = lambda _action: (
+                            lambda params: captured_params.update(dict(params)) or {"meta": {}, "params": dict(params)}
+                        )
+                        chat_middleware_mod.push_sims_result_to_chat = lambda payload, _action: captured_payload.update(dict(payload))
+                        if not nlq_router_mod._try_handle_analytics_nlq(
+                            question, room={}, session_state={}, make_ts=lambda: "", next_seq=lambda: 1,
+                            logger=logging.getLogger("ssai.regression"),
+                        ):
+                            raise AssertionError(f"nlq_case_not_handled={question}")
+                    finally:
+                        nlq_router_mod._resolve_analytics_action = old_resolver
+                        nlq_router_mod._get_analytics_handler = old_handler
+                        nlq_router_mod._build_analytics_params = old_builder
+                        chat_middleware_mod.push_sims_result_to_chat = old_case_push
+                    return captured_params, captured_payload
+
+                explicit_params, explicit_payload = _run_nlq_case(
+                    "장부재고 00247 창고 품목별 재고부족현황", "품목별 재고부족현황",
+                    {"stock_mode": "book", "stock_cds": ["00247"], "stock_cd": "00247"},
+                )
+                explicit_summary = str((explicit_payload.get("meta") or {}).get("query_summary") or "")
+                if (
+                    explicit_params.get("stock_mode") != "book"
+                    or explicit_params.get("stock_cd_list") != ["00247"]
+                    or "재고위치: 00247 (질문에서 지정)" not in explicit_summary
+                    or "재고위치: 전체 (질문에서 지정)" in explicit_summary
+                    or explicit_params.get("dashboard_product_di_list") != ["0004:1", "0004:2"]
+                ):
+                    raise AssertionError(f"nlq_explicit_stock_display={explicit_params!r}/{explicit_summary!r}")
+
+                clear_params, clear_payload = _run_nlq_case(
+                    "전체 창고 전체 제품구분 품목별 재고부족현황", "품목별 재고부족현황", {
+                        "stock_cds": ["00247"], "stock_nm": "창고", "product_di_nm": "일반",
+                    },
+                )
+                clear_summary = str((clear_payload.get("meta") or {}).get("query_summary") or "")
+                if (
+                    any(clear_params.get(key) not in ([], "") for key in ("stock_cd_list", "stock_cds", "stock_cd", "stock_nm", "stock_nm_list"))
+                    or any(clear_params.get(key) not in ([], "") for key in ("product_di_list", "dashboard_product_di_list", "product_di", "product_di_nm", "product_di_nm_list"))
+                    or clear_params.get("dashboard_product_class_list") != ["0031:01"]
+                    or "재고위치: 전체 (전체 조건)" not in clear_summary
+                    or "제품구분: 전체 (전체 조건)" not in clear_summary
+                ):
+                    raise AssertionError(f"nlq_explicit_clear_aliases={clear_params!r}/{clear_summary!r}")
+
+                summary_clear_params, _summary_clear_payload = _run_nlq_case(
+                    "전체 제품분류 품목별 매출 추세 요약표", "품목별 매출 추세 요약표", {"product_class_nm": "기존"},
+                )
+                if (
+                    any(summary_clear_params.get(key) not in ([], "") for key in ("product_class_list", "dashboard_product_class_list", "product_class", "product_class_nm", "product_class_nm_list"))
+                    or summary_clear_params.get("stock_cd_list") != ["00001", "00247"]
+                    or summary_clear_params.get("dashboard_product_di_list") != ["0004:1", "0004:2"]
+                ):
+                    raise AssertionError(f"nlq_summary_product_class_clear={summary_clear_params!r}")
+
+                name_only = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {"stock_nm": "본사"}, text="본사 창고 품목별 재고부족현황", action="품목별 재고부족현황",
+                    session_state={}, logger=logging.getLogger("ssai.regression"),
+                )
+                if (
+                    name_only.get("stock_nm") != "본사"
+                    or name_only.get("stock_cd_list") not in (None, [])
+                    or name_only.get("stock_cds") not in (None, [])
+                    or name_only.get("stock_cd") not in (None, "")
+                ):
+                    raise AssertionError(f"nlq_name_to_code_leak={name_only!r}")
+
+                actual_parser_results: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
+                old_resolver = nlq_router_mod._resolve_analytics_action
+                old_handler = nlq_router_mod._get_analytics_handler
+                old_case_push = chat_middleware_mod.push_sims_result_to_chat
+                old_explicit_option_loader = analytics_view_mod._load_code_options
+                try:
+                    analytics_view_mod._load_code_options = lambda gcode: (
+                        [{"code": "01", "name": "일반", "label": "01 - 일반"}]
+                        if gcode == "0031" else []
+                    )
+                    def _run_actual_parser_case(question: str, action: str) -> tuple[dict[str, Any], dict[str, Any]]:
+                        captured_params: dict[str, Any] = {}
+                        captured_payload: dict[str, Any] = {}
+                        nlq_router_mod._resolve_analytics_action = lambda _text: action
+                        nlq_router_mod._get_analytics_handler = lambda _action: (
+                            lambda params: captured_params.update(dict(params)) or {
+                                "params": dict(params),
+                                "meta": {"query_summary": f"재고위치: {params.get('stock_cd') or params.get('stock_nm') or '전체'}"},
+                            }
+                        )
+                        chat_middleware_mod.push_sims_result_to_chat = lambda payload, _action: captured_payload.update(dict(payload))
+                        if not nlq_router_mod._try_handle_analytics_nlq(
+                            question, room={}, session_state={}, make_ts=lambda: "", next_seq=lambda: 1,
+                            logger=logging.getLogger("ssai.regression"),
+                        ):
+                            raise AssertionError(f"actual_parser_not_handled={question}")
+                        return captured_params, captured_payload
+
+                    actual_parser_results["code"] = _run_actual_parser_case("장부재고 00247 창고 품목별 재고부족현황", "품목별 재고부족현황")
+                    actual_parser_results["clear"] = _run_actual_parser_case("전체 창고 전체 제품구분 품목별 재고부족현황", "품목별 재고부족현황")
+                    actual_parser_results["class_clear"] = _run_actual_parser_case("전체 제품분류 품목별 매출 추세 요약표", "품목별 매출 추세 요약표")
+                    actual_parser_results["stock_name"] = _run_actual_parser_case("본사 창고 품목별 재고부족현황", "품목별 재고부족현황")
+                    actual_parser_results["di_name"] = _run_actual_parser_case("일반의약품 제품구분 품목별 매출 추세 요약표", "품목별 매출 추세 요약표")
+                    for action in (
+                        "품목별 재고부족현황",
+                        "품목별 매출 추세 요약표",
+                        "품목별 매출 예상",
+                    ):
+                        actual_parser_results[f"0031_default::{action}"] = _run_actual_parser_case(
+                            action,
+                            action,
+                        )
+                    actual_parser_results["manufacturer_group"] = _run_actual_parser_case(
+                        "제약사별 매출 추세분석",
+                        "제약사별 매출 추세 분석",
+                    )
+                    actual_parser_results["manufacturer_explicit"] = _run_actual_parser_case(
+                        "한미제약 제약사별 매출 추세분석",
+                        "제약사별 매출 추세 분석",
+                    )
+                    actual_parser_results["manufacturer_sales_forecast"] = _run_actual_parser_case(
+                        "한미제약 품목별 매출 예상 조회",
+                        "품목별 매출 예상",
+                    )
+                    actual_parser_results["manufacturer_sales_summary"] = _run_actual_parser_case(
+                        "한미제약 품목별 매출 추세 요약표 조회",
+                        "품목별 매출 추세 요약표",
+                    )
+                    actual_parser_results["manufacturer_year_group"] = _run_actual_parser_case(
+                        "2026년 제약사별 매출 추세분석",
+                        "제약사별 매출 추세 분석",
+                    )
+                    actual_parser_results["explicit_0031_tcode"] = _run_actual_parser_case(
+                        "01 제품분류 품목별 매출 추세 요약표",
+                        "품목별 매출 추세 요약표",
+                    )
+                    actual_parser_results["explicit_0031_pair"] = _run_actual_parser_case(
+                        "0031:01 제품분류 품목별 매출 추세 요약표",
+                        "품목별 매출 추세 요약표",
+                    )
+                    actual_parser_results["explicit_0031_name"] = _run_actual_parser_case(
+                        "일반 제품분류 품목별 매출 추세 요약표",
+                        "품목별 매출 추세 요약표",
+                    )
+                    actual_parser_results["explicit_0028_pair"] = _run_actual_parser_case(
+                        "0028:01 제품분류 품목별 매출 추세 요약표",
+                        "품목별 매출 추세 요약표",
+                    )
+                    actual_parser_results["context_pairs_forecast"] = _run_actual_parser_case(
+                        "0004:1 제품구분 0031:01 제품분류 품목별 매출 예상 조회",
+                        "품목별 매출 예상",
+                    )
+                    actual_parser_results["context_pairs_summary"] = _run_actual_parser_case(
+                        "0031:01 제품분류 0004:J 제품구분 품목별 매출 추세 요약표 조회",
+                        "품목별 매출 추세 요약표",
+                    )
+                    actual_parser_results["context_pairs_0028_0031"] = _run_actual_parser_case(
+                        "0028:01 특수관리제품 0031:01 제품분류 품목별 재고부족현황",
+                        "품목별 재고부족현황",
+                    )
+                finally:
+                    nlq_router_mod._resolve_analytics_action = old_resolver
+                    nlq_router_mod._get_analytics_handler = old_handler
+                    chat_middleware_mod.push_sims_result_to_chat = old_case_push
+                    analytics_view_mod._load_code_options = old_explicit_option_loader
+
+                actual_code_params, actual_code_payload = actual_parser_results["code"]
+                actual_clear_params, _actual_clear_payload = actual_parser_results["clear"]
+                actual_class_params, _actual_class_payload = actual_parser_results["class_clear"]
+                actual_stock_name_params, actual_stock_name_payload = actual_parser_results["stock_name"]
+                actual_di_name_params, _actual_di_name_payload = actual_parser_results["di_name"]
+                actual_code_summary = str((actual_code_payload.get("meta") or {}).get("query_summary") or "")
+                if (
+                    actual_code_params.get("stock_mode") != "book"
+                    or actual_code_params.get("stock_cd_list") != ["00247"]
+                    or actual_code_params.get("stock_nm") not in (None, "")
+                    or actual_code_summary.count("재고위치:") != 1
+                    or (actual_code_payload.get("meta") or {}).get("condition") != actual_code_summary
+                ):
+                    raise AssertionError(f"actual_parser_code_path={actual_code_params!r}/{actual_code_summary!r}")
+                if (
+                    any(actual_clear_params.get(key) not in ([], "") for key in ("stock_cd_list", "stock_cds", "stock_cd", "stock_nm", "stock_nm_list"))
+                    or any(actual_clear_params.get(key) not in ([], "") for key in ("product_di_list", "dashboard_product_di_list", "product_di", "product_di_nm", "product_di_nm_list"))
+                    or any(actual_class_params.get(key) not in ([], "") for key in ("product_class_list", "dashboard_product_class_list", "product_class", "product_class_nm", "product_class_nm_list"))
+                ):
+                    raise AssertionError(f"actual_parser_explicit_clear={actual_clear_params!r}/{actual_class_params!r}")
+                if (
+                    actual_stock_name_params.get("stock_nm") != "본사"
+                    or actual_stock_name_params.get("stock_cd_list") not in (None, [])
+                    or actual_stock_name_params.get("stock_cds") not in (None, [])
+                    or "본사" not in str((actual_stock_name_payload.get("meta") or {}).get("query_summary") or "")
+                    or actual_di_name_params.get("product_di_nm") != "일반의약품"
+                    or actual_di_name_params.get("product_di_list") not in (None, [])
+                    or actual_di_name_params.get("dashboard_product_di_list") not in (None, [])
+                ):
+                    raise AssertionError(f"actual_parser_name_path={actual_stock_name_params!r}/{actual_di_name_params!r}")
+                for key, (captured_params, _captured_payload) in actual_parser_results.items():
+                    if not key.startswith("0031_default::"):
+                        continue
+                    if (
+                        captured_params.get("product_class_list") != []
+                        or captured_params.get("product_class") not in (None, "")
+                        or captured_params.get("product_class_nm") not in (None, "")
+                        or captured_params.get("product_class_nm_list") not in (None, [])
+                        or captured_params.get("dashboard_product_class_list") != ["0031:01"]
+                    ):
+                        raise AssertionError(f"actual_parser_0031_contract={key}/{captured_params!r}")
+
+                manufacturer_group_params, _ = actual_parser_results["manufacturer_group"]
+                manufacturer_explicit_params, _ = actual_parser_results["manufacturer_explicit"]
+                manufacturer_sales_forecast_params, _ = actual_parser_results["manufacturer_sales_forecast"]
+                manufacturer_sales_summary_params, _ = actual_parser_results["manufacturer_sales_summary"]
+                manufacturer_year_group_params, _ = actual_parser_results["manufacturer_year_group"]
+                if (
+                    manufacturer_group_params.get("maker_nm") not in (None, "")
+                    or manufacturer_group_params.get("product_ven_nm") not in (None, "")
+                    or manufacturer_explicit_params.get("maker_nm") != "한미제약"
+                    or manufacturer_explicit_params.get("product_ven_nm") != "한미제약"
+                    or manufacturer_sales_forecast_params.get("maker_nm") != "한미제약"
+                    or manufacturer_sales_forecast_params.get("product_ven_nm") != "한미제약"
+                    or manufacturer_sales_summary_params.get("maker_nm") != "한미제약"
+                    or manufacturer_sales_summary_params.get("product_ven_nm") != "한미제약"
+                    or manufacturer_year_group_params.get("maker_nm") not in (None, "")
+                    or manufacturer_year_group_params.get("product_ven_nm") not in (None, "")
+                ):
+                    raise AssertionError(
+                        "manufacturer_group_action_parser="
+                        f"{manufacturer_group_params!r}/{manufacturer_explicit_params!r}/"
+                        f"{manufacturer_sales_forecast_params!r}/{manufacturer_sales_summary_params!r}/"
+                        f"{manufacturer_year_group_params!r}"
+                    )
+                for key in ("explicit_0031_tcode", "explicit_0031_pair", "explicit_0031_name"):
+                    captured_params, _ = actual_parser_results[key]
+                    if (
+                        captured_params.get("product_class_list") != []
+                        or captured_params.get("product_class") not in (None, "")
+                        or captured_params.get("product_class_nm") not in (None, "")
+                        or captured_params.get("product_class_nm_list") not in (None, [])
+                        or captured_params.get("dashboard_product_class_list") != ["0031:01"]
+                    ):
+                        raise AssertionError(f"explicit_0031_tax_contract={key}/{captured_params!r}")
+                explicit_0028_params, _ = actual_parser_results["explicit_0028_pair"]
+                if (
+                    explicit_0028_params.get("product_class_list") != ["01"]
+                    or explicit_0028_params.get("dashboard_product_class_list") not in (None, [])
+                ):
+                        raise AssertionError(f"explicit_0028_legacy_contract={explicit_0028_params!r}")
+
+                context_forecast_params, _ = actual_parser_results["context_pairs_forecast"]
+                context_summary_params, _ = actual_parser_results["context_pairs_summary"]
+                context_mixed_params, _ = actual_parser_results["context_pairs_0028_0031"]
+                if (
+                    context_forecast_params.get("product_di_list") != ["1"]
+                    or context_forecast_params.get("dashboard_product_di_list") != ["0004:1"]
+                    or context_forecast_params.get("product_class_list") != []
+                    or context_forecast_params.get("dashboard_product_class_list") != ["0031:01"]
+                ):
+                    raise AssertionError(f"context_pair_forecast_contract={context_forecast_params!r}")
+                if (
+                    context_summary_params.get("product_di_list") != ["J"]
+                    or context_summary_params.get("dashboard_product_di_list") != ["0004:J"]
+                    or context_summary_params.get("product_class_list") != []
+                    or context_summary_params.get("dashboard_product_class_list") != ["0031:01"]
+                ):
+                    raise AssertionError(f"context_pair_summary_contract={context_summary_params!r}")
+                if (
+                    context_mixed_params.get("product_class_list") != ["01"]
+                    or context_mixed_params.get("dashboard_product_class_list") != ["0031:01"]
+                ):
+                    raise AssertionError(f"context_pair_0028_0031_contract={context_mixed_params!r}")
+
+                for group_action in (
+                    "품목별 매출 추세 분석",
+                    "매입처별 재고부족 현황",
+                    "매출처별 매출 예상",
+                    "영업사원별 매출 예상",
+                    "지역별 매출 예상",
+                ):
+                    cleaned = nlq_router_mod._cleanup_analytics_named_params(
+                        {"maker_nm": "별", "product_ven_nm": "별"},
+                        text=group_action,
+                        action=group_action,
+                    )
+                    if cleaned.get("maker_nm") or cleaned.get("product_ven_nm"):
+                        raise AssertionError(f"group_action_suffix_parser={group_action}/{cleaned!r}")
+
+                bind_params = {"dashboard_product_class_list": ["0031:01"]}
+                detail_clauses: list[str] = []
+                analytics_service_mod._add_dashboard_code_pair_filter(
+                    detail_clauses,
+                    bind_params,
+                    gcode_sql="Physic_Cd.Rd04_Physic_Tax_Gcode",
+                    tcode_sql="Physic_Cd.Rd04_Physic_Tax",
+                    key="dashboard_product_class_list",
+                )
+                monthly_bind_params = {"dashboard_product_class_list": ["0031:01"]}
+                monthly_clauses: list[str] = []
+                analytics_service_mod._add_dashboard_code_pair_filter(
+                    monthly_clauses,
+                    monthly_bind_params,
+                    gcode_sql="Physic_Cd.Rd04_Physic_Tax_Gcode",
+                    tcode_sql="Physic_Cd.Rd04_Physic_Tax",
+                    key="dashboard_product_class_list",
+                )
+                detail_predicate = " ".join(detail_clauses)
+                monthly_predicate = " ".join(monthly_clauses)
+                if (
+                    bind_params.get("dashboard_product_class_list_g_0") != "0031"
+                    or bind_params.get("dashboard_product_class_list_t_0") != "01"
+                    or monthly_bind_params.get("dashboard_product_class_list_g_0") != "0031"
+                    or monthly_bind_params.get("dashboard_product_class_list_t_0") != "01"
+                    or "Rd04_Physic_Gu IN" in detail_predicate
+                    or "Rd04_Physic_Gu IN" in monthly_predicate
+                ):
+                    raise AssertionError(
+                        f"business_code_sql_bind={bind_params!r}/{monthly_bind_params!r}/"
+                        f"{detail_predicate!r}/{monthly_predicate!r}"
+                    )
+
+                cache_state = {"__analysis_profile_company_cache": {"41": {"stock_cd_list": ["00001"]}, "42": {"stock_cd_list": ["00999"]}}}
+                company_profile_mod.invalidate_analysis_profile_cache(cache_state, company_id=41)
+                if "41" in cache_state["__analysis_profile_company_cache"] or "42" not in cache_state["__analysis_profile_company_cache"]:
+                    raise AssertionError(f"profile_cache_target_invalidation={cache_state!r}")
+                current_company["id"] = "41"
+                refresh_ns = "save-refresh"
+                refresh_stock_widget = f"__analytics_stock_shortage_stock__{refresh_ns}"
+                refresh_prefill = f"__analytics_dashboard_prefill_codes::{refresh_stock_widget}"
+                profile_by_company["41"]["stock_cd_list"] = ["00001"]
+                company_profile_mod.invalidate_analysis_profile_cache(analytics_st.session_state, company_id=41)
+                analytics_view_mod._prepare_analytics_company_defaults("stock_shortage", refresh_ns)
+                if analytics_st.session_state.get(refresh_prefill) != ["00001"]:
+                    raise AssertionError(f"profile_generation_initial={analytics_st.session_state!r}")
+                profile_by_company["41"]["stock_cd_list"] = ["00247"]
+                analytics_st.session_state["__analysis_profile_generation::42"] = 7
+                generation = company_profile_mod.mark_analysis_profile_saved(analytics_st.session_state, company_id=41)
+                analytics_view_mod._prepare_analytics_company_defaults("stock_shortage", refresh_ns)
+                if (
+                    generation != 1
+                    or analytics_st.session_state.get(refresh_prefill) != ["00247"]
+                    or analytics_st.session_state.get(f"__analytics_profile_applied_generation::41::stock_shortage::{refresh_ns}") != generation
+                ):
+                    raise AssertionError(f"profile_generation_refresh={analytics_st.session_state!r}")
+                analytics_st.session_state[refresh_stock_widget] = ["00901"]
+                analytics_view_mod._prepare_analytics_company_defaults("stock_shortage", refresh_ns)
+                if analytics_st.session_state.get(refresh_stock_widget) != ["00901"]:
+                    raise AssertionError(f"profile_generation_live_value_overwritten={analytics_st.session_state!r}")
+                if analytics_st.session_state.get("__analysis_profile_generation::42") != 7:
+                    raise AssertionError(f"profile_generation_other_company_mutated={analytics_st.session_state!r}")
+
+                nlq_src = Path("app/sims/nlq/nlq_router.py").read_text(encoding="utf-8")
+                if (
+                    "analytics handled action=%r params=%r" in nlq_src
+                    or "analytics service failed action=%r params=%r" in nlq_src
+                    or "_analytics_nlq_code_values" not in nlq_src
+                    or "_analytics_nlq_name_values" not in nlq_src
+                ):
+                    raise AssertionError("nlq_param_logging_or_alias_separation_missing")
+            finally:
+                company_profile_mod.load_dashboard_profile = old_profile_loader
+                analytics_view_mod.load_dashboard_profile = old_analytics_loader
+                analytics_view_mod.st = old_analytics_st
+                login_mod.get_selected_company = old_company_getter
+                nlq_router_mod._analytics_nlq_option_codes = old_nlq_option_codes
+            results.append(_ok("Company Default adapter for Dashboard, KPI, and NLQ", "supported keys only; dates/manufacturer excluded; explicit override/clear and company-scoped cache verified"))
+        except Exception as e:
+            results.append(_fail("Company Default adapter for Dashboard, KPI, and NLQ", f"{type(e).__name__}: {e}"))
 
         code_pair_errors: list[str] = []
         code_pair_df = pd.DataFrame(
@@ -8923,7 +9858,7 @@ def run_basic_checks() -> list[CheckResult]:
                 codes = {
                     "0013": ["PG1", "PG2"],
                     "0004": ["PD1", "PD2"],
-                    "0028": ["PC1", "PC2"],
+                    "0031": ["PC1", "PC2"],
                     "0018": ["00001", "00002"],
                 }.get(str(gcode), [])
                 return [{"code": code, "name": code, "label": f"{code} - {code}"} for code in codes]
