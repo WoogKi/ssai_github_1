@@ -2051,46 +2051,133 @@ def _build_inventory_facts(
 
 
 def _build_today_actions(sales: dict[str, Any], inventory: dict[str, Any], turnover: dict[str, Any]) -> list[dict[str, Any]]:
-    actions: list[dict[str, Any]] = []
-    seen_products: set[str] = set()
-    for row in inventory.get("risk_targets", []):
+    """Build deterministic Dashboard actions from existing facts only."""
+    started = time.perf_counter()
+    candidates: list[dict[str, Any]] = []
+    for row in inventory.get("readiness_rows") or inventory.get("risk_targets", []):
         product_code = str(row.get("product_code") or "").strip()
-        dedupe_key = product_code or str(row.get("product_name") or "").strip()
-        if not dedupe_key or dedupe_key in seen_products:
+        product_name = str(row.get("product_name") or "").strip()
+        risk_status = str(row.get("재고위험상태") or "").strip()
+        is_shortage = risk_status in {"긴급 부족", "부족 주의"}
+        is_overstock = bool(row.get("과잉후보여부"))
+        if not is_shortage and not is_overstock:
             continue
-        seen_products.add(dedupe_key)
         remaining = float(row.get("위험보정잔여예상수요", row.get("remaining_expected_demand_qty")) or 0)
         shortage_qty = float(row.get("위험보정부족예상수량", row.get("shortage_qty")) or 0)
         shortage_amt = float(row.get("위험보정부족예상금액", row.get("shortage_amt")) or 0)
         readiness_pct = float(row.get("위험보정재고준비율", row.get("stock_readiness_pct")) or 0)
-        demand_surge = bool(row.get("수요급증여부"))
-        adjustment_basis = str(row.get("위험보정기준") or "")
-        evidence = f"잔여수요 {remaining:,.0f}, 부족 {shortage_qty:,.0f}"
-        if demand_surge:
-            evidence = f"수요급증 · {adjustment_basis or '진행속도 보정'} · {evidence}"
-        actions.append(
+        if is_shortage:
+            demand_surge = bool(row.get("수요급증여부"))
+            adjustment_basis = str(row.get("위험보정기준") or "")
+            evidence = f"잔여수요 {remaining:,.0f}, 부족 {shortage_qty:,.0f}"
+            if demand_surge:
+                evidence = f"수요급증 · {adjustment_basis or '진행속도 보정'} · {evidence}"
+            severity = 0 if risk_status == "긴급 부족" else 1
+            cause_type = "stock_shortage"
+            recommended_action = "발주·재고이동·대체공급 확인"
+            threshold_label = "재고준비율"
+            threshold_value = readiness_pct
+            evidence_label = "위험보정부족예상금액"
+            evidence_value = shortage_amt
+            evidence_unit = "원"
+        else:
+            severity = 3
+            cause_type = "overstock_candidate"
+            evidence = str(row.get("과잉후보사유") or "현재재고가 3개월 필요수량 초과")
+            evidence_label = "과잉후보금액"
+            evidence_value = float(row.get("과잉후보금액") or 0)
+            evidence_unit = "원"
+            threshold_label = "과잉후보 기준"
+            threshold_value = float(row.get("3개월필요수량") or 0)
+            recommended_action = "재고이동·소진계획 확인"
+        target_code = product_code
+        target_name = product_name or product_code or "제품"
+        candidates.append(
             {
-                "rank": len(actions) + 1,
-                "priority": "높음",
-                "risk_grade": "조치 필요",
-                "target": row.get("product_name") or row.get("product_code") or "제품",
-                "product_code": product_code,
-                "product_name": row.get("product_name") or "",
+                "action_id": f"{cause_type}:product:{target_code or product_name or 'missing'}",
+                "_severity": severity,
+                "_impact": float(evidence_value),
+                "cause_type": cause_type,
+                "status": risk_status or ("과잉 후보" if is_overstock else ""),
+                "target_kind": "product",
+                "target_code": target_code,
+                "target_name": target_name,
+                "evidence_label": evidence_label,
+                "evidence_value": evidence_value,
+                "evidence_unit": evidence_unit,
+                "threshold_label": threshold_label,
+                "threshold_value": threshold_value,
+                "recommended_action": recommended_action,
+                "drilldown_action": "품목별 재고부족현황" if target_code else "",
+                "drilldown_params": {"product_code": target_code} if target_code else {},
+                "source_dashboard_event_id": "",
+                "target": target_name,
+                "product_code": target_code,
+                "product_name": product_name,
                 "manufacturer_name": row.get("manufacturer_name") or "",
                 "current_stock_qty": float(row.get("current_stock_qty") or 0),
                 "remaining_expected_demand_qty": remaining,
                 "shortage_qty": shortage_qty,
                 "shortage_amt": shortage_amt,
                 "stock_readiness_pct": readiness_pct,
-                "status": f"준비율 {readiness_pct:.1f}%",
                 "evidence": evidence,
-                "recommended_action": "발주·재고이동·대체공급 확인",
-                "drill_down": "품목별 재고부족현황",
             }
         )
-        if len(actions) >= 10:
-            break
-    return actions[:10]
+
+    for row in sales.get("decline_targets", []):
+        target_name = str(row.get("target") or "").strip()
+        if not target_name:
+            continue
+        amount = float(row.get("amount") or 0)
+        growth_pct = float(row.get("growth_pct") or 0)
+        candidates.append(
+            {
+                "action_id": f"sales_decline:manufacturer_name:{target_name}",
+                "_severity": 2,
+                "_impact": amount,
+                "cause_type": "sales_decline",
+                "status": "매출 감소",
+                "target_kind": "manufacturer_name_unresolved",
+                "target_code": "",
+                "target_name": target_name,
+                "evidence_label": "완료월 매출",
+                "evidence_value": amount,
+                "evidence_unit": "원",
+                "threshold_label": "최근3개월증감률",
+                "threshold_value": growth_pct,
+                "recommended_action": "감소 원인과 거래처·품목 구성을 확인",
+                "drilldown_action": "",
+                "drilldown_params": {},
+                "source_dashboard_event_id": "",
+                "target": target_name,
+                "evidence": str(row.get("reason") or "고매출 감소 판정"),
+            }
+        )
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        action_id = str(candidate["action_id"])
+        current = deduped.get(action_id)
+        if current is None or (candidate["_severity"], -candidate["_impact"]) < (current["_severity"], -current["_impact"]):
+            deduped[action_id] = candidate
+    actions = sorted(
+        deduped.values(),
+        key=lambda row: (int(row["_severity"]), -float(row["_impact"]), str(row["target_code"]), str(row["target_name"])),
+    )[:10]
+    for rank, action in enumerate(actions, start=1):
+        action["priority"] = rank
+        action["risk_grade"] = action["status"]
+        action.pop("_severity", None)
+        action.pop("_impact", None)
+    log.info(
+        "[dashboard.actions] total_candidates=%s deduped_candidates=%s displayed_actions=%s shortage_actions=%s decline_actions=%s overstock_actions=%s data_quality_actions=0 elapsed_ms=%s",
+        len(candidates), len(deduped), len(actions),
+        sum(1 for item in actions if item.get("cause_type") == "stock_shortage"),
+        sum(1 for item in actions if item.get("cause_type") == "sales_decline"),
+        sum(1 for item in actions if item.get("cause_type") == "overstock_candidate"),
+        int((time.perf_counter() - started) * 1000),
+    )
+    return actions
 
 
 def build_dashboard_lite_facts(

@@ -170,7 +170,7 @@ from app.ui.sims_entry import (
     sims_mode_selector,
     render_sims_sidebar_controls,
 )
-from app.ui.sims_panel import render_sims_main, set_run_flag
+from app.ui.sims_panel import _consume_dashboard_drilldown_request, render_sims_main, set_run_flag
 from app.ui.sims_hub import render_sims_hub
 from app.db.db_config import load_mssql_config
 from app.ui.chat_middleware import set_chat_render_anchor,render_sims_chat_item
@@ -1912,6 +1912,20 @@ def _scroll_to_anchor_js(anchor_id: str, *, center: bool = True) -> None:
     """, height=1, tab_index=-1)
     except Exception:
         log.exception("[ui] scroll anchor iframe failed")
+
+
+def _consume_dashboard_scroll_suppression(requested_jump_to: Any) -> Any:
+    """Consume one local Dashboard scroll suppression without affecting new message scrolls."""
+    suppression = st.session_state.pop("__dashboard_lite_suppress_chat_autoscroll_once", None)
+    if not isinstance(suppression, dict):
+        return requested_jump_to
+    reason = str(suppression.get("reason") or "local_filter")
+    log.info(
+        "[dashboard.scroll] reason=%s suppress_requested=False suppress_consumed=True message_appended=%s scroll_to_bottom=False",
+        reason,
+        bool(requested_jump_to),
+    )
+    return None
 ## ===================================================
 ## CSV/엑셀 파일명에 액션명 반영
 ## =====================================================
@@ -8902,7 +8916,7 @@ def migrate_rooms_seq_if_needed(rooms: List[Dict[str, Any]], *, chat_file: str, 
             for i, m in enumerate(msgs, start=1):
                 m["seq"] = i
             changed = True
-            logger.info("[chat.migrate] room=%s seq renumbered (n=%s)", r.get("id"), len(msgs))
+            log.info("[chat.migrate] room=%s seq renumbered (n=%s)", r.get("id"), len(msgs))
 
         # 전체 최대 seq 계산
         local_max = 0
@@ -8920,17 +8934,17 @@ def migrate_rooms_seq_if_needed(rooms: List[Dict[str, Any]], *, chat_file: str, 
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 bak = f"{chat_file}.bak_{ts}"
                 shutil.copy2(chat_file, bak)
-                logger.info("[chat.migrate] backup created: %s", bak)
+                log.info("[chat.migrate] backup created: %s", bak)
         except Exception:
-            logger.exception("[chat.migrate] backup failed")
+            log.exception("[chat.migrate] backup failed")
 
         try:
             # 세션에 반영 후 기존 원자 저장 루틴 사용
             st.session_state.chat_rooms = rooms
             save_chat_rooms()
-            logger.info("[chat.migrate] rooms saved (seq migrated)")
+            log.info("[chat.migrate] rooms saved (seq migrated)")
         except Exception:
-            logger.exception("[chat.migrate] save failed")
+            log.exception("[chat.migrate] save failed")
 
     return max_seq_all
 
@@ -9540,6 +9554,16 @@ def _render_sims_sidebar_fragment() -> None:
     st.session_state.setdefault("__sims_q", "")
     st.session_state.setdefault("__sims_run", False)
 
+    # Dashboard 상세 보기 요청은 __sims_open 토글을 만들기 전에만 소비한다.
+    # 이 preflight가 실패하면 consumer가 요청을 폐기하고 기존 패널 상태를 보존한다.
+    _dashboard_drilldown_selected = _consume_dashboard_drilldown_request(
+        st.session_state.get("__sims_selected"),
+        widget_safe_phase=True,
+    )
+    if _dashboard_drilldown_selected:
+        st.session_state["__sims_selected"] = dict(_dashboard_drilldown_selected)
+        st.session_state["__sims_selected_snapshot"] = dict(_dashboard_drilldown_selected)
+
     sims_panel_open = st.toggle("SIMS 패널 열기", key="__sims_open")
 
     if not sims_panel_open:
@@ -9583,7 +9607,10 @@ def _render_sims_sidebar_fragment() -> None:
             except Exception:
                 selected = {}
 
-        if selected:
+        dashboard_drilldown_active = isinstance(
+            st.session_state.get("__dashboard_drilldown_auto_run"), dict
+        )
+        if selected and not dashboard_drilldown_active:
             new_selected = dict(selected)
             # 중요:
             # 카테고리/작업 선택만으로는 기존 SIMS 결과/채팅 표를 지우지 않는다.
@@ -9591,7 +9618,7 @@ def _render_sims_sidebar_fragment() -> None:
             st.session_state["__sims_selected"] = new_selected
             st.session_state["__sims_selected_snapshot"] = dict(new_selected)
             st.caption("선택됨. ‘SIMS 작업 열기’를 눌러 선택한 화면/폼을 여세요.")
-        else:
+        elif not dashboard_drilldown_active:
             st.session_state.pop("__sims_selected", None)
             st.session_state["__sims_selected_snapshot"] = {}
 
@@ -11330,7 +11357,8 @@ with st.container():
 
 
     # (A) 이번 rerun에서 점프할 앵커(검색 패널에서 set) 한 번만 소비
-    _jump_to = st.session_state.pop("__scroll_to_msg", None)
+    _requested_jump_to = st.session_state.pop("__scroll_to_msg", None)
+    _jump_to = _consume_dashboard_scroll_suppression(_requested_jump_to)
 
     # 이번 화면 렌더 사이클에서 SIMS 결과 카드는 1회만 그린다.
     # history/pending/immediate render가 같은 table_key를 동시에 잡아도 중복 출력하지 않기 위한 set.

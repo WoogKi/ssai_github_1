@@ -7305,12 +7305,22 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append("excluded_product_in_risk_targets")
         if not facts.get("today_actions"):
             fact_errors.append("today_actions_empty")
-        if any(not action.get("product_code") for action in facts.get("today_actions") or []):
-            fact_errors.append("today_actions_contains_non_product_item")
-        if len({a.get("product_code") for a in facts.get("today_actions") or []}) != len(facts.get("today_actions") or []):
-            fact_errors.append("today_actions_duplicate_product")
-        if any(float(a.get("stock_readiness_pct") or 0) >= 98.0 for a in facts.get("today_actions") or []):
-            fact_errors.append("today_actions_contains_ready_product")
+        action_ids = [str(action.get("action_id") or "") for action in facts.get("today_actions") or []]
+        required_action_fields = {
+            "action_id", "priority", "status", "cause_type", "target_kind", "target_code",
+            "target_name", "evidence_label", "evidence_value", "evidence_unit",
+            "threshold_label", "threshold_value", "recommended_action", "drilldown_action",
+            "drilldown_params", "source_dashboard_event_id",
+        }
+        if any(required_action_fields - set(action) for action in facts.get("today_actions") or []):
+            fact_errors.append("today_actions_schema_missing")
+        if len(action_ids) != len(set(action_ids)) or any(not action_id for action_id in action_ids):
+            fact_errors.append("today_actions_duplicate_or_empty_action_id")
+        action_priorities = [int(action.get("priority") or 0) for action in facts.get("today_actions") or []]
+        if action_priorities != sorted(action_priorities) or len(action_priorities) > 10:
+            fact_errors.append("today_actions_order_or_limit")
+        if any(action.get("cause_type") == "stock_shortage" and float(action.get("stock_readiness_pct") or 0) >= 98.0 for action in facts.get("today_actions") or []):
+            fact_errors.append("today_actions_contains_ready_shortage")
         filter_facts = facts.get("filters") or {}
         if [x.get("code") for x in filter_facts.get("included_stock_locations") or []] != ["00002", "00001"]:
             fact_errors.append(f"filter_stock_locations={filter_facts!r}")
@@ -7452,6 +7462,21 @@ def run_basic_checks() -> list[CheckResult]:
             or "진행속도 보정" not in str(surge_action.get("evidence") or "")
         ):
             fact_errors.append(f"stock_risk_demand_surge_actions={surge_actions!r}")
+        action_code_contract_row = dict(surge_emergency)
+        action_code_contract_row.update({
+            "product_code": "12345",
+            "product_name": "코드계약제품",
+            "주요매입처코드": "16789",
+            "manufacturer_code": "11090",
+        })
+        action_code_contract = dash_mod._build_today_actions({}, {"risk_targets": [action_code_contract_row]}, {})
+        contract_action = action_code_contract[0] if action_code_contract else {}
+        if (
+            contract_action.get("target_code") != "12345"
+            or (contract_action.get("drilldown_params") or {}).get("product_code") != "12345"
+            or contract_action.get("target_code") in {"16789", "11090"}
+        ):
+            fact_errors.append(f"today_action_product_code_contract={contract_action!r}")
         stock_risk_log_records: list[tuple[str, tuple[Any, ...]]] = []
 
         class _StockRiskLogCapture:
@@ -8593,29 +8618,118 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_ok("Dashboard Lite KPI HTML escaping", "metric label/value/help are escaped inside dashboard-scoped HTML"))
 
         action_table_errors: list[str] = []
-        captured_tables: list[pd.DataFrame] = []
-
-        try:
-            fake_st = _FakeStreamlit(submit_sequence=[])
-            fake_st.column_config = _FakeNumberColumnFactory()
-            fake_st.dataframe = lambda df, **_kwargs: captured_tables.append(df.copy())
-            setattr(view_mod, "st", fake_st)
-            view_mod._render_today_actions(facts)
-        finally:
-            setattr(view_mod, "st", old_st)
-        if not captured_tables:
-            action_table_errors.append("today_action_table_not_rendered")
-        else:
-            action_table = captured_tables[0]
-            for col in ("우선순위", "현재 사용 가능 재고", "당월 잔여예상수요", "부족예상수량", "부족예상금액", "재고준비율"):
-                if col not in action_table.columns:
-                    action_table_errors.append(f"missing_col={col}")
-                elif not pd.api.types.is_numeric_dtype(action_table[col]):
-                    action_table_errors.append(f"non_numeric={col}:{action_table[col].dtype}")
+        action_view_src = Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8")
+        action_view_start = action_view_src.find("def _render_today_actions")
+        action_view_end = action_view_src.find("def _risk_detail_instance_key", action_view_start)
+        action_view_source = action_view_src[action_view_start:action_view_end]
+        for required_text in (
+            "st.columns", "상세 보기", "render_mode == \"primary\"",
+            "__dashboard_lite_action_drilldown::", "판정 기준",
+            "_fmt_dashboard_amount(value, amount_unit)", "threshold_label",
+            "on_click=_select_dashboard_action_detail",
+        ):
+            if required_text not in action_view_source:
+                action_table_errors.append(f"action_list_missing={required_text}")
         if action_table_errors:
             results.append(_fail("Dashboard Lite today action numeric table", "; ".join(action_table_errors)))
         else:
             results.append(_ok("Dashboard Lite today action numeric table", "priority/qty/amount/ratio columns remain numeric before st.dataframe"))
+
+        action_display_errors: list[str] = []
+        try:
+            if view_mod._fmt_dashboard_amount(105_600_000, "thousand") != "105,600.0 천원":
+                action_display_errors.append("thousand_amount_display")
+            if view_mod._fmt_dashboard_amount(105_600_000, "million") != "105.6 백만원":
+                action_display_errors.append("million_amount_display")
+            if view_mod._fmt_threshold_pct(45.3) != "45.3":
+                action_display_errors.append("readiness_threshold_precision")
+            if view_mod._fmt_threshold_pct(-12.5) != "-12.5":
+                action_display_errors.append("decline_threshold_precision")
+        except Exception as exc:
+            action_display_errors.append(f"{type(exc).__name__}: {exc}")
+        if action_display_errors:
+            results.append(_fail("Dashboard Lite today action amount and threshold display", "; ".join(action_display_errors)))
+        else:
+            results.append(_ok("Dashboard Lite today action amount and threshold display", "facts stay raw while primary and compact amount/threshold rendering uses the Dashboard unit policy"))
+
+        action_callback_errors: list[str] = []
+        try:
+            class _ActionCallbackStreamlit(_FakeStreamlit):
+                def __init__(self, *, click_once: bool):
+                    super().__init__(submit_sequence=[])
+                    self.click_once = click_once
+                    self.writes: list[str] = []
+
+                def write(self, value, *_args, **_kwargs):
+                    self.writes.append(str(value))
+
+                def button(self, _label, **kwargs):
+                    self._count("button")
+                    if self.click_once:
+                        self.click_once = False
+                        callback = kwargs.get("on_click")
+                        if callable(callback):
+                            callback(*tuple(kwargs.get("args") or ()))
+                    return False
+
+            old_view_st = view_mod.st
+            old_view_room_getter = view_mod.get_current_chat_room_id
+            try:
+                view_mod.get_current_chat_room_id = lambda: "room-action"
+                action_st = _ActionCallbackStreamlit(click_once=True)
+                view_mod.st = action_st
+                current_action = {
+                    "action_id": "a1", "priority": 1, "status": "긴급 부족",
+                    "target_name": "테스트제품", "target_code": "12345", "product_code": "12345",
+                    "major_purchase_vendor_code": "16789", "manufacturer_code": "11090",
+                    "drilldown_action": "품목별 재고부족현황", "drilldown_params": {},
+                }
+                current_cache = {"company_id": "company-action", "room_id": "room-action", "dashboard_event_id": "event-action", "params": {}}
+                view_mod._render_today_actions({"today_actions": [current_action], "filters": {}}, current_cache, render_mode="primary")
+                selected = action_st.session_state.get("__dashboard_selected_action_detail")
+                if not isinstance(selected, dict) or selected.get("product_code") != "12345" or selected.get("product_code") in {"16789", "11090"}:
+                    action_callback_errors.append("callback_selection_not_cached")
+                if "__dashboard_drilldown_request" in action_st.session_state or "__dashboard_drilldown_auto_run" in action_st.session_state:
+                    action_callback_errors.append("callback_legacy_handoff_created")
+                if not isinstance(action_st.session_state.get("__dashboard_lite_suppress_chat_autoscroll_once"), dict):
+                    action_callback_errors.append("callback_scroll_suppression_missing")
+                view_mod._render_selected_dashboard_action_detail(
+                    {"inventory": {"risk_detail_rows": [{"제품코드": "12345", "제품명": "코드계약제품", "위험상태": "긴급 부족"}]}},
+                    current_cache,
+                    render_mode="primary",
+                )
+                if action_st.calls.get("dataframe", 0) != 1:
+                    action_callback_errors.append("cached_action_detail_not_rendered")
+                legacy_action = {
+                    "rank": 1, "priority": "높음", "risk_grade": "조치 필요",
+                    "target": "테스트제품", "product_code": "00001", "stock_readiness_pct": 45.3,
+                    "shortage_amt": 100000, "recommended_action": "확인", "drill_down": "품목별 재고부족현황",
+                }
+                legacy_st = _ActionCallbackStreamlit(click_once=False)
+                view_mod.st = legacy_st
+                view_mod._render_today_actions({"today_actions": [legacy_action], "filters": {}}, current_cache, render_mode="chat")
+                if view_mod._safe_action_rank(legacy_action, 9) != 1:
+                    action_callback_errors.append("legacy_rank")
+                if "조치 필요" not in legacy_st.writes:
+                    action_callback_errors.append("legacy_status")
+                if "테스트제품" not in legacy_st.writes:
+                    action_callback_errors.append("legacy_target")
+                for action_case, expected in (
+                    ({"priority": 1}, 1), ({"priority": "1"}, 1), ({"priority": "높음", "rank": 2}, 2),
+                    ({"priority": ""}, 4), ({"priority": None}, 5), ({}, 6), ({"rank": "1"}, 1),
+                ):
+                    fallback = expected if expected > 1 else 9
+                    if view_mod._safe_action_rank(action_case, fallback) != expected:
+                        action_callback_errors.append(f"safe_rank={action_case!r}")
+            finally:
+                view_mod.st = old_view_st
+                view_mod.get_current_chat_room_id = old_view_room_getter
+        except Exception as exc:
+            action_callback_errors.append(f"{type(exc).__name__}: {exc}")
+        if action_callback_errors:
+            results.append(_fail("Dashboard Lite action callback and legacy snapshot", "; ".join(action_callback_errors)))
+        else:
+            results.append(_ok("Dashboard Lite action callback and legacy snapshot", "button callback stores only the active cache selection; legacy rank/priority fields render without a numeric conversion error"))
 
         panel_src = Path("app/ui/sims_panel.py").read_text(encoding="utf-8")
         entry_src = Path("app/ui/sims_entry.py").read_text(encoding="utf-8")
@@ -8624,6 +8738,351 @@ def run_basic_checks() -> list[CheckResult]:
         main_dashboard_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
         chat_middleware_dashboard_src = Path("app/ui/chat_middleware.py").read_text(encoding="utf-8")
         sales_trend_src = Path("app/services/analytics_sales_trend_service.py").read_text(encoding="utf-8")
+        drilldown_errors: list[str] = []
+        for required_text in (
+            "def _consume_dashboard_drilldown_request",
+            "room_mismatch",
+            "company_mismatch",
+            "stale_event",
+            "target_not_registered",
+            "__dashboard_drilldown_auto_run",
+        ):
+            if required_text not in panel_src:
+                drilldown_errors.append(f"panel_missing={required_text}")
+        analytics_src = Path("app/sims/views/analytics_views.py").read_text(encoding="utf-8")
+        for required_text in (
+            "def _dashboard_stock_shortage_handoff",
+            "def _apply_dashboard_stock_shortage_params",
+            "def _dashboard_stock_shortage_handoff_summary",
+            "dashboard_product_group_list",
+            "manufacturer_test_codes",
+            "io_gu_list",
+            "__dashboard_drilldown_auto_run",
+            "st.session_state.pop(\"__dashboard_drilldown_auto_run\"",
+        ):
+            if required_text not in analytics_src:
+                drilldown_errors.append(f"analytics_missing={required_text}")
+        sales_start = analytics_src.find("def render_sales_trend_analysis")
+        sales_end = analytics_src.find("\ndef ", sales_start + 1)
+        stock_start = analytics_src.find("def render_stock_shortage_analysis")
+        stock_end = analytics_src.find("\ndef ", stock_start + 1)
+        sales_source = analytics_src[sales_start:sales_end]
+        stock_source = analytics_src[stock_start:stock_end]
+        if "_apply_dashboard_stock_shortage_params" in sales_source or "dashboard_handoff" in sales_source:
+            drilldown_errors.append("sales_trend_handoff_location")
+        if "_apply_dashboard_stock_shortage_params(params, dashboard_handoff)" not in stock_source:
+            drilldown_errors.append("stock_shortage_params_apply_missing")
+        if "_dashboard_stock_shortage_handoff_summary(params)" not in stock_source:
+            drilldown_errors.append("stock_shortage_summary_missing")
+        if view_src.count('st.markdown("### 오늘의 조치")') != 1 or 'st.markdown("#### 오늘의 조치")' in action_view_source:
+            drilldown_errors.append("today_actions_heading_duplicate")
+        if "uuid.uuid4" in action_view_source:
+            drilldown_errors.append("action_widget_uuid")
+        for required_text in (
+            "def _dashboard_action_detail_selection",
+            "def _select_dashboard_action_detail",
+            "def _render_selected_dashboard_action_detail",
+            "on_click=_select_dashboard_action_detail",
+            "__dashboard_selected_action_detail",
+            "def _safe_action_rank",
+            "def _legacy_action_status",
+            "def _legacy_action_target",
+        ):
+            if required_text not in action_view_src:
+                drilldown_errors.append(f"action_callback_missing={required_text}")
+        if "on_click=_queue_dashboard_drilldown_request" in action_view_source or "__dashboard_drilldown_request" in action_view_source:
+            drilldown_errors.append("action_callback_uses_legacy_handoff")
+        if "if st.button(\"상세 보기\"" in action_view_source or "int(action.get('priority') or 0)" in action_view_source:
+            drilldown_errors.append("legacy_button_or_priority_cast")
+        panel_main_start = panel_src.find("def render_sims_main")
+        panel_main_end = panel_src.find("\ndef ", panel_main_start + 1)
+        panel_main_source = panel_src[panel_main_start:panel_main_end]
+        consume_at = panel_main_source.find("_consume_dashboard_drilldown_request(selected")
+        context_controls_at = panel_main_source.find("render_sims_context_controls()")
+        if consume_at < 0 or context_controls_at < 0 or consume_at > context_controls_at:
+            drilldown_errors.append("consume_after_panel_widget")
+        if consume_at >= 0 and 'ss["__sims_open"] =' in panel_main_source[consume_at:]:
+            drilldown_errors.append("panel_main_mutates_sims_open_after_consume")
+        for required_text in (
+            "stage=prepared", "stage=consumed", "stage=discarded", "widget_safe_phase=",
+            "state_prepare_failed", "unsafe_widget_phase",
+        ):
+            if required_text not in panel_src:
+                drilldown_errors.append(f"consume_log_missing={required_text}")
+        if "_consume_dashboard_drilldown_request" not in main_dashboard_src:
+            drilldown_errors.append("sidebar_preflight_missing")
+        for required_text in (
+            "__dashboard_lite_suppress_chat_autoscroll_once",
+            "[dashboard.scroll] reason=%s",
+            "suppress_consumed=True",
+        ):
+            if required_text not in main_dashboard_src:
+                drilldown_errors.append(f"scroll_suppression_missing={required_text}")
+        if re.search(r"(?m)^\s*logger\.(?:info|warning|exception)\(", main_dashboard_src):
+            drilldown_errors.append("main_undefined_logger_reference")
+        if "def _consume_dashboard_scroll_suppression" not in main_dashboard_src or "log.info(" not in main_dashboard_src:
+            drilldown_errors.append("scroll_suppression_existing_logger_not_used")
+        try:
+            main_tree = ast.parse(main_dashboard_src)
+            scroll_helper_node = next(
+                node for node in main_tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == "_consume_dashboard_scroll_suppression"
+            )
+
+            class _ScrollSuppressionSt:
+                session_state: dict[str, Any] = {}
+
+            class _ScrollSuppressionLog:
+                calls: list[tuple[Any, ...]] = []
+
+                def info(self, *args: Any, **_kwargs: Any) -> None:
+                    self.calls.append(args)
+
+            scroll_log = _ScrollSuppressionLog()
+            scroll_ns = {"st": _ScrollSuppressionSt, "log": scroll_log, "Any": Any}
+            exec(
+                compile(ast.fix_missing_locations(ast.Module(body=[scroll_helper_node], type_ignores=[])), "dashboard_scroll_helper", "exec"),
+                scroll_ns,
+            )
+            _ScrollSuppressionSt.session_state = {"__dashboard_lite_suppress_chat_autoscroll_once": {"reason": "action_detail"}}
+            if scroll_ns["_consume_dashboard_scroll_suppression"]("anchor-1") is not None:
+                drilldown_errors.append("scroll_suppression_not_consumed")
+            if "__dashboard_lite_suppress_chat_autoscroll_once" in _ScrollSuppressionSt.session_state or not scroll_log.calls:
+                drilldown_errors.append("scroll_suppression_runtime_log_missing")
+            if scroll_ns["_consume_dashboard_scroll_suppression"]("anchor-2") != "anchor-2":
+                drilldown_errors.append("scroll_suppression_new_message_blocked")
+        except Exception as exc:
+            drilldown_errors.append(f"scroll_suppression_runtime={type(exc).__name__}: {exc}")
+        if drilldown_errors:
+            results.append(_fail("Dashboard Lite action drill-down one-shot", "; ".join(drilldown_errors)))
+        else:
+            results.append(_ok("Dashboard Lite action drill-down one-shot", "deterministic action key, primary-only control, and room/company/event fail-closed consumer are present"))
+
+        action_scope_errors: list[str] = []
+        try:
+            analytics_views_mod = importlib.import_module("app.sims.views.analytics_views")
+            handoff_source = {
+                "stock_cd_list": ["00001", "00002"],
+                "vendor_group_list": ["VG1"],
+                "vendor_kind_list": ["VK1"],
+                "product_group_list": ["PG1", "PG2"],
+                "product_di_list": ["PD1", "PD2"],
+                "product_class_list": ["PC1", "PC2"],
+                "io_gu_list": ["001", "051"],
+                "manufacturer_test_codes": ["10047"],
+                "amount_display_unit": "million",
+                "product_code": "P100",
+            }
+            applied = analytics_views_mod._apply_dashboard_stock_shortage_params(
+                {"physic_cd": "P100", "product_group": "", "product_group_nm": ""},
+                {"target_params": handoff_source},
+            )
+            for key in (
+                "stock_cd_list", "vendor_group_list", "vendor_kind_list", "product_group_list", "product_di_list",
+                "product_class_list", "io_gu_list", "manufacturer_test_codes", "amount_display_unit",
+                "dashboard_product_group_list", "dashboard_product_di_list", "dashboard_product_class_list",
+                "dashboard_manufacturer_codes",
+            ):
+                source_key = {
+                    "dashboard_product_group_list": "product_group_list",
+                    "dashboard_product_di_list": "product_di_list",
+                    "dashboard_product_class_list": "product_class_list",
+                    "dashboard_manufacturer_codes": "manufacturer_test_codes",
+                }.get(key, key)
+                if applied.get(key) != handoff_source.get(source_key):
+                    action_scope_errors.append(f"handoff_missing={key}")
+            if applied.get("product_group") or applied.get("product_group_nm"):
+                action_scope_errors.append("multi_group_narrowed_by_legacy_widget")
+            summary = analytics_views_mod._dashboard_stock_shortage_handoff_summary(applied)
+            for token in ("재고위치", "제품구분", "제품분류", "입출고구분"):
+                if token not in summary:
+                    action_scope_errors.append(f"handoff_summary_missing={token}")
+        except Exception as exc:
+            action_scope_errors.append(f"{type(exc).__name__}: {exc}")
+        if action_scope_errors:
+            results.append(_fail("Dashboard Lite action drill-down scope handoff", "; ".join(action_scope_errors)))
+        else:
+            results.append(_ok("Dashboard Lite action drill-down scope handoff", "stock, product code-pair, vendor, IO, manufacturer, product-code, and amount-unit handoff params are retained"))
+
+        drilldown_runtime_errors: list[str] = []
+        try:
+            analytics_views_mod = importlib.import_module("app.sims.views.analytics_views")
+
+            class _FakeAnalyticsStreamlit(_FakeStreamlit):
+                def date_input(self, _label, value=None, **kwargs):
+                    return self.session_state.get(kwargs.get("key"), value)
+
+                def text_input(self, _label, value="", **kwargs):
+                    return self.session_state.get(kwargs.get("key"), value)
+
+                def multiselect(self, _label, options=None, default=None, **kwargs):
+                    key = kwargs.get("key")
+                    return self.session_state.get(key, default if default is not None else [])
+
+            def _fake_code_options(gcode: str) -> list[dict[str, str]]:
+                codes = {
+                    "0013": ["PG1", "PG2"],
+                    "0004": ["PD1", "PD2"],
+                    "0028": ["PC1", "PC2"],
+                    "0018": ["00001", "00002"],
+                }.get(str(gcode), [])
+                return [{"code": code, "name": code, "label": f"{code} - {code}"} for code in codes]
+
+            old_analytics_st = analytics_views_mod.st
+            old_sales_result = analytics_views_mod.get_sales_trend_result
+            old_stock_result = analytics_views_mod.get_stock_shortage_result
+            old_code_loader = analytics_views_mod._load_code_options
+            old_inline_header = analytics_views_mod._render_inline_analysis_header_enabled
+            sales_calls: list[dict[str, Any]] = []
+            stock_calls: list[dict[str, Any]] = []
+            try:
+                analytics_views_mod._load_code_options = _fake_code_options
+                analytics_views_mod._render_inline_analysis_header_enabled = lambda: False
+                analytics_views_mod.get_sales_trend_result = lambda params: sales_calls.append(dict(params)) or {"final": True, "type": "dataframe", "data": pd.DataFrame(), "meta": {}}
+                sales_st = _FakeAnalyticsStreamlit(submit_sequence=[True])
+                analytics_views_mod.st = sales_st
+                analytics_views_mod.render_sales_trend_analysis()
+                if len(sales_calls) != 1:
+                    drilldown_runtime_errors.append(f"sales_trend_calls={len(sales_calls)}")
+                if sales_calls and any(key.startswith("dashboard_") for key in sales_calls[0]):
+                    drilldown_runtime_errors.append("sales_trend_dashboard_scope_leak")
+
+                handoff_params = {
+                    "month_from": "202601", "evaluation_month": "202607", "stock_mode": "real",
+                    "stock_cd_list": ["00001", "00002"], "vendor_group_list": ["VG1"],
+                    "vendor_kind_list": ["VK1"], "product_group_list": ["PG1", "PG2"],
+                    "product_di_list": ["PD1", "PD2"], "product_class_list": ["PC1", "PC2"],
+                    "io_gu_list": ["001", "051"], "manufacturer_test_codes": ["10047", "10048"],
+                    "product_code": "P100", "amount_display_unit": "million",
+                }
+                stock_st = _FakeAnalyticsStreamlit(submit_sequence=[False])
+                stock_st.session_state["__dashboard_drilldown_auto_run"] = {
+                    "target_action": "품목별 재고부족현황", "target_params": handoff_params,
+                }
+                analytics_views_mod.st = stock_st
+                analytics_views_mod.get_stock_shortage_result = lambda params: stock_calls.append(dict(params)) or {"final": True, "type": "dataframe", "data": pd.DataFrame(), "meta": {}}
+                analytics_views_mod.render_stock_shortage_analysis()
+                if len(stock_calls) != 1:
+                    drilldown_runtime_errors.append(f"stock_shortage_calls={len(stock_calls)}")
+                captured = stock_calls[0] if stock_calls else {}
+                for key in (
+                    "stock_mode", "stock_cd_list", "vendor_group_list", "vendor_kind_list", "product_group_list",
+                    "product_di_list", "product_class_list", "io_gu_list", "manufacturer_test_codes",
+                    "dashboard_product_group_list", "dashboard_product_di_list", "dashboard_product_class_list",
+                    "dashboard_manufacturer_codes", "amount_display_unit",
+                ):
+                    if key not in captured:
+                        drilldown_runtime_errors.append(f"stock_runtime_missing={key}")
+                if captured.get("physic_cd") != "P100":
+                    drilldown_runtime_errors.append(f"stock_runtime_product_code={captured.get('physic_cd')!r}")
+                if "__dashboard_drilldown_auto_run" in stock_st.session_state:
+                    drilldown_runtime_errors.append("stock_runtime_auto_run_not_consumed")
+                if stock_st.calls.get("rerun", 0):
+                    drilldown_runtime_errors.append("stock_runtime_explicit_rerun")
+            finally:
+                analytics_views_mod.st = old_analytics_st
+                analytics_views_mod.get_sales_trend_result = old_sales_result
+                analytics_views_mod.get_stock_shortage_result = old_stock_result
+                analytics_views_mod._load_code_options = old_code_loader
+                analytics_views_mod._render_inline_analysis_header_enabled = old_inline_header
+        except Exception as exc:
+            drilldown_runtime_errors.append(f"{type(exc).__name__}: {exc}")
+        if drilldown_runtime_errors:
+            results.append(_fail("Dashboard Lite drill-down runtime placement", "; ".join(drilldown_runtime_errors)))
+        else:
+            results.append(_ok("Dashboard Lite drill-down runtime placement", "sales trend has no handoff dependency; stock shortage consumes one request, retains scope params, and makes one service call"))
+
+        drilldown_widget_lock_errors: list[str] = []
+        try:
+            panel_mod = importlib.import_module("app.ui.sims_panel")
+
+            class _WidgetLockedState(dict):
+                def __init__(self):
+                    super().__init__()
+                    self._locked_keys: set[str] = set()
+
+                def lock_widget(self, key: str) -> None:
+                    self._locked_keys.add(key)
+
+                def __setitem__(self, key, value):
+                    if key in self._locked_keys:
+                        raise RuntimeError(f"widget key locked: {key}")
+                    super().__setitem__(key, value)
+
+            class _FakePanelStreamlit:
+                def __init__(self, session_state):
+                    self.session_state = session_state
+
+            target_category = next(iter(panel_mod._CATEGORIES))
+            target_action = next(iter(panel_mod._CATEGORIES[target_category]["actions"]))
+
+            def _valid_request(*, company_id="company-1"):
+                return {
+                    "source": "dashboard",
+                    "request_token": "token-1",
+                    "source_room_id": "room-1",
+                    "company_id": company_id,
+                    "source_dashboard_event_id": "event-1",
+                    "target_category": target_category,
+                    "target_action": target_action,
+                    "target_params": {"product_code": "P100"},
+                }
+
+            old_panel_st = panel_mod.st
+            old_room_getter = panel_mod.get_current_chat_room_id
+            old_company_stamp = panel_mod._panel_current_company_stamp
+            try:
+                panel_mod.get_current_chat_room_id = lambda: "room-1"
+                panel_mod._panel_current_company_stamp = lambda: {"company_id": "company-1"}
+
+                normal_state = _WidgetLockedState()
+                normal_state["__dashboard_drilldown_request"] = _valid_request()
+                normal_state["__dashboard_lite_result"] = {"dashboard_event_id": "event-1"}
+                panel_mod.st = _FakePanelStreamlit(normal_state)
+                target = panel_mod._consume_dashboard_drilldown_request(None, widget_safe_phase=True)
+                if target != {"category": target_category, "action": target_action}:
+                    drilldown_widget_lock_errors.append("prepared_target")
+                for key, expected in (
+                    ("__sims_open", True),
+                    ("__sims_panel_active", True),
+                    ("__sims_run_flag", True),
+                ):
+                    if normal_state.get(key) is not expected:
+                        drilldown_widget_lock_errors.append(f"prepared_state={key}")
+                if "__dashboard_drilldown_request" in normal_state:
+                    drilldown_widget_lock_errors.append("request_not_consumed")
+                if not isinstance(normal_state.get("__dashboard_drilldown_auto_run"), dict):
+                    drilldown_widget_lock_errors.append("auto_run_missing")
+                normal_state.lock_widget("__sims_open")
+                try:
+                    normal_state["__sims_open"] = False
+                    drilldown_widget_lock_errors.append("widget_lock_not_enforced")
+                except RuntimeError:
+                    pass
+                if panel_mod._consume_dashboard_drilldown_request(target, widget_safe_phase=True) != target:
+                    drilldown_widget_lock_errors.append("one_shot_repeat")
+
+                invalid_state = _WidgetLockedState()
+                invalid_state["__dashboard_drilldown_request"] = _valid_request(company_id="other-company")
+                invalid_state["__dashboard_lite_result"] = {"dashboard_event_id": "event-1"}
+                invalid_state["__sims_open"] = False
+                invalid_state["__sims_panel_active"] = False
+                panel_mod.st = _FakePanelStreamlit(invalid_state)
+                panel_mod._consume_dashboard_drilldown_request({"category": "keep", "action": "keep"}, widget_safe_phase=True)
+                if invalid_state.get("__sims_open") or invalid_state.get("__sims_panel_active"):
+                    drilldown_widget_lock_errors.append("invalid_mutated_panel_state")
+                if "__dashboard_drilldown_request" in invalid_state:
+                    drilldown_widget_lock_errors.append("invalid_request_not_discarded")
+            finally:
+                panel_mod.st = old_panel_st
+                panel_mod.get_current_chat_room_id = old_room_getter
+                panel_mod._panel_current_company_stamp = old_company_stamp
+        except Exception as exc:
+            drilldown_widget_lock_errors.append(f"{type(exc).__name__}: {exc}")
+        if drilldown_widget_lock_errors:
+            results.append(_fail("Dashboard drill-down widget-safe consume", "; ".join(drilldown_widget_lock_errors)))
+        else:
+            results.append(_ok("Dashboard drill-down widget-safe consume", "request is prepared before the locked toggle, consumed once, and invalid requests leave panel state unchanged"))
         dashboard_multiselect_keys = (
             "__dashboard_lite_stock_labels",
             "__dashboard_lite_product_group_list",

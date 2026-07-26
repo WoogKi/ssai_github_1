@@ -1364,6 +1364,122 @@ def _current_action_payload_key(action: str) -> Optional[str]:
     }.get(str(action or "").strip())
 
 
+def _consume_dashboard_drilldown_request(
+    selected: Optional[Dict[str, str]],
+    *,
+    widget_safe_phase: bool = True,
+) -> Optional[Dict[str, str]]:
+    """Fail closed and consume one Dashboard drill-down request before panel widgets."""
+    ss = st.session_state
+    request = ss.get("__dashboard_drilldown_request")
+    if not isinstance(request, dict):
+        return selected
+    token_present = bool(str(request.get("request_token") or "").strip())
+    target_category = str(request.get("target_category") or "").strip()
+    target_action = str(request.get("target_action") or "").strip()
+    current_room_id = get_current_chat_room_id()
+    current_company_id = str(_panel_current_company_stamp().get("company_id") or "")
+    cache = ss.get("__dashboard_lite_result")
+    cache_event = str((cache or {}).get("dashboard_event_id") or "") if isinstance(cache, dict) else ""
+    reasons: list[str] = []
+    if request.get("source") != "dashboard":
+        reasons.append("invalid_source")
+    if not token_present:
+        reasons.append("missing_token")
+    if str(request.get("source_room_id") or "") != current_room_id:
+        reasons.append("room_mismatch")
+    if str(request.get("company_id") or "") != current_company_id:
+        reasons.append("company_mismatch")
+    if not cache_event or str(request.get("source_dashboard_event_id") or "") != cache_event:
+        reasons.append("stale_event")
+    if target_action not in (_CATEGORIES.get(target_category, {}).get("actions", {})):
+        reasons.append("target_not_registered")
+    target_params = request.get("target_params") or {}
+    if not str(target_params.get("product_code") or "").strip():
+        reasons.append("missing_target_code")
+    if not widget_safe_phase:
+        reasons.append("unsafe_widget_phase")
+
+    panel_open_before = bool(ss.get("__sims_open"))
+    if reasons:
+        ss.pop("__dashboard_drilldown_request", None)
+        ss.pop("__dashboard_drilldown_auto_run", None)
+        log.info(
+            "[dashboard.drilldown.consume] stage=discarded request_token_present=%s "
+            "target_action=%s panel_open_before=%s panel_open_after=%s "
+            "widget_safe_phase=%s discard_reason=%s auto_run=False result_push_expected=False",
+            token_present,
+            target_action,
+            panel_open_before,
+            bool(ss.get("__sims_open")),
+            widget_safe_phase,
+            ",".join(reasons),
+        )
+        return selected
+
+    target = {"category": target_category, "action": target_action}
+    state_keys = (
+        "__dashboard_drilldown_auto_run",
+        "__sims_selected",
+        "__sims_selected_snapshot",
+        "__sims_panel_active",
+        "__sims_open",
+        "__sims_run_flag",
+    )
+    missing = object()
+    previous = {key: ss.get(key, missing) for key in state_keys}
+    try:
+        # This function is called by the sidebar preflight before the toggle is created.
+        ss["__dashboard_drilldown_auto_run"] = dict(request)
+        ss["__sims_selected"] = target
+        ss["__sims_selected_snapshot"] = dict(target)
+        ss["__sims_panel_active"] = True
+        ss["__sims_open"] = True
+        ss["__sims_run_flag"] = True
+    except Exception:
+        for key, value in previous.items():
+            if value is missing:
+                ss.pop(key, None)
+            else:
+                ss[key] = value
+        ss.pop("__dashboard_drilldown_request", None)
+        log.warning(
+            "[dashboard.drilldown.consume] stage=discarded request_token_present=%s "
+            "target_action=%s panel_open_before=%s panel_open_after=%s "
+            "widget_safe_phase=%s discard_reason=state_prepare_failed "
+            "auto_run=False result_push_expected=False",
+            token_present,
+            target_action,
+            panel_open_before,
+            bool(ss.get("__sims_open")),
+            widget_safe_phase,
+        )
+        return selected
+
+    log.info(
+        "[dashboard.drilldown.consume] stage=prepared request_token_present=%s "
+        "target_action=%s panel_open_before=%s panel_open_after=%s "
+        "widget_safe_phase=%s discard_reason= auto_run=True result_push_expected=True",
+        token_present,
+        target_action,
+        panel_open_before,
+        bool(ss.get("__sims_open")),
+        widget_safe_phase,
+    )
+    ss.pop("__dashboard_drilldown_request", None)
+    log.info(
+        "[dashboard.drilldown.consume] stage=consumed request_token_present=%s "
+        "target_action=%s panel_open_before=%s panel_open_after=%s "
+        "widget_safe_phase=%s discard_reason= auto_run=True result_push_expected=True",
+        token_present,
+        target_action,
+        panel_open_before,
+        bool(ss.get("__sims_open")),
+        widget_safe_phase,
+    )
+    return target
+
+
 def _clear_current_action_payload(action: str) -> None:
     key = _current_action_payload_key(action)
     if key:
@@ -2593,9 +2709,12 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
     # 최종 여부 플래그는 payload 렌더링 시점에 다시 세팅
     ss["__sims_was_final"] = False
 
+    # Dashboard 요청은 패널 컨텍스트 위젯보다 먼저 소비한다. 일반 경로에서는
+    # 사이드바 preflight가 이미 소비하므로 여기서는 no-op이다.
+    selected = _consume_dashboard_drilldown_request(selected, widget_safe_phase=False)
+
     # 사이드 컨트롤(열림/닫힘 등) — 필요 시 보이기
     render_sims_context_controls()
-
     if not selected or not selected.get("category") or not selected.get("action"):
         st.info("좌측에서 카테고리와 작업을 선택하세요.")
         return

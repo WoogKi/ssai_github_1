@@ -64,6 +64,8 @@ DASHBOARD_LITE_SESSION_KEYS = (
     "__dashboard_lite_exclude_product_di_list",
     "__dashboard_lite_exclude_product_class_list",
     "__dashboard_lite_risk_detail_excel_cache",
+    "__dashboard_selected_action_detail",
+    "__dashboard_lite_suppress_chat_autoscroll_once",
 )
 
 DASHBOARD_LITE_OPTION_CACHE_KEY = "__dashboard_lite_scope_options"
@@ -126,7 +128,7 @@ def clear_dashboard_lite_active_result(session_state: Any) -> list[str]:
     removed: list[str] = []
     for key in list(session_state.keys()):
         text = str(key)
-        if text == "__dashboard_lite_result" or text.startswith("__dashboard_lite_risk_detail_"):
+        if text in {"__dashboard_lite_result", "__dashboard_selected_action_detail", "__dashboard_lite_suppress_chat_autoscroll_once"} or text.startswith("__dashboard_lite_risk_detail_"):
             session_state.pop(key, None)
             removed.append(text)
     return removed
@@ -737,48 +739,204 @@ def _render_turnover(facts: dict[str, Any]) -> None:
         st.caption(str(turnover.get("definition")))
 
 
-def _render_today_actions(facts: dict[str, Any]) -> None:
-    actions = facts.get("today_actions") or []
-    st.markdown("#### 오늘 우선 확인할 제품 10개")
-    st.caption(
-        "선택한 재고위치와 제품 제외조건을 적용한 결과입니다. "
-        "재고준비율 98% 미만 제품 중 부족 영향이 큰 순서로 표시합니다."
+def _dashboard_drilldown_params(cache: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+    """Build the small, code-only handoff payload for an existing SIMS view."""
+    source = dict(cache.get("params") or {})
+    allowed = (
+        "month_from", "month_to", "evaluation_month", "stock_mode", "stock_cd_list",
+        "vendor_group_list", "vendor_kind_list", "product_group_list", "product_di_list",
+        "product_class_list", "io_gu_list", "amount_display_unit", "manufacturer_test_codes",
     )
+    params = {key: source.get(key) for key in allowed if source.get(key) not in (None, "", [])}
+    params.update(dict(action.get("drilldown_params") or {}))
+    return params
+
+
+def _build_dashboard_drilldown_request(cache: dict[str, Any], action: dict[str, Any]) -> dict[str, Any] | None:
+    """Build a compact request while rendering; the button callback only stores it."""
+    target_action = str(action.get("drilldown_action") or action.get("drill_down") or "").strip()
+    target_code = str(action.get("target_code") or action.get("product_code") or "").strip()
+    room_id = get_current_chat_room_id()
+    company_id = str(cache.get("company_id") or "").strip()
+    event_id = str(cache.get("dashboard_event_id") or "").strip()
+    if not target_action or not target_code or not room_id or not company_id or not event_id:
+        return None
+    params = _dashboard_drilldown_params(cache, action)
+    params["product_code"] = target_code
+    return {
+        "request_token": str(uuid.uuid4()),
+        "source": "dashboard",
+        "source_dashboard_event_id": event_id,
+        "source_room_id": room_id,
+        "company_id": company_id,
+        "target_category": "분석/KPI",
+        "target_action": target_action,
+        "target_params": params,
+        "created_reason": str(action.get("cause_type") or ""),
+        "consume_once": True,
+    }
+
+
+def _queue_dashboard_drilldown_request(request: dict[str, Any] | None) -> None:
+    """Streamlit button callback: queue one validated request and nothing else."""
+    if not isinstance(request, dict):
+        return
+    target_action = str(request.get("target_action") or "").strip()
+    target_params = request.get("target_params") or {}
+    target_code = str(target_params.get("product_code") or "").strip() if isinstance(target_params, dict) else ""
+    required = (
+        request.get("request_token"), request.get("source_dashboard_event_id"),
+        request.get("source_room_id"), request.get("company_id"), target_action, target_code,
+    )
+    if not all(str(value or "").strip() for value in required):
+        return
+    st.session_state["__dashboard_drilldown_request"] = dict(request)
+    log.info(
+        "[dashboard.drilldown.request] stage=callback_queued request_token_present=True "
+        "source_event_present=True source_room_present=True target_action=%s target_code_present=True",
+        target_action,
+    )
+
+
+def _dashboard_action_detail_selection(cache: dict[str, Any], action: dict[str, Any]) -> dict[str, str] | None:
+    """Build a local-only selection for the active Dashboard cache."""
+    room_id = get_current_chat_room_id()
+    company_id = str(cache.get("company_id") or "").strip()
+    event_id = str(cache.get("dashboard_event_id") or "").strip()
+    action_id = str(action.get("action_id") or "").strip()
+    product_code = str(action.get("target_code") or action.get("product_code") or "").strip()
+    if not all((room_id, company_id, event_id, action_id, product_code)):
+        return None
+    return {
+        "room_id": room_id,
+        "company_id": company_id,
+        "dashboard_event_id": event_id,
+        "action_id": action_id,
+        "product_code": product_code,
+        "risk_detail_instance_key": _risk_detail_instance_key(cache),
+    }
+
+
+def _request_dashboard_scroll_suppression(reason: str) -> None:
+    """Suppress one existing chat-bottom scroll for a local Dashboard interaction."""
+    st.session_state["__dashboard_lite_suppress_chat_autoscroll_once"] = {"reason": str(reason or "local_filter")}
+    log.info(
+        "[dashboard.scroll] reason=%s suppress_requested=True suppress_consumed=False message_appended=False scroll_to_bottom=False",
+        str(reason or "local_filter"),
+    )
+
+
+def _select_dashboard_action_detail(selection: dict[str, str] | None) -> None:
+    """Callback only: select an existing cached row and request its local detail view."""
+    if not isinstance(selection, dict):
+        return
+    required = ("room_id", "company_id", "dashboard_event_id", "action_id", "product_code", "risk_detail_instance_key")
+    if not all(str(selection.get(key) or "").strip() for key in required):
+        return
+    st.session_state["__dashboard_selected_action_detail"] = dict(selection)
+    st.session_state[f"__dashboard_lite_risk_detail_open_request::{selection['risk_detail_instance_key']}"] = {
+        "action_id": str(selection["action_id"]),
+        "product_code": str(selection["product_code"]),
+    }
+    _request_dashboard_scroll_suppression("action_detail")
+    log.info(
+        "[dashboard.action_detail] stage=callback_selected room_match=True company_match=True event_match=True "
+        "action_id_present=True product_code_present=True detail_match_count=0 db_query_count=0 chat_push_count=0 suppress_autoscroll=True"
+    )
+
+
+def _safe_action_rank(action: dict[str, Any], fallback_index: int) -> int:
+    """Read current numeric priorities and legacy rank-based Dashboard actions safely."""
+    for key in ("priority", "rank"):
+        value = action.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            if value not in (None, ""):
+                return int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+    return int(fallback_index)
+
+
+def _legacy_action_status(action: dict[str, Any]) -> str:
+    status = str(action.get("status") or action.get("risk_grade") or "").strip()
+    if status:
+        return status
+    priority = action.get("priority")
+    if isinstance(priority, str) and priority.strip() and not priority.strip().isdigit():
+        return priority.strip()
+    return "-"
+
+
+def _legacy_action_target(action: dict[str, Any]) -> str:
+    return str(
+        action.get("target_name") or action.get("product_name") or action.get("target")
+        or action.get("product_code") or "-"
+    )
+
+
+def _render_today_actions(facts: dict[str, Any], cache: dict[str, Any], *, render_mode: str) -> None:
+    actions = facts.get("today_actions") or []
+    st.caption("상태 · 근거 · 판정 기준 · 권장 조치 순서로 최대 10건을 표시합니다.")
     if not actions:
         st.success("현재 기본 규칙으로 조치가 필요한 항목이 없습니다.")
-    else:
-        display_rows = []
-        for action in actions[:10]:
-            display_rows.append(
-                {
-                    "우선순위": int(action.get("rank") or len(display_rows) + 1),
-                    "위험등급": action.get("risk_grade") or action.get("priority") or "",
-                    "제품코드": action.get("product_code") or "",
-                    "제품명": action.get("product_name") or action.get("target") or "",
-                    "제약사명": action.get("manufacturer_name") or "",
-                    "현재 사용 가능 재고": float(action.get("current_stock_qty") or 0),
-                    "당월 잔여예상수요": float(action.get("remaining_expected_demand_qty") or 0),
-                    "부족예상수량": float(action.get("shortage_qty") or 0),
-                    "부족예상금액": float(action.get("shortage_amt") or 0),
-                    "재고준비율": float(action.get("stock_readiness_pct") or 0),
-                    "권장조치": action.get("recommended_action") or "",
-                    "상세표": action.get("drill_down") or "",
-                }
-            )
-        st.dataframe(
-            pd.DataFrame(display_rows),
-            width="stretch",
-            height=388,
-            hide_index=True,
-            column_config={
-                "우선순위": st.column_config.NumberColumn("우선순위", format="%d"),
-                "현재 사용 가능 재고": st.column_config.NumberColumn("현재 사용 가능 재고", format="%,.0f"),
-                "당월 잔여예상수요": st.column_config.NumberColumn("당월 잔여예상수요", format="%,.0f"),
-                "부족예상수량": st.column_config.NumberColumn("부족예상수량", format="%,.0f"),
-                "부족예상금액": st.column_config.NumberColumn("부족예상금액", format="%,.0f"),
-                "재고준비율": st.column_config.NumberColumn("재고준비율", format="%.1f%%"),
-            },
-        )
+        return
+    interactive = render_mode == "primary"
+    event_id = str(cache.get("dashboard_event_id") or "")
+    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
+    headers = st.columns([0.5, 1.1, 1.8, 2.2, 2.0, 2.0, 1.0])
+    for column, label in zip(headers, ("순위", "상태", "대상", "판단 근거", "판정 기준", "권장 조치", "상세")):
+        with column:
+            st.caption(label)
+    for fallback_index, action in enumerate(actions[:10], start=1):
+        if not isinstance(action, dict):
+            action = {}
+        cols = st.columns([0.5, 1.1, 1.8, 2.2, 2.0, 2.0, 1.0])
+        with cols[0]:
+            st.markdown(f"**{_safe_action_rank(action, fallback_index)}**")
+        with cols[1]:
+            st.write(_legacy_action_status(action))
+        with cols[2]:
+            st.write(_legacy_action_target(action))
+        with cols[3]:
+            value = action.get("evidence_value")
+            unit = str(action.get("evidence_unit") or "")
+            evidence = str(action.get("evidence_label") or "")
+            if value is not None and unit == "원":
+                evidence = f"{evidence} {_fmt_dashboard_amount(value, amount_unit)}"
+            if not evidence and action.get("shortage_amt") not in (None, ""):
+                evidence = _fmt_dashboard_amount(action.get("shortage_amt"), amount_unit)
+            st.caption(evidence or str(action.get("evidence") or "-"))
+        with cols[4]:
+            threshold_label = str(action.get("threshold_label") or "")
+            threshold_value = action.get("threshold_value")
+            cause_type = str(action.get("cause_type") or "")
+            if threshold_value is None and action.get("stock_readiness_pct") not in (None, ""):
+                threshold = f"재고준비율 {_fmt_threshold_pct(action.get('stock_readiness_pct'))}%"
+            elif threshold_value is None:
+                threshold = threshold_label or "-"
+            elif cause_type in {"stock_shortage", "sales_decline"}:
+                threshold = f"{threshold_label} {_fmt_threshold_pct(threshold_value)}%"
+            elif cause_type == "overstock_candidate":
+                threshold = f"{threshold_label} {_fmt_number(threshold_value)}"
+            else:
+                threshold = f"{threshold_label} {_fmt_number(threshold_value)}".strip()
+            st.caption(threshold)
+        with cols[5]:
+            st.caption(str(action.get("recommended_action") or "-"))
+        with cols[6]:
+            selection = _dashboard_action_detail_selection(cache, action) if interactive else None
+            if interactive and selection and callable(getattr(st, "button", None)):
+                action_id = str(selection["action_id"])
+                st.button(
+                    "상세 보기",
+                    key=f"__dashboard_lite_action_drilldown::{event_id}::{action_id}",
+                    on_click=_select_dashboard_action_detail,
+                    args=(selection,),
+                )
+            elif not interactive and bool(action.get("drilldown_action") or action.get("drill_down")):
+                st.caption("상세는 현재 조회에서만 가능")
 
 
 def _risk_detail_instance_key(cache: dict[str, Any]) -> str:
@@ -796,6 +954,57 @@ def _risk_detail_instance_key(cache: dict[str, Any]) -> str:
         )
     )
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
+
+
+def _selected_dashboard_action_detail(cache: dict[str, Any], *, render_mode: str) -> dict[str, str] | None:
+    """Return only a selection owned by the current primary Dashboard result."""
+    selected = st.session_state.get("__dashboard_selected_action_detail")
+    if render_mode != "primary" or not isinstance(selected, dict):
+        return None
+    room_id = get_current_chat_room_id()
+    matches = {
+        "room_match": bool(room_id and room_id == str(selected.get("room_id") or "") == str(cache.get("room_id") or "")),
+        "company_match": bool(str(selected.get("company_id") or "") and str(selected.get("company_id") or "") == str(cache.get("company_id") or "")),
+        "event_match": bool(str(selected.get("dashboard_event_id") or "") and str(selected.get("dashboard_event_id") or "") == str(cache.get("dashboard_event_id") or "")),
+    }
+    action_id_present = bool(str(selected.get("action_id") or "").strip())
+    product_code_present = bool(str(selected.get("product_code") or "").strip())
+    if not (all(matches.values()) and action_id_present and product_code_present):
+        st.session_state.pop("__dashboard_selected_action_detail", None)
+        log.info(
+            "[dashboard.action_detail] stage=discarded room_match=%s company_match=%s event_match=%s "
+            "action_id_present=%s product_code_present=%s detail_match_count=0 db_query_count=0 chat_push_count=0 suppress_autoscroll=False",
+            matches["room_match"], matches["company_match"], matches["event_match"], action_id_present, product_code_present,
+        )
+        return None
+    return {key: str(value or "") for key, value in selected.items()}
+
+
+def _render_selected_dashboard_action_detail(facts: dict[str, Any], cache: dict[str, Any], *, render_mode: str) -> None:
+    """Render selected action rows from the current in-memory Dashboard facts only."""
+    selected = _selected_dashboard_action_detail(cache, render_mode=render_mode)
+    if not selected:
+        return
+    rows = list(((facts.get("inventory") or {}).get("risk_detail_rows") or []))
+    product_code = str(selected["product_code"]).strip()
+    matched_rows = [row for row in rows if isinstance(row, dict) and str(row.get("제품코드") or "").strip() == product_code]
+    log.info(
+        "[dashboard.action_detail] stage=rendered room_match=True company_match=True event_match=True "
+        "action_id_present=True product_code_present=True detail_match_count=%s db_query_count=0 chat_push_count=0 suppress_autoscroll=False",
+        len(matched_rows),
+    )
+    st.markdown("#### 선택 조치 상세")
+    if not matched_rows:
+        st.info("현재 Dashboard 상세자료에서 해당 품목을 찾지 못했습니다.")
+        return
+    display_columns = [
+        "제품코드", "제품명", "위험상태", "위험사유", "현재재고수량", "위험보정잔여예상수요",
+        "위험보정부족예상수량", "위험보정부족예상금액", "위험보정재고준비율", "주요매입처명",
+        "수요급증여부", "위험보정기준", "권장 조치",
+    ]
+    display = pd.DataFrame(matched_rows)
+    display = display[[column for column in display_columns if column in display.columns]]
+    st.dataframe(display, width="stretch", hide_index=True)
 
 
 def _clear_stale_risk_detail_export_cache(instance_key: str) -> None:
@@ -906,7 +1115,20 @@ def _render_risk_detail(
             detail_rows_available,
         )
         return
-    show_detail = toggle("상세표 보기", value=False, key=f"__dashboard_lite_risk_detail_toggle::{instance_key}")
+    toggle_key = f"__dashboard_lite_risk_detail_toggle::{instance_key}"
+    search_key = f"__dashboard_lite_risk_detail_search::{instance_key}"
+    open_request = st.session_state.pop(f"__dashboard_lite_risk_detail_open_request::{instance_key}", None)
+    if isinstance(open_request, dict):
+        selected_code = str(open_request.get("product_code") or "").strip()
+        st.session_state[toggle_key] = True
+        if selected_code:
+            st.session_state[search_key] = selected_code
+    show_detail = toggle(
+        "상세표 보기",
+        key=toggle_key,
+        on_change=_request_dashboard_scroll_suppression,
+        args=("risk_detail_toggle",),
+    )
     if not show_detail:
         log.info(
             "[dashboard.risk_detail.render] render_mode=primary source_rows=%s detail_rows_available=%s toggle_rendered=True export_controls_allowed=False",
@@ -925,15 +1147,15 @@ def _render_risk_detail(
     vendor_options, vendor_labels = _risk_detail_vendor_options(rows)
     filter_cols = st.columns((1, 2, 1, 1, 2))
     with filter_cols[0]:
-        risk_status = st.selectbox("위험상태", ["전체 위험", "긴급 부족", "부족 주의"], key=f"__dashboard_lite_risk_detail_status::{instance_key}")
+        risk_status = st.selectbox("위험상태", ["전체 위험", "긴급 부족", "부족 주의"], key=f"__dashboard_lite_risk_detail_status::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with filter_cols[1]:
-        vendor_key = st.selectbox("주요매입처", vendor_options, format_func=lambda value: vendor_labels.get(value, "매입처 미확인"), key=f"__dashboard_lite_risk_detail_vendor::{instance_key}")
+        vendor_key = st.selectbox("주요매입처", vendor_options, format_func=lambda value: vendor_labels.get(value, "매입처 미확인"), key=f"__dashboard_lite_risk_detail_vendor::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with filter_cols[2]:
-        surge_filter = st.selectbox("수요급증", ["전체", "수요급증", "일반"], key=f"__dashboard_lite_risk_detail_surge::{instance_key}")
+        surge_filter = st.selectbox("수요급증", ["전체", "수요급증", "일반"], key=f"__dashboard_lite_risk_detail_surge::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with filter_cols[3]:
-        include_zero_amount = st.toggle("금액 0 포함", value=True, key=f"__dashboard_lite_risk_detail_zero::{instance_key}")
+        include_zero_amount = st.toggle("금액 0 포함", value=True, key=f"__dashboard_lite_risk_detail_zero::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with filter_cols[4]:
-        search_text = st.text_input("제품 검색", key=f"__dashboard_lite_risk_detail_search::{instance_key}")
+        search_text = st.text_input("제품 검색", key=search_key, on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
 
     filtered, filter_summary, elapsed_ms = filter_dashboard_risk_detail_rows(
         rows,
@@ -943,7 +1165,7 @@ def _render_risk_detail(
         include_zero_amount=include_zero_amount,
         search_text=search_text,
     )
-    display_limit = st.selectbox("화면 표시 행 수", [100, 300, 500], index=0, key=f"__dashboard_lite_risk_detail_limit::{instance_key}")
+    display_limit = st.selectbox("화면 표시 행 수", [100, 300, 500], index=0, key=f"__dashboard_lite_risk_detail_limit::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     display = filtered.head(int(display_limit)).copy()
     display.insert(0, "순번", range(1, len(display) + 1))
     display_columns = [
@@ -1641,7 +1863,8 @@ def _render_dashboard_facts(
     _render_turnover(facts)
 
     st.markdown("### 오늘의 조치")
-    _render_today_actions(facts)
+    _render_today_actions(facts, cache or {}, render_mode=render_mode)
+    _render_selected_dashboard_action_detail(facts, cache or {}, render_mode=render_mode)
     _render_risk_detail(facts, cache or {}, render_mode=render_mode)
 
 def _render_dashboard_result_in_primary_area(cache: dict[str, Any]) -> None:
@@ -1838,6 +2061,9 @@ def render_dashboard_lite() -> dict[str, Any]:
     }
     event_id = str(uuid.uuid4())
     result_cache["dashboard_event_id"] = event_id
+    for action in facts.get("today_actions") or []:
+        if isinstance(action, dict):
+            action["source_dashboard_event_id"] = event_id
     st.session_state["__dashboard_lite_result"] = result_cache
     _mark_dashboard_room_title()
     return {
