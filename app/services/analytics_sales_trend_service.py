@@ -514,6 +514,84 @@ def _add_dashboard_code_pair_filter(
     return True
 
 
+_IO_GU_SCOPE_PARAM_KEYS = (
+    "io_gu",
+    "io_gu_list",
+    "io_gu_pairs",
+    "dashboard_io_gu_list",
+    "sales_io_gu_list",
+    "purchase_io_gu_list",
+)
+
+
+def _sales_io_scope(params: Dict[str, Any]) -> tuple[str, list[str]]:
+    """Return the sales-only IO scope without numeric coercion or prefix expansion."""
+    if "io_gu_list" not in params:
+        return "legacy_broad_fallback", []
+
+    raw_values = params.get("io_gu_list")
+    if raw_values is None:
+        return "explicit_all", []
+    if isinstance(raw_values, str):
+        values = [raw_values]
+    elif isinstance(raw_values, (list, tuple, set)):
+        values = list(raw_values)
+    else:
+        raise ValueError("io_gu_list 업무코드는 문자열 또는 문자열 목록이어야 합니다.")
+
+    codes: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("io_gu_list 업무코드는 문자열이어야 합니다.")
+        code = normalize_business_code(value)
+        if code and code not in seen:
+            codes.append(code)
+            seen.add(code)
+    return ("exact_selected", codes) if codes else ("explicit_all", [])
+
+
+def _add_sales_io_scope_filter(
+    clauses: list[str],
+    params: Dict[str, Any],
+    *,
+    gcode_sql: str,
+    tcode_sql: str,
+) -> tuple[str, int]:
+    """Bind selected 0012 Tcodes exactly; retain legacy broad scope only when absent."""
+    mode, codes = _sales_io_scope(params)
+    params["_sales_io_filter_mode"] = mode
+    params["_sales_io_selected_count"] = len(codes)
+    if mode != "exact_selected":
+        return mode, 0
+
+    params["sales_io_gu_gcode"] = "0012"
+    names: list[str] = []
+    for index, code in enumerate(codes):
+        key = f"sales_io_gu_{index}"
+        params[key] = code
+        names.append(f"%({key})s")
+    _add_filter(
+        clauses,
+        f"({gcode_sql} = %(sales_io_gu_gcode)s AND {tcode_sql} IN ({', '.join(names)}))",
+    )
+    return mode, len(codes)
+
+
+def _copy_current_stock_params_without_io_scope(params: Dict[str, Any]) -> tuple[Dict[str, Any], int]:
+    """Keep stock balances independent from demand/sales IO scope aliases."""
+    out = dict(params or {})
+    selected_count = 0
+    for key in _IO_GU_SCOPE_PARAM_KEYS:
+        value = out.get(key)
+        if isinstance(value, str):
+            selected_count += int(bool(value.strip()))
+        elif isinstance(value, (list, tuple, set)):
+            selected_count += sum(1 for item in value if isinstance(item, str) and item.strip())
+        out.pop(key, None)
+    return out, selected_count
+
+
 def _build_filters(params: Dict[str, Any]) -> str:
     clauses: list[str] = []
 
@@ -523,22 +601,15 @@ def _build_filters(params: Dict[str, Any]) -> str:
     if clean_text(params.get("date_to")):
         _add_filter(clauses, "Out_Put.Rd12_Out_YyMmDd <= %(date_to)s")
 
-    # 매출 추세 1차 기본: 정상출고 + 출고반품
-    # 5xx = 정상출고(+), 6xx = 출고반품(-)
-    sales_prefixes = params.get("sales_prefixes")
-    if isinstance(sales_prefixes, (list, tuple, set)):
-        vals = [str(x).strip() for x in sales_prefixes if str(x).strip()]
-    else:
-        vals = []
-
-    if vals:
-        names = []
-        for i, v in enumerate(vals):
-            key = f"sales_prefix_{i}"
-            params[key] = v[:1]
-            names.append(f"%({key})s")
-        _add_filter(clauses, f"LEFT(Out_Put.Rd12_Io_Gu, 1) IN ({', '.join(names)})")
-    else:
+    # Explicit Dashboard/KPI selection is exact Tcode scope.  Historical
+    # callers without io_gu_list retain the former broad 5xx/6xx behavior.
+    sales_io_mode, _ = _add_sales_io_scope_filter(
+        clauses,
+        params,
+        gcode_sql="Out_Put.Rd12_Io_Gu_Gcode",
+        tcode_sql="Out_Put.Rd12_Io_Gu",
+    )
+    if sales_io_mode != "exact_selected":
         _add_filter(clauses, "LEFT(Out_Put.Rd12_Io_Gu, 1) IN ('5', '6')")
 
     # 제품
@@ -1033,6 +1104,15 @@ def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> t
     if clean_text(bind_params.get("month_to")):
         _add_filter(clauses, f"M.{p}_Stock_YyMm <= %(month_to)s")
 
+    sales_io_mode, _ = _add_sales_io_scope_filter(
+        clauses,
+        bind_params,
+        gcode_sql=f"M.{p}_Io_Gu_Gcode",
+        tcode_sql=f"M.{p}_Io_Gu",
+    )
+    # Monthly stock tables contain inbound and outbound movements together.
+    # Exact selection narrows the requested Tcodes; this guard preserves the
+    # sales-source direction and prevents selected inbound Tcodes entering sales.
     _add_filter(clauses, f"LEFT(M.{p}_Io_Gu, 1) IN ({spec['out_prefixes']})")
 
     if clean_text(bind_params.get("physic_cd")):
@@ -1447,6 +1527,7 @@ OPTION (RECOMPILE)
         "elapsed_ms": elapsed_ms,
     }
     sales_df.attrs.update(perf)
+    log.info("[analytics.sales_io_scope] filter_mode=%s selected_count=%s gcode_applied=%s direction_guard_applied=True prefix_expansion=False", sales_bind.get("_sales_io_filter_mode", "legacy_broad_fallback"), int(sales_bind.get("_sales_io_selected_count") or 0), sales_bind.get("_sales_io_filter_mode") == "exact_selected")
     log.info("[analytics.sales_trend.dashboard_bundle] source_mode=%s source_scan_mode=%s raw_bundle_rows=%s sales_rows=%s purchase_source_rows=%s purchase_source_sql_included=True sql_ms=%s sales_finalize_ms=%s purchase_min_frame_ms=%s elapsed_ms=%s", source_mode, perf["source_scan_mode"], raw_bundle_rows, len(sales_df), len(purchase_df), perf["sql_ms"], sales_finalize_ms, purchase_min_frame_ms, elapsed_ms)
     return {"sales_df": sales_df, "purchase_vendor_df": purchase_df, "perf": perf}
 
@@ -3798,9 +3879,6 @@ def _load_product_current_month_stock_movements(
         if real_mode
         else "CAST(ISNULL(T.Rd12_Quantity, 0) AS FLOAT)"
     )
-    in_exclude = ("2",) if real_mode else ("3",)
-    out_exclude = ("7",) if real_mode else ("8",)
-
     stock_codes = _clean_list_param(stock_cd_list)
     if not stock_codes and clean_text(stock_cd):
         stock_codes = [clean_text(stock_cd)]
@@ -3819,6 +3897,7 @@ def _load_product_current_month_stock_movements(
         bind_params: Dict[str, Any] = {
             "date_from": date_from,
             "date_to": date_to,
+            "io_gu_gcode": "0012",
         }
         placeholders: list[str] = []
         for i, cd in enumerate(batch_codes):
@@ -3828,9 +3907,6 @@ def _load_product_current_month_stock_movements(
 
         in_stock_filter = _stock_filter("T.Rd11_Stock_Cd", bind_params, "in")
         out_stock_filter = _stock_filter("T.Rd12_Stock_Cd", bind_params, "out")
-        in_exclude_sql = ", ".join(f"'{x}'" for x in in_exclude)
-        out_exclude_sql = ", ".join(f"'{x}'" for x in out_exclude)
-
         sql = f"""
 WITH InAgg AS (
     SELECT
@@ -3841,7 +3917,7 @@ WITH InAgg AS (
       AND NULLIF(LTRIM(RTRIM({in_date_field})), '') IS NOT NULL
       AND {in_date_field} >= %(date_from)s
       AND {in_date_field} <= %(date_to)s
-      AND LEFT(LTRIM(RTRIM(T.Rd11_Io_Gu)), 1) NOT IN ({in_exclude_sql})
+      AND T.Rd11_Io_Gu_Gcode = %(io_gu_gcode)s
       {in_stock_filter}
     GROUP BY LTRIM(RTRIM(T.Rd11_Physic_Cd))
 ),
@@ -3854,7 +3930,7 @@ OutAgg AS (
       AND NULLIF(LTRIM(RTRIM({out_date_field})), '') IS NOT NULL
       AND {out_date_field} >= %(date_from)s
       AND {out_date_field} <= %(date_to)s
-      AND LEFT(LTRIM(RTRIM(T.Rd12_Io_Gu)), 1) NOT IN ({out_exclude_sql})
+      AND T.Rd12_Io_Gu_Gcode = %(io_gu_gcode)s
       {out_stock_filter}
     GROUP BY LTRIM(RTRIM(T.Rd12_Physic_Cd))
 )
@@ -3896,7 +3972,7 @@ def _load_product_current_stock(
     policy_date: Any = None,
     stock_cd_list: Any = None,
     stock_cd: Any = None,
-    io_gu_list: Any = None,
+    ignored_io_gu_count: int = 0,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황의 현재고를 월집계 누계로 가져온다.
@@ -3912,8 +3988,7 @@ def _load_product_current_stock(
     if not stock_codes and clean_text(stock_cd):
         stock_codes = [clean_text(stock_cd)]
     stock_codes = [clean_text(x) for x in stock_codes if clean_text(x)]
-    io_gu_codes = _clean_list_param(io_gu_list)
-    batch_plan = _stock_query_batch_plan(stock_cd_count=len(stock_codes), io_gu_count=len(io_gu_codes))
+    batch_plan = _stock_query_batch_plan(stock_cd_count=len(stock_codes), io_gu_count=0)
 
     spec = _stock_current_monthly_spec(stock_mode)
     table = spec["table"]
@@ -3950,6 +4025,9 @@ def _load_product_current_stock(
         df.attrs["stock_query_elapsed_sec"] = elapsed
         df.attrs["stock_sql_ms"] = int(sql_elapsed * 1000)
         df.attrs["stock_aggregate_ms"] = int(aggregate_elapsed * 1000)
+        df.attrs["current_stock_io_filter_applied"] = False
+        df.attrs["current_stock_io_tcode_parameter_count"] = 0
+        df.attrs["selected_io_count_ignored"] = max(0, int(ignored_io_gu_count or 0))
         df.attrs.update(batch_plan)
         return df
 
@@ -3989,16 +4067,6 @@ def _load_product_current_stock(
                 stock_names.append(f"%({key})s")
             stock_filter_sql = f"\n      AND M.{pfx}_Stock_Cd IN ({', '.join(stock_names)})"
         bind_params["io_gu_gcode"] = "0012"
-        io_gu_filter_sql = ""
-        if io_gu_codes:
-            io_names: list[str] = []
-            for i, code in enumerate(io_gu_codes):
-                key = f"io_gu_{i}"
-                bind_params[key] = code
-                io_names.append(f"%({key})s")
-            io_gu_filter_sql = (
-                f"\n      AND M.{pfx}_Io_Gu IN ({', '.join(io_names)})"
-            )
 
         if len(bind_params) >= SQL_SERVER_PARAMETER_LIMIT:
             raise ValueError("stock query parameter count reached the SQL Server limit")
@@ -4031,7 +4099,6 @@ WITH StockAgg AS (
       AND M.{pfx}_Stock_YyMm <= %(stock_month_to)s
       AND M.{pfx}_Io_Gu_Gcode = %(io_gu_gcode)s
       {stock_filter_sql}
-      {io_gu_filter_sql}
 
     GROUP BY
         M.{pfx}_Physic_Cd
@@ -4099,7 +4166,6 @@ OPTION (RECOMPILE)
             date_to=detail_date_to,
             stock_cd_list=stock_cd_list,
             stock_cd=stock_cd,
-            io_gu_list=io_gu_list,
         )
         if movement_df is not None and not movement_df.empty:
             if stock_df is None or stock_df.empty:
@@ -4308,18 +4374,24 @@ def get_stock_shortage_df(
 
     stock_cutoff_month = _stock_current_cutoff_month(params)
     stock_spec = _stock_current_monthly_spec(stock_mode)
+    current_stock_params, ignored_io_count = _copy_current_stock_params_without_io_scope(params)
 
     stock_df = _load_product_current_stock(
         product_codes,
         stock_mode=stock_mode,
         month_to=stock_cutoff_month,
-        date_to=params.get("date_to"),
-        policy_date=params.get("policy_date") or params.get("as_of_date") or params.get("today"),
-        stock_cd_list=params.get("stock_cd_list"),
-        stock_cd=params.get("stock_cd"),
-        io_gu_list=params.get("io_gu_list"),
+        date_to=current_stock_params.get("date_to"),
+        policy_date=current_stock_params.get("policy_date") or current_stock_params.get("as_of_date") or current_stock_params.get("today"),
+        stock_cd_list=current_stock_params.get("stock_cd_list"),
+        stock_cd=current_stock_params.get("stock_cd"),
+        ignored_io_gu_count=ignored_io_count,
     )
     t_stock = time.perf_counter()
+    log.info(
+        "[analytics.current_stock_io_scope] tcode_filter_applied=False selected_io_count_ignored=%s stock_mode=%s",
+        ignored_io_count,
+        stock_mode,
+    )
 
     if stock_df is None or stock_df.empty:
         out["장부재고수량"] = 0
@@ -4620,8 +4692,13 @@ def get_stock_shortage_df(
         "stock_cd_parameter_count",
         "io_gu_parameter_count",
         "total_parameter_count",
+        "current_stock_io_tcode_parameter_count",
+        "selected_io_count_ignored",
     ):
         out.attrs[key] = int(getattr(stock_df, "attrs", {}).get(key) or 0)
+    out.attrs["current_stock_io_filter_applied"] = bool(
+        getattr(stock_df, "attrs", {}).get("current_stock_io_filter_applied", False)
+    )
 
     log.info(
         "[analytics.stock_shortage.source] evaluation_mode=%s use_hybrid_detail=%s display_source=%s stock_source=%s",

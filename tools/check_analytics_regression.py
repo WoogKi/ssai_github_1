@@ -8871,12 +8871,15 @@ def run_basic_checks() -> list[CheckResult]:
         import app.services.dashboard_inbound_facts_service as inbound_mod
 
         service_errors: list[str] = []
-        calls = {"shared_sales": 0, "manufacturer": 0, "stock": 0, "inbound": 0}
+        calls = {"shared_sales": 0, "manufacturer": 0, "forecast": 0, "stock": 0, "inbound": 0}
         seen_params: list[dict] = []
+        forecast_params_seen: list[dict] = []
+        shortage_params_seen: list[dict] = []
         preloaded_seen = {"manufacturer": False, "stock": False}
         old_shared = getattr(sales_mod, "get_sales_trend_df")
         old_dashboard_bundle = getattr(sales_mod, "get_dashboard_sales_source_bundle")
         old_manufacturer = getattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result")
+        old_forecast = getattr(sales_mod, "get_sales_forecast_df")
         old_stock = getattr(sales_mod, "get_stock_shortage_result")
         old_inbound = getattr(inbound_mod, "get_dashboard_inbound_facts")
 
@@ -8902,8 +8905,15 @@ def run_basic_checks() -> list[CheckResult]:
         def _fake_stock_service(params=None, sales_raw_df=None, sales_forecast_df=None):
             calls["stock"] += 1
             seen_params.append(dict(params or {}))
+            shortage_params_seen.append(dict(params or {}))
             preloaded_seen["stock"] = isinstance(sales_raw_df, pd.DataFrame) and isinstance(sales_forecast_df, pd.DataFrame)
             return {"df": stock_df.copy(), "meta": {}}
+
+        def _fake_forecast_service(params=None, raw_df=None):
+            calls["forecast"] += 1
+            seen_params.append(dict(params or {}))
+            forecast_params_seen.append(dict(params or {}))
+            return sales_df.copy()
 
         def _fake_inbound_service(params=None, **_kwargs):
             calls["inbound"] += 1
@@ -8919,6 +8929,7 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(sales_mod, "get_sales_trend_df", _fake_shared_sales_source)
             setattr(sales_mod, "get_dashboard_sales_source_bundle", _fake_dashboard_sales_bundle)
             setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", _fake_manufacturer_service)
+            setattr(sales_mod, "get_sales_forecast_df", _fake_forecast_service)
             setattr(sales_mod, "get_stock_shortage_result", _fake_stock_service)
             setattr(inbound_mod, "get_dashboard_inbound_facts", _fake_inbound_service)
             built = dash_mod.build_dashboard_lite_facts(
@@ -8928,6 +8939,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "evaluation_month": "202607",
                     "stock_cd_list": ["00001"],
                     "manufacturer_test_codes": ["V001"],
+                    "io_gu_list": ["501", "590"],
                 },
                 today=date(2026, 7, 20),
             )
@@ -8935,9 +8947,10 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(sales_mod, "get_sales_trend_df", old_shared)
             setattr(sales_mod, "get_dashboard_sales_source_bundle", old_dashboard_bundle)
             setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", old_manufacturer)
+            setattr(sales_mod, "get_sales_forecast_df", old_forecast)
             setattr(sales_mod, "get_stock_shortage_result", old_stock)
             setattr(inbound_mod, "get_dashboard_inbound_facts", old_inbound)
-        if calls != {"shared_sales": 1, "manufacturer": 1, "stock": 1, "inbound": 1}:
+        if calls != {"shared_sales": 1, "manufacturer": 1, "forecast": 1, "stock": 1, "inbound": 1}:
             service_errors.append(f"service_calls={calls!r}")
         if built.get("source_call_count") != 3:
             service_errors.append(f"source_call_count={built.get('source_call_count')!r}")
@@ -8949,6 +8962,10 @@ def run_basic_checks() -> list[CheckResult]:
             service_errors.append("empty_params_sent")
         if not any(p.get("dashboard_manufacturer_codes") == ["V001"] for p in seen_params):
             service_errors.append(f"manufacturer_filter_not_bound={seen_params!r}")
+        if len(forecast_params_seen) != 1 or forecast_params_seen[0].get("io_gu_list") != ["501", "590"]:
+            service_errors.append(f"dashboard_forecast_io_lost={forecast_params_seen!r}")
+        if len(shortage_params_seen) != 1 or shortage_params_seen[0].get("io_gu_list") != ["501", "590"]:
+            service_errors.append(f"dashboard_shortage_io_lost={shortage_params_seen!r}")
         if built.get("filters", {}).get("manufacturer_test_codes") != ["V001"]:
             service_errors.append(f"manufacturer_filter_not_in_facts={built.get('filters')!r}")
         if service_errors:
@@ -10765,6 +10782,96 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard Lite stock SQL parameter batches", "; ".join(stock_batch_errors)))
         else:
             results.append(_ok("Dashboard Lite stock SQL parameter batches", "configured values fall back safely and every effective product batch remains below the SQL Server bind limit"))
+
+        io_scope_errors: list[str] = []
+        try:
+            import app.services.analytics_sales_trend_service as io_scope_mod
+
+            exact_params = {"io_gu_list": ["501", "590"]}
+            exact_where = io_scope_mod._build_filters(exact_params)
+            if "Rd12_Io_Gu_Gcode = %(sales_io_gu_gcode)s" not in exact_where:
+                io_scope_errors.append("sales_exact_gcode_missing")
+            if "Rd12_Io_Gu IN (%(sales_io_gu_0)s, %(sales_io_gu_1)s)" not in exact_where:
+                io_scope_errors.append("sales_exact_tcode_bind_missing")
+            if exact_params.get("sales_io_gu_0") != "501" or exact_params.get("sales_io_gu_1") != "590":
+                io_scope_errors.append(f"sales_exact_values={exact_params!r}")
+            if "LEFT(Out_Put.Rd12_Io_Gu, 1)" in exact_where:
+                io_scope_errors.append("sales_exact_prefix_expansion")
+
+            mixed_params = {"io_gu_list": ["001", "002", "501", "590", "601"]}
+            monthly_spec = io_scope_mod._monthly_spec("monthly_real")
+            monthly_prefix = monthly_spec["prefix"]
+            monthly_where, monthly_bind = io_scope_mod._build_monthly_fast_where(
+                mixed_params,
+                monthly_spec,
+            )
+            if f"M.{monthly_prefix}_Io_Gu_Gcode = %(sales_io_gu_gcode)s" not in monthly_where:
+                io_scope_errors.append("monthly_exact_gcode_missing")
+            if f"M.{monthly_prefix}_Io_Gu IN (%(sales_io_gu_0)s, %(sales_io_gu_1)s, %(sales_io_gu_2)s, %(sales_io_gu_3)s, %(sales_io_gu_4)s)" not in monthly_where:
+                io_scope_errors.append("monthly_exact_tcode_bind_missing")
+            if f"LEFT(M.{monthly_prefix}_Io_Gu, 1) IN" not in monthly_where:
+                io_scope_errors.append("monthly_sales_direction_guard_missing")
+            if [monthly_bind.get(f"sales_io_gu_{index}") for index in range(5)] != ["001", "002", "501", "590", "601"]:
+                io_scope_errors.append(f"monthly_exact_values={monthly_bind!r}")
+
+            dedupe_mode, dedupe_codes = io_scope_mod._sales_io_scope({"io_gu_list": ["501", "590", "501"]})
+            if dedupe_mode != "exact_selected" or dedupe_codes != ["501", "590"]:
+                io_scope_errors.append(f"sales_ordered_dedupe={dedupe_mode}:{dedupe_codes!r}")
+
+            explicit_all_params = {"io_gu_list": []}
+            explicit_all_where = io_scope_mod._build_filters(explicit_all_params)
+            legacy_where = io_scope_mod._build_filters({})
+            if explicit_all_params.get("_sales_io_filter_mode") != "explicit_all" or "LEFT(Out_Put.Rd12_Io_Gu, 1) IN ('5', '6')" not in explicit_all_where:
+                io_scope_errors.append("sales_explicit_all_compatibility")
+            if "legacy_broad_fallback" not in str(legacy_where) and "LEFT(Out_Put.Rd12_Io_Gu, 1) IN ('5', '6')" not in legacy_where:
+                io_scope_errors.append("sales_legacy_broad_fallback")
+            try:
+                io_scope_mod._sales_io_scope({"io_gu_list": [501]})
+                io_scope_errors.append("sales_numeric_code_not_rejected")
+            except ValueError:
+                pass
+
+            original = {
+                "io_gu": "501", "io_gu_list": ["501", "590"], "io_gu_pairs": ["0012:501"],
+                "dashboard_io_gu_list": ["501"], "sales_io_gu_list": ["501"], "purchase_io_gu_list": ["001"],
+                "stock_cd_list": ["00001"], "product_di_list": ["0004:1"],
+            }
+            stock_only, ignored_count = io_scope_mod._copy_current_stock_params_without_io_scope(original)
+            if any(key in stock_only for key in io_scope_mod._IO_GU_SCOPE_PARAM_KEYS):
+                io_scope_errors.append(f"stock_io_alias_retained={stock_only!r}")
+            if stock_only.get("stock_cd_list") != ["00001"] or stock_only.get("product_di_list") != ["0004:1"]:
+                io_scope_errors.append(f"stock_scope_lost_non_io_filters={stock_only!r}")
+            if original.get("io_gu_list") != ["501", "590"] or ignored_count != 7:
+                io_scope_errors.append(f"stock_scope_source_mutated_or_count={original!r}|{ignored_count}")
+
+            stock_loader_source = Path(io_scope_mod.__file__).read_text(encoding="utf-8")
+            loader_start = stock_loader_source.index("def _load_product_current_stock(")
+            loader_end = stock_loader_source.index("def get_stock_shortage_df(", loader_start)
+            loader_source = stock_loader_source[loader_start:loader_end]
+            if "Io_Gu IN" in loader_source or "io_gu_filter_sql" in loader_source:
+                io_scope_errors.append("current_stock_tcode_predicate_present")
+            if "Io_Gu_Gcode = %(io_gu_gcode)s" not in loader_source:
+                io_scope_errors.append("current_stock_gcode_missing")
+            movement_start = stock_loader_source.index("def _load_product_current_month_stock_movements(")
+            movement_end = stock_loader_source.index("def _load_product_current_stock(", movement_start)
+            movement_source = stock_loader_source[movement_start:movement_end]
+            if "Io_Gu)), 1) NOT IN" in movement_source:
+                io_scope_errors.append("current_month_movement_prefix_exclusion_present")
+            if "Rd11_Io_Gu_Gcode = %(io_gu_gcode)s" not in movement_source or "Rd12_Io_Gu_Gcode = %(io_gu_gcode)s" not in movement_source:
+                io_scope_errors.append("current_month_movement_gcode_missing")
+            zero_io_plan = io_scope_mod._stock_query_batch_plan(stock_cd_count=100, io_gu_count=0, configured_value="1800")
+            if zero_io_plan["io_gu_parameter_count"] != 0 or zero_io_plan["total_parameter_count"] >= io_scope_mod.SQL_SERVER_PARAMETER_LIMIT:
+                io_scope_errors.append(f"current_stock_zero_io_bind_plan={zero_io_plan!r}")
+
+            dashboard_facts_source = (PROJECT_ROOT / "app" / "services" / "dashboard_lite_facts.py").read_text(encoding="utf-8")
+            if "_dashboard_current_stock_params" in dashboard_facts_source or "stock_shortage_payload[\"params\"] = dict(service_params)" in dashboard_facts_source:
+                io_scope_errors.append("dashboard_display_params_override_present")
+        except Exception as exc:
+            io_scope_errors.append(f"io_scope_runtime={type(exc).__name__}:{exc}")
+        if io_scope_errors:
+            results.append(_fail("Dashboard/KPI IO scope contract", "; ".join(io_scope_errors)))
+        else:
+            results.append(_ok("Dashboard/KPI IO scope contract", "selected sales Tcodes bind exactly, while current stock removes every IO alias and binds no IO Tcode"))
 
         profile_reentry_errors: list[str] = []
         try:

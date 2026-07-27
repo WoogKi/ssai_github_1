@@ -269,6 +269,19 @@ def _dashboard_source_months(df: pd.DataFrame | None) -> pd.Series | None:
     return df["기준월"].astype(str).str.replace(r"\D", "", regex=True).str[:6]
 
 
+def _dashboard_sales_io_scope_meta(params: Mapping[str, Any]) -> tuple[str, int]:
+    raw = params.get("io_gu_list") if isinstance(params, Mapping) else None
+    if "io_gu_list" not in params:
+        return "legacy_broad_fallback", 0
+    if isinstance(raw, str):
+        count = int(bool(raw.strip()))
+    elif isinstance(raw, (list, tuple, set)):
+        count = sum(1 for value in raw if isinstance(value, str) and value.strip())
+    else:
+        count = 0
+    return ("exact_selected", count) if count else ("explicit_all", 0)
+
+
 def _build_demand_surge_history_by_product(
     df: pd.DataFrame | None,
     *,
@@ -2345,6 +2358,7 @@ def build_dashboard_lite_facts(
             service_params = default_dashboard_lite_scope(today=today)
 
     source_params = _dashboard_internal_source_params(service_params, today=today)
+    sales_io_filter_mode, sales_io_selected_count = _dashboard_sales_io_scope_meta(service_params)
     existing_support_params = {
         **source_params,
         "month_from": source_params.get("dashboard_lite_trend_month_from"),
@@ -2367,6 +2381,11 @@ def build_dashboard_lite_facts(
         service_params.get("month_to"),
         service_params.get("evaluation_month"),
         int((time.perf_counter() - t0) * 1000),
+    )
+    log.info(
+        "[dashboard.scope_contract] sales_io_filter_mode=%s sales_io_selected_count=%s forecast_io_filter_applied=True current_stock_io_filter_applied=False",
+        sales_io_filter_mode,
+        sales_io_selected_count,
     )
 
     expanded_sales_source_df: pd.DataFrame | None = None
