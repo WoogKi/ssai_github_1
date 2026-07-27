@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import traceback
 import warnings
 import zipfile
@@ -7228,6 +7229,7 @@ def run_basic_checks() -> list[CheckResult]:
             },
             manufacturer_summary_payload={"df": sales_df, "meta": {"evaluation_month": "2026-07"}},
             stock_shortage_payload={"df": stock_df, "meta": {}},
+            inbound_facts_df=pd.DataFrame(),
         )
         fact_errors: list[str] = []
         required_fact_keys = {
@@ -8866,14 +8868,17 @@ def run_basic_checks() -> list[CheckResult]:
         import app.services.analytics_manufacturer_sales_trend_service as manufacturer_mod
         import app.services.analytics_sales_trend_service as sales_mod
 
+        import app.services.dashboard_inbound_facts_service as inbound_mod
+
         service_errors: list[str] = []
-        calls = {"shared_sales": 0, "manufacturer": 0, "stock": 0}
+        calls = {"shared_sales": 0, "manufacturer": 0, "stock": 0, "inbound": 0}
         seen_params: list[dict] = []
         preloaded_seen = {"manufacturer": False, "stock": False}
         old_shared = getattr(sales_mod, "get_sales_trend_df")
         old_dashboard_bundle = getattr(sales_mod, "get_dashboard_sales_source_bundle")
         old_manufacturer = getattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result")
         old_stock = getattr(sales_mod, "get_stock_shortage_result")
+        old_inbound = getattr(inbound_mod, "get_dashboard_inbound_facts")
 
         def _fake_shared_sales_source(params=None):
             calls["shared_sales"] += 1
@@ -8900,11 +8905,22 @@ def run_basic_checks() -> list[CheckResult]:
             preloaded_seen["stock"] = isinstance(sales_raw_df, pd.DataFrame) and isinstance(sales_forecast_df, pd.DataFrame)
             return {"df": stock_df.copy(), "meta": {}}
 
+        def _fake_inbound_service(params=None, **_kwargs):
+            calls["inbound"] += 1
+            return pd.DataFrame([{
+                "product_code": "P1", "last_normal_inbound_date": "20260701",
+                "normal_inbound_day_count_365": 2, "avg_inbound_cycle_days": 15.0,
+                "inbound_data_status": "normal", "inbound_delayed_candidate": False,
+                "normal_inbound_90_exists": True, "normal_inbound_365_exists": True,
+                "recent_inbound_vendor_source": "actual_inbound",
+            }])
+
         try:
             setattr(sales_mod, "get_sales_trend_df", _fake_shared_sales_source)
             setattr(sales_mod, "get_dashboard_sales_source_bundle", _fake_dashboard_sales_bundle)
             setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", _fake_manufacturer_service)
             setattr(sales_mod, "get_stock_shortage_result", _fake_stock_service)
+            setattr(inbound_mod, "get_dashboard_inbound_facts", _fake_inbound_service)
             built = dash_mod.build_dashboard_lite_facts(
                 {
                     "month_from": "202601",
@@ -8920,9 +8936,10 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(sales_mod, "get_dashboard_sales_source_bundle", old_dashboard_bundle)
             setattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result", old_manufacturer)
             setattr(sales_mod, "get_stock_shortage_result", old_stock)
-        if calls != {"shared_sales": 1, "manufacturer": 1, "stock": 1}:
+            setattr(inbound_mod, "get_dashboard_inbound_facts", old_inbound)
+        if calls != {"shared_sales": 1, "manufacturer": 1, "stock": 1, "inbound": 1}:
             service_errors.append(f"service_calls={calls!r}")
-        if built.get("source_call_count") != 2:
+        if built.get("source_call_count") != 3:
             service_errors.append(f"source_call_count={built.get('source_call_count')!r}")
         if preloaded_seen != {"manufacturer": True, "stock": True}:
             service_errors.append(f"preloaded_seen={preloaded_seen!r}")
@@ -8937,7 +8954,101 @@ def run_basic_checks() -> list[CheckResult]:
         if service_errors:
             results.append(_fail("Dashboard Lite guarded service calls", "; ".join(service_errors)))
         else:
-            results.append(_ok("Dashboard Lite guarded service calls", "shared sales source loads once, is passed to sales/stock facts, and stock source runs once"))
+            results.append(_ok("Dashboard Lite guarded service calls", "shared sales, stock, and one inbound source load once; existing sales/stock frames are reused"))
+
+        inbound_errors: list[str] = []
+        inbound_fixture = pd.DataFrame([
+            {"product_code": "P1", "master_order_vendor_code": "M1", "master_order_vendor_name": "Master", "inbound_date": "20260101", "io_tcode": "001", "vendor_code": "A", "inbound_vendor_name": "Vendor A", "quantity": 10, "oquantity": 0, "supply_price": 100},
+            {"product_code": "P1", "master_order_vendor_code": "M1", "inbound_date": "20260111", "io_tcode": "002", "vendor_code": "A", "inbound_vendor_name": "Vendor A", "quantity": 10, "oquantity": 0, "supply_price": 100},
+            {"product_code": "P1", "master_order_vendor_code": "M1", "inbound_date": "20260131", "io_tcode": "001", "vendor_code": "B", "inbound_vendor_name": "Vendor B", "quantity": 10, "oquantity": 0, "supply_price": 90},
+            {"product_code": "P1", "master_order_vendor_code": "M1", "inbound_date": "20260720", "io_tcode": "051", "vendor_code": "X", "quantity": 99, "oquantity": 0, "supply_price": 999},
+            {"product_code": "P1", "master_order_vendor_code": "M1", "inbound_date": "20260721", "io_tcode": "101", "vendor_code": "A", "quantity": -3, "oquantity": 0, "supply_price": -30},
+            {"product_code": "P2", "master_order_vendor_code": "M2", "inbound_date": "20260721", "io_tcode": "001", "vendor_code": "A", "quantity": -2, "oquantity": 0, "supply_price": -20},
+            {"product_code": "P3", "master_order_vendor_code": "M3", "inbound_date": "", "io_tcode": "", "vendor_code": "", "quantity": 0, "oquantity": 0, "supply_price": 0},
+            {"product_code": "P4", "master_order_vendor_code": "M4", "inbound_date": "20260720", "io_tcode": "001", "vendor_code": "", "quantity": 200, "oquantity": 0, "supply_price": 200},
+            {"product_code": "P5", "master_order_vendor_code": "M5", "inbound_date": "20260720", "io_tcode": "001", "vendor_code": "", "quantity": 200, "oquantity": 0, "supply_price": 200},
+            {"product_code": "P5", "master_order_vendor_code": "M5", "inbound_date": "20260721", "io_tcode": "001", "vendor_code": "V5", "inbound_vendor_name": "Vendor 5", "quantity": 1, "oquantity": 0, "supply_price": 1},
+            {"product_code": "P6", "master_order_vendor_code": "M6", "inbound_date": "20250722", "io_tcode": "001", "vendor_code": "OLD", "quantity": 10, "oquantity": 0, "supply_price": 10},
+            {"product_code": "P6", "master_order_vendor_code": "M6", "inbound_date": "20250723", "io_tcode": "001", "vendor_code": "EDGE", "quantity": 10, "oquantity": 0, "supply_price": 10},
+            {"product_code": "P6", "master_order_vendor_code": "M6", "inbound_date": "20260723", "io_tcode": "001", "vendor_code": "FUTURE", "quantity": 10, "oquantity": 0, "supply_price": 10},
+            {"product_code": "P6", "master_order_vendor_code": "M6", "inbound_date": "invalid", "io_tcode": "001", "vendor_code": "BAD", "quantity": 10, "oquantity": 0, "supply_price": 10},
+        ])
+        inbound_frame = inbound_mod.build_dashboard_inbound_facts_frame(
+            inbound_fixture, data_cutoff_date="20260722", cycle_lookback_days=365, vendor_lookback_days=90,
+        ).set_index("product_code")
+        p1 = inbound_frame.loc["P1"].to_dict()
+        p2 = inbound_frame.loc["P2"].to_dict()
+        p3 = inbound_frame.loc["P3"].to_dict()
+        p4 = inbound_frame.loc["P4"].to_dict()
+        p5 = inbound_frame.loc["P5"].to_dict()
+        p6 = inbound_frame.loc["P6"].to_dict()
+        vendor_frame = inbound_mod.build_dashboard_inbound_facts_frame(
+            inbound_fixture, data_cutoff_date="20260131", cycle_lookback_days=365, vendor_lookback_days=90,
+        ).set_index("product_code")
+        if p1.get("normal_inbound_day_count_365") != 3 or p1.get("avg_inbound_cycle_days") != 15.0:
+            inbound_errors.append(f"normal_day_or_gap={p1!r}")
+        if p1.get("normal_inbound_raw_qty_365") != 30.0 or p1.get("inbound_return_raw_qty_365") != -3.0:
+            inbound_errors.append(f"raw_or_return_sign={p1!r}")
+        if p2.get("normal_inbound_365_exists") or p2.get("inbound_data_status") != "insufficient":
+            inbound_errors.append(f"negative_not_excluded={p2!r}")
+        if p3.get("recent_inbound_vendor_source") != "master_order_vendor" or not p3.get("recent_inbound_vendor_fallback"):
+            inbound_errors.append(f"fallback_contract={p3!r}")
+        if p4.get("recent_inbound_vendor_source") != "master_order_vendor" or p4.get("recent_inbound_vendor_code") != "M4":
+            inbound_errors.append(f"blank_vendor_fallback={p4!r}")
+        if p5.get("recent_inbound_vendor_source") != "actual_inbound" or p5.get("recent_inbound_vendor_code") != "V5":
+            inbound_errors.append(f"mixed_vendor_prefers_actual={p5!r}")
+        if p6.get("normal_inbound_day_count_365") != 1 or p6.get("last_normal_inbound_date") != "20250723":
+            inbound_errors.append(f"cycle_boundary_or_future={p6!r}")
+        if vendor_frame.loc["P1", "recent_inbound_vendor_code"] != "A":
+            inbound_errors.append(f"vendor_rank_contract={vendor_frame.loc['P1'].to_dict()!r}")
+        if vendor_frame.loc["P1", "recent_inbound_vendor_name"] != "Vendor A":
+            inbound_errors.append(f"vendor_name_contract={vendor_frame.loc['P1'].to_dict()!r}")
+        sql_text, sql_binds = inbound_mod._sql(
+            {"stock_cd_list": ["00001"], "dashboard_product_group_list": ["0013:01"], "dashboard_product_di_list": ["0004:1"], "product_class_list": ["0031:01"], "vendor_group_list": ["0019:02"], "vendor_kind_list": ["0009:J"], "io_gu_list": ["0012:090"]},
+            start_date="20250723", cutoff_date="20260722",
+        )
+        if "'001', '002', '101', '102', '193'" not in sql_text or "LEFT(" in sql_text:
+            inbound_errors.append("fixed_tcode_whitelist_contract")
+        for predicate in (
+            "I.Rd11_Stock_Cd_Gcode = '0018'", "P.Rd04_Physic_Group_Gcode = '0013'",
+            "P.Rd04_Physic_Di_Gcode = '0004'", "P.Rd04_Physic_Tax_Gcode = '0031'",
+            "FilterVendor.Rd03_Ven_Group_Gcode = '0019'", "FilterVendor.Rd03_Ven_Kind_Gcode = '0009'",
+        ):
+            if predicate not in sql_text:
+                inbound_errors.append(f"missing_compound_predicate={predicate}")
+        if sql_binds.get("stock_cd_0") != "00001" or sql_binds.get("product_class_0") != "01":
+            inbound_errors.append(f"string_bind_contract={sql_binds!r}")
+        if inbound_mod._codes(["01", "1", "J"]) != ["01", "1", "J"] or inbound_mod._codes([1, 2.0, None]) != [] or inbound_mod._codes("0031:01") != ["0031:01"]:
+            inbound_errors.append("strict_string_code_contract")
+        cutoff_cases = {
+            "current": dash_mod._dashboard_inbound_cutoff_date({"evaluation_month": "202607", "policy_date": "20260727", "date_to": "20260630"}, today=date(2026, 7, 27)),
+            "past": dash_mod._dashboard_inbound_cutoff_date({"evaluation_month": "202606", "policy_date": "20260727"}, today=date(2026, 7, 27)),
+            "future": dash_mod._dashboard_inbound_cutoff_date({"evaluation_month": "202608", "policy_date": "20260728"}, today=date(2026, 7, 27)),
+        }
+        if cutoff_cases != {"current": "20260727", "past": "20260630", "future": "20260727"}:
+            inbound_errors.append(f"inbound_cutoff_policy={cutoff_cases!r}")
+        synthetic_rows = 200_000
+        synthetic_source = pd.DataFrame({
+            "product_code": [f"S{index % 25_000:05d}" for index in range(synthetic_rows)],
+            "master_order_vendor_code": [f"M{index % 97:03d}" for index in range(synthetic_rows)],
+            "inbound_date": [f"2026{(index % 7) + 1:02d}{(index % 27) + 1:02d}" for index in range(synthetic_rows)],
+            "io_tcode": ["001" if index % 5 else "101" for index in range(synthetic_rows)],
+            "vendor_code": [f"V{index % 113:03d}" for index in range(synthetic_rows)],
+            "quantity": [1 if index % 5 else -1 for index in range(synthetic_rows)],
+            "oquantity": [0] * synthetic_rows,
+            "supply_price": [10] * synthetic_rows,
+        })
+        synthetic_started = time.perf_counter()
+        synthetic_facts = inbound_mod.build_dashboard_inbound_facts_frame(
+            synthetic_source, data_cutoff_date="20260727", cycle_lookback_days=365, vendor_lookback_days=90,
+        )
+        synthetic_elapsed_ms = int((time.perf_counter() - synthetic_started) * 1000)
+        if len(synthetic_facts) != 25_000 or synthetic_elapsed_ms > 10_000:
+            inbound_errors.append(f"vectorized_synthetic={len(synthetic_facts)}rows/{synthetic_elapsed_ms}ms")
+        if inbound_errors:
+            results.append(_fail("Dashboard inbound-date facts", "; ".join(inbound_errors)))
+        else:
+            results.append(_ok("Dashboard inbound-date facts", "001/002 positive events, signed 101/102/193 returns, fallback, cycle gap, and string binds are preserved"))
 
         import app.sims.views.dashboard_lite as view_mod
 

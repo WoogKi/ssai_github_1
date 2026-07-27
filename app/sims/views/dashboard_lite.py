@@ -1178,6 +1178,8 @@ def _render_risk_detail(
     display_columns = [
         "순번", "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "주요매입처명", "현재재고수량",
         "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액", "위험보정재고준비율", "수요급증세부분류",
+        "최근 정상 입고일", "입고 경과일", "정상 입고 거래일수", "평균 입고간격일", "입고 자료상태", "입고 지연후보",
+        "최근입고 대표매입처명", "최근입고 대표매입처코드", "최근입고 대표매입처출처", "최근365일 입고이력",
     ]
     display = display[[column for column in display_columns if column in display.columns]]
     log.info(
@@ -1367,6 +1369,9 @@ def _dashboard_cache_key(params: dict[str, Any], *, run_seq: int) -> str:
         "readiness_warning_pct": params.get("readiness_warning_pct"),
         "risk_quick_view_count": params.get("risk_quick_view_count"),
         "amount_display_unit": params.get("amount_display_unit"),
+        "inbound_cycle_days": 365,
+        "inbound_vendor_days": 90,
+        "inbound_data_cutoff_date": params.get("date_to"),
         "exclude_product_group_list": _normalized_key_list(params.get("exclude_product_group_list")),
         "exclude_product_di_list": _normalized_key_list(params.get("exclude_product_di_list")),
         "exclude_product_class_list": _normalized_key_list(params.get("exclude_product_class_list")),
@@ -1758,6 +1763,21 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
             "stock_demand_surge_summary": dict(inventory.get("stock_demand_surge_summary") or {}),
             "vendor_stock_risk_summary": dict(inventory.get("vendor_stock_risk_summary") or {}),
+            "inbound_summary": {
+                key: (inventory.get("inbound_summary") or {}).get(key)
+                for key in (
+                    "cycle_days", "vendor_days", "delayed_products", "insufficient_products",
+                    "fallback_products", "inbound_source_call_count", "inbound_io_policy",
+                )
+            },
+            "inbound_metadata": {
+                "inbound_cycle_days": (inventory.get("inbound_summary") or {}).get("cycle_days"),
+                "inbound_vendor_days": (inventory.get("inbound_summary") or {}).get("vendor_days"),
+                "inbound_delayed_count": (inventory.get("inbound_summary") or {}).get("delayed_products"),
+                "inbound_insufficient_count": (inventory.get("inbound_summary") or {}).get("insufficient_products"),
+                "inbound_fallback_count": (inventory.get("inbound_summary") or {}).get("fallback_products"),
+                "inbound_source_call_count": (inventory.get("inbound_summary") or {}).get("inbound_source_call_count"),
+            },
             "risk_detail_summary": {
                 key: (inventory.get("risk_detail_summary") or {}).get(key)
                 for key in ("source_rows", "emergency_rows", "warning_rows", "amount_positive_rows", "zero_amount_rows")

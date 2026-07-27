@@ -11,7 +11,7 @@ payload is not supplied by the UI.
 from __future__ import annotations
 
 from calendar import monthrange
-from datetime import date
+from datetime import date, datetime
 import logging
 import re
 import time
@@ -203,6 +203,20 @@ def _dashboard_internal_source_params(params: Mapping[str, Any], *, today: date)
         }
     )
     return source
+
+
+def _dashboard_inbound_cutoff_date(params: Mapping[str, Any], *, today: date) -> str:
+    """Use the evaluation-month policy date, never the completed-display month."""
+    evaluation_month = _normalize_yyyymm(params.get("evaluation_month")) or f"{today.year:04d}{today.month:02d}"
+    today_ym = f"{today.year:04d}{today.month:02d}"
+    if evaluation_month < today_ym:
+        return _last_day_yyyymm(evaluation_month)
+    policy_text = re.sub(r"\D", "", str(params.get("policy_date") or ""))[:8]
+    try:
+        policy_day = datetime.strptime(policy_text, "%Y%m%d").date()
+    except ValueError:
+        policy_day = today
+    return min(policy_day, today).strftime("%Y%m%d")
 
 
 def _stock_timing_meta(stock_attrs: Mapping[str, Any] | None, *, fallback_total_ms: int) -> dict[str, int]:
@@ -1670,7 +1684,34 @@ def _build_dashboard_risk_detail(
             "최근6완료월순매입금액": float(row.get("최근6완료월순매입금액") or 0),
             "최근6완료월순입고수량": float(row.get("최근6완료월순입고수량") or 0),
             "최근6완료월최근매입월": str(row.get("최근6완료월최근매입월") or ""),
+            "최근 정상 입고일": str(row.get("last_normal_inbound_date") or ""),
+            "입고 거래일수": int(row.get("normal_inbound_day_count_365") or 0),
+            "평균 입고간격일": row.get("avg_inbound_cycle_days"),
+            "입고 자료상태": str(row.get("inbound_data_status") or "insufficient"),
+            "입고 지연후보": bool(row.get("inbound_delayed_candidate")),
+            "최근입고 대표매입처코드": str(row.get("recent_inbound_vendor_code") or ""),
+            "최근입고 대표매입처출처": str(row.get("recent_inbound_vendor_source") or "none"),
+            "최근365일 입고이력": bool(row.get("normal_inbound_365_exists")),
         }
+        detail.update({
+            "최근 정상 입고일": str(row.get("last_normal_inbound_date") or ""),
+            "입고 경과일": row.get("inbound_delay_days"),
+            "정상 입고 거래일수": int(row.get("normal_inbound_day_count_365") or 0),
+            "평균 입고간격일": row.get("avg_inbound_cycle_days"),
+            "입고 자료상태": {
+                "normal": "정상",
+                "delayed_candidate": "지연후보",
+                "insufficient": "자료부족",
+            }.get(str(row.get("inbound_data_status") or ""), "자료부족"),
+            "입고 지연후보": "예" if row.get("inbound_delayed_candidate") else "아니오",
+            "최근입고 대표매입처코드": str(row.get("recent_inbound_vendor_code") or ""),
+            "최근입고 대표매입처명": str(row.get("recent_inbound_vendor_name") or ""),
+            "최근입고 대표매입처출처": {
+                "actual_inbound": "실제입고",
+                "master_order_vendor": "제품마스터 발주처",
+                "none": "자료없음",
+            }.get(str(row.get("recent_inbound_vendor_source") or ""), "자료없음"),
+        })
         detail["_주요매입처필터키"] = _risk_detail_vendor_key(detail)
         detail_rows.append(detail)
 
@@ -1755,6 +1796,97 @@ def filter_dashboard_risk_detail_rows(
     return frame, summary, int((time.perf_counter() - started) * 1000)
 
 
+def _attach_dashboard_inbound_facts(
+    rows: list[dict[str, Any]],
+    inbound_facts_df: pd.DataFrame | None,
+    *,
+    inbound_source_call_count: int = 0,
+) -> dict[str, Any]:
+    """Left-attach read-only inbound facts without changing stock-risk policy."""
+    started = time.perf_counter()
+    frame = inbound_facts_df.copy() if isinstance(inbound_facts_df, pd.DataFrame) else pd.DataFrame()
+    by_product: dict[str, dict[str, Any]] = {}
+    if not frame.empty and "product_code" in frame.columns:
+        frame["product_code"] = frame["product_code"].fillna("").astype(str).str.strip()
+        for item in frame.to_dict("records"):
+            code = str(item.get("product_code") or "").strip()
+            if code:
+                by_product[code] = item
+
+    delayed = insufficient = fallback = no_vendor = history_365 = history_90 = 0
+    for row in rows:
+        inbound = by_product.get(str(row.get("product_code") or "").strip(), {})
+        # Keep explicit None values for products with no history; this prevents
+        # them from being mistaken for a real zero-day cycle in the detail UI.
+        row.update({
+            "last_normal_inbound_date": str(inbound.get("last_normal_inbound_date") or ""),
+            "normal_inbound_day_count_365": int(inbound.get("normal_inbound_day_count_365") or 0),
+            "avg_inbound_cycle_days": inbound.get("avg_inbound_cycle_days"),
+            "inbound_delay_days": inbound.get("inbound_delay_days"),
+            "inbound_delay_threshold_days": inbound.get("inbound_delay_threshold_days"),
+            "inbound_data_status": str(inbound.get("inbound_data_status") or "insufficient"),
+            "inbound_delayed_candidate": bool(inbound.get("inbound_delayed_candidate")),
+            "normal_inbound_raw_qty_365": float(inbound.get("normal_inbound_raw_qty_365") or 0.0),
+            "normal_inbound_positive_qty_365": float(inbound.get("normal_inbound_positive_qty_365") or 0.0),
+            "inbound_return_raw_qty_365": float(inbound.get("inbound_return_raw_qty_365") or 0.0),
+            "normal_inbound_90_exists": bool(inbound.get("normal_inbound_90_exists")),
+            "normal_inbound_365_exists": bool(inbound.get("normal_inbound_365_exists")),
+            "recent_inbound_vendor_code": str(inbound.get("recent_inbound_vendor_code") or ""),
+            "recent_inbound_vendor_name": str(inbound.get("recent_inbound_vendor_name") or ""),
+            "recent_inbound_vendor_qty_90": float(inbound.get("recent_inbound_vendor_qty_90") or 0.0),
+            "recent_inbound_vendor_last_date": str(inbound.get("recent_inbound_vendor_last_date") or ""),
+            "recent_inbound_vendor_source": str(inbound.get("recent_inbound_vendor_source") or "none"),
+            "recent_inbound_vendor_fallback": bool(inbound.get("recent_inbound_vendor_fallback")),
+        })
+        status_label = {
+            "normal": "정상",
+            "delayed_candidate": "지연후보",
+            "insufficient": "자료부족",
+        }.get(row["inbound_data_status"], "자료부족")
+        source_label = {
+            "actual_inbound": "실제입고",
+            "master_order_vendor": "제품마스터 발주처",
+            "none": "자료없음",
+        }.get(row["recent_inbound_vendor_source"], "자료없음")
+        row.update({
+            "최근 정상 입고일": row["last_normal_inbound_date"],
+            "입고 경과일": row["inbound_delay_days"],
+            "정상 입고 거래일수": row["normal_inbound_day_count_365"],
+            "평균 입고간격일": row["avg_inbound_cycle_days"],
+            "입고 자료상태": status_label,
+            "입고 지연후보": "예" if row["inbound_delayed_candidate"] else "아니오",
+            "최근입고 대표매입처코드": row["recent_inbound_vendor_code"],
+            "최근입고 대표매입처명": row["recent_inbound_vendor_name"],
+            "최근입고 대표매입처출처": source_label,
+        })
+        delayed += int(row["inbound_delayed_candidate"])
+        insufficient += int(row["inbound_data_status"] == "insufficient")
+        fallback += int(row["recent_inbound_vendor_source"] == "master_order_vendor")
+        no_vendor += int(row["recent_inbound_vendor_source"] == "none")
+        history_365 += int(row["normal_inbound_365_exists"])
+        history_90 += int(row["normal_inbound_90_exists"])
+    summary = {
+        "dashboard_products": int(len(rows)),
+        "history_365_products": history_365,
+        "history_90_products": history_90,
+        "insufficient_products": insufficient,
+        "delayed_products": delayed,
+        "fallback_products": fallback,
+        "no_vendor_products": no_vendor,
+        "cycle_days": 365,
+        "vendor_days": 90,
+        "inbound_source_call_count": int(inbound_source_call_count),
+        "inbound_io_policy": "fixed_normal_return_whitelist",
+        "attach_elapsed_ms": int((time.perf_counter() - started) * 1000),
+    }
+    log.info(
+        "[dashboard.inbound.facts] dashboard_products=%s history_365_products=%s history_90_products=%s insufficient_products=%s delayed_products=%s fallback_products=%s no_vendor_products=%s attach_elapsed_ms=%s",
+        summary["dashboard_products"], summary["history_365_products"], summary["history_90_products"],
+        summary["insufficient_products"], summary["delayed_products"], summary["fallback_products"], summary["no_vendor_products"], summary["attach_elapsed_ms"],
+    )
+    return summary
+
+
 def _build_inventory_facts(
     payload: Mapping[str, Any] | None,
     *,
@@ -1764,7 +1896,9 @@ def _build_inventory_facts(
     demand_surge_history: Mapping[str, Any] | None = None,
     purchase_vendor_df: pd.DataFrame | None = None,
     purchase_history_month_from: str = "",
+    inbound_facts_df: pd.DataFrame | None = None,
     source_call_count: int = 0,
+    inbound_source_call_count: int = 0,
     stock_mode: str = "real",
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -1926,6 +2060,11 @@ def _build_inventory_facts(
         history_month_from=purchase_history_month_from,
         source_call_count=source_call_count,
     )
+    inbound_summary = _attach_dashboard_inbound_facts(
+        rows,
+        inbound_facts_df,
+        inbound_source_call_count=inbound_source_call_count,
+    )
     risk_detail_rows, risk_detail_summary = _build_dashboard_risk_detail(rows, stock_mode=stock_mode)
     demand_rows = [r for r in rows if r.get("재고위험상태") != "판정 제외"]
     ready_rows = [r for r in rows if r.get("재고위험상태") == "적정"]
@@ -2044,6 +2183,7 @@ def _build_inventory_facts(
         "vendor_stock_risk_summary": vendor_stock_risk["summary"],
         "vendor_stock_risk_rows": vendor_stock_risk["rows"],
         "vendor_stock_risk_top_rows": vendor_stock_risk["top_rows"],
+        "inbound_summary": inbound_summary,
         "risk_detail_summary": risk_detail_summary,
         "risk_detail_rows": risk_detail_rows,
         "data_quality": [] if rows else ["재고준비율 산정 자료 없음"],
@@ -2185,6 +2325,7 @@ def build_dashboard_lite_facts(
     *,
     manufacturer_summary_payload: Mapping[str, Any] | None = None,
     stock_shortage_payload: Mapping[str, Any] | None = None,
+    inbound_facts_df: pd.DataFrame | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
     """Build Dashboard Lite v0.1 facts from existing analytics payloads."""
@@ -2192,6 +2333,9 @@ def build_dashboard_lite_facts(
     t0 = time.perf_counter()
     needs_sales_source = manufacturer_summary_payload is None
     needs_stock_source = stock_shortage_payload is None
+    # The inbound source is an independent third source.  Offline callers that
+    # intentionally avoid it must pass an explicit (possibly empty) DataFrame.
+    needs_inbound_source = inbound_facts_df is None
     if needs_sales_source or needs_stock_source:
         service_params = normalize_dashboard_lite_params(params, today=today)
     else:
@@ -2237,6 +2381,39 @@ def build_dashboard_lite_facts(
     stock_timing = _stock_timing_meta({}, fallback_total_ms=0)
     purchase_vendor_df: pd.DataFrame | None = None
     purchase_bundle_perf: dict[str, Any] = {}
+    inbound_source_elapsed_ms = 0
+    inbound_query_elapsed_ms = 0
+    inbound_build_elapsed_ms = 0
+    inbound_source_rows = 0
+    inbound_cutoff_date = _dashboard_inbound_cutoff_date(service_params, today=today)
+    if needs_inbound_source:
+        from app.services.dashboard_inbound_facts_service import get_dashboard_inbound_facts
+
+        inbound_started = time.perf_counter()
+        inbound_facts_df = get_dashboard_inbound_facts(
+            dict(service_params),
+            data_cutoff_date=inbound_cutoff_date,
+            cycle_lookback_days=365,
+            vendor_lookback_days=90,
+        )
+        inbound_source_elapsed_ms = int((time.perf_counter() - inbound_started) * 1000)
+        inbound_source_rows = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_source_rows") or 0)
+        inbound_query_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_query_elapsed_ms") or 0)
+        inbound_build_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_build_elapsed_ms") or 0)
+    elif isinstance(inbound_facts_df, pd.DataFrame):
+        inbound_source_rows = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_source_rows") or len(inbound_facts_df))
+        inbound_query_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_query_elapsed_ms") or 0)
+        inbound_build_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_build_elapsed_ms") or 0)
+    log.info(
+        "[dashboard.inbound.source_load] source_rows=%s product_rows=%s source_call_count=%s data_cutoff_date=%s query_elapsed_ms=%s build_elapsed_ms=%s elapsed_ms=%s",
+        inbound_source_rows,
+        0 if not isinstance(inbound_facts_df, pd.DataFrame) else len(inbound_facts_df),
+        int(needs_inbound_source),
+        inbound_cutoff_date,
+        inbound_query_elapsed_ms,
+        inbound_build_elapsed_ms,
+        inbound_source_elapsed_ms,
+    )
     if needs_sales_source or needs_stock_source:
         from app.services.analytics_sales_trend_service import get_dashboard_sales_source_bundle
 
@@ -2412,7 +2589,9 @@ def build_dashboard_lite_facts(
         demand_surge_history=demand_surge_history,
         purchase_vendor_df=purchase_vendor_df,
         purchase_history_month_from=str(source_params.get("dashboard_lite_history_month_from") or ""),
+        inbound_facts_df=inbound_facts_df,
         source_call_count=int(needs_sales_source) + int(needs_stock_source),
+        inbound_source_call_count=int(needs_inbound_source),
         stock_mode=str(service_params.get("stock_mode") or "real"),
     )
     log.info(
@@ -2468,6 +2647,7 @@ def build_dashboard_lite_facts(
             "returns_policy": "반품 제외, 별도 표시",
         },
         "inventory": inventory,
+        "inbound_summary": dict(inventory.get("inbound_summary") or {}),
         "stock_readiness": {
             "threshold_pct": float(service_params.get("readiness_warning_pct") or STOCK_READY_THRESHOLD_PCT),
             "policy": "제품별 준비가능수량=min(max(현재재고,0), 위험보정 잔여예상수요)",
@@ -2499,13 +2679,21 @@ def build_dashboard_lite_facts(
             "재고 98% 이상 SKU를 기본 조치 목록에 반복 노출",
         ],
     }
-    facts["source_call_count"] = int(needs_sales_source) + int(needs_stock_source)
+    facts["base_source_call_count"] = int(needs_sales_source) + int(needs_stock_source)
+    facts["inbound_source_call_count"] = int(needs_inbound_source)
+    facts["source_call_count"] = facts["base_source_call_count"] + facts["inbound_source_call_count"]
+    facts["performance"]["inbound_source_elapsed_ms"] = inbound_source_elapsed_ms
+    facts["performance"]["inbound_query_elapsed_ms"] = inbound_query_elapsed_ms
+    facts["performance"]["inbound_build_elapsed_ms"] = inbound_build_elapsed_ms
+    facts["performance"]["inbound_source_rows"] = inbound_source_rows
     log.info(
-        "[dashboard.finish] company_id=%s month_from=%s month_to=%s evaluation_month=%s source_call_count=%s dashboard_total_ms=%s elapsed_ms=%s",
+        "[dashboard.finish] company_id=%s month_from=%s month_to=%s evaluation_month=%s base_source_call_count=%s inbound_source_call_count=%s source_call_count=%s dashboard_total_ms=%s elapsed_ms=%s",
         service_params.get("company_id") or "",
         service_params.get("month_from"),
         service_params.get("month_to"),
         service_params.get("evaluation_month"),
+        facts["base_source_call_count"],
+        facts["inbound_source_call_count"],
         facts["source_call_count"],
         int((time.perf_counter() - t0) * 1000),
         int((time.perf_counter() - t0) * 1000),
