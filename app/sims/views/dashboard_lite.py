@@ -443,6 +443,41 @@ def _inject_dashboard_lite_styles_once() -> None:
             font-size: 0.75rem;
             text-align: left;
         }
+        .dashboard-lite-sales-state {
+            margin: 10px 0 14px;
+            padding: 9px 12px;
+            border-left: 3px solid #0f766e;
+            background: #f7fbfb;
+            color: rgba(49, 51, 63, 0.82);
+            font-size: 0.86rem;
+            line-height: 1.55;
+        }
+        .dashboard-lite-sales-brief {
+            margin: 14px 0 18px;
+            padding: 16px 18px;
+            border: 1px solid rgba(15, 118, 110, 0.22);
+            border-radius: 8px;
+            background: #fbfdfd;
+        }
+        .dashboard-lite-sales-brief-title {
+            margin: 0 0 8px;
+            color: #1f2937;
+            font-size: 1.125rem;
+            font-weight: 700;
+            line-height: 1.35;
+        }
+        .dashboard-lite-sales-brief-line {
+            margin: 4px 0;
+            color: rgba(31, 41, 55, 0.9);
+            font-size: 1rem;
+            line-height: 1.6;
+        }
+        .dashboard-lite-sales-brief-note {
+            margin: 8px 0 0;
+            color: rgba(49, 51, 63, 0.62);
+            font-size: 0.82rem;
+            line-height: 1.45;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -450,34 +485,82 @@ def _inject_dashboard_lite_styles_once() -> None:
     st.session_state["__dashboard_lite_styles_loaded"] = True
 
 
+def _sales_time_status_label(value: Any) -> str:
+    try:
+        achievement = float(value)
+    except (TypeError, ValueError):
+        return "계산불가"
+    if achievement >= 105.0:
+        return "현재일 예상보다 앞섬"
+    if achievement >= 95.0:
+        return "현재일 예상과 유사"
+    return "현재일 예상보다 뒤처짐"
+
+
+def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
+    """Derive display-only sales labels without changing stored Dashboard facts."""
+    sales = facts.get("sales") or {}
+    metrics = sales.get("metrics") or {}
+    visualization = sales.get("visualization") or {}
+    current = (metrics.get("current_month_sales") or {}).get("value")
+    forecast = (metrics.get("current_month_forecast_sales") or {}).get("value")
+    time_progress = (metrics.get("time_progress_pct") or {}).get("value")
+    achievement = (metrics.get("time_adjusted_achievement_pct") or {}).get("value")
+    try:
+        current_number = float(current)
+        forecast_number = float(forecast)
+    except (TypeError, ValueError):
+        current_number = forecast_number = None
+
+    if current_number is None or forecast_number is None:
+        comparison_label, comparison_amount = "월말 예상 비교 자료부족", None
+    elif current_number > forecast_number:
+        comparison_label, comparison_amount = "월말 예상 초과", current_number - forecast_number
+    elif current_number < forecast_number:
+        comparison_label, comparison_amount = "월말 예상 잔여", forecast_number - current_number
+    else:
+        comparison_label, comparison_amount = "월말 예상 도달", 0.0
+
+    elapsed_days = total_days = None
+    evaluation_month = str(visualization.get("evaluation_month") or "")
+    time_basis = str((metrics.get("time_progress_pct") or {}).get("time_basis") or "")
+    day_match = re.search(r"(\d+)\s*/\s*(\d+)", time_basis)
+    if day_match:
+        elapsed_days, total_days = int(day_match.group(1)), int(day_match.group(2))
+    elif evaluation_month and time_progress is not None:
+        try:
+            total_days = monthrange(int(evaluation_month[:4]), int(evaluation_month[4:6]))[1]
+            elapsed_days = round(total_days * float(time_progress) / 100.0)
+        except (ValueError, TypeError):
+            elapsed_days = total_days = None
+
+    return {
+        "current_sales": current,
+        "forecast_sales": forecast,
+        "expected_to_date_sales": visualization.get("expected_to_date_sales"),
+        "sales_progress_pct": visualization.get("sales_progress_pct", (metrics.get("current_month_progress_pct") or {}).get("value")),
+        "time_progress_pct": time_progress,
+        "time_adjusted_achievement_pct": achievement,
+        "time_adjusted_status": _sales_time_status_label(achievement),
+        "comparison_label": comparison_label,
+        "comparison_amount": comparison_amount,
+        "elapsed_days": elapsed_days,
+        "total_days": total_days,
+    }
+
+
 def _render_status_cards(facts: dict[str, Any]) -> None:
     _inject_dashboard_lite_styles_once()
-    sales_metrics = (facts.get("sales") or {}).get("metrics") or {}
-    inventory_metrics = (facts.get("inventory") or {}).get("metrics") or {}
-    actions = facts.get("today_actions") or []
+    state = _sales_presentation_state(facts)
     amount_unit = _facts_amount_display_unit(facts)
-
     cards = [
-        sales_metrics.get("completed_month_avg_sales"),
-        sales_metrics.get("current_month_sales"),
-        sales_metrics.get("current_month_forecast_sales"),
-        sales_metrics.get("current_month_progress_pct"),
-        inventory_metrics.get("ready_sku_count"),
-        inventory_metrics.get("shortage_sku_count"),
-        inventory_metrics.get("sku_readiness_pct"),
-        {
-            "label": "오늘 조치 필요 건수",
-            "value": len(actions),
-            "unit": "건",
-            "time_basis": "Dashboard deterministic action rules",
-        },
+        ("당월 현재매출", state["current_sales"], "당월 누적 실적", "amount"),
+        ("월말 예상매출", state["forecast_sales"], "당월 월말 예상", "amount"),
+        ("현재일 기준 예상매출", state["expected_to_date_sales"], "월 경과율 반영", "amount"),
+        ("현재일 기준 달성률", state["time_adjusted_achievement_pct"], state["time_adjusted_status"], "pct"),
     ]
     if amount_unit == "auto":
-        amount_values = [
-            metric.get("value")
-            for metric in cards
-            if isinstance(metric, dict) and str(metric.get("unit") or "") in {"원", "금액"}
-        ]
+        amount_values = [value for _label, value, _help, kind in cards if kind == "amount"]
         try:
             max_amount = max(abs(float(value)) for value in amount_values if value is not None)
         except ValueError:
@@ -485,27 +568,103 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
         divisor, _label = _amount_display_spec("auto", max_amount)
         amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
 
-    for row in range(0, len(cards), 4):
-        cols = st.columns(4)
-        for col, metric in zip(cols, cards[row:row + 4]):
-            metric = metric or {}
-            unit = str(metric.get("unit") or "")
-            suffix = "%" if unit == "%" else ("건" if unit == "건" else ("개" if unit == "개" else ""))
-            digits = 1 if unit == "%" else 0
-            is_amount = unit in {"원", "금액"}
-            with col:
-                _metric_card(
-                    str(metric.get("label") or "-"),
-                    metric.get("value"),
-                    suffix,
-                    help_text=str(metric.get("time_basis") or ""),
-                    digits=digits,
-                    amount_unit=amount_unit if is_amount else "",
-                )
+    cols = st.columns(4)
+    for col, (label, value, help_text, kind) in zip(cols, cards):
+        with col:
+            _metric_card(
+                label,
+                value,
+                "%" if kind == "pct" else "",
+                help_text=help_text,
+                digits=1 if kind == "pct" else 0,
+                amount_unit=amount_unit if kind == "amount" else "",
+            )
+
+    progress_text = "자료부족"
+    if state["elapsed_days"] is not None and state["total_days"] is not None and state["time_progress_pct"] is not None:
+        progress_text = f"{state['elapsed_days']}일 / {state['total_days']}일 · {_fmt_number(state['time_progress_pct'], 1)}%"
+    sales_progress_text = _fmt_number(state["sales_progress_pct"], 1)
+    comparison_text = state["comparison_label"]
+    if state["comparison_amount"] is not None and state["comparison_label"] != "월말 예상 도달":
+        comparison_text = f"{comparison_text} {_fmt_dashboard_amount(state['comparison_amount'], amount_unit)}"
+    st.markdown(
+        "<div class=\"dashboard-lite-sales-state\">"
+        f"<strong>월 경과</strong>: {html.escape(progress_text)} · "
+        f"<strong>월말 예상 달성률</strong>: {html.escape(sales_progress_text)}% · "
+        f"<strong>{html.escape(comparison_text)}</strong>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_sales_brief(facts: dict[str, Any]) -> None:
+    sales = facts.get("sales") or {}
+    metrics = sales.get("metrics") or {}
+    visualization = sales.get("visualization") or {}
+    current = metrics.get("current_month_sales") or {}
+    forecast = metrics.get("current_month_forecast_sales") or {}
+    state = _sales_presentation_state(facts)
+    amount_unit = _facts_amount_display_unit(facts)
+    current_value = current.get("value")
+    forecast_value = forecast.get("value")
+    if current_value is None or forecast_value is None:
+        st.caption("당월 현재·예상 매출 자료가 부족합니다.")
+        return
+
+    if state["comparison_label"] == "월말 예상 초과":
+        lines = [
+            f"현재 매출은 <strong>{html.escape(_fmt_dashboard_amount(current_value, amount_unit))}</strong>이며, 월말 예상 <strong>{html.escape(_fmt_dashboard_amount(forecast_value, amount_unit))}</strong>을 <strong>{html.escape(_fmt_dashboard_amount(state['comparison_amount'], amount_unit))}</strong> 초과했습니다.",
+        ]
+    elif state["comparison_label"] == "월말 예상 도달":
+        lines = [
+            f"현재 매출은 <strong>{html.escape(_fmt_dashboard_amount(current_value, amount_unit))}</strong>이며, 월말 예상 <strong>{html.escape(_fmt_dashboard_amount(forecast_value, amount_unit))}</strong>에 도달했습니다.",
+        ]
+    else:
+        lines = [
+            f"현재 매출은 <strong>{html.escape(_fmt_dashboard_amount(current_value, amount_unit))}</strong>이며, 월말 예상은 <strong>{html.escape(_fmt_dashboard_amount(forecast_value, amount_unit))}</strong>입니다. 월말 예상까지 <strong>{html.escape(_fmt_dashboard_amount(state['comparison_amount'], amount_unit))}</strong>이 남았습니다.",
+        ]
+
+    expected_to_date = state["expected_to_date_sales"]
+    if expected_to_date is None:
+        lines.append("현재일 기준 예상매출을 계산할 수 있는 평가월 자료가 부족합니다.")
+    else:
+        difference = float(current_value) - float(expected_to_date)
+        if state["time_adjusted_status"] == "현재일 예상과 유사":
+            lines.append("현재일 기준 예상매출과 유사한 수준입니다.")
+        elif difference > 0:
+            lines.append(f"현재일 기준 예상매출보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 앞서 있습니다.")
+        else:
+            lines.append(f"현재일 기준 예상매출보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 뒤처져 있습니다.")
+
+    chart_rows = sales.get("chart_rows") or []
+    completed = [row for row in chart_rows if row.get("kind") == "완료월 실제"]
+    preforecast = [row for row in chart_rows if row.get("kind") == "완료월 사전예상"]
+    preforecast_by_month = {str(row.get("period_sort") or ""): row for row in preforecast}
+    comparable = [row for row in completed if str(row.get("period_sort") or "") in preforecast_by_month]
+    if comparable:
+        latest = max(comparable, key=lambda row: str(row.get("period_sort") or ""))
+        prior = preforecast_by_month[str(latest.get("period_sort") or "")]
+        prior_value = float(prior.get("value") or 0)
+        if prior_value:
+            delta_pct = (float(latest.get("value") or 0) / prior_value - 1.0) * 100.0
+            direction = "높았습니다" if delta_pct > 0 else ("낮았습니다" if delta_pct < 0 else "같았습니다")
+            lines.append(f"최근 완료월 실적은 당시 사전예상보다 <strong>{html.escape(_fmt_number(abs(delta_pct), 1))}%</strong> {direction}.")
+        else:
+            lines.append("최근 완료월의 비교 가능한 사전예상 자료가 없습니다.")
+    else:
+        lines.append("최근 완료월의 비교 가능한 사전예상 자료가 없습니다.")
+    st.markdown(
+        "<div class=\"dashboard-lite-sales-brief\">"
+        "<div class=\"dashboard-lite-sales-brief-title\">오늘의 매출 요약</div>"
+        + "".join(f"<div class=\"dashboard-lite-sales-brief-line\">{line}</div>" for line in lines)
+        + "<div class=\"dashboard-lite-sales-brief-note\">현재일 기준 예상매출은 평가월의 월 경과율을 반영한 참고값입니다.</div>"
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart | None:
-    """Build the comparable monthly actual/forecast bar chart without reloading facts."""
+    """Build the monthly actual bar, forecast line, and current-day marker without reloading facts."""
     rows = (facts.get("sales") or {}).get("chart_rows") or []
     if not rows:
         return None
@@ -513,63 +672,130 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     if df.empty or not {"period", "period_sort", "kind", "value"}.issubset(df.columns):
         return None
     df = df.sort_values(["period_sort", "kind"], kind="stable").reset_index(drop=True)
-    period_order = (
+    period_lookup = (
         df[["period", "period_sort"]]
         .drop_duplicates()
-        .sort_values("period_sort", kind="stable")["period"]
-        .tolist()
+        .sort_values("period_sort", kind="stable")
     )
+    first_year = str(period_lookup.iloc[0]["period_sort"])[:4]
+    period_lookup["display_period"] = period_lookup.apply(
+        lambda row: (
+            f"{str(row['period_sort'])[:4]}년 {int(str(row['period_sort'])[4:6])}월"
+            if str(row["period_sort"])[:4] != first_year
+            else f"{int(str(row['period_sort'])[4:6])}월"
+        ),
+        axis=1,
+    )
+    period_display_map = dict(zip(period_lookup["period"], period_lookup["display_period"]))
+    period_order = period_lookup["display_period"].tolist()
+    df["display_period"] = df["period"].map(period_display_map).fillna(df["period"])
 
+    amount_unit = _facts_amount_display_unit(facts)
+    divisor, unit_label = _amount_display_spec(amount_unit, pd.to_numeric(df["value"], errors="coerce").abs().max())
+    df["display_value"] = pd.to_numeric(df["value"], errors="coerce") / divisor
     actual_df = df[~df["kind"].astype(str).str.contains("예상", na=False)].copy()
     forecast_df = df[df["kind"].astype(str).str.contains("예상", na=False)].copy()
+    actual_df["series"] = "실제매출"
+    actual_df["value_kind"] = actual_df["kind"].map(
+        {"완료월 실제": "완료월 실제", "당월 현재(부분월)": "당월 현재매출"}
+    ).fillna("실제매출")
+    forecast_df["series"] = "예상매출"
+    forecast_df["value_kind"] = forecast_df["kind"].map(
+        {"완료월 사전예상": "완료월 사전예상", "당월 예상": "당월 월말 예상"}
+    ).fillna("예상매출")
+    forecast_df = forecast_df[pd.to_numeric(forecast_df["value"], errors="coerce").notna()].copy()
+    forecast_df = forecast_df.sort_values("period_sort", kind="stable")
+    forecast_df["forecast_segment"] = (
+        forecast_df["period_sort"].astype(str).map(lambda value: int(value[:4]) * 12 + int(value[4:6]))
+        .diff()
+        .ne(1)
+        .cumsum()
+    )
     tooltip = [
-        alt.Tooltip("period:N", title="기간"),
-        alt.Tooltip("kind:N", title="구분"),
-        alt.Tooltip("value:Q", title="매출", format=",.0f"),
+        alt.Tooltip("display_period:N", title="기준월"),
+        alt.Tooltip("value_kind:N", title="값 종류"),
+        alt.Tooltip("display_value:Q", title=f"매출 ({unit_label})", format=",.0f"),
+        alt.Tooltip("value:Q", title="원본 금액(원)", format=",.0f"),
+        alt.Tooltip("amount_display_unit:N", title="표시 단위"),
+        alt.Tooltip("month_status:N", title="월 구분"),
         alt.Tooltip("partial_period:N", title="부분월"),
         alt.Tooltip("forecast_status:N", title="예상 상태"),
         alt.Tooltip("forecast_basis:N", title="예상 기준"),
     ]
-    kind_color = alt.Color(
-        "kind:N",
-        title="구분",
+    df["amount_display_unit"] = unit_label
+    actual_df["amount_display_unit"] = unit_label
+    forecast_df["amount_display_unit"] = unit_label
+    actual_df["month_status"] = actual_df["kind"].map(
+        {"완료월 실제": "완료월", "당월 현재(부분월)": "평가월"}
+    ).fillna("실제")
+    forecast_df["month_status"] = forecast_df["kind"].map(
+        {"완료월 사전예상": "완료월", "당월 예상": "평가월"}
+    ).fillna("예상")
+    series_color = alt.Color(
+        "series:N",
+        title=None,
         scale=alt.Scale(
-            domain=["완료월 실제", "당월 현재(부분월)", "완료월 사전예상", "당월 예상"],
-            range=["#2563eb", "#2563eb", "#f97316", "#f97316"],
+            domain=["실제매출", "예상매출", "현재일 기준"],
+            range=["#2563eb", "#f97316", "#0f766e"],
         ),
+        legend=alt.Legend(orient="top", direction="horizontal", labelFontSize=12, symbolSize=90),
     )
-    x_encoding = alt.X("period:N", title="기간", sort=period_order)
-    y_encoding = alt.Y("value:Q", title="매출", stack=None)
+    x_encoding = alt.X("display_period:N", title=None, sort=period_order, axis=alt.Axis(labelAngle=0, labelPadding=8))
+    y_encoding = alt.Y("display_value:Q", title=f"매출 ({unit_label})", stack=None, axis=alt.Axis(grid=True, gridColor="#e5e7eb", gridOpacity=0.8))
     base = alt.Chart(df).encode(
         x=x_encoding,
         y=y_encoding,
         tooltip=tooltip,
     )
     layers = []
-    # Forecast is behind the narrower actual bar at the same monthly center point.
-    if not forecast_df.empty:
-        layers.append(
-            alt.Chart(forecast_df).mark_bar(opacity=0.55, size=28).encode(
-                x=x_encoding,
-                y=y_encoding,
-                color=kind_color,
-                tooltip=tooltip,
-            )
-        )
     if not actual_df.empty:
         layers.append(
-            alt.Chart(actual_df).mark_bar(opacity=0.88, size=18).encode(
+            alt.Chart(actual_df).mark_bar(opacity=0.9, size=32).encode(
                 x=x_encoding,
                 y=y_encoding,
-                color=kind_color,
+                color=series_color,
                 tooltip=tooltip,
             )
         )
-    return (
-        alt.layer(*layers).resolve_scale(y="shared").properties(height=260)
-        if layers
-        else base.mark_bar().properties(height=260)
+    if not forecast_df.empty:
+        layers.append(
+            alt.Chart(forecast_df).mark_line(point=alt.OverlayMarkDef(filled=True, size=58), strokeWidth=2.5).encode(
+                x=x_encoding,
+                y=y_encoding,
+                color=series_color,
+                detail="forecast_segment:N",
+                tooltip=tooltip,
+            )
+        )
+    chart = (
+        alt.layer(*layers).resolve_scale(y="shared", color="shared").properties(height=380, padding={"left": 4, "right": 8, "top": 8, "bottom": 0})
+        if layers else base.mark_bar().properties(height=380)
     )
+    visualization = (facts.get("sales") or {}).get("visualization") or {}
+    marker_period = str(visualization.get("evaluation_month") or "")
+    marker_value = visualization.get("expected_to_date_sales")
+    if marker_period and marker_value is not None and visualization.get("time_progress_pct") not in (None, 0, 100):
+        marker_period_label = period_display_map.get(f"{marker_period[:4]}-{marker_period[4:6]}") or f"{int(marker_period[4:6])}월"
+        marker_df = pd.DataFrame(
+            [{
+                "display_period": marker_period_label,
+                "display_value": float(marker_value) / divisor,
+                "value": float(marker_value),
+                "series": "현재일 기준",
+                "value_kind": "현재일 기준 예상매출",
+                "amount_display_unit": unit_label,
+                "month_status": "평가월",
+                "time_progress_pct": visualization.get("time_progress_pct"),
+            }]
+        )
+        marker = alt.Chart(marker_df).mark_point(shape="diamond", filled=True, size=100).encode(
+            x=x_encoding,
+            y=y_encoding,
+            color=series_color,
+            tooltip=tooltip + [alt.Tooltip("time_progress_pct:Q", title="월 경과율", format=".1f")],
+        )
+        chart = chart + marker
+    return chart
 
 
 def _render_sales_chart(facts: dict[str, Any]) -> None:
@@ -1976,6 +2202,7 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
         },
         "sales": {
             "metrics": dict(sales.get("metrics") or {}),
+            "visualization": dict(sales.get("visualization") or {}),
             "chart_rows": list(sales.get("chart_rows") or []),
             "decline_targets": list(sales.get("decline_targets") or [])[:row_limit],
         },
@@ -2083,7 +2310,7 @@ def _render_dashboard_result_header(cache: dict[str, Any]) -> None:
     params = dict(cache.get("params") or {})
     elapsed_ms = int(cache.get("elapsed_ms") or 0)
     created_at = str(cache.get("created_at") or "").strip()
-    st.markdown("## Dashboard Lite")
+    st.markdown("## 일일 재고·매출 보고")
     st.caption(_dashboard_scope_header(params))
     if created_at:
         st.caption(f"조회 완료 · {max(0, elapsed_ms) / 1000:.1f}초 · {created_at}")
@@ -2106,6 +2333,7 @@ def _render_dashboard_facts(
         labels = ", ".join(str(item.get("label") or "제품 조건") for item in filter_issues)
         st.warning(f"{labels} 제외 조건에 필요한 코드 컬럼이 없어 이번 결과에는 적용하지 않았습니다.")
     _render_status_cards(facts)
+    _render_sales_brief(facts)
     st.divider()
 
     st.markdown("### 매출 그래프")
@@ -2211,7 +2439,7 @@ def render_dashboard_lite_chat_item(cache: dict[str, Any], *, render_mode: str =
 
 def render_dashboard_lite() -> dict[str, Any]:
     """Render Dashboard Lite without changing current-table routing."""
-    st.subheader("Dashboard Lite v0.1")
+    st.subheader("일일 재고·매출 보고")
     st.caption("상태 → 근거 → 무엇을 해야 하나 순서로 읽는 운영 브리핑입니다.")
 
     _apply_saved_dashboard_profile_once()

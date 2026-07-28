@@ -847,6 +847,41 @@ def _safe_div(numerator: float, denominator: float, default: float = 0.0) -> flo
     return float(numerator) / float(denominator) if float(denominator or 0) else default
 
 
+def _dashboard_time_progress(
+    evaluation_month: Any,
+    *,
+    policy_date: Any = None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Return the calendar progress used only to interpret the evaluation month."""
+    today = today or date.today()
+    yyyymm = _normalize_yyyymm(evaluation_month)
+    if not yyyymm:
+        return {"pct": None, "elapsed_days": None, "total_days": None, "status": "자료부족"}
+
+    today_ym = today.strftime("%Y%m")
+    if yyyymm < today_ym:
+        return {"pct": 100.0, "elapsed_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "total_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "status": "완료월"}
+    if yyyymm > today_ym:
+        return {"pct": 0.0, "elapsed_days": 0, "total_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "status": "미래월"}
+
+    total_days = monthrange(today.year, today.month)[1]
+    policy_text = re.sub(r"\D", "", str(policy_date or ""))[:8]
+    try:
+        policy_day = datetime.strptime(policy_text, "%Y%m%d").date()
+    except ValueError:
+        policy_day = today
+    if policy_day.strftime("%Y%m") != yyyymm:
+        policy_day = today
+    elapsed_days = max(0, min(int(policy_day.day), total_days))
+    return {
+        "pct": float(elapsed_days / total_days * 100.0),
+        "elapsed_days": elapsed_days,
+        "total_days": total_days,
+        "status": "진행중",
+    }
+
+
 def _fact(
     label: str,
     value: Any,
@@ -1227,6 +1262,9 @@ def _build_sales_facts(
     payload: Mapping[str, Any] | None,
     *,
     history_actuals: list[dict[str, Any]] | None = None,
+    evaluation_month: Any = None,
+    policy_date: Any = None,
+    today: date | None = None,
 ) -> dict[str, Any]:
     df = _payload_df(payload)
     meta = _payload_meta(payload)
@@ -1236,6 +1274,30 @@ def _build_sales_facts(
     current_sales = _sum_col(df, "당월 현재매출") or _num(meta.get("sum_current_month_sales_amt"))
     forecast_sales = _sum_col(df, "당월 예상매출") or _num(meta.get("sum_current_month_expected_sales_amt"))
     progress_pct = _safe_div(current_sales * 100.0, forecast_sales)
+    remaining_sales = _sum_col(df, "당월 잔여예상") or _num(meta.get("sum_current_month_remaining_expected_amt"))
+    if not ("당월 잔여예상" in df.columns or "sum_current_month_remaining_expected_amt" in meta):
+        remaining_sales = max(forecast_sales - current_sales, 0.0)
+    evaluation_yyyymm = _normalize_yyyymm(evaluation_month) or _normalize_yyyymm(meta.get("evaluation_month") or meta.get("current_month"))
+    time_progress = _dashboard_time_progress(evaluation_yyyymm, policy_date=policy_date, today=today)
+    time_progress_pct = time_progress["pct"]
+    expected_to_date_sales = (
+        float(forecast_sales) * float(time_progress_pct) / 100.0
+        if time_progress_pct is not None
+        else None
+    )
+    time_adjusted_achievement_pct = (
+        float(progress_pct) / float(time_progress_pct) * 100.0
+        if time_progress_pct not in (None, 0)
+        else None
+    )
+    if time_adjusted_achievement_pct is None:
+        time_adjusted_status = "계산불가"
+    elif time_adjusted_achievement_pct >= 105.0:
+        time_adjusted_status = "시간 진척보다 앞섬"
+    elif time_adjusted_achievement_pct >= 95.0:
+        time_adjusted_status = "시간 진척과 유사"
+    else:
+        time_adjusted_status = "시간 진척보다 뒤처짐"
 
     amount_basis_col = "완료월총매출" if "완료월총매출" in df.columns else "총매출액"
     total_basis = _sum_col(df, amount_basis_col)
@@ -1359,6 +1421,16 @@ def _build_sales_facts(
                 partial_period=True,
                 comparable_with=["당월 현재매출"],
             ),
+            "current_month_remaining_forecast_sales": _fact(
+                "당월 잔여예상",
+                remaining_sales,
+                unit="원",
+                aggregation="forecast - current when source value is unavailable",
+                grain="제약사",
+                time_basis="당월 잔여 예상 매출",
+                source_columns=["당월 잔여예상", "당월 예상매출", "당월 현재매출"],
+                partial_period=True,
+            ),
             "current_month_progress_pct": _fact(
                 "당월 진척률",
                 progress_pct,
@@ -1366,6 +1438,30 @@ def _build_sales_facts(
                 aggregation="current / forecast",
                 grain="제약사",
                 time_basis="당월 부분월",
+                source_columns=["당월 현재매출", "당월 예상매출"],
+                partial_period=True,
+            ),
+            "time_progress_pct": _fact(
+                "시간 진척률",
+                time_progress_pct,
+                unit="%",
+                aggregation="elapsed_days / calendar_days",
+                grain="평가월",
+                time_basis=(
+                    f"{evaluation_yyyymm or '평가월'} "
+                    f"{time_progress.get('elapsed_days')}/{time_progress.get('total_days')}일 경과 "
+                    f"{time_progress.get('status') or ''}"
+                ),
+                source_columns=[],
+                partial_period=True,
+            ),
+            "time_adjusted_achievement_pct": _fact(
+                "시간 대비 달성률",
+                time_adjusted_achievement_pct,
+                unit="%",
+                aggregation="sales_progress / time_progress",
+                grain="평가월",
+                time_basis=time_adjusted_status,
                 source_columns=["당월 현재매출", "당월 예상매출"],
                 partial_period=True,
             ),
@@ -1389,6 +1485,19 @@ def _build_sales_facts(
             ),
         },
         "chart_rows": chart_rows,
+        "visualization": {
+            "current_sales": current_sales,
+            "forecast_sales": forecast_sales,
+            "remaining_forecast": remaining_sales,
+            "sales_progress_pct": progress_pct,
+            "time_progress_pct": time_progress_pct,
+            "time_adjusted_achievement_pct": time_adjusted_achievement_pct,
+            "time_adjusted_status": time_adjusted_status,
+            "expected_to_date_sales": expected_to_date_sales,
+            "evaluation_month": evaluation_yyyymm,
+            "chart_month_count": len({str(row.get("period_sort") or "") for row in chart_rows if row.get("period_sort")}),
+            "completed_month_count": completed_months,
+        },
         "trend_counts": trend_counts,
         "trend_amounts": trend_amounts,
         "trend_shares": trend_shares,
@@ -2597,6 +2706,9 @@ def build_dashboard_lite_facts(
     sales = _build_sales_facts(
         manufacturer_summary_payload,
         history_actuals=source_monthly_actuals,
+        evaluation_month=service_params.get("evaluation_month"),
+        policy_date=service_params.get("policy_date"),
+        today=today,
     )
     log.info(
         "[dashboard.sales_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",

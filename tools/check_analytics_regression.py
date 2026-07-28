@@ -9175,6 +9175,12 @@ def run_basic_checks() -> list[CheckResult]:
             service_errors.append(f"service_calls={calls!r}")
         if built.get("source_call_count") != 3:
             service_errors.append(f"source_call_count={built.get('source_call_count')!r}")
+        if built.get("base_source_call_count") != 2 or built.get("inbound_source_call_count") != 1:
+            service_errors.append(
+                "source_call_contract="
+                f"base={built.get('base_source_call_count')!r},"
+                f"inbound={built.get('inbound_source_call_count')!r}"
+            )
         if preloaded_seen != {"manufacturer": True, "stock": True, "stock_master_universe": True}:
             service_errors.append(f"preloaded_seen={preloaded_seen!r}")
         if any(not p.get("month_from") or not p.get("month_to") for p in seen_params):
@@ -9192,7 +9198,7 @@ def run_basic_checks() -> list[CheckResult]:
         if service_errors:
             results.append(_fail("Dashboard Lite guarded service calls", "; ".join(service_errors)))
         else:
-            results.append(_ok("Dashboard Lite guarded service calls", "shared sales, stock, and one inbound source load once; existing sales/stock frames are reused"))
+            results.append(_ok("Dashboard Lite guarded service calls", "base source calls=2, inbound source calls=1, total source calls=3; visualization and compact snapshots add no source call"))
 
         inbound_errors: list[str] = []
         inbound_fixture = pd.DataFrame([
@@ -9577,7 +9583,7 @@ def run_basic_checks() -> list[CheckResult]:
             if view_mod.render_dashboard_lite_chat_item(dashboard_cache, render_mode="primary") is not False:
                 render_errors.append("dashboard_same_rerun_primary_not_guarded")
             view_mod.render_dashboard_lite_chat_item(first["meta"]["dashboard_cache"], render_mode="chat")
-            if not any(text == "## Dashboard Lite" for text in fake_st.markdowns):
+            if not any(text == "## 일일 재고·매출 보고" for text in fake_st.markdowns):
                 render_errors.append("dashboard_result_title_not_rendered")
             if not any("조회기간:" in text and "평가월:" in text and "재고위치:" in text for text in fake_st.captions):
                 render_errors.append(f"dashboard_scope_header_missing={fake_st.captions!r}")
@@ -9668,18 +9674,18 @@ def run_basic_checks() -> list[CheckResult]:
             sales_chart_json = json.dumps(sales_chart_spec, ensure_ascii=False)
             if '"type": "bar"' not in sales_chart_json:
                 chart_errors.append("sales_chart_not_bar")
-            if '"type": "line"' in sales_chart_json or '"type": "point"' in sales_chart_json:
-                chart_errors.append("sales_chart_contains_line_or_point")
-            if "#2563eb" not in sales_chart_json or "#f97316" not in sales_chart_json:
-                chart_errors.append("sales_chart_actual_forecast_colors_missing")
-            if "당월 현재(부분월)" not in sales_chart_json or "당월 예상" not in sales_chart_json:
-                chart_errors.append("sales_chart_current_month_rows_missing")
+            if '"type": "line"' not in sales_chart_json or '"type": "point"' not in sales_chart_json:
+                chart_errors.append("sales_chart_line_or_marker_missing")
+            if not all(token in sales_chart_json for token in ("#2563eb", "#f97316", "#0f766e")):
+                chart_errors.append("sales_chart_actual_forecast_marker_colors_missing")
+            if not all(token in sales_chart_json for token in ("실제매출", "예상매출", "현재일 기준")):
+                chart_errors.append("sales_chart_user_legend_missing")
         except Exception as exc:
             chart_errors.append(f"sales_chart_build={type(exc).__name__}:{exc}")
         if chart_errors:
             results.append(_fail("Dashboard Lite monthly sales bar chart", "; ".join(chart_errors)))
         else:
-            results.append(_ok("Dashboard Lite monthly sales bar chart", "completed/current actual and forecast sales render as same-axis bars without connected lines or points"))
+            results.append(_ok("Dashboard Lite monthly sales chart", "actual bars, forecast line, and the current-day marker are rendered from the existing compact facts"))
 
         preforecast_errors: list[str] = []
         chart_source = pd.DataFrame(
@@ -9707,9 +9713,9 @@ def run_basic_checks() -> list[CheckResult]:
                 {"period": "2025-11", "period_sort": "202511", "value": 8},
                 {"period": "2025-12", "period_sort": "202512", "value": 9},
             ]
-            chart_sales = dash_mod._build_sales_facts({"df": chart_source, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history)
-            target_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_target, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history)
-            history_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_history, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history)
+            chart_sales = dash_mod._build_sales_facts({"df": chart_source, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28))
+            target_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_target, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28))
+            history_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_history, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28))
             chart_rows = chart_sales.get("chart_rows") or []
             period_order = []
             for row in chart_rows:
@@ -9737,20 +9743,51 @@ def run_basic_checks() -> list[CheckResult]:
                 preforecast_errors.append("target_month_actual_changed_its_preforecast")
             if _forecast_value(chart_sales, "2026-04") == _forecast_value(history_changed_sales, "2026-04"):
                 preforecast_errors.append("prior_history_did_not_change_later_preforecast")
+            visualization = chart_sales.get("visualization") or {}
+            if abs(float(visualization.get("time_progress_pct") or 0) - (14 / 31 * 100)) > 1e-9:
+                preforecast_errors.append(f"time_progress={visualization.get('time_progress_pct')!r}")
+            if abs(float(visualization.get("expected_to_date_sales") or 0) - (90 * 14 / 31)) > 1e-9:
+                preforecast_errors.append(f"expected_to_date={visualization.get('expected_to_date_sales')!r}")
+            if visualization.get("remaining_forecast") != 20:
+                preforecast_errors.append(f"remaining_forecast={visualization.get('remaining_forecast')!r}")
+            if visualization.get("time_adjusted_status") != "시간 진척보다 앞섬":
+                preforecast_errors.append(f"time_adjusted_status={visualization.get('time_adjusted_status')!r}")
+            if dash_mod._dashboard_time_progress("202602", today=date(2026, 7, 28)).get("pct") != 100.0:
+                preforecast_errors.append("past_month_time_progress")
+            if dash_mod._dashboard_time_progress("202608", today=date(2026, 7, 28)).get("pct") != 0.0:
+                preforecast_errors.append("future_month_time_progress")
+            if dash_mod._dashboard_time_progress("202402", today=date(2024, 2, 29)).get("pct") != 100.0:
+                preforecast_errors.append("leap_year_time_progress")
             chart_spec = view_mod._build_sales_bar_chart({"sales": chart_sales}).to_dict()
+            expected_display_order = [f"{month}월" for month in range(1, 8)]
             layer_sorts = [layer.get("encoding", {}).get("x", {}).get("sort") for layer in chart_spec.get("layer", [])]
-            if not layer_sorts or any(sort != expected_period_order for sort in layer_sorts):
+            if not layer_sorts or any(sort != expected_display_order for sort in layer_sorts):
                 preforecast_errors.append(f"layer_period_sorts={layer_sorts!r}")
             if any("xOffset" in layer.get("encoding", {}) for layer in chart_spec.get("layer", [])):
                 preforecast_errors.append("x_offset_side_by_side_remains")
             if chart_spec.get("resolve", {}).get("scale", {}).get("y") != "shared":
                 preforecast_errors.append(f"y_scale_resolve={chart_spec.get('resolve')!r}")
             layer_marks = [layer.get("mark") or {} for layer in chart_spec.get("layer", [])]
-            if [mark.get("size") for mark in layer_marks] != [28, 18]:
-                preforecast_errors.append(f"overlay_bar_widths={layer_marks!r}")
+            if layer_marks[0].get("type") != "bar" or layer_marks[0].get("size") != 32:
+                preforecast_errors.append(f"actual_bar_width={layer_marks!r}")
+            if layer_marks[1].get("type") != "line" or layer_marks[2].get("type") != "point":
+                preforecast_errors.append(f"forecast_line_or_current_marker={layer_marks!r}")
             layer_stacks = [layer.get("encoding", {}).get("y", {}).get("stack") for layer in chart_spec.get("layer", [])]
-            if layer_stacks != [None, None]:
+            if layer_stacks != [None, None, None]:
                 preforecast_errors.append(f"layer_y_stacks={layer_stacks!r}")
+            forecast_encoding = chart_spec.get("layer", [])[1].get("encoding", {})
+            if forecast_encoding.get("detail", {}).get("field") != "forecast_segment":
+                preforecast_errors.append(f"forecast_gap_segment={forecast_encoding.get('detail')!r}")
+            cross_year_rows = list(chart_rows)
+            cross_year_rows.append({"period": "2027-01", "period_sort": "202701", "kind": "완료월 실제", "value": 12})
+            cross_year_spec = view_mod._build_sales_bar_chart({"sales": {"chart_rows": cross_year_rows, "visualization": visualization}}).to_dict()
+            if "2027년 1월" not in json.dumps(cross_year_spec, ensure_ascii=False):
+                preforecast_errors.append("cross_year_month_label_missing")
+            missing_forecast_rows = [row for row in chart_rows if not (row.get("kind") == "완료월 사전예상" and row.get("period") == "2026-03")]
+            missing_forecast_spec = view_mod._build_sales_bar_chart({"sales": {"chart_rows": missing_forecast_rows, "visualization": visualization}}).to_dict()
+            missing_json = json.dumps(missing_forecast_spec, ensure_ascii=False)
+            if '"period": "2026-03", "period_sort": "202603", "kind": "완료월 사전예상", "value": 0' in missing_json:
+                preforecast_errors.append("missing_forecast_zero_fabricated")
             actual_values = {
                 row.get("period"): float(row.get("value") or 0)
                 for row in chart_rows
@@ -9763,7 +9800,51 @@ def run_basic_checks() -> list[CheckResult]:
         if preforecast_errors:
             results.append(_fail("Dashboard Lite completed-month preforecast bars", "; ".join(preforecast_errors)))
         else:
-            results.append(_ok("Dashboard Lite completed-month preforecast bars", "internal support months produce preforecasts for every visible completed month; target-month actual never feeds its own forecast"))
+            results.append(_ok("Dashboard Lite sales visualization", "actual bars, forecast line gaps, and the current-day marker use the compact facts without mutating raw chart rows"))
+
+        presentation_errors: list[str] = []
+        try:
+            presentation_base = {"sales": {"metrics": {
+                "current_month_sales": {"value": 110},
+                "current_month_forecast_sales": {"value": 100},
+                "current_month_progress_pct": {"value": 110},
+                "time_progress_pct": {"value": 90.3, "time_basis": "202607 28/31일 경과 진행중"},
+                "time_adjusted_achievement_pct": {"value": 121.8},
+            }, "visualization": {"expected_to_date_sales": 90.3}}}
+            over_state = view_mod._sales_presentation_state(presentation_base)
+            if over_state.get("comparison_label") != "월말 예상 초과" or over_state.get("comparison_amount") != 10:
+                presentation_errors.append(f"over_state={over_state!r}")
+            if over_state.get("time_adjusted_status") != "현재일 예상보다 앞섬":
+                presentation_errors.append(f"ahead_status={over_state!r}")
+            under_facts = json.loads(json.dumps(presentation_base))
+            under_facts["sales"]["metrics"]["current_month_sales"]["value"] = 80
+            under_facts["sales"]["metrics"]["time_adjusted_achievement_pct"]["value"] = 96
+            under_state = view_mod._sales_presentation_state(under_facts)
+            if under_state.get("comparison_label") != "월말 예상 잔여" or under_state.get("comparison_amount") != 20:
+                presentation_errors.append(f"under_state={under_state!r}")
+            equal_facts = json.loads(json.dumps(presentation_base))
+            equal_facts["sales"]["metrics"]["current_month_sales"]["value"] = 100
+            equal_facts["sales"]["metrics"]["time_adjusted_achievement_pct"]["value"] = 94
+            equal_state = view_mod._sales_presentation_state(equal_facts)
+            if equal_state.get("comparison_label") != "월말 예상 도달" or equal_state.get("comparison_amount") != 0:
+                presentation_errors.append(f"equal_state={equal_state!r}")
+            if equal_state.get("time_adjusted_status") != "현재일 예상보다 뒤처짐":
+                presentation_errors.append(f"behind_status={equal_state!r}")
+            unchanged_remaining = (chart_sales.get("visualization") or {}).get("remaining_forecast")
+            if unchanged_remaining != 20:
+                presentation_errors.append(f"remaining_fact_mutated={unchanged_remaining!r}")
+            ui_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
+            for label in ("현재일 기준 예상매출", "현재일 기준 달성률", "월 경과", "월말 예상 초과", "오늘의 매출 요약"):
+                if label not in ui_source:
+                    presentation_errors.append(f"ui_label_missing={label}")
+            if '"시간 진척률"' in ui_source or '"시간 대비 달성률"' in ui_source:
+                presentation_errors.append("legacy_ui_labels_remain")
+        except Exception as exc:
+            presentation_errors.append(f"presentation_runtime={type(exc).__name__}:{exc}")
+        if presentation_errors:
+            results.append(_fail("Dashboard Lite sales presentation states", "; ".join(presentation_errors)))
+        else:
+            results.append(_ok("Dashboard Lite sales presentation states", "four cards and the status bar distinguish forecast overage, remaining amount, forecast reached, and current-day achievement labels without changing facts"))
 
         reset_errors: list[str] = []
         session_fixture = {
@@ -10664,7 +10745,16 @@ def run_basic_checks() -> list[CheckResult]:
                     "manufacturer_names": [f"제약사{i}" for i in range(1000)],
                 },
                 "facts": {
-                    "sales": {"metrics": {"amount": 1}, "chart_rows": [{"period": "2026-01", "value": 1}]},
+                    "sales": {
+                        "metrics": {"amount": 1},
+                        "visualization": {
+                            "current_sales": 10, "forecast_sales": 20, "remaining_forecast": 10,
+                            "sales_progress_pct": 50, "time_progress_pct": 40,
+                            "time_adjusted_achievement_pct": 125, "expected_to_date_sales": 8,
+                            "chart_month_count": 7, "completed_month_count": 6,
+                        },
+                        "chart_rows": [{"period": "2026-01", "value": 1}],
+                    },
                     "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
                     "today_actions": [{"priority": 1}],
                 },
@@ -10675,6 +10765,9 @@ def run_basic_checks() -> list[CheckResult]:
                 dashboard_roundtrip_errors.append(f"dashboard_snapshot_not_compact bytes={len(compact_json)}")
             if not (compact_cache.get("facts", {}).get("sales", {}).get("chart_rows") and compact_cache.get("facts", {}).get("inventory", {}).get("risk_targets")):
                 dashboard_roundtrip_errors.append("dashboard_snapshot_render_inputs_lost")
+            compact_visualization = compact_cache.get("facts", {}).get("sales", {}).get("visualization") or {}
+            if compact_visualization.get("time_adjusted_achievement_pct") != 125 or compact_visualization.get("expected_to_date_sales") != 8:
+                dashboard_roundtrip_errors.append(f"dashboard_snapshot_visualization_lost={compact_visualization!r}")
             if "stock_risk_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
                 dashboard_roundtrip_errors.append("dashboard_stock_risk_summary_missing")
             if "stock_overstock_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
