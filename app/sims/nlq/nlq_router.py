@@ -894,6 +894,35 @@ def _looks_like_analytics_nlq(txt: str) -> bool:
     return _resolve_analytics_action(txt) is not None
 
 
+def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
+    """Resolve a new SIMS action without executing a service or DB query.
+
+    The chat entrypoint uses this only to distinguish a fresh SIMS/NLQ request
+    from a current-table follow-up.  Execution remains owned by
+    :func:`try_handle_nlq`.
+    """
+    normalized = keyboard_fix(str(txt or "").strip())
+    if not normalized:
+        return None
+
+    analytics_action = _resolve_analytics_action(normalized)
+    if analytics_action:
+        return {"route": "analytics", "action": str(analytics_action)}
+
+    try:
+        from app.services.io_nlq import resolve_io_nlq
+
+        io_input = _append_lookup_verb_for_io(_normalize_io_action_spacing(normalized))
+        parsed = resolve_io_nlq(io_input)
+    except Exception:
+        return None
+
+    action = str((parsed or {}).get("action") or "").strip()
+    if not action:
+        return None
+    return {"route": "io", "action": action}
+
+
 def _last_day_yyyymm(yyyymm: str) -> str:
     s = re.sub(r"[^0-9]", "", str(yyyymm or ""))
     if len(s) < 6:
@@ -1325,13 +1354,16 @@ def _apply_analytics_condition_aliases(params: Dict[str, Any], txt: str) -> Dict
 
 
 _ANALYTICS_NLQ_DEFAULT_KEYS = {
-    "품목별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "품목별 매출 추세 요약표": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "품목별 매출 예상": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "제약사별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "제약사별 매출 추세 분석 요약표": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "품목별 재고부족현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
-    "매입처별 재고부족 현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
+    "품목별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 매출 추세 요약표": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 매출 예상": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "제약사별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "제약사별 매출 추세 분석 요약표": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "매출처별 매출 예상": {"io_gu_list"},
+    "영업사원별 매출 예상": {"io_gu_list"},
+    "지역별 매출 예상": {"io_gu_list"},
+    "품목별 재고부족현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "매입처별 재고부족 현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
 }
 
 
@@ -1374,6 +1406,7 @@ def _analytics_nlq_code_values(params: Dict[str, Any], key: str) -> list[str]:
         "stock_cd_list": ("stock_cd_list", "stock_cds", "stock_cd"),
         "product_di_list": ("dashboard_product_di_list", "product_di_list", "product_di"),
         "product_class_list": ("dashboard_product_class_list", "product_class_list", "product_class"),
+        "io_gu_list": ("io_gu_list", "dashboard_io_gu_list", "sales_io_gu_list", "io_gu_pairs", "io_gu"),
     }
     values = _analytics_nlq_values(params, *aliases.get(key, ()))
     normalized: list[str] = []
@@ -1399,6 +1432,7 @@ def _analytics_nlq_option_codes(field: str) -> list[str]:
         "stock_cd_list": "0018",
         "product_di_list": "0004",
         "product_class_list": "0031",
+        "io_gu_list": "0012",
     }.get(str(field or ""))
     if not gcode:
         return []
@@ -1487,6 +1521,7 @@ def _analytics_nlq_condition_sources(params: Dict[str, Any], sources: Dict[str, 
         "stock_cd_list": "재고위치",
         "product_di_list": "제품구분",
         "product_class_list": "제품분류",
+        "io_gu_list": "입출고구분",
     }
     values = {
         "stock_mode": {"real": "실재고", "book": "장부재고"}.get(str(params.get("stock_mode") or ""), str(params.get("stock_mode") or "")),
@@ -1496,6 +1531,7 @@ def _analytics_nlq_condition_sources(params: Dict[str, Any], sources: Dict[str, 
         or _analytics_nlq_name_values(params, "product_di_list"),
         "product_class_list": _analytics_nlq_code_values(params, "product_class_list")
         or _analytics_nlq_name_values(params, "product_class_list"),
+        "io_gu_list": _analytics_nlq_code_values(params, "io_gu_list"),
     }
     parts = []
     for key in labels:
@@ -1564,6 +1600,7 @@ def _analytics_nlq_param_log_summary(params: Dict[str, Any], sources: Dict[str, 
         "stock_cd_count": len(_analytics_nlq_code_values(params, "stock_cd_list")),
         "product_di_count": len(_analytics_nlq_code_values(params, "product_di_list")),
         "product_class_count": len(_analytics_nlq_code_values(params, "product_class_list")),
+        "io_gu_count": len(_analytics_nlq_code_values(params, "io_gu_list")),
         "default_condition_count": source_values.count("default"),
         "explicit_condition_count": source_values.count("explicit"),
         "explicit_clear_count": source_values.count("explicit_clear"),
@@ -1619,6 +1656,11 @@ def _apply_company_default_to_analytics_nlq(
         clear_keys.add("product_di_list")
     if any(token in text_compact for token in ("전체제품분류", "전제품분류", "모든제품분류")):
         clear_keys.add("product_class_list")
+    # KPI NLQ never accepts a per-question IO override.  Preserve the shared
+    # parser behavior for non-KPI IO actions, but remove those aliases only
+    # at this KPI action boundary before the company Default is injected.
+    for key in ("io_gu", "io_gu_list", "io_gu_pairs", "dashboard_io_gu_list", "sales_io_gu_list", "io_gu_prefix"):
+        out.pop(key, None)
     product_di_code_values = _analytics_nlq_code_values(out, "product_di_list")
     product_di_name_values = _analytics_nlq_name_values(out, "product_di_list")
     explicit_product_di_pairs = _resolve_explicit_product_di_contract(text)
@@ -1709,6 +1751,19 @@ def _apply_company_default_to_analytics_nlq(
                 action, key, normalized["selected_count"], normalized["available_count"],
                 normalized["is_full_selection"], len(values), source,
             )
+        elif key == "io_gu_list":
+            values = [] if source == "explicit_clear" else _profile_tcodes(value)
+            # Company IO is a required, persisted scope for KPI NLQ.  Unlike
+            # optional multi-select filters, choosing every configured code
+            # still means a concrete company policy and must not collapse to
+            # an empty legacy/all scope.
+            out["io_gu_list"] = list(dict.fromkeys(values))
+            logger.info(
+                "[analysis_profile.filter_normalize] action=%s field=%s selected_count=%s available_count=%s "
+                "full_selection=%s effective_count=%s source=%s",
+                action, key, len(values), len(_analytics_nlq_option_codes(key)),
+                False, len(out["io_gu_list"]), source,
+            )
         elif key in {"product_di_list", "product_class_list"}:
             pairs = [] if source == "explicit_clear" else _profile_code_pairs(value)
             normalized = normalize_analytics_multi_code_filter(
@@ -1759,6 +1814,15 @@ def _apply_company_default_to_analytics_nlq(
             out[key] = [] if key.endswith("_list") else ""
 
     out["__analysis_default_sources"] = dict(adapter.get("sources") or {})
+    io_source = str((out["__analysis_default_sources"] or {}).get("io_gu_list") or "")
+    if io_source == "default":
+        io_source = "company_default"
+    elif io_source == "explicit_clear":
+        io_source = "explicit_all"
+    out["io_gu_source"] = io_source or "company_default"
+    out["_require_company_io"] = True
+    if not _analytics_nlq_code_values(out, "io_gu_list"):
+        out["__company_io_missing"] = True
 
     logger.info(
         "[analysis_profile.adapter] company_id_present=True profile_found=%s target_context=nlq "
@@ -1873,6 +1937,29 @@ def _try_handle_analytics_nlq(
     adapter_sources = dict(params.pop("__analysis_default_sources", {}) or {})
     service_params = dict(params)
     log_summary = _analytics_nlq_param_log_summary(service_params, adapter_sources)
+
+    if service_params.pop("__company_io_missing", False):
+        payload = {
+            "final": True,
+            "type": "text",
+            "title": action,
+            "action": action,
+            "params": service_params,
+            "data": "회사 공통 분석용 입출고구분이 설정되지 않았습니다. Dashboard 공통조건에서 설정 후 저장해 주세요.",
+            "message": "회사 공통 분석용 입출고구분이 설정되지 않았습니다. Dashboard 공통조건에서 설정 후 저장해 주세요.",
+            "meta": {
+                "nlq": True,
+                "analysis_nlq": True,
+                "analytics": True,
+                "action": action,
+                "io_gu_source": "company_default",
+                "company_io_required": True,
+                "row_count": 0,
+                "row_count_total": 0,
+            },
+        }
+        push_sims_result_to_chat(payload, action)
+        return True
 
     try:
         payload = fn(service_params)

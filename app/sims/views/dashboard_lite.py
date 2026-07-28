@@ -1372,6 +1372,11 @@ def _apply_saved_dashboard_profile_once() -> None:
         supported_keys=COMPANY_DEFAULT_KEYS,
     )
     profile_values = dict(adapter.get("effective") or {})
+    company_io_key = "__dashboard_lite_company_io_gu_list"
+    if isinstance(profile, dict):
+        st.session_state[company_io_key] = _clean_list(profile_values.get("io_gu_list"))
+    else:
+        st.session_state.pop(company_io_key, None)
     log.info(
         "[analysis_profile.adapter] company_id_present=True profile_found=%s target_context=dashboard "
         "supported_key_count=%s applied_default_count=%s explicit_override_count=0 explicit_clear_count=0 "
@@ -1809,7 +1814,7 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
             with row3[2]:
                 product_class = st.multiselect("제품분류", options=product_class_codes, key="__dashboard_lite_product_class_list", format_func=lambda code: _option_label(code, product_class_code_to_name.get(str(code), "")), help="미선택 시 전체 제품분류를 포함합니다.")
             with row3[3]:
-                io_gu = st.multiselect("입출고구분", options=io_gu_codes, key="__dashboard_lite_io_gu_list", format_func=lambda code: _option_label(code, io_gu_code_to_name.get(str(code), "")), help="미선택 시 0012 업무코드 전체를 사용합니다.")
+                io_gu = st.multiselect("입출고구분", options=io_gu_codes, key="__dashboard_lite_io_gu_list", format_func=lambda code: _option_label(code, io_gu_code_to_name.get(str(code), "")), help="저장한 Dashboard 공통조건이 Dashboard, KPI, 분석/NLQ의 판매·수요 계산에 적용됩니다.")
 
             row4 = st.columns(5)
             with row4[0]:
@@ -1858,7 +1863,13 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
         "product_group_list": product_group_codes_selected,
         "product_di_list": product_di_codes_selected,
         "product_class_list": product_class_codes_selected,
-        "io_gu_list": [str(value).split(":", 1)[-1] for value in _clean_list(io_gu)],
+        "io_gu_list": (
+            [str(value).split(":", 1)[-1] for value in _clean_list(io_gu)]
+            if save_requested
+            else _clean_list(st.session_state.get("__dashboard_lite_company_io_gu_list"))
+        ),
+        "io_gu_source": "company_default",
+        "_require_company_io": True,
         "product_supplier_scope_mode": scope_mode,
         "manufacturer_codes": supplier_result["codes"] if scope_mode == SCOPE_MANUFACTURER else [],
         "manufacturer_manager_codes": selected_manager_codes if scope_mode == SCOPE_MANUFACTURER else [],
@@ -1939,6 +1950,7 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
         for key in (
             "month_from", "month_to", "evaluation_month", "stock_mode", "stock_cd_list", "stock_name_list",
             "product_group_list", "product_di_list", "product_class_list", "amount_display_unit",
+            "io_gu_list", "io_gu_source",
             "product_supplier_scope_mode", "supplier_scope_label", "supplier_manager_label", "supplier_manager_labels",
         )
         if key in params
@@ -2208,13 +2220,17 @@ def render_dashboard_lite() -> dict[str, Any]:
     cache = st.session_state.get("__dashboard_lite_result")
 
     if submitted:
-        st.session_state["__dashboard_lite_run_seq"] = run_seq + 1
-        run_seq += 1
-        for key in list(st.session_state.keys()):
-            if str(key).startswith("__dashboard_lite_risk_detail_excel::"):
-                st.session_state.pop(key, None)
-        st.session_state.pop("__dashboard_lite_result", None)
-        cache = None
+        if not _clean_list(params.get("io_gu_list")):
+            st.warning("회사 공통 분석용 입출고구분이 설정되지 않았습니다. Dashboard 공통조건에서 설정 후 저장해 주세요.")
+            submitted = False
+        else:
+            st.session_state["__dashboard_lite_run_seq"] = run_seq + 1
+            run_seq += 1
+            for key in list(st.session_state.keys()):
+                if str(key).startswith("__dashboard_lite_risk_detail_excel::"):
+                    st.session_state.pop(key, None)
+            st.session_state.pop("__dashboard_lite_result", None)
+            cache = None
 
     if save_requested and params:
         identity = _dashboard_context_identity()
@@ -2229,6 +2245,7 @@ def render_dashboard_lite() -> dict[str, Any]:
             try:
                 action = save_dashboard_profile(company_id=int(identity["company_id"]), params=params, actor_user_id=int(identity["user_id"]))
                 mark_analysis_profile_saved(st.session_state, company_id=identity["company_id"])
+                st.session_state["__dashboard_lite_company_io_gu_list"] = _clean_list(params.get("io_gu_list"))
                 st.success("조회조건을 저장했습니다." if action else "조회조건을 저장했습니다.")
             except Exception as exc:
                 log.warning("[dashboard.profile_save] user_id=%s company_id=%s saved=False error_type=%s", identity.get("user_id"), identity.get("company_id"), type(exc).__name__)

@@ -164,7 +164,7 @@ def _script_perf_mark(name: str) -> None:
 
 
 import pandas as pd
-from app.sims.nlq.nlq_router import try_handle_nlq
+from app.sims.nlq.nlq_router import resolve_new_sims_nlq_candidate, try_handle_nlq
 
 from app.ui.sims_entry import (
     sims_mode_selector,
@@ -10896,6 +10896,21 @@ if user_input and user_input.strip():
     current_table_followup_input = _normalize_current_table_followup_input(user_input)
     compact_current = re.sub(r"\s+", "", str(current_table_followup_input or ""))
 
+    has_explicit_current_table_reference = (
+        "현재표" in compact_current
+        or "현재조회결과" in compact_current
+        or "현재조회자료" in compact_current
+    )
+    new_sims_candidate = None
+    if not has_explicit_current_table_reference:
+        try:
+            new_sims_candidate = resolve_new_sims_nlq_candidate(user_input)
+        except Exception:
+            log.exception("[chat.route.decision] route_candidate_error")
+    new_sims_action = str((new_sims_candidate or {}).get("action") or "").strip()
+    new_sims_route = str((new_sims_candidate or {}).get("route") or "").strip()
+    is_new_sims_nlq = bool(new_sims_action)
+
     # ✅ 분석/KPI 명시 조회는 최근 SIMS 결과가 있어도 LLM 후속질문으로 보내지 않는다.
     # 예:
     # - 품목별추세요약표 조회
@@ -10906,7 +10921,7 @@ if user_input and user_input.strip():
     # - 품목별 재고부족현황 조회
     compact_analytics = compact_current
 
-    is_explicit_analytics_nlq = (
+    is_explicit_analytics_nlq = is_new_sims_nlq or (
         "조회" in compact_analytics
         and any(
             key in compact_analytics
@@ -10937,16 +10952,19 @@ if user_input and user_input.strip():
         )
     )
 
-    is_current_table_forced_followup = (
-        "현재표" in compact_current
-        or "현재조회결과" in compact_current
-        or "현재조회자료" in compact_current
-    )
+    is_current_table_forced_followup = has_explicit_current_table_reference
 
     is_implicit_analytics_current_followup = (
-        not is_explicit_analytics_nlq
+        not is_new_sims_nlq
         and _looks_like_implicit_analytics_current_followup(user_input)
     )
+
+    if is_new_sims_nlq:
+        log.info(
+            "[chat.route.decision] route=new_sims_nlq reason=parsed_action resolved_action=%s current_table_present=%s",
+            new_sims_action,
+            _has_current_table_source_df(),
+        )
 
     if is_implicit_analytics_current_followup:
         log.info(
@@ -11045,7 +11063,7 @@ if user_input and user_input.strip():
 
         elif (
             is_sims_result_followup
-            and not is_explicit_analytics_nlq
+            and not is_new_sims_nlq
             and not is_pending_product_pick
             and not is_pending_product_cancel
         ):
@@ -11077,6 +11095,31 @@ if user_input and user_input.strip():
                 next_seq=_next_seq,
                 logger=log,
             )
+            if is_new_sims_nlq and not handled:
+                log.info(
+                    "[chat.route.decision] route=new_sims_nlq reason=execution_failed resolved_action=%s current_table_present=%s",
+                    new_sims_action,
+                    _has_current_table_source_df(),
+                )
+                try:
+                    from app.ui.chat_middleware import push_sims_result_to_chat
+
+                    push_sims_result_to_chat(
+                        {
+                            "type": "sims_result",
+                            "action": new_sims_action,
+                            "summary": "새 SIMS 조회를 처리하지 못했습니다. 조회조건을 확인한 뒤 다시 시도해 주세요.",
+                            "meta": {
+                                "nlq": True,
+                                "route": "new_sims_nlq",
+                                "query_execution_failed": True,
+                            },
+                        },
+                        new_sims_action,
+                    )
+                    handled = True
+                except Exception:
+                    log.exception("[chat.route.decision] new_sims_failure_notice_error")
 
     else:
         log.debug("[chat] skip NLQ (not sims-related): %r", user_input[:80])

@@ -557,6 +557,8 @@ _IO_GU_SCOPE_PARAM_KEYS = (
 def _sales_io_scope(params: Dict[str, Any]) -> tuple[str, list[str]]:
     """Return the sales-only IO scope without numeric coercion or prefix expansion."""
     if "io_gu_list" not in params:
+        if bool(params.get("_require_company_io")):
+            raise ValueError("회사 공통 분석용 입출고구분이 설정되지 않았습니다. Dashboard 공통조건에서 설정 후 저장해 주세요.")
         return "legacy_broad_fallback", []
 
     raw_values = params.get("io_gu_list")
@@ -578,6 +580,8 @@ def _sales_io_scope(params: Dict[str, Any]) -> tuple[str, list[str]]:
         if code and code not in seen:
             codes.append(code)
             seen.add(code)
+    if not codes and bool(params.get("_require_company_io")):
+        raise ValueError("회사 공통 분석용 입출고구분이 설정되지 않았습니다. Dashboard 공통조건에서 설정 후 저장해 주세요.")
     return ("exact_selected", codes) if codes else ("explicit_all", [])
 
 
@@ -870,6 +874,16 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
     if not clean_text(params.get("month_to")) and clean_text(params.get("date_to")):
         params["month_to"] = _digits_only(params.get("date_to"))[:6]
         _add_filter(clauses, f"{a}.{p}_Stock_YyMm <= %(month_to)s")
+
+    # Monthly source must honor the same canonical IO contract as the
+    # detail/fast source.  The direction guard below remains for legacy and
+    # explicit-all requests; selected codes are exact Gcode=0012 Tcodes.
+    _add_sales_io_scope_filter(
+        clauses,
+        params,
+        gcode_sql=f"{a}.{p}_Io_Gu_Gcode",
+        tcode_sql=f"{a}.{p}_Io_Gu",
+    )
 
     # 출고 계열만
     _add_filter(clauses, f"LEFT({a}.{p}_Io_Gu, 1) IN ({spec['out_prefixes']})")

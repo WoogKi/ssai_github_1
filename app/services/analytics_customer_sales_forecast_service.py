@@ -24,6 +24,7 @@ from app.services.analytics_sales_trend_service import (
     _normalize_analytics_numeric_columns,
     _parse_yyyymm,
     _resolve_period_source_policy,
+    _sales_io_scope,
     _split_sales_period_months,
 )
 
@@ -305,6 +306,78 @@ GROUP BY LEFT(LTRIM(RTRIM(T.Rd13_Trans_YyMmDd)), 6), LTRIM(RTRIM(T.Rd13_Ven_Cd))
     return df
 
 
+def _load_rddbc120_monthly_for_exact_io(params: Dict[str, Any], policy: Dict[str, Any]) -> pd.DataFrame:
+    """Aggregate selected sales IOs before customer/salesperson/region grouping."""
+    t0 = time.perf_counter()
+    date_from = _clean_text(params.get("date_from"))
+    date_to = _clean_text(policy.get("effective_date_to") or policy.get("requested_date_to") or params.get("date_to"))
+    mode, io_codes = _sales_io_scope(params)
+    if mode != "exact_selected" or len(date_from) != 8 or len(date_to) != 8:
+        return pd.DataFrame()
+
+    sql_params: Dict[str, Any] = {
+        "date_from": date_from,
+        "date_to": date_to,
+        "sales_io_gu_gcode": "0012",
+    }
+    io_bindings: list[str] = []
+    for index, code in enumerate(io_codes):
+        key = f"sales_io_gu_{index}"
+        sql_params[key] = code
+        io_bindings.append(f"%({key})s")
+    sql = f"""
+SELECT
+    LEFT(LTRIM(RTRIM(D.Rd12_Out_YyMmDd)), 6) AS base_month,
+    LTRIM(RTRIM(D.Rd12_Ven_Cd)) AS customer_cd,
+    SUM(CAST(COALESCE(D.Rd12_Fin_Supply_Price, D.Rd12_Supply_Price, 0) AS float)) AS supply_amt,
+    SUM(CAST(COALESCE(D.Rd12_Fin_Tax_Price, D.Rd12_Tax_Price, 0) AS float)) AS tax_amt,
+    SUM(CAST(
+        COALESCE(D.Rd12_Fin_Supply_Price, D.Rd12_Supply_Price, 0)
+        + COALESCE(D.Rd12_Fin_Tax_Price, D.Rd12_Tax_Price, 0)
+        AS float
+    )) AS total_amt,
+    COUNT_BIG(*) AS row_count
+FROM dbo.Rddbc120 AS D WITH (NOLOCK)
+WHERE D.Rd12_Out_YyMmDd >= %(date_from)s
+  AND D.Rd12_Out_YyMmDd <= %(date_to)s
+  AND D.Rd12_Ven_Cd >= '50000'
+  AND D.Rd12_Ven_Cd <= '8ZZZZ'
+  AND D.Rd12_Io_Gu_Gcode = %(sales_io_gu_gcode)s
+  AND D.Rd12_Io_Gu IN ({', '.join(io_bindings)})
+GROUP BY LEFT(LTRIM(RTRIM(D.Rd12_Out_YyMmDd)), 6), LTRIM(RTRIM(D.Rd12_Ven_Cd))
+"""
+    df = query_to_df(sql, sql_params)
+    elapsed = time.perf_counter() - t0
+    if not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+    df = df.rename(columns={
+        "base_month": "기준월",
+        "customer_cd": "매출처코드",
+        "supply_amt": "매출공급가액",
+        "tax_amt": "매출세액",
+        "total_amt": "매출합계",
+        "row_count": "집계건수",
+    })
+    raw_rows = int(pd.to_numeric(df.get("집계건수", 0), errors="coerce").fillna(0).sum()) if not df.empty else 0
+    df.attrs.update({
+        "source_table": "Rddbc120",
+        "source_mode": "detail_exact_io",
+        "date_from": date_from,
+        "date_to": date_to,
+        "raw_rows": raw_rows,
+        "monthly_rows": int(len(df)),
+        "source_elapsed": elapsed,
+        "sales_io_filter_mode": mode,
+        "sales_io_selected_count": len(io_codes),
+    })
+    log.info(
+        "[analytics.customer_sales_forecast.source] source=Rddbc120 mode=exact_selected "
+        "io_count=%s monthly_rows=%s elapsed=%.3fs",
+        len(io_codes), len(df), elapsed,
+    )
+    return df
+
+
 def _load_customer_master(params: Dict[str, Any]) -> pd.DataFrame:
     t0 = time.perf_counter()
     sql_params: Dict[str, Any] = {"dummy": 1}
@@ -359,7 +432,12 @@ def _has_master_filter(params: Dict[str, Any]) -> bool:
 
 
 def _combine_sources(params: Dict[str, Any], policy: Dict[str, Any]) -> pd.DataFrame:
-    out = _load_rddbc130_monthly(params, policy)
+    io_mode, _ = _sales_io_scope(params)
+    out = (
+        _load_rddbc120_monthly_for_exact_io(params, policy)
+        if io_mode == "exact_selected"
+        else _load_rddbc130_monthly(params, policy)
+    )
     stats = dict(getattr(out, "attrs", {}) or {})
     if not isinstance(out, pd.DataFrame) or out.empty:
         return pd.DataFrame(columns=["기준월", "매출처코드", "매출공급가액", "매출세액", "매출합계", "집계건수"])

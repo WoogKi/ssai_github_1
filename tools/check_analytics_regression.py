@@ -1193,6 +1193,55 @@ def run_basic_checks() -> list[CheckResult]:
                     results.append(_fail(f"analytics action resolver: {q}", f"expected={expected!r}, got={got!r}"))
         else:
             results.append(_fail("analytics action resolver", "_resolve_analytics_action 없음"))
+
+        resolve_candidate = getattr(router, "resolve_new_sims_nlq_candidate", None)
+        if not callable(resolve_candidate):
+            results.append(_fail("new SIMS/NLQ route candidate", "parse-only resolver missing"))
+        else:
+            candidate_cases = [
+                ("품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
+                ("한미제약 품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
+                ("정상출고만 품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
+                ("정상출고 내역 조회", "io", "출고명세 조회"),
+            ]
+            for query, expected_route, expected_action in candidate_cases:
+                candidate = resolve_candidate(query) or {}
+                if candidate.get("route") != expected_route or candidate.get("action") != expected_action:
+                    results.append(
+                        _fail(
+                            f"new SIMS/NLQ route candidate: {query}",
+                            f"expected=({expected_route!r}, {expected_action!r}), got={candidate!r}",
+                        )
+                    )
+                else:
+                    results.append(
+                        _ok(
+                            f"new SIMS/NLQ route candidate: {query}",
+                            f"route={expected_route}, action={expected_action}",
+                        )
+                    )
+
+            main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+            route_checks = []
+            for required in (
+                "resolve_new_sims_nlq_candidate(user_input)",
+                "not is_new_sims_nlq",
+                "route=new_sims_nlq reason=parsed_action",
+                "query_execution_failed",
+            ):
+                if required not in main_src:
+                    route_checks.append(f"missing main route guard {required!r}")
+            if "has_explicit_current_table_reference" not in main_src:
+                route_checks.append("explicit current-table priority guard missing")
+            if route_checks:
+                results.append(_fail("new SIMS/NLQ versus current-table route guards", "; ".join(route_checks)))
+            else:
+                results.append(
+                    _ok(
+                        "new SIMS/NLQ versus current-table route guards",
+                        "new actions route before implicit follow-ups; explicit current-table references retain priority",
+                    )
+                )
     except Exception as e:
         results.append(_fail("analytics action resolver", f"{type(e).__name__}: {e}"))
 
@@ -8084,15 +8133,17 @@ def run_basic_checks() -> list[CheckResult]:
                 "41": {
                     "stock_mode": "real",
                     "stock_cd_list": ["00247", "00001"],
-                    "product_di_list": ["0004:2", "0004:1"],
-                    "product_class_list": ["0031:01"],
-                    "risk_analysis_days": 90,
+                "product_di_list": ["0004:2", "0004:1"],
+                "product_class_list": ["0031:01"],
+                "io_gu_list": ["0012:051"],
+                "risk_analysis_days": 90,
                     "manufacturer_test_codes": ["must-not-apply"],
                 },
                 "42": {
                     "stock_mode": "real",
-                    "stock_cd_list": ["00999"],
-                    "product_di_list": ["0004:7"],
+                "stock_cd_list": ["00999"],
+                "product_di_list": ["0004:7"],
+                "io_gu_list": ["0012:001"],
                 },
             }
             current_company = {"id": "41"}
@@ -8277,6 +8328,8 @@ def run_basic_checks() -> list[CheckResult]:
                         return self.session_state.get(key, options[0] if options else "")
                     def multiselect(self, _label, _options, *, key=None, **_kwargs):
                         return self.session_state.get(key, [])
+                    def checkbox(self, _label, value=False, *, key=None, **_kwargs):
+                        return self.session_state.get(key, value)
                     def text_input(self, _label, value="", *, key=None, **_kwargs):
                         return self.session_state.get(key, value)
                     def date_input(self, _label, value, *, key=None, **_kwargs):
@@ -8450,17 +8503,17 @@ def run_basic_checks() -> list[CheckResult]:
                             f"panel_nlq_default_param_mismatch key={key} "
                             f"panel={panel_full.get(key)!r} nlq={nlq_full_class.get(key)!r}"
                         )
-                unsupported_action_params = analytics_view_mod._attach_analytics_default_code_pairs(
+                group_forecast_params = analytics_view_mod._attach_analytics_default_code_pairs(
                     {"product_di_list": ["1"], "product_class_list": ["01"]},
                     action_key="customer_sales_forecast",
                     ns=summary_ns,
                 )
-                unsupported_action_params = analytics_view_mod._normalize_analytics_multi_code_params(
-                    unsupported_action_params,
+                group_forecast_params = analytics_view_mod._normalize_analytics_multi_code_params(
+                    group_forecast_params,
                     action_key="customer_sales_forecast",
                 )
-                if any(key.startswith("dashboard_") for key in unsupported_action_params):
-                    raise AssertionError(f"unsupported_action_default_scope_leak={unsupported_action_params!r}")
+                if group_forecast_params.get("product_di_list") != ["1"] or group_forecast_params.get("dashboard_product_class_list") != ["0031:01"]:
+                    raise AssertionError(f"group_forecast_non_io_param_changed={group_forecast_params!r}")
 
                 import app.ui.sims_panel as panel_mod
                 registry_actions = dict(panel_mod._CATEGORIES["분석/KPI"]["actions"])
@@ -8886,6 +8939,61 @@ def run_basic_checks() -> list[CheckResult]:
         except Exception as e:
             results.append(_fail("Company Default adapter for Dashboard, KPI, and NLQ", f"{type(e).__name__}: {e}"))
 
+        kpi_company_io_errors: list[str] = []
+        try:
+            import app.services.analytics_sales_trend_service as analytics_service_mod
+            import app.sims.nlq.nlq_router as nlq_router_mod
+            import app.sims.views.analytics_views as analytics_view_mod
+
+            analytics_view_source = Path(analytics_view_mod.__file__).read_text(encoding="utf-8")
+            if "def _render_analytics_io_scope" in analytics_view_source or "__analytics_.*_io_gu_all" in analytics_view_source:
+                kpi_company_io_errors.append("kpi_io_override_ui_present")
+            enforced = analytics_view_mod._attach_analytics_company_io(
+                {"io_gu_list": ["999"]}, {"effective": {"io_gu_list": ["0012:051", "001"]}}
+            )
+            if enforced.get("io_gu_list") != ["051", "001"] or enforced.get("io_gu_source") != "company_default":
+                kpi_company_io_errors.append(f"kpi_company_io_not_forced={enforced!r}")
+            missing = analytics_view_mod._attach_analytics_company_io({}, {"effective": {}})
+            if not missing.get("__company_io_missing") or "io_gu_list" in missing:
+                kpi_company_io_errors.append(f"kpi_company_io_missing_marker={missing!r}")
+            try:
+                analytics_service_mod._sales_io_scope({"_require_company_io": True})
+                kpi_company_io_errors.append("kpi_company_io_missing_not_blocked")
+            except ValueError as exc:
+                if "회사 공통 분석용 입출고구분" not in str(exc):
+                    kpi_company_io_errors.append(f"kpi_company_io_wrong_message={exc}")
+            if analytics_service_mod._sales_io_scope({}) != ("legacy_broad_fallback", []):
+                kpi_company_io_errors.append("ordinary_io_legacy_changed")
+
+            old_company_getter = nlq_router_mod.get_selected_company if hasattr(nlq_router_mod, "get_selected_company") else None
+            # The router imports this dependency inside the helper, so patch the
+            # source module used by that import rather than parser behavior.
+            import app.services.ssai_analysis_profile_service as profile_service_mod
+            import app.ui.ssai_login as login_mod
+            old_profile_loader = profile_service_mod.load_dashboard_profile
+            old_login_getter = login_mod.get_selected_company
+            try:
+                profile_service_mod.load_dashboard_profile = lambda **_kwargs: {"io_gu_list": ["0012:051"]}
+                login_mod.get_selected_company = lambda: {"company_id": "71"}
+                forced_nlq = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                    {"io_gu_list": ["193"], "io_gu": "193"},
+                    text="정상출고 품목별 매출 예상",
+                    action="품목별 매출 예상",
+                    session_state={},
+                    logger=logging.getLogger("ssai.regression"),
+                )
+                if forced_nlq.get("io_gu_list") != ["051"] or forced_nlq.get("io_gu_source") != "company_default":
+                    kpi_company_io_errors.append(f"kpi_nlq_explicit_io_not_ignored={forced_nlq!r}")
+            finally:
+                profile_service_mod.load_dashboard_profile = old_profile_loader
+                login_mod.get_selected_company = old_login_getter
+        except Exception as exc:
+            kpi_company_io_errors.append(f"{type(exc).__name__}: {exc}")
+        if kpi_company_io_errors:
+            results.append(_fail("KPI company IO scope enforcement", "; ".join(kpi_company_io_errors)))
+        else:
+            results.append(_ok("KPI company IO scope enforcement", "KPI UI has no IO override control; panel/NLQ use the persisted company scope, missing scope blocks, and ordinary IO legacy behavior remains separate"))
+
         code_pair_errors: list[str] = []
         code_pair_df = pd.DataFrame(
             [
@@ -9272,6 +9380,7 @@ def run_basic_checks() -> list[CheckResult]:
         old_dashboard_target = getattr(view_mod, "_DASHBOARD_RENDER_TARGET")
         old_dashboard_identity = getattr(view_mod, "_dashboard_context_identity")
         old_current_chat_room_id = getattr(view_mod, "get_current_chat_room_id")
+        old_dashboard_profile_loader = getattr(view_mod, "load_dashboard_profile")
         build_calls: list[dict] = []
         requested_gcodes: list[str] = []
         option_calls = {"stock": 0, "code": 0}
@@ -9316,6 +9425,7 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(view_mod, "_dashboard_code_name_options", _fake_code_options)
             setattr(view_mod, "_dashboard_context_identity", lambda: {"user_id": "8", "company_id": "4", "db_sig": ""})
             setattr(view_mod, "get_current_chat_room_id", lambda: "dashboard-room")
+            setattr(view_mod, "load_dashboard_profile", lambda **_kwargs: {"io_gu_list": ["0012:I_EX"]})
             primary_target = _FakeDashboardTarget()
             view_mod.set_dashboard_lite_render_target(primary_target)
             fake_st.session_state["current_room"] = "dashboard-room"
@@ -9544,6 +9654,7 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(view_mod, "query_to_df", old_manufacturer_query)
             setattr(view_mod, "_dashboard_context_identity", old_dashboard_identity)
             setattr(view_mod, "get_current_chat_room_id", old_current_chat_room_id)
+            setattr(view_mod, "load_dashboard_profile", old_dashboard_profile_loader)
             view_mod.set_dashboard_lite_render_target(old_dashboard_target)
 
         if render_errors:
@@ -10100,6 +10211,9 @@ def run_basic_checks() -> list[CheckResult]:
                     key = kwargs.get("key")
                     return self.session_state.get(key, default if default is not None else [])
 
+                def checkbox(self, _label, value=False, **kwargs):
+                    return self.session_state.get(kwargs.get("key"), value)
+
             def _fake_code_options(gcode: str) -> list[dict[str, str]]:
                 codes = {
                     "0013": ["PG1", "PG2"],
@@ -10114,11 +10228,17 @@ def run_basic_checks() -> list[CheckResult]:
             old_stock_result = analytics_views_mod.get_stock_shortage_result
             old_code_loader = analytics_views_mod._load_code_options
             old_inline_header = analytics_views_mod._render_inline_analysis_header_enabled
+            old_default_adapter = analytics_views_mod._prepare_analytics_company_defaults
             sales_calls: list[dict[str, Any]] = []
             stock_calls: list[dict[str, Any]] = []
             try:
                 analytics_views_mod._load_code_options = _fake_code_options
                 analytics_views_mod._render_inline_analysis_header_enabled = lambda: False
+                analytics_views_mod._prepare_analytics_company_defaults = lambda *_args, **_kwargs: {
+                    "effective": {"io_gu_list": ["0012:051"]},
+                    "profile_found": True,
+                    "default_supported_keys": ["io_gu_list"],
+                }
                 analytics_views_mod.get_sales_trend_result = lambda params: sales_calls.append(dict(params)) or {"final": True, "type": "dataframe", "data": pd.DataFrame(), "meta": {}}
                 sales_st = _FakeAnalyticsStreamlit(submit_sequence=[True])
                 analytics_views_mod.st = sales_st
@@ -10156,6 +10276,8 @@ def run_basic_checks() -> list[CheckResult]:
                         drilldown_runtime_errors.append(f"stock_runtime_missing={key}")
                 if captured.get("physic_cd") != "P100":
                     drilldown_runtime_errors.append(f"stock_runtime_product_code={captured.get('physic_cd')!r}")
+                if captured.get("io_gu_list") != ["051"] or captured.get("io_gu_source") != "company_default":
+                    drilldown_runtime_errors.append(f"stock_runtime_company_io={captured.get('io_gu_list')!r}/{captured.get('io_gu_source')!r}")
                 if "__dashboard_drilldown_auto_run" in stock_st.session_state:
                     drilldown_runtime_errors.append("stock_runtime_auto_run_not_consumed")
                 if stock_st.calls.get("rerun", 0):
@@ -10166,6 +10288,7 @@ def run_basic_checks() -> list[CheckResult]:
                 analytics_views_mod.get_stock_shortage_result = old_stock_result
                 analytics_views_mod._load_code_options = old_code_loader
                 analytics_views_mod._render_inline_analysis_header_enabled = old_inline_header
+                analytics_views_mod._prepare_analytics_company_defaults = old_default_adapter
         except Exception as exc:
             drilldown_runtime_errors.append(f"{type(exc).__name__}: {exc}")
         if drilldown_runtime_errors:
@@ -10932,6 +11055,17 @@ def run_basic_checks() -> list[CheckResult]:
             if [monthly_bind.get(f"sales_io_gu_{index}") for index in range(5)] != ["001", "002", "501", "590", "601"]:
                 io_scope_errors.append(f"monthly_exact_values={monthly_bind!r}")
 
+            legacy_monthly_params = {"io_gu_list": ["501"]}
+            legacy_monthly_where = io_scope_mod._build_monthly_filters(
+                legacy_monthly_params,
+                monthly_spec,
+            )
+            if (
+                f"M.{monthly_prefix}_Io_Gu_Gcode = %(sales_io_gu_gcode)s" not in legacy_monthly_where
+                or "%(sales_io_gu_0)s" not in legacy_monthly_where
+            ):
+                io_scope_errors.append(f"monthly_legacy_exact_io_missing={legacy_monthly_where!r}")
+
             dedupe_mode, dedupe_codes = io_scope_mod._sales_io_scope({"io_gu_list": ["501", "590", "501"]})
             if dedupe_mode != "exact_selected" or dedupe_codes != ["501", "590"]:
                 io_scope_errors.append(f"sales_ordered_dedupe={dedupe_mode}:{dedupe_codes!r}")
@@ -10984,6 +11118,43 @@ def run_basic_checks() -> list[CheckResult]:
             dashboard_facts_source = (PROJECT_ROOT / "app" / "services" / "dashboard_lite_facts.py").read_text(encoding="utf-8")
             if "_dashboard_current_stock_params" in dashboard_facts_source or "stock_shortage_payload[\"params\"] = dict(service_params)" in dashboard_facts_source:
                 io_scope_errors.append("dashboard_display_params_override_present")
+
+            customer_forecast_mod = importlib.import_module("app.services.analytics_customer_sales_forecast_service")
+            captured_customer_sql: list[tuple[str, dict[str, Any]]] = []
+            old_customer_query = customer_forecast_mod.query_to_df
+            try:
+                customer_forecast_mod.query_to_df = lambda sql, bind: (
+                    captured_customer_sql.append((str(sql), dict(bind)))
+                    or pd.DataFrame([
+                        {"base_month": "202607", "customer_cd": "50001", "supply_amt": 100.0,
+                         "tax_amt": 10.0, "total_amt": 110.0, "row_count": 1}
+                    ])
+                )
+                customer_exact = customer_forecast_mod._combine_sources(
+                    {"date_from": "20260701", "date_to": "20260731", "io_gu_list": ["501"]},
+                    {"effective_date_to": "20260731"},
+                )
+                if customer_exact.empty or len(captured_customer_sql) != 1:
+                    io_scope_errors.append("customer_exact_io_source_not_called")
+                elif (
+                    "FROM dbo.Rddbc120 AS D" not in captured_customer_sql[0][0]
+                    or captured_customer_sql[0][1].get("sales_io_gu_0") != "501"
+                ):
+                    io_scope_errors.append("customer_exact_io_detail_contract_missing")
+            finally:
+                customer_forecast_mod.query_to_df = old_customer_query
+
+            nlq_mod = importlib.import_module("app.sims.nlq.nlq_router")
+            required_group_actions = {
+                "제약사별 매출 추세 분석", "제약사별 매출 추세 분석 요약표",
+                "매출처별 매출 예상", "영업사원별 매출 예상", "지역별 매출 예상",
+            }
+            missing_nlq_io_actions = sorted(
+                action for action in required_group_actions
+                if "io_gu_list" not in nlq_mod._ANALYTICS_NLQ_DEFAULT_KEYS.get(action, set())
+            )
+            if missing_nlq_io_actions:
+                io_scope_errors.append(f"nlq_group_io_default_missing={missing_nlq_io_actions!r}")
         except Exception as exc:
             io_scope_errors.append(f"io_scope_runtime={type(exc).__name__}:{exc}")
         if io_scope_errors:
@@ -12104,6 +12275,87 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
                 setattr(views_mod, "_render_customer_sales_forecast_form", old_form)
             if old_st is not None:
                 setattr(views_mod, "st", old_st)
+
+        old_prepare_defaults = getattr(views_mod, "_prepare_analytics_company_defaults", None)
+        old_caption = getattr(views_mod, "_render_analytics_default_caption", None)
+        old_form_st = getattr(views_mod, "st", None)
+
+        class _ForecastFormContext:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class _ForecastFormSt:
+            def __init__(self, submitted: bool):
+                self.session_state: dict[str, Any] = {}
+                self._submitted = submitted
+
+            def form(self, *_args, **_kwargs):
+                return _ForecastFormContext()
+
+            def columns(self, count):
+                return [_ForecastFormContext() for _ in range(int(count))]
+
+            @staticmethod
+            def date_input(_label, *, value, **_kwargs):
+                return value
+
+            @staticmethod
+            def caption(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def selectbox(_label, options, *, index=0, **_kwargs):
+                return list(options)[index]
+
+            @staticmethod
+            def text_input(_label, *, value="", **_kwargs):
+                return value
+
+            def form_submit_button(self, *_args, **_kwargs):
+                return self._submitted
+
+        try:
+            setattr(
+                views_mod,
+                "_prepare_analytics_company_defaults",
+                lambda _action_key, _ns: {
+                    "effective": {"io_gu_list": ["0012:051"]},
+                    "profile_found": True,
+                    "default_supported_keys": [],
+                },
+            )
+            for action_key in (
+                "customer_sales_forecast",
+                "salesperson_sales_forecast",
+                "region_sales_forecast",
+            ):
+                initial_st = _ForecastFormSt(submitted=False)
+                setattr(views_mod, "st", initial_st)
+                initial_submitted, initial_params = views_mod._render_customer_sales_forecast_form(action_key)
+                if initial_submitted or initial_params:
+                    mismatches.append(
+                        f"{action_key} initial form should return (False, {{}}), got={(initial_submitted, initial_params)!r}"
+                    )
+
+                submit_st = _ForecastFormSt(submitted=True)
+                setattr(views_mod, "st", submit_st)
+                submitted, form_params = views_mod._render_customer_sales_forecast_form(action_key)
+                if not submitted:
+                    mismatches.append(f"{action_key} submit form did not submit")
+                if form_params.get("io_gu_list") != ["051"] or form_params.get("io_gu_source") != "company_default":
+                    mismatches.append(
+                        f"{action_key} company IO adapter missing params={form_params!r}"
+                    )
+        finally:
+            if old_prepare_defaults is not None:
+                setattr(views_mod, "_prepare_analytics_company_defaults", old_prepare_defaults)
+            if old_caption is not None:
+                setattr(views_mod, "_render_analytics_default_caption", old_caption)
+            if old_form_st is not None:
+                setattr(views_mod, "st", old_form_st)
 
         filtered = customer_mod.get_customer_sales_forecast_df({**params_current, "sido_nm": "서울"})
         if set(filtered["매출처코드"].astype(str).tolist()) != {"50001"}:

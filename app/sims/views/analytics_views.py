@@ -129,7 +129,7 @@ def _apply_dashboard_stock_shortage_params(params: Dict[str, Any], request: dict
         return params
     for key in (
         "stock_cd_list", "vendor_group_list", "vendor_kind_list", "product_di_list",
-        "product_class_list", "io_gu_list", "manufacturer_test_codes", "amount_display_unit",
+        "product_class_list", "io_gu_list", "io_gu_source", "manufacturer_test_codes", "amount_display_unit",
         "product_supplier_scope_mode", "manufacturer_codes", "manufacturer_manager_codes",
         "order_vendor_codes", "purchase_manager_codes",
     ):
@@ -177,13 +177,16 @@ def _ns() -> str:
 
 
 _ANALYTICS_DEFAULT_KEYS = {
-    "sales_trend": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "sales_forecast": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "manufacturer_sales_trend": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "manufacturer_sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list"},
-    "stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
-    "supplier_stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list"},
+    "sales_trend": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "sales_forecast": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "manufacturer_sales_trend": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "manufacturer_sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "customer_sales_forecast": {"io_gu_list"},
+    "salesperson_sales_forecast": {"io_gu_list"},
+    "region_sales_forecast": {"io_gu_list"},
+    "stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "supplier_stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
 }
 
 _ANALYTICS_DEFAULT_OPTION_GCODES = {
@@ -191,6 +194,7 @@ _ANALYTICS_DEFAULT_OPTION_GCODES = {
         "stock_cd_list": "0018",
         "product_di_list": "0004",
         "product_class_list": "0031",
+        "io_gu_list": "0012",
     }
     for action_key in _ANALYTICS_DEFAULT_KEYS
 }
@@ -233,6 +237,21 @@ KPI_DEFAULT_ACTION_SPECS = {
         "view": "render_supplier_stock_shortage_analysis",
         "service": "get_supplier_stock_shortage_result",
     },
+    "매출처별 매출 예상": {
+        "adapter_key": "customer_sales_forecast",
+        "view": "render_customer_sales_forecast_analysis",
+        "service": "get_customer_sales_forecast_result",
+    },
+    "영업사원별 매출 예상": {
+        "adapter_key": "salesperson_sales_forecast",
+        "view": "render_salesperson_sales_forecast_analysis",
+        "service": "get_salesperson_sales_forecast_result",
+    },
+    "지역별 매출 예상": {
+        "adapter_key": "region_sales_forecast",
+        "view": "render_region_sales_forecast_analysis",
+        "service": "get_region_sales_forecast_result",
+    },
 }
 
 
@@ -263,6 +282,28 @@ def _analytics_normalized_selection(values: Any) -> list[str]:
 
 def _analytics_default_pair_key(widget_key: str) -> str:
     return f"__analytics_dashboard_default_pairs::{widget_key}"
+
+
+def _attach_analytics_company_io(
+    params: Dict[str, Any], adapter: Mapping[str, Any] | None
+) -> Dict[str, Any]:
+    """Inject the persisted company IO scope; KPI screens never override it."""
+    out = dict(params or {})
+    raw_values = dict(adapter or {}).get("effective", {}).get("io_gu_list", [])
+    codes = list(dict.fromkeys(
+        str(value).split(":", 1)[-1].strip()
+        for value in (raw_values or [])
+        if str(value).split(":", 1)[-1].strip()
+    ))
+    out["_require_company_io"] = True
+    out["io_gu_source"] = "company_default"
+    if codes:
+        out["io_gu_list"] = codes
+        out.pop("__company_io_missing", None)
+    else:
+        out.pop("io_gu_list", None)
+        out["__company_io_missing"] = True
+    return out
 
 
 def _attach_analytics_default_code_pairs(
@@ -893,6 +934,19 @@ def _build_sales_trend_query_condition(params: Dict[str, Any], meta: Dict[str, A
         bits.append(f"추세판정 {params.get('trend_judge')}")
     if _clean_text(params.get("shortage_grade")):
         bits.append(f"부족등급 {params.get('shortage_grade')}")
+    io_source = _clean_text(params.get("io_gu_source") or meta.get("io_gu_source"))
+    io_codes = [str(value).strip() for value in (params.get("io_gu_list") or []) if str(value).strip()]
+    if io_codes:
+        source_label = {
+            "explicit": "사용자 지정",
+            "company_default": "회사 Default 초기값",
+            "dashboard_handoff": "Dashboard 조건",
+        }.get(io_source, "적용")
+        bits.append(f"입출고구분 {', '.join(io_codes)} ({source_label})")
+    elif io_source == "explicit_all":
+        bits.append("입출고구분 전체 (사용자 지정)")
+    elif io_source == "legacy":
+        bits.append("입출고구분 기존 판매범위")
 
     # top은 내부 조회 상한/표시 정책용 값이므로 조회조건 문구에는 노출하지 않는다.
     return " / ".join(bits)
@@ -1564,6 +1618,7 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
     }
     params = _attach_analytics_default_code_pairs(params, action_key="sales_trend", ns=ns)
     params = _normalize_analytics_multi_code_params(params, action_key="sales_trend")
+    params = _attach_analytics_company_io(params, default_adapter)
     try:
 
         result = get_sales_trend_result(params)
@@ -1830,6 +1885,7 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
     }
     params = _attach_analytics_default_code_pairs(params, action_key="sales_trend_summary", ns=ns)
     params = _normalize_analytics_multi_code_params(params, action_key="sales_trend_summary")
+    params = _attach_analytics_company_io(params, default_adapter)
     try:
         result = get_sales_trend_summary_result(params)
 
@@ -2085,6 +2141,7 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
 
     params = _attach_analytics_default_code_pairs(params, action_key="sales_forecast", ns=ns)
     params = _normalize_analytics_multi_code_params(params, action_key="sales_forecast")
+    params = _attach_analytics_company_io(params, default_adapter)
     try:
         result = get_sales_forecast_result(params)
 
@@ -2137,6 +2194,8 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
 def _render_customer_sales_forecast_form(action_key: str) -> tuple[bool, Dict[str, Any]]:
 
     ns = _ns()
+    default_adapter = _prepare_analytics_company_defaults(action_key, ns)
+    _render_analytics_default_caption(default_adapter)
 
     with st.form(
         key=f"__analytics_customer_sales_forecast_form__{ns}",
@@ -2253,7 +2312,8 @@ def _render_customer_sales_forecast_form(action_key: str) -> tuple[bool, Dict[st
         "top": int(top),
     }
     params = _attach_analytics_default_code_pairs(params, action_key=action_key, ns=ns)
-    return submitted, _normalize_analytics_multi_code_params(params, action_key=action_key)
+    params = _normalize_analytics_multi_code_params(params, action_key=action_key)
+    return submitted, _attach_analytics_company_io(params, default_adapter)
 
 
 def _finish_customer_group_forecast_result(
@@ -2545,6 +2605,7 @@ def _render_manufacturer_sales_trend_form(action_key: str) -> tuple[bool, Dict[s
         params,
         action_key=action_key,
     )
+    params = _attach_analytics_company_io(params, default_adapter)
     return submitted, params
 
 
@@ -2821,6 +2882,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
     params = _apply_dashboard_stock_shortage_params(params, dashboard_handoff)
     params = _attach_analytics_default_code_pairs(params, action_key="stock_shortage", ns=ns)
     params = _normalize_analytics_multi_code_params(params, action_key="stock_shortage")
+    params = _attach_analytics_company_io(params, default_adapter)
 
     try:
         result = get_stock_shortage_result(params)
@@ -3023,6 +3085,7 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
 
     params = _attach_analytics_default_code_pairs(params, action_key="supplier_stock_shortage", ns=ns)
     params = _normalize_analytics_multi_code_params(params, action_key="supplier_stock_shortage")
+    params = _attach_analytics_company_io(params, default_adapter)
     try:
         result = get_supplier_stock_shortage_result(params)
 
