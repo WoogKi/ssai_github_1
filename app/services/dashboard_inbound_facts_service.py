@@ -14,6 +14,7 @@ from typing import Any, Mapping
 import pandas as pd
 
 from app.services.rddbc_io_common import query_to_df
+from app.services.product_supplier_scope_service import build_product_supplier_scope_sql
 
 
 log = logging.getLogger("ssai.sims.dashboard_inbound")
@@ -79,7 +80,11 @@ def _parse_cutoff(value: str) -> date:
 def _sql(params: Mapping[str, Any], *, start_date: str, cutoff_date: str) -> tuple[str, dict[str, Any]]:
     binds: dict[str, Any] = {"inbound_start": str(start_date), "inbound_cutoff": str(cutoff_date)}
     product_filters: list[str] = []
-    _add_in(product_filters, binds, "P.Rd04_Ven_Cd", "manufacturer", _codes(params.get("dashboard_manufacturer_codes") or params.get("manufacturer_test_codes")))
+    supplier_scope_sql = build_product_supplier_scope_sql(
+        params, binds, product_code_sql="P.Rd04_Physic_Cd", bind_prefix="inbound_supplier"
+    )
+    if supplier_scope_sql:
+        product_filters.append(supplier_scope_sql)
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Group_Gcode", tcode_column="P.Rd04_Physic_Group", bind_key="product_group", values=params.get("dashboard_product_group_list") or params.get("product_group_list"), expected_gcode="0013")
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Di_Gcode", tcode_column="P.Rd04_Physic_Di", bind_key="product_di", values=params.get("dashboard_product_di_list") or params.get("product_di_list"), expected_gcode="0004")
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Tax_Gcode", tcode_column="P.Rd04_Physic_Tax", bind_key="product_class", values=params.get("dashboard_product_class_list") or params.get("product_class_list"), expected_gcode="0031")

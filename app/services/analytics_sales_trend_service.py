@@ -17,6 +17,8 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
+from app.services.product_supplier_scope_service import apply_product_supplier_scope, build_product_supplier_scope_sql
+
 from app.services.rddbc_io_common import (
     build_result_payload,
     clean_text,
@@ -111,6 +113,34 @@ def _effective_source_label(source_mode: Any, df: Any = None) -> str:
         current = str(df.attrs.get("source_label_current") or "출고상세(Rddbc120)")
         return f"완료월: {completed} / 당월: {current}"
     return _source_label(source_mode)
+
+
+def _safe_analytics_log_meta(params: Optional[Dict[str, Any]] = None) -> dict[str, Any]:
+    """Return count-only query metadata for non-identifying analytics logs."""
+    source = dict(params or {})
+
+    def _count(*keys: str) -> int:
+        values: list[Any] = []
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, (list, tuple, set)):
+                values.extend(value)
+            elif value not in (None, ""):
+                values.append(value)
+        return len([value for value in values if str(value).strip()])
+
+    mode = str(source.get("product_supplier_scope_mode") or "").strip()
+    if mode not in {"manufacturer", "order_vendor"}:
+        mode = "manufacturer"
+    return {
+        "supplier_scope_mode": mode,
+        "supplier_vendor_count": _count("manufacturer_codes", "order_vendor_codes"),
+        "supplier_manager_count": _count("manufacturer_manager_codes", "purchase_manager_codes"),
+        "stock_count": _count("stock_cd_list", "stock_cds", "stock_cd"),
+        "io_gu_count": _count("io_gu_list", "io_gu"),
+        "stock_mode": str(source.get("stock_mode") or "").strip(),
+        "current_stock_io_filter_applied": False,
+    }
 
 
 def _finalize_sales_trend_public_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -593,6 +623,7 @@ def _copy_current_stock_params_without_io_scope(params: Dict[str, Any]) -> tuple
 
 
 def _build_filters(params: Dict[str, Any]) -> str:
+    params.update(apply_product_supplier_scope(params))
     clauses: list[str] = []
 
     # 기간
@@ -615,14 +646,11 @@ def _build_filters(params: Dict[str, Any]) -> str:
     # 제품
     if clean_text(params.get("physic_cd")):
         _add_filter(clauses, "Out_Put.Rd12_Physic_Cd = %(physic_cd)s")
-    if _add_in_filter(
-        clauses,
-        params,
-        "Physic_Cd.Rd04_Ven_Cd",
-        "dashboard_manufacturer",
-        _clean_list_param(params.get("dashboard_manufacturer_codes")),
-    ):
-        pass
+    supplier_scope_sql = build_product_supplier_scope_sql(
+        params, params, product_code_sql="Out_Put.Rd12_Physic_Cd", bind_prefix="detail_supplier"
+    )
+    if supplier_scope_sql:
+        _add_filter(clauses, supplier_scope_sql)
 
     if like_value(params.get("physic_nm")):
         params["physic_nm_like"] = like_value(params.get("physic_nm"))
@@ -1096,7 +1124,7 @@ WHERE V.Rd03_Ven_Cd IN ({",".join(placeholders)})
 
 def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> tuple[str, Dict[str, Any]]:
     clauses: list[str] = []
-    bind_params = dict(params)
+    bind_params = apply_product_supplier_scope(params)
     p = spec["prefix"]
 
     if clean_text(bind_params.get("month_from")):
@@ -1118,17 +1146,11 @@ def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> t
     if clean_text(bind_params.get("physic_cd")):
         _add_filter(clauses, f"M.{p}_Physic_Cd = %(physic_cd)s")
 
-    manufacturer_codes = _clean_list_param(bind_params.get("dashboard_manufacturer_codes"))
-    if manufacturer_codes:
-        names: list[str] = []
-        for i, code in enumerate(manufacturer_codes):
-            key = f"fast_dashboard_manufacturer_{i}"
-            bind_params[key] = clean_text(code)
-            names.append(f"%({key})s")
-        _add_filter(
-            clauses,
-            f"M.{p}_Physic_Cd IN (SELECT P.Rd04_Physic_Cd FROM dbo.Rddbc040 AS P WITH (NOLOCK) WHERE P.Rd04_Ven_Cd IN ({','.join(names)}))",
-        )
+    supplier_scope_sql = build_product_supplier_scope_sql(
+        bind_params, bind_params, product_code_sql=f"M.{p}_Physic_Cd", bind_prefix="fast_supplier"
+    )
+    if supplier_scope_sql:
+        _add_filter(clauses, supplier_scope_sql)
 
     stock_codes = _clean_list_param(bind_params.get("stock_cd_list"))
     if stock_codes:
@@ -1330,7 +1352,7 @@ OPTION (RECOMPILE)
 def _build_dashboard_purchase_vendor_where(params: Dict[str, Any], spec: Dict[str, str]) -> tuple[str, Dict[str, Any]]:
     """Build the purchase branch filters without changing the sales fast-path filters."""
     clauses: list[str] = []
-    bind_params = dict(params)
+    bind_params = apply_product_supplier_scope(params)
     p = spec["prefix"]
 
     if clean_text(bind_params.get("month_from")):
@@ -1340,17 +1362,11 @@ def _build_dashboard_purchase_vendor_where(params: Dict[str, Any], spec: Dict[st
     if clean_text(bind_params.get("physic_cd")):
         _add_filter(clauses, f"M.{p}_Physic_Cd = %(physic_cd)s")
 
-    manufacturer_codes = _clean_list_param(bind_params.get("dashboard_manufacturer_codes"))
-    if manufacturer_codes:
-        names: list[str] = []
-        for i, code in enumerate(manufacturer_codes):
-            key = f"dashboard_purchase_manufacturer_{i}"
-            bind_params[key] = clean_text(code)
-            names.append(f"%({key})s")
-        _add_filter(
-            clauses,
-            f"M.{p}_Physic_Cd IN (SELECT P.Rd04_Physic_Cd FROM dbo.Rddbc040 AS P WITH (NOLOCK) WHERE P.Rd04_Ven_Cd IN ({','.join(names)}))",
-        )
+    supplier_scope_sql = build_product_supplier_scope_sql(
+        bind_params, bind_params, product_code_sql=f"M.{p}_Physic_Cd", bind_prefix="purchase_supplier"
+    )
+    if supplier_scope_sql:
+        _add_filter(clauses, supplier_scope_sql)
 
     stock_codes = _clean_list_param(bind_params.get("stock_cd_list"))
     if stock_codes:
@@ -2877,7 +2893,7 @@ def get_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str,
 
     row_count = 0 if df is None else int(len(df))
 
-    log.info("[analytics.sales_trend] rows=%s params=%r", row_count, params)
+    log.info("[analytics.sales_trend] rows=%s meta=%s", row_count, _safe_analytics_log_meta(params))
 
     source_mode = _resolve_source_mode(params)
     source_label = _effective_source_label(source_mode, df)
@@ -3104,7 +3120,7 @@ def get_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> D
     summary_df = _ensure_analysis_seq_column(summary_df, mode="row")
     row_count = 0 if summary_df is None else int(len(summary_df))
 
-    log.info("[analytics.sales_trend_summary] rows=%s params=%r", row_count, params)
+    log.info("[analytics.sales_trend_summary] rows=%s meta=%s", row_count, _safe_analytics_log_meta(params))
 
     source_mode = _resolve_source_mode(params)
     source_label = _effective_source_label(source_mode, raw_df)
@@ -3513,7 +3529,7 @@ def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
     df = _ensure_analysis_seq_column(df, mode="row")
     row_count = 0 if df is None else int(len(df))
 
-    log.info("[analytics.sales_forecast] rows=%s params=%r", row_count, params)
+    log.info("[analytics.sales_forecast] rows=%s meta=%s", row_count, _safe_analytics_log_meta(params))
 
     trend_counts_filtered = _trend_judge_counts(df)
     forecast_counts = _forecast_grade_counts(df)
@@ -4337,6 +4353,7 @@ def get_stock_shortage_df(
     params: Optional[Dict[str, Any]] = None,
     sales_raw_df: Optional[pd.DataFrame] = None,
     sales_forecast_df: Optional[pd.DataFrame] = None,
+    product_universe_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황 1차.
@@ -4357,11 +4374,31 @@ def get_stock_shortage_df(
 
     base = sales_forecast_df.copy() if isinstance(sales_forecast_df, pd.DataFrame) else get_sales_forecast_df(params, raw_df=sales_raw_df)
     t_base = time.perf_counter()
+    # ``None`` means normal Dashboard scope.  An explicit DataFrame, including
+    # an empty one, is a supplier-filtered master universe and must constrain
+    # the result rather than silently falling back to sales products.
+    master_universe_applied = isinstance(product_universe_df, pd.DataFrame)
+    universe = product_universe_df.copy() if master_universe_applied else pd.DataFrame()
+    if not universe.empty:
+        if "product_code" in universe.columns and "제품코드" not in universe.columns:
+            universe = universe.rename(columns={"product_code": "제품코드"})
+        if "제품코드" in universe.columns:
+            universe["제품코드"] = universe["제품코드"].fillna("").astype(str).str.strip()
+            universe = universe.loc[universe["제품코드"].ne("")].drop_duplicates("제품코드", keep="first")
+        else:
+            universe = pd.DataFrame()
+    if master_universe_applied:
+        if universe.empty:
+            base = pd.DataFrame()
+        elif base is None or base.empty:
+            base = universe.copy()
+        elif "제품코드" in base.columns:
+            base = universe.merge(base, on="제품코드", how="left", suffixes=("", "_sales"))
     if base is None or base.empty:
         log.info(
-            "[analytics.stock_shortage.perf] base_empty elapsed=%.3fs params=%r",
+            "[analytics.stock_shortage.perf] base_empty elapsed=%.3fs meta=%s",
             t_base - t0,
-            params,
+            _safe_analytics_log_meta(params),
         )
         return pd.DataFrame()
 
@@ -4817,6 +4854,7 @@ def get_stock_shortage_result(
     params: Optional[Dict[str, Any]] = None,
     sales_raw_df: Optional[pd.DataFrame] = None,
     sales_forecast_df: Optional[pd.DataFrame] = None,
+    product_universe_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, Any]:
     params = coalesce_params(params)
     params = _apply_month_or_date_params(params)
@@ -4825,10 +4863,11 @@ def get_stock_shortage_result(
         params,
         sales_raw_df=sales_raw_df,
         sales_forecast_df=sales_forecast_df,
+        product_universe_df=product_universe_df,
     )
     row_count = 0 if df is None else int(len(df))
 
-    log.info("[analytics.stock_shortage] rows=%s params=%r", row_count, params)
+    log.info("[analytics.stock_shortage] rows=%s meta=%s", row_count, _safe_analytics_log_meta(params))
 
     stock_mode = str(params.get("stock_mode") or "book").strip()
     stock_label = _stock_mode_label(stock_mode)

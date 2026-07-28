@@ -130,6 +130,8 @@ def _apply_dashboard_stock_shortage_params(params: Dict[str, Any], request: dict
     for key in (
         "stock_cd_list", "vendor_group_list", "vendor_kind_list", "product_di_list",
         "product_class_list", "io_gu_list", "manufacturer_test_codes", "amount_display_unit",
+        "product_supplier_scope_mode", "manufacturer_codes", "manufacturer_manager_codes",
+        "order_vendor_codes", "purchase_manager_codes",
     ):
         if key in source:
             params[key] = list(source[key]) if isinstance(source[key], list) else source[key]

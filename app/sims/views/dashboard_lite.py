@@ -25,6 +25,15 @@ from app.services.dashboard_lite_facts import (
     normalize_dashboard_lite_params,
 )
 from app.services.dashboard_risk_detail_export import build_dashboard_risk_detail_excel_bytes
+from app.services.product_supplier_scope_service import (
+    SCOPE_MANUFACTURER,
+    SCOPE_ORDER_VENDOR,
+    apply_product_supplier_scope,
+    load_supplier_manager_options,
+    normalize_product_supplier_scope,
+    resolve_supplier_vendor_codes,
+    supplier_scope_fingerprint,
+)
 from app.services.ssai_analysis_profile_service import (
     COMPANY_DEFAULT_KEYS,
     PROFILE_PERMISSION,
@@ -67,6 +76,11 @@ DASHBOARD_LITE_SESSION_KEYS = (
     "__dashboard_lite_manufacturer_resolved_name",
     "__dashboard_lite_manufacturer_candidates",
     "__dashboard_lite_manufacturer_candidate_code",
+    "__dashboard_lite_product_supplier_scope_mode",
+    "__dashboard_lite_order_vendor_text",
+    "__dashboard_lite_manufacturer_manager_codes",
+    "__dashboard_lite_purchase_manager_codes",
+    "__dashboard_lite_supplier_scope",
     "__dashboard_lite_exclude_product_group_list",
     "__dashboard_lite_exclude_product_di_list",
     "__dashboard_lite_exclude_product_class_list",
@@ -320,6 +334,50 @@ def _amount_display_spec(unit: str, value: Any) -> tuple[float, str]:
     return 1.0, "원"
 
 
+def _resolved_dashboard_amount_unit(facts: dict[str, Any], requested_unit: Any) -> str:
+    """Resolve auto once per event so a later widget change cannot restyle it."""
+    requested = str(requested_unit or "auto").strip().lower()
+    if requested in {"won", "thousand", "million"}:
+        return requested
+
+    values: list[float] = []
+
+    def _collect(value: Any) -> None:
+        if isinstance(value, dict):
+            unit = str(value.get("unit") or "")
+            if unit in {"원", "금액"}:
+                try:
+                    values.append(abs(float(value.get("value") or 0)))
+                except (TypeError, ValueError):
+                    pass
+            for key, child in value.items():
+                normalized_key = str(key).lower()
+                if "금액" in str(key) or "amount" in normalized_key:
+                    try:
+                        values.append(abs(float(child or 0)))
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+                if isinstance(child, (dict, list, tuple)):
+                    _collect(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                _collect(child)
+
+    _collect(facts)
+    divisor, _label = _amount_display_spec("auto", max(values, default=0.0))
+    return "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
+
+
+def _facts_amount_display_unit(facts: dict[str, Any]) -> str:
+    filters = facts.get("filters") or {}
+    return str(
+        filters.get("amount_display_unit_resolved")
+        or filters.get("amount_display_unit")
+        or "auto"
+    )
+
+
 def _fmt_dashboard_amount(value: Any, unit: str) -> str:
     if value is None:
         return _fmt_number(value)
@@ -397,7 +455,7 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
     sales_metrics = (facts.get("sales") or {}).get("metrics") or {}
     inventory_metrics = (facts.get("inventory") or {}).get("metrics") or {}
     actions = facts.get("today_actions") or []
-    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
+    amount_unit = _facts_amount_display_unit(facts)
 
     cards = [
         sales_metrics.get("completed_month_avg_sales"),
@@ -568,7 +626,7 @@ def _render_stock_chart(facts: dict[str, Any]) -> None:
 def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
     rows = (facts.get("inventory") or {}).get("stock_risk_summary") or []
     by_status = {str(row.get("재고위험상태") or ""): row for row in rows if isinstance(row, dict)}
-    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
+    amount_unit = _facts_amount_display_unit(facts)
     readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
     threshold_text = _fmt_threshold_pct(readiness_threshold)
     ordered = (
@@ -641,7 +699,7 @@ def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
     rows = inventory.get("vendor_stock_risk_top_rows") or []
     if not summary:
         return
-    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
+    amount_unit = _facts_amount_display_unit(facts)
     total_amount = float(summary.get("total_adjusted_shortage_amount") or 0)
     if amount_unit == "auto":
         divisor, _ = _amount_display_spec("auto", abs(total_amount))
@@ -752,7 +810,8 @@ def _dashboard_drilldown_params(cache: dict[str, Any], action: dict[str, Any]) -
     allowed = (
         "month_from", "month_to", "evaluation_month", "stock_mode", "stock_cd_list",
         "vendor_group_list", "vendor_kind_list", "product_group_list", "product_di_list",
-        "product_class_list", "io_gu_list", "amount_display_unit", "manufacturer_test_codes",
+        "product_class_list", "io_gu_list", "amount_display_unit", "product_supplier_scope_mode",
+        "manufacturer_codes", "manufacturer_manager_codes", "order_vendor_codes", "purchase_manager_codes",
     )
     params = {key: source.get(key) for key in allowed if source.get(key) not in (None, "", [])}
     params.update(dict(action.get("drilldown_params") or {}))
@@ -891,7 +950,7 @@ def _render_today_actions(facts: dict[str, Any], cache: dict[str, Any], *, rende
         return
     interactive = render_mode == "primary"
     event_id = str(cache.get("dashboard_event_id") or "")
-    amount_unit = str((facts.get("filters") or {}).get("amount_display_unit") or "auto")
+    amount_unit = _facts_amount_display_unit(facts)
     headers = st.columns([0.5, 1.1, 1.8, 2.2, 2.0, 2.0, 1.0])
     for column, label in zip(headers, ("순위", "상태", "대상", "판단 근거", "판정 기준", "권장 조치", "상세")):
         with column:
@@ -957,7 +1016,7 @@ def _risk_detail_instance_key(cache: dict[str, Any]) -> str:
             str(params.get("month_from") or ""),
             str(params.get("month_to") or ""),
             str(params.get("evaluation_month") or ""),
-            str(params.get("manufacturer_scope_label") or "전체"),
+            repr(supplier_scope_fingerprint(params)),
         )
     )
     return hashlib.sha256(source.encode("utf-8")).hexdigest()[:20]
@@ -1057,11 +1116,24 @@ def _risk_detail_query_conditions(
     stock_mode = "장부재고" if str(params.get("stock_mode") or "") == "book" else "실재고"
     threshold = _fmt_threshold_pct((facts.get("stock_readiness") or {}).get("threshold_pct") or params.get("readiness_warning_pct") or 98)
     vendor_summary = inventory.get("vendor_stock_risk_summary") or {}
+    scope = normalize_product_supplier_scope(params)
+    mode = scope["product_supplier_scope_mode"]
+    supplier_conditions = [{"조건명": "공급 기준", "값": {SCOPE_MANUFACTURER: "제약사", SCOPE_ORDER_VENDOR: "발주처"}[mode]}]
+    if mode == SCOPE_MANUFACTURER:
+        supplier_conditions.extend([
+            {"조건명": "제약사", "값": str(params.get("supplier_scope_label") or "전체")},
+            {"조건명": "제약사 담당자", "값": str(params.get("supplier_manager_label") or "전체")},
+        ])
+    elif mode == SCOPE_ORDER_VENDOR:
+        supplier_conditions.extend([
+            {"조건명": "발주처", "값": str(params.get("supplier_scope_label") or "전체")},
+            {"조건명": "발주담당자", "값": str(params.get("supplier_manager_label") or "전체")},
+        ])
     return [
         {"조건명": "시작월", "값": str(params.get("month_from") or "")},
         {"조건명": "종료월", "값": str(params.get("month_to") or "")},
         {"조건명": "평가월", "값": str(params.get("evaluation_month") or "")},
-        {"조건명": "제약사 범위", "값": str(params.get("manufacturer_scope_label") or "전체")},
+        *supplier_conditions,
         {"조건명": "재고기준", "값": stock_mode},
         {"조건명": "대상 재고위치", "값": ", ".join(stock_labels) if stock_labels else "전체"},
         {"조건명": "재고준비율 경고기준", "값": f"{threshold}%"},
@@ -1362,7 +1434,7 @@ def _dashboard_cache_key(params: dict[str, Any], *, run_seq: int) -> str:
         "product_di_list": _normalized_key_list(params.get("product_di_list")),
         "product_class_list": _normalized_key_list(params.get("product_class_list")),
     "io_gu_list": _normalized_key_list(params.get("io_gu_list")),
-        "manufacturer_test_codes": _normalized_key_list(params.get("manufacturer_test_codes")),
+        "supplier_scope": supplier_scope_fingerprint(params),
         "major_purchase_vendor_days": params.get("major_purchase_vendor_days"),
         "risk_analysis_days": params.get("risk_analysis_days"),
         "overstock_inactive_days": params.get("overstock_inactive_days"),
@@ -1431,6 +1503,77 @@ def _clear_dashboard_manufacturer_state(*, keep_text: bool = False) -> None:
         st.session_state.pop(key, None)
     if not keep_text:
         st.session_state.pop("__dashboard_lite_manufacturer_text", None)
+
+
+def _clear_inactive_dashboard_supplier_state(mode: str) -> bool:
+    """Clear inactive temporary supplier controls on every mode transition."""
+    removed = False
+    keys = {
+        SCOPE_MANUFACTURER: ("__dashboard_lite_order_vendor_text", "__dashboard_lite_purchase_manager_codes"),
+        SCOPE_ORDER_VENDOR: ("__dashboard_lite_manufacturer_text", "__dashboard_lite_manufacturer_manager_codes", "__dashboard_lite_manufacturer_test_codes", "__dashboard_lite_manufacturer_scope"),
+    }.get(mode, ())
+    for key in keys:
+        if st.session_state.get(key):
+            removed = True
+        st.session_state.pop(key, None)
+    return removed
+
+
+def _on_dashboard_supplier_scope_mode_change() -> None:
+    """Immediate, non-querying callback for the temporary supplier scope mode."""
+    mode = str(st.session_state.get("__dashboard_lite_product_supplier_scope_mode") or "").strip()
+    if mode not in {SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR}:
+        mode = SCOPE_MANUFACTURER
+        st.session_state["__dashboard_lite_product_supplier_scope_mode"] = mode
+    _clear_inactive_dashboard_supplier_state(mode)
+
+
+def _dashboard_supplier_manager_options(mode: str) -> list[dict[str, str]]:
+    """Cache manager choices by company and scope mode outside Dashboard facts calls."""
+    if mode not in {SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR}:
+        return []
+    identity = _dashboard_context_identity()
+    company_key = str(identity.get("company_id") or "")
+    cache = st.session_state.setdefault("__dashboard_lite_supplier_manager_options", {})
+    cache_key = f"{company_key}:{mode}"
+    if cache_key in cache:
+        rows = list(cache.get(cache_key) or [])
+        log.info("[dashboard.supplier_manager_options] mode=%s status=success manager_option_count=%s cache_used=True query_elapsed_ms=0", mode, len(rows))
+        return rows
+    started = time.perf_counter()
+    try:
+        rows = load_supplier_manager_options(mode=mode)
+    except Exception as exc:
+        log.warning(
+            "[dashboard.supplier_manager_options] mode=%s status=error error_type=%s cache_used=False query_elapsed_ms=%s",
+            mode,
+            type(exc).__name__,
+            int((time.perf_counter() - started) * 1000),
+        )
+        raise
+    cache[cache_key] = rows
+    log.info("[dashboard.supplier_manager_options] mode=%s status=success manager_option_count=%s cache_used=False query_elapsed_ms=%s", mode, len(rows), int((time.perf_counter() - started) * 1000))
+    return rows
+
+
+def _resolve_dashboard_supplier(text: Any, *, mode: str) -> dict[str, Any]:
+    """Resolve the active vendor family only when Dashboard is submitted."""
+    raw = " ".join(str(text or "").split())
+    if not raw or raw == "전체":
+        return {"status": "all", "codes": [], "names": [], "label": "전체"}
+    if len(raw) < 2 and not re.fullmatch(r"[A-Za-z0-9]+", raw):
+        return {"status": "too_short", "codes": [], "names": [], "label": "전체"}
+    try:
+        rows = resolve_supplier_vendor_codes(raw, mode=mode)
+    except Exception as exc:
+        log.warning("[dashboard.supplier_scope] mode=%s resolver_error_type=%s", mode, type(exc).__name__)
+        return {"status": "error", "codes": [], "names": [], "label": "전체"}
+    codes = [str(row.get("code") or "") for row in rows if str(row.get("code") or "")]
+    names = [str(row.get("name") or "") for row in rows]
+    if not codes:
+        return {"status": "missing", "codes": [], "names": [], "label": "전체"}
+    label = f"{names[0]} [{codes[0]}]" if len(codes) == 1 and names[0] else (f"'{raw}' 포함 {len(codes)}개사" if len(codes) > 1 else codes[0])
+    return {"status": "resolved", "codes": codes, "names": names, "label": label}
 
 
 def _resolve_dashboard_manufacturer(text: Any) -> dict[str, Any]:
@@ -1593,16 +1736,56 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
     io_count = len(_clean_list(st.session_state.get("__dashboard_lite_io_gu_list")))
     io_summary = "\uc785\ucd9c\uace0 \uc804\uccb4" if io_count == 0 else f"\uc785\ucd9c\uace0 {io_count}\uac1c"
     condition_summary = f"{stock_basis} \u00b7 \uc7ac\uace0\uc704\uce58 {stock_scope} \u00b7 {io_summary} \u00b7 \uc704\ud5d8 {risk_days}\uc77c \u00b7 \uc900\ube44\uc728 {readiness}%"
+    for key, default_value in (
+        ("__dashboard_lite_month_from", defaults["month_from"]),
+        ("__dashboard_lite_month_to", defaults["month_to"]),
+        ("__dashboard_lite_evaluation_month", defaults["evaluation_month"]),
+    ):
+        if key not in st.session_state:
+            st.session_state[key] = default_value
+    if st.session_state.get("__dashboard_lite_product_supplier_scope_mode") not in {SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR}:
+        st.session_state["__dashboard_lite_product_supplier_scope_mode"] = SCOPE_MANUFACTURER
+
+    scope_cols = st.columns([1, 1, 1, 1.1, 2.1, 2.1], gap="small")
+    with scope_cols[0]:
+        month_from = st.text_input("시작월", max_chars=6, help="YYYYMM", key="__dashboard_lite_month_from")
+    with scope_cols[1]:
+        month_to = st.text_input("종료월", max_chars=6, help="YYYYMM", key="__dashboard_lite_month_to")
+    with scope_cols[2]:
+        evaluation_month = st.text_input("평가월", max_chars=6, help="YYYYMM", key="__dashboard_lite_evaluation_month")
+    with scope_cols[3]:
+        scope_mode = st.selectbox(
+            "공급 기준", options=[SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR],
+            format_func=lambda value: {SCOPE_MANUFACTURER: "제약사", SCOPE_ORDER_VENDOR: "발주처"}[value],
+            key="__dashboard_lite_product_supplier_scope_mode",
+            on_change=_on_dashboard_supplier_scope_mode_change,
+        )
+    inactive_scope_cleared = _clear_inactive_dashboard_supplier_state(scope_mode)
+    with scope_cols[4]:
+        if scope_mode == SCOPE_ORDER_VENDOR:
+            supplier_text = st.text_input("발주처", key="__dashboard_lite_order_vendor_text")
+        else:
+            supplier_text = st.text_input("제약사", key="__dashboard_lite_manufacturer_text")
+    manager_options: list[dict[str, str]] = []
+    manager_option_error = False
+    try:
+        manager_options = _dashboard_supplier_manager_options(scope_mode)
+    except Exception:
+        manager_option_error = True
+    manager_codes = [row["code"] for row in manager_options]
+    manager_names = {row["code"]: row["name"] for row in manager_options}
+    manager_key = "__dashboard_lite_manufacturer_manager_codes" if scope_mode == SCOPE_MANUFACTURER else "__dashboard_lite_purchase_manager_codes"
+    with scope_cols[5]:
+        st.session_state[manager_key] = [code for code in _clean_list(st.session_state.get(manager_key)) if code in manager_codes]
+        if manager_option_error:
+            st.warning("담당자 목록을 불러오지 못했습니다.")
+        else:
+            st.multiselect(
+                "제약사 담당자" if scope_mode == SCOPE_MANUFACTURER else "발주담당자",
+                options=manager_codes, key=manager_key,
+                format_func=lambda code: f"{manager_names.get(str(code), str(code))} [{code}]",
+            )
     with st.form("dashboard_lite_scope_form", clear_on_submit=False):
-        cols = st.columns(4)
-        with cols[0]:
-            month_from = st.text_input("시작월", value=defaults["month_from"], max_chars=6, help="YYYYMM")
-        with cols[1]:
-            month_to = st.text_input("종료월", value=defaults["month_to"], max_chars=6, help="YYYYMM")
-        with cols[2]:
-            evaluation_month = st.text_input("평가월", value=defaults["evaluation_month"], max_chars=6, help="YYYYMM")
-        with cols[3]:
-            manufacturer_text = st.text_input("제약사", key="__dashboard_lite_manufacturer_text")
         with st.expander(f"\ucd94\uac00 \ubd84\uc11d\uc870\uac74 \u00b7 {condition_summary}", expanded=False):
             row1 = st.columns([1, 3, 1])
             with row1[0]:
@@ -1645,22 +1828,23 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
             save_requested = st.form_submit_button("저장", width="stretch") if has_permission(PROFILE_PERMISSION) else False
         except Exception:
             save_requested = False
-    manufacturer_result = {"status": "all", "codes": []}
+    supplier_result = {"status": "all", "codes": [], "names": [], "label": "전체"}
     if submitted:
-        manufacturer_result = _resolve_dashboard_manufacturer(manufacturer_text)
-        if manufacturer_result.get("status") == "too_short":
-            st.warning("제약사명 검색은 두 글자 이상 입력해 주세요.")
+        supplier_result = _resolve_dashboard_supplier(supplier_text, mode=scope_mode)
+        if supplier_result.get("status") == "too_short":
+            st.warning("거래처명 검색은 두 글자 이상 입력해 주세요.")
             return False, False, None
-        if manufacturer_result.get("status") in {"missing", "error"}:
-            st.warning("해당 제약사를 찾을 수 없습니다.")
+        if supplier_result.get("status") in {"missing", "error"}:
+            st.warning("해당 거래처를 찾을 수 없습니다.")
             return False, False, None
-    elif not str(manufacturer_text or "").strip() or str(manufacturer_text or "").strip() == "전체":
-        _clear_dashboard_manufacturer_state(keep_text=True)
     stock_cd_list = _clean_list(selected_stock_labels)
     stock_name_list = [stock_code_to_name.get(code, "") for code in stock_cd_list]
     product_group_codes_selected = _clean_list(product_groups)
     product_di_codes_selected = _clean_list(product_di)
     product_class_codes_selected = _clean_list(product_class)
+    selected_manager_codes = _clean_list(st.session_state.get(manager_key))
+    selected_manager_labels = [f"{manager_names.get(code, code)} [{code}]" for code in selected_manager_codes]
+    supplier_manager_label = "전체" if not selected_manager_labels else (selected_manager_labels[0] if len(selected_manager_labels) == 1 else f"{len(selected_manager_labels)}명")
     raw_params = {
         "month_from": month_from,
         "month_to": month_to,
@@ -1675,12 +1859,16 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
         "product_di_list": product_di_codes_selected,
         "product_class_list": product_class_codes_selected,
         "io_gu_list": [str(value).split(":", 1)[-1] for value in _clean_list(io_gu)],
-        "manufacturer_test_codes": _clean_list(st.session_state.get("__dashboard_lite_manufacturer_test_codes")),
-        "manufacturer_scope_label": str((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("label") or "전체"),
-        "manufacturer_search_term": str((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("search_term") or ""),
-        "manufacturer_match_mode": str((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("match_mode") or "all"),
-        "manufacturer_match_count": int((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("match_count") or 0),
-        "manufacturer_names": _clean_list((st.session_state.get("__dashboard_lite_manufacturer_scope") or {}).get("names")),
+        "product_supplier_scope_mode": scope_mode,
+        "manufacturer_codes": supplier_result["codes"] if scope_mode == SCOPE_MANUFACTURER else [],
+        "manufacturer_manager_codes": selected_manager_codes if scope_mode == SCOPE_MANUFACTURER else [],
+        "order_vendor_codes": supplier_result["codes"] if scope_mode == SCOPE_ORDER_VENDOR else [],
+        "purchase_manager_codes": selected_manager_codes if scope_mode == SCOPE_ORDER_VENDOR else [],
+        "supplier_scope_label": supplier_result["label"],
+        "supplier_scope_names": supplier_result["names"],
+        "supplier_manager_label": supplier_manager_label,
+        "supplier_manager_labels": selected_manager_labels,
+        "inactive_scope_cleared": inactive_scope_cleared,
         "major_purchase_vendor_days": major_purchase_vendor_days,
         "risk_analysis_days": risk_analysis_days,
         "overstock_inactive_days": overstock_inactive_days,
@@ -1690,6 +1878,7 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
     }
     try:
         params = normalize_dashboard_lite_params(raw_params, today=date.today())
+        log.info("[dashboard.supplier_scope] mode=%s vendor_count=%s manager_count=%s inactive_scope_cleared=%s", params.get("product_supplier_scope_mode"), len(params.get("manufacturer_codes") or params.get("order_vendor_codes") or []), len(params.get("manufacturer_manager_codes") or params.get("purchase_manager_codes") or []), bool(params.get("inactive_scope_cleared")))
     except Exception as exc:
         st.warning(str(exc))
         return False, False, None
@@ -1702,8 +1891,17 @@ def _dashboard_scope_header(params: dict[str, Any]) -> str:
         f"조회기간: {params.get('month_from') or '-'}~{params.get('month_to') or '-'}",
         f"평가월: {params.get('evaluation_month') or '-'}",
     ]
-    manufacturer_label = str(params.get("manufacturer_scope_label") or "전체").strip() or "전체"
-    parts.append(f"제약사: {manufacturer_label}")
+    scope = normalize_product_supplier_scope(params)
+    mode = scope["product_supplier_scope_mode"]
+    mode_labels = {SCOPE_MANUFACTURER: "제약사", SCOPE_ORDER_VENDOR: "발주처"}
+    parts.append(f"공급 기준: {mode_labels[mode]}")
+    if mode == SCOPE_MANUFACTURER:
+        manufacturer_label = str(params.get("supplier_scope_label") or params.get("manufacturer_scope_label") or "전체").strip() or "전체"
+        parts.append(f"제약사: {manufacturer_label}")
+        parts.append(f"제약사 담당자: {str(params.get('supplier_manager_label') or '전체').strip() or '전체'}")
+    elif mode == SCOPE_ORDER_VENDOR:
+        parts.append(f"발주처: {str(params.get('supplier_scope_label') or '전체').strip() or '전체'}")
+        parts.append(f"발주담당자: {str(params.get('supplier_manager_label') or '전체').strip() or '전체'}")
     stock_codes = _clean_list(params.get("stock_cd_list"))
     stock_names = _clean_list(params.get("stock_name_list"))
     stock_labels = [
@@ -1741,16 +1939,29 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
         for key in (
             "month_from", "month_to", "evaluation_month", "stock_mode", "stock_cd_list", "stock_name_list",
             "product_group_list", "product_di_list", "product_class_list", "amount_display_unit",
-            "manufacturer_scope_label", "manufacturer_search_term", "manufacturer_match_mode", "manufacturer_match_count",
+            "product_supplier_scope_mode", "supplier_scope_label", "supplier_manager_label", "supplier_manager_labels",
         )
         if key in params
     }
-    compact_params["manufacturer_scope_label"] = str(compact_params.get("manufacturer_scope_label") or "전체")
-    compact_params["manufacturer_codes"] = _clean_list(params.get("manufacturer_test_codes"))[:row_limit]
-    compact_params["manufacturer_names"] = _clean_list(params.get("manufacturer_names"))[:row_limit]
+    compact_params["amount_display_unit_requested"] = params.get("amount_display_unit_requested") or params.get("amount_display_unit")
+    compact_params["amount_display_unit_resolved"] = (
+        params.get("amount_display_unit_resolved")
+        or (facts.get("filters") or {}).get("amount_display_unit_resolved")
+        or (facts.get("filters") or {}).get("amount_display_unit")
+    )
+    compact_params["product_supplier_scope_mode"] = normalize_product_supplier_scope(params)["product_supplier_scope_mode"]
+    compact_params["manufacturer_codes"] = _clean_list(params.get("manufacturer_codes"))[:row_limit]
+    compact_params["manufacturer_manager_codes"] = _clean_list(params.get("manufacturer_manager_codes"))[:row_limit]
+    compact_params["order_vendor_codes"] = _clean_list(params.get("order_vendor_codes"))[:row_limit]
+    compact_params["purchase_manager_codes"] = _clean_list(params.get("purchase_manager_codes"))[:row_limit]
     compact_facts = {
         "kind": facts.get("kind"),
         "period": facts.get("period"),
+        "filters": {
+            "amount_display_unit": _facts_amount_display_unit(facts),
+            "amount_display_unit_requested": (facts.get("filters") or {}).get("amount_display_unit_requested"),
+            "amount_display_unit_resolved": (facts.get("filters") or {}).get("amount_display_unit_resolved"),
+        },
         "sales": {
             "metrics": dict(sales.get("metrics") or {}),
             "chart_rows": list(sales.get("chart_rows") or []),
@@ -2088,6 +2299,16 @@ def render_dashboard_lite() -> dict[str, Any]:
         }
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
+    requested_amount_unit = str(params.get("amount_display_unit") or "auto").strip().lower()
+    resolved_amount_unit = _resolved_dashboard_amount_unit(facts, requested_amount_unit)
+    params["amount_display_unit_requested"] = requested_amount_unit
+    params["amount_display_unit_resolved"] = resolved_amount_unit
+    facts_filters = dict(facts.get("filters") or {})
+    facts_filters["amount_display_unit_requested"] = requested_amount_unit
+    facts_filters["amount_display_unit_resolved"] = resolved_amount_unit
+    # Renderers read this event-local value, never the current form widget.
+    facts_filters["amount_display_unit"] = resolved_amount_unit
+    facts["filters"] = facts_filters
     result_cache = {
         "cache_key": cache_key,
         "query_fingerprint": _dashboard_cache_key(params, run_seq=0),

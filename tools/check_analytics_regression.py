@@ -8875,7 +8875,7 @@ def run_basic_checks() -> list[CheckResult]:
         seen_params: list[dict] = []
         forecast_params_seen: list[dict] = []
         shortage_params_seen: list[dict] = []
-        preloaded_seen = {"manufacturer": False, "stock": False}
+        preloaded_seen = {"manufacturer": False, "stock": False, "stock_master_universe": False}
         old_shared = getattr(sales_mod, "get_sales_trend_df")
         old_dashboard_bundle = getattr(sales_mod, "get_dashboard_sales_source_bundle")
         old_manufacturer = getattr(manufacturer_mod, "get_manufacturer_sales_trend_summary_result")
@@ -8902,11 +8902,15 @@ def run_basic_checks() -> list[CheckResult]:
             preloaded_seen["manufacturer"] = isinstance(raw_df, pd.DataFrame)
             return {"df": sales_df.copy(), "meta": {"evaluation_month": "202607"}}
 
-        def _fake_stock_service(params=None, sales_raw_df=None, sales_forecast_df=None):
+        def _fake_stock_service(params=None, sales_raw_df=None, sales_forecast_df=None, product_universe_df=None):
             calls["stock"] += 1
             seen_params.append(dict(params or {}))
             shortage_params_seen.append(dict(params or {}))
-            preloaded_seen["stock"] = isinstance(sales_raw_df, pd.DataFrame) and isinstance(sales_forecast_df, pd.DataFrame)
+            preloaded_seen["stock"] = (
+                isinstance(sales_raw_df, pd.DataFrame)
+                and isinstance(sales_forecast_df, pd.DataFrame)
+            )
+            preloaded_seen["stock_master_universe"] = isinstance(product_universe_df, pd.DataFrame)
             return {"df": stock_df.copy(), "meta": {}}
 
         def _fake_forecast_service(params=None, raw_df=None):
@@ -8954,7 +8958,7 @@ def run_basic_checks() -> list[CheckResult]:
             service_errors.append(f"service_calls={calls!r}")
         if built.get("source_call_count") != 3:
             service_errors.append(f"source_call_count={built.get('source_call_count')!r}")
-        if preloaded_seen != {"manufacturer": True, "stock": True}:
+        if preloaded_seen != {"manufacturer": True, "stock": True, "stock_master_universe": True}:
             service_errors.append(f"preloaded_seen={preloaded_seen!r}")
         if any(not p.get("month_from") or not p.get("month_to") for p in seen_params):
             service_errors.append(f"missing_month_params={seen_params!r}")
@@ -9117,7 +9121,12 @@ def run_basic_checks() -> list[CheckResult]:
             def columns(self, n, **_kwargs):
                 self.column_specs.append(n)
                 return [_FakeCtx() for _ in range(len(n) if isinstance(n, (list, tuple)) else int(n))]
-            def text_input(self, _label, value="", **_kwargs): return value
+            def text_input(self, _label, value="", **kwargs):
+                key = kwargs.get("key")
+                if key:
+                    self.session_state.setdefault(key, value)
+                    return self.session_state.get(key, "")
+                return value
             def radio(self, _label, options=None, **kwargs):
                 key = kwargs.get("key")
                 return self.session_state.get(key, list(options or [""])[0])
@@ -9215,8 +9224,8 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append(f"open_called_service={len(build_calls)}")
             if option_calls != {"stock": 1, "code": 6}:
                 render_errors.append(f"open_called_option_source={option_calls!r}")
-            if not fake_st.column_specs or fake_st.column_specs[0] != 4:
-                render_errors.append(f"date_manufacturer_row_not_four_columns={fake_st.column_specs!r}")
+            if fake_st.column_specs[:1] != [[1, 1, 1, 1.1, 2.1, 2.1]]:
+                render_errors.append(f"single_scope_row_not_expected_columns={fake_st.column_specs!r}")
             if (opened.get("meta") or {}).get("status") != "condition_only":
                 render_errors.append(f"open_status={opened!r}")
 
@@ -10872,6 +10881,196 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard/KPI IO scope contract", "; ".join(io_scope_errors)))
         else:
             results.append(_ok("Dashboard/KPI IO scope contract", "selected sales Tcodes bind exactly, while current stock removes every IO alias and binds no IO Tcode"))
+
+        supplier_scope_errors: list[str] = []
+        try:
+            from app.services.product_supplier_scope_service import (
+                build_product_supplier_scope_sql, load_supplier_manager_options,
+                normalize_product_supplier_scope, supplier_scope_filter_active, supplier_scope_fingerprint,
+            )
+            manufacturer = normalize_product_supplier_scope({
+                "product_supplier_scope_mode": "manufacturer", "manufacturer_codes": ["00015", "00015", 15],
+                "manufacturer_manager_codes": ["00021"], "order_vendor_codes": ["20001"],
+            })
+            if manufacturer["manufacturer_codes"] != ["00015"] or manufacturer["order_vendor_codes"] or manufacturer["purchase_manager_codes"]:
+                supplier_scope_errors.append(f"manufacturer_exclusive_or_string_contract={manufacturer!r}")
+            binds: dict[str, Any] = {}
+            sql = build_product_supplier_scope_sql(manufacturer, binds, product_code_sql="M.Rd21_Physic_Cd", bind_prefix="scope")
+            if "SupplierProduct.Rd04_Ven_Cd IN" not in sql or "SupplierVendor.Rd03_Sales_Man IN" not in sql or "Rd04_Orven_Cd" in sql or binds != {"scope_vendor_0": "00015", "scope_manager_0": "00021"}:
+                supplier_scope_errors.append(f"manufacturer_sql_contract={sql!r}|{binds!r}")
+            order_vendor = normalize_product_supplier_scope({
+                "product_supplier_scope_mode": "order_vendor", "manufacturer_codes": ["00015"],
+                "order_vendor_codes": ["20001", "20002"], "purchase_manager_codes": ["00031"],
+            })
+            binds = {}
+            sql = build_product_supplier_scope_sql(order_vendor, binds, product_code_sql="M.Rd21_Physic_Cd", bind_prefix="scope")
+            if order_vendor["manufacturer_codes"] or "SupplierProduct.Rd04_Orven_Cd IN" not in sql or "SupplierVendor.Rd03_Sales_Man IN" not in sql:
+                supplier_scope_errors.append(f"order_vendor_sql_contract={order_vendor!r}|{sql!r}")
+            all_scope = normalize_product_supplier_scope({"product_supplier_scope_mode": "all", "manufacturer_codes": ["00015"], "order_vendor_codes": ["20001"]})
+            if all_scope["product_supplier_scope_mode"] != "manufacturer" or any(all_scope[key] for key in ("manufacturer_codes", "manufacturer_manager_codes", "order_vendor_codes", "purchase_manager_codes")):
+                supplier_scope_errors.append(f"all_scope_not_cleared={all_scope!r}")
+            empty_scope_sql = build_product_supplier_scope_sql(all_scope, {}, product_code_sql="M.Rd21_Physic_Cd", bind_prefix="scope")
+            if empty_scope_sql:
+                supplier_scope_errors.append(f"empty_supplier_scope_has_predicate={empty_scope_sql!r}")
+            if (
+                supplier_scope_filter_active({"product_supplier_scope_mode": "manufacturer"})
+                or supplier_scope_filter_active({"product_supplier_scope_mode": "order_vendor"})
+                or not supplier_scope_filter_active({"product_supplier_scope_mode": "manufacturer", "manufacturer_manager_codes": ["00021"]})
+                or not supplier_scope_filter_active({"product_supplier_scope_mode": "order_vendor", "order_vendor_codes": ["20001"]})
+            ):
+                supplier_scope_errors.append("supplier_scope_filter_active_contract")
+            scope_service = importlib.import_module("app.services.product_supplier_scope_service")
+            captured_manager_queries: list[tuple[str, Any]] = []
+            original_manager_query = scope_service.query_to_df
+            try:
+                scope_service.query_to_df = lambda sql, query_params=(): (captured_manager_queries.append((sql, query_params)) or pd.DataFrame([{"user_code": "00021", "user_name": "담당자"}]))
+                manager_rows = load_supplier_manager_options(mode="manufacturer")
+                manager_rows_with_vendor = load_supplier_manager_options(mode="order_vendor", vendor_codes=["00015"])
+            finally:
+                scope_service.query_to_df = original_manager_query
+            if (
+                manager_rows[0]["code"] != "00021"
+                or captured_manager_queries[0][1] != ()
+                or "ManagerRows.user_name" not in captured_manager_queries[0][0]
+                or "SELECT DISTINCT" not in captured_manager_queries[0][0]
+                or captured_manager_queries[1][1] != ("00015",)
+                or "P.Rd04_Orven_Cd IN (?)" not in captured_manager_queries[1][0]
+            ):
+                supplier_scope_errors.append("supplier_manager_sql_bind_or_string_contract")
+            if supplier_scope_fingerprint({"product_supplier_scope_mode": "manufacturer", "manufacturer_codes": ["00002", "00001"]}) != supplier_scope_fingerprint({"product_supplier_scope_mode": "manufacturer", "manufacturer_codes": ["00001", "00002"]}):
+                supplier_scope_errors.append("supplier_scope_fingerprint_order_dependent")
+            inbound_mod = importlib.import_module("app.services.dashboard_inbound_facts_service")
+            inbound_sql, _ = inbound_mod._sql({"product_supplier_scope_mode": "manufacturer", "manufacturer_codes": ["00015"]}, start_date="20260101", cutoff_date="20260131")
+            if "SupplierProduct.Rd04_Physic_Cd = P.Rd04_Physic_Cd" not in inbound_sql or "P.Rd04_Physic_Cd = P.Rd04_Physic_Cd" in inbound_sql:
+                supplier_scope_errors.append("inbound_manufacturer_alias_correlation")
+            inbound_sql, _ = inbound_mod._sql({"product_supplier_scope_mode": "order_vendor", "order_vendor_codes": ["20001"]}, start_date="20260101", cutoff_date="20260131")
+            if "SupplierProduct.Rd04_Physic_Cd = P.Rd04_Physic_Cd" not in inbound_sql or "SupplierProduct.Rd04_Orven_Cd IN" not in inbound_sql:
+                supplier_scope_errors.append("inbound_order_vendor_alias_correlation")
+            view_source = Path(view_mod.__file__).read_text(encoding="utf-8")
+            form_start = view_source.index('with st.form("dashboard_lite_scope_form"')
+            scope_row_start = view_source.index("scope_cols = st.columns([1, 1, 1, 1.1, 2.1, 2.1], gap=\"small\")")
+            scope_start = view_source.index('"공급 기준"', scope_row_start)
+            if (
+                not (scope_row_start < scope_start < form_start)
+                or "options=[SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR]" not in view_source
+                or "담당자 목록을 불러오지 못했습니다." not in view_source
+                or "on_change=_on_dashboard_supplier_scope_mode_change" not in view_source
+            ):
+                supplier_scope_errors.append("supplier_scope_form_callback_contract")
+            header = view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "product_supplier_scope_mode": "manufacturer", "supplier_scope_label": "제약사A [00015]", "supplier_manager_label": "담당자A [00021]"})
+            if "제약사 담당자: 담당자A [00021]" not in header:
+                supplier_scope_errors.append("supplier_manager_header_contract")
+            blank_header = view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "product_supplier_scope_mode": "all"})
+            if "공급 기준: 제약사" not in blank_header or "제약사: 전체" not in blank_header or "제약사 담당자: 전체" not in blank_header or "공급 기준: 전체" in blank_header:
+                supplier_scope_errors.append("supplier_scope_header_legacy_all_contract")
+            for log_source_path in (
+                Path("app/services/analytics_sales_trend_service.py"),
+                Path("app/services/analytics_manufacturer_sales_trend_service.py"),
+            ):
+                log_source = log_source_path.read_text(encoding="utf-8")
+                if "params=%r" in log_source:
+                    supplier_scope_errors.append(f"raw_analytics_params_log={log_source_path.name}")
+        except Exception as exc:
+            supplier_scope_errors.append(f"supplier_scope_runtime={type(exc).__name__}:{exc}")
+        if supplier_scope_errors:
+            results.append(_fail("Dashboard product supplier scope contract", "; ".join(supplier_scope_errors)))
+        else:
+            results.append(_ok("Dashboard product supplier scope contract", "manufacturer/order-vendor scopes are exclusive, legacy all normalizes to blank manufacturer, and manager binds are positional"))
+
+        product_universe_errors: list[str] = []
+        try:
+            sales_mod = importlib.import_module("app.services.analytics_sales_trend_service")
+            dashboard_mod = importlib.import_module("app.services.dashboard_lite_facts")
+            original_stock_loader = sales_mod._load_product_current_stock
+            stock_loader_calls: list[list[str]] = []
+            try:
+                def _fake_stock_loader(product_codes, **_kwargs):
+                    stock_loader_calls.append(list(product_codes))
+                    frame = pd.DataFrame([{
+                        "제품코드": "P_SCOPE_EMPTY",
+                        "실재고수량": 12.0,
+                        "실재고금액": 1200.0,
+                        "실재고평가단가": 100.0,
+                    }])
+                    frame.attrs.update({"stock_sql_ms": 1, "stock_query_batches": 1, "stock_aggregate_ms": 0})
+                    return frame
+
+                sales_mod._load_product_current_stock = _fake_stock_loader
+                no_sales_df = sales_mod.get_stock_shortage_df(
+                    {"stock_mode": "real", "month_from": "202601", "month_to": "202607", "evaluation_month": "202607"},
+                    sales_forecast_df=pd.DataFrame(),
+                    product_universe_df=pd.DataFrame([{"product_code": "P_SCOPE_EMPTY"}]),
+                )
+                default_scope_df = sales_mod.get_stock_shortage_df(
+                    {"stock_mode": "real", "month_from": "202601", "month_to": "202607", "evaluation_month": "202607"},
+                    sales_forecast_df=pd.DataFrame([{"제품코드": "P_DEFAULT"}]),
+                    product_universe_df=None,
+                )
+                explicit_empty_df = sales_mod.get_stock_shortage_df(
+                    {"stock_mode": "real", "month_from": "202601", "month_to": "202607", "evaluation_month": "202607"},
+                    sales_forecast_df=pd.DataFrame([{"제품코드": "P_DEFAULT"}]),
+                    product_universe_df=pd.DataFrame(columns=["product_code"]),
+                )
+            finally:
+                sales_mod._load_product_current_stock = original_stock_loader
+            if not isinstance(no_sales_df, pd.DataFrame) or len(no_sales_df) != 1:
+                product_universe_errors.append("sales_empty_product_universe_row_missing")
+            elif float(no_sales_df.iloc[0].get("현재재고수량") or 0) != 12.0 or float(no_sales_df.iloc[0].get("당월 잔여예상출고수량") or 0) != 0.0:
+                product_universe_errors.append("sales_empty_stock_or_demand_contract")
+            if not isinstance(default_scope_df, pd.DataFrame) or default_scope_df.empty or str(default_scope_df.iloc[0].get("제품코드") or "") != "P_DEFAULT":
+                product_universe_errors.append("empty_scope_default_universe_not_preserved")
+            if not isinstance(explicit_empty_df, pd.DataFrame) or not explicit_empty_df.empty:
+                product_universe_errors.append("explicit_empty_master_universe_not_empty")
+            if stock_loader_calls != [["P_SCOPE_EMPTY"], ["P_DEFAULT"]]:
+                product_universe_errors.append(f"sales_empty_stock_loader_calls={stock_loader_calls!r}")
+            inventory = dashboard_mod._build_inventory_facts(
+                {"df": no_sales_df},
+                inbound_facts_df=pd.DataFrame([{"product_code": "P_SCOPE_EMPTY"}]),
+                source_call_count=2,
+                inbound_source_call_count=1,
+                stock_mode="real",
+                evaluation_month="202607",
+            )
+            if len(inventory.get("readiness_rows") or []) != 1:
+                product_universe_errors.append("sales_empty_dashboard_inventory_missing")
+        except Exception as exc:
+            product_universe_errors.append(f"sales_empty_product_universe_runtime={type(exc).__name__}:{exc}")
+        if product_universe_errors:
+            results.append(_fail("Dashboard supplier product universe", "; ".join(product_universe_errors)))
+        else:
+            results.append(_ok("Dashboard supplier product universe", "only explicit supplier scopes apply the master universe; normal scope preserves the sales-based Dashboard path"))
+
+        display_unit_errors: list[str] = []
+        try:
+            view_mod = importlib.import_module("app.sims.views.dashboard_lite")
+            event_a_facts = {
+                "filters": {"amount_display_unit": "auto"},
+                "sales": {"metrics": {"sales": {"unit": "원", "value": 5_000_000}}},
+                "inventory": {},
+            }
+            event_a_unit = view_mod._resolved_dashboard_amount_unit(event_a_facts, "auto")
+            event_a_facts["filters"].update({
+                "amount_display_unit": event_a_unit,
+                "amount_display_unit_requested": "auto",
+                "amount_display_unit_resolved": event_a_unit,
+            })
+            event_a_cache = {"params": {"amount_display_unit": "auto", "amount_display_unit_requested": "auto", "amount_display_unit_resolved": event_a_unit}, "facts": event_a_facts}
+            event_a_snapshot = view_mod.build_dashboard_lite_chat_snapshot(event_a_cache)
+            event_b_facts = {"filters": {"amount_display_unit": "won", "amount_display_unit_requested": "won", "amount_display_unit_resolved": "won"}}
+            if (
+                event_a_unit != "million"
+                or view_mod._facts_amount_display_unit(event_a_facts) != "million"
+                or event_a_snapshot.get("params", {}).get("amount_display_unit_resolved") != "million"
+                or event_a_snapshot.get("facts", {}).get("filters", {}).get("amount_display_unit_resolved") != "million"
+                or view_mod._facts_amount_display_unit(event_b_facts) != "won"
+            ):
+                display_unit_errors.append("event_amount_display_unit_not_immutable")
+        except Exception as exc:
+            display_unit_errors.append(f"event_amount_display_unit_runtime={type(exc).__name__}:{exc}")
+        if display_unit_errors:
+            results.append(_fail("Dashboard event amount display unit", "; ".join(display_unit_errors)))
+        else:
+            results.append(_ok("Dashboard event amount display unit", "requested and resolved units are retained per primary event and compact snapshot"))
 
         profile_reentry_errors: list[str] = []
         try:

@@ -26,6 +26,7 @@ from app.services.analytics_sales_trend_service import (
     _pct_change,
     _resolve_period_source_policy,
     _resolve_source_mode,
+    _safe_analytics_log_meta,
     _split_sales_period_months,
     get_sales_trend_df,
 )
@@ -854,7 +855,7 @@ def get_manufacturer_sales_trend_result(
     params = _apply_month_or_date_params(coalesce_params(params))
     df = get_manufacturer_sales_trend(params, raw_df=raw_df)
     rows = 0 if df is None else int(len(df))
-    log.info("[analytics.manufacturer_sales_trend] rows=%s params=%r", rows, params)
+    log.info("[analytics.manufacturer_sales_trend] rows=%s meta=%s", rows, _safe_analytics_log_meta(params))
     source_label = str(getattr(df, "attrs", {}).get("source_label") or _effective_source_label(_resolve_source_mode(params), df))
     query_summary = _fmt_analytics_query_summary(params, source_label)
     meta = _manufacturer_trend_meta(df, months=list(getattr(df, "attrs", {}).get("months") or []), policy=getattr(df, "attrs", {}) or {})
@@ -897,7 +898,7 @@ def get_manufacturer_sales_trend_summary_result(
     params = _apply_month_or_date_params(coalesce_params(params))
     df = get_manufacturer_sales_trend_summary(params, raw_df=raw_df)
     rows = 0 if df is None else int(len(df))
-    log.info("[analytics.manufacturer_sales_trend_summary] rows=%s params=%r", rows, params)
+    log.info("[analytics.manufacturer_sales_trend_summary] rows=%s meta=%s", rows, _safe_analytics_log_meta(params))
     source_label = str(getattr(df, "attrs", {}).get("source_label") or _effective_source_label(_resolve_source_mode(params), df))
     query_summary = _fmt_analytics_query_summary(params, source_label)
     meta = _manufacturer_summary_meta(df, months=list(getattr(df, "attrs", {}).get("months") or []), policy=getattr(df, "attrs", {}) or {})

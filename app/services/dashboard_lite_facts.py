@@ -19,6 +19,8 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from app.services.product_supplier_scope_service import apply_product_supplier_scope, supplier_scope_filter_active
+
 
 FACTS_KIND = "SIMS_DASHBOARD_FACTS_V01"
 STOCK_READY_THRESHOLD_PCT = 98.0
@@ -167,7 +169,7 @@ def normalize_dashboard_lite_params(
     out["dashboard_product_group_list"] = list(out["product_group_list"])
     out["dashboard_product_di_list"] = list(out["product_di_list"])
     out["dashboard_product_class_list"] = list(out["product_class_list"])
-    return out
+    return apply_product_supplier_scope(out)
 
 
 def _dashboard_internal_source_params(params: Mapping[str, Any], *, today: date) -> dict[str, Any]:
@@ -181,8 +183,7 @@ def _dashboard_internal_source_params(params: Mapping[str, Any], *, today: date)
     history_month_from = _add_months(evaluation_month, -13)
     source_month_from = min(trend_month_from, history_month_from)
     today_ym = f"{today.year:04d}{today.month:02d}"
-    source = dict(params)
-    manufacturer_codes = _clean_list_param(params.get("manufacturer_test_codes"))
+    source = apply_product_supplier_scope(params)
     source.update(
         {
             "month_from": source_month_from,
@@ -197,9 +198,7 @@ def _dashboard_internal_source_params(params: Mapping[str, Any], *, today: date)
             # legacy single-code filters reinterpret Tax classification as Gu.
             "product_di_list": [],
             "product_class_list": [],
-            # This one-session test condition is resolved to product codes before
-            # the shared sales and stock SQL paths execute. It is never persisted.
-            "dashboard_manufacturer_codes": manufacturer_codes,
+            # Supplier scope is temporary and is attached once to all shared sources.
         }
     )
     return source
@@ -700,7 +699,7 @@ def _dashboard_filter_facts(params: Mapping[str, Any]) -> dict[str, Any]:
     class_names = _clean_list_param(params.get("product_class_nm_list"))
     vendor_group_codes = _clean_list_param(params.get("vendor_group_list"))
     vendor_kind_codes = _clean_list_param(params.get("vendor_kind_list"))
-    manufacturer_test_codes = _clean_list_param(params.get("manufacturer_test_codes"))
+    supplier_scope = apply_product_supplier_scope(params)
     legacy_group_codes = _clean_list_param(params.get("exclude_product_group_list"))
     legacy_group_names = _clean_list_param(params.get("exclude_product_group_nm_list"))
     legacy_di_codes = _clean_list_param(params.get("exclude_product_di_list"))
@@ -725,9 +724,13 @@ def _dashboard_filter_facts(params: Mapping[str, Any]) -> dict[str, Any]:
         "excluded_product_classes": _code_pair_items(legacy_class_codes, legacy_class_names, "0031"),
         "included_vendor_groups": _code_pair_items(vendor_group_codes, [], "0019"),
         "included_vendor_types": _code_pair_items(vendor_kind_codes, [], "0009"),
-        # This is deliberately kept out of the shared saved profile. It is a
-        # one-run test scope but still belongs in facts provenance.
-        "manufacturer_test_codes": manufacturer_test_codes,
+        "product_supplier_scope_mode": supplier_scope["product_supplier_scope_mode"],
+        "manufacturer_codes": supplier_scope["manufacturer_codes"],
+        # Legacy provenance key is retained for pre-existing compact clients.
+        "manufacturer_test_codes": supplier_scope["manufacturer_codes"],
+        "manufacturer_manager_codes": supplier_scope["manufacturer_manager_codes"],
+        "order_vendor_codes": supplier_scope["order_vendor_codes"],
+        "purchase_manager_codes": supplier_scope["purchase_manager_codes"],
         "io_gu_tcodes": _clean_list_param(params.get("io_gu_list")),
         "stock_mode": str(params.get("stock_mode") or "real"),
         "amount_display_unit": str(params.get("amount_display_unit") or "auto"),
@@ -2364,7 +2367,8 @@ def build_dashboard_lite_facts(
         "month_from": source_params.get("dashboard_lite_trend_month_from"),
         "date_from": f"{source_params.get('dashboard_lite_trend_month_from')}01",
     }
-    manufacturer_test_codes = _clean_list_param(service_params.get("manufacturer_test_codes"))
+    supplier_scope = apply_product_supplier_scope(service_params)
+    scope_filter_active = supplier_scope_filter_active(service_params)
     period = {
         "month_from": service_params.get("month_from"),
         "month_to": service_params.get("month_to"),
@@ -2383,7 +2387,10 @@ def build_dashboard_lite_facts(
         int((time.perf_counter() - t0) * 1000),
     )
     log.info(
-        "[dashboard.scope_contract] sales_io_filter_mode=%s sales_io_selected_count=%s forecast_io_filter_applied=True current_stock_io_filter_applied=False",
+        "[dashboard.scope_contract] supplier_scope_mode=%s supplier_vendor_count=%s supplier_manager_count=%s sales_io_filter_mode=%s sales_io_selected_count=%s forecast_io_filter_applied=True current_stock_io_filter_applied=False",
+        supplier_scope["product_supplier_scope_mode"],
+        len(supplier_scope["manufacturer_codes"] or supplier_scope["order_vendor_codes"]),
+        len(supplier_scope["manufacturer_manager_codes"] or supplier_scope["purchase_manager_codes"]),
         sales_io_filter_mode,
         sales_io_selected_count,
     )
@@ -2477,7 +2484,7 @@ def build_dashboard_lite_facts(
         if isinstance(expanded_sales_source_df, pd.DataFrame):
             filter_diagnostics.extend(list(expanded_sales_source_df.attrs.get("dashboard_filter_diagnostics") or []))
         log.info(
-            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s manufacturer_test_filter_enabled=%s manufacturer_test_product_count=%s expanded_history_month_from=%s expanded_history_month_to=%s expanded_history_rows=%s existing_support_rows=%s visible_rows=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s range_slice_ms=%s history_aggregate_ms=%s purchase_source_rows=%s purchase_source_sql_included=%s purchase_min_frame_ms=%s elapsed_ms=%s",
+            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s supplier_scope_mode=%s supplier_scope_product_count=%s expanded_history_month_from=%s expanded_history_month_to=%s expanded_history_rows=%s existing_support_rows=%s visible_rows=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s range_slice_ms=%s history_aggregate_ms=%s purchase_source_rows=%s purchase_source_sql_included=%s purchase_min_frame_ms=%s elapsed_ms=%s",
             service_params.get("company_id") or "",
             service_params.get("month_from"),
             service_params.get("month_to"),
@@ -2485,7 +2492,7 @@ def build_dashboard_lite_facts(
             0 if expanded_sales_source_df is None else len(expanded_sales_source_df),
             1,
             False,
-            bool(manufacturer_test_codes),
+            supplier_scope["product_supplier_scope_mode"],
             int(expanded_sales_source_df["제품코드"].nunique()) if isinstance(expanded_sales_source_df, pd.DataFrame) and "제품코드" in expanded_sales_source_df.columns else 0,
             source_params.get("dashboard_lite_history_month_from") or "",
             service_params.get("evaluation_month") or "",
@@ -2539,6 +2546,7 @@ def build_dashboard_lite_facts(
             },
             sales_raw_df=visible_sales_df,
             sales_forecast_df=shared_sales_forecast_df,
+            product_universe_df=inbound_facts_df if scope_filter_active else None,
         )
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
         t_master_merge = time.perf_counter()
@@ -2612,6 +2620,39 @@ def build_dashboard_lite_facts(
         source_call_count=int(needs_sales_source) + int(needs_stock_source),
         inbound_source_call_count=int(needs_inbound_source),
         stock_mode=str(service_params.get("stock_mode") or "real"),
+    )
+    def _product_codes(frame: Any, *columns: str) -> set[str]:
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return set()
+        for column in columns:
+            if column in frame.columns:
+                return {
+                    str(value).strip()
+                    for value in frame[column].fillna("").astype(str).tolist()
+                    if str(value).strip()
+                }
+        return set()
+
+    master_product_codes = _product_codes(inbound_facts_df, "product_code")
+    sales_product_codes = _product_codes(visible_sales_df, "제품코드")
+    stock_product_codes = _product_codes(source_df, "제품코드")
+    inbound_product_codes = _product_codes(inbound_facts_df, "product_code")
+    dashboard_product_codes = {
+        str(row.get("product_code") or "").strip()
+        for row in (inventory.get("readiness_rows") or [])
+        if str(row.get("product_code") or "").strip()
+    }
+    log.info(
+        "[dashboard.product_universe] supplier_scope_mode=%s supplier_scope_filter_active=%s master_universe_applied=%s master_product_count=%s sales_product_count=%s stock_product_count=%s inbound_product_count=%s dashboard_product_count=%s sales_empty_product_count=%s",
+        supplier_scope["product_supplier_scope_mode"],
+        scope_filter_active,
+        scope_filter_active,
+        len(master_product_codes),
+        len(sales_product_codes),
+        len(stock_product_codes),
+        len(inbound_product_codes),
+        len(dashboard_product_codes),
+        len(master_product_codes - sales_product_codes),
     )
     log.info(
         "[dashboard.stock_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",
