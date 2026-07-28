@@ -1124,8 +1124,37 @@ def _render_chat_fast_dataframe(
     분석/KPI 큰 표도 공용 column_config를 사용해서
     좌측 고정 칼럼/컬럼폭/숫자 표시를 유지한다.
     """
-    df = _preserve_product_flow_table_dtypes(df)
-    view_df = normalize_display_df_for_streamlit(_chat_fast_display_df(df))
+    full_df = df
+    display_df = _limit_chat_display_df(full_df)
+    display_rows = int(len(display_df)) if isinstance(display_df, pd.DataFrame) else 0
+    full_rows = int(len(full_df)) if isinstance(full_df, pd.DataFrame) else 0
+    display_limit = _chat_display_max_rows()
+    render_truncated = bool(display_limit > 0 and full_rows > display_rows)
+
+    if render_truncated:
+        st.caption(
+            f"전체 {full_rows:,}건 중 처음 {display_rows:,}건만 화면에 표시합니다. "
+            "전체 자료는 Excel 또는 CSV 다운로드를 이용하세요."
+        )
+
+    log_sims_table_render(
+        full_df,
+        action=action_name,
+        render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
+        mode="fast",
+        renderer="_render_chat_fast_dataframe",
+        height=height,
+        visible_rows=display_rows,
+        width_mode="stretch",
+        column_config_count=0,
+        full_rows=full_rows,
+        display_rows=display_rows,
+        render_truncated=render_truncated,
+        display_limit=display_limit,
+    )
+
+    display_df = _preserve_product_flow_table_dtypes(display_df)
+    view_df = normalize_display_df_for_streamlit(_chat_fast_display_df(display_df))
 
     try:
         view_df, column_config, table_width, table_height = build_sims_table_display_config(
@@ -1146,7 +1175,7 @@ def _render_chat_fast_dataframe(
         view_df = _preserve_product_flow_table_dtypes(_chat_clean_display_none_values(view_df))
         column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
         log_sims_display_fields(
-            df,
+            full_df,
             view_df,
             action=action_name,
             render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
@@ -1164,7 +1193,7 @@ def _render_chat_fast_dataframe(
         log.exception("[chat] fast common table render failed")
         cfg = _chat_fast_column_config(view_df)
         log_sims_display_fields(
-            df,
+            full_df,
             view_df,
             action=action_name,
             render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
@@ -9396,17 +9425,6 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         # 단, 분석/KPI 원표는 이미 서비스에서 순번/요약 컬럼을 구성하므로
                         # IO 전용 display_df 변환을 다시 적용하지 않는다. (요약표/컬럼 차이 방지)
                         if is_large_analysis_table:
-                            log_sims_table_render(
-                                render_df,
-                                action=action_name,
-                                render_path=table_render_path,
-                                mode="fast",
-                                renderer="_render_chat_fast_dataframe",
-                                height=520,
-                                visible_rows=min(int(len(render_df)), 300),
-                                width_mode="stretch",
-                                column_config_count=0,
-                            )
                             _render_chat_fast_dataframe(
                                 render_df.copy(),
                                 height=520,

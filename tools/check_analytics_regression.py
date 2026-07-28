@@ -4358,6 +4358,115 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("streamlit width compatibility for SIMS tables", f"{type(e).__name__}: {e}"))
 
         try:
+            import inspect
+
+            from app.ui import chat_middleware as chat_mod
+
+            old_display_limit = os.environ.get("SIMS_CHAT_DISPLAY_MAX_ROWS")
+            original_dataframe = chat_mod.st.dataframe
+            original_caption = chat_mod.st.caption
+            original_table_log = chat_mod.log_sims_table_render
+            dataframe_calls: list[pd.DataFrame] = []
+            captions: list[str] = []
+            table_logs: list[dict[str, Any]] = []
+
+            def _fake_dataframe(data=None, *args, **kwargs):
+                if isinstance(data, pd.DataFrame):
+                    dataframe_calls.append(data.copy(deep=True))
+                return data
+
+            def _fake_caption(value, *args, **kwargs):
+                captions.append(str(value))
+
+            def _fake_table_log(df, **kwargs):
+                table_logs.append({"rows": int(len(df)), **dict(kwargs)})
+
+            try:
+                os.environ["SIMS_CHAT_DISPLAY_MAX_ROWS"] = "17"
+                chat_mod.st.dataframe = _fake_dataframe
+                chat_mod.st.caption = _fake_caption
+                chat_mod.log_sims_table_render = _fake_table_log
+                chat_mod.st.session_state["__sims_table_render_path"] = "history"
+
+                empty_df = pd.DataFrame({"code": pd.Series(dtype="string")})
+                small_df = pd.DataFrame({"code": pd.Series(["00001"] * 16, dtype="string"), "qty": pd.Series(range(16), dtype="Int64")})
+                equal_df = pd.DataFrame({"code": pd.Series(["00001"] * 17, dtype="string"), "qty": pd.Series(range(17), dtype="Int64")})
+                over_df = pd.DataFrame({"code": pd.Series(["00001"] * 18, dtype="string"), "qty": pd.Series(range(18), dtype="Int64")})
+                for frame, expected_rows in ((empty_df, 0), (small_df, 16), (equal_df, 17), (over_df, 17)):
+                    limited = chat_mod._limit_chat_display_df(frame)
+                    if len(limited) != expected_rows:
+                        raise AssertionError(f"limit_rows={len(limited)} expected={expected_rows}")
+
+                columns = {"product_code": pd.Series([f"{idx:05d}" for idx in range(10115)], dtype="string")}
+                columns.update({f"metric_{idx:02d}": pd.Series(range(10115), dtype="Int64") for idx in range(97)})
+                full_df = pd.DataFrame(columns)
+                full_before = full_df.copy(deep=True)
+                chat_mod.st.session_state["sims_tables"] = {"history-large-fixture": full_df}
+                chat_mod.st.session_state["sims_export_tables"] = {"history-large-fixture": full_df}
+                chat_mod.st.session_state["__sims_export_tables_by_key"] = {"history-large-fixture": full_df}
+                chat_mod.st.session_state["__sims_current_table_source_key"] = "history-large-fixture"
+                chat_mod._render_chat_fast_dataframe(
+                    full_df,
+                    height=520,
+                    action_name="\ud488\ubaa9\ubcc4 \uc7ac\uace0\ubd80\uc871\ud604\ud669",
+                    meta={"kind": "table", "table_key": "history-large-fixture"},
+                )
+            finally:
+                chat_mod.st.dataframe = original_dataframe
+                chat_mod.st.caption = original_caption
+                chat_mod.log_sims_table_render = original_table_log
+                if old_display_limit is None:
+                    os.environ.pop("SIMS_CHAT_DISPLAY_MAX_ROWS", None)
+                else:
+                    os.environ["SIMS_CHAT_DISPLAY_MAX_ROWS"] = old_display_limit
+
+            failures: list[str] = []
+            if not dataframe_calls or len(dataframe_calls[-1]) != 17:
+                failures.append(f"fast_renderer_rows={len(dataframe_calls[-1]) if dataframe_calls else 'missing'}")
+            if dataframe_calls and dataframe_calls[-1].columns.tolist() != full_df.columns.tolist():
+                failures.append("fast_renderer_columns_changed")
+            try:
+                pd.testing.assert_frame_equal(full_df, full_before, check_dtype=True)
+            except AssertionError as assert_exc:
+                failures.append(f"fast_renderer_input_mutated={assert_exc}")
+            for store_name in ("sims_tables", "sims_export_tables", "__sims_export_tables_by_key"):
+                stored = (chat_mod.st.session_state.get(store_name) or {}).get("history-large-fixture")
+                if stored is not full_df or not isinstance(stored, pd.DataFrame) or len(stored) != 10115:
+                    failures.append(f"{store_name}_full_source_changed")
+            if not captions or "10,115" not in captions[-1] or "17" not in captions[-1]:
+                failures.append(f"truncation_caption={captions!r}")
+            if not table_logs:
+                failures.append("table_render_log_missing")
+            else:
+                logged = table_logs[-1]
+                expected_log = {
+                    "full_rows": 10115,
+                    "display_rows": 17,
+                    "render_truncated": True,
+                    "display_limit": 17,
+                }
+                for key, expected in expected_log.items():
+                    if logged.get(key) != expected:
+                        failures.append(f"log_{key}={logged.get(key)!r}")
+
+            body_source = inspect.getsource(chat_mod._render_chat_item_body)
+            fast_source = inspect.getsource(chat_mod._render_chat_fast_dataframe)
+            if "_render_chat_fast_dataframe(\n                                render_df.copy()" not in body_source:
+                failures.append("history_large_fast_branch_missing")
+            if "_render_chat_fast_dataframe(\n                                view_df.copy()" not in body_source:
+                failures.append("nlq_fast_direct_branch_missing")
+            if "_limit_chat_display_df(full_df)" not in fast_source:
+                failures.append("fast_renderer_display_limit_missing")
+            if "head(300)" in fast_source or "SIMS_CHAT_TABLE_DISPLAY_LIMIT" in fast_source:
+                failures.append("new_fixed_300_limit_detected")
+            if failures:
+                results.append(_fail("SIMS chat history fast table row cap", "; ".join(failures)))
+            else:
+                results.append(_ok("SIMS chat history fast table row cap", "history/NLQ fast paths share the display-limit boundary; 10,115x98 render input is capped by SIMS_CHAT_DISPLAY_MAX_ROWS while the original DataFrame remains unchanged"))
+        except Exception as e:
+            results.append(_fail("SIMS chat history fast table row cap", f"{type(e).__name__}: {e}"))
+
+        try:
             import io
             import json
             from openpyxl import load_workbook

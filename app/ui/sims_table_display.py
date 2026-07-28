@@ -113,16 +113,26 @@ def log_sims_table_render(
     visible_rows: Any = "",
     width_mode: str = "",
     column_config_count: Any = "",
+    full_rows: Any = "",
+    display_rows: Any = "",
+    render_truncated: Any = "",
+    display_limit: Any = "",
 ) -> None:
     rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
     cols = int(len(df.columns)) if isinstance(df, pd.DataFrame) else 0
+    if full_rows == "":
+        full_rows = rows
+    if display_rows == "":
+        display_rows = rows
+    if render_truncated == "":
+        render_truncated = False
     if visible_rows == "":
         try:
             visible_rows = min(rows, max(int((int(height) - 48) / 32), 0)) if height not in ("", None) else ""
         except Exception:
             visible_rows = ""
     log.info(
-        "[sims.table_render] action=%s render_path=%s mode=%s renderer=%s height=%s visible_rows=%s width_mode=%s column_config_count=%s rows=%s cols=%s",
+        "[sims.table_render] action=%s render_path=%s mode=%s renderer=%s height=%s visible_rows=%s width_mode=%s column_config_count=%s rows=%s cols=%s full_rows=%s display_rows=%s render_truncated=%s display_limit=%s",
         str(action or ""),
         str(render_path or "chat"),
         str(mode or ""),
@@ -133,6 +143,10 @@ def log_sims_table_render(
         column_config_count,
         rows,
         cols,
+        full_rows,
+        display_rows,
+        bool(render_truncated),
+        display_limit,
     )
 
 
