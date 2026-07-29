@@ -12070,6 +12070,88 @@ def run_basic_checks() -> list[CheckResult]:
             if len(nonzero_df) != 1:
                 risk_detail_errors.append(f"detail_zero_exclusion={len(nonzero_df)}")
 
+            display_source = pd.DataFrame([
+                {
+                    "위험상태": "긴급 부족", "위험사유": "재고없음", "제품코드": "P-001", "제품명": "Alpha",
+                    "규격": "10", "제조사명": "M1", "주요매입처명": "Vendor A", "현재재고수량": 0.0,
+                    "위험보정잔여예상수요": 5.0, "위험보정부족예상수량": 5.0, "위험보정부족예상금액": 500.0,
+                    "위험보정재고준비율": 0.0, "수요급증세부분류": None, "최근 정상 입고일": "20260727",
+                    "입고 경과일": float("nan"), "정상 입고 거래일수": 0, "평균 입고간격일": pd.NaT,
+                    "입고 자료상태": "None", "입고 지연후보": "아니오", "최근입고 대표매입처명": "Vendor A",
+                },
+                {
+                    "위험상태": "부족 주의", "위험사유": "준비율 경고기준 미만", "제품코드": "P-002", "제품명": "Beta",
+                    "현재재고수량": 2.0, "위험보정잔여예상수요": 3.0, "위험보정부족예상수량": 1.0,
+                    "위험보정부족예상금액": 100.0, "위험보정재고준비율": 66.67,
+                },
+            ])
+            display_frame = view_mod._build_risk_detail_display_frame(display_source, 1)
+            expected_display_prefix = [
+                "순번", "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "주요매입처명",
+                "현재재고수량", "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액", "위험보정재고준비율",
+            ]
+            if (
+                len(display_frame) != 1
+                or list(display_frame.columns[:len(expected_display_prefix)]) != expected_display_prefix
+                or str(display_frame.iloc[0].get("최근 정상 입고일") or "") != "2026-07-27"
+                or str(display_frame.iloc[0].get("수요급증세부분류") or "")
+                or str(display_frame.iloc[0].get("입고 자료상태") or "")
+                or float(display_frame.iloc[0].get("현재재고수량")) != 0.0
+                or len(display_source) != 2
+                or str(display_source.iloc[0].get("최근 정상 입고일") or "") != "20260727"
+                or not pd.isna(display_source.iloc[0].get("수요급증세부분류"))
+            ):
+                risk_detail_errors.append("detail_display_frame_contract")
+            display_limit_options = [10, 50, 100, 300, 500]
+            if (
+                list(view_mod._RISK_DETAIL_DISPLAY_LIMIT_OPTIONS) != display_limit_options
+                or view_mod._RISK_DETAIL_DEFAULT_DISPLAY_LIMIT != 100
+                or [view_mod._normalize_risk_detail_display_limit(value) for value in (100, 300, 500)] != [100, 300, 500]
+                or any(view_mod._normalize_risk_detail_display_limit(value) != 100 for value in (None, "", "invalid", 42, 0, 501))
+            ):
+                risk_detail_errors.append("detail_display_limit_options")
+            display_41_source = pd.concat([display_source.iloc[[0]].assign(제품코드=f"P-{index:03d}") for index in range(1, 42)], ignore_index=True)
+            display_10 = view_mod._build_risk_detail_display_frame(display_41_source, 10)
+            display_7 = view_mod._build_risk_detail_display_frame(display_41_source.head(7), 10)
+            if (
+                len(display_41_source) != 41
+                or len(display_10) != 10
+                or list(display_10["순번"]) != list(range(1, 11))
+                or len(display_7) != 7
+                or list(display_7["순번"]) != list(range(1, 8))
+                or view_mod._risk_detail_display_summary(41, 10) != "필터 결과 41건 중 상위 10건 표시"
+                or view_mod._risk_detail_display_summary(7, 7) != "필터 결과 7건 중 상위 7건 표시"
+                or view_mod._risk_detail_display_height(10) != 422
+                or view_mod._risk_detail_display_height(7) != 317
+            ):
+                risk_detail_errors.append("detail_display_limit_slice")
+            reset_st = _ActionCallbackStreamlit(click_once=False)
+            old_reset_st = view_mod.st
+            try:
+                view_mod.st = reset_st
+                reset_keys = view_mod._risk_detail_filter_keys("display-limit")
+                reset_st.session_state.update({
+                    reset_keys["limit"]: 10,
+                    reset_keys["status"]: "긴급 부족",
+                    reset_keys["search"]: "P-001",
+                })
+                view_mod._reset_risk_detail_filters("display-limit")
+                if reset_st.session_state.get(reset_keys["limit"]) != 10:
+                    risk_detail_errors.append("detail_reset_preserves_limit")
+            finally:
+                view_mod.st = old_reset_st
+            risk_detail_render_slice = view_src[view_src.find("def _render_risk_detail"):view_src.find("def _dashboard_context_identity")]
+            if (
+                "_RISK_DETAIL_DISPLAY_COLUMNS" not in view_src
+                or "_build_risk_detail_display_frame(filtered" not in view_src
+                or "filter_cols = st.columns((16, 34, 18, 32))" not in view_src
+                or "utility_cols = st.columns((16, 20, 14, 50), vertical_alignment=\"bottom\")" not in view_src
+                or "list(_RISK_DETAIL_DISPLAY_LIMIT_OPTIONS)" not in risk_detail_render_slice
+                or "_risk_detail_display_height(len(display))" not in risk_detail_render_slice
+                or "상세 범위" in risk_detail_render_slice
+            ):
+                risk_detail_errors.append("detail_layout_contract")
+
             detail_rows[0]["_\uc8fc\uc694\ub9e4\uc785\ucc98\ud544\ud130\ud0a4"] = "assigned:A"
             excel_bytes, excel_info = risk_detail_mod.build_dashboard_risk_detail_excel_bytes(
                 detail_rows,

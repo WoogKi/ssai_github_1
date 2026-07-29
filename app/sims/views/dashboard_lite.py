@@ -1612,6 +1612,7 @@ def _risk_detail_filter_keys(instance_key: str) -> dict[str, str]:
         "surge": f"__dashboard_lite_risk_detail_surge::{instance_key}",
         "zero": f"__dashboard_lite_risk_detail_zero::{instance_key}",
         "search": f"__dashboard_lite_risk_detail_search::{instance_key}",
+        "limit": f"__dashboard_lite_risk_detail_limit::{instance_key}",
         "notice": f"__dashboard_lite_risk_detail_sync_notice::{instance_key}",
     }
 
@@ -1683,6 +1684,124 @@ def _risk_detail_vendor_options(rows: list[dict[str, Any]]) -> tuple[list[str], 
     if any(str(row.get("_주요매입처필터키") or "") == "vendor_unknown" for row in rows):
         options.append("vendor_unknown")
     return options, labels
+
+
+_RISK_DETAIL_DISPLAY_COLUMNS = (
+    "순번",
+    "위험상태",
+    "위험사유",
+    "제품코드",
+    "제품명",
+    "규격",
+    "제조사명",
+    "주요매입처명",
+    "현재재고수량",
+    "위험보정잔여예상수요",
+    "위험보정부족예상수량",
+    "위험보정부족예상금액",
+    "위험보정재고준비율",
+    "수요급증세부분류",
+    "최근 정상 입고일",
+    "입고 경과일",
+    "정상 입고 거래일수",
+    "평균 입고간격일",
+    "입고 자료상태",
+    "입고 지연후보",
+    "최근입고 대표매입처명",
+    "최근입고 대표매입처코드",
+    "최근입고 대표매입처출처",
+    "최근365일 입고이력",
+)
+
+_RISK_DETAIL_DISPLAY_TEXT_COLUMNS = {
+    "위험상태",
+    "위험사유",
+    "제품코드",
+    "제품명",
+    "규격",
+    "제조사명",
+    "주요매입처명",
+    "수요급증세부분류",
+    "최근 정상 입고일",
+    "입고 자료상태",
+    "입고 지연후보",
+    "최근입고 대표매입처명",
+    "최근입고 대표매입처코드",
+    "최근입고 대표매입처출처",
+    "최근365일 입고이력",
+}
+
+
+_RISK_DETAIL_DISPLAY_LIMIT_OPTIONS = (10, 50, 100, 300, 500)
+_RISK_DETAIL_DEFAULT_DISPLAY_LIMIT = 100
+
+
+def _normalize_risk_detail_display_limit(value: Any) -> int:
+    """Keep legacy valid widget values while safely recovering invalid state."""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return _RISK_DETAIL_DEFAULT_DISPLAY_LIMIT
+    return limit if limit in _RISK_DETAIL_DISPLAY_LIMIT_OPTIONS else _RISK_DETAIL_DEFAULT_DISPLAY_LIMIT
+
+
+def _risk_detail_display_summary(filtered_rows: int, display_rows: int) -> str:
+    return f"필터 결과 {int(filtered_rows):,}건 중 상위 {int(display_rows):,}건 표시"
+
+
+def _risk_detail_display_height(display_rows: int) -> int:
+    return min(560, max(220, 72 + int(display_rows) * 35))
+
+
+def _build_risk_detail_display_frame(filtered: pd.DataFrame, display_limit: int) -> pd.DataFrame:
+    """Build a presentation-only slice without changing cached or export facts."""
+    limit = max(0, int(display_limit or 0))
+    display = filtered.head(limit).copy()
+    display.insert(0, "순번", range(1, len(display) + 1))
+    visible_columns = [column for column in _RISK_DETAIL_DISPLAY_COLUMNS if column in display.columns]
+    display = display.loc[:, visible_columns]
+
+    for column in _RISK_DETAIL_DISPLAY_TEXT_COLUMNS.intersection(display.columns):
+        values = display[column]
+        cleaned = values.where(values.notna(), "").astype(str).str.strip()
+        display[column] = cleaned.mask(cleaned.str.casefold().isin({"none", "nan", "nat"}), "")
+
+    if "최근 정상 입고일" in display.columns:
+        values = display["최근 정상 입고일"].astype(str).str.strip()
+        valid_yyyymmdd = values.str.fullmatch(r"\d{8}")
+        display.loc[valid_yyyymmdd, "최근 정상 입고일"] = (
+            values.loc[valid_yyyymmdd].str.slice(0, 4)
+            + "-"
+            + values.loc[valid_yyyymmdd].str.slice(4, 6)
+            + "-"
+            + values.loc[valid_yyyymmdd].str.slice(6, 8)
+        )
+    return display
+
+
+def _risk_detail_display_column_config() -> dict[str, Any]:
+    return {
+        "순번": st.column_config.NumberColumn("순번", format="%d", width="small"),
+        "위험상태": st.column_config.TextColumn("위험상태", width="small"),
+        "위험사유": st.column_config.TextColumn("위험사유", width="medium"),
+        "제품코드": st.column_config.TextColumn("제품코드", width="small"),
+        "제품명": st.column_config.TextColumn("제품명", width="large"),
+        "규격": st.column_config.TextColumn("규격", width="medium"),
+        "제조사명": st.column_config.TextColumn("제조사명", width="medium"),
+        "주요매입처명": st.column_config.TextColumn("주요매입처명", width="large"),
+        "현재재고수량": st.column_config.NumberColumn("현재재고수량", format="%,.2f", width="small"),
+        "위험보정잔여예상수요": st.column_config.NumberColumn("위험보정잔여예상수요", format="%,.2f", width="medium"),
+        "위험보정부족예상수량": st.column_config.NumberColumn("위험보정부족예상수량", format="%,.2f", width="medium"),
+        "위험보정부족예상금액": st.column_config.NumberColumn("위험보정부족예상금액", format="%,.0f", width="medium"),
+        "위험보정재고준비율": st.column_config.NumberColumn("위험보정재고준비율", format="%.2f%%", width="small"),
+        "수요급증세부분류": st.column_config.TextColumn("수요급증세부분류", width="medium"),
+        "최근 정상 입고일": st.column_config.TextColumn("최근 정상 입고일", width="medium"),
+        "입고 경과일": st.column_config.NumberColumn("입고 경과일", format="%,.0f", width="small"),
+        "정상 입고 거래일수": st.column_config.NumberColumn("정상 입고 거래일수", format="%,.0f", width="small"),
+        "평균 입고간격일": st.column_config.NumberColumn("평균 입고간격일", format="%,.2f", width="small"),
+        "입고 자료상태": st.column_config.TextColumn("입고 자료상태", width="medium"),
+        "입고 지연후보": st.column_config.TextColumn("입고 지연후보", width="small"),
+    }
 
 
 def _risk_detail_query_conditions(
@@ -1814,7 +1933,7 @@ def _render_risk_detail(
     if bool(st.session_state.pop(filter_keys["notice"], False)):
         st.caption("선택한 조치 품목 조건으로 전체 위험품목을 표시합니다.")
 
-    filter_cols = st.columns((1, 2, 1, 2))
+    filter_cols = st.columns((16, 34, 18, 32))
     with filter_cols[0]:
         risk_status = st.selectbox("위험상태", ["전체 위험", "긴급 부족", "부족 주의"], key=f"__dashboard_lite_risk_detail_status::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with filter_cols[1]:
@@ -1824,11 +1943,22 @@ def _render_risk_detail(
     with filter_cols[3]:
         search_text = st.text_input("제품 검색", key=search_key, on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
 
-    utility_cols = st.columns((1, 1, 3))
+    limit_key = filter_keys["limit"]
+    if limit_key in st.session_state:
+        st.session_state[limit_key] = _normalize_risk_detail_display_limit(st.session_state.get(limit_key))
+
+    utility_cols = st.columns((16, 20, 14, 50), vertical_alignment="bottom")
     with utility_cols[0]:
         include_zero_amount = st.toggle("금액 0 포함", value=True, key=f"__dashboard_lite_risk_detail_zero::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with utility_cols[1]:
-        display_limit = st.selectbox("화면 표시 행 수", [100, 300, 500], index=0, key=f"__dashboard_lite_risk_detail_limit::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
+        display_limit = st.selectbox(
+            "화면 표시 행 수",
+            list(_RISK_DETAIL_DISPLAY_LIMIT_OPTIONS),
+            index=_RISK_DETAIL_DISPLAY_LIMIT_OPTIONS.index(_RISK_DETAIL_DEFAULT_DISPLAY_LIMIT),
+            key=limit_key,
+            on_change=_request_dashboard_scroll_suppression,
+            args=("local_filter",),
+        )
     with utility_cols[2]:
         st.button(
             "필터 초기화",
@@ -1844,34 +1974,21 @@ def _render_risk_detail(
         include_zero_amount=include_zero_amount,
         search_text=search_text,
     )
-    display = filtered.head(int(display_limit)).copy()
-    display.insert(0, "순번", range(1, len(display) + 1))
-    display_columns = [
-        "순번", "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "주요매입처명", "현재재고수량",
-        "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액", "위험보정재고준비율", "수요급증세부분류",
-        "최근 정상 입고일", "입고 경과일", "정상 입고 거래일수", "평균 입고간격일", "입고 자료상태", "입고 지연후보",
-        "최근입고 대표매입처명", "최근입고 대표매입처코드", "최근입고 대표매입처출처", "최근365일 입고이력",
-    ]
-    display = display[[column for column in display_columns if column in display.columns]]
+    display_limit = _normalize_risk_detail_display_limit(display_limit)
+    display = _build_risk_detail_display_frame(filtered, display_limit)
     log.info(
         "[dashboard.risk_detail] source_rows=%s filtered_rows=%s displayed_rows=%s emergency_rows=%s warning_rows=%s zero_amount_rows=%s vendor_filter_applied=%s surge_filter_applied=%s search_filter_applied=%s include_zero_amount=%s display_limit=%s elapsed_ms=%s",
         filter_summary["source_rows"], filter_summary["filtered_rows"], len(display), filter_summary["emergency_rows"], filter_summary["warning_rows"], filter_summary["zero_amount_rows"],
         vendor_key != "전체", surge_filter != "전체", bool(str(search_text or "").strip()), include_zero_amount, display_limit, elapsed_ms,
     )
-    st.caption(f"필터 결과 {filter_summary['filtered_rows']:,}건 중 상위 {len(display):,}건 표시")
+    with utility_cols[3]:
+        st.caption(_risk_detail_display_summary(filter_summary["filtered_rows"], len(display)))
     st.dataframe(
         display,
         width="stretch",
-        height=min(560, max(220, 72 + len(display) * 35)),
+        height=_risk_detail_display_height(len(display)),
         hide_index=True,
-        column_config={
-            "순번": st.column_config.NumberColumn("순번", format="%d"),
-            "현재재고수량": st.column_config.NumberColumn("현재재고수량", format="%,.2f"),
-            "위험보정잔여예상수요": st.column_config.NumberColumn("위험보정잔여예상수요", format="%,.2f"),
-            "위험보정부족예상수량": st.column_config.NumberColumn("위험보정부족예상수량", format="%,.2f"),
-            "위험보정부족예상금액": st.column_config.NumberColumn("위험보정부족예상금액", format="%,.0f"),
-            "위험보정재고준비율": st.column_config.NumberColumn("위험보정재고준비율", format="%.2f%%"),
-        },
+        column_config=_risk_detail_display_column_config(),
     )
 
     if not export_controls_allowed:
