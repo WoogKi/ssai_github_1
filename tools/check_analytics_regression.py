@@ -9302,6 +9302,59 @@ def run_basic_checks() -> list[CheckResult]:
 
         render_errors: list[str] = []
 
+        transaction_cycle_ui_errors: list[str] = []
+        try:
+            source_required = view_mod._transaction_cycle_presentation(
+                {"sales_data_status": "source_required"}, side="sales"
+            )
+            if source_required != {
+                "status": "source_required",
+                "message": "일자 단위 정상 매출 거래일 자료 연결 필요",
+            }:
+                transaction_cycle_ui_errors.append(f"source_required={source_required!r}")
+            no_sales = view_mod._transaction_cycle_presentation(
+                {"sales_data_status": "no_data"}, side="sales"
+            )
+            if no_sales.get("message") != "최근 90일 정상 매출 거래가 없습니다.":
+                transaction_cycle_ui_errors.append(f"sales_no_data={no_sales!r}")
+            no_purchase = view_mod._transaction_cycle_presentation(
+                {"purchase_data_status": "missing"}, side="purchase"
+            )
+            if no_purchase.get("status") != "no_data" or no_purchase.get("message") != "최근 90일 정상 매입 거래가 없습니다.":
+                transaction_cycle_ui_errors.append(f"purchase_no_data={no_purchase!r}")
+            one_day = view_mod._transaction_cycle_presentation(
+                {
+                    "sales_data_status": "insufficient_days",
+                    "sales_latest_date": "20260729",
+                    "sales_elapsed_days": 0,
+                    "sales_unique_trade_days": 1,
+                },
+                side="sales",
+            )
+            if one_day.get("latest_date") != "2026-07-29" or one_day.get("average_label") != "거래일 부족":
+                transaction_cycle_ui_errors.append(f"insufficient_days={one_day!r}")
+            ready = view_mod._transaction_cycle_presentation(
+                {
+                    "purchase_data_status": "normal",
+                    "purchase_latest_date": "20260728",
+                    "purchase_elapsed_days": 1,
+                    "purchase_unique_trade_days": 42,
+                    "purchase_average_interval_days": 2.5,
+                },
+                side="purchase",
+            )
+            if ready.get("status") != "ready" or ready.get("average_interval_days") != 2.5:
+                transaction_cycle_ui_errors.append(f"ready={ready!r}")
+            turnover_source = Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8")
+            if "_transaction_cycle_presentation(turnover, side=side)" not in turnover_source:
+                transaction_cycle_ui_errors.append("turnover_renderer_not_using_presentation")
+        except Exception as exc:
+            transaction_cycle_ui_errors.append(f"runtime={type(exc).__name__}:{exc}")
+        if transaction_cycle_ui_errors:
+            results.append(_fail("Dashboard transaction-cycle UI status distinction", "; ".join(transaction_cycle_ui_errors)))
+        else:
+            results.append(_ok("Dashboard transaction-cycle UI status distinction", "source_required, no_data, insufficient_days, and ready are rendered as distinct snapshot-safe states without a source query"))
+
         class _FakeCtx:
             def __enter__(self):
                 return self

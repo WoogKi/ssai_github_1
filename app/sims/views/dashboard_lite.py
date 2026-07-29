@@ -1159,41 +1159,60 @@ def _render_demand_surge_detail_summary(facts: dict[str, Any]) -> None:
         st.caption("분류자료부족: 제품코드 또는 과거 출고 이력이 부족해 세부 유형을 확정할 수 없는 품목입니다.")
 
 
+def _transaction_cycle_presentation(turnover: dict[str, Any], *, side: str) -> dict[str, Any]:
+    """Return a small, snapshot-safe presentation model for one transaction side."""
+    is_purchase = side == "purchase"
+    label = "매입" if is_purchase else "매출"
+    raw_status = str(turnover.get(f"{side}_data_status") or "").strip().lower()
+    status = {"normal": "ready", "missing": "no_data"}.get(raw_status, raw_status)
+    if status == "source_required":
+        return {"status": status, "message": f"일자 단위 정상 {label} 거래일 자료 연결 필요"}
+    if status == "no_data":
+        return {"status": status, "message": f"최근 90일 정상 {label} 거래가 없습니다."}
+
+    latest = str(turnover.get(f"{side}_latest_date") or "").strip()
+    if len(latest) == 8 and latest.isdigit():
+        latest = f"{latest[:4]}-{latest[4:6]}-{latest[6:]}"
+    unique_days = turnover.get(f"{side}_unique_trade_days")
+    interval = turnover.get(f"{side}_average_interval_days")
+    return {
+        "status": status or "no_data",
+        "message": "",
+        "latest_date": latest or "자료 없음",
+        "elapsed_days": turnover.get(f"{side}_elapsed_days"),
+        "unique_trade_days": unique_days,
+        "average_interval_days": interval,
+        "average_label": "거래일 부족" if status == "insufficient_days" else None,
+    }
+
+
 def _render_turnover(facts: dict[str, Any]) -> None:
     turnover = facts.get("transaction_cycle") or facts.get("turnover_days") or {}
 
-    def _value(value: Any, *, suffix: str = "") -> str:
-        if value in (None, ""):
-            return "자료 없음"
-        return f"{value}{suffix}"
-
-    def _date(value: Any) -> str:
-        raw = str(value or "").strip()
-        if len(raw) == 8 and raw.isdigit():
-            return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
-        return raw or "자료 없음"
+    def _render_side(side: str) -> None:
+        label = "매입" if side == "purchase" else "매출"
+        presentation = _transaction_cycle_presentation(turnover, side=side)
+        st.markdown(f"#### {label} 거래 주기")
+        st.caption(f"최근 정상 {label} {period_days}일 기준")
+        if presentation.get("message"):
+            st.caption(str(presentation["message"]))
+            return
+        elapsed = presentation.get("elapsed_days")
+        unique_days = presentation.get("unique_trade_days")
+        interval = presentation.get("average_interval_days")
+        st.markdown(f"최근 정상 거래일: **{presentation.get('latest_date') or '자료 없음'}**")
+        st.markdown(f"경과일: **{'자료 없음' if elapsed in (None, '') else f'{elapsed}일'}**")
+        st.markdown(f"고유 거래일: **{'자료 없음' if unique_days in (None, '') else f'{unique_days}일'}**")
+        average_label = presentation.get("average_label")
+        average_value = average_label or ("자료 없음" if interval in (None, "") else f"{_fmt_number(interval)}일")
+        st.markdown(f"평균 거래간격: **{average_value}**")
 
     period_days = int(turnover.get("period_days") or 90)
     purchase_col, sales_col = st.columns(2)
     with purchase_col:
-        st.markdown("#### 매입 거래 주기")
-        st.caption(f"최근 정상 매입 {period_days}일 기준")
-        st.markdown(f"최근 정상 거래일: **{_date(turnover.get('purchase_latest_date'))}**")
-        st.markdown(f"경과일: **{_value(turnover.get('purchase_elapsed_days'), suffix='일')}**")
-        st.markdown(f"고유 거래일: **{_value(turnover.get('purchase_unique_trade_days'), suffix='일')}**")
-        interval = turnover.get("purchase_average_interval_days")
-        st.markdown(f"평균 거래간격: **{_value(_fmt_number(interval) if interval not in (None, '') else None, suffix='일')}**")
+        _render_side("purchase")
     with sales_col:
-        st.markdown("#### 매출 거래 주기")
-        st.caption(f"최근 정상 매출 {period_days}일 기준")
-        if str(turnover.get("sales_data_status") or "") == "source_required":
-            st.caption("일자 단위 정상 매출 거래 facts 자료 연결 필요")
-        else:
-            st.markdown(f"최근 정상 거래일: **{_date(turnover.get('sales_latest_date'))}**")
-            st.markdown(f"경과일: **{_value(turnover.get('sales_elapsed_days'), suffix='일')}**")
-            st.markdown(f"고유 거래일: **{_value(turnover.get('sales_unique_trade_days'), suffix='일')}**")
-            interval = turnover.get("sales_average_interval_days")
-            st.markdown(f"평균 거래간격: **{_value(_fmt_number(interval) if interval not in (None, '') else None, suffix='일')}**")
+        _render_side("sales")
     st.caption("본 지표는 ERP의 정상 매입·매출 거래일을 기준으로 계산합니다.")
 
 
