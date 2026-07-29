@@ -961,6 +961,60 @@ def _build_count_donut(rows: list[dict[str, Any]], *, total_label: str, total: i
     ).properties(title={"text": total_label, "subtitle": [f"{total:,}개"]}, height=245)
 
 
+def _demand_surge_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
+    """Derive display-only surge partitions from the persisted aggregate facts."""
+    summary = (facts.get("inventory") or {}).get("stock_demand_surge_summary") or {}
+    total = int(summary.get("전체수요급증품목수", summary.get("품목수", 0)) or 0)
+    top_rows = [
+        {"label": "기존 예상 초과", "count": int(summary.get("기존예상초과품목수") or 0), "amount": 0.0},
+        {"label": "예상외 출고 발생", "count": int(summary.get("예상외출고발생품목수") or 0), "amount": 0.0},
+    ]
+    detail_rows = [
+        {"label": "예상 누락", "count": int(summary.get("예상누락품목수") or 0)},
+        {"label": "계절성 재발생 후보", "count": int(summary.get("계절성재발생후보품목수") or 0)},
+        {"label": "3개월 이상 재출고", "count": int(summary.get("3개월이상재출고품목수") or 0)},
+        {"label": "신규 출고 후보", "count": int(summary.get("신규출고후보품목수") or 0)},
+        {"label": "분류자료부족", "count": int(summary.get("분류자료부족품목수") or 0)},
+    ]
+    unexpected_total = int(summary.get("예상외출고발생품목수") or 0)
+    return {
+        "total": total,
+        "top_rows": top_rows,
+        "detail_rows": detail_rows,
+        "top_partition_valid": total >= 0 and sum(int(row["count"]) for row in top_rows) == total,
+        "detail_partition_valid": unexpected_total >= 0 and sum(int(row["count"]) for row in detail_rows) == unexpected_total,
+        "unexpected_total": unexpected_total,
+    }
+
+
+def _build_demand_surge_type_chart(rows: list[dict[str, Any]]) -> alt.Chart | None:
+    """Build a compact count-only chart for existing surge detail classifications."""
+    frame = pd.DataFrame([row for row in rows if int(row.get("count") or 0) > 0])
+    if frame.empty:
+        return None
+    frame = frame.sort_values(["count", "label"], ascending=[False, True], kind="stable")
+    frame["count_label"] = frame["count"].map(lambda value: f"{int(value):,}개")
+    order = frame["label"].tolist()
+    colors = {
+        "예상 누락": "#64748b",
+        "계절성 재발생 후보": "#0f766e",
+        "3개월 이상 재출고": "#2563eb",
+        "신규 출고 후보": "#7c3aed",
+        "분류자료부족": "#9ca3af",
+    }
+    y = alt.Y("label:N", title=None, sort=order, axis=alt.Axis(labelLimit=180))
+    bars = alt.Chart(frame).mark_bar(cornerRadiusEnd=3).encode(
+        x=alt.X("count:Q", title="품목 수", axis=alt.Axis(tickMinStep=1)),
+        y=y,
+        color=alt.Color("label:N", legend=None, scale=alt.Scale(domain=list(colors), range=list(colors.values()))),
+        tooltip=[alt.Tooltip("label:N", title="유형"), alt.Tooltip("count:Q", title="품목 수", format=",.0f")],
+    )
+    labels = alt.Chart(frame).mark_text(align="left", dx=5, color="#334155").encode(
+        x=alt.X("count:Q"), y=y, text="count_label:N"
+    )
+    return (bars + labels).properties(height=max(150, min(260, len(frame) * 38)))
+
+
 def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
     summary = _stock_risk_display_summary(facts)
     amount_unit = _facts_amount_display_unit(facts)
@@ -1057,40 +1111,53 @@ def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
 
 
 def _render_demand_surge_detail_summary(facts: dict[str, Any]) -> None:
-    """Render aggregate surge-detail facts without exposing product rows."""
+    """Render the persisted demand-surge partitions without querying new rows."""
     summary = (facts.get("inventory") or {}).get("stock_demand_surge_summary") or {}
-    total = int(summary.get("전체수요급증품목수", summary.get("품목수", 0)) or 0)
+    state = _demand_surge_presentation_state(facts)
+    total = int(state["total"])
     if total <= 0:
         return
 
-    st.markdown("#### 수요급증 세부")
-    top_cols = st.columns(3)
-    for col, (label, value) in zip(top_cols, (
-        ("전체 수요급증", total),
-        ("기존 예상 초과", int(summary.get("기존예상초과품목수") or 0)),
-        ("예상외 출고 발생", int(summary.get("예상외출고발생품목수") or 0)),
-    )):
-        with col:
-            _metric_card(label, value, "개")
+    st.markdown("### 수요급증 세부")
+    composition_col, type_col = st.columns([35, 65])
+    with composition_col:
+        st.markdown("#### 수요급증 구성")
+        if state["top_partition_valid"]:
+            donut = _build_count_donut(
+                state["top_rows"], total_label="수요급증", total=total, colors=["#f97316", "#7c3aed"]
+            )
+            if donut is not None:
+                st.altair_chart(donut, width="stretch")
+            for row in state["top_rows"]:
+                pct = (int(row["count"]) / total * 100.0) if total else 0.0
+                st.caption(f"{row['label']} {int(row['count']):,}개 / {_fmt_number(pct, 1)}%")
+        else:
+            st.caption("상위 분류 합계가 전체 수요급증과 일치하지 않아 독립 지표로 표시합니다.")
+            for row in state["top_rows"]:
+                _metric_card(row["label"], row["count"], "개")
 
-    detail_cols = st.columns(5)
-    for col, (label, value) in zip(detail_cols, (
-        ("예상 누락", int(summary.get("예상누락품목수") or 0)),
-        ("계절성 재발생 후보", int(summary.get("계절성재발생후보품목수") or 0)),
-        ("3개월 이상 재출고", int(summary.get("3개월이상재출고품목수") or 0)),
-        ("신규 출고 후보", int(summary.get("신규출고후보품목수") or 0)),
-        ("분류자료부족", int(summary.get("분류자료부족품목수") or 0)),
-    )):
-        with col:
-            _metric_card(label, value, "개")
+    with type_col:
+        st.markdown("#### 예상외 출고 유형")
+        if state["detail_partition_valid"]:
+            chart = _build_demand_surge_type_chart(state["detail_rows"])
+            if chart is not None:
+                st.altair_chart(chart, width="stretch")
+            else:
+                st.caption("예상외 출고 발생 품목이 없습니다.")
+        else:
+            st.caption("하위 유형 합계가 예상외 출고 발생과 일치하지 않아 독립 지표로 표시합니다.")
+            for row in state["detail_rows"]:
+                _metric_card(row["label"], row["count"], "개")
 
-    start_month = str(summary.get("이력지원시작월") or "")
-    end_month = str(summary.get("이력지원종료월") or "")
-    if start_month and end_month:
-        st.caption(
-            f"신규 출고 후보는 지원기간 {start_month}~{end_month} 완료월에 양의 순출고 이력이 없는 경우이며, ERP 전체 최초 출고 확정은 아닙니다."
-        )
-    st.caption("계절성 재발생 후보는 최근 3개월 무출고이면서 전년 동월 ±1개월에 양의 순출고 이력이 있는 품목입니다.")
+    with st.expander("분류 기준 보기"):
+        st.caption("예상 누락: 최근 3개월 완료월 출고 이력이 있으나 당월 기준예상은 0인 품목입니다.")
+        st.caption("계절성 재발생 후보: 최근 3개월 무출고이면서 전년 동월 ±1개월에 양의 순출고 이력이 있는 품목입니다.")
+        st.caption("3개월 이상 재출고: 최근 3개월 무출고 후 지원기간 과거 양의 순출고 이력이 있는 품목입니다.")
+        start_month = str(summary.get("이력지원시작월") or "")
+        end_month = str(summary.get("이력지원종료월") or "")
+        if start_month and end_month:
+            st.caption(f"신규 출고 후보: 지원기간 {start_month}~{end_month} 완료월에 양의 순출고 이력이 없는 품목이며, ERP 전체 최초 출고 확정은 아닙니다.")
+        st.caption("분류자료부족: 제품코드 또는 과거 출고 이력이 부족해 세부 유형을 확정할 수 없는 품목입니다.")
 
 
 def _render_turnover(facts: dict[str, Any]) -> None:

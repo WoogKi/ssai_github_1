@@ -9943,6 +9943,61 @@ def run_basic_checks() -> list[CheckResult]:
         else:
             results.append(_ok("Dashboard Lite sales gauge", "month-end achievement drives the needle and main value; current-day achievement remains a separate marker with safe over-120 scaling"))
 
+        demand_surge_visual_errors: list[str] = []
+        try:
+            demand_surge_facts = {
+                "inventory": {
+                    "stock_demand_surge_summary": {
+                        "전체수요급증품목수": 188,
+                        "기존예상초과품목수": 184,
+                        "예상외출고발생품목수": 4,
+                        "예상누락품목수": 0,
+                        "계절성재발생후보품목수": 1,
+                        "3개월이상재출고품목수": 1,
+                        "신규출고후보품목수": 2,
+                        "분류자료부족품목수": 0,
+                    }
+                }
+            }
+            demand_surge_state = view_mod._demand_surge_presentation_state(demand_surge_facts)
+            if (
+                not demand_surge_state.get("top_partition_valid")
+                or not demand_surge_state.get("detail_partition_valid")
+                or demand_surge_state.get("total") != 188
+                or sum(int(row["count"]) for row in demand_surge_state.get("top_rows", [])) != 188
+                or sum(int(row["count"]) for row in demand_surge_state.get("detail_rows", [])) != 4
+            ):
+                demand_surge_visual_errors.append(f"partition_state={demand_surge_state!r}")
+            type_chart = view_mod._build_demand_surge_type_chart(demand_surge_state["detail_rows"])
+            type_chart_spec = type_chart.to_dict() if type_chart is not None else {}
+            type_chart_json = json.dumps(type_chart_spec, ensure_ascii=False)
+            if not all(label in type_chart_json for label in ("계절성 재발생 후보", "3개월 이상 재출고", "신규 출고 후보")):
+                demand_surge_visual_errors.append(f"type_chart_labels={type_chart_json}")
+            chart_rows = next(iter((type_chart_spec.get("datasets") or {}).values()), [])
+            if any(int(row.get("count") or 0) <= 0 for row in chart_rows):
+                demand_surge_visual_errors.append(f"zero_value_type_bar_rendered={chart_rows!r}")
+            fallback_facts = json.loads(json.dumps(demand_surge_facts))
+            fallback_facts["inventory"]["stock_demand_surge_summary"]["예상외출고발생품목수"] = 5
+            fallback_state = view_mod._demand_surge_presentation_state(fallback_facts)
+            if fallback_state.get("detail_partition_valid") or fallback_state.get("top_partition_valid"):
+                demand_surge_visual_errors.append(f"partition_fallback={fallback_state!r}")
+            zero_facts = {"inventory": {"stock_demand_surge_summary": {}}}
+            zero_state = view_mod._demand_surge_presentation_state(zero_facts)
+            if zero_state.get("total") != 0 or not zero_state.get("top_partition_valid") or not zero_state.get("detail_partition_valid"):
+                demand_surge_visual_errors.append(f"zero_safe_state={zero_state!r}")
+            if demand_surge_facts["inventory"]["stock_demand_surge_summary"]["전체수요급증품목수"] != 188:
+                demand_surge_visual_errors.append("demand_surge_summary_mutated")
+            ui_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
+            for token in ("수요급증 구성", "예상외 출고 유형", "분류 기준 보기", "_demand_surge_presentation_state", "_build_demand_surge_type_chart"):
+                if token not in ui_source:
+                    demand_surge_visual_errors.append(f"ui_token_missing={token}")
+        except Exception as exc:
+            demand_surge_visual_errors.append(f"demand_surge_visual_runtime={type(exc).__name__}:{exc}")
+        if demand_surge_visual_errors:
+            results.append(_fail("Dashboard Lite demand-surge visualization", "; ".join(demand_surge_visual_errors)))
+        else:
+            results.append(_ok("Dashboard Lite demand-surge visualization", "aggregate facts verify the mutually exclusive top and detail partitions, omit zero-value bars, and fall back to independent indicators when the persisted totals do not reconcile"))
+
         reset_errors: list[str] = []
         session_fixture = {
             "__dashboard_lite_result": {"facts": "cached"},
