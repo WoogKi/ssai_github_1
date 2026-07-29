@@ -7494,7 +7494,11 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append(f"filter_class_code={filter_facts!r}")
         if not facts.get("additional_notes") or "sales_decline_targets" not in facts.get("additional_notes"):
             fact_errors.append("additional_notes_missing")
-        if facts["turnover_days"].get("status") != "자료부족":
+        if (
+            facts["turnover_days"].get("status") != "partial"
+            or facts.get("transaction_cycle", {}).get("sales_data_status") != "source_required"
+            or facts.get("transaction_cycle", {}).get("period_days") != 90
+        ):
             fact_errors.append("turnover_status_wrong")
         stock_risk_rows = [
             {"product_code": "MISSING", "current_stock_qty": 0, "current_stock_amt": 0, "remaining_expected_demand_qty": 10, "shortage_qty": 10, "shortage_amt": 100, "stock_readiness_pct": 0, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": False},
@@ -10188,6 +10192,9 @@ def run_basic_checks() -> list[CheckResult]:
                 def write(self, value, *_args, **_kwargs):
                     self.writes.append(str(value))
 
+                def markdown(self, value, *_args, **_kwargs):
+                    self.writes.append(str(value))
+
                 def button(self, _label, **kwargs):
                     self._count("button")
                     if self.click_once:
@@ -10214,6 +10221,46 @@ def run_basic_checks() -> list[CheckResult]:
                 selected = action_st.session_state.get("__dashboard_selected_action_detail")
                 if not isinstance(selected, dict) or selected.get("product_code") != "12345" or selected.get("product_code") in {"16789", "11090"}:
                     action_callback_errors.append("callback_selection_not_cached")
+                selected_instance_key = str((selected or {}).get("risk_detail_instance_key") or "")
+                selected_filter_keys = view_mod._risk_detail_filter_keys(selected_instance_key)
+                if selected_filter_keys["mode"] in action_st.session_state or selected_filter_keys["search"] in action_st.session_state:
+                    action_callback_errors.append("callback_mutated_risk_detail_state")
+                selected_row = {
+                    "제품코드": "12345",
+                    "위험상태": "긴급 부족",
+                    "_주요매입처필터키": "assigned:A",
+                    "수요급증여부": True,
+                    "위험보정부족예상금액": 100.0,
+                }
+                action_st.session_state.update({
+                    selected_filter_keys["mode"]: "all_risk_items",
+                    selected_filter_keys["toggle"]: True,
+                    selected_filter_keys["status"]: "부족 주의",
+                    selected_filter_keys["vendor"]: "all",
+                    selected_filter_keys["surge"]: "일반",
+                    selected_filter_keys["search"]: "other-product",
+                    selected_filter_keys["zero"]: False,
+                })
+                view_mod._show_selected_action_in_all_risks(
+                    selected,
+                    [selected_row],
+                    selected_instance_key,
+                    ["all", "assigned:A"],
+                )
+                if (
+                    action_st.session_state.get(selected_filter_keys["mode"]) != "all_risk_items"
+                    or action_st.session_state.get(selected_filter_keys["search"]) != "12345"
+                    or action_st.session_state.get(selected_filter_keys["surge"]) != "수요급증"
+                ):
+                    action_callback_errors.append("selected_all_risk_sync")
+                view_mod._clear_selected_dashboard_action(selected_instance_key)
+                if (
+                    "__dashboard_selected_action_detail" in action_st.session_state
+                    or action_st.session_state.get(selected_filter_keys["mode"]) != "all_risk_items"
+                    or action_st.session_state.get(selected_filter_keys["status"]) != "긴급 부족"
+                    or action_st.session_state.get(selected_filter_keys["search"]) != "12345"
+                ):
+                    action_callback_errors.append("selected_action_clear")
                 if "__dashboard_drilldown_request" in action_st.session_state or "__dashboard_drilldown_auto_run" in action_st.session_state:
                     action_callback_errors.append("callback_legacy_handoff_created")
                 if not isinstance(action_st.session_state.get("__dashboard_lite_suppress_chat_autoscroll_once"), dict):
@@ -10223,8 +10270,8 @@ def run_basic_checks() -> list[CheckResult]:
                     current_cache,
                     render_mode="primary",
                 )
-                if action_st.calls.get("dataframe", 0) != 1:
-                    action_callback_errors.append("cached_action_detail_not_rendered")
+                if action_st.calls.get("dataframe", 0) != 0 or not action_st.writes:
+                    action_callback_errors.append("cached_action_detail_not_rendered_compact")
                 legacy_action = {
                     "rank": 1, "priority": "높음", "risk_grade": "조치 필요",
                     "target": "테스트제품", "product_code": "00001", "stock_readiness_pct": 45.3,
@@ -10235,9 +10282,9 @@ def run_basic_checks() -> list[CheckResult]:
                 view_mod._render_today_actions({"today_actions": [legacy_action], "filters": {}}, current_cache, render_mode="chat")
                 if view_mod._safe_action_rank(legacy_action, 9) != 1:
                     action_callback_errors.append("legacy_rank")
-                if "조치 필요" not in legacy_st.writes:
+                if view_mod._legacy_action_status(legacy_action) != "조치 필요":
                     action_callback_errors.append("legacy_status")
-                if "테스트제품" not in legacy_st.writes:
+                if view_mod._legacy_action_target(legacy_action) != "테스트제품":
                     action_callback_errors.append("legacy_target")
                 for action_case, expected in (
                     ({"priority": 1}, 1), ({"priority": "1"}, 1), ({"priority": "높음", "rank": 2}, 2),
@@ -10255,6 +10302,69 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard Lite action callback and legacy snapshot", "; ".join(action_callback_errors)))
         else:
             results.append(_ok("Dashboard Lite action callback and legacy snapshot", "button callback stores only the active cache selection; legacy rank/priority fields render without a numeric conversion error"))
+
+        action_visual_errors: list[str] = []
+        try:
+            action_rows = [
+                {
+                    "action_id": "stock-emergency", "priority": 1, "status": "긴급 부족", "cause_type": "stock_shortage",
+                    "target_name": "긴급품목", "evidence_label": "위험보정부족예상금액", "evidence_value": 1_200_000,
+                    "evidence_unit": "원", "threshold_label": "재고준비율", "threshold_value": 20.0,
+                    "recommended_action": "발주 확인", "drilldown_action": "품목별 재고부족현황", "drilldown_params": {"product_code": "P1"},
+                },
+                {
+                    "action_id": "stock-warning", "priority": 2, "status": "부족 주의", "cause_type": "stock_shortage",
+                    "target_name": "주의품목", "evidence_label": "위험보정부족예상금액", "evidence_value": 300_000,
+                    "evidence_unit": "원", "threshold_label": "재고준비율", "threshold_value": 90.0,
+                    "recommended_action": "재고 확인", "drilldown_action": "품목별 재고부족현황", "drilldown_params": {"product_code": "P2"},
+                },
+                {
+                    "action_id": "sales-decline", "priority": 3, "status": "매출 감소", "cause_type": "sales_decline",
+                    "target_name": "매출대상", "evidence_label": "완료월 매출", "evidence_value": 900_000,
+                    "evidence_unit": "원", "threshold_label": "최근3개월증감률", "threshold_value": -12.5,
+                    "recommended_action": "감소 원인 확인", "drilldown_action": "", "drilldown_params": {},
+                },
+                {
+                    "action_id": "overstock", "priority": 4, "status": "과잉 후보", "cause_type": "overstock_candidate",
+                    "target_name": "과잉품목", "evidence_label": "과잉후보금액", "evidence_value": 50_000,
+                    "evidence_unit": "원", "threshold_label": "과잉후보 기준", "threshold_value": 30.0,
+                    "recommended_action": "소진계획 확인", "drilldown_action": "", "drilldown_params": {},
+                },
+            ]
+            visual_state = view_mod._today_actions_presentation_state(action_rows)
+            if (
+                visual_state.get("total") != 4
+                or not visual_state.get("status_partition_valid")
+                or [row.get("label") for row in visual_state.get("status_rows", [])] != ["긴급 부족", "부족 주의", "매출 감소", "과잉 후보"]
+                or [row.get("count") for row in visual_state.get("type_rows", [])] != [2, 1, 1]
+            ):
+                action_visual_errors.append(f"visual_state={visual_state!r}")
+            if action_rows[0].get("priority") != 1 or action_rows[-1].get("target_name") != "과잉품목":
+                action_visual_errors.append("source_action_rows_mutated")
+            mismatch_state = view_mod._today_actions_presentation_state([*action_rows, "invalid-row"])
+            if mismatch_state.get("total") != 4 or not mismatch_state.get("status_partition_valid"):
+                action_visual_errors.append(f"invalid_action_ignored={mismatch_state!r}")
+            badge = view_mod._dashboard_action_status_badge("긴급 부족")
+            if "긴급 부족" not in badge or "#b91c1c" not in badge:
+                action_visual_errors.append(f"emergency_badge={badge!r}")
+            unknown_badge = view_mod._dashboard_action_status_badge("자료 부족")
+            if "자료 부족" not in unknown_badge or "#475569" not in unknown_badge:
+                action_visual_errors.append(f"fallback_badge={unknown_badge!r}")
+            action_visual_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
+            for token in ("오늘의 조치 TOP", "오늘의 우선 조치 TOP 10", "선택 조치 상세", "_today_actions_presentation_state", "_dashboard_action_status_badge", "on_click=_select_dashboard_action_detail"):
+                if token not in action_visual_source:
+                    action_visual_errors.append(f"action_visual_token_missing={token}")
+            if "_build_count_donut(" in action_visual_source[action_visual_source.find("def _render_today_actions"):action_visual_source.find("def _risk_detail_instance_key")]:
+                action_visual_errors.append("today_action_donut_remains")
+            action_renderer = action_visual_source[action_visual_source.find("def _render_today_actions"):action_visual_source.find("def _risk_detail_instance_key")]
+            if "st.container(height=580, border=False)" not in action_renderer or "st.columns([42, 58])" not in action_renderer:
+                action_visual_errors.append("today_action_master_detail_scroll_container_missing")
+        except Exception as exc:
+            action_visual_errors.append(f"action_visual_runtime={type(exc).__name__}:{exc}")
+        if action_visual_errors:
+            results.append(_fail("Dashboard Lite today-action visualization", "; ".join(action_visual_errors)))
+        else:
+            results.append(_ok("Dashboard Lite today-action visualization", "existing TOP action rows keep their rank, status, target, evidence, criterion, recommendation, and drill-down contract while the summary uses only display-derived status/type counts"))
 
         panel_src = Path("app/ui/sims_panel.py").read_text(encoding="utf-8")
         entry_src = Path("app/ui/sims_entry.py").read_text(encoding="utf-8")
@@ -10299,7 +10409,7 @@ def run_basic_checks() -> list[CheckResult]:
             drilldown_errors.append("stock_shortage_params_apply_missing")
         if "_dashboard_stock_shortage_handoff_summary(params)" not in stock_source:
             drilldown_errors.append("stock_shortage_summary_missing")
-        if view_src.count('st.markdown("### 오늘의 조치")') != 1 or 'st.markdown("#### 오늘의 조치")' in action_view_source:
+        if view_src.count('st.markdown("## 오늘의 조치")') != 1 or 'st.markdown("#### 오늘의 조치")' in action_view_source:
             drilldown_errors.append("today_actions_heading_duplicate")
         if "uuid.uuid4" in action_view_source:
             drilldown_errors.append("action_widget_uuid")

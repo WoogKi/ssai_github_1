@@ -1118,7 +1118,6 @@ def _render_demand_surge_detail_summary(facts: dict[str, Any]) -> None:
     if total <= 0:
         return
 
-    st.markdown("### 수요급증 세부")
     composition_col, type_col = st.columns([35, 65])
     with composition_col:
         st.markdown("#### 수요급증 구성")
@@ -1161,14 +1160,41 @@ def _render_demand_surge_detail_summary(facts: dict[str, Any]) -> None:
 
 
 def _render_turnover(facts: dict[str, Any]) -> None:
-    turnover = facts.get("turnover_days") or {}
-    st.caption("매입/매출 거래 회전일")
-    st.info(
-        "v0.1에서는 최근 90일 정상 매입/매출 고유 거래일 facts가 아직 연결되지 않아 자료부족으로 표시합니다. "
-        "입금/출금/현금 회전일은 원천자료가 없어 표시하지 않습니다."
-    )
-    if turnover.get("definition"):
-        st.caption(str(turnover.get("definition")))
+    turnover = facts.get("transaction_cycle") or facts.get("turnover_days") or {}
+
+    def _value(value: Any, *, suffix: str = "") -> str:
+        if value in (None, ""):
+            return "자료 없음"
+        return f"{value}{suffix}"
+
+    def _date(value: Any) -> str:
+        raw = str(value or "").strip()
+        if len(raw) == 8 and raw.isdigit():
+            return f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+        return raw or "자료 없음"
+
+    period_days = int(turnover.get("period_days") or 90)
+    purchase_col, sales_col = st.columns(2)
+    with purchase_col:
+        st.markdown("#### 매입 거래 주기")
+        st.caption(f"최근 정상 매입 {period_days}일 기준")
+        st.markdown(f"최근 정상 거래일: **{_date(turnover.get('purchase_latest_date'))}**")
+        st.markdown(f"경과일: **{_value(turnover.get('purchase_elapsed_days'), suffix='일')}**")
+        st.markdown(f"고유 거래일: **{_value(turnover.get('purchase_unique_trade_days'), suffix='일')}**")
+        interval = turnover.get("purchase_average_interval_days")
+        st.markdown(f"평균 거래간격: **{_value(_fmt_number(interval) if interval not in (None, '') else None, suffix='일')}**")
+    with sales_col:
+        st.markdown("#### 매출 거래 주기")
+        st.caption(f"최근 정상 매출 {period_days}일 기준")
+        if str(turnover.get("sales_data_status") or "") == "source_required":
+            st.caption("일자 단위 정상 매출 거래 facts 자료 연결 필요")
+        else:
+            st.markdown(f"최근 정상 거래일: **{_date(turnover.get('sales_latest_date'))}**")
+            st.markdown(f"경과일: **{_value(turnover.get('sales_elapsed_days'), suffix='일')}**")
+            st.markdown(f"고유 거래일: **{_value(turnover.get('sales_unique_trade_days'), suffix='일')}**")
+            interval = turnover.get("sales_average_interval_days")
+            st.markdown(f"평균 거래간격: **{_value(_fmt_number(interval) if interval not in (None, '') else None, suffix='일')}**")
+    st.caption("본 지표는 ERP의 정상 매입·매출 거래일을 기준으로 계산합니다.")
 
 
 def _dashboard_drilldown_params(cache: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
@@ -1267,14 +1293,10 @@ def _select_dashboard_action_detail(selection: dict[str, str] | None) -> None:
     if not all(str(selection.get(key) or "").strip() for key in required):
         return
     st.session_state["__dashboard_selected_action_detail"] = dict(selection)
-    st.session_state[f"__dashboard_lite_risk_detail_open_request::{selection['risk_detail_instance_key']}"] = {
-        "action_id": str(selection["action_id"]),
-        "product_code": str(selection["product_code"]),
-    }
     _request_dashboard_scroll_suppression("action_detail")
     log.info(
         "[dashboard.action_detail] stage=callback_selected room_match=True company_match=True event_match=True "
-        "action_id_present=True product_code_present=True detail_match_count=0 db_query_count=0 chat_push_count=0 suppress_autoscroll=True"
+        "action_id_present=True product_code_present=True detail_match_count=0 db_query_count=0 chat_push_count=0 suppress_autoscroll=True risk_filter_mutated=False"
     )
 
 
@@ -1309,67 +1331,162 @@ def _legacy_action_target(action: dict[str, Any]) -> str:
     )
 
 
+def _today_actions_presentation_state(actions: Any) -> dict[str, Any]:
+    """Summarize only the existing TOP action rows for Dashboard display."""
+    rows = [dict(action) for action in (actions or [])[:10] if isinstance(action, dict)]
+    status_rows: list[dict[str, Any]] = []
+    status_index: dict[str, dict[str, Any]] = {}
+    type_rows: list[dict[str, Any]] = []
+    type_index: dict[str, dict[str, Any]] = {}
+    type_labels = {
+        "stock_shortage": "재고 부족",
+        "sales_decline": "매출 감소",
+        "overstock_candidate": "과잉 후보",
+    }
+    for fallback_index, action in enumerate(rows, start=1):
+        status = _legacy_action_status(action)
+        status_item = status_index.get(status)
+        if status_item is None:
+            status_item = {"label": status, "count": 0, "amount": 0.0, "amount_available": True}
+            status_index[status] = status_item
+            status_rows.append(status_item)
+        status_item["count"] += 1
+        if str(action.get("evidence_unit") or "") == "원" and action.get("evidence_value") not in (None, ""):
+            status_item["amount"] += float(action.get("evidence_value") or 0)
+        else:
+            status_item["amount_available"] = False
+
+        cause_type = str(action.get("cause_type") or "").strip()
+        label = type_labels.get(cause_type, cause_type or "기타")
+        type_item = type_index.get(label)
+        if type_item is None:
+            type_item = {"label": label, "count": 0}
+            type_index[label] = type_item
+            type_rows.append(type_item)
+        type_item["count"] += 1
+
+    status_order = {"긴급 부족": 0, "부족 주의": 1, "매출 감소": 2, "과잉 후보": 3}
+    status_rows.sort(key=lambda row: (status_order.get(str(row["label"]), 99), str(row["label"])))
+    type_rows.sort(key=lambda row: (-int(row["count"]), str(row["label"])))
+    return {
+        "rows": rows,
+        "total": len(rows),
+        "status_rows": status_rows,
+        "type_rows": type_rows,
+        "status_partition_valid": sum(int(row["count"]) for row in status_rows) == len(rows),
+    }
+
+
+def _dashboard_action_status_badge(status: str) -> str:
+    colors = {
+        "긴급 부족": ("#fee2e2", "#b91c1c"),
+        "부족 주의": ("#ffedd5", "#c2410c"),
+        "매출 감소": ("#dbeafe", "#1d4ed8"),
+        "과잉 후보": ("#ede9fe", "#6d28d9"),
+    }
+    background, foreground = colors.get(status, ("#e5e7eb", "#475569"))
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;border-radius:4px;'
+        f'font-size:0.82rem;font-weight:600;background:{background};color:{foreground};">'
+        f'{html.escape(status)}</span>'
+    )
+
+
 def _render_today_actions(facts: dict[str, Any], cache: dict[str, Any], *, render_mode: str) -> None:
-    actions = facts.get("today_actions") or []
-    st.caption("상태 · 근거 · 판정 기준 · 권장 조치 순서로 최대 10건을 표시합니다.")
+    # 판정 기준은 목록의 작은 "기준:" 보조 문구로만 표시한다.
+    state = _today_actions_presentation_state(facts.get("today_actions") or [])
+    actions = state["rows"]
     if not actions:
-        st.success("현재 기본 규칙으로 조치가 필요한 항목이 없습니다.")
+        inventory = facts.get("inventory") or {}
+        if not inventory or ("readiness_rows" not in inventory and "risk_targets" not in inventory):
+            st.info("조치 판단에 필요한 자료가 부족합니다.")
+        else:
+            st.success("현재 우선 조치가 필요한 품목이 없습니다.")
         return
     interactive = render_mode == "primary"
     event_id = str(cache.get("dashboard_event_id") or "")
     amount_unit = _facts_amount_display_unit(facts)
-    headers = st.columns([0.5, 1.1, 1.8, 2.2, 2.0, 2.0, 1.0])
-    for column, label in zip(headers, ("순위", "상태", "대상", "판단 근거", "판정 기준", "권장 조치", "상세")):
-        with column:
-            st.caption(label)
-    for fallback_index, action in enumerate(actions[:10], start=1):
-        if not isinstance(action, dict):
-            action = {}
-        cols = st.columns([0.5, 1.1, 1.8, 2.2, 2.0, 2.0, 1.0])
-        with cols[0]:
-            st.markdown(f"**{_safe_action_rank(action, fallback_index)}**")
-        with cols[1]:
-            st.write(_legacy_action_status(action))
-        with cols[2]:
-            st.write(_legacy_action_target(action))
-        with cols[3]:
-            value = action.get("evidence_value")
-            unit = str(action.get("evidence_unit") or "")
-            evidence = str(action.get("evidence_label") or "")
-            if value is not None and unit == "원":
-                evidence = f"{evidence} {_fmt_dashboard_amount(value, amount_unit)}"
-            if not evidence and action.get("shortage_amt") not in (None, ""):
-                evidence = _fmt_dashboard_amount(action.get("shortage_amt"), amount_unit)
-            st.caption(evidence or str(action.get("evidence") or "-"))
-        with cols[4]:
-            threshold_label = str(action.get("threshold_label") or "")
-            threshold_value = action.get("threshold_value")
-            cause_type = str(action.get("cause_type") or "")
-            if threshold_value is None and action.get("stock_readiness_pct") not in (None, ""):
-                threshold = f"재고준비율 {_fmt_threshold_pct(action.get('stock_readiness_pct'))}%"
-            elif threshold_value is None:
-                threshold = threshold_label or "-"
-            elif cause_type in {"stock_shortage", "sales_decline"}:
-                threshold = f"{threshold_label} {_fmt_threshold_pct(threshold_value)}%"
-            elif cause_type == "overstock_candidate":
-                threshold = f"{threshold_label} {_fmt_number(threshold_value)}"
+    st.markdown(f"**오늘의 조치 TOP {state['total']:,}건**")
+    st.markdown(" ".join(f"`{row['label']} {int(row['count']):,}건`" for row in state["status_rows"]))
+    if state["type_rows"]:
+        st.markdown(" ".join(f"`{row['label']} {int(row['count']):,}건`" for row in state["type_rows"]))
+        st.caption("조치 유형은 한 품목에 여러 조건이 함께 적용될 수 있습니다.")
+
+    actions_col, detail_col = st.columns([42, 58])
+    with actions_col:
+        st.markdown("#### 오늘의 우선 조치 TOP 10")
+        st.caption("위험도와 업무 우선순위가 높은 조치를 순서대로 표시합니다.")
+        with st.container(height=580, border=False):
+            for fallback_index, action in enumerate(actions, start=1):
+                rank = _safe_action_rank(action, fallback_index)
+                status = _legacy_action_status(action)
+                target = _legacy_action_target(action)
+                value = action.get("evidence_value")
+                unit = str(action.get("evidence_unit") or "")
+                evidence_label = str(action.get("evidence_label") or "")
+                evidence = evidence_label
+                if value is not None and unit == "원":
+                    evidence = f"{evidence_label} {_fmt_dashboard_amount(value, amount_unit)}"
+                if not evidence:
+                    evidence = str(action.get("evidence") or "-")
+                threshold_label = str(action.get("threshold_label") or "")
+                threshold_value = action.get("threshold_value")
+                cause_type = str(action.get("cause_type") or "")
+                if threshold_value is None and action.get("stock_readiness_pct") not in (None, ""):
+                    criterion = f"재고준비율 {_fmt_threshold_pct(action.get('stock_readiness_pct'))}%"
+                elif threshold_value is None:
+                    criterion = threshold_label or "-"
+                elif cause_type in {"stock_shortage", "sales_decline"}:
+                    criterion = f"{threshold_label} {_fmt_threshold_pct(threshold_value)}%"
+                elif cause_type == "overstock_candidate":
+                    criterion = f"{threshold_label} {_fmt_number(threshold_value)}"
+                else:
+                    criterion = f"{threshold_label} {_fmt_number(threshold_value)}".strip()
+                row_col, button_col = st.columns([84, 16])
+                with row_col:
+                    st.markdown(f"**{rank}.** {_dashboard_action_status_badge(status)} &nbsp; **{html.escape(target)}**", unsafe_allow_html=True)
+                    st.caption(f"{html.escape(evidence)} · {html.escape(criterion)} · {html.escape(str(action.get('recommended_action') or '-'))}")
+                with button_col:
+                    selection = _dashboard_action_detail_selection(cache, action) if interactive else None
+                    if interactive and selection and callable(getattr(st, "button", None)):
+                        action_id = str(selection["action_id"])
+                        st.button(
+                            "상세 보기",
+                            key=f"__dashboard_lite_action_drilldown::{event_id}::{action_id}",
+                            on_click=_select_dashboard_action_detail,
+                            args=(selection,),
+                        )
+                    elif not interactive and bool(action.get("drilldown_action") or action.get("drill_down")):
+                        st.caption("상세는 현재 조회에서만 가능")
+
+    with detail_col:
+        st.markdown("#### 선택 조치 상세")
+        with st.container(height=580, border=False):
+            selected = _selected_dashboard_action_detail(cache, render_mode=render_mode)
+            if not interactive:
+                st.caption("상세 조치 정보는 현재 Dashboard 조회 세션에서만 확인할 수 있습니다.")
+            elif not selected:
+                st.info("조치 목록에서 [상세 보기]를 선택하세요.")
             else:
-                threshold = f"{threshold_label} {_fmt_number(threshold_value)}".strip()
-            st.caption(threshold)
-        with cols[5]:
-            st.caption(str(action.get("recommended_action") or "-"))
-        with cols[6]:
-            selection = _dashboard_action_detail_selection(cache, action) if interactive else None
-            if interactive and selection and callable(getattr(st, "button", None)):
-                action_id = str(selection["action_id"])
-                st.button(
-                    "상세 보기",
-                    key=f"__dashboard_lite_action_drilldown::{event_id}::{action_id}",
-                    on_click=_select_dashboard_action_detail,
-                    args=(selection,),
-                )
-            elif not interactive and bool(action.get("drilldown_action") or action.get("drill_down")):
-                st.caption("상세는 현재 조회에서만 가능")
+                matched_rows = _render_selected_dashboard_action_detail(facts, cache, render_mode=render_mode)
+                if matched_rows:
+                    instance_key = _risk_detail_instance_key(cache)
+                    vendor_options, _ = _risk_detail_vendor_options(list(((facts.get("inventory") or {}).get("risk_detail_rows") or [])))
+                    action_col, clear_col = st.columns(2)
+                    with action_col:
+                        st.button(
+                            "전체 위험품목에서 보기",
+                            key=f"__dashboard_lite_action_show_all::{event_id}",
+                            on_click=_show_selected_action_in_all_risks,
+                            args=(selected, matched_rows, instance_key, vendor_options),
+                        )
+                    with clear_col:
+                        st.button(
+                            "선택 해제",
+                            key=f"__dashboard_lite_action_clear::{event_id}",
+                            on_click=_clear_selected_dashboard_action,
+                            args=(instance_key,),
+                        )
 
 
 def _risk_detail_instance_key(cache: dict[str, Any]) -> str:
@@ -1413,11 +1530,11 @@ def _selected_dashboard_action_detail(cache: dict[str, Any], *, render_mode: str
     return {key: str(value or "") for key, value in selected.items()}
 
 
-def _render_selected_dashboard_action_detail(facts: dict[str, Any], cache: dict[str, Any], *, render_mode: str) -> None:
+def _render_selected_dashboard_action_detail(facts: dict[str, Any], cache: dict[str, Any], *, render_mode: str) -> list[dict[str, Any]]:
     """Render selected action rows from the current in-memory Dashboard facts only."""
     selected = _selected_dashboard_action_detail(cache, render_mode=render_mode)
     if not selected:
-        return
+        return []
     rows = list(((facts.get("inventory") or {}).get("risk_detail_rows") or []))
     product_code = str(selected["product_code"]).strip()
     matched_rows = [row for row in rows if isinstance(row, dict) and str(row.get("제품코드") or "").strip() == product_code]
@@ -1426,18 +1543,101 @@ def _render_selected_dashboard_action_detail(facts: dict[str, Any], cache: dict[
         "action_id_present=True product_code_present=True detail_match_count=%s db_query_count=0 chat_push_count=0 suppress_autoscroll=False",
         len(matched_rows),
     )
-    st.markdown("#### 선택 조치 상세")
     if not matched_rows:
         st.info("현재 Dashboard 상세자료에서 해당 품목을 찾지 못했습니다.")
+        return []
+    row = matched_rows[0]
+    selected_action = next(
+        (
+            action for action in facts.get("today_actions") or []
+            if isinstance(action, dict) and str(action.get("action_id") or "") == str(selected.get("action_id") or "")
+        ),
+        {},
+    )
+    status = str(row.get("위험상태") or "판정 제외")
+    product_name = str(row.get("제품명") or product_code or "제품")
+    st.markdown(f"{_dashboard_action_status_badge(status)} &nbsp; **{html.escape(product_name)}**", unsafe_allow_html=True)
+    amount_unit = _facts_amount_display_unit(facts)
+    st.caption(f"제품코드 {str(row.get('제품코드') or '자료 없음')} · 주요매입처 {str(row.get('주요매입처명') or '자료 없음')}")
+    values = (
+        ("현재재고수량", _fmt_number(row.get("현재재고수량"), 2) if row.get("현재재고수량") is not None else "자료 없음"),
+        ("위험보정잔여예상수요", _fmt_number(row.get("위험보정잔여예상수요"), 2) if row.get("위험보정잔여예상수요") is not None else "자료 없음"),
+        ("위험보정부족예상수량", _fmt_number(row.get("위험보정부족예상수량"), 2) if row.get("위험보정부족예상수량") is not None else "자료 없음"),
+        ("위험보정부족예상금액", _fmt_dashboard_amount(row.get("위험보정부족예상금액"), amount_unit) if row.get("위험보정부족예상금액") is not None else "자료 없음"),
+    )
+    for chunk_start in range(0, len(values), 2):
+        cols = st.columns(2)
+        for col, (label, value) in zip(cols, values[chunk_start:chunk_start + 2]):
+            with col:
+                st.caption(label)
+                st.markdown(f"**{html.escape(str(value))}**")
+    st.caption(
+        " · ".join((
+            f"준비율 {(_fmt_threshold_pct(row.get('위험보정재고준비율')) + '%') if row.get('위험보정재고준비율') is not None else '자료 없음'}",
+            f"위험사유 {str(row.get('위험사유') or '자료 없음')}",
+            f"수요급증 {'수요급증' if bool(row.get('수요급증여부')) else '해당 없음'}",
+            f"최근 정상 입고일 {str(row.get('최근 정상 입고일') or '자료 없음')}",
+            f"입고 경과일 {str(row.get('입고 경과일') or '자료 없음')}",
+        ))
+    )
+    st.markdown(f"**권장 조치: {html.escape(str(selected_action.get('recommended_action') or '자료 없음'))}**")
+    return matched_rows
+
+
+def _risk_detail_filter_keys(instance_key: str) -> dict[str, str]:
+    return {
+        "mode": f"__dashboard_lite_risk_detail_mode::{instance_key}",
+        "toggle": f"__dashboard_lite_risk_detail_toggle::{instance_key}",
+        "status": f"__dashboard_lite_risk_detail_status::{instance_key}",
+        "vendor": f"__dashboard_lite_risk_detail_vendor::{instance_key}",
+        "surge": f"__dashboard_lite_risk_detail_surge::{instance_key}",
+        "zero": f"__dashboard_lite_risk_detail_zero::{instance_key}",
+        "search": f"__dashboard_lite_risk_detail_search::{instance_key}",
+        "notice": f"__dashboard_lite_risk_detail_sync_notice::{instance_key}",
+    }
+
+
+def _show_selected_action_in_all_risks(
+    selection: dict[str, str] | None,
+    matched_rows: list[dict[str, Any]],
+    instance_key: str,
+    vendor_options: list[str],
+) -> None:
+    """Apply selection-derived filters only after the user explicitly asks for them."""
+    if not isinstance(selection, dict) or not matched_rows:
         return
-    display_columns = [
-        "제품코드", "제품명", "위험상태", "위험사유", "현재재고수량", "위험보정잔여예상수요",
-        "위험보정부족예상수량", "위험보정부족예상금액", "위험보정재고준비율", "주요매입처명",
-        "수요급증여부", "위험보정기준", "권장 조치",
-    ]
-    display = pd.DataFrame(matched_rows)
-    display = display[[column for column in display_columns if column in display.columns]]
-    st.dataframe(display, width="stretch", hide_index=True)
+    row = matched_rows[0]
+    keys = _risk_detail_filter_keys(instance_key)
+    product_code = str(row.get("제품코드") or selection.get("product_code") or "").strip()
+    status = str(row.get("위험상태") or "")
+    vendor_key = str(row.get("_주요매입처필터키") or "")
+    st.session_state[keys["mode"]] = "all_risk_items"
+    st.session_state[keys["toggle"]] = True
+    st.session_state[keys["search"]] = product_code
+    st.session_state[keys["status"]] = status if status in {"긴급 부족", "부족 주의"} else "전체 위험"
+    st.session_state[keys["vendor"]] = vendor_key if vendor_key in vendor_options else "전체"
+    st.session_state[keys["surge"]] = "수요급증" if bool(row.get("수요급증여부")) else "전체"
+    if float(row.get("위험보정부족예상금액") or 0) <= 0:
+        st.session_state[keys["zero"]] = True
+    st.session_state[keys["notice"]] = True
+    _request_dashboard_scroll_suppression("selected_action_all_risk")
+
+
+def _clear_selected_dashboard_action(instance_key: str) -> None:
+    st.session_state.pop("__dashboard_selected_action_detail", None)
+    st.session_state.pop(f"__dashboard_lite_risk_detail_open_request::{instance_key}", None)
+    _request_dashboard_scroll_suppression("selected_action_clear")
+
+
+def _reset_risk_detail_filters(instance_key: str) -> None:
+    keys = _risk_detail_filter_keys(instance_key)
+    st.session_state[keys["status"]] = "전체 위험"
+    st.session_state[keys["vendor"]] = "전체"
+    st.session_state[keys["surge"]] = "전체"
+    st.session_state[keys["zero"]] = True
+    st.session_state[keys["search"]] = ""
+    st.session_state.pop(keys["notice"], None)
+    _request_dashboard_scroll_suppression("risk_detail_reset")
 
 
 def _clear_stale_risk_detail_export_cache(instance_key: str) -> None:
@@ -1524,7 +1724,7 @@ def _render_risk_detail(
     if not summary:
         return
     st.markdown("### 위험 품목 상세")
-    summary_cols = st.columns(5)
+    summary_cols = st.columns(3)
     for column, (label, key) in zip(summary_cols, (
         ("전체 위험품목", "source_rows"), ("긴급 부족", "emergency_rows"), ("부족 주의", "warning_rows"),
         ("금액 양수", "amount_positive_rows"), ("금액 0", "zero_amount_rows"),
@@ -1532,6 +1732,10 @@ def _render_risk_detail(
         with column:
             _metric_card(label, summary.get(key, 0), "개")
 
+    st.caption(
+        f"금액 양수 {int(summary.get('amount_positive_rows') or 0):,}건 · "
+        f"금액 0 {int(summary.get('zero_amount_rows') or 0):,}건"
+    )
     source_rows = int(summary.get("source_rows") or 0)
     detail_rows_available = int(len(rows))
     if render_mode != "primary":
@@ -1561,14 +1765,9 @@ def _render_risk_detail(
             detail_rows_available,
         )
         return
-    toggle_key = f"__dashboard_lite_risk_detail_toggle::{instance_key}"
-    search_key = f"__dashboard_lite_risk_detail_search::{instance_key}"
-    open_request = st.session_state.pop(f"__dashboard_lite_risk_detail_open_request::{instance_key}", None)
-    if isinstance(open_request, dict):
-        selected_code = str(open_request.get("product_code") or "").strip()
-        st.session_state[toggle_key] = True
-        if selected_code:
-            st.session_state[search_key] = selected_code
+    filter_keys = _risk_detail_filter_keys(instance_key)
+    toggle_key = filter_keys["toggle"]
+    search_key = filter_keys["search"]
     show_detail = toggle(
         "상세표 보기",
         key=toggle_key,
@@ -1591,7 +1790,12 @@ def _render_risk_detail(
     )
 
     vendor_options, vendor_labels = _risk_detail_vendor_options(rows)
-    filter_cols = st.columns((1, 2, 1, 1, 2))
+    st.session_state[filter_keys["mode"]] = "all_risk_items"
+
+    if bool(st.session_state.pop(filter_keys["notice"], False)):
+        st.caption("선택한 조치 품목 조건으로 전체 위험품목을 표시합니다.")
+
+    filter_cols = st.columns((1, 2, 1, 2))
     with filter_cols[0]:
         risk_status = st.selectbox("위험상태", ["전체 위험", "긴급 부족", "부족 주의"], key=f"__dashboard_lite_risk_detail_status::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with filter_cols[1]:
@@ -1599,10 +1803,20 @@ def _render_risk_detail(
     with filter_cols[2]:
         surge_filter = st.selectbox("수요급증", ["전체", "수요급증", "일반"], key=f"__dashboard_lite_risk_detail_surge::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     with filter_cols[3]:
-        include_zero_amount = st.toggle("금액 0 포함", value=True, key=f"__dashboard_lite_risk_detail_zero::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
-    with filter_cols[4]:
         search_text = st.text_input("제품 검색", key=search_key, on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
 
+    utility_cols = st.columns((1, 1, 3))
+    with utility_cols[0]:
+        include_zero_amount = st.toggle("금액 0 포함", value=True, key=f"__dashboard_lite_risk_detail_zero::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
+    with utility_cols[1]:
+        display_limit = st.selectbox("화면 표시 행 수", [100, 300, 500], index=0, key=f"__dashboard_lite_risk_detail_limit::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
+    with utility_cols[2]:
+        st.button(
+            "필터 초기화",
+            key=f"__dashboard_lite_risk_detail_reset::{instance_key}",
+            on_click=_reset_risk_detail_filters,
+            args=(instance_key,),
+        )
     filtered, filter_summary, elapsed_ms = filter_dashboard_risk_detail_rows(
         rows,
         risk_status=risk_status,
@@ -1611,7 +1825,6 @@ def _render_risk_detail(
         include_zero_amount=include_zero_amount,
         search_text=search_text,
     )
-    display_limit = st.selectbox("화면 표시 행 수", [100, 300, 500], index=0, key=f"__dashboard_lite_risk_detail_limit::{instance_key}", on_change=_request_dashboard_scroll_suppression, args=("local_filter",))
     display = filtered.head(int(display_limit)).copy()
     display.insert(0, "순번", range(1, len(display) + 1))
     display_columns = [
@@ -2377,6 +2590,7 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "data_quality": list(inventory.get("data_quality") or [])[:row_limit],
         },
         "turnover_days": dict(facts.get("turnover_days") or {}),
+        "transaction_cycle": dict(facts.get("transaction_cycle") or facts.get("turnover_days") or {}),
         "today_actions": list(facts.get("today_actions") or [])[:row_limit],
         "data_quality": list(facts.get("data_quality") or [])[:row_limit],
         "performance": dict(facts.get("performance") or {}),
@@ -2474,35 +2688,43 @@ def _render_dashboard_facts(
     if filter_issues:
         labels = ", ".join(str(item.get("label") or "제품 조건") for item in filter_issues)
         st.warning(f"{labels} 제외 조건에 필요한 코드 컬럼이 없어 이번 결과에는 적용하지 않았습니다.")
-    sales_gauge_col, sales_chart_col = st.columns([35, 65])
-    with sales_gauge_col:
-        _render_sales_gauge(facts)
-    with sales_chart_col:
-        st.markdown("### 월별 실제매출·목표")
-        st.caption("파란 막대는 실제매출, 주황 목표선은 월 예상, 청록 목표선은 현재일 기준 예상입니다.")
-        _render_sales_chart(facts)
-    _render_sales_brief(facts)
-    st.divider()
+    with st.container(border=True):
+        st.markdown("## 매출 진행")
+        sales_gauge_col, sales_chart_col = st.columns([35, 65])
+        with sales_gauge_col:
+            _render_sales_gauge(facts)
+        with sales_chart_col:
+            st.markdown("### 월별 실제매출·목표")
+            st.caption("파란 막대는 실제매출, 주황 목표선은 월 예상, 청록 목표선은 현재일 기준 예상입니다.")
+            _render_sales_chart(facts)
+        _render_sales_brief(facts)
 
-    stock_summary_col, stock_chart_col = st.columns([35, 65])
-    with stock_summary_col:
-        _render_stock_risk_summary(facts)
-    with stock_chart_col:
-        st.markdown("### 재고 준비율 미달 TOP 10")
-        readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
-        st.caption(f"준비율 경고기준 {_fmt_threshold_pct(readiness_threshold)}% 미만 품목 중 위험도가 높은 품목을 표시합니다.")
-        _render_stock_chart(facts)
+    with st.container(border=True):
+        st.markdown("## 재고 위험")
+        stock_summary_col, stock_chart_col = st.columns([35, 65])
+        with stock_summary_col:
+            _render_stock_risk_summary(facts)
+        with stock_chart_col:
+            st.markdown("### 재고 준비율 미달 TOP 10")
+            readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
+            st.caption(f"준비율 경고기준 {_fmt_threshold_pct(readiness_threshold)}% 미만 품목 중 위험도가 높은 품목을 표시합니다.")
+            _render_stock_chart(facts)
+        _render_vendor_stock_risk(facts)
 
-    _render_vendor_stock_risk(facts)
-    _render_demand_surge_detail_summary(facts)
+    with st.container(border=True):
+        st.markdown("## 수요급증")
+        _render_demand_surge_detail_summary(facts)
 
-    st.markdown("### 매입·매출 거래 회전일")
-    _render_turnover(facts)
+    with st.container(border=True):
+        st.markdown("## 매입·매출 거래 주기")
+        _render_turnover(facts)
 
-    st.markdown("### 오늘의 조치")
-    _render_today_actions(facts, cache or {}, render_mode=render_mode)
-    _render_selected_dashboard_action_detail(facts, cache or {}, render_mode=render_mode)
-    _render_risk_detail(facts, cache or {}, render_mode=render_mode)
+    with st.container(border=True):
+        st.markdown("## 오늘의 조치")
+        _render_today_actions(facts, cache or {}, render_mode=render_mode)
+
+    with st.container(border=True):
+        _render_risk_detail(facts, cache or {}, render_mode=render_mode)
 
 def _render_dashboard_result_in_primary_area(cache: dict[str, Any]) -> None:
     """Render the active result inline at its chat-history message position."""

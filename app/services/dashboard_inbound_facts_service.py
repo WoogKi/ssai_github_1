@@ -259,6 +259,20 @@ def build_dashboard_inbound_facts_frame(
     result = result.reindex(columns=columns)
     merge_finalize_ms = int((time.perf_counter() - finalize_started) * 1000)
     result.attrs["inbound_build_elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+    # This is a bounded aggregate from the already-loaded inbound source.  It
+    # deliberately keeps no daily source rows in the Dashboard facts/snapshot.
+    recent_days = positive.loc[positive["within_vendor"], "inbound_date_value"].dropna().drop_duplicates().sort_values()
+    recent_gaps = recent_days.diff().dt.days.dropna()
+    latest_date = recent_days.max() if not recent_days.empty else pd.NaT
+    result.attrs["purchase_transaction_cycle"] = {
+        "period_days": int(vendor_lookback_days),
+        "cutoff_date": cutoff.strftime("%Y%m%d"),
+        "latest_date": "" if pd.isna(latest_date) else latest_date.strftime("%Y%m%d"),
+        "elapsed_days": None if pd.isna(latest_date) else int((cutoff_ts - latest_date).days),
+        "unique_trade_days": int(len(recent_days)),
+        "average_interval_days": None if len(recent_days) < 2 else float(recent_gaps.mean()),
+        "data_status": "missing" if recent_days.empty else ("insufficient" if len(recent_days) == 1 else "normal"),
+    }
     log.info(
         "[dashboard.inbound.build] source_rows=%s product_rows=%s normalize_ms=%s event_aggregate_ms=%s gap_aggregate_ms=%s vendor_aggregate_ms=%s merge_finalize_ms=%s build_elapsed_ms=%s",
         len(raw), len(result), normalize_ms, event_aggregate_ms, gap_aggregate_ms, vendor_aggregate_ms, merge_finalize_ms, result.attrs["inbound_build_elapsed_ms"],

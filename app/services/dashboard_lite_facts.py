@@ -2775,12 +2775,27 @@ def build_dashboard_lite_facts(
         len(inventory.get("readiness_rows") or []),
         int((time.perf_counter() - t_stock) * 1000),
     )
+    purchase_cycle = {}
+    if isinstance(inbound_facts_df, pd.DataFrame):
+        purchase_cycle = dict(inbound_facts_df.attrs.get("purchase_transaction_cycle") or {})
     turnover = {
-        "status": "자료부족",
-        "purchase_turnover_days": None,
+        "status": "partial",
+        "period_days": int(purchase_cycle.get("period_days") or 90),
+        "cutoff_date": str(purchase_cycle.get("cutoff_date") or ""),
+        "purchase_latest_date": str(purchase_cycle.get("latest_date") or ""),
+        "purchase_elapsed_days": purchase_cycle.get("elapsed_days"),
+        "purchase_unique_trade_days": purchase_cycle.get("unique_trade_days"),
+        "purchase_average_interval_days": purchase_cycle.get("average_interval_days"),
+        "purchase_data_status": str(purchase_cycle.get("data_status") or "missing"),
+        "sales_latest_date": "",
+        "sales_elapsed_days": None,
+        "sales_unique_trade_days": None,
+        "sales_average_interval_days": None,
+        "sales_data_status": "source_required",
+        "purchase_turnover_days": purchase_cycle.get("average_interval_days"),
         "sales_turnover_days": None,
-        "definition": "최근 90일 정상 거래 고유 거래일 사이 평균 일수",
-        "data_quality": ["입고/출고 정상 거래일 facts 미연결"],
+        "definition": "최근 90일 정상 매입·매출 고유 거래일 사이 평균 일수",
+        "data_quality": ["매출 일자 단위 정상 거래일 facts 연결 필요"],
     }
     t_actions = time.perf_counter()
     today_actions = _build_today_actions(sales, inventory, turnover)
@@ -2827,6 +2842,7 @@ def build_dashboard_lite_facts(
             "sku_readiness_pct": inventory["metrics"]["sku_readiness_pct"],
         },
         "turnover_days": turnover,
+        "transaction_cycle": turnover,
         "rankings": {
             "high_sales_decline": sales.get("decline_targets", []),
             "stock_risk": inventory.get("risk_targets", []),
