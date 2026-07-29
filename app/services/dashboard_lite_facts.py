@@ -1857,6 +1857,108 @@ def _attach_stock_extension_facts(
     return summary
 
 
+def _build_visual_phase2_summary(
+    rows: list[dict[str, Any]],
+    purchase_vendor_df: pd.DataFrame | None,
+    *,
+    evaluation_remaining_days: int | None,
+    today_action_count: int = 0,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Build bounded presentation aggregates from already-loaded Dashboard facts."""
+    started = time.perf_counter()
+    work = pd.DataFrame(rows)
+    index = work.index
+    status = work.get("stock_cover_status", pd.Series("insufficient_data", index=index)).fillna("insufficient_data").astype(str)
+    cover_days = pd.to_numeric(work.get("stock_cover_days", pd.Series(float("nan"), index=index)), errors="coerce")
+    remaining = int(evaluation_remaining_days or 0)
+    cover_zero = status.eq("zero_stock")
+    cover_ready = status.eq("ready")
+    cover_shortfall = cover_ready & cover_days.lt(remaining)
+    cover_sufficient = cover_ready & ~cover_shortfall
+    cover_no_demand = status.eq("no_demand")
+    cover_insufficient = status.isin(["insufficient_data", "closed_horizon"])
+    cover_total = int(len(work))
+    cover_counts = {
+        "zero_stock": int(cover_zero.sum()),
+        "shortfall": int(cover_shortfall.sum()),
+        "sufficient": int(cover_sufficient.sum()),
+        "no_demand": int(cover_no_demand.sum()),
+        "insufficient": int(cover_insufficient.sum()),
+    }
+    cover_valid = sum(cover_counts.values()) == cover_total
+    inbound_delay = work.get("inbound_delayed_candidate", pd.Series(False, index=index)).fillna(False).astype(bool)
+    overstock = work.get("과잉후보여부", pd.Series(False, index=index)).fillna(False).astype(bool)
+    recent_none = work.get("주요매입처상태", pd.Series("", index=index)).fillna("").astype(str).eq("recent_purchase_none")
+    vendor_unknown = work.get("주요매입처상태", pd.Series("", index=index)).fillna("").astype(str).isin(["vendor_unknown", "product_code_missing"])
+    demand_surge = work.get("수요급증여부", pd.Series(False, index=index)).fillna(False).astype(bool)
+    purchase_rows: list[dict[str, Any]] = []
+    if isinstance(purchase_vendor_df, pd.DataFrame) and {"기준월", "매입금액"}.issubset(purchase_vendor_df.columns):
+        purchase = purchase_vendor_df.loc[:, ["기준월", "매입금액"]].copy()
+        purchase["기준월"] = purchase["기준월"].map(_normalize_yyyymm)
+        purchase["매입금액"] = pd.to_numeric(purchase["매입금액"], errors="coerce").fillna(0.0)
+        purchase = purchase.loc[purchase["기준월"].ne("")]
+        purchase_monthly = purchase.groupby("기준월", as_index=False)["매입금액"].sum().sort_values("기준월", kind="stable").tail(18)
+        purchase_rows = [
+            {"month": str(row.get("기준월") or ""), "amount": float(row.get("매입금액") or 0.0)}
+            for row in purchase_monthly.to_dict("records")
+        ]
+    summary = {
+        "inventory_count": cover_total,
+        "evaluation_remaining_days": remaining,
+        "cover_zero_stock_count": cover_counts["zero_stock"],
+        "cover_shortfall_count": cover_counts["shortfall"],
+        "cover_sufficient_count": cover_counts["sufficient"],
+        "cover_no_demand_count": cover_counts["no_demand"],
+        "cover_insufficient_count": cover_counts["insufficient"],
+        "cover_partition_valid": cover_valid,
+        "inbound_delay_candidate_count": int(inbound_delay.sum()),
+        "overstock_candidate_count": int(overstock.sum()),
+        "recent_purchase_none_count": int(recent_none.sum()),
+        "vendor_unknown_count": int(vendor_unknown.sum()),
+        "demand_surge_count": int(demand_surge.sum()),
+        "action_count": int(today_action_count),
+        "purchase_trend_status": "ready" if purchase_rows else "source_required",
+        "purchase_trend_points": int(len(purchase_rows)),
+        "additional_source_call_count": 0,
+        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+    }
+    return summary, purchase_rows
+
+
+def _build_visual_phase2_briefing(
+    summary: Mapping[str, Any],
+    *,
+    emergency_count: int,
+    warning_count: int,
+) -> list[str]:
+    """Create short deterministic briefing lines from persisted aggregates only."""
+    inventory_count = int(summary.get("inventory_count") or 0)
+    lines = [
+        f"재고 위험은 긴급 부족 {int(emergency_count):,}개, 부족 주의 {int(warning_count):,}개로 확인됩니다.",
+    ]
+    if bool(summary.get("cover_partition_valid")):
+        lines.append(
+            "재고커버 기준으로 재고 없음 "
+            f"{int(summary.get('cover_zero_stock_count') or 0):,}개, 잔여 기간 미만 "
+            f"{int(summary.get('cover_shortfall_count') or 0):,}개를 우선 확인합니다."
+        )
+    else:
+        lines.append(f"재고커버 집계는 현재 {inventory_count:,}개 품목의 자료 상태를 함께 확인해야 합니다.")
+    followups = [
+        ("입고 지연 후보", int(summary.get("inbound_delay_candidate_count") or 0)),
+        ("과잉 후보", int(summary.get("overstock_candidate_count") or 0)),
+        ("최근 매입 없음", int(summary.get("recent_purchase_none_count") or 0)),
+        ("매입처 미확인", int(summary.get("vendor_unknown_count") or 0)),
+    ]
+    active = [f"{label} {count:,}개" for label, count in followups if count > 0]
+    lines.append("후속 확인 항목은 " + (", ".join(active) if active else "현재 집계된 후보가 없습니다") + "입니다.")
+    surge_count = int(summary.get("demand_surge_count") or 0)
+    if surge_count > 0:
+        lines.append(f"수요급증 {surge_count:,}개 품목은 현재 출고속도를 반영한 위험보정 수요를 사용합니다.")
+    lines.append(f"오늘의 우선 조치 {int(summary.get('action_count') or 0):,}건은 아래 목록에서 확인합니다.")
+    return lines[:5]
+
+
 _RISK_DETAIL_COLUMNS = (
     "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "제품그룹명", "제품구분명", "제품분류명",
     "주요매입처코드", "주요매입처명", "주요매입처상태", "주요매입처선정기준", "재고기준",
@@ -2520,6 +2622,9 @@ def _build_today_actions(sales: dict[str, Any], inventory: dict[str, Any], turno
                 "shortage_amt": shortage_amt,
                 "stock_readiness_pct": readiness_pct,
                 "evidence": evidence,
+                "stock_cover_days": row.get("stock_cover_days"),
+                "inbound_delayed_candidate": bool(row.get("inbound_delayed_candidate")),
+                "last_normal_inbound_date": str(row.get("last_normal_inbound_date") or ""),
             }
         )
 
@@ -2933,6 +3038,36 @@ def build_dashboard_lite_facts(
     }
     t_actions = time.perf_counter()
     today_actions = _build_today_actions(sales, inventory, turnover)
+    visual_phase2_summary, purchase_trend_rows = _build_visual_phase2_summary(
+        list(inventory.get("readiness_rows") or []),
+        purchase_vendor_df,
+        evaluation_remaining_days=next(
+            (
+                row.get("평가월잔여일수")
+                for row in (inventory.get("readiness_rows") or [])
+                if isinstance(row, Mapping) and row.get("평가월잔여일수") is not None
+            ),
+            0,
+        ),
+        today_action_count=len(today_actions),
+    )
+    stock_status_summary = {
+        str(row.get("상태") or ""): int(row.get("품목수") or 0)
+        for row in (inventory.get("stock_risk_summary") or [])
+        if isinstance(row, Mapping)
+    }
+    visual_phase2_summary["briefing_lines"] = _build_visual_phase2_briefing(
+        visual_phase2_summary,
+        emergency_count=stock_status_summary.get("긴급 부족", 0),
+        warning_count=stock_status_summary.get("부족 주의", 0),
+    )
+    visual_phase2_summary["vendor_top_count"] = min(10, len(inventory.get("vendor_stock_risk_top_rows") or []))
+    inventory["visual_phase2_summary"] = visual_phase2_summary
+    inventory["purchase_trend_rows"] = purchase_trend_rows
+    log.info(
+        "[dashboard.visual_phase2] inventory_rows=%s cover_zero_stock_rows=%s cover_shortfall_rows=%s cover_sufficient_rows=%s cover_no_demand_rows=%s cover_insufficient_rows=%s inbound_delay_candidate_rows=%s overstock_candidate_rows=%s recent_purchase_none_rows=%s demand_surge_rows=%s purchase_trend_status=%s purchase_trend_points=%s vendor_top_count=%s briefing_line_count=%s build_elapsed_ms=%s additional_source_call_count=0",
+        visual_phase2_summary["inventory_count"], visual_phase2_summary["cover_zero_stock_count"], visual_phase2_summary["cover_shortfall_count"], visual_phase2_summary["cover_sufficient_count"], visual_phase2_summary["cover_no_demand_count"], visual_phase2_summary["cover_insufficient_count"], visual_phase2_summary["inbound_delay_candidate_count"], visual_phase2_summary["overstock_candidate_count"], visual_phase2_summary["recent_purchase_none_count"], visual_phase2_summary["demand_surge_count"], visual_phase2_summary["purchase_trend_status"], visual_phase2_summary["purchase_trend_points"], visual_phase2_summary["vendor_top_count"], len(visual_phase2_summary["briefing_lines"]), visual_phase2_summary["elapsed_ms"],
+    )
     additional_notes = {
         "sales_decline_targets": sales.get("decline_targets", []),
         "turnover_status": turnover.get("status") or "",

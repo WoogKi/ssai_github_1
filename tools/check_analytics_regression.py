@@ -7829,6 +7829,67 @@ def run_basic_checks() -> list[CheckResult]:
             or (fact_detail_rows and not required_extension_detail_columns.issubset(set(fact_detail_rows[0])))
         ):
             fact_errors.append(f"stock_extension_inventory_detail={fact_inventory!r}")
+        visual_phase2_rows = [
+            {"stock_cover_status": "zero_stock", "stock_cover_days": 0.0, "inbound_delayed_candidate": True, "과잉후보여부": False, "주요매입처상태": "assigned", "수요급증여부": True},
+            {"stock_cover_status": "ready", "stock_cover_days": 5.0, "inbound_delayed_candidate": False, "과잉후보여부": True, "주요매입처상태": "recent_purchase_none", "수요급증여부": False},
+            {"stock_cover_status": "ready", "stock_cover_days": 25.0, "inbound_delayed_candidate": False, "과잉후보여부": False, "주요매입처상태": "vendor_unknown", "수요급증여부": False},
+            {"stock_cover_status": "no_demand", "stock_cover_days": None, "inbound_delayed_candidate": False, "과잉후보여부": False, "주요매입처상태": "assigned", "수요급증여부": False},
+            {"stock_cover_status": "insufficient_data", "stock_cover_days": None, "inbound_delayed_candidate": False, "과잉후보여부": False, "주요매입처상태": "product_code_missing", "수요급증여부": False},
+        ]
+        visual_phase2_before = [dict(row) for row in visual_phase2_rows]
+        visual_purchase_rows = pd.DataFrame(
+            [{"기준월": f"2025{month:02d}", "매입금액": month * 1000.0} for month in range(1, 13)]
+            + [{"기준월": "202501", "매입금액": 500.0}]
+        )
+        visual_summary, visual_purchase_trend = dash_mod._build_visual_phase2_summary(
+            visual_phase2_rows,
+            visual_purchase_rows,
+            evaluation_remaining_days=20,
+            today_action_count=10,
+        )
+        visual_briefing = dash_mod._build_visual_phase2_briefing(visual_summary, emergency_count=1, warning_count=1)
+        if (
+            visual_phase2_rows != visual_phase2_before
+            or sum(
+                int(visual_summary.get(key) or 0)
+                for key in (
+                    "cover_zero_stock_count", "cover_shortfall_count", "cover_sufficient_count",
+                    "cover_no_demand_count", "cover_insufficient_count",
+                )
+            ) != 5
+            or not visual_summary.get("cover_partition_valid")
+            or visual_summary.get("inbound_delay_candidate_count") != 1
+            or visual_summary.get("overstock_candidate_count") != 1
+            or visual_summary.get("recent_purchase_none_count") != 1
+            or visual_summary.get("vendor_unknown_count") != 2
+            or visual_summary.get("demand_surge_count") != 1
+            or visual_summary.get("additional_source_call_count") != 0
+            or len(visual_purchase_trend) != 12
+            or visual_purchase_trend[0].get("month") != "202501"
+            or float(visual_purchase_trend[0].get("amount") or 0) != 1500.0
+            or not (3 <= len(visual_briefing) <= 5)
+        ):
+            fact_errors.append(f"visual_phase2_aggregate={visual_summary!r}/{visual_purchase_trend!r}/{visual_briefing!r}")
+        invalid_cover_summary, _ = dash_mod._build_visual_phase2_summary(
+            [{"stock_cover_status": "unknown"}],
+            None,
+            evaluation_remaining_days=10,
+            today_action_count=0,
+        )
+        unavailable_purchase_summary, unavailable_purchase_rows = dash_mod._build_visual_phase2_summary(
+            visual_phase2_rows,
+            None,
+            evaluation_remaining_days=10,
+            today_action_count=0,
+        )
+        if (
+            invalid_cover_summary.get("cover_partition_valid")
+            or unavailable_purchase_summary.get("purchase_trend_status") != "source_required"
+            or unavailable_purchase_rows
+        ):
+            fact_errors.append(
+                f"visual_phase2_fallback={invalid_cover_summary!r}/{unavailable_purchase_summary!r}/{unavailable_purchase_rows!r}"
+            )
         facts_stock_risk_by_status = {
             str(row.get("재고위험상태") or ""): row
             for row in (facts.get("inventory") or {}).get("stock_risk_summary") or []
@@ -10010,9 +10071,9 @@ def run_basic_checks() -> list[CheckResult]:
                 inventory_visual_errors.append(f"overstock_summary={display_summary['과잉 후보']!r}")
             if display_summary["최근 매입 없음"] != {"count": 2, "amount": 2_000_000.0} or display_summary["매입처 미확인"] != {"count": 1, "amount": 1_000_000.0}:
                 inventory_visual_errors.append(f"supply_status_summary={display_summary!r}")
-            top_rows = (inventory_visual_facts["inventory"]["vendor_stock_risk_top_rows"] or [])[:5]
-            if len(top_rows) != 5 or any(float(top_rows[index]["전체위험보정부족금액"]) < float(top_rows[index + 1]["전체위험보정부족금액"]) for index in range(len(top_rows) - 1)):
-                inventory_visual_errors.append(f"vendor_top5_order={top_rows!r}")
+            top_rows = (inventory_visual_facts["inventory"]["vendor_stock_risk_top_rows"] or [])[:10]
+            if len(top_rows) != 7 or any(float(top_rows[index]["전체위험보정부족금액"]) < float(top_rows[index + 1]["전체위험보정부족금액"]) for index in range(len(top_rows) - 1)):
+                inventory_visual_errors.append(f"vendor_top10_order={top_rows!r}")
             if len(inventory_visual_facts["inventory"]["risk_targets"]) != 12:
                 inventory_visual_errors.append("readiness_source_mutated")
             inventory_donut = view_mod._build_count_donut(
@@ -10037,7 +10098,7 @@ def run_basic_checks() -> list[CheckResult]:
         if inventory_visual_errors:
             results.append(_fail("Dashboard Lite inventory risk visualization", "; ".join(inventory_visual_errors)))
         else:
-            results.append(_ok("Dashboard Lite inventory risk visualization", "existing readiness, risk, overstock, vendor, supply-link, and demand-surge facts render as TOP 10/TOP 5 presentation data without source mutation or new calls"))
+            results.append(_ok("Dashboard Lite inventory risk visualization", "existing readiness, risk, overstock, vendor, supply-link, and demand-surge facts render as TOP 10 presentation data without source mutation or new calls"))
 
         gauge_errors: list[str] = []
         try:
@@ -11128,7 +11189,7 @@ def run_basic_checks() -> list[CheckResult]:
                         },
                         "chart_rows": [{"period": "2026-01", "value": 1}],
                     },
-                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
+                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "visual_phase2_summary": {"inventory_count": 1, "cover_partition_valid": True, "briefing_lines": ["브리핑 1", "브리핑 2", "브리핑 3"], "additional_source_call_count": 0}, "purchase_trend_rows": [{"month": "202601", "amount": 10}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
                     "today_actions": [{"priority": 1}],
                 },
             }
@@ -11149,6 +11210,13 @@ def run_basic_checks() -> list[CheckResult]:
                 dashboard_roundtrip_errors.append("dashboard_stock_demand_surge_summary_missing")
             if not compact_cache.get("facts", {}).get("inventory", {}).get("vendor_stock_risk_top_rows"):
                 dashboard_roundtrip_errors.append("dashboard_vendor_stock_risk_top_rows_missing")
+            compact_inventory = compact_cache.get("facts", {}).get("inventory", {})
+            if (
+                (compact_inventory.get("visual_phase2_summary") or {}).get("briefing_lines") != ["브리핑 1", "브리핑 2", "브리핑 3"]
+                or compact_inventory.get("purchase_trend_rows") != [{"month": "202601", "amount": 10}]
+                or "readiness_rows" in compact_inventory
+            ):
+                dashboard_roundtrip_errors.append(f"dashboard_visual_phase2_snapshot={compact_inventory!r}")
             full_payload = {
                 "id": "dashboard-event-full",
                 "type": "dashboard_lite",

@@ -1039,6 +1039,214 @@ def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
         st.caption(f"참고: 수요급증 {int(demand_surge.get('품목수') or 0)}개 품목은 현재 출고속도를 반영해 평가월 잔여수요를 다시 계산했습니다.")
 
 
+def _build_follow_up_chart(rows: list[dict[str, Any]]) -> alt.Chart | None:
+    frame = pd.DataFrame([row for row in rows if int(row.get("count") or 0) > 0])
+    if frame.empty:
+        return None
+    frame = frame.sort_values(["count", "label"], ascending=[False, True], kind="stable")
+    frame["count_label"] = frame["count"].map(lambda value: f"{int(value):,}개")
+    order = frame["label"].tolist()
+    y = alt.Y("label:N", title=None, sort=order, axis=alt.Axis(labelLimit=180))
+    bars = alt.Chart(frame).mark_bar(cornerRadiusEnd=3).encode(
+        x=alt.X("count:Q", title="품목 수", axis=alt.Axis(tickMinStep=1)),
+        y=y,
+        color=alt.Color("label:N", legend=None, scale=alt.Scale(domain=order, range=frame["color"].tolist())),
+        tooltip=[alt.Tooltip("label:N", title="확인 항목"), alt.Tooltip("count:Q", title="품목 수", format=",.0f")],
+    )
+    labels = alt.Chart(frame).mark_text(align="left", dx=5, color="#334155").encode(
+        x=alt.X("count:Q"), y=y, text="count_label:N"
+    )
+    return (bars + labels).properties(height=max(150, min(270, len(frame) * 38)))
+
+
+def _build_stock_cover_donut(rows: list[dict[str, Any]], *, total: int) -> alt.Chart | None:
+    frame = pd.DataFrame([row for row in rows if int(row.get("count") or 0) > 0])
+    if frame.empty:
+        return None
+    colors = ["#dc2626", "#f59e0b", "#16a34a", "#2563eb", "#64748b"]
+    labels = [row["label"] for row in rows]
+    donut = alt.Chart(frame).mark_arc(innerRadius=54, outerRadius=82).encode(
+        theta=alt.Theta("count:Q"),
+        color=alt.Color("label:N", legend=alt.Legend(orient="bottom", title=None), scale=alt.Scale(domain=labels, range=colors)),
+        tooltip=[alt.Tooltip("label:N", title="상태"), alt.Tooltip("count:Q", title="품목 수", format=",.0f")],
+    )
+    center_label = alt.Chart(pd.DataFrame({"label": ["재고커버"], "value": [f"총 {total:,}개"]})).mark_text(
+        dy=-8, fontSize=14, fontWeight="bold", color="#334155"
+    ).encode(text="label:N")
+    center_total = alt.Chart(pd.DataFrame({"value": [f"총 {total:,}개"]})).mark_text(
+        dy=12, fontSize=13, color="#475569"
+    ).encode(text="value:N")
+    return (donut + center_label + center_total).properties(height=245)
+
+
+def _render_visual_phase2(facts: dict[str, Any]) -> None:
+    inventory = facts.get("inventory") or {}
+    summary = inventory.get("visual_phase2_summary") or {}
+    if not summary:
+        return
+    total = int(summary.get("inventory_count") or 0)
+    cover_rows = [
+        {"label": "재고 없음", "count": int(summary.get("cover_zero_stock_count") or 0), "amount": 0.0},
+        {"label": "잔여 기간 미만", "count": int(summary.get("cover_shortfall_count") or 0), "amount": 0.0},
+        {"label": "잔여 기간 이상", "count": int(summary.get("cover_sufficient_count") or 0), "amount": 0.0},
+        {"label": "수요 없음", "count": int(summary.get("cover_no_demand_count") or 0), "amount": 0.0},
+        {"label": "자료 부족", "count": int(summary.get("cover_insufficient_count") or 0), "amount": 0.0},
+    ]
+    follow_up_rows = [
+        {"label": "입고 지연 후보", "count": int(summary.get("inbound_delay_candidate_count") or 0), "color": "#f59e0b"},
+        {"label": "과잉 후보", "count": int(summary.get("overstock_candidate_count") or 0), "color": "#7c3aed"},
+        {"label": "최근 매입 없음", "count": int(summary.get("recent_purchase_none_count") or 0), "color": "#94a3b8"},
+        {"label": "매입처 미확인", "count": int(summary.get("vendor_unknown_count") or 0), "color": "#94a3b8"},
+        {"label": "수요급증", "count": int(summary.get("demand_surge_count") or 0), "color": "#0f766e"},
+        {"label": "재고 없음", "count": int(summary.get("cover_zero_stock_count") or 0), "color": "#dc2626"},
+    ]
+    cover_col, follow_up_col = st.columns([35, 65])
+    with cover_col:
+        st.markdown("### 재고커버 구성")
+        if bool(summary.get("cover_partition_valid")):
+            donut = _build_stock_cover_donut(cover_rows, total=total)
+            if donut is not None:
+                st.altair_chart(donut, width="stretch")
+            else:
+                st.caption("재고커버 판정 대상이 없습니다.")
+        else:
+            st.caption("재고커버 상태 집계가 불완전해 도넛으로 표시하지 않았습니다.")
+        for row in cover_rows:
+            count = int(row["count"])
+            if count > 0:
+                ratio = (count / total * 100.0) if total else 0.0
+                st.caption(f"{row['label']} {count:,}개 / {ratio:.1f}%")
+        st.caption("재고커버 구성은 평가월의 위험보정 잔여예상수요를 기준으로 계산합니다.")
+    with follow_up_col:
+        st.markdown("### 후속 확인 항목")
+        chart = _build_follow_up_chart(follow_up_rows)
+        if chart is not None:
+            st.altair_chart(chart, width="stretch")
+        else:
+            st.caption("현재 후속 확인 후보가 없습니다.")
+        st.caption("항목은 서로 중복될 수 있으며, 비율 합계로 해석하지 않습니다.")
+
+    purchase_rows = list(inventory.get("purchase_trend_rows") or [])[:18]
+    if summary.get("purchase_trend_status") == "ready" and purchase_rows:
+        purchase = pd.DataFrame(purchase_rows)
+        if {"month", "amount"}.issubset(purchase.columns):
+            amount_unit = _facts_amount_display_unit(facts)
+            total_amount = float(pd.to_numeric(purchase["amount"], errors="coerce").fillna(0.0).abs().sum())
+            divisor, unit_label = _amount_display_spec(amount_unit, total_amount)
+            purchase = purchase.copy()
+            purchase["display_amount"] = pd.to_numeric(purchase["amount"], errors="coerce").fillna(0.0) / divisor
+            purchase = purchase.sort_values("month", kind="stable")
+            st.markdown("### 월별 매입 추세")
+            chart = alt.Chart(purchase).mark_bar(color="#0f766e", cornerRadiusTopLeft=2, cornerRadiusTopRight=2).encode(
+                x=alt.X("month:N", title="월", sort=purchase["month"].tolist()),
+                y=alt.Y("display_amount:Q", title=f"매입금액 ({unit_label})", axis=alt.Axis(format=",.0f")),
+                tooltip=[alt.Tooltip("month:N", title="기준월"), alt.Tooltip("amount:Q", title="매입금액", format=",.0f")],
+            ).properties(height=230)
+            st.altair_chart(chart, width="stretch")
+            st.caption("공통 매출 원천에서 이미 확보한 월별 매입금액을 재사용합니다.")
+
+    briefing_lines = [str(line) for line in (summary.get("briefing_lines") or []) if str(line).strip()][:5]
+    if briefing_lines:
+        with st.container(border=True):
+            st.markdown("### 오늘의 재고·공급 브리핑")
+            for line in briefing_lines:
+                st.caption(line)
+
+
+def _build_follow_up_chart(rows: list[dict[str, Any]]) -> alt.Chart | None:
+    frame = pd.DataFrame([row for row in rows if int(row.get("count") or 0) > 0])
+    if frame.empty:
+        return None
+    frame = frame.sort_values(["count", "label"], ascending=[False, True], kind="stable")
+    frame["count_label"] = frame["count"].map(lambda value: f"{int(value):,}개")
+    order = frame["label"].tolist()
+    y = alt.Y("label:N", title=None, sort=order, axis=alt.Axis(labelLimit=180))
+    bars = alt.Chart(frame).mark_bar(cornerRadiusEnd=3).encode(
+        x=alt.X("count:Q", title="품목 수", axis=alt.Axis(tickMinStep=1)),
+        y=y,
+        color=alt.Color("label:N", legend=None, scale=alt.Scale(domain=order, range=frame["color"].tolist())),
+        tooltip=[alt.Tooltip("label:N", title="확인 항목"), alt.Tooltip("count:Q", title="품목 수", format=",.0f")],
+    )
+    labels = alt.Chart(frame).mark_text(align="left", dx=5, color="#334155").encode(
+        x=alt.X("count:Q"), y=y, text="count_label:N"
+    )
+    return (bars + labels).properties(height=max(150, min(270, len(frame) * 38)))
+
+
+def _render_visual_phase2(facts: dict[str, Any]) -> None:
+    inventory = facts.get("inventory") or {}
+    summary = inventory.get("visual_phase2_summary") or {}
+    if not summary:
+        return
+    total = int(summary.get("inventory_count") or 0)
+    cover_rows = [
+        {"label": "재고 없음", "count": int(summary.get("cover_zero_stock_count") or 0), "amount": 0.0},
+        {"label": "잔여 기간 미만", "count": int(summary.get("cover_shortfall_count") or 0), "amount": 0.0},
+        {"label": "잔여 기간 이상", "count": int(summary.get("cover_sufficient_count") or 0), "amount": 0.0},
+        {"label": "수요 없음", "count": int(summary.get("cover_no_demand_count") or 0), "amount": 0.0},
+        {"label": "자료 부족", "count": int(summary.get("cover_insufficient_count") or 0), "amount": 0.0},
+    ]
+    follow_up_rows = [
+        {"label": "입고 지연 후보", "count": int(summary.get("inbound_delay_candidate_count") or 0), "color": "#f59e0b"},
+        {"label": "과잉 후보", "count": int(summary.get("overstock_candidate_count") or 0), "color": "#7c3aed"},
+        {"label": "최근 매입 없음", "count": int(summary.get("recent_purchase_none_count") or 0), "color": "#94a3b8"},
+        {"label": "매입처 미확인", "count": int(summary.get("vendor_unknown_count") or 0), "color": "#94a3b8"},
+        {"label": "수요급증", "count": int(summary.get("demand_surge_count") or 0), "color": "#0f766e"},
+        {"label": "재고 없음", "count": int(summary.get("cover_zero_stock_count") or 0), "color": "#dc2626"},
+    ]
+    cover_col, follow_up_col = st.columns([35, 65])
+    with cover_col:
+        st.markdown("### 재고커버 구성")
+        if bool(summary.get("cover_partition_valid")):
+            donut = _build_count_donut(
+                cover_rows,
+                total_label="재고커버 총",
+                total=total,
+                colors=["#dc2626", "#f59e0b", "#16a34a", "#94a3b8", "#64748b"],
+            )
+            if donut is not None:
+                st.altair_chart(donut, width="stretch")
+            else:
+                st.caption("재고커버 판정 대상이 없습니다.")
+        else:
+            st.caption("재고커버 상태 집계가 불완전해 도넛으로 표시하지 않았습니다.")
+        st.caption("재고 없음과 잔여 기간 미만을 우선 확인합니다.")
+    with follow_up_col:
+        st.markdown("### 후속 확인 항목")
+        chart = _build_follow_up_chart(follow_up_rows)
+        if chart is not None:
+            st.altair_chart(chart, width="stretch")
+        else:
+            st.caption("현재 후속 확인 후보가 없습니다.")
+        st.caption("항목은 서로 중복될 수 있으며, 비율 합계로 해석하지 않습니다.")
+
+    purchase_rows = list(inventory.get("purchase_trend_rows") or [])[:18]
+    if summary.get("purchase_trend_status") == "ready" and purchase_rows:
+        purchase = pd.DataFrame(purchase_rows)
+        if {"month", "amount"}.issubset(purchase.columns):
+            amount_unit = _facts_amount_display_unit(facts)
+            total_amount = float(pd.to_numeric(purchase["amount"], errors="coerce").fillna(0.0).abs().sum())
+            divisor, unit_label = _amount_display_spec(amount_unit, total_amount)
+            purchase = purchase.copy()
+            purchase["display_amount"] = pd.to_numeric(purchase["amount"], errors="coerce").fillna(0.0) / divisor
+            purchase = purchase.sort_values("month", kind="stable")
+            st.markdown("### 월별 매입 추세")
+            chart = alt.Chart(purchase).mark_bar(color="#0f766e", cornerRadiusTopLeft=2, cornerRadiusTopRight=2).encode(
+                x=alt.X("month:N", title="월", sort=purchase["month"].tolist()),
+                y=alt.Y("display_amount:Q", title=f"매입금액 ({unit_label})", axis=alt.Axis(format=",.0f")),
+                tooltip=[alt.Tooltip("month:N", title="기준월"), alt.Tooltip("amount:Q", title="매입금액", format=",.0f")],
+            ).properties(height=230)
+            st.altair_chart(chart, width="stretch")
+            st.caption("공통 매출 원천에서 이미 확보한 월별 매입금액을 재사용합니다.")
+
+    briefing_lines = [str(line) for line in (summary.get("briefing_lines") or []) if str(line).strip()][:5]
+    if briefing_lines:
+        with st.container(border=True):
+            st.markdown("### 오늘의 재고·공급 브리핑")
+            for line in briefing_lines:
+                st.caption(line)
+
+
 def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
     inventory = facts.get("inventory") or {}
     summary = inventory.get("vendor_stock_risk_summary") or {}
@@ -1051,7 +1259,7 @@ def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
         divisor, _ = _amount_display_spec("auto", abs(total_amount))
         amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
 
-    st.markdown("### 매입처별 재고위험 TOP 5")
+    st.markdown("### 매입처별 재고위험 TOP 10")
     st.caption("최근 완료월 매입 자료로 선정한 주요 매입처별 위험금액입니다.")
     supply_col, chart_col = st.columns([35, 65])
     with supply_col:
@@ -1074,7 +1282,7 @@ def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
         with chart_col:
             st.caption("정상 귀속된 긴급 부족·부족 주의 매입처가 없습니다.")
         return
-    frame = pd.DataFrame(rows).head(5).copy()
+    frame = pd.DataFrame(rows).head(10).copy()
     if frame.empty:
         return
     divisor, unit_label = _amount_display_spec(amount_unit, total_amount)
@@ -1105,7 +1313,7 @@ def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
             alt.Tooltip("위험품목수:Q", title="위험 품목", format=",.0f"), alt.Tooltip("수요급증품목수:Q", title="수요급증 품목", format=",.0f"),
             alt.Tooltip("전체위험금액:Q", title="전체 위험금액", format=",.0f"), alt.Tooltip("금액:Q", title="구분 금액", format=",.0f"),
         ],
-    ).properties(height=max(180, min(360, len(order) * 30)))
+    ).properties(height=max(180, min(420, len(order) * 34)))
     with chart_col:
         st.altair_chart(chart, width="stretch")
         st.caption("주요 매입처는 최근 완료월의 순매입금액·순입고수량·최근 매입일 순으로 선정합니다.")
@@ -1462,10 +1670,17 @@ def _render_today_actions(facts: dict[str, Any], cache: dict[str, Any], *, rende
                     criterion = f"{threshold_label} {_fmt_number(threshold_value)}"
                 else:
                     criterion = f"{threshold_label} {_fmt_number(threshold_value)}".strip()
+                supplements = []
+                cover_days = action.get("stock_cover_days")
+                if cover_days not in (None, ""):
+                    supplements.append(f"재고커버 {_fmt_number(cover_days, 1)}일")
+                if bool(action.get("inbound_delayed_candidate")):
+                    supplements.append("입고 지연 후보")
+                supplement = f" · {' · '.join(supplements[:2])}" if supplements else ""
                 row_col, button_col = st.columns([84, 16])
                 with row_col:
                     st.markdown(f"**{rank}.** {_dashboard_action_status_badge(status)} &nbsp; **{html.escape(target)}**", unsafe_allow_html=True)
-                    st.caption(f"{html.escape(evidence)} · {html.escape(criterion)} · {html.escape(str(action.get('recommended_action') or '-'))}")
+                    st.caption(f"{html.escape(evidence)} · {html.escape(criterion)} · {html.escape(str(action.get('recommended_action') or '-'))}{html.escape(supplement)}")
                 with button_col:
                     selection = _dashboard_action_detail_selection(cache, action) if interactive else None
                     if interactive and selection and callable(getattr(st, "button", None)):
@@ -2829,6 +3044,18 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
                 key: (inventory.get("risk_detail_summary") or {}).get(key)
                 for key in ("source_rows", "emergency_rows", "warning_rows", "amount_positive_rows", "zero_amount_rows")
             },
+            "visual_phase2_summary": {
+                key: (inventory.get("visual_phase2_summary") or {}).get(key)
+                for key in (
+                    "inventory_count", "evaluation_remaining_days", "cover_zero_stock_count",
+                    "cover_shortfall_count", "cover_sufficient_count", "cover_no_demand_count",
+                    "cover_insufficient_count", "cover_partition_valid", "inbound_delay_candidate_count",
+                    "overstock_candidate_count", "recent_purchase_none_count", "vendor_unknown_count",
+                    "demand_surge_count", "action_count", "purchase_trend_status", "purchase_trend_points",
+                    "vendor_top_count", "additional_source_call_count", "briefing_lines",
+                )
+            },
+            "purchase_trend_rows": list(inventory.get("purchase_trend_rows") or [])[:18],
             "data_quality": list(inventory.get("data_quality") or [])[:row_limit],
         },
         "turnover_days": dict(facts.get("turnover_days") or {}),
@@ -2952,6 +3179,10 @@ def _render_dashboard_facts(
             st.caption(f"준비율 경고기준 {_fmt_threshold_pct(readiness_threshold)}% 미만 품목 중 위험도가 높은 품목을 표시합니다.")
             _render_stock_chart(facts)
         _render_vendor_stock_risk(facts)
+
+    with st.container(border=True):
+        st.markdown("## 재고 후속관리")
+        _render_visual_phase2(facts)
 
     with st.container(border=True):
         st.markdown("## 수요급증")
