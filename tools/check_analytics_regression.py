@@ -9674,8 +9674,8 @@ def run_basic_checks() -> list[CheckResult]:
             sales_chart_json = json.dumps(sales_chart_spec, ensure_ascii=False)
             if '"type": "bar"' not in sales_chart_json:
                 chart_errors.append("sales_chart_not_bar")
-            if '"type": "line"' not in sales_chart_json or '"type": "point"' not in sales_chart_json:
-                chart_errors.append("sales_chart_line_or_marker_missing")
+            if sales_chart_json.count('"type": "tick"') < 2:
+                chart_errors.append("sales_chart_target_markers_missing")
             if not all(token in sales_chart_json for token in ("#2563eb", "#f97316", "#0f766e")):
                 chart_errors.append("sales_chart_actual_forecast_marker_colors_missing")
             if not all(token in sales_chart_json for token in ("실제매출", "예상매출", "현재일 기준")):
@@ -9770,14 +9770,11 @@ def run_basic_checks() -> list[CheckResult]:
             layer_marks = [layer.get("mark") or {} for layer in chart_spec.get("layer", [])]
             if layer_marks[0].get("type") != "bar" or layer_marks[0].get("size") != 32:
                 preforecast_errors.append(f"actual_bar_width={layer_marks!r}")
-            if layer_marks[1].get("type") != "line" or layer_marks[2].get("type") != "point":
-                preforecast_errors.append(f"forecast_line_or_current_marker={layer_marks!r}")
+            if layer_marks[1].get("type") != "tick" or layer_marks[2].get("type") != "tick":
+                preforecast_errors.append(f"forecast_or_current_target_marker={layer_marks!r}")
             layer_stacks = [layer.get("encoding", {}).get("y", {}).get("stack") for layer in chart_spec.get("layer", [])]
             if layer_stacks != [None, None, None]:
                 preforecast_errors.append(f"layer_y_stacks={layer_stacks!r}")
-            forecast_encoding = chart_spec.get("layer", [])[1].get("encoding", {})
-            if forecast_encoding.get("detail", {}).get("field") != "forecast_segment":
-                preforecast_errors.append(f"forecast_gap_segment={forecast_encoding.get('detail')!r}")
             cross_year_rows = list(chart_rows)
             cross_year_rows.append({"period": "2027-01", "period_sort": "202701", "kind": "완료월 실제", "value": 12})
             cross_year_spec = view_mod._build_sales_bar_chart({"sales": {"chart_rows": cross_year_rows, "visualization": visualization}}).to_dict()
@@ -9845,6 +9842,106 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard Lite sales presentation states", "; ".join(presentation_errors)))
         else:
             results.append(_ok("Dashboard Lite sales presentation states", "four cards and the status bar distinguish forecast overage, remaining amount, forecast reached, and current-day achievement labels without changing facts"))
+
+        inventory_visual_errors: list[str] = []
+        try:
+            readiness_rows = [
+                {
+                    "product_code": f"P{index:02d}", "product_name": f"위험품목{index:02d}",
+                    "재고위험상태": "긴급 부족" if index < 4 else "부족 주의",
+                    "current_stock_qty": index - 3, "위험보정잔여예상수요": 20 + index,
+                    "위험보정재고준비율": float(index * 7), "위험보정부족예상수량": 10 + index,
+                    "위험보정부족예상금액": 1_000_000 * (12 - index), "주요매입처명": "매입처",
+                }
+                for index in range(12)
+            ]
+            inventory_visual_facts = {
+                "filters": {"amount_display_unit_resolved": "million"},
+                "stock_readiness": {"threshold_pct": 97.5},
+                "inventory": {
+                    "risk_targets": readiness_rows,
+                    "stock_risk_summary": [
+                        {"재고위험상태": "긴급 부족", "품목수": 4, "부족예상금액": 40_000_000},
+                        {"재고위험상태": "부족 주의", "품목수": 8, "부족예상금액": 20_000_000},
+                        {"재고위험상태": "적정", "품목수": 20, "부족예상금액": 0},
+                        {"재고위험상태": "판정 제외", "품목수": 1, "부족예상금액": 0},
+                    ],
+                    "stock_overstock_summary": {"품목수": 3, "과잉후보금액": 8_000_000},
+                    "stock_demand_surge_summary": {"품목수": 5},
+                    "vendor_stock_risk_summary": {
+                        "assigned_rows": 10, "assigned_adjusted_shortage_amount": 55_000_000,
+                        "recent_purchase_none_rows": 2, "recent_purchase_none_amount": 2_000_000,
+                        "vendor_unknown_rows": 1, "vendor_unknown_amount": 1_000_000,
+                    },
+                    "vendor_stock_risk_top_rows": [
+                        {"주요매입처명": f"매입처{index}", "주요매입처코드": f"V{index}", "전체위험보정부족금액": (10 - index) * 1_000_000,
+                         "긴급부족금액": (10 - index) * 700_000, "부족주의금액": (10 - index) * 300_000,
+                         "긴급부족품목수": 1, "부족주의품목수": 1, "위험품목수": 2, "수요급증품목수": 0}
+                        for index in range(7)
+                    ],
+                },
+            }
+            chart = view_mod._build_stock_readiness_chart(inventory_visual_facts)
+            chart_spec = chart.to_dict() if chart is not None else {}
+            chart_json = json.dumps(chart_spec, ensure_ascii=False)
+            if '"P10"' in chart_json or '"P11"' in chart_json:
+                inventory_visual_errors.append("readiness_top10_not_limited")
+            if not all(token in chart_json for token in ("#dc2626", "#f59e0b", "97.5", "display_readiness_label")):
+                inventory_visual_errors.append("readiness_chart_status_or_threshold_missing")
+            display_summary = view_mod._stock_risk_display_summary(inventory_visual_facts)
+            if display_summary["긴급 부족"] != {"count": 4, "amount": 40_000_000.0}:
+                inventory_visual_errors.append(f"emergency_summary={display_summary['긴급 부족']!r}")
+            if display_summary["과잉 후보"] != {"count": 3, "amount": 8_000_000.0}:
+                inventory_visual_errors.append(f"overstock_summary={display_summary['과잉 후보']!r}")
+            if display_summary["최근 매입 없음"] != {"count": 2, "amount": 2_000_000.0} or display_summary["매입처 미확인"] != {"count": 1, "amount": 1_000_000.0}:
+                inventory_visual_errors.append(f"supply_status_summary={display_summary!r}")
+            top_rows = (inventory_visual_facts["inventory"]["vendor_stock_risk_top_rows"] or [])[:5]
+            if len(top_rows) != 5 or any(float(top_rows[index]["전체위험보정부족금액"]) < float(top_rows[index + 1]["전체위험보정부족금액"]) for index in range(len(top_rows) - 1)):
+                inventory_visual_errors.append(f"vendor_top5_order={top_rows!r}")
+            if len(inventory_visual_facts["inventory"]["risk_targets"]) != 12:
+                inventory_visual_errors.append("readiness_source_mutated")
+            inventory_donut = view_mod._build_count_donut(
+                [
+                    {"label": "긴급 부족", "count": 4, "amount": 40_000_000},
+                    {"label": "부족 주의", "count": 8, "amount": 20_000_000},
+                    {"label": "적정", "count": 20, "amount": 0},
+                    {"label": "판정 제외", "count": 1, "amount": 0},
+                ], total_label="판정 대상", total=33, colors=["#dc2626", "#f59e0b", "#16a34a", "#9ca3af"],
+            )
+            if inventory_donut is None or '"type": "arc"' not in json.dumps(inventory_donut.to_dict(), ensure_ascii=False):
+                inventory_visual_errors.append("inventory_donut_missing")
+            supply_rows = [
+                {"label": "정상 귀속 위험", "count": 10, "amount": 55_000_000},
+                {"label": "최근 매입 없음", "count": 2, "amount": 2_000_000},
+                {"label": "매입처 미확인", "count": 1, "amount": 1_000_000},
+            ]
+            if sum(row["count"] for row in supply_rows) != 13 or "#16a34a" in json.dumps(view_mod._build_count_donut(supply_rows, total_label="공급연결 판정", total=13, colors=["#0f766e", "#f59e0b", "#9ca3af"]).to_dict(), ensure_ascii=False):
+                inventory_visual_errors.append("supply_donut_contract")
+        except Exception as exc:
+            inventory_visual_errors.append(f"inventory_visual_runtime={type(exc).__name__}:{exc}")
+        if inventory_visual_errors:
+            results.append(_fail("Dashboard Lite inventory risk visualization", "; ".join(inventory_visual_errors)))
+        else:
+            results.append(_ok("Dashboard Lite inventory risk visualization", "existing readiness, risk, overstock, vendor, supply-link, and demand-surge facts render as TOP 10/TOP 5 presentation data without source mutation or new calls"))
+
+        gauge_errors: list[str] = []
+        try:
+            gauge_facts = {"sales": {"metrics": {
+                "current_month_sales": {"value": 150}, "current_month_forecast_sales": {"value": 100},
+                "current_month_progress_pct": {"value": 150}, "time_progress_pct": {"value": 80, "time_basis": "202607 24/31일 경과 진행중"},
+                "time_adjusted_achievement_pct": {"value": 187.5},
+            }, "visualization": {"expected_to_date_sales": 80}}}
+            gauge_state = view_mod._sales_gauge_state(gauge_facts)
+            if gauge_state.get("needle_pct") != 150 or gauge_state.get("today_marker_pct") != 187.5 or float(gauge_state.get("gauge_max_pct") or 0) < 187.5:
+                gauge_errors.append(f"gauge_state={gauge_state!r}")
+            if gauge_state.get("comparison_label") != "월말 예상 초과" or gauge_state.get("comparison_amount") != 50:
+                gauge_errors.append(f"gauge_comparison={gauge_state!r}")
+        except Exception as exc:
+            gauge_errors.append(f"gauge_runtime={type(exc).__name__}:{exc}")
+        if gauge_errors:
+            results.append(_fail("Dashboard Lite sales gauge", "; ".join(gauge_errors)))
+        else:
+            results.append(_ok("Dashboard Lite sales gauge", "month-end achievement drives the needle and main value; current-day achievement remains a separate marker with safe over-120 scaling"))
 
         reset_errors: list[str] = []
         session_fixture = {
@@ -10755,7 +10852,7 @@ def run_basic_checks() -> list[CheckResult]:
                         },
                         "chart_rows": [{"period": "2026-01", "value": 1}],
                     },
-                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
+                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
                     "today_actions": [{"priority": 1}],
                 },
             }
@@ -10774,6 +10871,8 @@ def run_basic_checks() -> list[CheckResult]:
                 dashboard_roundtrip_errors.append("dashboard_stock_overstock_summary_missing")
             if "stock_demand_surge_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
                 dashboard_roundtrip_errors.append("dashboard_stock_demand_surge_summary_missing")
+            if not compact_cache.get("facts", {}).get("inventory", {}).get("vendor_stock_risk_top_rows"):
+                dashboard_roundtrip_errors.append("dashboard_vendor_stock_risk_top_rows_missing")
             full_payload = {
                 "id": "dashboard-event-full",
                 "type": "dashboard_lite",

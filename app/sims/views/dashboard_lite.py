@@ -478,6 +478,30 @@ def _inject_dashboard_lite_styles_once() -> None:
             font-size: 0.82rem;
             line-height: 1.45;
         }
+        .dashboard-lite-sales-gauge {
+            min-height: 244px;
+            padding: 6px 10px 10px;
+            border: 1px solid rgba(49, 51, 63, 0.16);
+            border-radius: 8px;
+            text-align: center;
+            background: #ffffff;
+        }
+        .dashboard-lite-sales-gauge svg {
+            display: block;
+            width: min(100%, 260px);
+            margin: 0 auto -24px;
+        }
+        .dashboard-lite-gauge-main {
+            color: #1f2937;
+            font-size: 1.6rem;
+            font-weight: 700;
+            font-variant-numeric: tabular-nums;
+        }
+        .dashboard-lite-gauge-label, .dashboard-lite-gauge-sub {
+            color: rgba(49, 51, 63, 0.68);
+            font-size: 0.8rem;
+            line-height: 1.45;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -547,6 +571,55 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
         "elapsed_days": elapsed_days,
         "total_days": total_days,
     }
+
+
+def _sales_gauge_state(facts: dict[str, Any]) -> dict[str, Any]:
+    """Return display-only gauge bounds; current-day progress stays calendar based."""
+    state = _sales_presentation_state(facts)
+    try:
+        progress = max(0.0, float(state.get("sales_progress_pct") or 0.0))
+    except (TypeError, ValueError):
+        progress = 0.0
+    try:
+        today_progress = max(0.0, float(state.get("time_adjusted_achievement_pct") or 0.0))
+    except (TypeError, ValueError):
+        today_progress = 0.0
+    maximum = max(120.0, min(max(progress, today_progress, 100.0) + 10.0, 250.0))
+    return {**state, "gauge_max_pct": maximum, "needle_pct": progress, "today_marker_pct": today_progress, "time_basis_label": "현재일 기준"}
+
+
+def _render_sales_gauge(facts: dict[str, Any]) -> None:
+    _inject_dashboard_lite_styles_once()
+    state = _sales_gauge_state(facts)
+    amount_unit = _facts_amount_display_unit(facts)
+    progress = float(state["needle_pct"])
+    maximum = float(state["gauge_max_pct"])
+    needle_angle = max(-90.0, min(90.0, -90.0 + min(progress, maximum) / maximum * 180.0))
+    today_angle = max(-90.0, min(90.0, -90.0 + min(float(state["today_marker_pct"]), maximum) / maximum * 180.0))
+    comparison = state["comparison_label"]
+    comparison_amount = state.get("comparison_amount")
+    comparison_text = comparison if comparison_amount is None or comparison == "월말 예상 도달" else f"{comparison} {_fmt_dashboard_amount(comparison_amount, amount_unit)}"
+    st.markdown("### 평가월 매출 진행")
+    st.markdown(
+        f"""
+        <div class="dashboard-lite-sales-gauge">
+          <svg viewBox="0 0 240 138" role="img" aria-label="평가월 매출 진행">
+            <path d="M 24 116 A 96 96 0 0 1 216 116" fill="none" stroke="#e5e7eb" stroke-width="18" stroke-linecap="round"/>
+            <path d="M 120 20 L 120 39" stroke="#f59e0b" stroke-width="4" transform="rotate(0 120 116)"/>
+            <path d="M 120 23 L 120 43" stroke="#0f766e" stroke-width="4" transform="rotate({today_angle:.3f} 120 116)"/>
+            <path d="M 120 116 L 120 42" stroke="#2563eb" stroke-width="5" stroke-linecap="round" transform="rotate({needle_angle:.3f} 120 116)"/>
+            <circle cx="120" cy="116" r="7" fill="#2563eb"/>
+          </svg>
+          <div class="dashboard-lite-gauge-main">{html.escape(_fmt_number(progress, 1))}%</div>
+          <div class="dashboard-lite-gauge-label">월말 예상 달성률</div>
+          <div class="dashboard-lite-gauge-sub">{html.escape(state['time_basis_label'])} 달성률 {html.escape(_fmt_number(state['today_marker_pct'], 1))}%</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    for label, value in (("현재매출", state["current_sales"]), ("월말 예상매출", state["forecast_sales"]), ("오늘 기준 예상매출", state["expected_to_date_sales"])):
+        st.caption(f"{label}: {_fmt_dashboard_amount(value, amount_unit)}")
+    st.caption(comparison_text)
 
 
 def _render_status_cards(facts: dict[str, Any]) -> None:
@@ -664,7 +737,7 @@ def _render_sales_brief(facts: dict[str, Any]) -> None:
 
 
 def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart | None:
-    """Build the monthly actual bar, forecast line, and current-day marker without reloading facts."""
+    """Build actual bars with monthly forecast and current-day target markers."""
     rows = (facts.get("sales") or {}).get("chart_rows") or []
     if not rows:
         return None
@@ -704,13 +777,6 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
         {"완료월 사전예상": "완료월 사전예상", "당월 예상": "당월 월말 예상"}
     ).fillna("예상매출")
     forecast_df = forecast_df[pd.to_numeric(forecast_df["value"], errors="coerce").notna()].copy()
-    forecast_df = forecast_df.sort_values("period_sort", kind="stable")
-    forecast_df["forecast_segment"] = (
-        forecast_df["period_sort"].astype(str).map(lambda value: int(value[:4]) * 12 + int(value[4:6]))
-        .diff()
-        .ne(1)
-        .cumsum()
-    )
     tooltip = [
         alt.Tooltip("display_period:N", title="기준월"),
         alt.Tooltip("value_kind:N", title="값 종류"),
@@ -759,11 +825,10 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
         )
     if not forecast_df.empty:
         layers.append(
-            alt.Chart(forecast_df).mark_line(point=alt.OverlayMarkDef(filled=True, size=58), strokeWidth=2.5).encode(
+            alt.Chart(forecast_df).mark_tick(orient="horizontal", thickness=3, size=34).encode(
                 x=x_encoding,
                 y=y_encoding,
                 color=series_color,
-                detail="forecast_segment:N",
                 tooltip=tooltip,
             )
         )
@@ -788,7 +853,7 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
                 "time_progress_pct": visualization.get("time_progress_pct"),
             }]
         )
-        marker = alt.Chart(marker_df).mark_point(shape="diamond", filled=True, size=100).encode(
+        marker = alt.Chart(marker_df).mark_tick(orient="horizontal", thickness=3, size=34).encode(
             x=x_encoding,
             y=y_encoding,
             color=series_color,
@@ -806,15 +871,18 @@ def _render_sales_chart(facts: dict[str, Any]) -> None:
     st.altair_chart(chart, width="stretch")
 
 
-def _render_stock_chart(facts: dict[str, Any]) -> None:
+def _build_stock_readiness_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart | None:
     inventory = facts.get("inventory") or {}
     rows = inventory.get("risk_targets") or []
     threshold_value = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
-    threshold_text = _fmt_threshold_pct(threshold_value)
     if not rows:
-        st.info(f"준비율 경고기준 {threshold_text}% 미만 재고준비율 조치 대상이 없습니다.")
-        return
+        return None
     df = pd.DataFrame(rows).head(10).copy()
+    if df.empty:
+        return None
+    for field, fallback in (("product_code", ""), ("product_name", "제품명 미확인"), ("재고위험상태", "판정 제외"), ("current_stock_qty", None), ("주요매입처명", ""), ("수요급증여부", False), ("위험보정기준", "")):
+        if field not in df.columns:
+            df[field] = fallback
     df["display_readiness_pct"] = pd.to_numeric(
         df.get("위험보정재고준비율", df.get("stock_readiness_pct")), errors="coerce"
     ).fillna(pd.to_numeric(df.get("stock_readiness_pct"), errors="coerce"))
@@ -827,96 +895,93 @@ def _render_stock_chart(facts: dict[str, Any]) -> None:
     df["display_shortage_amt"] = pd.to_numeric(
         df.get("위험보정부족예상금액", df.get("shortage_amt")), errors="coerce"
     ).fillna(pd.to_numeric(df.get("shortage_amt"), errors="coerce"))
+    df["display_readiness_label"] = df["display_readiness_pct"].map(lambda value: f"{float(value):.1f}%" if pd.notna(value) else "자료부족")
+    df["위험색상"] = df["재고위험상태"].map({"긴급 부족": "긴급 부족", "부족 주의": "부족 주의"}).fillna("보조 상태")
     threshold = pd.DataFrame({"threshold": [threshold_value]})
     bars = (
         alt.Chart(df)
-        .mark_bar(color="#ef4444")
+        .mark_bar()
         .encode(
             x=alt.X("display_readiness_pct:Q", title="재고준비율(%)", scale=alt.Scale(domain=[0, 100])),
-            y=alt.Y("product_name:N", title="제품", sort="-x"),
+            y=alt.Y("product_name:N", title=None, sort=alt.SortField("display_readiness_pct", order="ascending"), axis=alt.Axis(labelLimit=230)),
+            color=alt.Color("위험색상:N", legend=None, scale=alt.Scale(domain=["긴급 부족", "부족 주의", "보조 상태"], range=["#dc2626", "#f59e0b", "#9ca3af"])),
             tooltip=[
-                alt.Tooltip("product_name:N", title="제품"),
+                alt.Tooltip("product_code:N", title="제품코드"), alt.Tooltip("product_name:N", title="제품명"),
+                alt.Tooltip("재고위험상태:N", title="위험상태"), alt.Tooltip("current_stock_qty:Q", title="현재재고수량", format=",.0f"),
                 alt.Tooltip("display_readiness_pct:Q", title="준비율", format=".1f"),
                 alt.Tooltip("display_remaining_demand_qty:Q", title="잔여예상수요", format=",.0f"),
                 alt.Tooltip("display_shortage_qty:Q", title="부족수량", format=",.0f"),
                 alt.Tooltip("display_shortage_amt:Q", title="부족금액", format=",.0f"),
-                alt.Tooltip("수요급증여부:N", title="수요급증"),
-                alt.Tooltip("위험보정기준:N", title="위험보정기준"),
+                alt.Tooltip("주요매입처명:N", title="주요매입처명"),
+                alt.Tooltip("수요급증여부:N", title="수요급증"), alt.Tooltip("위험보정기준:N", title="위험보정기준"),
             ],
         )
     )
     rule = alt.Chart(threshold).mark_rule(color="#0f766e", strokeDash=[4, 4]).encode(x="threshold:Q")
-    st.altair_chart((bars + rule).properties(height=280), width="stretch")
+    labels = alt.Chart(df).mark_text(align="left", dx=4, color="#374151", fontSize=11).encode(
+        x="display_readiness_pct:Q", y=alt.Y("product_name:N", sort=alt.SortField("display_readiness_pct", order="ascending")), text="display_readiness_label:N"
+    )
+    return (bars + rule + labels).properties(height=max(260, min(360, len(df) * 29)))
+
+
+def _render_stock_chart(facts: dict[str, Any]) -> None:
+    threshold_value = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
+    threshold_text = _fmt_threshold_pct(threshold_value)
+    chart = _build_stock_readiness_chart(facts)
+    if chart is None:
+        st.info(f"준비율 경고기준 {threshold_text}% 미만 재고준비율 조치 대상이 없습니다.")
+        return
+    st.altair_chart(chart, width="stretch")
+
+
+def _stock_risk_display_summary(facts: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    rows = (facts.get("inventory") or {}).get("stock_risk_summary") or []
+    by_status = {str(row.get("재고위험상태") or ""): row for row in rows if isinstance(row, dict)}
+    vendor = (facts.get("inventory") or {}).get("vendor_stock_risk_summary") or {}
+    overstock = (facts.get("inventory") or {}).get("stock_overstock_summary") or {}
+    return {
+        "긴급 부족": {"count": int((by_status.get("긴급 부족") or {}).get("품목수") or 0), "amount": float((by_status.get("긴급 부족") or {}).get("부족예상금액") or 0)},
+        "부족 주의": {"count": int((by_status.get("부족 주의") or {}).get("품목수") or 0), "amount": float((by_status.get("부족 주의") or {}).get("부족예상금액") or 0)},
+        "과잉 후보": {"count": int(overstock.get("품목수") or 0), "amount": float(overstock.get("과잉후보금액") or 0)},
+        "최근 매입 없음": {"count": int(vendor.get("recent_purchase_none_rows") or 0), "amount": float(vendor.get("recent_purchase_none_amount") or 0)},
+        "적정": {"count": int((by_status.get("적정") or {}).get("품목수") or 0)},
+        "판정 제외": {"count": int((by_status.get("판정 제외") or {}).get("품목수") or 0)},
+        "매입처 미확인": {"count": int(vendor.get("vendor_unknown_rows") or 0), "amount": float(vendor.get("vendor_unknown_amount") or 0)},
+    }
+
+
+def _build_count_donut(rows: list[dict[str, Any]], *, total_label: str, total: int, colors: list[str]) -> alt.Chart | None:
+    frame = pd.DataFrame([row for row in rows if int(row.get("count") or 0) > 0])
+    if frame.empty:
+        return None
+    return alt.Chart(frame).mark_arc(innerRadius=54, outerRadius=82).encode(
+        theta=alt.Theta("count:Q"),
+        color=alt.Color("label:N", legend=alt.Legend(orient="bottom", title=None), scale=alt.Scale(domain=[row["label"] for row in rows], range=colors)),
+        tooltip=[alt.Tooltip("label:N", title="상태"), alt.Tooltip("count:Q", title="품목 수", format=",.0f"), alt.Tooltip("amount:Q", title="금액", format=",.0f")],
+    ).properties(title={"text": total_label, "subtitle": [f"{total:,}개"]}, height=245)
 
 
 def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
-    rows = (facts.get("inventory") or {}).get("stock_risk_summary") or []
-    by_status = {str(row.get("재고위험상태") or ""): row for row in rows if isinstance(row, dict)}
+    summary = _stock_risk_display_summary(facts)
     amount_unit = _facts_amount_display_unit(facts)
-    readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
-    threshold_text = _fmt_threshold_pct(readiness_threshold)
-    ordered = (
-        ("긴급 부족", "부족예상금액", True),
-        ("부족 주의", "품목수", False),
-        ("적정", "품목수", False),
-        ("판정 제외", "품목수", False),
-    )
-    amount_values = [
-        float((by_status.get(status) or {}).get(field) or 0)
-        for status, field, is_amount in ordered
-        if is_amount
-    ]
-    if amount_unit == "auto":
-        divisor, _label = _amount_display_spec("auto", max([abs(value) for value in amount_values], default=0.0))
-        amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
-
-    st.markdown("### 재고위험 요약")
-    cols = st.columns(4)
-    for col, (status, value_field, is_amount) in zip(cols, ordered):
-        row = by_status.get(status) or {}
-        with col:
-            _metric_card(
-                status,
-                row.get(value_field, 0),
-                "" if is_amount else "개",
-                help_text=(
-                    f"품목 수 {_fmt_number(row.get('품목수', 0))}개 · 수요급증 반영 {_fmt_number((facts.get('inventory') or {}).get('stock_demand_surge_summary', {}).get('긴급부족품목수', 0))}개"
-                    if is_amount
-                    else (
-                        f"준비율 {threshold_text}% 미만" if status == "부족 주의" else
-                        f"준비율 {threshold_text}% 이상" if status == "적정" else
-                        "수요없음 또는 필수값 누락" if status == "판정 제외" else
-                        "품목 수"
-                    )
-                ),
-                amount_unit=amount_unit if is_amount else "",
-            )
-
+    statuses = ["긴급 부족", "부족 주의", "적정", "판정 제외"]
+    donut_rows = [{"label": label, "count": summary[label]["count"], "amount": summary[label].get("amount", 0.0)} for label in statuses]
+    total = sum(int(row["count"]) for row in donut_rows)
+    st.markdown("### 재고 위험 구성")
+    donut = _build_count_donut(donut_rows, total_label="판정 대상", total=total, colors=["#dc2626", "#f59e0b", "#16a34a", "#9ca3af"])
+    if donut is not None:
+        st.altair_chart(donut, width="stretch")
+    for label in statuses:
+        item = summary[label]
+        suffix = f" / {_fmt_dashboard_amount(item.get('amount', 0), amount_unit)}" if label in {"긴급 부족", "부족 주의"} else ""
+        st.caption(f"{label} {item['count']:,}개{suffix}")
+    st.caption(f"과잉 후보 {summary['과잉 후보']['count']:,}개 / {_fmt_dashboard_amount(summary['과잉 후보']['amount'], amount_unit)}")
+    st.caption(f"최근 매입 없음 {summary['최근 매입 없음']['count']:,}개 / {_fmt_dashboard_amount(summary['최근 매입 없음']['amount'], amount_unit)}")
+    st.caption(f"매입처 미확인 {summary['매입처 미확인']['count']:,}개")
+    st.caption("과잉 후보는 적정 품목의 보조 관찰지표이며 기본 재고위험 합계에는 중복 반영하지 않습니다.")
     demand_surge = (facts.get("inventory") or {}).get("stock_demand_surge_summary") or {}
     if int(demand_surge.get("품목수") or 0) > 0:
-        st.info(
-            f"수요급증 {int(demand_surge.get('품목수') or 0)}개 품목은 현재 출고속도를 기준으로 평가월 잔여수요를 다시 계산했습니다."
-        )
-
-    overstock = (facts.get("inventory") or {}).get("stock_overstock_summary") or {}
-    st.markdown("#### 적정 중 과잉 후보")
-    overstock_cols = st.columns(2)
-    with overstock_cols[0]:
-        _metric_card(
-            "과잉후보금액",
-            overstock.get("과잉후보금액", 0),
-            "",
-            help_text="현재재고가 3개월 필요수량 초과",
-            amount_unit=amount_unit,
-        )
-    with overstock_cols[1]:
-        _metric_card(
-            "과잉 후보 품목 수",
-            overstock.get("품목수", 0),
-            "개",
-            help_text="기본 상태 적정 품목만 포함",
-        )
-    st.caption("과잉 후보는 적정 품목의 보조 관찰지표이며 기본 재고위험 상태에는 중복 반영하지 않습니다.")
+        st.caption(f"참고: 수요급증 {int(demand_surge.get('품목수') or 0)}개 품목은 현재 출고속도를 반영해 평가월 잔여수요를 다시 계산했습니다.")
 
 
 def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
@@ -931,23 +996,30 @@ def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
         divisor, _ = _amount_display_spec("auto", abs(total_amount))
         amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
 
-    st.markdown("### 최근 6완료월 주요 매입처별 재고위험")
-    st.caption("제품별 주요 매입처는 평가월 직전 최근 6완료월의 순매입금액·순입고수량·최근 매입월 순으로 1개를 선정합니다.")
-    st.caption("본 기준은 월집계 자료를 사용하며, 저장 조건의 ‘주요 매입처 판정기간(일)’을 적용한 결과가 아닙니다.")
-    summary_cols = st.columns(4)
-    with summary_cols[0]:
-        _metric_card("정상 귀속 위험품목", summary.get("assigned_rows", 0), "개", amount_unit="")
-    with summary_cols[1]:
-        _metric_card("정상 귀속 위험금액", summary.get("assigned_adjusted_shortage_amount", 0), "", amount_unit=amount_unit)
-    with summary_cols[2]:
-        _metric_card("최근 매입 없음", summary.get("recent_purchase_none_rows", 0), "개", help_text=f"위험금액 {_fmt_dashboard_amount(summary.get('recent_purchase_none_amount', 0), amount_unit)}")
-    with summary_cols[3]:
-        _metric_card("매입처 미확인", summary.get("vendor_unknown_rows", 0), "개", help_text=f"위험금액 {_fmt_dashboard_amount(summary.get('vendor_unknown_amount', 0), amount_unit)}")
+    st.markdown("### 매입처별 재고위험 TOP 5")
+    st.caption("최근 완료월 매입 자료로 선정한 주요 매입처별 위험금액입니다.")
+    supply_col, chart_col = st.columns([35, 65])
+    with supply_col:
+        st.markdown("#### 공급 연결 상태")
+        supply_rows = [
+            {"label": "정상 귀속 위험", "count": int(summary.get("assigned_rows") or 0), "amount": float(summary.get("assigned_adjusted_shortage_amount") or 0)},
+            {"label": "최근 매입 없음", "count": int(summary.get("recent_purchase_none_rows") or 0), "amount": float(summary.get("recent_purchase_none_amount") or 0)},
+            {"label": "매입처 미확인", "count": int(summary.get("vendor_unknown_rows") or 0), "amount": float(summary.get("vendor_unknown_amount") or 0)},
+        ]
+        supply_total = sum(row["count"] for row in supply_rows)
+        supply_donut = _build_count_donut(supply_rows, total_label="공급연결 판정", total=supply_total, colors=["#0f766e", "#f59e0b", "#9ca3af"])
+        if supply_total == int(summary.get("risk_rows") or 0) and supply_donut is not None:
+            st.altair_chart(supply_donut, width="stretch")
+        else:
+            st.caption("공급 연결 상태 집계가 중복되거나 불완전해 도넛으로 표시하지 않았습니다.")
+        for row in supply_rows:
+            st.caption(f"{row['label']} {row['count']:,}개 / {_fmt_dashboard_amount(row['amount'], amount_unit)}")
 
     if not rows:
-        st.caption("정상 귀속된 긴급 부족·부족 주의 매입처가 없습니다.")
+        with chart_col:
+            st.caption("정상 귀속된 긴급 부족·부족 주의 매입처가 없습니다.")
         return
-    frame = pd.DataFrame(rows).copy()
+    frame = pd.DataFrame(rows).head(5).copy()
     if frame.empty:
         return
     divisor, unit_label = _amount_display_spec(amount_unit, total_amount)
@@ -979,7 +1051,9 @@ def _render_vendor_stock_risk(facts: dict[str, Any]) -> None:
             alt.Tooltip("전체위험금액:Q", title="전체 위험금액", format=",.0f"), alt.Tooltip("금액:Q", title="구분 금액", format=",.0f"),
         ],
     ).properties(height=max(180, min(360, len(order) * 30)))
-    st.altair_chart(chart, width="stretch")
+    with chart_col:
+        st.altair_chart(chart, width="stretch")
+        st.caption("주요 매입처는 최근 완료월의 순매입금액·순입고수량·최근 매입일 순으로 선정합니다.")
 
 
 def _render_demand_surge_detail_summary(facts: dict[str, Any]) -> None:
@@ -2213,6 +2287,7 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
             "stock_demand_surge_summary": dict(inventory.get("stock_demand_surge_summary") or {}),
             "vendor_stock_risk_summary": dict(inventory.get("vendor_stock_risk_summary") or {}),
+            "vendor_stock_risk_top_rows": list(inventory.get("vendor_stock_risk_top_rows") or [])[:row_limit],
             "inbound_summary": {
                 key: (inventory.get("inbound_summary") or {}).get(key)
                 for key in (
@@ -2332,20 +2407,25 @@ def _render_dashboard_facts(
     if filter_issues:
         labels = ", ".join(str(item.get("label") or "제품 조건") for item in filter_issues)
         st.warning(f"{labels} 제외 조건에 필요한 코드 컬럼이 없어 이번 결과에는 적용하지 않았습니다.")
-    _render_status_cards(facts)
+    sales_gauge_col, sales_chart_col = st.columns([35, 65])
+    with sales_gauge_col:
+        _render_sales_gauge(facts)
+    with sales_chart_col:
+        st.markdown("### 월별 실제매출·목표")
+        st.caption("파란 막대는 실제매출, 주황 목표선은 월 예상, 청록 목표선은 현재일 기준 예상입니다.")
+        _render_sales_chart(facts)
     _render_sales_brief(facts)
     st.divider()
 
-    st.markdown("### 매출 그래프")
-    st.caption("완료월 실제값과 당시 시점의 사전예상, 당월 부분월 현재/예상값을 같은 월 기준으로 비교합니다.")
-    _render_sales_chart(facts)
+    stock_summary_col, stock_chart_col = st.columns([35, 65])
+    with stock_summary_col:
+        _render_stock_risk_summary(facts)
+    with stock_chart_col:
+        st.markdown("### 재고 준비율 미달 TOP 10")
+        readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
+        st.caption(f"준비율 경고기준 {_fmt_threshold_pct(readiness_threshold)}% 미만 품목 중 위험도가 높은 품목을 표시합니다.")
+        _render_stock_chart(facts)
 
-    st.markdown("### 재고 그래프")
-    readiness_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 98.0)
-    st.caption(f"준비율 경고기준 {_fmt_threshold_pct(readiness_threshold)}% 미만 SKU를 기본 조치 대상으로 표시합니다.")
-    _render_stock_chart(facts)
-
-    _render_stock_risk_summary(facts)
     _render_vendor_stock_risk(facts)
     _render_demand_surge_detail_summary(facts)
 
