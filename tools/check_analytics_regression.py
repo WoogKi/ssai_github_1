@@ -7771,6 +7771,64 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append("stock_risk_summary_missing")
         if "stock_overstock_summary" not in (facts.get("inventory") or {}):
             fact_errors.append("stock_overstock_summary_missing")
+        stock_extension_rows = [
+            {"product_code": "COVER_READY", "current_stock_qty": 100, "위험보정잔여예상수요": 200, "과잉후보여부": False},
+            {"product_code": "COVER_ZERO", "current_stock_qty": 0, "위험보정잔여예상수요": 200, "과잉후보여부": False},
+            {"product_code": "COVER_NO_DEMAND", "current_stock_qty": 100, "위험보정잔여예상수요": 0, "과잉후보여부": False},
+            {"product_code": "COVER_MISSING", "current_stock_qty": None, "위험보정잔여예상수요": 20, "과잉후보여부": False},
+            {"product_code": "COVER_NEGATIVE", "current_stock_qty": -5, "위험보정잔여예상수요": 200, "과잉후보여부": False},
+            {"product_code": "COVER_OVER", "current_stock_qty": 300, "위험보정잔여예상수요": 20, "과잉후보여부": True, "과잉후보사유": "현재재고가 3개월 필요수량 초과"},
+        ]
+        stock_extension_summary = dash_mod._attach_stock_extension_facts(
+            stock_extension_rows,
+            evaluation_remaining_days=20,
+        )
+        stock_extension_by_code = {str(row.get("product_code") or ""): row for row in stock_extension_rows}
+        if (
+            stock_extension_by_code["COVER_READY"].get("stock_cover_status") != "ready"
+            or float(stock_extension_by_code["COVER_READY"].get("stock_cover_days") or 0) != 10
+            or stock_extension_by_code["COVER_ZERO"].get("stock_cover_status") != "zero_stock"
+            or stock_extension_by_code["COVER_ZERO"].get("stock_cover_days") != 0.0
+            or stock_extension_by_code["COVER_NO_DEMAND"].get("stock_cover_status") != "no_demand"
+            or stock_extension_by_code["COVER_NO_DEMAND"].get("stock_cover_days") is not None
+            or stock_extension_by_code["COVER_MISSING"].get("stock_cover_status") != "insufficient_data"
+            or stock_extension_by_code["COVER_MISSING"].get("stock_cover_days") is not None
+            or stock_extension_by_code["COVER_NEGATIVE"].get("stock_cover_status") != "zero_stock"
+            or stock_extension_by_code["COVER_NEGATIVE"].get("stock_cover_days") != 0.0
+            or stock_extension_by_code["COVER_OVER"].get("과잉·저활성 근거") != "현재재고가 3개월 필요수량 초과"
+            or any(row.get("outbound_data_status") != "source_required" for row in stock_extension_rows)
+            or any(row.get("last_normal_outbound_date") for row in stock_extension_rows)
+            or stock_extension_summary.get("additional_source_call_count") != 0
+        ):
+            fact_errors.append(f"stock_extension_cover_or_evidence={stock_extension_rows!r}/{stock_extension_summary!r}")
+        closed_horizon_rows = [{"product_code": "COVER_CLOSED", "current_stock_qty": 100, "위험보정잔여예상수요": 200}]
+        dash_mod._attach_stock_extension_facts(closed_horizon_rows, evaluation_remaining_days=0)
+        if (
+            closed_horizon_rows[0].get("stock_cover_status") != "closed_horizon"
+            or closed_horizon_rows[0].get("stock_cover_days") is not None
+        ):
+            fact_errors.append(f"stock_extension_closed_horizon={closed_horizon_rows!r}")
+        unchanged_risk_rows = [dict(row) for row in stock_risk_rows]
+        unchanged_before = [
+            (row.get("재고위험상태"), row.get("위험보정부족예상수량"), row.get("위험보정부족예상금액"), row.get("위험보정재고준비율"))
+            for row in unchanged_risk_rows
+        ]
+        dash_mod._attach_stock_extension_facts(unchanged_risk_rows, evaluation_remaining_days=20)
+        unchanged_after = [
+            (row.get("재고위험상태"), row.get("위험보정부족예상수량"), row.get("위험보정부족예상금액"), row.get("위험보정재고준비율"))
+            for row in unchanged_risk_rows
+        ]
+        if unchanged_before != unchanged_after:
+            fact_errors.append("stock_extension_changed_existing_risk_facts")
+        fact_inventory = facts.get("inventory") or {}
+        fact_detail_rows = fact_inventory.get("risk_detail_rows") or []
+        required_extension_detail_columns = {"재고커버일", "재고커버 자료상태", "과잉후보여부", "과잉·저활성 근거", "최근 정상 출고일", "출고 경과일", "출고 자료상태"}
+        if (
+            "stock_extension_summary" not in fact_inventory
+            or (fact_inventory.get("stock_extension_summary") or {}).get("additional_source_call_count") != 0
+            or (fact_detail_rows and not required_extension_detail_columns.issubset(set(fact_detail_rows[0])))
+        ):
+            fact_errors.append(f"stock_extension_inventory_detail={fact_inventory!r}")
         facts_stock_risk_by_status = {
             str(row.get("재고위험상태") or ""): row
             for row in (facts.get("inventory") or {}).get("stock_risk_summary") or []
@@ -12076,6 +12134,9 @@ def run_basic_checks() -> list[CheckResult]:
                     "규격": "10", "제조사명": "M1", "주요매입처명": "Vendor A", "현재재고수량": 0.0,
                     "위험보정잔여예상수요": 5.0, "위험보정부족예상수량": 5.0, "위험보정부족예상금액": 500.0,
                     "위험보정재고준비율": 0.0, "수요급증세부분류": None, "최근 정상 입고일": "20260727",
+                    "재고커버일": 0.0, "재고커버 자료상태": "재고 없음", "과잉후보여부": False,
+                    "과잉·저활성 근거": "기존 과잉후보 기준 미해당", "최근 정상 출고일": "",
+                    "출고 경과일": None, "출고 자료상태": "자료 연결 필요",
                     "입고 경과일": float("nan"), "정상 입고 거래일수": 0, "평균 입고간격일": pd.NaT,
                     "입고 자료상태": "None", "입고 지연후보": "아니오", "최근입고 대표매입처명": "Vendor A",
                 },
@@ -12088,7 +12149,7 @@ def run_basic_checks() -> list[CheckResult]:
             display_frame = view_mod._build_risk_detail_display_frame(display_source, 1)
             expected_display_prefix = [
                 "순번", "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "주요매입처명",
-                "현재재고수량", "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액", "위험보정재고준비율",
+                "현재재고수량", "위험보정잔여예상수요", "위험보정부족예상수량", "최소보충수량", "위험보정부족예상금액", "위험보정재고준비율",
             ]
             if (
                 len(display_frame) != 1
@@ -12096,12 +12157,48 @@ def run_basic_checks() -> list[CheckResult]:
                 or str(display_frame.iloc[0].get("최근 정상 입고일") or "") != "2026-07-27"
                 or str(display_frame.iloc[0].get("수요급증세부분류") or "")
                 or str(display_frame.iloc[0].get("입고 자료상태") or "")
+                or float(display_frame.iloc[0].get("재고커버일")) != 0.0
+                or str(display_frame.iloc[0].get("재고커버 자료상태") or "") != "재고 없음"
+                or "최근 정상 출고일" in display_frame.columns
+                or "출고 경과일" in display_frame.columns
+                or "출고 자료상태" in display_frame.columns
+                or int(display_frame.iloc[0].get("최소보충수량")) != 5
+                or str(display_frame.iloc[0].get("과잉·저활성 근거") or "")
                 or float(display_frame.iloc[0].get("현재재고수량")) != 0.0
                 or len(display_source) != 2
                 or str(display_source.iloc[0].get("최근 정상 입고일") or "") != "20260727"
                 or not pd.isna(display_source.iloc[0].get("수요급증세부분류"))
+                or not {"재고커버일", "재고커버 자료상태", "과잉후보여부", "과잉·저활성 근거"}.issubset(set(display_frame.columns))
             ):
                 risk_detail_errors.append("detail_display_frame_contract")
+            display_number_source = pd.DataFrame({
+                "위험보정부족예상수량": [0.0, 0.01, 0.67, 1.0, 1.17, 15.3, None],
+                "현재재고수량": [0.0, 4.0, 1104.0, -3.0, None, 4.5, 1.0],
+                "출고 자료상태": ["자료 연결 필요"] * 7,
+            })
+            display_number_frame = view_mod._build_risk_detail_display_frame(display_number_source, 10)
+            expected_minimum_replenishment = [0, 1, 1, 1, 2, 16, pd.NA]
+            actual_minimum_replenishment = display_number_frame["최소보충수량"].tolist()
+            if (
+                actual_minimum_replenishment[:6] != expected_minimum_replenishment[:6]
+                or not pd.isna(actual_minimum_replenishment[6])
+                or display_number_source["위험보정부족예상수량"].tolist()[:6] != [0.0, 0.01, 0.67, 1.0, 1.17, 15.3]
+                or not pd.isna(display_number_source["위험보정부족예상수량"].iloc[6])
+                or display_number_source["현재재고수량"].tolist()[:4] != [0.0, 4.0, 1104.0, -3.0]
+                or "출고 자료상태" in display_number_frame.columns
+            ):
+                risk_detail_errors.append("detail_display_number_and_minimum_replenishment")
+            detail_config = view_mod._risk_detail_display_column_config()
+            pinned_columns = ["순번", "위험상태", "위험사유", "제품코드", "제품명", "규격"]
+            if (
+                list(view_mod._RISK_DETAIL_DISPLAY_COLUMNS[:6]) != pinned_columns
+                or any(not bool((detail_config.get(column) or {}).get("pinned")) for column in pinned_columns)
+                or bool((detail_config.get("제조사명") or {}).get("pinned"))
+                or detail_config["현재재고수량"].get("label") != "현재고"
+                or detail_config["위험보정부족예상수량"].get("label") != "부족예상수량"
+                or (detail_config["최소보충수량"].get("type_config") or {}).get("format") != "%,.0f"
+            ):
+                risk_detail_errors.append("detail_pinned_column_config")
             display_limit_options = [10, 50, 100, 300, 500]
             if (
                 list(view_mod._RISK_DETAIL_DISPLAY_LIMIT_OPTIONS) != display_limit_options
@@ -12151,6 +12248,13 @@ def run_basic_checks() -> list[CheckResult]:
                 or "상세 범위" in risk_detail_render_slice
             ):
                 risk_detail_errors.append("detail_layout_contract")
+            selected_action_source = view_src[
+                view_src.find("def _render_selected_dashboard_action_detail"):
+                view_src.find("def _risk_detail_filter_keys")
+            ]
+            for token in ("재고커버일", "재고커버 자료상태", "최소보충수량", "과잉·저활성 근거", "출고 자료상태"):
+                if token not in selected_action_source:
+                    risk_detail_errors.append(f"selected_action_extension_missing={token}")
 
             detail_rows[0]["_\uc8fc\uc694\ub9e4\uc785\ucc98\ud544\ud130\ud0a4"] = "assigned:A"
             excel_bytes, excel_info = risk_detail_mod.build_dashboard_risk_detail_excel_bytes(

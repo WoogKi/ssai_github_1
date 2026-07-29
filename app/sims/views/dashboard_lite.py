@@ -9,6 +9,7 @@ import hashlib
 import html
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -1577,12 +1578,16 @@ def _render_selected_dashboard_action_detail(facts: dict[str, Any], cache: dict[
     product_name = str(row.get("제품명") or product_code or "제품")
     st.markdown(f"{_dashboard_action_status_badge(status)} &nbsp; **{html.escape(product_name)}**", unsafe_allow_html=True)
     amount_unit = _facts_amount_display_unit(facts)
+    minimum_replenishment_qty = _minimum_replenishment_qty(row.get("위험보정부족예상수량"))
     st.caption(f"제품코드 {str(row.get('제품코드') or '자료 없음')} · 주요매입처 {str(row.get('주요매입처명') or '자료 없음')}")
     values = (
-        ("현재재고수량", _fmt_number(row.get("현재재고수량"), 2) if row.get("현재재고수량") is not None else "자료 없음"),
+        ("현재고", _fmt_number(row.get("현재재고수량"), 0) if row.get("현재재고수량") is not None else "자료 없음"),
         ("위험보정잔여예상수요", _fmt_number(row.get("위험보정잔여예상수요"), 2) if row.get("위험보정잔여예상수요") is not None else "자료 없음"),
-        ("위험보정부족예상수량", _fmt_number(row.get("위험보정부족예상수량"), 2) if row.get("위험보정부족예상수량") is not None else "자료 없음"),
+        ("부족예상수량", _fmt_number(row.get("위험보정부족예상수량"), 2) if row.get("위험보정부족예상수량") is not None else "자료 없음"),
+        ("최소보충수량", _fmt_number(minimum_replenishment_qty, 0) if minimum_replenishment_qty is not None else "자료 없음"),
         ("위험보정부족예상금액", _fmt_dashboard_amount(row.get("위험보정부족예상금액"), amount_unit) if row.get("위험보정부족예상금액") is not None else "자료 없음"),
+        ("재고커버일", _fmt_number(row.get("재고커버일"), 1) if row.get("재고커버일") is not None else "자료 없음"),
+        ("재고커버 자료상태", str(row.get("재고커버 자료상태") or "자료 부족")),
     )
     for chunk_start in range(0, len(values), 2):
         cols = st.columns(2)
@@ -1597,6 +1602,9 @@ def _render_selected_dashboard_action_detail(facts: dict[str, Any], cache: dict[
             f"수요급증 {'수요급증' if bool(row.get('수요급증여부')) else '해당 없음'}",
             f"최근 정상 입고일 {str(row.get('최근 정상 입고일') or '자료 없음')}",
             f"입고 경과일 {str(row.get('입고 경과일') or '자료 없음')}",
+            f"과잉·저활성 근거 {str(row.get('과잉·저활성 근거') or '자료 없음')}",
+            f"최근 정상 출고일 {str(row.get('최근 정상 출고일') or '자료 연결 필요')}",
+            f"출고 자료상태 {str(row.get('출고 자료상태') or '자료 연결 필요')}",
         ))
     )
     st.markdown(f"**권장 조치: {html.escape(str(selected_action.get('recommended_action') or '자료 없음'))}**")
@@ -1698,8 +1706,16 @@ _RISK_DETAIL_DISPLAY_COLUMNS = (
     "현재재고수량",
     "위험보정잔여예상수요",
     "위험보정부족예상수량",
+    "최소보충수량",
     "위험보정부족예상금액",
     "위험보정재고준비율",
+    "재고커버일",
+    "재고커버 자료상태",
+    "과잉후보여부",
+    "과잉·저활성 근거",
+    "최근 정상 출고일",
+    "출고 경과일",
+    "출고 자료상태",
     "수요급증세부분류",
     "최근 정상 입고일",
     "입고 경과일",
@@ -1713,6 +1729,21 @@ _RISK_DETAIL_DISPLAY_COLUMNS = (
     "최근365일 입고이력",
 )
 
+_RISK_DETAIL_PINNED_COLUMNS = {
+    "순번",
+    "위험상태",
+    "위험사유",
+    "제품코드",
+    "제품명",
+    "규격",
+}
+
+_RISK_DETAIL_OUTBOUND_COLUMNS = {
+    "최근 정상 출고일",
+    "출고 경과일",
+    "출고 자료상태",
+}
+
 _RISK_DETAIL_DISPLAY_TEXT_COLUMNS = {
     "위험상태",
     "위험사유",
@@ -1721,6 +1752,11 @@ _RISK_DETAIL_DISPLAY_TEXT_COLUMNS = {
     "규격",
     "제조사명",
     "주요매입처명",
+    "재고커버 자료상태",
+    "과잉후보여부",
+    "과잉·저활성 근거",
+    "최근 정상 출고일",
+    "출고 자료상태",
     "수요급증세부분류",
     "최근 정상 입고일",
     "입고 자료상태",
@@ -1753,12 +1789,63 @@ def _risk_detail_display_height(display_rows: int) -> int:
     return min(560, max(220, 72 + int(display_rows) * 35))
 
 
+def _risk_detail_has_outbound_facts(filtered: pd.DataFrame) -> bool:
+    """Keep unavailable outbound placeholders out of the primary detail grid."""
+    if filtered.empty:
+        return False
+    if "출고 자료상태" in filtered.columns:
+        statuses = filtered["출고 자료상태"].fillna("").astype(str).str.strip()
+        populated_statuses = statuses.loc[statuses.ne("")]
+        return bool(populated_statuses.ne("자료 연결 필요").any())
+    if "최근 정상 출고일" in filtered.columns:
+        dates = filtered["최근 정상 출고일"].fillna("").astype(str).str.strip()
+        return bool(dates.ne("").any())
+    return False
+
+
+def _minimum_replenishment_qty(value: Any) -> int | None:
+    """Return the display-only unit-level replenishment reference quantity."""
+    try:
+        shortage_qty = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(shortage_qty):
+        return None
+    return max(0, math.ceil(shortage_qty))
+
+
 def _build_risk_detail_display_frame(filtered: pd.DataFrame, display_limit: int) -> pd.DataFrame:
     """Build a presentation-only slice without changing cached or export facts."""
     limit = max(0, int(display_limit or 0))
     display = filtered.head(limit).copy()
     display.insert(0, "순번", range(1, len(display) + 1))
-    visible_columns = [column for column in _RISK_DETAIL_DISPLAY_COLUMNS if column in display.columns]
+    shortage_qty = pd.to_numeric(display.get("위험보정부족예상수량"), errors="coerce")
+    if not isinstance(shortage_qty, pd.Series):
+        shortage_qty = pd.Series(index=display.index, dtype="float64")
+    minimum_replenishment = (-shortage_qty.clip(lower=0)).floordiv(1).mul(-1)
+    display["최소보충수량"] = minimum_replenishment.astype("Int64")
+
+    if "과잉후보여부" in display.columns:
+        overstock_candidate = display["과잉후보여부"].eq(True)
+        display["과잉후보여부"] = overstock_candidate.map({True: "예", False: ""})
+        if "과잉·저활성 근거" in display.columns:
+            display.loc[~overstock_candidate, "과잉·저활성 근거"] = ""
+    if "재고커버 자료상태" in display.columns:
+        display["재고커버 자료상태"] = display["재고커버 자료상태"].replace({
+            "ready": "계산 가능",
+            "zero_stock": "재고 없음",
+            "no_demand": "잔여수요 없음",
+            "insufficient_data": "자료 부족",
+            "closed_horizon": "평가기간 종료",
+        })
+
+    hidden_columns = set()
+    if not _risk_detail_has_outbound_facts(filtered):
+        hidden_columns.update(_RISK_DETAIL_OUTBOUND_COLUMNS)
+    visible_columns = [
+        column for column in _RISK_DETAIL_DISPLAY_COLUMNS
+        if column in display.columns and column not in hidden_columns
+    ]
     display = display.loc[:, visible_columns]
 
     for column in _RISK_DETAIL_DISPLAY_TEXT_COLUMNS.intersection(display.columns):
@@ -1766,10 +1853,12 @@ def _build_risk_detail_display_frame(filtered: pd.DataFrame, display_limit: int)
         cleaned = values.where(values.notna(), "").astype(str).str.strip()
         display[column] = cleaned.mask(cleaned.str.casefold().isin({"none", "nan", "nat"}), "")
 
-    if "최근 정상 입고일" in display.columns:
-        values = display["최근 정상 입고일"].astype(str).str.strip()
+    for date_column in ("최근 정상 입고일", "최근 정상 출고일"):
+        if date_column not in display.columns:
+            continue
+        values = display[date_column].astype(str).str.strip()
         valid_yyyymmdd = values.str.fullmatch(r"\d{8}")
-        display.loc[valid_yyyymmdd, "최근 정상 입고일"] = (
+        display.loc[valid_yyyymmdd, date_column] = (
             values.loc[valid_yyyymmdd].str.slice(0, 4)
             + "-"
             + values.loc[valid_yyyymmdd].str.slice(4, 6)
@@ -1781,26 +1870,40 @@ def _build_risk_detail_display_frame(filtered: pd.DataFrame, display_limit: int)
 
 def _risk_detail_display_column_config() -> dict[str, Any]:
     return {
-        "순번": st.column_config.NumberColumn("순번", format="%d", width="small"),
-        "위험상태": st.column_config.TextColumn("위험상태", width="small"),
-        "위험사유": st.column_config.TextColumn("위험사유", width="medium"),
-        "제품코드": st.column_config.TextColumn("제품코드", width="small"),
-        "제품명": st.column_config.TextColumn("제품명", width="large"),
-        "규격": st.column_config.TextColumn("규격", width="medium"),
-        "제조사명": st.column_config.TextColumn("제조사명", width="medium"),
-        "주요매입처명": st.column_config.TextColumn("주요매입처명", width="large"),
-        "현재재고수량": st.column_config.NumberColumn("현재재고수량", format="%,.2f", width="small"),
-        "위험보정잔여예상수요": st.column_config.NumberColumn("위험보정잔여예상수요", format="%,.2f", width="medium"),
-        "위험보정부족예상수량": st.column_config.NumberColumn("위험보정부족예상수량", format="%,.2f", width="medium"),
-        "위험보정부족예상금액": st.column_config.NumberColumn("위험보정부족예상금액", format="%,.0f", width="medium"),
-        "위험보정재고준비율": st.column_config.NumberColumn("위험보정재고준비율", format="%.2f%%", width="small"),
-        "수요급증세부분류": st.column_config.TextColumn("수요급증세부분류", width="medium"),
-        "최근 정상 입고일": st.column_config.TextColumn("최근 정상 입고일", width="medium"),
-        "입고 경과일": st.column_config.NumberColumn("입고 경과일", format="%,.0f", width="small"),
-        "정상 입고 거래일수": st.column_config.NumberColumn("정상 입고 거래일수", format="%,.0f", width="small"),
-        "평균 입고간격일": st.column_config.NumberColumn("평균 입고간격일", format="%,.2f", width="small"),
-        "입고 자료상태": st.column_config.TextColumn("입고 자료상태", width="medium"),
-        "입고 지연후보": st.column_config.TextColumn("입고 지연후보", width="small"),
+        "순번": st.column_config.NumberColumn("순번", format="%d", width=60, pinned=True, alignment="center"),
+        "위험상태": st.column_config.TextColumn("위험상태", width=100, pinned=True, alignment="center"),
+        "위험사유": st.column_config.TextColumn("위험사유", width=150, pinned=True),
+        "제품코드": st.column_config.TextColumn("제품코드", width=90, pinned=True, alignment="center"),
+        "제품명": st.column_config.TextColumn("제품명", width=280, pinned=True),
+        "규격": st.column_config.TextColumn("규격", width=90, pinned=True, alignment="center"),
+        "제조사명": st.column_config.TextColumn("제조사명", width=150),
+        "주요매입처명": st.column_config.TextColumn("주요매입처명", width=230),
+        "현재재고수량": st.column_config.NumberColumn("현재고", format="%,.0f", width=100, alignment="right"),
+        "위험보정잔여예상수요": st.column_config.NumberColumn("잔여예상수요", format="%,.2f", width=120, alignment="right"),
+        "위험보정부족예상수량": st.column_config.NumberColumn("부족예상수량", format="%,.2f", width=120, alignment="right"),
+        "최소보충수량": st.column_config.NumberColumn(
+            "최소보충수량",
+            format="%,.0f",
+            width=120,
+            alignment="right",
+            help="부족예상수량을 제품 단위로 올림한 최소 보충 참고수량입니다. 실제 발주수량은 포장·발주단위를 확인해야 합니다.",
+        ),
+        "위험보정부족예상금액": st.column_config.NumberColumn("부족예상금액", format="%,.0f", width=130, alignment="right"),
+        "위험보정재고준비율": st.column_config.NumberColumn("재고준비율", format="%.2f%%", width=110, alignment="right"),
+        "재고커버일": st.column_config.NumberColumn("커버일", format="%,.1f", width=90, alignment="right"),
+        "재고커버 자료상태": st.column_config.TextColumn("커버상태", width=120, alignment="center"),
+        "과잉후보여부": st.column_config.TextColumn("과잉후보", width=80, alignment="center"),
+        "과잉·저활성 근거": st.column_config.TextColumn("과잉근거", width=220),
+        "최근 정상 출고일": st.column_config.TextColumn("최근 정상 출고일", width=120, alignment="center"),
+        "출고 경과일": st.column_config.NumberColumn("출고 경과일", format="%,.0f", width=100, alignment="right"),
+        "출고 자료상태": st.column_config.TextColumn("출고 자료상태", width=120, alignment="center"),
+        "수요급증세부분류": st.column_config.TextColumn("수요급증유형", width=150),
+        "최근 정상 입고일": st.column_config.TextColumn("최근 정상 입고일", width=120, alignment="center"),
+        "입고 경과일": st.column_config.NumberColumn("입고 경과일", format="%,.0f", width=100, alignment="right"),
+        "정상 입고 거래일수": st.column_config.NumberColumn("입고거래일수", format="%,.0f", width=110, alignment="right"),
+        "평균 입고간격일": st.column_config.NumberColumn("평균입고간격", format="%,.2f", width=120, alignment="right"),
+        "입고 자료상태": st.column_config.TextColumn("입고 자료상태", width=110, alignment="center"),
+        "입고 지연후보": st.column_config.TextColumn("입고 지연후보", width=100, alignment="center"),
     }
 
 
@@ -1862,6 +1965,7 @@ def _render_risk_detail(
     if not summary:
         return
     st.markdown("### 위험 품목 상세")
+    st.caption("재고커버일은 현재 평가월의 위험보정 잔여예상수요를 기준으로 계산한 재고 보유 가능 일수입니다.")
     summary_cols = st.columns(3)
     for column, (label, key) in zip(summary_cols, (
         ("전체 위험품목", "source_rows"), ("긴급 부족", "emergency_rows"), ("부족 주의", "warning_rows"),
@@ -1983,6 +2087,8 @@ def _render_risk_detail(
     )
     with utility_cols[3]:
         st.caption(_risk_detail_display_summary(filter_summary["filtered_rows"], len(display)))
+    if not _risk_detail_has_outbound_facts(filtered):
+        st.caption("최근 정상 출고일은 일자 단위 원천 연결 후 제공됩니다.")
     st.dataframe(
         display,
         width="stretch",

@@ -1744,12 +1744,126 @@ def _attach_major_purchase_vendors(
     return {"summary": summary, "rows": vendor_rows, "top_rows": vendor_rows[:10], "aggregate_ms": aggregate_ms, "rank_ms": rank_ms, "group_ms": vendor_risk_group_ms}
 
 
+def _attach_stock_extension_facts(
+    rows: list[dict[str, Any]],
+    *,
+    evaluation_remaining_days: int | None,
+) -> dict[str, Any]:
+    """Attach display-only stock-cover and evidence facts from existing rows.
+
+    The shared sales bundle is monthly, so it cannot truthfully provide a last
+    normal-outbound date. Keep that boundary explicit instead of inventing a
+    date or adding a source call.
+    """
+    started = time.perf_counter()
+    if not rows:
+        summary = {
+            "inventory_rows": 0,
+            "ready_rows": 0,
+            "zero_stock_rows": 0,
+            "no_demand_rows": 0,
+            "insufficient_data_rows": 0,
+            "closed_horizon_rows": 0,
+            "outbound_source_required_rows": 0,
+            "additional_source_call_count": 0,
+            "elapsed_ms": int((time.perf_counter() - started) * 1000),
+        }
+        log.info(
+            "[dashboard.stock_extension] inventory_rows=0 ready_rows=0 zero_stock_rows=0 no_demand_rows=0 insufficient_data_rows=0 closed_horizon_rows=0 outbound_source_required_rows=0 additional_source_call_count=0 elapsed_ms=%s",
+            summary["elapsed_ms"],
+        )
+        return summary
+
+    work = pd.DataFrame(rows)
+    index = work.index
+    stock = pd.to_numeric(work.get("current_stock_qty", pd.Series(float("nan"), index=index)), errors="coerce")
+    demand = pd.to_numeric(
+        work.get("위험보정잔여예상수요", work.get("remaining_expected_demand_qty", pd.Series(float("nan"), index=index))),
+        errors="coerce",
+    )
+    stock_present = work.get("_stock_cover_stock_present", stock.notna()).fillna(False).astype(bool)
+    demand_present = work.get("_stock_cover_demand_present", demand.notna()).fillna(False).astype(bool)
+    required = stock_present & demand_present & stock.notna() & demand.notna()
+    try:
+        remaining_days = int(evaluation_remaining_days) if evaluation_remaining_days is not None else None
+    except (TypeError, ValueError):
+        remaining_days = None
+
+    status = pd.Series("insufficient_data", index=index, dtype="object")
+    cover_days = pd.Series(float("nan"), index=index, dtype="float64")
+    daily_demand = pd.Series(float("nan"), index=index, dtype="float64")
+    if remaining_days is not None and remaining_days <= 0:
+        status.loc[:] = "closed_horizon"
+    elif remaining_days is not None:
+        daily_demand = demand / float(remaining_days)
+        no_demand = required & demand.le(0)
+        positive_demand = required & demand.gt(0)
+        zero_stock = positive_demand & stock.le(0)
+        ready = positive_demand & stock.gt(0)
+        status.loc[no_demand] = "no_demand"
+        status.loc[zero_stock] = "zero_stock"
+        status.loc[ready] = "ready"
+        cover_days.loc[zero_stock] = 0.0
+        cover_days.loc[ready] = stock.loc[ready] / daily_demand.loc[ready]
+
+    status_labels = {
+        "ready": "계산 가능",
+        "zero_stock": "재고 없음",
+        "no_demand": "잔여 예상수요 없음",
+        "insufficient_data": "자료 부족",
+        "closed_horizon": "평가기간 종료",
+    }
+    overstock_candidate = work.get("과잉후보여부", pd.Series(False, index=index)).fillna(False).astype(bool)
+    overstock_reason = work.get("과잉후보사유", pd.Series("", index=index, dtype="object")).fillna("").astype(str).str.strip()
+    evidence = pd.Series("기존 과잉후보 기준 미해당", index=index, dtype="object")
+    evidence.loc[overstock_candidate] = overstock_reason.loc[overstock_candidate].where(
+        overstock_reason.loc[overstock_candidate].ne(""),
+        "기존 과잉후보 기준 해당",
+    )
+
+    work["stock_cover_days"] = cover_days.astype("object").where(cover_days.notna(), None)
+    work["stock_cover_daily_demand_qty"] = daily_demand.astype("object").where(daily_demand.notna(), None)
+    work["stock_cover_remaining_days"] = remaining_days
+    work["stock_cover_status"] = status
+    work["재고커버일"] = work["stock_cover_days"]
+    work["재고커버 자료상태"] = status.map(status_labels).fillna("자료 부족")
+    work["과잉·저활성 근거"] = evidence
+    work["last_normal_outbound_date"] = ""
+    work["outbound_elapsed_days"] = None
+    work["outbound_data_status"] = "source_required"
+    work["최근 정상 출고일"] = ""
+    work["출고 경과일"] = None
+    work["출고 자료상태"] = "자료 연결 필요"
+    rows[:] = work.drop(columns=["_stock_cover_stock_present", "_stock_cover_demand_present"], errors="ignore").to_dict("records")
+
+    counts = status.value_counts(dropna=False)
+    summary = {
+        "inventory_rows": int(len(work)),
+        "ready_rows": int(counts.get("ready", 0)),
+        "zero_stock_rows": int(counts.get("zero_stock", 0)),
+        "no_demand_rows": int(counts.get("no_demand", 0)),
+        "insufficient_data_rows": int(counts.get("insufficient_data", 0)),
+        "closed_horizon_rows": int(counts.get("closed_horizon", 0)),
+        "outbound_source_required_rows": int(len(work)),
+        "additional_source_call_count": 0,
+        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+    }
+    log.info(
+        "[dashboard.stock_extension] inventory_rows=%s ready_rows=%s zero_stock_rows=%s no_demand_rows=%s insufficient_data_rows=%s closed_horizon_rows=%s outbound_source_required_rows=%s additional_source_call_count=0 elapsed_ms=%s",
+        summary["inventory_rows"], summary["ready_rows"], summary["zero_stock_rows"],
+        summary["no_demand_rows"], summary["insufficient_data_rows"], summary["closed_horizon_rows"],
+        summary["outbound_source_required_rows"], summary["elapsed_ms"],
+    )
+    return summary
+
+
 _RISK_DETAIL_COLUMNS = (
     "위험상태", "위험사유", "제품코드", "제품명", "규격", "제조사명", "제품그룹명", "제품구분명", "제품분류명",
     "주요매입처코드", "주요매입처명", "주요매입처상태", "주요매입처선정기준", "재고기준",
     "현재재고수량", "현재재고금액", "재고평가단가", "당월현재출고수량", "당월기준예상출고수량",
     "진행속도기준월말예상출고수량", "위험보정예상출고수량", "위험보정잔여예상수요", "위험보정재고준비율",
-    "위험보정부족예상수량", "위험보정부족예상금액", "수요급증여부", "수요급증상위분류", "수요급증세부분류",
+    "위험보정부족예상수량", "위험보정부족예상금액", "재고커버일", "재고커버 자료상태", "과잉후보여부", "과잉·저활성 근거",
+    "최근 정상 출고일", "출고 경과일", "출고 자료상태", "수요급증여부", "수요급증상위분류", "수요급증세부분류",
     "수요급증사유", "최근6완료월순매입금액", "최근6완료월순입고수량", "최근6완료월최근매입월",
 )
 
@@ -1802,6 +1916,13 @@ def _build_dashboard_risk_detail(
             "위험보정재고준비율": float(row.get("위험보정재고준비율") or 0),
             "위험보정부족예상수량": float(row.get("위험보정부족예상수량") or 0),
             "위험보정부족예상금액": float(row.get("위험보정부족예상금액") or 0),
+            "재고커버일": row.get("stock_cover_days"),
+            "재고커버 자료상태": str(row.get("재고커버 자료상태") or "자료 부족"),
+            "과잉후보여부": bool(row.get("과잉후보여부")),
+            "과잉·저활성 근거": str(row.get("과잉·저활성 근거") or ""),
+            "최근 정상 출고일": str(row.get("last_normal_outbound_date") or ""),
+            "출고 경과일": row.get("outbound_elapsed_days"),
+            "출고 자료상태": str(row.get("출고 자료상태") or "자료 연결 필요"),
             "수요급증여부": bool(row.get("수요급증여부")),
             "수요급증상위분류": str(row.get("수요급증상위분류") or ""),
             "수요급증세부분류": str(row.get("수요급증세부분류") or ""),
@@ -2069,6 +2190,8 @@ def _build_inventory_facts(
                     "_source_shortage_qty": source_shortage_qty,
                     "_source_shortage_amt": source_shortage_amt,
                     "_unit_price": unit_price,
+                    "_stock_cover_stock_present": row.get("현재재고수량") is not None and pd.notna(row.get("현재재고수량")) and str(row.get("현재재고수량")).strip() != "",
+                    "_stock_cover_demand_present": row.get("당월 잔여예상출고수량") is not None and pd.notna(row.get("당월 잔여예상출고수량")) and str(row.get("당월 잔여예상출고수량")).strip() != "",
                     "_stock_risk_required_values_present": all(
                         value is not None and pd.notna(value) and str(value).strip() != ""
                         for value in required_values
@@ -2098,6 +2221,8 @@ def _build_inventory_facts(
                     "_source_shortage_qty": 0.0,
                     "_source_shortage_amt": 0.0,
                     "_unit_price_values": [],
+                    "_stock_cover_stock_present": True,
+                    "_stock_cover_demand_present": True,
                     "_stock_risk_required_values_present": True,
                 },
             )
@@ -2117,6 +2242,8 @@ def _build_inventory_facts(
             if float(item.get("_unit_price") or 0) > 0:
                 acc["_unit_price_values"].append(float(item.get("_unit_price") or 0))
             acc["_stock_risk_required_values_present"] = bool(acc["_stock_risk_required_values_present"]) and bool(item.get("_stock_risk_required_values_present"))
+            acc["_stock_cover_stock_present"] = bool(acc["_stock_cover_stock_present"]) and bool(item.get("_stock_cover_stock_present"))
+            acc["_stock_cover_demand_present"] = bool(acc["_stock_cover_demand_present"]) and bool(item.get("_stock_cover_demand_present"))
 
         for row in grouped.values():
             stock = float(row.get("current_stock_qty") or 0)
@@ -2158,6 +2285,8 @@ def _build_inventory_facts(
                     "shortage_qty": shortage_qty,
                     "shortage_amt": shortage_amt,
                     "stock_valuation_unit_price": unit_price,
+                    "_stock_cover_stock_present": bool(row.get("_stock_cover_stock_present")),
+                    "_stock_cover_demand_present": bool(row.get("_stock_cover_demand_present")),
                     "_stock_risk_required_values_present": bool(row.get("_stock_risk_required_values_present")),
                     "has_demand": has_demand,
                     "status": status,
@@ -2189,6 +2318,10 @@ def _build_inventory_facts(
         rows,
         inbound_facts_df,
         inbound_source_call_count=inbound_source_call_count,
+    )
+    stock_extension_summary = _attach_stock_extension_facts(
+        rows,
+        evaluation_remaining_days=demand_surge_context["evaluation_remaining_days"],
     )
     risk_detail_rows, risk_detail_summary = _build_dashboard_risk_detail(rows, stock_mode=stock_mode)
     demand_rows = [r for r in rows if r.get("재고위험상태") != "판정 제외"]
@@ -2309,6 +2442,7 @@ def _build_inventory_facts(
         "vendor_stock_risk_rows": vendor_stock_risk["rows"],
         "vendor_stock_risk_top_rows": vendor_stock_risk["top_rows"],
         "inbound_summary": inbound_summary,
+        "stock_extension_summary": stock_extension_summary,
         "risk_detail_summary": risk_detail_summary,
         "risk_detail_rows": risk_detail_rows,
         "data_quality": [] if rows else ["재고준비율 산정 자료 없음"],
