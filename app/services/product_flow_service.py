@@ -1192,6 +1192,7 @@ def _flow_candidate_table_payload(
             date_from=date_from,
             date_to=date_to,
             meta={
+                "result_status": "no_data",
                 "pending_product_candidates": [],
                 "pending_product_action": ACTION,
                 "pending_product_params": {
@@ -1216,6 +1217,7 @@ def _flow_candidate_table_payload(
     )
 
     meta = {
+        "result_status": "candidate_required",
         "row_count": int(len(df_candidates)),
         "row_count_total": int(len(cand_df)) if isinstance(cand_df, pd.DataFrame) else int(len(df_candidates)),
         "query_summary": f"제품명 후보검색 {physic_nm}",
@@ -1310,6 +1312,19 @@ def get_product_flow_result(params: Optional[Dict[str, Any]] = None) -> Dict[str
     params = coalesce_params(params)
     settings = _mode_settings(params)
 
+    # NLQ 외 직접 호출도 제품 조건 없이 후보/수불 SQL로 진행하지 않는다.
+    if not clean_text(params.get("physic_cd")) and not clean_text(params.get("physic_nm")):
+        return _flow_text_payload(
+            message="제품수불현황은 제품 1개를 먼저 지정해 주세요. 예: 제품수불현황 제품명 우루사 조회",
+            params=params,
+            meta={
+                "input_required": True,
+                "result_status": "input_required",
+                "row_count": 0,
+                "row_count_total": 0,
+            },
+        )
+
     try:
         date_from, date_to = _resolve_flow_dates(params)
 
@@ -1357,6 +1372,12 @@ def get_product_flow_result(params: Optional[Dict[str, Any]] = None) -> Dict[str
                     settings=settings,
                     date_from=date_from,
                     date_to=date_to,
+                    meta={
+                        "input_required": True,
+                        "result_status": "input_required",
+                        "row_count": 0,
+                        "row_count_total": 0,
+                    },
                 )
 
         work_params = dict(params)
@@ -1382,7 +1403,12 @@ def get_product_flow_result(params: Optional[Dict[str, Any]] = None) -> Dict[str
                 date_from=date_from,
                 date_to=date_to,
                 work_params=work_params,
-                meta=meta,
+                meta={
+                    **dict(meta or {}),
+                    "result_status": "no_data",
+                    "row_count": 0,
+                    "row_count_total": 0,
+                },
             )
 
         detail_count = len(df_display)
@@ -1427,6 +1453,7 @@ def get_product_flow_result(params: Optional[Dict[str, Any]] = None) -> Dict[str
             "message": f"제품수불현황 {max(detail_count, 0):,}건",
             "meta": {
                 **meta,
+                "result_status": "success",
                 "query_summary": _build_flow_query_summary(
                     date_from=date_from,
                     date_to=date_to,

@@ -7,6 +7,7 @@ import re
 import uuid
 import datetime as dt
 import os
+import time
 
 import importlib
 import pandas as pd
@@ -910,7 +911,10 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return {"route": "analytics", "action": str(analytics_action)}
 
     try:
-        from app.services.io_nlq import resolve_io_nlq
+        from app.services.io_nlq import (
+            resolve_io_nlq,
+            resolve_unlabeled_io_entity_condition,
+        )
 
         io_input = _append_lookup_verb_for_io(_normalize_io_action_spacing(normalized))
         parsed = resolve_io_nlq(io_input)
@@ -1927,6 +1931,10 @@ def _try_handle_analytics_nlq(
         return False
 
     params = _build_analytics_params(t, action)
+    from app.services.io_nlq import apply_nlq_default_period_policy
+
+    _, period_policy = apply_nlq_default_period_policy(params, action)
+    _log_nlq_period_policy(logger, action, period_policy, params)
     params = _apply_company_default_to_analytics_nlq(
         params,
         text=t,
@@ -1956,6 +1964,7 @@ def _try_handle_analytics_nlq(
                 "company_io_required": True,
                 "row_count": 0,
                 "row_count_total": 0,
+                "period_policy": period_policy,
             },
         }
         push_sims_result_to_chat(payload, action)
@@ -1992,6 +2001,7 @@ def _try_handle_analytics_nlq(
                 "row_count_total": 0,
                 "condition": "",
                 "query_summary": "",
+                "period_policy": period_policy,
             },
         }
 
@@ -2032,6 +2042,7 @@ def _try_handle_analytics_nlq(
         "_force_push": True,
         "_nlq_nonce": str(uuid.uuid4()),
         "analysis_nlq": True,
+        "period_policy": period_policy,
     })
     payload["meta"] = meta
 
@@ -2081,6 +2092,12 @@ def _apply_io_recent_1month_default(
     - 화면 표시는 기존처럼 200건만 표시한다.
     - LLM/다운로드는 이 조회조건 전체 건을 기준으로 한다.
     """
+    from app.services.io_nlq import apply_nlq_default_period_policy
+
+    out, policy = apply_nlq_default_period_policy(params, action)
+    if bool(policy.get("auto_applied")):
+        return out
+
     out = dict(params or {})
 
     if _io_has_period_params(out):
@@ -2117,6 +2134,35 @@ def _apply_io_recent_1month_default(
     return out
 
 
+def _apply_io_period_policy(
+    params: Dict[str, Any],
+    action: str,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Apply the canonical policy and retain its display/logging metadata."""
+    from app.services.io_nlq import apply_nlq_default_period_policy
+
+    return apply_nlq_default_period_policy(params, action)
+
+
+def _log_nlq_period_policy(logger, action: str, policy: Dict[str, Any], params: Dict[str, Any]) -> None:
+    """Emit count-only period-policy diagnostics for IO and analytics NLQ."""
+    logger.info(
+        "[nlq.period_policy] action=%r action_class=%s explicit_period_present=%s "
+        "explicit_condition_names=%s explicit_condition_count=%s default_policy=%s "
+        "policy_reason=%s final_date_from=%s final_date_to=%s auto_applied=%s",
+        action,
+        policy.get("action_class"),
+        policy.get("explicit_period_present"),
+        policy.get("explicit_condition_names"),
+        policy.get("explicit_condition_count"),
+        policy.get("default_policy"),
+        policy.get("policy_reason"),
+        policy.get("final_date_from") or params.get("date_from"),
+        policy.get("final_date_to") or params.get("date_to"),
+        policy.get("auto_applied"),
+    )
+
+
 def _fmt_io_yyyymmdd(value: Any) -> str:
     s = re.sub(r"[^0-9]", "", str(value or ""))
     if len(s) == 8:
@@ -2151,7 +2197,45 @@ def _append_code_name(parts: list[str], label: str, code: Any = "", name: Any = 
         parts.append(f"{label} {name_s}")
 
 
-def _build_io_query_summary(action: str, params: Dict[str, Any]) -> str:
+def _period_policy_summary_label(period_policy: Dict[str, Any] | None) -> str:
+    policy = dict(period_policy or {})
+    if not bool(policy.get("auto_applied")):
+        return ""
+    if str(policy.get("default_policy") or "") == "current_month":
+        condition_labels = {
+            "manufacturer": "제약사 조건",
+            "product": "제품 조건",
+            "vendor": "거래처 조건",
+            "stock": "재고위치 조건",
+            "salesperson": "영업사원 조건",
+            "region": "지역 조건",
+            "io_type": "입출고구분 조건",
+            "product_category": "제품분류 조건",
+        }
+        names = list(policy.get("explicit_condition_names") or [])
+        return f"최근 1개월 자동적용({condition_labels.get(str(names[0]), '명시 조건')})"
+    return {
+        "recent_1day": "최근 1일 자동적용(추가 조건 없음)",
+        "recent_7days": "최근 7일 자동적용(단일 제품 수불)",
+        "current_month_inventory": "현재월 자동적용(재고 월조회)",
+        "current_month_snapshot": "기본월 자동적용",
+    }.get(str(policy.get("default_policy") or ""), "기본기간 자동적용")
+
+
+def _begin_sims_nlq_response_timing(session_state: Dict[str, Any]) -> None:
+    """Record the request boundary once, before a routed SIMS NLQ does work."""
+    started_at = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+    session_state["__sims_nlq_response_timing"] = {
+        "request_started_at": started_at,
+        "request_started_monotonic": time.monotonic(),
+    }
+
+
+def _build_io_query_summary(
+    action: str,
+    params: Dict[str, Any],
+    period_policy: Dict[str, Any] | None = None,
+) -> str:
     """
     IO / 명세서 / 재고 NLQ 공통 조회조건 표시용 summary.
 
@@ -2218,7 +2302,7 @@ def _build_io_query_summary(action: str, params: Dict[str, Any]) -> str:
 
     # 제품/거래처
     _append_code_name(parts, "제품", p.get("physic_cd"), p.get("physic_nm"))
-    _append_code_name(parts, "거래처", p.get("ven_cd"), p.get("ven_nm"))
+    _append_code_name(parts, "거래처", p.get("ven_cd"), _first_clean_value(p.get("ven_nm"), p.get("ven_nm_display")))
 
     # 거래처/제품 관련 참조 조건
     maker_cd = _first_clean_value(p.get("maker_cd"), p.get("product_ven_cd"))
@@ -2279,16 +2363,21 @@ def _build_io_query_summary(action: str, params: Dict[str, Any]) -> str:
     if str(p.get("only_mismatch_tax") or "").upper() == "Y":
         parts.append("세금계산서 불일치만")
 
-    # 기본기간/기본월 자동 적용 표시
-    if str(p.get("_default_recent_1month_applied") or "").upper() == "Y":
-        parts.append("최근 1개월 자동적용")
-    elif str(p.get("_default_date_applied") or "").upper() == "Y":
-        parts.append("기본기간 자동적용")
+    # The canonical policy owns the label for NLQ routes. Legacy parser
+    # markers remain only for existing callers without policy metadata.
+    policy_label = _period_policy_summary_label(period_policy)
+    if policy_label:
+        parts.append(policy_label)
+    elif period_policy is None:
+        if str(p.get("_default_recent_1month_applied") or "").upper() == "Y":
+            parts.append("최근 1개월 자동적용")
+        elif str(p.get("_default_date_applied") or "").upper() == "Y":
+            parts.append("기본기간 자동적용")
 
-    if str(p.get("_default_month_applied") or "").upper() == "Y":
-        parts.append("기본월 자동적용")
-    if str(p.get("_year_month_range_applied") or "").upper() == "Y":
-        parts.append("연도기간 자동적용")
+        if str(p.get("_default_month_applied") or "").upper() == "Y":
+            parts.append("기본월 자동적용")
+        if str(p.get("_year_month_range_applied") or "").upper() == "Y":
+            parts.append("연도기간 자동적용")
 
 
     return " / ".join(str(x).strip() for x in parts if str(x).strip())
@@ -2461,8 +2550,16 @@ def _ensure_product_flow_llm_summary(
 
     row_count = int(meta.get("row_count_total") or meta.get("row_count") or (len(df) if isinstance(df, pd.DataFrame) else 0) or 0)
 
+    if bool(meta.get("input_required")):
+        meta.setdefault("result_status", "input_required")
+        meta["llm_summary_kind"] = "product_flow_input_required"
+        meta["analysis_type"] = "product_flow"
+        payload["meta"] = meta
+        return payload
+
     # 후보표는 실제 수불표가 아니라 제품 선택 안내표다.
     if bool(meta.get("candidate_table")):
+        meta.setdefault("result_status", "candidate_required")
         candidate_count = row_count
         summary_md = (
             f"조회조건: {query_summary}\n\n"
@@ -4038,7 +4135,12 @@ def _ensure_monthly_stock_llm_summary(
 # 입출고/명세서/재고 NLQ 요약 보강
 # - 제품수불현황뿐만 아니라 입출고/명세서/재고 NLQ 결과에도 meta에 query_summary, summary_md를 보강한다.
 # - 이미 query_summary가 있는 payload는 건드리지 않는다.
-def _ensure_io_summary_meta(payload: Dict[str, Any], action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def _ensure_io_summary_meta(
+    payload: Dict[str, Any],
+    action: str,
+    params: Dict[str, Any],
+    period_policy: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
     """
     IO NLQ payload에 query_summary / condition / summary_md를 보강한다.
     제품수불현황은 LLM 분석용 flow_summary까지 추가로 보강한다.
@@ -4054,14 +4156,17 @@ def _ensure_io_summary_meta(payload: Dict[str, Any], action: str, params: Dict[s
         or ""
     ).strip()
 
-    if not query_summary:
-        query_summary = _build_io_query_summary(action, params)
+    policy_label = _period_policy_summary_label(period_policy)
+    if query_summary and policy_label and policy_label not in query_summary:
+        query_summary = f"{query_summary} / {policy_label}"
+    elif not query_summary:
+        query_summary = _build_io_query_summary(action, params, period_policy)
 
     if not query_summary:
         query_summary = "전체"
 
-    meta.setdefault("query_summary", query_summary)
-    meta.setdefault("condition", query_summary)
+    meta["query_summary"] = query_summary
+    meta["condition"] = query_summary
 
     summary_md = str(meta.get("summary_md") or "").strip()
 
@@ -4161,8 +4266,63 @@ def _try_handle_io_nlq(
     - service 실패 시에만 view fallback
     - 결과를 채팅 pending 큐로 push
     """
+    trace_request_id = uuid.uuid4().hex
+    trace_started = time.perf_counter()
+
+    def _trace_safe_params(trace_params: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep trace diagnostics useful without serializing raw entity values."""
+        safe: Dict[str, Any] = {}
+        for key in ("date_from", "date_to", "month_from", "month_to", "top_n", "stock_mode", "source_mode", "io_gu_list"):
+            value = trace_params.get(key)
+            if isinstance(value, (list, tuple, set)):
+                safe[f"{key}_count"] = len(value)
+            elif value not in (None, ""):
+                safe[key] = value
+        return safe
+
+    def _trace(
+        stage: str,
+        *,
+        trace_action: str = "",
+        trace_params: Dict[str, Any] | None = None,
+        result_status: str = "",
+        rows: int | None = None,
+        error: BaseException | None = None,
+        source_stage: str = "",
+        source_call_count: int | None = None,
+    ) -> None:
+        current_params = trace_params if isinstance(trace_params, dict) else {}
+        extracted_name = str(current_params.get("nlq_unlabeled_name") or "").strip()
+        search_fields = [
+            key for key in ("ven_nm", "maker_nm", "physic_nm", "nlq_unlabeled_name")
+            if current_params.get(key)
+        ]
+        error_text = str(error or "")
+        error_number_match = re.search(r"\b(1205|[A-Z]{2,5}\d{3,5})\b", error_text)
+        safe_error_number = error_number_match.group(1) if error_number_match else ""
+        logger.info(
+            "[nlq.trace.%s] request_id=%s question=%r action=%r extracted_name=%r "
+            "search_mode=%s search_fields=%s date_from=%s date_to=%s safe_params=%s "
+            "stage=%s rows=%s result_status=%s error_class=%s sql_error_number=%s "
+            "source_call_count=%s elapsed_ms=%s total_elapsed_ms=%s",
+            stage, trace_request_id, txt, trace_action, extracted_name,
+            "unlabeled_or" if extracted_name else "labeled_or_none", search_fields,
+            current_params.get("date_from") or "", current_params.get("date_to") or "",
+            _trace_safe_params(current_params), source_stage, rows, result_status,
+            type(error).__name__ if error is not None else "",
+            safe_error_number,
+            source_call_count,
+            int((time.perf_counter() - trace_started) * 1000),
+            int((time.perf_counter() - trace_started) * 1000),
+        )
+
+    _trace("start")
+
     try:
-        from app.services.io_nlq import resolve_io_nlq
+        from app.services.io_nlq import (
+            resolve_io_nlq,
+            resolve_unlabeled_io_entity_condition,
+        )
     except Exception:
         logger.exception("[nlq.router] failed to import io_nlq")
         return False
@@ -4233,6 +4393,7 @@ def _try_handle_io_nlq(
                     "meta": {
                         "nlq": True,
                         "nlq_query": txt,
+                        "nlq_trace_request_id": trace_request_id,
                         "_force_push": True,
                         "_nlq_nonce": str(uuid.uuid4()),
                     },
@@ -4243,9 +4404,8 @@ def _try_handle_io_nlq(
                 )
                 return True
 
+    txt_for_io = _append_lookup_verb_for_io(_normalize_io_action_spacing(txt))
     if not isinstance(parsed, dict):
-        txt_for_io = _normalize_io_action_spacing(txt)
-        txt_for_io = _append_lookup_verb_for_io(txt_for_io)
 
         parsed = resolve_io_nlq(txt_for_io)
 
@@ -4280,8 +4440,141 @@ def _try_handle_io_nlq(
     if not action:
         return False
 
-    params = _apply_io_recent_1month_default(params, action)
+    _trace("parsed", trace_action=action, trace_params=params)
+
+    # Label-free proper nouns are never assigned to a condition by wording
+    # alone.  The IO master relationships must identify exactly one semantic
+    # target; otherwise retain the existing candidate-table result contract.
+    entity_resolution = resolve_unlabeled_io_entity_condition(
+        txt_for_io,
+        action=action,
+        params=params,
+    )
+    entity_status = str(entity_resolution.get("status") or "")
+    if entity_status in {"candidate_required", "not_found", "resolution_unavailable"}:
+        candidates = list(entity_resolution.get("candidates") or [])
+        show_candidates = entity_status == "candidate_required"
+        candidate_labels = {
+            "transaction_vendor": "거래처",
+            "manufacturer": "제조사",
+            "product": "제품",
+        }
+        candidate_df = pd.DataFrame([
+            {
+                "조건 종류": candidate_labels.get(str(row.get("match_type") or ""), "조건"),
+                "조건명": str(row.get("match_value") or "").strip(),
+            }
+            for row in candidates
+        ]) if show_candidates else pd.DataFrame()
+        if entity_status == "candidate_required":
+            message = "조건 이름을 확인할 수 없습니다. 거래처, 제약사, 제품 중 하나를 지정해 다시 조회해 주세요."
+        elif entity_status == "resolution_unavailable":
+            message = "조회 조건을 확인하는 중 오류가 발생했습니다. 거래처·제약사·제품 중 조건 종류를 명시해 다시 조회해 주세요."
+        else:
+            message = "해당 조건과 일치하는 거래처·제약사·제품을 찾지 못했습니다."
+        payload = {
+            "final": True,
+            "type": "table" if not candidate_df.empty else "text",
+            "title": action,
+            "action": action,
+            "params": params,
+            "data": candidate_df if not candidate_df.empty else message,
+            "message": message,
+            "df": candidate_df if not candidate_df.empty else None,
+            "df_display": candidate_df if not candidate_df.empty else None,
+            "meta": {
+                "nlq": True,
+                "nlq_query": txt,
+                "nlq_trace_request_id": trace_request_id,
+                "result_status": "candidate_required" if entity_status == "candidate_required" else "input_required",
+                "input_required": entity_status != "candidate_required",
+                "candidate_table": show_candidates,
+                "entity_resolution_status": entity_status,
+                "candidate_count": int(len(candidates)),
+                "notice_codes": [
+                    "candidate_required" if entity_status == "candidate_required"
+                    else "resolution_unavailable" if entity_status == "resolution_unavailable"
+                    else "entity_not_found"
+                ],
+                "row_count": int(len(candidate_df)),
+                "row_count_total": int(len(candidate_df)),
+                "tableless_result": bool(candidate_df.empty),
+                "_force_push": True,
+                "_nlq_nonce": str(uuid.uuid4()),
+            },
+        }
+        push_sims_result_to_chat(payload, action)
+        _trace(
+            "result",
+            trace_action=action,
+            trace_params=params,
+            result_status=str(payload["meta"].get("result_status") or ""),
+            rows=int(len(candidate_df)),
+            source_stage="entity_resolution",
+        )
+        _trace(
+            "finish",
+            trace_action=action,
+            trace_params=params,
+            result_status=str(payload["meta"].get("result_status") or ""),
+        )
+        logger.info(
+            "[nlq.router] io unlabeled entity action=%r status=%s candidate_count=%s service_call_skipped=True",
+            action,
+            entity_status,
+            len(candidates),
+        )
+        return True
+    if entity_status == "resolved":
+        params = dict(entity_resolution.get("params") or params)
+        parsed["params"] = params
+        logger.info(
+            "[nlq.router] io unlabeled entity resolved action=%r resolved_kind=%s",
+            action,
+            str(entity_resolution.get("resolved_kind") or ""),
+        )
+
+    # 제품수불은 단일 제품이 필수다. 빈 조건은 서비스/DB 호출 전에 안내만 남긴다.
+    if action == "제품수불현황 조회" and not (
+        str(params.get("physic_cd") or "").strip()
+        or str(params.get("physic_nm") or "").strip()
+    ):
+        message = "제품수불현황은 제품 1개를 먼저 지정해 주세요. 예: 제품수불현황 제품명 우루사 조회"
+        payload = {
+            "final": True,
+            "type": "text",
+            "title": action,
+            "action": action,
+            "params": params,
+            "data": message,
+            "message": message,
+            "meta": {
+                "nlq": True,
+                "nlq_query": txt,
+                "nlq_trace_request_id": trace_request_id,
+                "input_required": True,
+                "result_status": "input_required",
+                "notice_codes": ["input_required"],
+                "row_count": 0,
+                "row_count_total": 0,
+                "tableless_result": True,
+                "_force_push": True,
+                "_nlq_nonce": str(uuid.uuid4()),
+            },
+        }
+        payload = _ensure_io_summary_meta(payload, action, params)
+        push_sims_result_to_chat(payload, action)
+        session_state["__sims_last_nlq_action"] = action
+        session_state["__sims_last_nlq_params"] = params
+        logger.info("[nlq.router] product flow input required; service_call_skipped=True")
+        _trace("result", trace_action=action, trace_params=params, result_status="input_required", rows=0, source_stage="input_required")
+        _trace("finish", trace_action=action, trace_params=params, result_status="input_required")
+        return True
+
+    params, period_policy = _apply_io_period_policy(params, action)
     parsed["params"] = params
+
+    _log_nlq_period_policy(logger, action, period_policy, params)
 
     logger.info("[nlq.router] io parsed action=%r params=%r", action, params)
 
@@ -4401,6 +4694,8 @@ def _try_handle_io_nlq(
             meta = dict(payload.get("meta") or {})
             meta.setdefault("row_count", int(len(df)))
             meta.setdefault("row_count_total", int(len(df)))
+            if action in {"제품수불현황 조회", "제품재고현황 조회"}:
+                meta.setdefault("result_status", "success")
             payload["meta"] = meta
 
             return payload
@@ -4437,6 +4732,8 @@ def _try_handle_io_nlq(
         meta.setdefault("query_summary", query_summary)
         meta.setdefault("condition", query_summary)
         meta.setdefault("summary_md", msg)
+        if action in {"제품수불현황 조회", "제품재고현황 조회"}:
+            meta.setdefault("result_status", "no_data")
         payload["meta"] = meta
 
         return payload
@@ -4493,6 +4790,7 @@ def _try_handle_io_nlq(
     }
 
     payload = None
+    detail_perf_started = time.perf_counter() if action == "출고명세 조회" else 0.0
 
     spec = service_specs.get(action)
     if spec:
@@ -4521,8 +4819,27 @@ def _try_handle_io_nlq(
                             break
 
             if fn is not None:
+                _trace("query", trace_action=action, trace_params=params, source_stage="display")
                 payload = _call_any(fn, params)
                 payload = _normalize_payload(payload, action, params)
+
+                if action == "출고명세 조회":
+                    condition_types = [
+                        key for key in (
+                            "ven_cd", "ven_nm", "product_ven_cd", "maker_nm",
+                            "physic_cd", "physic_nm", "stock_cd_list",
+                        )
+                        if params.get(key)
+                    ]
+                    logger.info(
+                        "[io.detail.perf] action=%s stage=router_display_result mode=display "
+                        "condition_type_count=%s result_rows=%s source_call_count=%s elapsed_ms=%s",
+                        action,
+                        len(condition_types),
+                        int((payload.get("meta") or {}).get("row_count") or 0),
+                        int((payload.get("meta") or {}).get("source_call_count") or 0),
+                        int((time.perf_counter() - detail_perf_started) * 1000),
+                    )
 
                 # 최종 action/title은 NLQ parser가 결정한 action을 우선한다.
                 payload["title"] = action
@@ -4537,7 +4854,8 @@ def _try_handle_io_nlq(
 
                 payload["params"] = params
 
-        except Exception:
+        except Exception as exc:
+            _trace("error", trace_action=action, trace_params=params, error=exc, source_stage="display")
             logger.exception("[nlq.router] io service failed action=%r module=%r", action, module_name)
 
     if payload is None:
@@ -4547,22 +4865,10 @@ def _try_handle_io_nlq(
             logger.exception("[nlq.router] failed to import io views")
             return False
 
-        action_map = {
-            "입고명세 조회": getattr(rddbc_io_views, "view_rddbc110", None),
-            "출고명세 조회": getattr(rddbc_io_views, "view_rddbc120", None),
-            "거래명세서 공통 조회": getattr(rddbc_io_views, "view_rddbc130", None),
-            "세금계산서 공통 조회": getattr(rddbc_io_views, "view_rddbc140", None),
-            "실재고월집계 조회": getattr(rddbc_io_views, "view_rddbc210", None),
-            "장부재고월집계 조회": getattr(rddbc_io_views, "view_rddbc220", None),
-            "입고↔거래명세서 검증": getattr(rddbc_io_views, "view_rddbc110_trans_check", None),
-            "입고↔세금계산서 검증": getattr(rddbc_io_views, "view_rddbc110_tax_check", None),
-            "출고↔거래명세서 검증": getattr(rddbc_io_views, "view_rddbc120_trans_check", None),
-            "출고↔세금계산서 검증": getattr(rddbc_io_views, "view_rddbc120_tax_check", None),
-            "제품수불현황 조회": getattr(rddbc_io_views, "view_rddbc250", None),
-            "제품재고현황 조회": getattr(rddbc_io_views, "view_rddbc260", None),
-        }
+        from app.sims.nlq.action_inventory import IO_VIEW_FALLBACK_TARGETS
 
-        handler = action_map.get(action)
+        fallback_name = IO_VIEW_FALLBACK_TARGETS.get(action, "")
+        handler = getattr(rddbc_io_views, fallback_name, None) if fallback_name else None
         if not callable(handler):
             logger.warning("[nlq.router] io action mapped but no handler: %r", action)
             return False
@@ -4574,7 +4880,7 @@ def _try_handle_io_nlq(
             logger.exception("[nlq.router] io view fallback failed action=%r params=%r", action, params)
             return False
 
-    payload = _ensure_io_summary_meta(payload, action, params)
+    payload = _ensure_io_summary_meta(payload, action, params, period_policy)
 
     meta = dict(payload.get("meta") or {})
     meta.update(
@@ -4583,15 +4889,48 @@ def _try_handle_io_nlq(
             "nlq_query": txt,
             "_force_push": True,
             "_nlq_nonce": str(uuid.uuid4()),
+            "period_policy": period_policy,
+            "nlq_trace_request_id": trace_request_id,
+            "parsed_action": action,
+            "canonical_action": str(meta.get("canonical_action") or action),
+            "search_mode": "unlabeled_or" if str(params.get("nlq_unlabeled_name") or "").strip() else "",
+            "search_fields": [
+                key for key in ("ven_nm", "maker_nm", "physic_nm", "nlq_unlabeled_name")
+                if str(params.get(key) or "").strip()
+            ],
         }
     )
     payload["meta"] = meta
     
+    delivery_started = time.perf_counter()
     try:
         push_sims_result_to_chat(payload, action)
-    except Exception:
+    except Exception as exc:
+        _trace("error", trace_action=action, trace_params=params, error=exc, source_stage="delivery")
         logger.exception("[nlq.router] push_sims_result_to_chat failed action=%r", action)
         return False
+
+    _trace(
+        "result",
+        trace_action=action,
+        trace_params=params,
+        result_status=str(meta.get("result_status") or "success"),
+        rows=int(meta.get("row_count") or 0),
+        source_stage="display_and_full_source",
+        source_call_count=int(meta.get("source_call_count") or 0),
+    )
+
+    if action == "출고명세 조회":
+        result_meta = dict(payload.get("meta") or {})
+        logger.info(
+            "[io.detail.perf] action=%s stage=delivery_with_context mode=display "
+            "result_rows=%s source_call_count=%s delivery_elapsed_ms=%s total_elapsed_ms=%s",
+            action,
+            int(result_meta.get("row_count") or 0),
+            int(result_meta.get("source_call_count") or 0),
+            int((time.perf_counter() - delivery_started) * 1000),
+            int((time.perf_counter() - detail_perf_started) * 1000) if detail_perf_started else 0,
+        )
 
     session_state["__sims_last_nlq_action"] = action
     session_state["__sims_last_nlq_params"] = params
@@ -4600,15 +4939,13 @@ def _try_handle_io_nlq(
     pending_action = str(meta.get("pending_product_action") or action).strip()
     pending_params = dict(meta.get("pending_product_params") or params)
 
-    logger.info(
-        "[nlq.router] pending product candidates action=%r rows=%s meta_keys=%s",
-        pending_action,
-        len(pending_rows) if isinstance(pending_rows, list) else None,
-        sorted(list(meta.keys())),
-    )
-
-
     if isinstance(pending_rows, list) and pending_rows:
+        logger.info(
+            "[nlq.router] pending product candidates action=%r rows=%s meta_keys=%s",
+            pending_action,
+            len(pending_rows),
+            sorted(list(meta.keys())),
+        )
         session_state["__io_pending_product_pick"] = {
             "action": pending_action,
             "params": pending_params,
@@ -4625,6 +4962,15 @@ def _try_handle_io_nlq(
     )
 
     logger.info("[nlq.router] io handled action=%r params=%r", action, params)
+    _trace(
+        "finish",
+        trace_action=action,
+        trace_params=params,
+        result_status=str(meta.get("result_status") or "success"),
+        rows=int(meta.get("row_count") or 0),
+        source_stage="delivery",
+        source_call_count=int(meta.get("source_call_count") or 0),
+    )
     return True
 
 def _clean_road_token(value: str) -> str:
@@ -4928,6 +5274,10 @@ def try_handle_nlq(
     if not raw:
         return False
 
+    # A shared push boundary completes this record.  Starting here captures
+    # routing, service work, and result preparation rather than render time.
+    _begin_sims_nlq_response_timing(session_state)
+
 
 #  NLQ 라우팅 우선순위:
 # 1) 코드마스터 화면에서 코드마스터 NLQ
@@ -5142,8 +5492,13 @@ def try_handle_nlq(
     #
     # 이런 문장은 거래처 마스터 NLQ가 먼저 가로채면 안 된다.
     try:
+        from app.services.io_nlq import is_io_validation_explanation_request
 
-        if _is_explicit_io_nlq_phrase(txt_io):
+        if is_io_validation_explanation_request(txt_io):
+            logger.info(
+                "[nlq.router] IO validation explanation question; defer to normal answer route"
+            )
+        elif _is_explicit_io_nlq_phrase(txt_io):
             if _try_handle_io_nlq(
                 txt_io,
 
@@ -5204,15 +5559,18 @@ def try_handle_nlq(
 
     # 3) 입출고/명세서/재고 NLQ 우선 처리
     try:
-        if _try_handle_io_nlq(
-            txt,
-            room=room,
-            session_state=session_state,
-            make_ts=make_ts,
-            next_seq=next_seq,
-            logger=logger,
-        ):
-            return True
+        from app.services.io_nlq import is_io_validation_explanation_request
+
+        if not is_io_validation_explanation_request(txt):
+            if _try_handle_io_nlq(
+                txt,
+                room=room,
+                session_state=session_state,
+                make_ts=make_ts,
+                next_seq=next_seq,
+                logger=logger,
+            ):
+                return True
     except Exception:
         logger.exception("[nlq.router] io-nlq handler failed")
 

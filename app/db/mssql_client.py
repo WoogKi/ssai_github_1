@@ -3,7 +3,7 @@
 
 VERSION = "chat_middleware/2025-11-01T-v1"
 
-import os, logging, time
+import os, logging, re, time
 from contextlib import contextmanager
 from urllib.parse import quote_plus
 import pyodbc
@@ -12,6 +12,179 @@ from contextvars import ContextVar
 from sqlalchemy import create_engine,text,inspect
 from sqlalchemy.engine import Engine
 from typing import Any, Optional, Sequence, Dict
+
+
+class DashboardQueryMeasurement:
+    """Collect per-query metadata only while a Dashboard request is active."""
+
+    def __init__(self, *, request_id: str, company_id: Any = "") -> None:
+        self.request_id = str(request_id or "")
+        self.company_id = str(company_id or "")
+        self.records: list[dict[str, Any]] = []
+        self.phase_records: list[dict[str, Any]] = []
+
+    def add(self, record: Dict[str, Any]) -> None:
+        self.records.append(dict(record))
+
+    def add_phase(
+        self,
+        *,
+        phase: str,
+        source_name: str,
+        source_mode: str = "",
+        input_rows: int = 0,
+        result_rows: int = 0,
+        elapsed_ms: int = 0,
+        cache_used: bool = False,
+        started_at_perf: float | None = None,
+        finished_at_perf: float | None = None,
+        input_cols: int = 0,
+        result_cols: int = 0,
+        physical_query_count_before: int | None = None,
+        physical_query_count_after: int | None = None,
+        copy_occurred: bool = False,
+        query_name: str = "",
+        table_names: str = "",
+    ) -> None:
+        started = float(started_at_perf) if started_at_perf is not None else None
+        finished = float(finished_at_perf) if finished_at_perf is not None else None
+        if started is not None and finished is not None:
+            elapsed_ms = int(max(0.0, finished - started) * 1000)
+        before = len(self.records) if physical_query_count_before is None else max(0, int(physical_query_count_before))
+        after = len(self.records) if physical_query_count_after is None else max(before, int(physical_query_count_after))
+        self.phase_records.append(
+            {
+                "phase": str(phase or "unknown"),
+                "source_name": str(source_name or "unknown"),
+                "source_mode": str(source_mode or ""),
+                "input_rows": max(0, int(input_rows or 0)),
+                "result_rows": max(0, int(result_rows or 0)),
+                "input_cols": max(0, int(input_cols or 0)),
+                "result_cols": max(0, int(result_cols or 0)),
+                "elapsed_ms": max(0, int(elapsed_ms or 0)),
+                "physical_query_count_before": before,
+                "physical_query_count_after": after,
+                "physical_query_count_delta": after - before,
+                "cache_used": bool(cache_used),
+                "copy_occurred": bool(copy_occurred),
+                "query_name": str(query_name or ""),
+                "table_names": str(table_names or ""),
+                "company_id": self.company_id,
+            }
+        )
+
+    def summary(self) -> Dict[str, Any]:
+        by_source: Dict[str, int] = {}
+        for record in self.records:
+            source = str(record.get("source") or "unknown")
+            by_source[source] = int(by_source.get(source) or 0) + 1
+        by_phase: Dict[str, int] = {}
+        for record in self.records:
+            phase = str(record.get("phase") or "unknown")
+            by_phase[phase] = int(by_phase.get(phase) or 0) + 1
+        return {
+            "logical_source_count": 3,
+            "physical_query_count": len(self.records),
+            "physical_query_count_total": len(self.records),
+            "physical_query_count_by_source": by_source,
+            "physical_query_count_by_phase": by_phase,
+            "physical_queries": [dict(record) for record in self.records],
+            "phase_metrics": [dict(record) for record in self.phase_records],
+        }
+
+
+_DASHBOARD_QUERY_MEASUREMENT: ContextVar[Optional[DashboardQueryMeasurement]] = ContextVar(
+    "dashboard_query_measurement", default=None
+)
+_DASHBOARD_QUERY_PHASE: ContextVar[Dict[str, str]] = ContextVar("dashboard_query_phase", default={})
+
+
+def get_active_dashboard_query_measurement() -> Optional[DashboardQueryMeasurement]:
+    return _DASHBOARD_QUERY_MEASUREMENT.get()
+
+
+def _dashboard_table_names(sql: str) -> str:
+    sql_text = str(sql or "")
+    cte_names = {
+        name
+        for match in re.finditer(r"(?:\bWITH|,)\s*([A-Za-z0-9_]+)\s+AS\s*\(", sql_text, flags=re.IGNORECASE)
+        for name in (match.group(1),)
+    }
+    names = re.findall(r"\b(?:FROM|JOIN)\s+(?:dbo\.)?([A-Za-z0-9_]+)", sql_text, flags=re.IGNORECASE)
+    return ",".join(name for name in dict.fromkeys(names) if name not in cte_names)
+
+
+@contextmanager
+def dashboard_query_measurement(
+    measurement: DashboardQueryMeasurement,
+    *,
+    source: str,
+    phase: str,
+    source_mode: str = "",
+) -> Any:
+    measurement_token = _DASHBOARD_QUERY_MEASUREMENT.set(measurement)
+    previous_phase = dict(_DASHBOARD_QUERY_PHASE.get() or {})
+    phase_token = _DASHBOARD_QUERY_PHASE.set(
+        {
+            "source": str(source or previous_phase.get("source") or "unknown"),
+            "phase": str(phase or previous_phase.get("phase") or "query"),
+            "source_mode": str(source_mode or previous_phase.get("source_mode") or ""),
+        }
+    )
+    try:
+        yield measurement
+    finally:
+        _DASHBOARD_QUERY_PHASE.reset(phase_token)
+        _DASHBOARD_QUERY_MEASUREMENT.reset(measurement_token)
+
+
+@contextmanager
+def dashboard_measurement_phase(
+    measurement: DashboardQueryMeasurement,
+    *,
+    phase: str,
+    source: str,
+    source_mode: str = "",
+    input_rows: int = 0,
+    input_cols: int = 0,
+    cache_used: bool = False,
+) -> Any:
+    """Record one exclusive Dashboard stage and its physical-query delta."""
+    started = time.perf_counter()
+    before = len(measurement.records)
+    state: Dict[str, Any] = {
+        "result_rows": 0,
+        "result_cols": 0,
+        "copy_occurred": False,
+        "query_name": "",
+        "table_names": "",
+    }
+    with dashboard_query_measurement(
+        measurement,
+        source=source,
+        phase=phase,
+        source_mode=source_mode,
+    ):
+        try:
+            yield state
+        finally:
+            measurement.add_phase(
+                phase=phase,
+                source_name=source,
+                source_mode=source_mode,
+                input_rows=input_rows,
+                result_rows=state.get("result_rows") or 0,
+                input_cols=input_cols,
+                result_cols=state.get("result_cols") or 0,
+                cache_used=cache_used,
+                copy_occurred=bool(state.get("copy_occurred")),
+                query_name=str(state.get("query_name") or ""),
+                table_names=str(state.get("table_names") or ""),
+                started_at_perf=started,
+                finished_at_perf=time.perf_counter(),
+                physical_query_count_before=before,
+                physical_query_count_after=len(measurement.records),
+            )
 
 # -----------------------------------------------------------------------------
 # .env 키 (예시)
@@ -278,6 +451,36 @@ def read_df(sql: str, params: Sequence[Any] | Dict[str, Any] = ()) -> pd.DataFra
     with get_conn() as conn:
         df = pd.read_sql(sql, con=conn, params=params)
     ms = int((time.perf_counter() - t0) * 1000)
+    measurement = _DASHBOARD_QUERY_MEASUREMENT.get()
+    if measurement is not None:
+        phase = dict(_DASHBOARD_QUERY_PHASE.get() or {})
+        record = {
+            "physical_query_index": len(measurement.records) + 1,
+            "source": str(phase.get("source") or "unknown"),
+            "phase": str(phase.get("phase") or "query"),
+            "source_mode": str(phase.get("source_mode") or ""),
+            "query_name": str(phase.get("phase") or "query"),
+            "table_names": _dashboard_table_names(sql),
+            "result_rows": int(len(df)),
+            "elapsed_ms": ms,
+            "cache_used": False,
+        }
+        measurement.add(record)
+        try:
+            _sims.info(
+                "[dashboard.physical_query] request_id=%s source=%s phase=%s source_mode=%s query=%s tables=%s rows=%s elapsed_ms=%s physical_query_index=%s cache_used=False",
+                measurement.request_id,
+                record["source"],
+                record["phase"],
+                record["source_mode"],
+                record["query_name"],
+                record["table_names"],
+                record["result_rows"],
+                record["elapsed_ms"],
+                record["physical_query_index"],
+            )
+        except Exception:
+            pass
     try:
         _sims.debug("[db.read_df] rows=%s, %s ms", len(df), ms)
     except Exception:

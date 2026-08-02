@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from datetime import date, timedelta
+
+import pandas as pd
 
 from typing import Any, Dict, Optional
 
 from app.services.rddbc_io_common import clean_text
+
+
+log = logging.getLogger("ssai")
 
 
 _IO_PREFIX_WORDS = {
@@ -363,6 +370,157 @@ def _last_day_from_yyyymm(yyyymm: str) -> str:
     return (nxt - timedelta(days=1)).strftime("%Y%m%d")
 
 
+def get_nlq_period_action_class(action: str) -> str:
+    """Return the canonical NLQ period policy class without importing UI code."""
+    try:
+        from app.sims.nlq.action_inventory import implemented_actions
+
+        for spec in implemented_actions():
+            if spec.canonical_action != str(action or "").strip():
+                continue
+            if spec.handler_kind == "analytics":
+                return "aggregate_analysis"
+            if spec.handler_target.endswith("product_flow_service.get_product_flow_result"):
+                return "single_entity_history"
+            if spec.handler_target.endswith("product_inventory_service.get_product_inventory_result"):
+                return "inventory_movement"
+            if spec.handler_target.endswith("rddbc210_service.get_rddbc210_result") or spec.handler_target.endswith("rddbc220_service.get_rddbc220_result"):
+                return "inventory_snapshot"
+            if spec.handler_kind == "io_service":
+                return "list_detail"
+    except Exception:
+        pass
+    return "other"
+
+
+def _has_period_param(params: Dict[str, Any]) -> bool:
+    return any(clean_text((params or {}).get(key)) for key in (
+        "date_from", "date_to", "month_from", "month_to",
+    ))
+
+
+def _has_explicit_value(params: Dict[str, Any], keys: tuple[str, ...]) -> bool:
+    for key in keys:
+        value = (params or {}).get(key)
+        if isinstance(value, (list, tuple, set)):
+            if any(clean_text(item) for item in value):
+                return True
+        elif clean_text(value):
+            return True
+    return False
+
+
+_NLQ_EXPLICIT_CONDITION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("product", ("physic_cd", "physic_nm")),
+    ("product_category", (
+        "product_group_cd", "product_group_nm", "product_di", "product_di_list",
+        "dashboard_product_di_list", "product_class", "product_class_list",
+        "dashboard_product_class_list",
+    )),
+    ("manufacturer", ("maker_cd", "maker_nm", "product_ven_cd", "product_ven_nm")),
+    ("vendor", (
+        "ven_cd", "ven_nm", "buy_cd", "buy_nm", "sale_cd", "sale_nm",
+        "order_cd", "order_nm", "real_ven_cd", "real_ven_nm",
+    )),
+    ("stock", ("stock_cd", "stock_cds", "stock_cd_list", "stock_nm")),
+    ("salesperson", ("sales_man", "sales_man_nm", "salesperson_cd", "salesperson_nm")),
+    ("region", ("region_cd", "region_nm")),
+    ("io_type", ("io_gu", "io_gu_list", "io_gu_prefix")),
+)
+
+
+def get_nlq_explicit_condition_names(params: Dict[str, Any]) -> list[str]:
+    """Return only user-parsed, result-narrowing condition categories."""
+    return [
+        name
+        for name, keys in _NLQ_EXPLICIT_CONDITION_GROUPS
+        if _has_explicit_value(params, keys)
+    ]
+
+
+def apply_nlq_default_period_policy(
+    params: Dict[str, Any],
+    action: str,
+    *,
+    today: date | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Apply one canonical NLQ default-period policy after parsing user input.
+
+    The function receives parser output before company or screen defaults are
+    injected, so its condition list remains limited to user-specified filters.
+    """
+    out = dict(params or {})
+    action_class = get_nlq_period_action_class(action)
+    # Parser may have populated a legacy default range before the canonical
+    # action is known. That is not a user-specified period and must not win
+    # over this policy.
+    parser_default_date = clean_text(out.get("_default_date_applied")).upper() == "Y"
+    explicit_period_present = _has_period_param(out) and not parser_default_date
+    explicit_condition_names = get_nlq_explicit_condition_names(out)
+    policy = {
+        "action": str(action or "").strip(),
+        "action_class": action_class,
+        "explicit_period_present": explicit_period_present,
+        "explicit_condition_names": explicit_condition_names,
+        "explicit_condition_count": len(explicit_condition_names),
+        "default_policy": "none",
+        "policy_reason": "explicit_period" if explicit_period_present else "not_applicable",
+        "auto_applied": False,
+        "final_date_from": clean_text(out.get("date_from")),
+        "final_date_to": clean_text(out.get("date_to")),
+    }
+
+    if clean_text(out.get("_default_month_applied")):
+        policy.update({
+            "explicit_period_present": False,
+            "default_policy": "current_month_snapshot",
+            "policy_reason": "monthly_inventory",
+            "auto_applied": True,
+        })
+        return out, policy
+
+    if explicit_period_present or action_class == "aggregate_analysis":
+        return out, policy
+
+    current_day = today or date.today()
+    if action_class == "single_entity_history":
+        date_from = current_day - timedelta(days=6)
+        default_policy = "recent_7days"
+        policy_reason = "single_product_history"
+    elif action_class == "inventory_movement":
+        # 제품재고현황/제품재고장은 입출고 계산을 포함하는 월 조회다.
+        # 조건 유무와 무관하게 기간이 없으면 현재월 시작일부터 평가일까지
+        # 동일하게 잡는다.
+        date_from = current_day.replace(day=1)
+        default_policy = "current_month_inventory"
+        policy_reason = "inventory_month_query"
+    elif action_class == "list_detail":
+        if explicit_condition_names:
+            date_from = current_day.replace(day=1)
+            default_policy = "current_month"
+            policy_reason = "explicit_condition"
+        else:
+            date_from = current_day
+            default_policy = "recent_1day"
+            policy_reason = "no_explicit_condition"
+    else:
+        return out, policy
+
+    out["date_from"] = date_from.strftime("%Y%m%d")
+    out["date_to"] = current_day.strftime("%Y%m%d")
+    out["month_from"] = date_from.strftime("%Y%m")
+    out["month_to"] = current_day.strftime("%Y%m")
+    out.pop("_default_date_applied", None)
+    policy.update({
+        "default_policy": default_policy,
+        "policy_reason": policy_reason,
+        "auto_applied": True,
+        "final_date_from": out["date_from"],
+        "final_date_to": out["date_to"],
+    })
+    return out, policy
+
+
 def _apply_date_params_for_product_flow(params: Dict[str, Any], text: str) -> Dict[str, Any]:
     """
     제품수불현황은 실제 조회에 date_from/date_to가 필요하다.
@@ -410,7 +568,102 @@ def _apply_date_params_for_product_inventory(params: Dict[str, Any], text: str) 
     제품재고현황/제품재고장은 실제 조회에 date_from/date_to가 필요하다.
     제품수불현황과 동일하게 2023~2026, 202605 같은 기간 표현을 date range로 보정한다.
     """
-    return _apply_date_params_for_product_flow(params, text)
+    out = _apply_date_params_for_product_flow(params, text)
+    date_from = clean_text(out.get("date_from"))
+    date_to = clean_text(out.get("date_to"))
+
+    # A single explicit day is an inventory movement cutoff, not a one-day
+    # movement query. Preserve explicit ranges, including a same-day range.
+    has_explicit_range = bool(
+        re.search(r"(?:~|부터|까지|에서|\bto\b|\d{8}\s*-\s*\d{8})", text or "", re.IGNORECASE)
+    )
+    if date_from and date_from == date_to and not has_explicit_range:
+        out["date_from"] = f"{date_to[:6]}01"
+        out["month_from"] = date_to[:6]
+    return out
+
+
+_NAMED_CONDITION_VALUE_KEYS = (
+    "physic_nm", "maker_nm", "product_ven_nm", "ven_nm", "buy_nm",
+    "sale_nm", "order_nm", "real_ven_nm", "sales_man_nm", "stock_nm",
+    "stock_apply_nm", "product_group_nm", "product_di_nm", "product_class_nm",
+    "ven_group_nm", "ven_kind_nm", "add_nm", "mod_nm", "region_nm",
+)
+
+
+def _action_suffix_phrases(action: str) -> tuple[str, ...]:
+    """Return registered action labels that are safe to remove only at value tails."""
+    phrases = {str(action or "").strip()}
+    try:
+        from app.sims.nlq.action_inventory import implemented_actions
+
+        for spec in implemented_actions():
+            phrases.add(str(spec.canonical_action or "").strip())
+            phrases.add(str(spec.panel_action or "").strip())
+            phrases.update(str(alias or "").strip() for alias in spec.label_aliases)
+    except Exception:
+        pass
+
+    # These are parser-supported aliases for the two product services.  They
+    # are action labels, not value-specific exceptions.
+    phrases.update(_PRODUCT_FLOW_WORDS)
+    phrases.update(_PRODUCT_INVENTORY_WORDS)
+    return tuple(sorted((item for item in phrases if item), key=len, reverse=True))
+
+
+def sanitize_io_named_condition_values(
+    params: Dict[str, Any],
+    *,
+    action: str,
+) -> Dict[str, Any]:
+    """Remove a trailing resolved action phrase from parsed named conditions.
+
+    Label-based parsing intentionally captures the rest of a sentence.  This
+    shared boundary prevents a final action phrase (for example ``출고명세
+    조회``) from becoming part of a manufacturer, vendor, or product value.
+    It only removes registered action labels at the *end* of a value.
+    """
+    out = dict(params or {})
+    suffixes = _action_suffix_phrases(action)
+    cleaned_fields: list[tuple[str, int, int]] = []
+
+    for key in _NAMED_CONDITION_VALUE_KEYS:
+        raw_value = clean_text(out.get(key))
+        if not raw_value:
+            continue
+
+        value = raw_value
+        for phrase in suffixes:
+            # Canonical labels may include 조회/현황/목록 themselves.  The
+            # shortened form is also accepted only when it is a value tail.
+            base = re.sub(r"\s*(?:조회|현황|목록|검색|확인)\s*$", "", phrase).strip()
+            for candidate in (phrase, base):
+                if not candidate:
+                    continue
+                pattern = rf"(?:\s+){re.escape(candidate)}(?:\s*(?:조회|현황|목록|검색|확인))?\s*$"
+                stripped = re.sub(pattern, "", value).strip()
+                if stripped != value:
+                    value = stripped
+                    break
+            if value != raw_value:
+                break
+
+        value = _trim_named_value(value)
+        if value != raw_value:
+            out[key] = value
+            cleaned_fields.append((key, len(raw_value), len(value)))
+
+    if cleaned_fields:
+        # Do not emit business values or inject diagnostics into service
+        # parameters. The log is limited to field names and value lengths.
+        log.info(
+            "[nlq.condition_cleanup] action=%s suffix_removed=%s fields=%s value_lengths=%s",
+            str(action or ""),
+            True,
+            [field for field, _, _ in cleaned_fields],
+            [(before, after) for _, before, after in cleaned_fields],
+        )
+    return out
 
 
 def _apply_date_params_for_io_detail(params: Dict[str, Any], text: str) -> Dict[str, Any]:
@@ -529,6 +782,39 @@ def _extract_code(text: str, label: str, digits: int) -> Optional[str]:
             return m.group(1)
     return None
 
+
+def _is_product_code_token(value: Any, *, explicit: bool = False) -> bool:
+    """제품코드는 숫자 변환 없이 5자리 업무코드 문자열로만 판정한다."""
+    token = str(value or "").strip()
+    if re.fullmatch(r"\d{5}", token):
+        return True
+    if explicit and re.fullmatch(r"[A-Za-z0-9]{5}", token):
+        return True
+    return bool(
+        re.fullmatch(r"[A-Za-z0-9]{5}", token)
+        and re.search(r"\d", token)
+    )
+
+
+def _extract_product_code_for_io(text: str) -> Optional[str]:
+    """IO 문장의 명시·단독 제품코드를 문자열 그대로 추출한다."""
+    t = _norm(text)
+    for match in re.finditer(
+        r"(?P<label>제품코드|제품)\s*[:=]?\s*(?P<code>[A-Za-z0-9]{5})(?![A-Za-z0-9])",
+        t,
+    ):
+        label = match.group("label")
+        code = match.group("code")
+        if _is_product_code_token(code, explicit=(label == "제품코드")):
+            return code
+
+    if _has_any(t, _PRODUCT_IO_WORDS):
+        for match in re.finditer(r"(?<![A-Za-z0-9])([A-Za-z0-9]{5})(?![A-Za-z0-9])", t):
+            code = match.group(1)
+            if _is_product_code_token(code):
+                return code
+    return None
+
 def _extract_code_flex(text: str, label: str, min_digits: int = 1, max_digits: int = 6) -> Optional[str]:
     patterns = [
         rf"{label}\s*[:=]?\s*(\d{{{min_digits},{max_digits}}})",
@@ -583,7 +869,9 @@ _NAME_STOP_WORDS = (
 
     # 입출고/재고/수불 액션어
     "현황", "수불", "수불부", "수불현황",
+    "제품수불", "제품수불부", "제품수불현황",
     "재고", "재고장", "재고현황",
+    "제품재고장", "제품재고현황",
     "실수불", "장부수불", "실재고", "장부재고",
     "입출고일자", "명세서일자",
 
@@ -957,7 +1245,7 @@ def _extract_product_name_after_label_for_io(text: str) -> Optional[str]:
         return None
 
     # 제품 00029 같은 경우는 제품코드 조건이므로 이름으로 보지 않는다.
-    if re.fullmatch(r"\d{5}", val):
+    if _is_product_code_token(val):
         return None
 
     if _looks_like_date_token(val):
@@ -976,7 +1264,7 @@ def _extract_loose_product_name_for_io(text: str) -> Optional[str]:
 
     # 제품 00029 / 제품코드 00029처럼 제품코드가 명확한 문장은
     # 남은 기호(~ 등)를 제품명으로 추정하지 않는다.
-    if re.search(r"(?:제품코드|제품)\s*[:=]?\s*\d{5}", t):
+    if re.search(r"(?:제품코드|제품)\s*[:=]?\s*[A-Za-z0-9]{5}(?![A-Za-z0-9])", t):
         return None
 
     # 제조사/발주처/그룹/구분/분류/거래처/재고위치 등
@@ -1047,7 +1335,7 @@ def _extract_loose_product_name_for_io(text: str) -> Optional[str]:
 
     # 재고위치/코드 표현 제거
     t = re.sub(r"(재고위치코드|재고위치)\s*[:=]?\s*\d{1,6}", " ", t)
-    t = re.sub(r"(제품코드|제품)\s*[:=]?\s*\d{5}", " ", t)
+    t = re.sub(r"(제품코드|제품)\s*[:=]?\s*[A-Za-z0-9]{5}(?![A-Za-z0-9])", " ", t)
 
     # 기준/범위 표현 제거
     t = re.sub(
@@ -1063,6 +1351,12 @@ def _extract_loose_product_name_for_io(text: str) -> Optional[str]:
 
     # 구두점/다중공백 정리
     # 날짜 범위 제거 후 남은 "~"도 제거한다.
+    # A standalone month left after parsing a year/month expression is not an
+    # implicit product name (for example, "2026년 6월 제품재고").
+    t = re.sub(r"(?<!\d)\d{1,2}\s*월(?!\d)", " ", t)
+    # Range connectors are syntax, never an implicit product name after the
+    # surrounding date tokens have been removed.
+    t = re.sub(r"\b(?:부터|까지|에서|to)\b", " ", t, flags=re.IGNORECASE)
     t = re.sub(r"[,/()]+", " ", t)
     t = re.sub(r"[~\-–—]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
@@ -1077,34 +1371,411 @@ def _extract_loose_product_name_for_io(text: str) -> Optional[str]:
     return cand
 
 
-def _resolve_single_product_code_by_name(name: str) -> Optional[str]:
+def _resolve_single_product_code_by_name_with_error(name: str) -> tuple[Optional[str], Optional[Exception]]:
     if not clean_text(name):
-        return None
+        return None, None
 
     try:
         from app.services.rddbc_io_common import query_to_df
         df = query_to_df(
             """
             SELECT TOP 2
-                LTRIM(RTRIM(Rd04_Physic_Cd)) AS physic_cd
+                LTRIM(RTRIM(Rd04_Physic_Cd)) AS physic_cd,
+                LTRIM(RTRIM(Rd04_Physic_Nm)) AS physic_nm
             FROM dbo.Rddbc040
-            WHERE ISNULL(Rd04_Del_Flag, '') <> 'E'
-              AND Rd04_Physic_Nm LIKE %(physic_nm_like)s
-            GROUP BY Rd04_Physic_Cd
+            WHERE Rd04_Physic_Nm LIKE %(physic_nm_like)s
+            GROUP BY Rd04_Physic_Cd, Rd04_Physic_Nm
             ORDER BY Rd04_Physic_Cd
             """,
             {"physic_nm_like": f"%{clean_text(name)}%"},
         )
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, exc
 
     if df is None or len(df) != 1:
-        return None
+        return None, None
 
     try:
-        return clean_text(df.iloc[0]["physic_cd"])
-    except Exception:
-        return None
+        row = df.iloc[0]
+        if clean_text(row["physic_nm"]) != clean_text(name):
+            return None, None
+        return clean_text(row["physic_cd"]), None
+    except Exception as exc:
+        return None, exc
+
+
+def _resolve_single_product_code_by_name(name: str) -> Optional[str]:
+    """Compatibility wrapper for callers that need only an unambiguous code."""
+    code, _ = _resolve_single_product_code_by_name_with_error(name)
+    return code
+
+
+def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
+    """Return a conservative proper-noun candidate left after IO syntax removal.
+
+    This is intentionally narrow: labelled conditions remain the parser's source
+    of truth, and a phrase is considered only when it is the sole residual token
+    around a resolved IO action.
+    """
+    candidate = _norm(text)
+    if not candidate:
+        return ""
+
+    # Action spelling is intentionally normalized here rather than per query.
+    # In particular, removing ``출고명세`` before ``출고명세서`` leaves a
+    # dangling "서" token and silently drops the preceding search phrase.
+    action_patterns = (
+        r"입고\s*명세(?:서)?",
+        r"출고\s*명세(?:서)?",
+        r"거래\s*명세서(?:\s*공통)?",
+        r"세금\s*계산서(?:\s*공통)?",
+        r"제품\s*수불(?:현황|부)?",
+        r"제품\s*재고(?:현황|장)?",
+        re.escape(action.replace(" 조회", "")),
+        r"조회|검색|찾아줘|찾아봐|보여줘|알려줘|확인",
+    )
+    for pattern in action_patterns:
+        if pattern:
+            candidate = re.sub(pattern, " ", candidate)
+
+    candidate = re.sub(r"(?:19|20)\d{6}|(?:19|20)\d{4}", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" ,:/-~")
+    if not candidate or _looks_like_date_token(candidate):
+        return ""
+    if len(candidate.split()) != 1:
+        return ""
+    return candidate
+
+
+def _has_explicit_name_label(text: str) -> bool:
+    """Return whether the user explicitly chose one name-search semantic."""
+    t = _norm(text)
+    if not t:
+        return False
+
+    return bool(re.search(
+        r"(?:거래처(?:명|코드)?|매입처(?:명|코드)?|매출처(?:명|코드)?|실납처(?:명|코드)?|"
+        r"제조사(?:명|코드)?|제약사(?:명|코드)?|발주처(?:명|코드)?|"
+        r"제품명|품목명|상품명|제품(?!수불|재고|코드|명|그룹|구분|분류))\s*(?:[:=]|\s)",
+        t,
+    ))
+
+
+def _log_entity_resolver(
+    *,
+    action: str,
+    resolver_type: str,
+    status: str,
+    candidate_count: int,
+    elapsed_ms: int,
+    exception_class: str = "",
+    safe_error_code: str = "",
+    final_decision: str = "",
+) -> None:
+    """Emit only resolver metadata; entity values and SQL stay out of logs."""
+    log.info(
+        "[nlq.entity_resolver] action=%s resolver_type=%s status=%s "
+        "candidate_count=%s elapsed_ms=%s exception_class=%s safe_error_code=%s final_decision=%s",
+        action,
+        resolver_type,
+        status,
+        candidate_count,
+        elapsed_ms,
+        exception_class,
+        safe_error_code,
+        final_decision,
+    )
+
+
+def _safe_entity_resolver_error_code(exc: Optional[Exception]) -> str:
+    """Return a stable, non-sensitive master-resolution error category."""
+    if exc is None:
+        return ""
+    return {
+        "NameError": "runtime_name_error",
+        "ProgrammingError": "master_query_contract",
+        "OperationalError": "master_connection",
+        "TimeoutError": "master_timeout",
+    }.get(type(exc).__name__, "master_resolver_error")
+
+
+def _lookup_transaction_vendor_candidates(name: str, *, action: str = "") -> dict[str, Any]:
+    """Resolve historical counterparties by the canonical transaction name.
+
+    ``Rd03_Del_Flag='E'`` prevents new registration only.  Historical outbound
+    detail lookups must still be able to resolve that counterparty, so this
+    deliberately does not use the UI's active-vendor filter.
+    """
+    started_at = time.perf_counter()
+    name = clean_text(name)
+    action_text = clean_text(action)
+    scope = "purchase_history" if "입고" in action_text else "sales_history"
+    try:
+        from app.services.rddbc030_service import search_rows
+
+        vendor_df = search_rows(
+            scope=scope,
+            ven_nm_kw=name,
+            top=30,
+            only_active=False,
+        )
+        rows: list[dict[str, str]] = []
+        if isinstance(vendor_df, pd.DataFrame):
+            seen_codes: set[str] = set()
+            for _, row in vendor_df.iterrows():
+                vendor_name = clean_text(row.get("Rd03_Ven_Nm"))
+                vendor_code = clean_text(row.get("Rd03_Ven_Cd"))
+                if name != vendor_name or not vendor_code or vendor_code in seen_codes:
+                    continue
+                seen_codes.add(vendor_code)
+                rows.append({
+                    "match_type": "transaction_vendor",
+                    "match_value": vendor_name,
+                    "match_code": vendor_code,
+                })
+        return {"candidates": rows, "error": None, "started_at": started_at}
+    except Exception as exc:
+        return {"candidates": [], "error": exc, "started_at": started_at}
+
+
+def _lookup_unlabeled_io_entity_candidates(name: str, *, action: str = "") -> dict[str, Any]:
+    """Verify an unlabeled name against existing IO master relationships.
+
+    Exact-name matching is deliberate.  A partial match must not silently turn
+    into a transaction-vendor, manufacturer, or product predicate.
+    """
+    name = clean_text(name)
+    if not name:
+        return {"candidates": [], "outcomes": []}
+
+    out: list[dict[str, str]] = []
+    outcomes: list[dict[str, Any]] = []
+
+    def record(resolver_type: str, candidate_count: int, started_at: float, exc: Optional[Exception] = None) -> None:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        status = "error" if exc is not None else ("success" if candidate_count else "not_found")
+        outcome = {
+            "resolver_type": resolver_type,
+            "status": status,
+            "candidate_count": int(candidate_count),
+            "elapsed_ms": elapsed_ms,
+            "exception_class": type(exc).__name__ if exc is not None else "",
+            "safe_error_code": _safe_entity_resolver_error_code(exc),
+        }
+        outcomes.append(outcome)
+        _log_entity_resolver(action=action, final_decision="", **outcome)
+
+    # Historical detail lookup needs the same sales-side vendor-code contract
+    # as Rddbc120, including masters no longer available for new registration.
+    vendor_lookup = _lookup_transaction_vendor_candidates(name, action=action)
+    vendor_rows = list(vendor_lookup.get("candidates") or [])
+    out.extend(vendor_rows)
+    record(
+        "transaction_vendor",
+        len(vendor_rows),
+        float(vendor_lookup.get("started_at") or time.perf_counter()),
+        vendor_lookup.get("error"),
+    )
+
+    started_at = time.perf_counter()
+    try:
+        # Supplier scope already verifies that the vendor is actually linked
+        # to active product master rows.
+        from app.services.product_supplier_scope_service import (
+            SCOPE_MANUFACTURER,
+            resolve_supplier_vendor_codes,
+        )
+
+        manufacturer_rows = resolve_supplier_vendor_codes(name, mode=SCOPE_MANUFACTURER)
+        matched = int(any(clean_text(row.get("name")) == name for row in manufacturer_rows))
+        if matched:
+            for row in manufacturer_rows:
+                if clean_text(row.get("name")) == name and clean_text(row.get("code")):
+                    out.append({
+                        "match_type": "manufacturer",
+                        "match_value": name,
+                        "match_code": clean_text(row.get("code")),
+                    })
+        record("manufacturer", matched, started_at)
+    except Exception as exc:
+        record("manufacturer", 0, started_at, exc)
+
+    # Keep the existing single-product resolver as the product-master proof
+    # path. It deliberately returns a code only for one unambiguous product.
+    started_at = time.perf_counter()
+    product_code, product_error = _resolve_single_product_code_by_name_with_error(name)
+    if product_code:
+        out.append({"match_type": "product", "match_value": name, "match_code": product_code})
+    record("product", int(bool(product_code)), started_at, product_error)
+
+    return {"candidates": out, "outcomes": outcomes}
+
+
+def resolve_unlabeled_io_entity_condition(
+    text: str,
+    *,
+    action: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Prepare the common name-search contract without overriding labels.
+
+    ``candidate_required`` is returned when master evidence points to more than
+    one semantic condition.  The router owns the existing chat candidate-table
+    contract and therefore decides how it is presented to the user.
+    """
+    out = dict(params or {})
+    phrase = _extract_unlabeled_entity_phrase(text, action)
+
+    # Detail and inventory lists are multi-result searches.  A bare token may
+    # have been tentatively placed in ``physic_nm`` by the generic parser (for
+    # example, "한미약품 제품재고장").  Reclassify it only when the question
+    # contains no explicit semantic label, then preserve the common OR-LIKE
+    # contract for transaction vendor, product and manufacturer names.
+    if (
+        action in {"입고명세 조회", "출고명세 조회", "제품재고현황 조회"}
+        and phrase
+        and not _has_explicit_name_label(text)
+    ):
+        out.pop("physic_nm", None)
+        out["nlq_unlabeled_name"] = phrase
+        _log_entity_resolver(
+            action=action,
+            resolver_type="detail_name_search",
+            status="success",
+            candidate_count=0,
+            elapsed_ms=0,
+            final_decision="resolved_like",
+        )
+        return {
+            "status": "resolved",
+            "params": out,
+            "phrase": phrase,
+            "resolved_kind": "unlabeled_like",
+            "candidates": [],
+        }
+
+    explicit_keys = (
+        "ven_cd", "ven_nm", "physic_cd", "physic_nm", "maker_cd",
+        "maker_nm", "product_ven_cd", "product_ven_nm", "order_cd",
+        "order_nm", "buy_cd", "buy_nm", "real_ven_cd", "real_ven_nm",
+        "stock_cd", "stock_nm", "sales_man", "sales_man_nm",
+    )
+    if any(clean_text(out.get(key)) for key in explicit_keys):
+        return {"status": "not_applicable", "params": out, "candidates": []}
+
+    if not phrase:
+        return {"status": "not_applicable", "params": out, "candidates": []}
+
+    # Detail and inventory lists are multi-result searches.  They must not
+    # resolve a name through master candidates: the service applies one OR LIKE
+    # predicate over transaction vendor, product, and manufacturer names.
+    if action in {"입고명세 조회", "출고명세 조회", "제품재고현황 조회"}:
+        out["nlq_unlabeled_name"] = phrase
+        _log_entity_resolver(
+            action=action,
+            resolver_type="detail_name_search",
+            status="success",
+            candidate_count=0,
+            elapsed_ms=0,
+            final_decision="resolved_like",
+        )
+        return {
+            "status": "resolved",
+            "params": out,
+            "phrase": phrase,
+            "resolved_kind": "unlabeled_like",
+            "candidates": [],
+        }
+
+    lookup = _lookup_unlabeled_io_entity_candidates(phrase, action=action)
+    # Accept the pre-closure list return in monkeypatch callers while the
+    # production path keeps outcome metadata for errors and timeouts.
+    if isinstance(lookup, list):
+        candidates = lookup
+        outcomes: list[dict[str, Any]] = []
+    else:
+        candidates = list(lookup.get("candidates") or [])
+        outcomes = list(lookup.get("outcomes") or [])
+    candidate_keys = {
+        (str(row.get("match_type") or ""), clean_text(row.get("match_code")) or clean_text(row.get("match_value")))
+        for row in candidates
+    }
+    kinds = {kind for kind, _ in candidate_keys}
+    has_resolver_error = any(str(row.get("status") or "") in {"error", "timeout"} for row in outcomes)
+    error_codes = ",".join(sorted({
+        str(row.get("safe_error_code") or "")
+        for row in outcomes
+        if row.get("safe_error_code")
+    }))
+    if has_resolver_error:
+        _log_entity_resolver(
+            action=action,
+            resolver_type="all",
+            status="error",
+            candidate_count=len(candidates),
+            elapsed_ms=sum(int(row.get("elapsed_ms") or 0) for row in outcomes),
+            exception_class=",".join(sorted({str(row.get("exception_class") or "") for row in outcomes if row.get("exception_class")})),
+            safe_error_code=error_codes,
+            final_decision="resolution_unavailable",
+        )
+        return {
+            "status": "resolution_unavailable",
+            "params": out,
+            "phrase": phrase,
+            "candidates": candidates,
+            "resolver_outcomes": outcomes,
+        }
+
+    if len(candidate_keys) != 1:
+        status = "candidate_required" if candidates else "not_found"
+        _log_entity_resolver(
+            action=action,
+            resolver_type="all",
+            status="ambiguous" if candidates else "not_found",
+            candidate_count=len(candidates),
+            elapsed_ms=sum(int(row.get("elapsed_ms") or 0) for row in outcomes),
+            final_decision=status,
+        )
+        return {
+            "status": status,
+            "params": out,
+            "phrase": phrase,
+            "candidates": candidates,
+            "resolver_outcomes": outcomes,
+        }
+
+    kind = next(iter(kinds))
+    if kind == "transaction_vendor":
+        candidate = candidates[0]
+        out["ven_cd"] = clean_text(candidate.get("match_code"))
+        out["ven_nm_display"] = phrase
+    elif kind == "manufacturer":
+        candidate = candidates[0]
+        out["product_ven_cd"] = clean_text(candidate.get("match_code"))
+        out["maker_nm_display"] = phrase
+        out["product_ven_nm_display"] = phrase
+    elif kind == "product":
+        out["physic_nm"] = phrase
+    else:
+        return {"status": "not_applicable", "params": out, "candidates": []}
+
+    _log_entity_resolver(
+        action=action,
+        resolver_type="all",
+        status="success",
+        candidate_count=len(candidates),
+        elapsed_ms=sum(int(row.get("elapsed_ms") or 0) for row in outcomes),
+        exception_class="",
+        final_decision="resolved",
+    )
+    return {
+        "status": "resolved",
+        "params": out,
+        "phrase": phrase,
+        "resolved_kind": kind,
+        "candidates": candidates,
+        "resolver_outcomes": outcomes,
+    }
 
 def extract_params(text: str) -> Dict[str, Any]:
     text = _norm(text)
@@ -1116,7 +1787,11 @@ def extract_params(text: str) -> Dict[str, Any]:
     ven_cd = _extract_code(text, "거래처", 5) or _extract_code(text, "거래처코드", 5)
     ven_nm = _extract_named_text(text, ("거래처명", "거래처"))
 
-    physic_cd = _extract_code(text, "제품", 5) or _extract_code(text, "제품코드", 5)
+    physic_cd = (
+        _extract_product_code_for_io(text)
+        or _extract_code(text, "제품", 5)
+        or _extract_code(text, "제품코드", 5)
+    )
 
     maker_cd = _extract_code(text, "제조사", 5) or _extract_code(text, "제약사", 5)
     order_cd = _extract_code(text, "발주처", 5)
@@ -1144,6 +1819,8 @@ def extract_params(text: str) -> Dict[str, Any]:
         # 제품코드가 명확히 잡힌 경우에는 제품명 보조조건이
         # 액션어/날짜/불필요어/기호로 잘못 남는 것을 제거한다.
         if (
+            str(physic_nm).strip() == str(physic_cd).strip()
+            or
             _looks_like_date_token(physic_nm)
             or not re.search(r"[가-힣A-Za-z0-9]", str(physic_nm or ""))
             or physic_nm in {"~", "-", "–", "—", "~년"}
@@ -1288,13 +1965,6 @@ def extract_params(text: str) -> Dict[str, Any]:
             params["io_gu_prefix"] = prefix
             break
 
-    if "불일치" in text or "검증" in text:
-        params["only_mismatch"] = "Y"
-        if "거래명세서" in text:
-            params["only_mismatch_trans"] = "Y"
-        if "세금계산서" in text:
-            params["only_mismatch_tax"] = "Y"
-
     if "거래명세서" in text:
         if (
             "매입분" in text
@@ -1401,6 +2071,110 @@ def extract_params(text: str) -> Dict[str, Any]:
 
     return params
 
+# Current-user text is the sole source for outbound validation intent.  In
+# particular, retrieved RAG context and an already-resolved action must never
+# add validation work to a detail query.
+_OUTBOUND_DETAIL_ACTIONS = {
+    "출고명세 조회",
+    "출고↔거래명세서 검증",
+    "출고↔세금계산서 검증",
+}
+_IO_VALIDATION_EXPLANATION_WORDS = (
+    "무슨뜻",
+    "방법",
+    "설명",
+    "원인",
+    "문서",
+    "rag",
+    "사용법",
+    "왜",
+    "이유",
+    "검색",
+    "자료",
+)
+
+
+def _is_structured_outbound_validation_request(raw: str) -> bool:
+    # This comparison is intentionally limited to validation intent. The
+    # general parser still receives its original normalized text.
+    normalized = re.sub(r"\s+", "", _norm(raw))
+    if not ("출고명세" in normalized and any(word in normalized for word in ("검증", "불일치"))):
+        return False
+    return not is_io_validation_explanation_request(normalized)
+
+
+def is_io_validation_explanation_request(raw: str) -> bool:
+    """Return whether a transaction/tax question has explanation or RAG intent."""
+    normalized = re.sub(r"\s+", "", _norm(raw))
+    if not any(document in normalized for document in ("거래명세서", "세금계산서")):
+        return False
+    lowered = normalized.lower()
+    return any(word in lowered for word in _IO_VALIDATION_EXPLANATION_WORDS)
+
+
+def is_outbound_validation_explanation_request(raw: str) -> bool:
+    """Backward-compatible alias for the shared IO validation explanation guard."""
+    return is_io_validation_explanation_request(raw)
+
+
+def _apply_outbound_validation_intent(
+    params: Dict[str, Any],
+    *,
+    action: str,
+    raw: str,
+) -> Dict[str, Any]:
+    """Attach outbound validation flags after the structured action is known."""
+    result = dict(params or {})
+    if action not in _OUTBOUND_DETAIL_ACTIONS:
+        return result
+
+    for key in (
+        "validation_requested",
+        "validation_trans",
+        "validation_tax",
+        "only_mismatch",
+        "only_mismatch_trans",
+        "only_mismatch_tax",
+        "validation_intent_source",
+    ):
+        result.pop(key, None)
+
+    result.update(
+        {
+            "validation_requested": False,
+            "validation_trans": False,
+            "validation_tax": False,
+        }
+    )
+    if not _is_structured_outbound_validation_request(raw):
+        return result
+
+    normalized = re.sub(r"\s+", "", _norm(raw))
+    has_transaction = "거래명세서" in normalized
+    has_tax = "세금계산서" in normalized
+    if not has_transaction and not has_tax:
+        # A generic outbound validation has no existing single-side contract.
+        # Validate both correlations rather than guessing one of them.
+        has_transaction = True
+        has_tax = True
+
+    result.update(
+        {
+            "validation_requested": True,
+            "validation_trans": has_transaction,
+            "validation_tax": has_tax,
+            "validation_intent_source": "user_text",
+        }
+    )
+    if "불일치" in normalized:
+        result["only_mismatch"] = "Y"
+        if has_transaction:
+            result["only_mismatch_trans"] = "Y"
+        if has_tax:
+            result["only_mismatch_tax"] = "Y"
+    return result
+
+
 # 입출고/재고 NLQ 해석의 최상위 함수
 # 입출고/재고 관련 신호가 있는지 보고, 관련 신호가 있으면 extract_params()로 파싱한 뒤
 # 입출고/재고 NLQ 의도를 판정한다.
@@ -1409,11 +2183,25 @@ def resolve_io_nlq(text: str) -> Optional[Dict[str, Any]]:
     if not raw:
         return None
 
+    # Explanation/help questions must continue to the normal answer or RAG
+    # route.  They are not structured requests for an outbound DB result.
+    if is_io_validation_explanation_request(raw):
+        return None
+
     params = extract_params(raw)
 
     def _result(action: str, params_in: Dict[str, Any]) -> Dict[str, Any]:
         fixed_params = _normalize_io_detail_vendor_params(
             params_in,
+            action=action,
+            raw=raw,
+        )
+        fixed_params = sanitize_io_named_condition_values(
+            fixed_params,
+            action=action,
+        )
+        fixed_params = _apply_outbound_validation_intent(
+            fixed_params,
             action=action,
             raw=raw,
         )
@@ -1431,11 +2219,6 @@ def resolve_io_nlq(text: str) -> Optional[Dict[str, Any]]:
     if _has_any(raw, _PRODUCT_FLOW_WORDS):
 
         params = _apply_date_params_for_product_flow(params, raw)
-
-        if not clean_text(params.get("physic_cd")) and clean_text(params.get("physic_nm")):
-            resolved = _resolve_single_product_code_by_name(clean_text(params.get("physic_nm")))
-            if resolved:
-                params["physic_cd"] = resolved
 
     is_common_doc_query = "공통" in raw
     is_check_query = ("불일치" in raw or "검증" in raw or "누락" in raw)
@@ -1455,37 +2238,62 @@ def resolve_io_nlq(text: str) -> Optional[Dict[str, Any]]:
                 {**check_params, "only_mismatch_tax": "Y"},
             )
 
-        if ("출고" in raw or "매출" in raw) and "거래명세서" in raw:
+        if (
+            ("출고" in raw or "매출" in raw)
+            and "거래명세서" in raw
+            and "세금계산서" in raw
+            and _is_structured_outbound_validation_request(raw)
+        ):
+            check_params = _ensure_default_date_range_for_heavy_check(params)
+            return _result("출고명세 조회", check_params)
+
+        if (
+            ("출고" in raw or "매출" in raw)
+            and "거래명세서" in raw
+            and _is_structured_outbound_validation_request(raw)
+        ):
             check_params = _ensure_default_date_range_for_heavy_check(params)
             return _result(
                 "출고↔거래명세서 검증",
-                {**check_params, "only_mismatch_trans": "Y"},
+                check_params,
             )
 
-        if ("출고" in raw or "매출" in raw) and "세금계산서" in raw:
+        if (
+            ("출고" in raw or "매출" in raw)
+            and "세금계산서" in raw
+            and _is_structured_outbound_validation_request(raw)
+        ):
             check_params = _ensure_default_date_range_for_heavy_check(params)
             return _result(
                 "출고↔세금계산서 검증",
-                {**check_params, "only_mismatch_tax": "Y"},
+                check_params,
             )
+
+        if (
+            ("출고" in raw or "매출" in raw)
+            and "출고명세" in raw
+            and _is_structured_outbound_validation_request(raw)
+        ):
+            check_params = _ensure_default_date_range_for_heavy_check(params)
+            return _result("출고명세 조회", check_params)
 
     # 월집계는 제품수불/제품재고보다 먼저 판정한다.
     # 예: "실재고월집계 2025 제품 00029 조회"
     if "실재고" in raw and "월집계" in raw:
         stock_params = _apply_month_params_for_monthly_stock(params, raw)
-        return {"action": "실재고월집계 조회", "params": stock_params}
+        return _result("실재고월집계 조회", stock_params)
 
     if "장부재고" in raw and "월집계" in raw:
         stock_params = _apply_month_params_for_monthly_stock(params, raw)
-        return {"action": "장부재고월집계 조회", "params": stock_params}
+        return _result("장부재고월집계 조회", stock_params)
 
 
     if _has_any(raw, _PRODUCT_FLOW_WORDS):
-        return {"action": "제품수불현황 조회", "params": params}
+        return _result("제품수불현황 조회", params)
 
     if _has_any(raw, _PRODUCT_INVENTORY_WORDS):
         params = _apply_date_params_for_product_inventory(params, raw)
-        return {"action": "제품재고현황 조회", "params": params}
+        return _result("제품재고현황 조회", params)
 
     # 명시적으로 입고명세 / 출고명세를 말한 경우에는
     # 거래명세서순번 / 세금계산서순번이 들어 있어도 상세 조회를 우선한다.
@@ -1497,17 +2305,17 @@ def resolve_io_nlq(text: str) -> Optional[Dict[str, Any]]:
 
     # 공통 조회는 '공통'을 명시했을 때 우선
     if "거래명세서 공통" in raw:
-        return {"action": "거래명세서 공통 조회", "params": params}
+        return _result("거래명세서 공통 조회", params)
 
     if "세금계산서 공통" in raw:
-        return {"action": "세금계산서 공통 조회", "params": params}
+        return _result("세금계산서 공통 조회", params)
 
     # 상세 명시가 없을 때만 공통 조회로 해석
     if "거래명세서" in raw and "입고명세" not in raw and "출고명세" not in raw:
-        return {"action": "거래명세서 공통 조회", "params": params}
+        return _result("거래명세서 공통 조회", params)
 
     if "세금계산서" in raw and "입고명세" not in raw and "출고명세" not in raw:
-        return {"action": "세금계산서 공통 조회", "params": params}
+        return _result("세금계산서 공통 조회", params)
     
     txn_signal = _has_transaction_signal(raw)
 

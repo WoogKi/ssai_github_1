@@ -24,6 +24,7 @@ from app.services.dashboard_lite_facts import (
     default_dashboard_lite_scope,
     filter_dashboard_risk_detail_rows,
     normalize_dashboard_lite_params,
+    resolve_transaction_cycle_status,
 )
 from app.services.dashboard_risk_detail_export import build_dashboard_risk_detail_excel_bytes
 from app.services.product_supplier_scope_service import (
@@ -88,11 +89,13 @@ DASHBOARD_LITE_SESSION_KEYS = (
     "__dashboard_lite_risk_detail_excel_cache",
     "__dashboard_selected_action_detail",
     "__dashboard_lite_suppress_chat_autoscroll_once",
+    "__dashboard_layout_v2_preview",
 )
 
 DASHBOARD_LITE_OPTION_CACHE_KEY = "__dashboard_lite_scope_options"
 DASHBOARD_LITE_OPTION_CACHE_VERSION = 3
 _DASHBOARD_RENDER_TARGET: Any | None = None
+_DASHBOARD_V2_PREVIEW_AVAILABLE = False
 
 _DASHBOARD_PROFILE_WIDGETS = {
     "stock_mode": "__dashboard_lite_stock_mode",
@@ -1373,11 +1376,18 @@ def _transaction_cycle_presentation(turnover: dict[str, Any], *, side: str) -> d
     is_purchase = side == "purchase"
     label = "매입" if is_purchase else "매출"
     raw_status = str(turnover.get(f"{side}_data_status") or "").strip().lower()
-    status = {"normal": "ready", "missing": "no_data"}.get(raw_status, raw_status)
+    status = {
+        "normal": "ready",
+        "missing": "no_data",
+        "success": "ready",
+        "single_trade_day": "insufficient_days",
+    }.get(raw_status, raw_status)
     if status == "source_required":
         return {"status": status, "message": f"일자 단위 정상 {label} 거래일 자료 연결 필요"}
     if status == "no_data":
         return {"status": status, "message": f"최근 90일 정상 {label} 거래가 없습니다."}
+    if status == "error":
+        return {"status": status, "message": f"최근 정상 {label} 거래일을 계산하지 못했습니다."}
 
     latest = str(turnover.get(f"{side}_latest_date") or "").strip()
     if len(latest) == 8 and latest.isdigit():
@@ -1387,7 +1397,7 @@ def _transaction_cycle_presentation(turnover: dict[str, Any], *, side: str) -> d
     return {
         "status": status or "no_data",
         "message": "",
-        "latest_date": latest or "자료 없음",
+        "latest_date": latest or "-",
         "elapsed_days": turnover.get(f"{side}_elapsed_days"),
         "unique_trade_days": unique_days,
         "average_interval_days": interval,
@@ -1409,11 +1419,11 @@ def _render_turnover(facts: dict[str, Any]) -> None:
         elapsed = presentation.get("elapsed_days")
         unique_days = presentation.get("unique_trade_days")
         interval = presentation.get("average_interval_days")
-        st.markdown(f"최근 정상 거래일: **{presentation.get('latest_date') or '자료 없음'}**")
-        st.markdown(f"경과일: **{'자료 없음' if elapsed in (None, '') else f'{elapsed}일'}**")
-        st.markdown(f"고유 거래일: **{'자료 없음' if unique_days in (None, '') else f'{unique_days}일'}**")
+        st.markdown(f"최근 정상 거래일: **{presentation.get('latest_date') or '-'}**")
+        st.markdown(f"경과일: **{'-' if elapsed in (None, '') else f'{elapsed}일'}**")
+        st.markdown(f"고유 거래일: **{'-' if unique_days in (None, '') else f'{unique_days}일'}**")
         average_label = presentation.get("average_label")
-        average_value = average_label or ("자료 없음" if interval in (None, "") else f"{_fmt_number(interval)}일")
+        average_value = average_label or ("-" if interval in (None, "") else f"{_fmt_number(interval)}일")
         st.markdown(f"평균 거래간격: **{average_value}**")
 
     period_days = int(turnover.get("period_days") or 90)
@@ -2970,6 +2980,36 @@ def _dashboard_scope_header(params: dict[str, Any]) -> str:
     return " · ".join(parts)
 
 
+def _compact_dashboard_rows(rows: Any, *, allowed_keys: tuple[str, ...], limit: int) -> list[dict[str, Any]]:
+    """Project persisted dashboard rows without retaining drill-down payloads."""
+    compact_rows: list[dict[str, Any]] = []
+    for row in list(rows or [])[:limit]:
+        if not isinstance(row, dict):
+            continue
+        compact_rows.append({key: row.get(key) for key in allowed_keys if key in row})
+    return compact_rows
+
+
+_DASHBOARD_COMPACT_RISK_TARGET_KEYS = (
+    "product_code", "product_name", "재고위험상태", "current_stock_qty", "주요매입처명",
+    "수요급증여부", "위험보정기준", "위험보정재고준비율", "stock_readiness_pct",
+    "위험보정잔여예상수요", "remaining_expected_demand_qty", "위험보정부족예상수량",
+    "shortage_qty", "위험보정부족예상금액", "shortage_amt",
+)
+
+_DASHBOARD_COMPACT_VENDOR_RISK_KEYS = (
+    "주요매입처명", "주요매입처코드", "긴급부족금액", "부족주의금액", "전체위험보정부족금액",
+    "긴급부족품목수", "부족주의품목수", "위험품목수", "수요급증품목수",
+)
+
+_DASHBOARD_COMPACT_ACTION_KEYS = (
+    "priority", "rank", "status", "risk_grade", "action_id", "product_code", "product_name",
+    "target", "target_name", "evidence_value", "evidence_unit", "evidence_label", "evidence",
+    "threshold_label", "threshold_value", "cause_type", "stock_readiness_pct", "recommended_action",
+    "stock_cover_days", "inbound_delayed_candidate",
+)
+
+
 def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
     """Keep the immutable chat rendering contract without persisting full readiness rows."""
     source = dict(cache or {}) if isinstance(cache, dict) else {}
@@ -3003,6 +3043,12 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
     compact_params["manufacturer_manager_codes"] = _clean_list(params.get("manufacturer_manager_codes"))[:row_limit]
     compact_params["order_vendor_codes"] = _clean_list(params.get("order_vendor_codes"))[:row_limit]
     compact_params["purchase_manager_codes"] = _clean_list(params.get("purchase_manager_codes"))[:row_limit]
+    compact_transaction_cycle = dict(facts.get("transaction_cycle") or facts.get("turnover_days") or {})
+    if compact_transaction_cycle and not compact_transaction_cycle.get("status"):
+        compact_transaction_cycle["status"] = resolve_transaction_cycle_status(
+            compact_transaction_cycle.get("purchase_result_status") or compact_transaction_cycle.get("purchase_data_status"),
+            compact_transaction_cycle.get("sales_result_status") or compact_transaction_cycle.get("sales_data_status"),
+        )
     compact_facts = {
         "kind": facts.get("kind"),
         "period": facts.get("period"),
@@ -3015,16 +3061,28 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "metrics": dict(sales.get("metrics") or {}),
             "visualization": dict(sales.get("visualization") or {}),
             "chart_rows": list(sales.get("chart_rows") or []),
-            "decline_targets": list(sales.get("decline_targets") or [])[:row_limit],
+            "decline_targets": _compact_dashboard_rows(
+                sales.get("decline_targets"),
+                allowed_keys=("product_code", "product_name", "current_month_amount", "previous_month_amount", "change_rate"),
+                limit=row_limit,
+            ),
         },
         "inventory": {
             "metrics": dict(inventory.get("metrics") or {}),
-            "risk_targets": list(inventory.get("risk_targets") or [])[:row_limit],
+            "risk_targets": _compact_dashboard_rows(
+                inventory.get("risk_targets"),
+                allowed_keys=_DASHBOARD_COMPACT_RISK_TARGET_KEYS,
+                limit=row_limit,
+            ),
             "stock_risk_summary": list(inventory.get("stock_risk_summary") or []),
             "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
             "stock_demand_surge_summary": dict(inventory.get("stock_demand_surge_summary") or {}),
             "vendor_stock_risk_summary": dict(inventory.get("vendor_stock_risk_summary") or {}),
-            "vendor_stock_risk_top_rows": list(inventory.get("vendor_stock_risk_top_rows") or [])[:row_limit],
+            "vendor_stock_risk_top_rows": _compact_dashboard_rows(
+                inventory.get("vendor_stock_risk_top_rows"),
+                allowed_keys=_DASHBOARD_COMPACT_VENDOR_RISK_KEYS,
+                limit=row_limit,
+            ),
             "inbound_summary": {
                 key: (inventory.get("inbound_summary") or {}).get(key)
                 for key in (
@@ -3058,11 +3116,32 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "purchase_trend_rows": list(inventory.get("purchase_trend_rows") or [])[:18],
             "data_quality": list(inventory.get("data_quality") or [])[:row_limit],
         },
-        "turnover_days": dict(facts.get("turnover_days") or {}),
-        "transaction_cycle": dict(facts.get("transaction_cycle") or facts.get("turnover_days") or {}),
-        "today_actions": list(facts.get("today_actions") or [])[:row_limit],
+        "turnover_days": dict(compact_transaction_cycle),
+        "transaction_cycle": dict(compact_transaction_cycle),
+        "today_actions": _compact_dashboard_rows(
+            facts.get("today_actions"),
+            allowed_keys=_DASHBOARD_COMPACT_ACTION_KEYS,
+            limit=row_limit,
+        ),
         "data_quality": list(facts.get("data_quality") or [])[:row_limit],
-        "performance": dict(facts.get("performance") or {}),
+        "performance": {
+            key: (facts.get("performance") or {}).get(key)
+            for key in (
+                "logical_source_count",
+                "physical_query_count",
+                "physical_query_count_total",
+                "physical_query_count_by_source",
+                "sales_source_elapsed_ms",
+                "stock_source_elapsed_ms",
+                "inbound_source_elapsed_ms",
+                "post_process_elapsed_ms",
+                "total_elapsed_ms",
+                "measured_phase_total_ms",
+                "unaccounted_elapsed_ms",
+                "unaccounted_ratio_pct",
+            )
+            if key in (facts.get("performance") or {})
+        },
     }
     return {
         "snapshot_version": 1,
@@ -3143,12 +3222,299 @@ def _render_dashboard_result_header(cache: dict[str, Any]) -> None:
         st.caption(f"조회 완료 · {max(0, elapsed_ms) / 1000:.1f}초")
 
 
+def _dashboard_layout_preview_key(cache: dict[str, Any]) -> str:
+    # This is a room/session display preference, not an event-payload field.
+    return "__dashboard_layout_v2_preview"
+
+
+def _dashboard_layout_v2_enabled(cache: dict[str, Any] | None) -> bool:
+    cache = cache or {}
+    key = _dashboard_layout_preview_key(cache)
+    if not _DASHBOARD_V2_PREVIEW_AVAILABLE:
+        # A stale preview selection must not survive the temporary rollback.
+        st.session_state.pop(key, None)
+        return False
+    return bool(st.session_state.get(key, False))
+
+
+def _render_dashboard_layout_preview_toggle(cache: dict[str, Any], *, render_mode: str) -> None:
+    """Render the preview switch without changing cached facts or query state."""
+    key = _dashboard_layout_preview_key(cache)
+    if not _DASHBOARD_V2_PREVIEW_AVAILABLE:
+        st.session_state.pop(key, None)
+        log.info(
+            "[dashboard.layout_preview] available=False enabled=False render_mode=%s",
+            render_mode,
+        )
+        return
+    if key not in st.session_state:
+        st.session_state[key] = False
+    if render_mode == "primary":
+        st.toggle("새 레이아웃 미리보기", key=key)
+    log.info(
+        "[dashboard.layout_preview] enabled=%s layout_mode=%s render_mode=%s room_id_present=%s "
+        "event_id_present=%s compact_mode=%s physical_query_count_delta=0 source_call_count_delta=0",
+        bool(st.session_state.get(key)),
+        "v2" if bool(st.session_state.get(key)) else "legacy",
+        render_mode,
+        bool(str(cache.get("room_id") or "")),
+        bool(str(cache.get("dashboard_event_id") or "")),
+        render_mode != "primary",
+    )
+
+
+def _dashboard_analysis_detail_key(cache: dict[str, Any]) -> str:
+    event_id = str(cache.get("dashboard_event_id") or cache.get("id") or "active").strip()
+    return f"__dashboard_analysis_detail_context::{event_id or 'active'}"
+
+
+def _set_dashboard_analysis_detail_context(cache: dict[str, Any], context: str, status: str = "") -> None:
+    st.session_state[_dashboard_analysis_detail_key(cache)] = {
+        "context": context,
+        "status": status,
+        "event_id": str(cache.get("dashboard_event_id") or ""),
+        "room_id": str(cache.get("room_id") or ""),
+    }
+    _request_dashboard_scroll_suppression("analysis_detail_context")
+
+
+def _dashboard_analysis_value(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def _dashboard_analysis_rows(facts: dict[str, Any], context: str) -> list[dict[str, Any]]:
+    inventory = facts.get("inventory") or {}
+    if context == "risk":
+        return [row for row in inventory.get("risk_detail_rows") or [] if isinstance(row, dict)]
+    rows = [row for row in inventory.get("readiness_rows") or [] if isinstance(row, dict)]
+    if context == "demand":
+        return [
+            row for row in rows
+            if bool(_dashboard_analysis_value(row, "수요급증여부", "demand_surge"))
+        ]
+    return rows
+
+
+def _dashboard_analysis_status(row: dict[str, Any], context: str) -> str:
+    if context == "risk":
+        return str(_dashboard_analysis_value(row, "재고위험상태", "위험상태", "status") or "기타")
+    if context == "demand":
+        return str(_dashboard_analysis_value(row, "수요급증상위분류", "수요급증세부분류", "수요 변화") or "수요 변화")
+    cover = str(_dashboard_analysis_value(row, "stock_cover_status", "재고커버상태") or "").strip()
+    if cover:
+        return cover
+    if bool(_dashboard_analysis_value(row, "inbound_delayed_candidate", "입고 지연후보")):
+        return "입고지연 후보"
+    if bool(_dashboard_analysis_value(row, "과잉후보여부")):
+        return "과잉 후보"
+    if str(_dashboard_analysis_value(row, "주요매입처상태")) == "recent_purchase_none":
+        return "최근 매입 없음"
+    return "전체"
+
+
+def _dashboard_analysis_frame(rows: list[dict[str, Any]], context: str) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        records.append({
+            "분석 상태": _dashboard_analysis_status(row, context),
+            "제품코드": _dashboard_analysis_value(row, "product_code", "제품코드"),
+            "제품명": _dashboard_analysis_value(row, "product_name", "제품명"),
+            "주요매입처": _dashboard_analysis_value(row, "주요매입처명", "major_purchase_vendor_name"),
+            "현재고": _dashboard_analysis_value(row, "current_stock_qty", "현재재고수량"),
+            "예상수요": _dashboard_analysis_value(row, "remaining_expected_demand_qty", "위험보정잔여예상수요"),
+            "부족예상수량": _dashboard_analysis_value(row, "shortage_qty", "위험보정부족예상수량"),
+            "부족예상금액": _dashboard_analysis_value(row, "shortage_amt", "위험보정부족예상금액"),
+            "재고준비율": _dashboard_analysis_value(row, "stock_readiness_pct", "위험보정재고준비율"),
+            "재고커버일": _dashboard_analysis_value(row, "stock_cover_days", "재고커버일수"),
+            "최근 입고일": _dashboard_analysis_value(row, "최근 정상 입고일", "last_normal_inbound_date"),
+            "분석 사유": _dashboard_analysis_value(row, "위험사유", "수요급증세부분류사유", "과잉후보사유"),
+        })
+    return pd.DataFrame(records)
+
+
+def _render_dashboard_analysis_detail(facts: dict[str, Any], cache: dict[str, Any], *, render_mode: str) -> None:
+    """Render one facts-only detail table for risk, follow-up, and demand contexts."""
+    selected = st.session_state.get(_dashboard_analysis_detail_key(cache))
+    context = str((selected or {}).get("context") or "risk") if isinstance(selected, dict) else "risk"
+    if context not in {"risk", "followup", "demand"}:
+        context = "risk"
+    if render_mode != "primary":
+        rows = _dashboard_analysis_rows(facts, context)
+        st.caption(f"{context} 분석 품목 요약 {len(rows):,}건 - 상세표와 Excel은 현재 Dashboard 조회에서만 제공합니다.")
+        return
+
+    rows = _dashboard_analysis_rows(facts, context)
+    frame = _dashboard_analysis_frame(rows, context)
+    status_options = ["전체"] + sorted({str(value) for value in frame.get("분석 상태", pd.Series(dtype=str)).tolist() if str(value).strip()})
+    instance = _dashboard_analysis_detail_key(cache)
+    vendor_options = ["all"] + sorted({
+        str(_dashboard_analysis_value(row, "major_purchase_vendor_name"))
+        for row in rows
+        if str(_dashboard_analysis_value(row, "major_purchase_vendor_name")).strip()
+    })
+    controls = st.columns((18, 24, 24, 22, 12))
+    with controls[0]:
+        selected_context = st.selectbox(
+            "분석 유형", ["risk", "followup", "demand"],
+            format_func=lambda value: {"risk": "위험 품목", "followup": "재고 후속관리", "demand": "수요 변화"}[value],
+            key=f"{instance}::selector",
+        )
+    if selected_context != context:
+        _set_dashboard_analysis_detail_context(cache, selected_context)
+        context = selected_context
+        rows = _dashboard_analysis_rows(facts, context)
+        frame = _dashboard_analysis_frame(rows, context)
+        status_options = ["전체"] + sorted({str(value) for value in frame.get("분석 상태", pd.Series(dtype=str)).tolist() if str(value).strip()})
+    with controls[1]:
+        status = st.selectbox("상태", status_options, key=f"{instance}::{context}::status")
+    with controls[2]:
+        vendor = st.selectbox("주요매입처", vendor_options, key=f"{instance}::{context}::vendor")
+    with controls[3]:
+        search_text = st.text_input("제품 검색", key=f"{instance}::{context}::search")
+    with controls[4]:
+        display_limit = st.selectbox("표시 행", [10, 30, 100], index=1, key=f"{instance}::{context}::limit")
+
+    if vendor != "all":
+        rows = [
+            row for row in rows
+            if str(_dashboard_analysis_value(row, "major_purchase_vendor_name")).strip() == vendor
+        ]
+        frame = _dashboard_analysis_frame(rows, context)
+    filtered = frame.copy()
+    if status != "전체" and "분석 상태" in filtered:
+        filtered = filtered[filtered["분석 상태"].astype(str).eq(status)]
+    if str(search_text or "").strip() and not filtered.empty:
+        needle = str(search_text).strip().lower()
+        filtered = filtered[
+            filtered["제품코드"].astype(str).str.lower().str.contains(needle, na=False)
+            | filtered["제품명"].astype(str).str.lower().str.contains(needle, na=False)
+        ]
+    display = filtered.head(int(display_limit)).copy()
+    event_match = bool(str(cache.get("dashboard_event_id") or ""))
+    log.info(
+        "[dashboard.analysis_detail] context=%s selected_status=%s selected_vendor_present=%s search_present=%s "
+        "source_rows=%s filtered_rows=%s displayed_rows=%s export_allowed=%s db_query_count=0 event_match=%s room_match=%s",
+        context, status, vendor != "all", bool(str(search_text or "").strip()), len(rows), len(filtered), len(display),
+        context == "risk", event_match, bool(str(cache.get("room_id") or "")),
+    )
+    st.caption(f"필터 결과 {len(filtered):,}건 중 상위 {len(display):,}건 표시")
+    st.dataframe(display, width="stretch", hide_index=True)
+
+
+def _render_dashboard_cycle_compact(facts: dict[str, Any], *, side: str) -> None:
+    turnover = facts.get("transaction_cycle") or facts.get("turnover_days") or {}
+    presentation = _transaction_cycle_presentation(turnover, side=side)
+    label = "매입" if side == "purchase" else "매출"
+    st.markdown(f"### {label} 거래 주기")
+    if presentation.get("message"):
+        st.caption(str(presentation["message"]))
+        return
+    cols = st.columns(4)
+    for column, (name, value, suffix) in zip(cols, (
+        ("최근 정상 거래일", presentation.get("latest_date") or "-", ""),
+        ("경과일", presentation.get("elapsed_days"), "일"),
+        ("고유 거래일", presentation.get("unique_trade_days"), "일"),
+        ("평균 거래간격", presentation.get("average_interval_days"), "일"),
+    )):
+        with column:
+            _metric_card(name, value if value not in (None, "") else "자료 없음", suffix, digits=1)
+    elapsed = presentation.get("elapsed_days")
+    interval = presentation.get("average_interval_days")
+    if isinstance(elapsed, (int, float)) and isinstance(interval, (int, float)) and interval > 0:
+        ratio = min(100.0, max(0.0, float(elapsed) / float(interval) * 100.0))
+        st.progress(ratio / 100.0, text=f"최근 거래 이후 경과 {ratio:.0f}%")
+
+
+def _render_dashboard_facts_v2(facts: dict[str, Any], cache: dict[str, Any], *, render_mode: str) -> None:
+    """Preview-only layout that reuses already-built Dashboard facts and charts."""
+    inventory = facts.get("inventory") or {}
+    sales = facts.get("sales") or {}
+    sales_state = _sales_presentation_state(facts)
+    inventory_summary = _stock_risk_display_summary(facts)
+    amount_unit = _facts_amount_display_unit(facts)
+    st.markdown("### 일일 핵심 요약")
+    kpis = st.columns(6)
+    kpi_values = (
+        ("현재매출", sales_state.get("current_sales"), "", amount_unit),
+        ("월말 예상매출", sales_state.get("forecast_sales"), "", amount_unit),
+        ("매출 진척률", sales_state.get("sales_progress_pct"), "%", ""),
+        ("긴급 부족 품목", inventory_summary.get("긴급 부족", {}).get("count", 0), "건", ""),
+        ("위험 부족금액", inventory_summary.get("긴급 부족", {}).get("amount", 0), "", amount_unit),
+        ("오늘의 조치", len(facts.get("today_actions") or []), "건", ""),
+    )
+    for column, (label, value, suffix, unit) in zip(kpis, kpi_values):
+        with column:
+            _metric_card(label, value, suffix, amount_unit=unit)
+    phase2 = inventory.get("visual_phase2_summary") or {}
+    st.caption(
+        " · ".join((
+            f"수요 변화 {int(phase2.get('demand_surge_count') or 0):,}건",
+            f"입고지연 후보 {int(phase2.get('inbound_delay_candidate_count') or 0):,}건",
+            f"재고 없음 {int(phase2.get('cover_zero_stock_count') or 0):,}건",
+            f"최근 매입 없음 {int(phase2.get('recent_purchase_none_count') or 0):,}건",
+        ))
+    )
+    briefing_lines = [str(line) for line in phase2.get("briefing_lines") or [] if str(line).strip()][:5]
+    if briefing_lines:
+        with st.container(border=True):
+            st.markdown("### 오늘의 통합 브리핑")
+            for line in briefing_lines:
+                st.caption(line)
+
+    action_tab, sales_tab, risk_tab, followup_tab, demand_tab, detail_tab = st.tabs(
+        ["오늘의 조치", "매출 현황", "재고·공급 위험", "재고 후속관리", "수요 변화", "상세 자료"]
+    )
+    with action_tab:
+        _render_today_actions(facts, cache, render_mode=render_mode)
+    with sales_tab:
+        sales_gauge_col, sales_chart_col = st.columns([35, 65])
+        with sales_gauge_col:
+            _render_sales_gauge(facts)
+        with sales_chart_col:
+            _render_sales_chart(facts)
+        _render_sales_brief(facts)
+        _render_dashboard_cycle_compact(facts, side="sales")
+    with risk_tab:
+        summary_col, chart_col = st.columns([35, 65])
+        with summary_col:
+            _render_stock_risk_summary(facts)
+        with chart_col:
+            _render_stock_chart(facts)
+        _render_vendor_stock_risk(facts)
+        if render_mode == "primary":
+            st.button("위험 품목 보기", key=f"{_dashboard_analysis_detail_key(cache)}::open-risk", on_click=_set_dashboard_analysis_detail_context, args=(cache, "risk"))
+    with followup_tab:
+        _render_visual_phase2(facts)
+        _render_dashboard_cycle_compact(facts, side="purchase")
+        if render_mode == "primary":
+            st.button("재고 후속관리 품목 보기", key=f"{_dashboard_analysis_detail_key(cache)}::open-followup", on_click=_set_dashboard_analysis_detail_context, args=(cache, "followup"))
+    with demand_tab:
+        _render_demand_surge_detail_summary(facts)
+        if render_mode == "primary":
+            st.button("수요 변화 품목 보기", key=f"{_dashboard_analysis_detail_key(cache)}::open-demand", on_click=_set_dashboard_analysis_detail_context, args=(cache, "demand"))
+    with detail_tab:
+        with st.expander("상세 자료 및 다운로드", expanded=False):
+            _render_dashboard_analysis_detail(facts, cache, render_mode=render_mode)
+            if render_mode == "primary":
+                _render_risk_detail(facts, cache, render_mode=render_mode)
+    for section, rows in (("today_actions", len(facts.get("today_actions") or [])), ("risk", len(inventory.get("risk_targets") or [])), ("followup", len(inventory.get("readiness_rows") or [])), ("demand", len(_dashboard_analysis_rows(facts, "demand")))):
+        log.info("[dashboard.layout_section] layout_mode=v2 section=%s compact_mode=%s rendered=True source_rows=%s result_rows=%s elapsed_ms=0", section, render_mode != "primary", rows, rows)
+
+
 def _render_dashboard_facts(
     facts: dict[str, Any],
     cache: dict[str, Any] | None = None,
     *,
     render_mode: str,
 ) -> None:
+    cache = cache or {}
+    if _dashboard_layout_v2_enabled(cache):
+        _render_dashboard_facts_v2(facts, cache, render_mode=render_mode)
+        return
     filter_issues = [
         item
         for item in (facts.get("data_quality") or [])
@@ -3202,6 +3568,7 @@ def _render_dashboard_facts(
 def _render_dashboard_result_in_primary_area(cache: dict[str, Any]) -> None:
     """Render the active result inline at its chat-history message position."""
     _render_dashboard_result_header(cache)
+    _render_dashboard_layout_preview_toggle(cache, render_mode="primary")
     _render_dashboard_facts(dict(cache.get("facts") or {}), cache, render_mode="primary")
 
 
@@ -3275,6 +3642,7 @@ def render_dashboard_lite_chat_item(cache: dict[str, Any], *, render_mode: str =
             reason="active_message",
         )
     _render_dashboard_result_header(cache)
+    _render_dashboard_layout_preview_toggle(cache, render_mode=render_mode)
     _render_dashboard_facts(dict(cache.get("facts") or {}), cache, render_mode="chat")
     return True
 

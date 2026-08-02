@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 import logging
 import time
 
-from app.db.mssql_client import read_df, log_sql
+from app.db.mssql_client import read_df
 from app.db.schema_map import SCHEMA as S
 from app.db.schema_utils import al as _al_shared
 
@@ -251,6 +251,10 @@ def _scope_clause(scope: str, alias: str = "V") -> str:
         "account_purchase": f"{col} BETWEEN '40000' AND '4ZZZZ'",
         "sales": f"{col} BETWEEN '50000' AND '8ZZZZ'",
         "account_sales": f"{col} BETWEEN '90001' AND '9ZZZZ'",
+        # Historical documents may reference both business and account sales
+        # masters.  Keep this separate from the active UI sales scope.
+        "sales_history": f"{col} BETWEEN '50000' AND '9ZZZZ'",
+        "purchase_history": f"{col} BETWEEN '00001' AND '4ZZZZ'",
         "cost_apply": f"{col} BETWEEN '50000' AND '8ZZZZ'",
         "stock_apply": f"{col} BETWEEN '50000' AND '8ZZZZ'",
     }
@@ -264,14 +268,18 @@ def _run_df(action: str, sql: str, params: tuple):
         ms = int((time.perf_counter() - t0) * 1000)
         try:
             log.info(
-                "[svc.rddbc030] action=%s rows=%s elapsed_ms=%s params=%s",
-                action, len(df), ms, params
+                "[svc.rddbc030] action=%s rows=%s elapsed_ms=%s param_count=%s",
+                action, len(df), ms, len(params)
             )
         except Exception:
             pass
         return df
-    except Exception:
-        log_sql(f"rddbc030.{action}.ERROR", sql, params)
+    except Exception as exc:
+        ms = int((time.perf_counter() - t0) * 1000)
+        log.warning(
+            "[svc.rddbc030] action=%s status=error elapsed_ms=%s param_count=%s exception_class=%s",
+            action, ms, len(params), type(exc).__name__,
+        )
         raise
 
 
@@ -843,4 +851,3 @@ def list_vendors_by_scope(scope: str, top: int = 1000, only_active: bool = True)
         only_active=only_active,
         top=top,
     )
-

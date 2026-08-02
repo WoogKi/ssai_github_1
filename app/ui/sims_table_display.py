@@ -16,6 +16,7 @@ import inspect
 import logging
 import os
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -153,6 +154,8 @@ def log_sims_table_render(
 def _is_display_missing_token(value: Any) -> bool:
     if value is None:
         return True
+    if isinstance(value, str):
+        return not value.strip() or value.strip() in _DISPLAY_LITERAL_NULL_STRINGS
     try:
         if pd.isna(value):
             return True
@@ -276,6 +279,10 @@ def _is_numeric_display_name(col: Any) -> bool:
     if s == "명세서번호":
         return True
 
+    # 입출고일자는 '출고'라는 단어를 포함해도 날짜 텍스트다.
+    if "일자" in s or "날짜" in s or "년월" in s:
+        return False
+
     if _is_explicit_code_display_name(s):
         return False
 
@@ -388,13 +395,8 @@ def _normalize_display_scalar(value: Any) -> Any:
 
 
 def _format_display_yyyymm(value: Any) -> Any:
-    if value is None:
-        return value
-    try:
-        if pd.isna(value):
-            return value
-    except Exception:
-        pass
+    if _is_display_missing_token(value):
+        return ""
     s = str(value).strip()
     if not s:
         return value
@@ -406,13 +408,8 @@ def _format_display_yyyymm(value: Any) -> Any:
 
 
 def _format_display_yyyymmdd(value: Any) -> Any:
-    if value is None:
-        return value
-    try:
-        if pd.isna(value):
-            return value
-    except Exception:
-        pass
+    if _is_display_missing_token(value):
+        return ""
     s = str(value).strip()
     if not s:
         return value
@@ -446,8 +443,15 @@ def normalize_display_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = sr.map(_format_display_yyyymmdd)
             continue
 
-        if _is_numeric_display_name(col):
-            out[col] = pd.to_numeric(sr, errors="coerce")
+        if _is_numeric_display_col(out, col):
+            numeric_source = sr.map(
+                lambda value: None if _is_display_missing_token(value) else value
+            )
+            # The chat renderer turns display-only numeric nulls into empty
+            # cells immediately before st.dataframe().  Keep ordinary numeric
+            # values here so that final renderer step can use the established
+            # object-plus-empty-cell Streamlit contract.
+            out[col] = pd.to_numeric(numeric_source, errors="coerce")
             continue
 
         if pd.api.types.is_object_dtype(sr) or pd.api.types.is_string_dtype(sr):
@@ -596,8 +600,19 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
     if any(w in s for w in force_numeric_words):
         return True
 
+    # Semantic code/date names always win over a driver-provided numeric dtype
+    # so leading zeros remain intact.  For every other column, the service
+    # DataFrame dtype is stronger evidence than a Korean display-name fragment:
+    # document sequences, quantities, and statement totals are often numeric
+    # even when their label does not contain a conventional amount keyword.
     if _is_explicit_code_display_name(s):
         return False
+
+    try:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            return True
+    except Exception:
+        pass
 
     # 명칭/구분/판정/기준/자료원 계열은 숫자처럼 보여도 문자 표시
     text_words = [
@@ -617,7 +632,7 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         "결과",
     ]
 
-    if any(w in s for w in text_words):
+    if any(w in s for w in text_words) or s.endswith("처"):
         return False
 
     # 숫자 표시 대상 단어
@@ -648,13 +663,6 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         "분석월수",
         "커버",
         "평균",
-        "매출",
-        "매입",
-        "출고",
-        "입고",
-        "재고",
-        "부족",
-        "필요",
     ]
 
     if any(w in s for w in numeric_words):
@@ -733,6 +741,8 @@ def _numeric_display_kind(col: Any) -> str:
         "당월 출고진척률",
         "당월 재고충족률",
     }
+    # Fast chat KPI tables use these established percent labels as well.
+    percent_cols.update({"전월대비매출증감률", "월시점 최근3개월증감률"})
     if s in percent_cols:
         return "percent2"
 
@@ -792,6 +802,152 @@ def _numeric_display_kind(col: Any) -> str:
         return "int"
 
     return "decimal2"
+
+
+def is_sims_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
+    """Public, side-effect-free numeric-column resolver for every SIMS table path."""
+    return _is_numeric_display_col(df, col)
+
+
+def resolve_sims_numeric_display_kind(col: Any) -> str:
+    """Return the shared NumberColumn display kind without creating widgets."""
+    return _numeric_display_kind(col)
+
+
+def resolve_sims_excel_number_format(col: Any) -> str:
+    """Return the shared Excel number format for a SIMS numeric display column."""
+    kind = resolve_sims_numeric_display_kind(col)
+    if kind == "int":
+        return "#,##0"
+    if kind == "percent2":
+        return "0.00\\%"
+    return "#,##0.##"
+
+
+def _normalize_product_inventory_display_values(df: pd.DataFrame, action_name: str) -> pd.DataFrame:
+    if "제품재고" not in _clean_text(action_name):
+        return df
+    out = df.copy()
+    for qty_col, amount_col in (("이월수량", "이월금액"), ("입고수량", "입고금액"), ("출고수량", "출고금액"), ("재고수량", "재고금액")):
+        if qty_col in out.columns:
+            qty = pd.to_numeric(out[qty_col], errors="coerce").fillna(0.0).astype("float64")
+            out[qty_col] = qty
+            if amount_col in out.columns:
+                amount = pd.to_numeric(out[amount_col], errors="coerce").astype("float64")
+                out[amount_col] = amount.mask(amount.isna() & qty.eq(0), 0.0)
+    for col in ("보험금액", "이월단가", "입고단가", "출고단가", "재고단가", "현보험약가", "이월DC율", "입고DC율", "출고DC율", "재고DC율"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
+    return out
+
+
+def _is_product_table_display_surface(df: pd.DataFrame, action_name: str) -> bool:
+    action = _clean_text(action_name)
+    if "제품수불" in action or "제품재고" in action:
+        return True
+    if not isinstance(df, pd.DataFrame):
+        return False
+    columns = {_clean_text(column) for column in df.columns}
+    return (
+        {"입출고일자", "입고수량", "출고수량", "재고수량"}.issubset(columns)
+        or {"이월수량", "입고수량", "출고수량", "재고수량"}.issubset(columns)
+    )
+
+
+def _normalize_product_table_display_values(df: pd.DataFrame, action_name: str) -> pd.DataFrame:
+    """Apply the common product-table null policy to a display-only copy.
+
+    Product flow and inventory tables contain synthetic summary/carry rows and
+    transaction-dependent text.  Missing text is blank; missing numeric values
+    remain float64 ``np.nan`` so Streamlit NumberColumn keeps numeric formatting.
+    """
+    if not _is_product_table_display_surface(df, action_name):
+        return df
+
+    out = df.copy()
+    for col in out.columns:
+        col_name = _clean_text(col)
+        if "일자" in col_name or "날짜" in col_name:
+            out[col] = out[col].map(
+                lambda value: "" if _is_display_missing_token(value) else value
+            )
+            continue
+        if _is_numeric_display_col(out, col):
+            values = out[col].map(
+                lambda value: np.nan if _is_display_missing_token(value) else value
+            )
+            out[col] = pd.to_numeric(values, errors="coerce").astype("float64")
+            continue
+
+        # This scope keeps generic analysis business text such as literal
+        # "None" unchanged while product-table missing text becomes blank.
+        out[col] = out[col].map(
+            lambda value: "" if _is_display_missing_token(value) else value
+        )
+    return out
+
+
+def prepare_sims_table_display_df(df: pd.DataFrame, *, action_name: str = "") -> pd.DataFrame:
+    """Create a display-only shared SIMS table view without mutating its source."""
+    out = normalize_display_df_for_streamlit(df)
+    out = _normalize_product_inventory_display_values(out, action_name)
+    return _normalize_product_table_display_values(out, action_name)
+
+
+def _format_numeric_display_value(value: Any, kind: str) -> str:
+    """Format one display-only numeric value while leaving missing values blank."""
+    if _is_display_missing_token(value):
+        return ""
+
+    try:
+        numeric = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    except Exception:
+        return ""
+    if _is_display_missing_token(numeric):
+        return ""
+
+    try:
+        if kind == "int":
+            return f"{float(numeric):,.0f}"
+        if kind == "percent2":
+            return f"{float(numeric):,.2f}%"
+        return f"{float(numeric):,.2f}"
+    except (TypeError, ValueError, OverflowError):
+        return ""
+
+
+def _format_numeric_null_columns_for_display(df: pd.DataFrame) -> tuple[pd.DataFrame, set[Any]]:
+    """Convert only numeric columns with missing values for the display copy.
+
+    Streamlit 1.59 renders numeric nulls in ``NumberColumn`` cells as the
+    literal ``None``.  Keep native numeric columns when they have no missing
+    values; only the affected display columns become formatted text so their
+    missing cells can remain visually blank.
+    """
+    if not isinstance(df, pd.DataFrame):
+        return df, set()
+
+    out = df.copy()
+    text_columns: set[Any] = set()
+    for col in out.columns:
+        if not _is_numeric_display_col(df, col):
+            continue
+
+        source = df[col]
+        try:
+            has_missing = bool(source.map(_is_display_missing_token).any())
+        except Exception:
+            has_missing = False
+        if not has_missing:
+            continue
+
+        kind = _numeric_display_kind(col)
+        out[col] = source.map(
+            lambda value: _format_numeric_display_value(value, kind)
+        ).astype("string")
+        text_columns.add(col)
+
+    return out, text_columns
 
 
 def _is_stock_shortage_quantity_int_col(name: Any) -> bool:
@@ -908,6 +1064,7 @@ def _make_column_config(
     *,
     width: int,
     pinned: bool,
+    force_text: bool = False,
 ) -> Any:
     name = _clean_text(col)
 
@@ -919,7 +1076,7 @@ def _make_column_config(
     if pinned and _supports_pinned():
         kwargs["pinned"] = True
 
-    if _is_numeric_display_col(df, col):
+    if _is_numeric_display_col(df, col) and not force_text:
         kind = _numeric_display_kind(name)
 
         if kind == "int":
@@ -1173,7 +1330,7 @@ def build_sims_table_display_config(
     if not isinstance(df, pd.DataFrame):
         return df, {}, min_width, min_height
 
-    view_df = normalize_display_df_for_streamlit(df)
+    view_df = prepare_sims_table_display_df(df, action_name=action_name)
 
     if add_row_no:
         view_df = ensure_row_no(view_df, col_name=row_no_name)
@@ -1190,24 +1347,26 @@ def build_sims_table_display_config(
         else []
     )
 
+    final_view_df, formatted_numeric_columns = _format_numeric_null_columns_for_display(view_df)
     column_config: Dict[str, Any] = {}
     total_width = 60
 
-    for col in view_df.columns:
-        width = _infer_width_px(view_df, col)
+    for col in final_view_df.columns:
+        width = _infer_width_px(final_view_df, col)
         total_width += width
 
         try:
             column_config[col] = _make_column_config(
-                view_df,
+                final_view_df,
                 col,
                 width=width,
                 pinned=_clean_text(col) in pinned_cols,
+                force_text=col in formatted_numeric_columns,
             )
         except TypeError:
             # 혹시 pinned 미지원/인자 차이가 있으면 pinned 없이 재시도
             try:
-                if _is_numeric_display_col(view_df, col):
+                if _is_numeric_display_col(final_view_df, col) and col not in formatted_numeric_columns:
                     column_config[col] = st.column_config.NumberColumn(
                         _clean_text(col),
                         width=width,
@@ -1224,9 +1383,8 @@ def build_sims_table_display_config(
             pass
 
     table_width = int(min(max(total_width, min_width), max_width))
-    table_height = int(min(max(min_height, row_height * (len(view_df) + 1) + 42), max_height))
-
-    return view_df, column_config, table_width, table_height
+    table_height = int(min(max(min_height, row_height * (len(final_view_df) + 1) + 42), max_height))
+    return final_view_df, column_config, table_width, table_height
 
 # SIMS 공용 표 렌더러.
 # 채팅창, SIMS 조회 화면, 향후 분석표가 같은 규칙을 쓰도록 하는 wrapper.

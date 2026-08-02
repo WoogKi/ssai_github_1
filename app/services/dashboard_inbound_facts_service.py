@@ -7,12 +7,14 @@ Business codes remain strings end to end so leading zeroes are never lost.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from contextlib import nullcontext
 import logging
 import time
 from typing import Any, Mapping
 
 import pandas as pd
 
+from app.db.mssql_client import dashboard_measurement_phase, dashboard_query_measurement, get_active_dashboard_query_measurement
 from app.services.rddbc_io_common import query_to_df
 from app.services.product_supplier_scope_service import build_product_supplier_scope_sql
 
@@ -75,6 +77,40 @@ def _parse_cutoff(value: str) -> date:
         return datetime.strptime(text, "%Y%m%d").date()
     except ValueError:
         return date.today()
+
+
+def summarize_transaction_cycle_dates(
+    trade_dates: Any,
+    *,
+    cutoff_date: str,
+    period_days: int = 90,
+) -> dict[str, Any]:
+    """Summarize distinct transaction dates without retaining source rows."""
+    cutoff = _parse_cutoff(cutoff_date)
+    cutoff_ts = pd.Timestamp(cutoff)
+    window_days = max(1, int(period_days))
+    window_start = cutoff_ts - pd.Timedelta(days=window_days - 1)
+    values = pd.to_datetime(pd.Series(trade_dates), errors="coerce").dropna().dt.normalize()
+    recent_days = values.loc[values.between(window_start, cutoff_ts)].drop_duplicates().sort_values()
+    latest_date = recent_days.max() if not recent_days.empty else pd.NaT
+    gaps = recent_days.diff().dt.days.dropna()
+    if recent_days.empty:
+        status = "no_data"
+    elif len(recent_days) == 1:
+        status = "single_trade_day"
+    else:
+        status = "success"
+    return {
+        "period_days": window_days,
+        "cutoff_date": cutoff.strftime("%Y%m%d"),
+        "window_start": window_start.strftime("%Y%m%d"),
+        "window_end": cutoff.strftime("%Y%m%d"),
+        "latest_date": "" if pd.isna(latest_date) else latest_date.strftime("%Y%m%d"),
+        "elapsed_days": None if pd.isna(latest_date) else int((cutoff_ts - latest_date).days),
+        "unique_trade_days": int(len(recent_days)),
+        "average_interval_days": None if len(recent_days) < 2 else float(gaps.mean()),
+        "result_status": status,
+    }
 
 
 def _sql(params: Mapping[str, Any], *, start_date: str, cutoff_date: str) -> tuple[str, dict[str, Any]]:
@@ -261,17 +297,23 @@ def build_dashboard_inbound_facts_frame(
     result.attrs["inbound_build_elapsed_ms"] = int((time.perf_counter() - started) * 1000)
     # This is a bounded aggregate from the already-loaded inbound source.  It
     # deliberately keeps no daily source rows in the Dashboard facts/snapshot.
-    recent_days = positive.loc[positive["within_vendor"], "inbound_date_value"].dropna().drop_duplicates().sort_values()
-    recent_gaps = recent_days.diff().dt.days.dropna()
-    latest_date = recent_days.max() if not recent_days.empty else pd.NaT
+    purchase_cycle = summarize_transaction_cycle_dates(
+        positive.loc[positive["within_vendor"], "inbound_date_value"],
+        cutoff_date=cutoff.strftime("%Y%m%d"),
+        period_days=vendor_lookback_days,
+    )
     result.attrs["purchase_transaction_cycle"] = {
-        "period_days": int(vendor_lookback_days),
-        "cutoff_date": cutoff.strftime("%Y%m%d"),
-        "latest_date": "" if pd.isna(latest_date) else latest_date.strftime("%Y%m%d"),
-        "elapsed_days": None if pd.isna(latest_date) else int((cutoff_ts - latest_date).days),
-        "unique_trade_days": int(len(recent_days)),
-        "average_interval_days": None if len(recent_days) < 2 else float(recent_gaps.mean()),
-        "data_status": "missing" if recent_days.empty else ("insufficient" if len(recent_days) == 1 else "normal"),
+        "period_days": purchase_cycle["period_days"],
+        "cutoff_date": purchase_cycle["cutoff_date"],
+        "latest_date": purchase_cycle["latest_date"],
+        "elapsed_days": purchase_cycle["elapsed_days"],
+        "unique_trade_days": purchase_cycle["unique_trade_days"],
+        "average_interval_days": purchase_cycle["average_interval_days"],
+        "data_status": {
+            "no_data": "missing",
+            "single_trade_day": "insufficient",
+            "success": "normal",
+        }[purchase_cycle["result_status"]],
     }
     log.info(
         "[dashboard.inbound.build] source_rows=%s product_rows=%s normalize_ms=%s event_aggregate_ms=%s gap_aggregate_ms=%s vendor_aggregate_ms=%s merge_finalize_ms=%s build_elapsed_ms=%s",
@@ -295,15 +337,46 @@ def get_dashboard_inbound_facts(
     start_date = (cutoff - timedelta(days=cycle_days - 1)).strftime("%Y%m%d")
     sql, binds = _sql(params or {}, start_date=start_date, cutoff_date=cutoff.strftime("%Y%m%d"))
     query_started = time.perf_counter()
-    source = query_to_df(sql, binds)
+    measurement = get_active_dashboard_query_measurement()
+    phase_context = (
+        dashboard_measurement_phase(
+            measurement,
+            source="inbound",
+            phase="inbound_sql",
+            source_mode="detail_required",
+        )
+        if measurement is not None
+        else nullcontext({})
+    )
+    with phase_context as phase_state:
+        source = query_to_df(sql, binds)
+        if isinstance(phase_state, dict) and isinstance(source, pd.DataFrame):
+            phase_state["result_rows"] = len(source)
+            phase_state["result_cols"] = len(source.columns)
     query_elapsed_ms = int((time.perf_counter() - query_started) * 1000)
     build_started = time.perf_counter()
-    facts = build_dashboard_inbound_facts_frame(
-        source,
-        data_cutoff_date=cutoff.strftime("%Y%m%d"),
-        cycle_lookback_days=cycle_days,
-        vendor_lookback_days=vendor_days,
+    phase_context = (
+        dashboard_measurement_phase(
+            measurement,
+            source="inbound",
+            phase="inbound_pandas",
+            source_mode="detail_required",
+            input_rows=len(source) if isinstance(source, pd.DataFrame) else 0,
+            input_cols=len(source.columns) if isinstance(source, pd.DataFrame) else 0,
+        )
+        if measurement is not None
+        else nullcontext({})
     )
+    with phase_context as phase_state:
+        facts = build_dashboard_inbound_facts_frame(
+            source,
+            data_cutoff_date=cutoff.strftime("%Y%m%d"),
+            cycle_lookback_days=cycle_days,
+            vendor_lookback_days=vendor_days,
+        )
+        if isinstance(phase_state, dict):
+            phase_state["result_rows"] = len(facts)
+            phase_state["result_cols"] = len(facts.columns)
     facts.attrs["inbound_source_rows"] = int(len(source))
     facts.attrs["inbound_query_elapsed_ms"] = query_elapsed_ms
     facts.attrs["inbound_build_elapsed_ms"] = int((time.perf_counter() - build_started) * 1000)

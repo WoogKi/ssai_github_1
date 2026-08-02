@@ -13,10 +13,13 @@ import calendar
 import logging
 import os
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
+import numpy as np
 import pandas as pd
 
+from app.db.mssql_client import dashboard_measurement_phase, dashboard_query_measurement, get_active_dashboard_query_measurement
 from app.services.product_supplier_scope_service import apply_product_supplier_scope, build_product_supplier_scope_sql
 
 from app.services.rddbc_io_common import (
@@ -165,7 +168,7 @@ def _sum_numeric(df: pd.DataFrame, col: str) -> float:
     return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
 
 
-def _normalize_analytics_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _normalize_analytics_numeric_columns(df: pd.DataFrame, *, copy: bool = True) -> pd.DataFrame:
     if df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return df
 
@@ -217,7 +220,7 @@ def _normalize_analytics_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
         "완료월수",
     )
 
-    out = df.copy()
+    out = df.copy() if copy else df
     for col in out.columns:
         s = str(col or "")
         s_lower = s.lower()
@@ -1090,7 +1093,16 @@ LEFT JOIN dbo.Rddbc010 AS Physic_Tax_Nm WITH (NOLOCK)
    AND Physic_Tax_Nm.Rd01_Tcode = P.Rd04_Physic_Tax
 WHERE P.Rd04_Physic_Cd IN ({",".join(placeholders)})
 """
-        df = query_to_df(sql, bind_params)
+        measurement = get_active_dashboard_query_measurement()
+        with dashboard_measurement_phase(
+            measurement,
+            source="sales",
+            phase="sales_product_master_enrichment",
+        ) if measurement is not None else nullcontext({}) as phase_state:
+            df = query_to_df(sql, bind_params)
+            if isinstance(phase_state, dict) and isinstance(df, pd.DataFrame):
+                phase_state["result_rows"] = len(df)
+                phase_state["result_cols"] = len(df.columns)
         if df is not None and not df.empty:
             frames.append(df)
 
@@ -1124,7 +1136,16 @@ SELECT
 FROM dbo.Rddbc030 AS V WITH (NOLOCK)
 WHERE V.Rd03_Ven_Cd IN ({",".join(placeholders)})
 """
-        df = query_to_df(sql, bind_params)
+        measurement = get_active_dashboard_query_measurement()
+        with dashboard_measurement_phase(
+            measurement,
+            source="sales",
+            phase="sales_vendor_master_enrichment",
+        ) if measurement is not None else nullcontext({}) as phase_state:
+            df = query_to_df(sql, bind_params)
+            if isinstance(phase_state, dict) and isinstance(df, pd.DataFrame):
+                phase_state["result_rows"] = len(df)
+                phase_state["result_cols"] = len(df.columns)
         if df is not None and not df.empty:
             frames.append(df)
 
@@ -1411,6 +1432,7 @@ def get_dashboard_sales_source_bundle(params: Optional[Dict[str, Any]] = None) -
     params = _apply_period_source_policy_params(params)
     source_policy = params.get("_period_source_policy") or {}
     source_mode = _resolve_source_mode(params)
+    measurement = get_active_dashboard_query_measurement()
     if source_mode not in {"monthly_book", "monthly_real"}:
         sales_df = get_sales_trend_df(params)
         return {
@@ -1482,38 +1504,92 @@ WHERE 1 = 1
 GROUP BY LEFT(M.{p}_Stock_YyMm, 6), M.{p}_Physic_Cd, M.{p}_Ven_Cd
 OPTION (RECOMPILE)
 """
-    raw_df = query_to_df(sql, bind_params)
+    with dashboard_measurement_phase(
+        measurement,
+        source="sales",
+        phase="sales_monthly_sql",
+        source_mode=source_mode,
+    ) if measurement is not None else nullcontext({}) as phase_state:
+        raw_df = query_to_df(sql, bind_params)
+        if isinstance(phase_state, dict) and isinstance(raw_df, pd.DataFrame):
+            phase_state["result_rows"] = len(raw_df)
+            phase_state["result_cols"] = len(raw_df.columns)
     t_sql = time.perf_counter()
     if raw_df is None:
         raw_df = pd.DataFrame()
     raw_bundle_rows = int(len(raw_df))
-    t_purchase_min = time.perf_counter()
+    t_branch_prepare = time.perf_counter()
     sales_raw = raw_df.loc[raw_df.get("_dashboard_source_kind", pd.Series(index=raw_df.index, dtype="object")).eq("sales")].copy()
     purchase_df = raw_df.loc[raw_df.get("_dashboard_source_kind", pd.Series(index=raw_df.index, dtype="object")).eq("purchase_vendor")].copy()
-    purchase_min_frame_ms = int((time.perf_counter() - t_purchase_min) * 1000)
+    branch_prepare_elapsed_ms = int((time.perf_counter() - t_branch_prepare) * 1000)
+    if measurement is not None:
+        measurement.add_phase(
+            phase="sales_branch_prepare",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=raw_bundle_rows,
+            result_rows=len(sales_raw),
+            input_cols=len(raw_df.columns),
+            result_cols=len(sales_raw.columns),
+            elapsed_ms=branch_prepare_elapsed_ms,
+            copy_occurred=True,
+        )
+        measurement.add_phase(
+            phase="purchase_branch_prepare",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=raw_bundle_rows,
+            result_rows=len(purchase_df),
+            input_cols=len(raw_df.columns),
+            result_cols=len(purchase_df.columns),
+            elapsed_ms=0,
+            copy_occurred=True,
+        )
 
-    product_codes = sales_raw.get("제품코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().tolist()
+    t_code_normalize = time.perf_counter()
+    for frame, code_columns in (
+        (sales_raw, ("제품코드", "매입처코드", "재고적용처코드")),
+        (purchase_df, ("제품코드", "매입처코드")),
+    ):
+        for col in code_columns:
+            if col in frame.columns:
+                frame[col] = frame[col].fillna("").astype(str).str.strip()
+    code_normalize_elapsed_ms = int((time.perf_counter() - t_code_normalize) * 1000)
+    if measurement is not None:
+        measurement.add_phase(
+            phase="code_normalize",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=len(sales_raw) + len(purchase_df),
+            result_rows=len(sales_raw) + len(purchase_df),
+            input_cols=max(len(sales_raw.columns), len(purchase_df.columns)),
+            result_cols=max(len(sales_raw.columns), len(purchase_df.columns)),
+            elapsed_ms=code_normalize_elapsed_ms,
+            copy_occurred=False,
+        )
+
+    product_codes = sales_raw.get("제품코드", pd.Series(dtype="object"))
+    product_codes = product_codes.loc[product_codes.ne("")].drop_duplicates().tolist()
     product_df = _load_monthly_product_master_for_codes(product_codes)
     vendor_codes: set[str] = set()
     for frame in (sales_raw, purchase_df):
         if "매입처코드" in frame.columns:
-            vendor_codes.update(frame["매입처코드"].fillna("").astype(str).str.strip().tolist())
+            vendor_codes.update(frame.loc[frame["매입처코드"].ne(""), "매입처코드"].drop_duplicates().tolist())
         if "재고적용처코드" in frame.columns:
-            vendor_codes.update(frame["재고적용처코드"].fillna("").astype(str).str.strip().tolist())
-    vendor_codes.discard("")
+            vendor_codes.update(frame.loc[frame["재고적용처코드"].ne(""), "재고적용처코드"].drop_duplicates().tolist())
     vendor_df = _load_monthly_vendor_names_for_codes(list(vendor_codes))
 
     t_sales_finalize = time.perf_counter()
-    merged = sales_raw.copy()
+    merged = sales_raw
+    t_sales_merge = time.perf_counter()
     if not merged.empty and product_df is not None and not product_df.empty:
-        merged["제품코드"] = merged["제품코드"].fillna("").astype(str).str.strip()
         merged = merged.merge(product_df, on="제품코드", how="left")
     if vendor_df is not None and not vendor_df.empty:
-        for col in ["매입처코드", "재고적용처코드"]:
-            if col in merged.columns:
-                merged[col] = merged[col].fillna("").astype(str).str.strip()
-        merged = merged.merge(vendor_df.rename(columns={"거래처코드": "매입처코드", "거래처명": "매입처명"}), on="매입처코드", how="left")
-        merged = merged.merge(vendor_df.rename(columns={"거래처코드": "재고적용처코드", "거래처명": "재고적용처명"}), on="재고적용처코드", how="left")
+        purchase_vendor_names = vendor_df.rename(columns={"거래처코드": "매입처코드", "거래처명": "매입처명"})
+        stock_vendor_names = vendor_df.rename(columns={"거래처코드": "재고적용처코드", "거래처명": "재고적용처명"})
+        merged = merged.merge(purchase_vendor_names, on="매입처코드", how="left")
+        merged = merged.merge(stock_vendor_names, on="재고적용처코드", how="left")
+    merge_elapsed_ms = int((time.perf_counter() - t_sales_merge) * 1000)
 
     final_cols = [
         "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명",
@@ -1521,18 +1597,84 @@ OPTION (RECOMPILE)
         "제품분류Gcode", "제품분류코드", "제품분류명", "매입처코드", "매입처명", "재고적용처코드", "재고적용처명",
         "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수", "매입처수", "분석자료원",
     ]
-    for col in final_cols:
-        if col not in merged.columns:
-            merged[col] = ""
-    sales_df = _normalize_analytics_numeric_columns(_add_trend_columns(merged[final_cols]))
+    t_final_column_build = time.perf_counter()
+    merged = merged.reindex(columns=final_cols, fill_value="")
+    final_column_build_elapsed_ms = int((time.perf_counter() - t_final_column_build) * 1000)
+    if measurement is not None:
+        measurement.add_phase(
+            phase="sales_merge",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=len(sales_raw),
+            result_rows=len(merged),
+            input_cols=len(sales_raw.columns),
+            result_cols=len(merged.columns),
+            elapsed_ms=merge_elapsed_ms,
+            copy_occurred=True,
+        )
+        measurement.add_phase(
+            phase="final_column_build",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=len(merged),
+            result_rows=len(merged),
+            input_cols=len(merged.columns),
+            result_cols=len(final_cols),
+            elapsed_ms=final_column_build_elapsed_ms,
+            copy_occurred=True,
+        )
+    t_trend_columns = time.perf_counter()
+    sales_df = _add_trend_columns(merged)
+    trend_columns_elapsed_ms = int((time.perf_counter() - t_trend_columns) * 1000)
+    t_normalize = time.perf_counter()
+    # _add_trend_columns returns a new frame owned by this bundle, so a second
+    # whole-frame copy here only increases the large monthly-bundle peak.
+    sales_df = _normalize_analytics_numeric_columns(sales_df, copy=False)
+    normalize_elapsed_ms = int((time.perf_counter() - t_normalize) * 1000)
+    if measurement is not None:
+        measurement.add_phase(
+            phase="sales_trend_columns",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=len(merged),
+            result_rows=len(sales_df),
+            input_cols=len(merged.columns),
+            result_cols=len(sales_df.columns),
+            elapsed_ms=trend_columns_elapsed_ms,
+            copy_occurred=True,
+        )
+        measurement.add_phase(
+            phase="numeric_normalize",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=len(merged),
+            result_rows=len(sales_df),
+            input_cols=len(merged.columns),
+            result_cols=len(sales_df.columns),
+            elapsed_ms=normalize_elapsed_ms,
+            copy_occurred=True,
+        )
+    t_current_detail_mix = time.perf_counter()
     sales_df = _apply_monthly_current_detail_mix(sales_df, params, source_mode=source_mode, source_policy=source_policy)
+    current_detail_mix_elapsed_ms = int((time.perf_counter() - t_current_detail_mix) * 1000)
+    if measurement is not None:
+        measurement.add_phase(
+            phase="sales_current_detail_mix",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=len(sales_df),
+            result_rows=len(sales_df),
+            input_cols=len(sales_df.columns),
+            result_cols=len(sales_df.columns),
+            elapsed_ms=current_detail_mix_elapsed_ms,
+            copy_occurred=True,
+        )
     sales_finalize_ms = int((time.perf_counter() - t_sales_finalize) * 1000)
 
-    t_purchase_min = time.perf_counter()
+    t_purchase_finalize = time.perf_counter()
     if vendor_df is not None and not vendor_df.empty and "매입처코드" in purchase_df.columns:
-        purchase_df["매입처코드"] = purchase_df["매입처코드"].fillna("").astype(str).str.strip()
         purchase_df = purchase_df.merge(
-            vendor_df.rename(columns={"거래처코드": "매입처코드", "거래처명": "매입처명"}),
+            purchase_vendor_names,
             on="매입처코드",
             how="left",
         )
@@ -1540,11 +1682,23 @@ OPTION (RECOMPILE)
     for col in purchase_cols:
         if col not in purchase_df.columns:
             purchase_df[col] = "" if col in {"기준월", "제품코드", "매입처코드", "매입처명"} else 0
-    purchase_df = purchase_df[purchase_cols]
+    purchase_df = purchase_df.loc[:, purchase_cols].copy()
     for col in ("입고수량", "매입금액", "매입발생건수"):
-        purchase_df[col] = pd.to_numeric(purchase_df[col], errors="coerce").fillna(0)
-    purchase_min_frame_ms += int((time.perf_counter() - t_purchase_min) * 1000)
+        purchase_df.loc[:, col] = pd.to_numeric(purchase_df[col], errors="coerce").fillna(0)
+    purchase_min_frame_ms = int((time.perf_counter() - t_purchase_finalize) * 1000)
     elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    if measurement is not None:
+        measurement.add_phase(
+            phase="sales_bundle_finalize",
+            source_name="sales",
+            source_mode=source_mode,
+            input_rows=len(sales_df) + len(purchase_df),
+            result_rows=len(sales_df) + len(purchase_df),
+            input_cols=len(sales_df.columns),
+            result_cols=len(sales_df.columns),
+            elapsed_ms=purchase_min_frame_ms,
+            copy_occurred=True,
+        )
     perf = {
         "purchase_source_sql_included": True,
         "source_scan_mode": "union_branches",
@@ -1552,6 +1706,9 @@ OPTION (RECOMPILE)
         "sales_rows": int(len(sales_df)),
         "purchase_source_rows": int(len(purchase_df)),
         "sales_finalize_ms": sales_finalize_ms,
+        "sales_merge_ms": merge_elapsed_ms,
+        "sales_normalize_ms": normalize_elapsed_ms,
+        "sales_current_detail_mix_ms": current_detail_mix_elapsed_ms,
         "purchase_min_frame_ms": purchase_min_frame_ms,
         "sql_ms": int((t_sql - t0) * 1000),
         "elapsed_ms": elapsed_ms,
@@ -1742,6 +1899,7 @@ def _build_sales_month_workforward_metrics(df: pd.DataFrame, params: Optional[Di
     if df is None or df.empty or "제품코드" not in df.columns or "기준월" not in df.columns:
         return pd.DataFrame()
 
+    t0 = time.perf_counter()
     work = df.copy()
     work["기준월"] = work["기준월"].map(_parse_yyyymm)
     for col in ["출고수량", "매출합계"]:
@@ -1750,6 +1908,7 @@ def _build_sales_month_workforward_metrics(df: pd.DataFrame, params: Optional[Di
         else:
             work[col] = 0
 
+    t_normalized = time.perf_counter()
     monthly = (
         work.groupby(["제품코드", "기준월"], dropna=False, as_index=False)[["출고수량", "매출합계"]]
         .sum()
@@ -1757,6 +1916,7 @@ def _build_sales_month_workforward_metrics(df: pd.DataFrame, params: Optional[Di
         .reset_index(drop=True)
     )
 
+    t_grouped = time.perf_counter()
     months = sorted({_parse_yyyymm(v) for v in monthly["기준월"].dropna().tolist()})
     completed_months, current_month, future_months = _split_sales_period_months(months, params)
     completed_set = set(completed_months)
@@ -1803,10 +1963,14 @@ def _build_sales_month_workforward_metrics(df: pd.DataFrame, params: Optional[Di
     )
     monthly["최근3개월평균매출"] = monthly["월시점 최근3개월평균매출"]
     monthly["최근6개월평균매출"] = monthly["월시점 최근6개월평균매출"]
-    monthly["월시점 증감률"] = [
-        _pct_change(r3, r6)
-        for r3, r6 in zip(monthly["월시점 최근3개월평균매출"].tolist(), monthly["월시점 최근6개월평균매출"].tolist())
-    ]
+    recent3_avg = monthly["월시점 최근3개월평균매출"]
+    recent6_avg = monthly["월시점 최근6개월평균매출"]
+    monthly["월시점 증감률"] = (
+        recent3_avg.sub(recent6_avg)
+        .div(recent6_avg.where(recent6_avg.abs().ge(1e-12), np.nan))
+        .mul(100)
+        .fillna(0)
+    )
     prev_negative_seen = (
         monthly.assign(_neg=monthly["매출합계"].lt(0))
         .groupby("제품코드", dropna=False)["_neg"]
@@ -1814,12 +1978,19 @@ def _build_sales_month_workforward_metrics(df: pd.DataFrame, params: Optional[Di
         .shift(1)
     )
     monthly["_누계반품월여부"] = prev_negative_seen.eq(True) & monthly["월시점 완료월수"].gt(0)
-    monthly["월시점 추세판정"] = monthly.apply(lambda r: _month_point_trend_judge(r), axis=1)
+    monthly["월시점 추세판정"] = _vectorized_trend_judge(
+        monthly["월시점 완료월총매출"],
+        recent3_avg,
+        recent6_avg,
+        monthly["_누계반품월여부"],
+        completed_count=monthly["월시점 완료월수"],
+    )
     monthly["월시점 판정결과"] = monthly["월시점 추세판정"]
     monthly["추세판정"] = monthly["월시점 추세판정"]
     monthly["판정결과"] = monthly["월시점 판정결과"]
     monthly["월시점 실제매출"] = monthly["매출합계"]
 
+    t_trend = time.perf_counter()
     projection_src = pd.DataFrame({
         "완료월총매출": monthly["월시점 완료월총매출"],
         "완료월수": monthly["월시점 완료월수"],
@@ -1831,23 +2002,36 @@ def _build_sales_month_workforward_metrics(df: pd.DataFrame, params: Optional[Di
         "매출발생월수": monthly["월시점 매출발생월수"],
         "추세판정": monthly["월시점 추세판정"],
     })
-    projection = projection_src.apply(lambda r: _forecast_projection_from_row(r), axis=1, result_type="expand")
-    if not projection.empty:
-        projection.columns = ["월시점 예상기준", "월시점 적용증감률", "월시점 예상매출"]
-        monthly["월시점 예상기준"] = projection["월시점 예상기준"]
-        monthly["월시점 적용증감률"] = projection["월시점 적용증감률"]
-        monthly["월시점 예상매출"] = projection["월시점 예상매출"]
+    projection_label, projection_rate, projection_sales, _ = _vectorized_forecast_projection(projection_src)
+    if not projection_src.empty:
+        monthly["월시점 예상기준"] = projection_label
+        monthly["월시점 적용증감률"] = projection_rate
+        monthly["월시점 예상매출"] = projection_sales
     else:
         monthly["월시점 예상기준"] = "자료부족"
         monthly["월시점 적용증감률"] = 0
         monthly["월시점 예상매출"] = 0
     monthly["월시점 예상대비차이"] = monthly["월시점 실제매출"] - monthly["월시점 예상매출"]
     monthly["월시점 잔여예상"] = (monthly["월시점 예상매출"] - monthly["월시점 실제매출"]).clip(lower=0)
-    monthly["월시점 달성률"] = [
-        (actual / expected * 100) if abs(float(expected or 0)) >= 1e-12 else 0
-        for actual, expected in zip(monthly["월시점 실제매출"].tolist(), monthly["월시점 예상매출"].tolist())
-    ]
-    return monthly.drop(columns=[c for c in ["_이전월매출", "_누계반품월여부"] if c in monthly.columns])
+    monthly["월시점 달성률"] = (
+        monthly["월시점 실제매출"]
+        .div(monthly["월시점 예상매출"].where(monthly["월시점 예상매출"].abs().ge(1e-12), np.nan))
+        .mul(100)
+        .fillna(0)
+    )
+    result = monthly.drop(columns=[c for c in ["_이전월매출", "_누계반품월여부"] if c in monthly.columns])
+    t_finish = time.perf_counter()
+    log.info(
+        "[analytics.sales_workforward.perf] input_rows=%s monthly_rows=%s normalize=%.3fs group=%.3fs trend=%.3fs forecast=%.3fs total=%.3fs rowwise_apply=False",
+        len(df),
+        len(result),
+        t_normalized - t0,
+        t_grouped - t_normalized,
+        t_trend - t_grouped,
+        t_finish - t_trend,
+        t_finish - t0,
+    )
+    return result
 
 
 def _add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -1908,12 +2092,9 @@ def _add_trend_columns(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     if "매출공급가액" in out.columns and "출고수량" in out.columns:
-        out["평균공급단가"] = out.apply(
-            lambda r: (float(r["매출공급가액"]) / float(r["출고수량"]))
-            if float(r["출고수량"] or 0) != 0
-            else 0,
-            axis=1,
-        )
+        supply = _numeric_series(out, "매출공급가액")
+        qty = _numeric_series(out, "출고수량")
+        out["평균공급단가"] = supply.div(qty.where(qty.ne(0), np.nan)).fillna(0)
 
     return out
 
@@ -1929,6 +2110,148 @@ def _month_point_trend_judge(row: pd.Series) -> str:
         float(row.get("월시점 최근6개월평균매출") or 0),
         bool(row.get("_누계반품월여부")),
     )
+
+
+def _numeric_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    """Return one numeric Series without changing the caller's DataFrame."""
+    if column not in frame.columns:
+        return pd.Series(0.0, index=frame.index, dtype="float64")
+    return pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+
+
+def _vectorized_trend_judge(
+    total_sales: pd.Series,
+    recent3: pd.Series,
+    recent6: pd.Series,
+    has_negative_month: pd.Series,
+    *,
+    completed_count: pd.Series | None = None,
+) -> pd.Series:
+    """Vectorized form of _trend_judge with its existing decision order."""
+    index = total_sales.index
+    total = pd.to_numeric(total_sales, errors="coerce").fillna(0.0)
+    r3 = pd.to_numeric(recent3, errors="coerce").fillna(0.0)
+    r6 = pd.to_numeric(recent6, errors="coerce").fillna(0.0)
+    negative = has_negative_month.fillna(False).astype(bool)
+    values = np.full(len(index), "안정", dtype=object)
+
+    # Later conditions deliberately do not overwrite an earlier, stricter one.
+    no_history = (total <= 0) & (r6 <= 0) & (r3 <= 0)
+    past_but_inactive = (total > 0) & (r6 <= 0) & (r3 <= 0)
+    new_or_rising = (r6 <= 0) & (r3 > 0)
+    ratio = r3.div(r6.where(r6.ne(0), np.nan)).fillna(0.0)
+    values[ratio.ge(1.15).to_numpy()] = "증가"
+    values[ratio.le(0.85).to_numpy()] = "감소"
+    values[new_or_rising.to_numpy()] = "신규/증가"
+    values[past_but_inactive.to_numpy()] = "감소"
+    values[no_history.to_numpy()] = "자료부족"
+    values[(negative | total.lt(0)).to_numpy()] = "반품주의"
+    if completed_count is not None:
+        insufficient = pd.to_numeric(completed_count, errors="coerce").fillna(0).le(0)
+        values[insufficient.to_numpy()] = "자료부족"
+    return pd.Series(values, index=index, dtype="object")
+
+
+def _vectorized_forecast_projection(
+    frame: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Vectorized equivalent of forecast base, grade, and projection helpers."""
+    index = frame.index
+    recent3 = _numeric_series(frame, "최근3개월평균매출")
+    recent6 = _numeric_series(frame, "최근6개월평균매출")
+    completed_avg = _numeric_series(frame, "완료월평균매출")
+    average = _numeric_series(frame, "월평균매출")
+    completed_total = _numeric_series(frame, "완료월총매출")
+    total_sales = completed_total.where(completed_total.gt(0), _numeric_series(frame, "총매출액"))
+    active_months = _numeric_series(frame, "매출발생월수")
+    rate = _numeric_series(frame, "최근3개월증감률")
+    judge = frame.get("추세판정", pd.Series("", index=index)).fillna("").astype(str).str.strip()
+
+    base = pd.Series(0.0, index=index, dtype="float64")
+    label = pd.Series("자료부족", index=index, dtype="object")
+    for values, name in (
+        (average, "월평균매출"),
+        (completed_avg, "완료월평균매출"),
+        (recent6, "최근6개월평균매출"),
+        (recent3, "최근3개월평균매출"),
+    ):
+        mask = values.gt(0)
+        base = base.where(~mask, values)
+        label = label.where(~mask, name)
+
+    grade = pd.Series("안정예상", index=index, dtype="object")
+    avg_sales = completed_avg.where(completed_avg.ne(0), average)
+    grade = grade.mask((avg_sales.gt(0)) & recent3.le(avg_sales * 0.75), "감소예상")
+    grade = grade.mask((avg_sales.gt(0)) & recent3.ge(avg_sales * 1.15), "상승예상")
+    grade = grade.mask(rate.le(-20), "감소예상")
+    grade = grade.mask(rate.ge(20), "상승예상")
+    grade = grade.mask(recent6.gt(0) & recent3.le(0), "감소예상")
+    grade = grade.mask(recent6.le(0) & recent3.gt(0), "신규확인")
+    grade = grade.mask(active_months.le(1), "자료부족")
+    grade = grade.mask(total_sales.le(0), "자료부족")
+    grade = grade.mask(judge.eq("반품주의") | total_sales.lt(0), "반품주의")
+
+    adjusted_rate_pct = rate.div(100.0).clip(lower=-0.30, upper=0.30).mul(0.5).mul(100.0)
+    next_month = base.mul(1.0 + adjusted_rate_pct.div(100.0)).clip(lower=0)
+    next_month = next_month.where(~grade.isin({"반품주의", "자료부족"}), base.clip(lower=0))
+    return label, adjusted_rate_pct, next_month, grade
+
+
+def get_dashboard_sales_transaction_dates(
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    date_from: str,
+    date_to: str,
+) -> pd.DataFrame:
+    """Return only scoped normal-sales date candidates for Dashboard cycles.
+
+    The predicate builder is the existing sales-detail contract.  This keeps
+    IO, supplier scope, product, customer, and location conditions identical
+    to Dashboard sales facts while avoiding detail amounts or display columns.
+    """
+    query_params = coalesce_params(params)
+    query_params["date_from"] = str(date_from)
+    query_params["date_to"] = str(date_to)
+    where_sql = _build_filters(query_params)
+    sql = f"""
+SELECT DISTINCT
+    Out_Put.Rd12_Out_YyMmDd AS trade_date,
+    Out_Put.Rd12_Io_Gu AS io_code
+FROM dbo.Rddbc120 AS Out_Put
+LEFT JOIN dbo.Rddbc030 AS Ven_Cd
+    ON Out_Put.Rd12_Ven_Cd = Ven_Cd.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS In_Ven_Cd
+    ON Out_Put.Rd12_In_Ven_Cd = In_Ven_Cd.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS Real_Ven_Cd
+    ON Out_Put.Rd12_Real_Ven_Cd = Real_Ven_Cd.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc040 AS Physic_Cd
+    ON Out_Put.Rd12_Physic_Cd = Physic_Cd.Rd04_Physic_Cd
+LEFT JOIN dbo.Rddbc030 AS Make_Ven
+    ON Physic_Cd.Rd04_Ven_Cd = Make_Ven.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc010 AS Physic_Group_Nm
+    ON Physic_Group_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Group_Gcode
+   AND Physic_Group_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Group
+LEFT JOIN dbo.Rddbc010 AS Physic_Di_Nm
+    ON Physic_Di_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Di_Gcode
+   AND Physic_Di_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Di
+LEFT JOIN dbo.Rddbc010 AS Physic_Gu_Nm
+    ON Physic_Gu_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Tax_Gcode
+   AND Physic_Gu_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Tax
+LEFT JOIN dbo.Rddbc010 AS Stock_Cd
+    ON Out_Put.Rd12_Stock_Cd_Gcode = Stock_Cd.Rd01_Gcode
+   AND Out_Put.Rd12_Stock_Cd = Stock_Cd.Rd01_Tcode
+LEFT JOIN dbo.Rddbc060 AS Sales_Man
+    ON Out_Put.Rd12_Sales_Man = Sales_Man.Rd06_User_Cd
+LEFT JOIN dbo.Rddbc021 AS Road1
+    ON LTRIM(RTRIM(Road1.Rd021_RoadCd)) = LTRIM(RTRIM(Ven_Cd.Rd03_RoadCd))
+   AND LTRIM(RTRIM(Road1.Rd021_DongSeq)) = LTRIM(RTRIM(Ven_Cd.Rd03_DongSeq))
+WHERE 1 = 1
+{where_sql}
+"""
+    df = query_to_df(sql, query_params)
+    if df is None:
+        return pd.DataFrame(columns=["trade_date", "io_code"])
+    return df.reindex(columns=["trade_date", "io_code"])
 
 
 def get_sales_trend_detail_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
@@ -2410,10 +2733,7 @@ def get_sales_trend_summary_df(
     # 기간 중 실제 매출이 발생한 월수
     # 예측등급에서 자료부족/감소예상을 구분하는 기준으로 사용한다.
     if completed_sales_cols:
-        out["매출발생월수"] = out[completed_sales_cols].apply(
-            lambda r: int((pd.to_numeric(r, errors="coerce").fillna(0) != 0).sum()),
-            axis=1,
-        )
+        out["매출발생월수"] = out[completed_sales_cols].ne(0).sum(axis=1).astype(int)
     else:
         out["매출발생월수"] = 0
 
@@ -2431,38 +2751,33 @@ def get_sales_trend_summary_df(
     else:
         out["최근6개월평균매출"] = 0
 
-    out["최근3개월증감률"] = out.apply(
-        lambda r: _pct_change(r.get("최근3개월평균매출"), r.get("최근6개월평균매출")),
-        axis=1,
+    out["최근3개월증감률"] = (
+        out["최근3개월평균매출"]
+        .sub(out["최근6개월평균매출"])
+        .div(out["최근6개월평균매출"].where(out["최근6개월평균매출"].abs().ge(1e-12), np.nan))
+        .mul(100)
+        .fillna(0)
     )
 
     out["_has_negative_month"] = False
     if completed_sales_cols:
         out["_has_negative_month"] = out[completed_sales_cols].lt(0).any(axis=1)
 
-    out["추세판정"] = out.apply(
-        lambda r: _trend_judge(
-            float(completed_total_sales.loc[r.name] if r.name in completed_total_sales.index else 0),
-            float(r.get("최근3개월평균매출") or 0),
-            float(r.get("최근6개월평균매출") or 0),
-            bool(r.get("_has_negative_month")),
-        ),
-        axis=1,
+    out["추세판정"] = _vectorized_trend_judge(
+        completed_total_sales,
+        out["최근3개월평균매출"],
+        out["최근6개월평균매출"],
+        out["_has_negative_month"],
     )
 
     if "_has_negative_month" in out.columns:
         out = out.drop(columns=["_has_negative_month"])
 
-    forecast_projection = out.apply(
-        lambda r: _forecast_projection_from_row(r),
-        axis=1,
-        result_type="expand",
-    )
-    if not forecast_projection.empty:
-        forecast_projection.columns = ["_당월예상기준", "_당월적용증감률", "_당월예상매출"]
-        out["_당월예상기준"] = forecast_projection["_당월예상기준"]
-        out["_당월적용증감률"] = forecast_projection["_당월적용증감률"]
-        out["당월 예상매출"] = forecast_projection["_당월예상매출"] if current_month else 0
+    forecast_label, forecast_rate, forecast_sales, _ = _vectorized_forecast_projection(out)
+    if not out.empty:
+        out["_당월예상기준"] = forecast_label
+        out["_당월적용증감률"] = forecast_rate
+        out["당월 예상매출"] = forecast_sales if current_month else 0
     else:
         out["_당월예상기준"] = "자료부족"
         out["_당월적용증감률"] = 0
@@ -2511,13 +2826,11 @@ def get_sales_trend_summary_df(
             out = out.drop(columns=[c for c in override_pairs if c in out.columns])
 
     out["당월 잔여예상"] = (out["당월 예상매출"] - out["당월 현재매출"]).clip(lower=0)
-    out["당월 진척률"] = out.apply(
-        lambda r: (
-            float(r.get("당월 현재매출") or 0) / float(r.get("당월 예상매출") or 0) * 100
-            if abs(float(r.get("당월 예상매출") or 0)) >= 1e-12
-            else 0
-        ),
-        axis=1,
+    out["당월 진척률"] = (
+        _numeric_series(out, "당월 현재매출")
+        .div(_numeric_series(out, "당월 예상매출").where(_numeric_series(out, "당월 예상매출").abs().ge(1e-12), np.nan))
+        .mul(100)
+        .fillna(0)
     )
 
     round_cols = ["완료월총매출", "월평균매출", "완료월평균매출", "당월 현재매출", "당월 예상매출", "당월 잔여예상"]
@@ -2582,7 +2895,7 @@ def get_sales_trend_summary_df(
     else:
         out = out.sort_values(["제품코드"]).reset_index(drop=True)
 
-    out = _normalize_analytics_numeric_columns(out)
+    out = _normalize_analytics_numeric_columns(out, copy=False)
     out.attrs.update(getattr(raw, "attrs", {}))
     t_sort = time.perf_counter()
     log.info(
@@ -3417,23 +3730,19 @@ def get_sales_forecast_df(
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
     t_numeric = time.perf_counter()
 
-    forecast_rows = []
-
-    for _, row in out.iterrows():
-        base_label, adjusted_rate_pct, next_month = _forecast_projection_from_row(row)
-        grade = _forecast_grade(row)
-
-        forecast_rows.append({
+    base_label, adjusted_rate_pct, next_month, grade = _vectorized_forecast_projection(out)
+    forecast_df = pd.DataFrame(
+        {
             "예상기준": base_label,
             "적용증감률": adjusted_rate_pct,
             "다음월예상매출": next_month,
             "3개월예상매출": next_month * 3,
             "6개월예상매출": next_month * 6,
             "예상등급": grade,
-        })
-
-    forecast_df = pd.DataFrame(forecast_rows)
-    out = pd.concat([out.reset_index(drop=True), forecast_df], axis=1)
+        },
+        index=out.index,
+    )
+    out = pd.concat([out, forecast_df], axis=1)
     for c in ["다음월예상매출", "3개월예상매출", "6개월예상매출"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0).round(0)
@@ -3502,7 +3811,7 @@ def get_sales_forecast_df(
 
     out.insert(0, "순번", range(1, len(out) + 1))
 
-    out = _normalize_analytics_numeric_columns(out)
+    out = _normalize_analytics_numeric_columns(out, copy=False)
     out.attrs.update(getattr(df, "attrs", {}))
     t_finish = time.perf_counter()
     log.info(
@@ -4011,6 +4320,7 @@ def _load_product_current_stock(
     전체 product code를 조회한다.
     """
     t0 = time.perf_counter()
+    measurement = get_active_dashboard_query_measurement()
     codes = [str(x or "").strip() for x in product_codes if str(x or "").strip()]
     codes = sorted(set(codes))
 
@@ -4018,7 +4328,16 @@ def _load_product_current_stock(
     if not stock_codes and clean_text(stock_cd):
         stock_codes = [clean_text(stock_cd)]
     stock_codes = [clean_text(x) for x in stock_codes if clean_text(x)]
+    batch_plan_started = time.perf_counter()
     batch_plan = _stock_query_batch_plan(stock_cd_count=len(stock_codes), io_gu_count=0)
+    if measurement is not None:
+        measurement.add_phase(
+            phase="stock_batch_plan",
+            source_name="stock",
+            input_rows=len(codes),
+            result_rows=len(codes),
+            elapsed_ms=int((time.perf_counter() - batch_plan_started) * 1000),
+        )
 
     spec = _stock_current_monthly_spec(stock_mode)
     table = spec["table"]
@@ -4027,6 +4346,7 @@ def _load_product_current_stock(
     amt_col = spec["amt_col"]
     unit_col = spec["unit_col"]
     fallback_unit_col = spec["fallback_unit_col"]
+    source_policy_started = time.perf_counter()
     source_policy = _resolve_period_source_policy({"date_to": date_to, "policy_date": policy_date})
     stock_month_to = _normalize_month(month_to) or source_policy["effective_month_to"]
     detail_date_to = str(source_policy.get("effective_date_to") or "")
@@ -4034,6 +4354,14 @@ def _load_product_current_stock(
     monthly_stock_month_to = _prev_yyyymm(detail_date_to[:6]) if use_mid_month_detail else stock_month_to
     if not monthly_stock_month_to:
         monthly_stock_month_to = stock_month_to
+    if measurement is not None:
+        measurement.add_phase(
+            phase="stock_source_policy",
+            source_name="stock",
+            input_rows=len(codes),
+            result_rows=len(codes),
+            elapsed_ms=int((time.perf_counter() - source_policy_started) * 1000),
+        )
 
     def _with_stock_attrs(
         df: pd.DataFrame,
@@ -4177,17 +4505,38 @@ OPTION (RECOMPILE)
     frames: list[pd.DataFrame] = []
 
     sql_started_at = time.perf_counter()
-    for batch in batches:
-        batch_df = _query_batch(batch)
-        if batch_df is not None and not batch_df.empty:
-            frames.append(batch_df)
+    with dashboard_measurement_phase(
+        measurement,
+        source="stock",
+        phase="stock_batch_query",
+        source_mode=str(stock_mode or ""),
+        input_rows=len(codes),
+    ) if measurement is not None else nullcontext({}) as phase_state:
+        for batch in batches:
+            batch_df = _query_batch(batch)
+            if batch_df is not None and not batch_df.empty:
+                frames.append(batch_df)
+        if isinstance(phase_state, dict):
+            phase_state["result_rows"] = sum(len(frame) for frame in frames)
+            phase_state["result_cols"] = max((len(frame.columns) for frame in frames), default=0)
     sql_elapsed = time.perf_counter() - sql_started_at
     aggregate_started_at = time.perf_counter()
 
-    if frames:
-        stock_df = pd.concat(frames, ignore_index=True)
-    else:
-        stock_df = pd.DataFrame()
+    with dashboard_measurement_phase(
+        measurement,
+        source="stock",
+        phase="stock_batch_concat",
+        source_mode=str(stock_mode or ""),
+        input_rows=sum(len(frame) for frame in frames),
+    ) if measurement is not None else nullcontext({}) as phase_state:
+        if frames:
+            stock_df = pd.concat(frames, ignore_index=True)
+        else:
+            stock_df = pd.DataFrame()
+        if isinstance(phase_state, dict):
+            phase_state["result_rows"] = len(stock_df)
+            phase_state["result_cols"] = len(stock_df.columns)
+            phase_state["copy_occurred"] = bool(frames)
 
     if use_mid_month_detail:
         movement_df = _load_product_current_month_stock_movements(
@@ -4212,16 +4561,27 @@ OPTION (RECOMPILE)
             stock_df[qty_col] = stock_df[qty_col] + stock_df["당월재고증감수량"]
             stock_df[amt_col] = stock_df[qty_col] * stock_df[unit_col]
 
-    product_col = "제품코드"
-    if not stock_df.empty and product_col in stock_df.columns:
-        dup_count = int(stock_df[product_col].fillna("").astype(str).str.strip().duplicated().sum())
-        if dup_count:
-            log.warning(
-                "[analytics.stock.load.duplicate_product_code] duplicates=%s codes=%s batches=%s",
-                dup_count,
-                len(codes),
-                len(batches),
-            )
+    with dashboard_measurement_phase(
+        measurement,
+        source="stock",
+        phase="stock_current_normalize",
+        source_mode=str(stock_mode or ""),
+        input_rows=len(stock_df),
+        input_cols=len(stock_df.columns),
+    ) if measurement is not None else nullcontext({}) as phase_state:
+        product_col = "제품코드"
+        if not stock_df.empty and product_col in stock_df.columns:
+            dup_count = int(stock_df[product_col].fillna("").astype(str).str.strip().duplicated().sum())
+            if dup_count:
+                log.warning(
+                    "[analytics.stock.load.duplicate_product_code] duplicates=%s codes=%s batches=%s",
+                    dup_count,
+                    len(codes),
+                    len(batches),
+                )
+        if isinstance(phase_state, dict):
+            phase_state["result_rows"] = len(stock_df)
+            phase_state["result_cols"] = len(stock_df.columns)
 
     aggregate_elapsed = time.perf_counter() - aggregate_started_at
     elapsed = time.perf_counter() - t0
@@ -4381,11 +4741,35 @@ def get_stock_shortage_df(
     params = _apply_month_or_date_params(params)
     params = _apply_period_source_policy_params(params)
     t0 = time.perf_counter()
+    measurement = get_active_dashboard_query_measurement()
 
+    def _record_stock_phase(
+        phase: str,
+        started_at: float,
+        *,
+        input_df: Optional[pd.DataFrame] = None,
+        result_df: Optional[pd.DataFrame] = None,
+    ) -> None:
+        if measurement is None:
+            return
+        measurement.add_phase(
+            phase=phase,
+            source_name="stock",
+            input_rows=0 if input_df is None else len(input_df),
+            result_rows=0 if result_df is None else len(result_df),
+            input_cols=0 if input_df is None else len(input_df.columns),
+            result_cols=0 if result_df is None else len(result_df.columns),
+            elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+            copy_occurred=input_df is not result_df,
+        )
+
+    params_started = time.perf_counter()
     stock_mode = str(params.get("stock_mode") or "book").strip()
     stock_label = _stock_mode_label(stock_mode)
     source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
+    _record_stock_phase("stock_params_prepare", params_started)
 
+    universe_started = time.perf_counter()
     base = sales_forecast_df.copy() if isinstance(sales_forecast_df, pd.DataFrame) else get_sales_forecast_df(params, raw_df=sales_raw_df)
     t_base = time.perf_counter()
     # ``None`` means normal Dashboard scope.  An explicit DataFrame, including
@@ -4408,6 +4792,7 @@ def get_stock_shortage_df(
             base = universe.copy()
         elif "제품코드" in base.columns:
             base = universe.merge(base, on="제품코드", how="left", suffixes=("", "_sales"))
+    _record_stock_phase("stock_product_universe_prepare", universe_started, input_df=sales_forecast_df if isinstance(sales_forecast_df, pd.DataFrame) else sales_raw_df, result_df=base)
     if base is None or base.empty:
         log.info(
             "[analytics.stock_shortage.perf] base_empty elapsed=%.3fs meta=%s",
@@ -4463,7 +4848,9 @@ def get_stock_shortage_df(
             if c in stock_df.columns:
                 stock_df[c] = pd.to_numeric(stock_df[c], errors="coerce").fillna(0)
 
+        master_merge_started = time.perf_counter()
         out = out.merge(stock_df, on="제품코드", how="left")
+        _record_stock_phase("stock_master_merge", master_merge_started, input_df=base, result_df=out)
 
 
     for c in ["장부재고수량", "실재고수량", "장부재고금액", "실재고금액"]:
@@ -4471,6 +4858,7 @@ def get_stock_shortage_df(
             out[c] = 0
         out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
 
+    sales_merge_started = time.perf_counter()
     qty_cols = _month_qty_columns(out)
     qty_month_pairs: list[tuple[str, str]] = []
     for c in qty_cols:
@@ -4504,6 +4892,7 @@ def get_stock_shortage_df(
             how="left",
             validate="one_to_one",
         )
+    _record_stock_phase("stock_sales_forecast_merge", sales_merge_started, input_df=base, result_df=out)
     for c in [
         "평가월 이전 완료월수",
         "완료월총수요수량",
@@ -4537,6 +4926,7 @@ def get_stock_shortage_df(
     out["당월 잔여예상출고수량"] = out["평가월 잔여예상수요수량"]
     out["당월 출고진척률"] = out["평가월 수요진척률"]
 
+    shortage_calc_started = time.perf_counter()
     stock_qty_col = _stock_qty_col(stock_mode)
     stock_amt_col = _stock_amt_col(stock_mode)
     stock_unit_col = "실재고평가단가" if stock_mode == "real" else "장부재고평가단가"
@@ -4589,6 +4979,7 @@ def get_stock_shortage_df(
         for stock, remain in zip(current_stock_qty.tolist(), remaining_out_qty.tolist())
     ]
     out["재고부족판정"] = out.apply(_stock_shortage_current_judge, axis=1)
+    _record_stock_phase("stock_shortage_calculation", shortage_calc_started, input_df=base, result_df=out)
 
     shortage_grade_filter = clean_text(
         params.get("shortage_grade") or params.get("shortage_grade_filter")
@@ -4722,7 +5113,9 @@ def get_stock_shortage_df(
     out["분석자료원"] = source_labels["display_source"]
     out["현재고원천"] = source_labels["stock_source"]
 
+    risk_base_started = time.perf_counter()
     out = _finalize_stock_shortage_public_df(out)
+    _record_stock_phase("stock_risk_base_prepare", risk_base_started, input_df=base, result_df=out)
 
     out.attrs["stock_source_table"] = stock_spec.get("source_table")
     out.attrs["stock_source_label"] = source_labels["stock_source"]
@@ -4759,6 +5152,8 @@ def get_stock_shortage_df(
         source_labels["stock_source"],
     )
 
+    source_finalize_started = time.perf_counter()
+    _record_stock_phase("stock_source_finalize", source_finalize_started, input_df=out, result_df=out)
     t_done = time.perf_counter()
     out.attrs["stock_shortage_build_ms"] = int((t_done - t_stock) * 1000)
     out.attrs["stock_shortage_total_ms"] = int((t_done - t0) * 1000)

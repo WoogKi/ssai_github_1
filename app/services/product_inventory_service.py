@@ -12,6 +12,7 @@ import pandas as pd
 
 from app.services.rddbc_io_common import (
     clean_text,
+    add_unlabeled_name_like_filter,
     coalesce_params,
     normalize_top,
     query_to_df,
@@ -50,6 +51,26 @@ def _safe_div(num: pd.Series | float, den: pd.Series | float) -> pd.Series | flo
         out.loc[mask] = num_s.loc[mask] / den_s.loc[mask]
         return out
     return 0.0 if den == 0 else num / den
+
+
+def _unit_price_from_amount_qty(amount: pd.Series, qty: pd.Series) -> pd.Series:
+    """Return a unit price only when the period has an actual quantity basis."""
+    amount_s = pd.to_numeric(amount, errors="coerce")
+    qty_s = pd.to_numeric(qty, errors="coerce")
+    out = pd.Series(float("nan"), index=qty_s.index, dtype="float64")
+    has_quantity = qty_s.notna() & qty_s.ne(0)
+    out.loc[has_quantity] = amount_s.loc[has_quantity] / qty_s.loc[has_quantity]
+    return out
+
+
+def _dc_rate_from_unit(insu_unit: pd.Series, unit_price: pd.Series) -> pd.Series:
+    """Keep DC blank when the period has no valid unit-price evidence."""
+    insu_s = pd.to_numeric(insu_unit, errors="coerce")
+    unit_s = pd.to_numeric(unit_price, errors="coerce")
+    out = pd.Series(float("nan"), index=insu_s.index, dtype="float64")
+    valid = insu_s.notna() & insu_s.ne(0) & unit_s.notna()
+    out.loc[valid] = ((insu_s.loc[valid] - unit_s.loc[valid]) * 100) / insu_s.loc[valid]
+    return out
 
 
 def _fmt_date_text(value: Any) -> str:
@@ -327,6 +348,13 @@ def _inventory_text_payload(
     for k, v in zero_defaults.items():
         meta.setdefault(k, v)
 
+    # 실제 0건 결과는 요약 수치를 숫자 0으로 고정한다. text payload를
+    # 현재표/다운로드 원본으로 오인하지 않도록 표 데이터도 만들지 않는다.
+    if meta.get("result_status") == "no_data":
+        meta.update(zero_defaults)
+        meta["row_count"] = 0
+        meta["row_count_total"] = 0
+
 
     out_params = {
         **params,
@@ -395,15 +423,14 @@ _DISPLAY_NUMERIC_COLS_260 = {
     "현보험약가", "보험금액",
 }
 
-
 def _finalize_display_df_260(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     for col in out.columns:
         if col in _DISPLAY_NUMERIC_COLS_260:
-            s = pd.to_numeric(out[col], errors="coerce")
-            s = s.mask(s.abs() < 1e-12)
-            out[col] = s
+            # 0은 실제 수량/금액/단가일 수 있다. 거래 근거가 없는
+            # 단가·DC는 집계 단계에서 이미 NA로 만들어 전달한다.
+            out[col] = pd.to_numeric(out[col], errors="coerce")
         else:
             out[col] = (
                 out[col]
@@ -429,9 +456,7 @@ def _clean_display_df_260(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in _DISPLAY_NUMERIC_COLS_260:
         if col in out.columns:
-            s = pd.to_numeric(out[col], errors="coerce")
-            s = s.mask(s.abs() < 1e-12)
-            out[col] = s
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
     try:
         out = out.replace({None: "", "None": "", "nan": "", "<NA>": "", "NaT": ""})
@@ -798,6 +823,15 @@ def _apply_master_filters(
         sql_params["physic_nm_like"] = f"%{clean_text(params.get('physic_nm'))}%"
         where.append("P.Rd04_Physic_Nm LIKE %(physic_nm_like)s")
 
+    # 제품재고장의 거래처 라벨은 제품 마스터에 연결된 매입처/발주처
+    # 이름만 대상으로 한다. 제품·제조사 조건과 섞지 않는다.
+    if clean_text(params.get("ven_nm")):
+        sql_params["ven_nm_like"] = f"%{clean_text(params.get('ven_nm'))}%"
+        where.append(
+            "(BuyVen.Rd03_Ven_Nm LIKE %(ven_nm_like)s "
+            "OR OrderVen.Rd03_Ven_Nm LIKE %(ven_nm_like)s)"
+        )
+
     if clean_text(params.get("maker_cd")):
         where.append("P.Rd04_Ven_Cd = %(maker_cd)s")
     if clean_text(params.get("maker_nm")):
@@ -815,6 +849,14 @@ def _apply_master_filters(
     if clean_text(params.get("buy_nm")):
         sql_params["buy_nm_like"] = f"%{clean_text(params.get('buy_nm'))}%"
         where.append("BuyVen.Rd03_Ven_Nm LIKE %(buy_nm_like)s")
+
+    add_unlabeled_name_like_filter(
+        where,
+        sql_params,
+        vendor_name_exprs=("BuyVen.Rd03_Ven_Nm", "OrderVen.Rd03_Ven_Nm"),
+        product_name_expr="P.Rd04_Physic_Nm",
+        manufacturer_name_expr="MakerVen.Rd03_Ven_Nm",
+    )
 
     if clean_text(params.get("product_group_nm")) and clean_text(params.get("product_group_nm")) != "전체":
         sql_params["product_group_nm_like"] = f"%{clean_text(params.get('product_group_nm'))}%"
@@ -1387,14 +1429,14 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
         grp["carry_unit"] = grp["master_unit_cost"]
         grp["stock_unit"] = grp["master_unit_cost"]
     else:  # avg
-        grp["carry_unit"] = _safe_div(_to_num(grp["old_in_amt"]), _to_num(grp["old_in_qty"]))
-        grp["stock_unit"] = _safe_div(
-            _to_num(grp["old_in_amt"]) + _to_num(grp["now_in_amt"]),
-            _to_num(grp["old_in_qty"]) + _to_num(grp["now_in_qty"]),
+        grp["carry_unit"] = _unit_price_from_amount_qty(grp["old_in_amt"], grp["old_in_qty"])
+        grp["stock_unit"] = _unit_price_from_amount_qty(
+            grp["old_in_amt"] + grp["now_in_amt"],
+            grp["old_in_qty"] + grp["now_in_qty"],
         )
 
-    grp["in_unit"] = _safe_div(_to_num(grp["now_in_amt"]), _to_num(grp["now_in_qty"]))
-    grp["out_unit"] = _safe_div(_to_num(grp["now_out_amt"]), _to_num(grp["now_out_qty"]))
+    grp["in_unit"] = _unit_price_from_amount_qty(grp["now_in_amt"], grp["now_in_qty"])
+    grp["out_unit"] = _unit_price_from_amount_qty(grp["now_out_amt"], grp["now_out_qty"])
 
     grp["carry_amt"] = _round_money(_to_num(grp["carry_qty"]) * _to_num(grp["carry_unit"]))
     grp["in_amt"] = _round_money(_to_num(grp["now_in_amt"]))
@@ -1402,22 +1444,10 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
     grp["stock_amt"] = _round_money(_to_num(grp["stock_qty"]) * _to_num(grp["stock_unit"]))
     grp["insu_amt"] = _round_money(_to_num(grp["stock_qty"]) * _to_num(grp["curr_insu_unit"]))
 
-    grp["carry_dc"] = _safe_div(
-        (_to_num(grp["curr_insu_unit"]) - _to_num(grp["carry_unit"])) * 100,
-        _to_num(grp["curr_insu_unit"]),
-    )
-    grp["in_dc"] = _safe_div(
-        (_to_num(grp["curr_insu_unit"]) - _to_num(grp["in_unit"])) * 100,
-        _to_num(grp["curr_insu_unit"]),
-    )
-    grp["out_dc"] = _safe_div(
-        (_to_num(grp["curr_insu_unit"]) - _to_num(grp["out_unit"])) * 100,
-        _to_num(grp["curr_insu_unit"]),
-    )
-    grp["stock_dc"] = _safe_div(
-        (_to_num(grp["curr_insu_unit"]) - _to_num(grp["stock_unit"])) * 100,
-        _to_num(grp["curr_insu_unit"]),
-    )
+    grp["carry_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["carry_unit"])
+    grp["in_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["in_unit"])
+    grp["out_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["out_unit"])
+    grp["stock_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["stock_unit"])
 
     keep_mask = (
         (_to_num(grp["carry_qty"]) != 0)
@@ -1505,23 +1535,23 @@ def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFr
     work["EDI코드"] = work["edi_cd"]
 
     work["이월수량"] = _to_num(work["carry_qty"])
-    work["이월단가"] = _to_num(work["carry_unit"]).round(2)
-    work["이월DC율"] = _to_num(work["carry_dc"]).round(2)
+    work["이월단가"] = pd.to_numeric(work["carry_unit"], errors="coerce").round(2)
+    work["이월DC율"] = pd.to_numeric(work["carry_dc"], errors="coerce").round(2)
     work["이월금액"] = _round_money(work["carry_amt"])
 
     work["입고수량"] = _to_num(work["now_in_qty"])
-    work["입고단가"] = _to_num(work["in_unit"]).round(2)
-    work["입고DC율"] = _to_num(work["in_dc"]).round(2)
+    work["입고단가"] = pd.to_numeric(work["in_unit"], errors="coerce").round(2)
+    work["입고DC율"] = pd.to_numeric(work["in_dc"], errors="coerce").round(2)
     work["입고금액"] = _round_money(work["in_amt"])
 
     work["출고수량"] = _to_num(work["now_out_qty"])
-    work["출고단가"] = _to_num(work["out_unit"]).round(2)
-    work["출고DC율"] = _to_num(work["out_dc"]).round(2)
+    work["출고단가"] = pd.to_numeric(work["out_unit"], errors="coerce").round(2)
+    work["출고DC율"] = pd.to_numeric(work["out_dc"], errors="coerce").round(2)
     work["출고금액"] = _round_money(work["out_amt"])
 
     work["재고수량"] = _to_num(work["stock_qty"])
-    work["재고단가"] = _to_num(work["stock_unit"]).round(2)
-    work["재고DC율"] = _to_num(work["stock_dc"]).round(2)
+    work["재고단가"] = pd.to_numeric(work["stock_unit"], errors="coerce").round(2)
+    work["재고DC율"] = pd.to_numeric(work["stock_dc"], errors="coerce").round(2)
     work["재고금액"] = _round_money(work["stock_amt"])
 
     work["현보험약가"] = _to_num(work["curr_insu_unit"]).round(2)
@@ -1668,6 +1698,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                     date_to=date_to,
                     work_params=work_params,
                     meta={
+                        "result_status": "no_data",
                         "row_count": 0,
                         "row_count_total": 0,
                     },
@@ -1695,6 +1726,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                     date_to=date_to,
                     work_params=work_params,
                     meta={
+                        "result_status": "no_data",
                         "row_count": 0,
                         "row_count_total": 0,
                     },
@@ -1715,7 +1747,12 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 date_from=date_from,
                 date_to=date_to,
                 work_params=work_params,
-                meta=meta,
+                meta={
+                    **dict(meta or {}),
+                    "result_status": "no_data",
+                    "row_count": 0,
+                    "row_count_total": 0,
+                },
             )
 
         query_summary = _build_inventory_query_summary(
@@ -1748,6 +1785,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             "message": f"제품재고현황 {detail_count:,}건",
             "meta": {
                 **meta,
+                "result_status": "success",
                 "query_summary": query_summary,
                 "summary_md": _build_inventory_header_md(meta),
                 "note": _build_inventory_header_md(meta),
@@ -1768,4 +1806,3 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             params=params,
             cfg=cfg,
         )
-    

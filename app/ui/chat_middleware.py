@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Iterable, Tuple, List
 import os
 import io, json, hashlib, logging
+import math
 import uuid
 import streamlit as st
 import pandas as pd
@@ -28,6 +29,10 @@ from app.ui.sims_table_display import (
     log_sims_table_mode,
     log_sims_table_render,
     normalize_display_df_for_streamlit,
+    is_sims_numeric_display_col,
+    prepare_sims_table_display_df,
+    resolve_sims_excel_number_format,
+    resolve_sims_numeric_display_kind,
 )
 from app.ui.sims_analysis_profiles import (
     build_query_scope_summary,
@@ -36,6 +41,7 @@ from app.ui.sims_analysis_profiles import (
     sanitize_llm_text,
     sanitize_sims_llm_dataframe,
 )
+from app.services.nlq_case_log_service import append_nlq_case_record
 
 import datetime as dt
 import time
@@ -103,7 +109,6 @@ _FAST_TABLE_NUMERIC_KPI_COLS = (
     | _FAST_TABLE_DECIMAL_KPI_COLS
     | _FAST_TABLE_PERCENT_KPI_COLS
 )
-
 
 def _chat_is_stock_shortage_quantity_int_col(name: Any) -> bool:
     """재고부족/현재표 수량 계열은 화면에서 정수 천단위로 표시한다."""
@@ -472,6 +477,9 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
                     worksheet.set_column(idx, idx, width, dec_fmt)
                 elif name in percent_cols:
                     worksheet.set_column(idx, idx, width, pct_fmt)
+                elif is_sims_numeric_display_col(df, col):
+                    shared_fmt = workbook.add_format({"num_format": resolve_sims_excel_number_format(col)})
+                    worksheet.set_column(idx, idx, width, shared_fmt)
                 elif width:
                     worksheet.set_column(idx, idx, width)
             return
@@ -502,6 +510,8 @@ def _apply_sims_excel_number_formats(writer: Any, df: pd.DataFrame, sheet_name: 
                 fmt = "#,##0.00"
             elif name in percent_cols:
                 fmt = "0.00\\%"
+            elif is_sims_numeric_display_col(df, col):
+                fmt = resolve_sims_excel_number_format(col)
             else:
                 continue
             for row in range(2, len(df) + 2):
@@ -839,77 +849,16 @@ def _render_current_followup_compact_header(
 
 
 def _chat_clean_display_none_values(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    채팅 표 화면 표시용 None/NaN 정리.
-
-    - 실제 None/NaN/pd.NA/NaT는 빈칸으로 표시
-    - 값이 있는 셀은 건드리지 않음
-    """
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-
-    out = df.copy()
-
-    for col in out.columns:
-        try:
-            col_name = str(col).strip()
-            if col_name == "순번" or col_name in _FAST_TABLE_NUMERIC_KPI_COLS or _chat_is_stock_shortage_quantity_int_col(col_name):
-                continue
-
-            s = out[col].astype("object")
-            s = s.where(pd.notna(s), "")
-            out[col] = s
-        except Exception:
-            pass
-
-    return out
+    """Use the shared display normalizer without changing numeric null dtype."""
+    return normalize_display_df_for_streamlit(df)
 
 
 def _chat_drop_number_config_for_blank_numeric_cols(
     df: pd.DataFrame,
     column_config: dict | None,
 ) -> dict | None:
-    """
-    빈칸이 섞인 숫자형 컬럼은 NumberColumn 설정을 제거한다.
-
-    이유:
-    - 값은 빈칸으로 정리했더라도 NumberColumn이 붙으면
-      Streamlit이 빈칸을 None처럼 표시하는 경우가 있다.
-    - 컬럼 폭/고정은 일부 약해질 수 있지만 None 표시 제거가 우선이다.
-    """
-    if not isinstance(column_config, dict) or not column_config:
-        return column_config
-
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return column_config
-
-    cfg = dict(column_config)
-
-    for col in list(df.columns):
-        if col not in cfg:
-            continue
-
-        try:
-            has_blank = df[col].astype("object").map(lambda v: str(v).strip() == "").any()
-        except Exception:
-            has_blank = False
-
-        if not has_blank:
-            continue
-
-        col_name = str(col or "").strip()
-        if col_name in _FAST_TABLE_NUMERIC_KPI_COLS or _chat_is_stock_shortage_quantity_int_col(col_name):
-            continue
-
-        try:
-            is_numeric_like = _chat_is_fast_numeric_column(df, col)
-        except Exception:
-            is_numeric_like = False
-
-        if is_numeric_like:
-            cfg.pop(col, None)
-
-    return cfg
+    """Compatibility shim: numeric display configs are never removed for nulls."""
+    return column_config
 
 
 def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
@@ -922,6 +871,13 @@ def _chat_is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
     """
     s = str(col or "").strip()
     s_lower = s.lower()
+
+    # 입출고일자는 '출고'를 포함해도 숫자형 KPI가 아닌 날짜 텍스트다.
+    if "일자" in s or "날짜" in s or "년월" in s:
+        return False
+
+    if is_sims_numeric_display_col(df, col):
+        return True
 
     if s in {"순번", "조회순번"}:
         return True
@@ -999,58 +955,10 @@ def _chat_fast_display_df(df: pd.DataFrame) -> pd.DataFrame:
     - 숫자 컬럼은 빠르게 반올림한다.
     - 단, 원본이 None/NaN/빈칸/"None"인 값은 다시 None으로 보이지 않게 빈칸으로 유지한다.
     """
-    out = _chat_clean_display_none_values(df)
+    # Fast, small and history paths converge on build_sims_table_display_config.
+    # Do not create object-plus-empty-string numeric columns here.
+    return df.copy()
 
-    for col in out.columns:
-        s = str(col or "").strip()
-
-        if not _chat_is_fast_numeric_column(out, col):
-            continue
-
-        try:
-            raw_obj = out[col].astype("object")
-
-            blank_mask = raw_obj.isna() | raw_obj.map(lambda v: str(v).strip() == "")
-
-            num = pd.to_numeric(
-                raw_obj.astype(str).str.replace(",", "", regex=False),
-                errors="coerce",
-            )
-
-            if s in _FAST_TABLE_PERCENT_KPI_COLS:
-                converted = num
-            elif _chat_is_stock_shortage_quantity_int_col(s):
-                converted = num.round(0)
-            elif s in _FAST_TABLE_DECIMAL_KPI_COLS:
-                converted = num.round(2)
-            elif (
-                s in _FAST_TABLE_INT_KPI_COLS
-                or s in {"순번", "조회순번"}
-                or s.endswith("건수")
-                or "품목수" in s
-                or "거래처수" in s
-                or "매입처수" in s
-                or "재고적용처수" in s
-                or "금액" in s
-                or "매출" in s
-                or "공급가액" in s
-                or "세액" in s
-                or "가격" in s
-            ):
-                converted = num.round(0)
-            else:
-                converted = num.round(2).astype("object")
-
-            if blank_mask.any() and s not in _FAST_TABLE_NUMERIC_KPI_COLS:
-                converted = converted.astype("object")
-                converted.loc[blank_mask] = ""
-
-            out[col] = converted
-
-        except Exception:
-            pass
-
-    return out
 
 def _chat_fast_column_config(df: pd.DataFrame) -> dict:
     """채팅 빠른 표용 column_config."""
@@ -1062,22 +970,14 @@ def _chat_fast_column_config(df: pd.DataFrame) -> dict:
         if not _chat_is_fast_numeric_column(df, col):
             continue
 
-        # 빈칸이 섞인 숫자형 컬럼은 NumberColumn을 적용하지 않는다.
-        # NumberColumn을 적용하면 빈칸이 Streamlit에서 None처럼 보일 수 있다.
-        try:
-            has_blank = df[col].astype("object").map(lambda v: str(v).strip() == "").any()
-            if has_blank and s not in _FAST_TABLE_NUMERIC_KPI_COLS and not _chat_is_stock_shortage_quantity_int_col(s):
-                continue
-        except Exception:
-            pass
-
-        if s in _FAST_TABLE_PERCENT_KPI_COLS:
+        kind = resolve_sims_numeric_display_kind(s)
+        if s in _FAST_TABLE_PERCENT_KPI_COLS or kind == "percent2":
             cfg[col] = st.column_config.NumberColumn(
                 s,
                 format="%.2f%%",
                 step=0.01,
             )
-        elif _chat_is_stock_shortage_quantity_int_col(s):
+        elif kind == "int":
             cfg[col] = st.column_config.NumberColumn(
                 s,
                 format="localized",
@@ -1137,24 +1037,9 @@ def _render_chat_fast_dataframe(
             "전체 자료는 Excel 또는 CSV 다운로드를 이용하세요."
         )
 
-    log_sims_table_render(
-        full_df,
-        action=action_name,
-        render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
-        mode="fast",
-        renderer="_render_chat_fast_dataframe",
-        height=height,
-        visible_rows=display_rows,
-        width_mode="stretch",
-        column_config_count=0,
-        full_rows=full_rows,
-        display_rows=display_rows,
-        render_truncated=render_truncated,
-        display_limit=display_limit,
-    )
-
     display_df = _preserve_product_flow_table_dtypes(display_df)
-    view_df = normalize_display_df_for_streamlit(_chat_fast_display_df(display_df))
+    # The shared builder performs the single display-only normalization pass.
+    view_df = _chat_fast_display_df(display_df)
 
     try:
         view_df, column_config, table_width, table_height = build_sims_table_display_config(
@@ -1172,8 +1057,21 @@ def _render_chat_fast_dataframe(
             row_height=32,
         )
 
-        view_df = _preserve_product_flow_table_dtypes(_chat_clean_display_none_values(view_df))
-        column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
+        log_sims_table_render(
+            full_df,
+            action=action_name,
+            render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
+            mode="fast",
+            renderer="_render_chat_fast_dataframe",
+            height=height,
+            visible_rows=display_rows,
+            width_mode="stretch",
+            column_config_count=len(column_config or {}),
+            full_rows=full_rows,
+            display_rows=display_rows,
+            render_truncated=render_truncated,
+            display_limit=display_limit,
+        )
         log_sims_display_fields(
             full_df,
             view_df,
@@ -1181,7 +1079,6 @@ def _render_chat_fast_dataframe(
             render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
             mode="fast",
         )
-
         st.dataframe(
             view_df,
             width="stretch",
@@ -1189,9 +1086,35 @@ def _render_chat_fast_dataframe(
             height=table_height,
             column_config=column_config if column_config else None,
         )
-    except Exception:
-        log.exception("[chat] fast common table render failed")
-        cfg = _chat_fast_column_config(view_df)
+    except Exception as exc:
+        log.exception(
+            "[chat] fast common table render failed action=%r render_path=%s "
+            "renderer=%s error_type=%s rows=%s cols=%s",
+            action_name,
+            str(st.session_state.get("__sims_table_render_path") or "chat"),
+            "_render_chat_fast_dataframe",
+            type(exc).__name__,
+            full_rows,
+            0 if not isinstance(full_df, pd.DataFrame) else len(full_df.columns),
+        )
+        # Reuse the common builder config so display-only text columns for
+        # numeric nulls do not become NumberColumn again in the fallback.
+        cfg = column_config or _chat_fast_column_config(view_df)
+        log_sims_table_render(
+            full_df,
+            action=action_name,
+            render_path=str(st.session_state.get("__sims_table_render_path") or "chat"),
+            mode="fast_fallback",
+            renderer="_render_chat_fast_dataframe",
+            height=height,
+            visible_rows=display_rows,
+            width_mode="stretch",
+            column_config_count=len(cfg or {}),
+            full_rows=full_rows,
+            display_rows=display_rows,
+            render_truncated=render_truncated,
+            display_limit=display_limit,
+        )
         log_sims_display_fields(
             full_df,
             view_df,
@@ -1725,6 +1648,83 @@ def _render_chat_analysis_header(meta: Dict[str, Any]) -> None:
 # - 이 함수는 채팅 히스토리에 저장하기 전에 호출하는 것을 권장한다 (실제 렌더링용 payload에는 DataFrame을 유지하는 것이 좋음).
 # - 이 함수는 payload를 직접 수정한다 (in-place).
 # - DataFrame이 없는 경우나, JSON 직렬화가 이미 가능한 경우에는 payload를 그대로 유지한다.
+def _json_safe_finite_number(value: Any) -> int | float | None:
+    """Convert scalar summary facts without allowing NaN into persisted history."""
+    try:
+        if value is None:
+            return None
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            value = value.item()
+        number = float(value)
+        if not math.isfinite(number):
+            return None
+        return int(number) if number.is_integer() else number
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _json_safe_table_value(value: Any) -> Any:
+    """Convert a table cell for persisted history without manufacturing zeroes."""
+    try:
+        if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+            value = value.item()
+    except Exception:
+        pass
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _json_safe_table_records(df: pd.DataFrame) -> list[Dict[str, Any]]:
+    if not isinstance(df, pd.DataFrame):
+        return []
+    return [
+        {str(column): _json_safe_table_value(value) for column, value in row.items()}
+        for row in df.to_dict(orient="records")
+    ]
+
+
+def _preserve_product_summary_facts(meta: Dict[str, Any], action_name: Any) -> Dict[str, Any]:
+    """Persist bounded product-flow/inventory facts per message, never from a display slice."""
+    action = str(action_name or "").strip()
+    out = dict(meta or {})
+    if "제품재고" in action:
+        keys = (
+            "sum_carry_qty", "sum_in_qty", "sum_out_qty", "sum_stock_qty",
+            "sum_stock_amt", "sum_insu_amt",
+        )
+        nested_key = "inventory_summary"
+    elif "제품수불" in action:
+        keys = ("carry_qty", "in_qty", "out_qty", "stock_qty")
+        nested_key = "flow_summary"
+    else:
+        return out
+
+    nested = out.get(nested_key)
+    nested = dict(nested) if isinstance(nested, dict) else {}
+    for key in keys:
+        value = _json_safe_finite_number(out.get(key))
+        if value is None:
+            value = _json_safe_finite_number(nested.get(key))
+        if value is not None:
+            out[key] = value
+            nested[key] = value
+    if nested:
+        out[nested_key] = nested
+    return out
+
+
 def _ensure_table_json_safe(payload: Dict[str, Any]) -> None:
     """테이블 payload가 JSON 직렬화 가능하도록 meta(df, columns)를 보장하고 DF 객체를 제거한다."""
     try:
@@ -1736,9 +1736,12 @@ def _ensure_table_json_safe(payload: Dict[str, Any]) -> None:
 
         df_ui = _drop_sensitive_columns(df_ui)
 
-        meta = dict(payload.get("meta") or {})
+        meta = _preserve_product_summary_facts(
+            dict(payload.get("meta") or {}),
+            payload.get("action") or payload.get("title"),
+        )
         meta["columns"] = list(df_ui.columns)
-        meta["df"] = df_ui.to_dict(orient="records")
+        meta["df"] = _json_safe_table_records(df_ui)
         meta.setdefault("row_count", int(len(df_ui)))
         payload["meta"] = meta
 
@@ -1812,11 +1815,10 @@ def _limit_chat_display_df(df: pd.DataFrame, *, limit: int | None = None) -> pd.
     if not isinstance(df, pd.DataFrame):
         return df
 
-    out = normalize_display_df_for_streamlit(df)
     row_limit = _chat_display_max_rows() if limit is None else int(limit or 0)
-    if row_limit > 0 and len(out) > row_limit:
-        return out.head(row_limit).copy()
-    return out
+    if row_limit > 0 and len(df) > row_limit:
+        return df.head(row_limit).copy()
+    return df.copy()
 
 
 _STOCK_DISPLAY_VALUE_COLS = (
@@ -4473,45 +4475,205 @@ def _expected_analysis_row_count(meta: Dict[str, Any], fallback_rows: int) -> in
 
     return fallback_rows
 
+def _download_source_context(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    table_key: str = "",
+) -> Dict[str, str]:
+    """Build a minimal, non-display download ownership context."""
+    runtime = _chat_runtime_log_context()
+
+    def _first(*values: Any) -> str:
+        for value in values:
+            normalized = str(value or "").strip()
+            if normalized:
+                return normalized
+        return ""
+
+    return {
+        "user_id": _first(meta.get("user_id"), item.get("user_id"), runtime.get("user_id")),
+        "company_id": _first(
+            meta.get("_ssai_company_id"), meta.get("company_id"),
+            item.get("_ssai_company_id"), item.get("company_id"), runtime.get("company_id"),
+        ),
+        "room_id": _first(meta.get("room_id"), item.get("room_id"), runtime.get("room_id")),
+        "action": _first(meta.get("action"), item.get("action"), item.get("title")),
+        "table_key": _first(table_key, meta.get("download_table_key"), meta.get("table_key"), item.get("table_key")),
+        "event_id": _first(meta.get("dashboard_event_id"), item.get("id")),
+    }
+
+
+def _stash_sims_export_provenance(
+    table_key: str,
+    export_df: pd.DataFrame,
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> None:
+    """Store ownership metadata beside, never inside, the export DataFrame stores."""
+    if not table_key or not isinstance(export_df, pd.DataFrame):
+        return
+    provenance = _download_source_context(item, meta, table_key=table_key)
+    provenance["rows"] = int(len(export_df))
+    try:
+        st.session_state.setdefault("__sims_export_table_provenance_by_key", {})
+        st.session_state["__sims_export_table_provenance_by_key"][table_key] = provenance
+    except Exception:
+        log.warning("[chat.download.provenance] export provenance cache failed")
+
+
+def _download_source_provenance_matches(
+    provenance: Any,
+    expected_context: Dict[str, str],
+    *,
+    candidate_rows: int,
+) -> tuple[bool, str]:
+    """Reject a foreign export cache without logging identifiers."""
+    if not isinstance(provenance, dict):
+        return True, "legacy_unverified"
+
+    for key in ("user_id", "company_id", "room_id", "action", "table_key"):
+        expected = str(expected_context.get(key) or "").strip()
+        actual = str(provenance.get(key) or "").strip()
+        if expected and actual and expected != actual:
+            return False, f"{key}_mismatch"
+
+    stored_rows = _safe_int_for_download(provenance.get("rows"), 0)
+    if stored_rows > 0 and stored_rows != candidate_rows:
+        return False, "row_count_mismatch"
+    return True, "verified"
+
+
+def _resolve_payload_full_download_source(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+    *,
+    display_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
+    """Resolve a verified full export source without promoting a display slice."""
+    display_rows = int(len(display_df)) if isinstance(display_df, pd.DataFrame) else 0
+    expected_rows = _expected_analysis_row_count(meta, display_rows)
+    table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    result: Dict[str, Any] = {
+        "df": None,
+        "source_name": "not_found",
+        "source_status": "not_found",
+        "source_table_key": table_key,
+        "source_rows": 0,
+        "expected_rows": expected_rows,
+        "provenance_status": "not_found",
+    }
+
+    # Current-table follow-ups must use their own captured source and never borrow history exports.
+    if bool(meta.get("current_table_followup")):
+        result["source_name"] = "current_table_no_fallback"
+        return result
+
+    partial_seen = False
+    expected_context = _download_source_context(item, meta, table_key=table_key)
+    candidates: list[tuple[pd.DataFrame, str, str, Any]] = []
+    try:
+        for scope_name, scope in (("payload", item), ("meta", meta)):
+            for key in ("df_full", "download_df", "export_df"):
+                value = scope.get(key)
+                if isinstance(value, pd.DataFrame) and not value.empty:
+                    candidates.append((value, f"{scope_name}.{key}", table_key, None))
+
+        table_keys: list[str] = []
+        for key in (
+            meta.get("table_key"), item.get("table_key"),
+            meta.get("download_table_key"), item.get("download_table_key"),
+        ):
+            normalized = str(key or "").strip()
+            if normalized and normalized not in table_keys:
+                table_keys.append(normalized)
+
+        provenance_store = st.session_state.get("__sims_export_table_provenance_by_key")
+        for candidate_key in table_keys:
+            for store_name in ("sims_export_tables", "__sims_export_tables_by_key"):
+                store = st.session_state.get(store_name)
+                value = store.get(candidate_key) if isinstance(store, dict) else None
+                if isinstance(value, pd.DataFrame) and not value.empty:
+                    provenance = provenance_store.get(candidate_key) if isinstance(provenance_store, dict) else None
+                    candidates.append((value, f"{store_name}.{candidate_key}", candidate_key, provenance))
+
+        payload_df = item.get("df")
+        if isinstance(payload_df, pd.DataFrame) and not payload_df.empty:
+            candidates.append((payload_df, "payload.df", table_key, None))
+
+        for candidate, source_name, candidate_key, provenance in candidates:
+            rows = int(len(candidate))
+            candidate_context = dict(expected_context)
+            candidate_context["table_key"] = str(candidate_key or table_key or "").strip()
+            provenance_ok, provenance_status = _download_source_provenance_matches(
+                provenance,
+                candidate_context,
+                candidate_rows=rows,
+            )
+            if not provenance_ok:
+                log.info(
+                    "[chat.download.source] source_rejected=%s expected_rows=%s source_rows=%s provenance=%s",
+                    source_name,
+                    expected_rows,
+                    rows,
+                    provenance_status,
+                )
+                continue
+
+            is_complete = expected_rows <= 0 or rows >= expected_rows
+            if expected_rows > display_rows and not is_complete:
+                partial_seen = True
+                continue
+
+            result.update(
+                {
+                    "df": candidate,
+                    "source_name": source_name,
+                    "source_status": "full" if expected_rows > display_rows else "complete_display",
+                    "source_table_key": candidate_key or table_key,
+                    "source_rows": rows,
+                    "provenance_status": provenance_status,
+                }
+            )
+            return result
+    except Exception:
+        log.warning("[chat.download.source] full source resolver failed")
+
+    result["source_status"] = "display_only_partial" if partial_seen or expected_rows > display_rows else "not_found"
+    result["source_name"] = result["source_status"]
+    return result
+
+
+def _resolve_payload_full_df_for_download(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+) -> tuple[Optional[pd.DataFrame], str]:
+    """Backward-compatible tuple wrapper for callers that only need a DataFrame."""
+    source = _resolve_payload_full_download_source(item, meta)
+    return source.get("df"), str(source.get("source_name") or "not_found")
+
+
+def _render_partial_download_source_notice(
+    *,
+    source_status: str,
+    download_rows: int,
+    expected_rows: int,
+) -> bool:
+    """Explain that CSV/Excel contain only the displayed slice when full source is absent."""
+    if source_status != "display_only_partial" or expected_rows <= download_rows:
+        return False
+    st.warning("전체 원본을 찾지 못했습니다.")
+    st.caption(f"CSV/EXCEL은 현재 화면 데이터 {download_rows:,}건만 포함합니다.")
+    st.caption(f"전체 예상 결과는 {expected_rows:,}건입니다.")
+    return True
+
+
 def _pick_payload_full_df_for_download(
     item: Dict[str, Any],
     meta: Dict[str, Any],
 ) -> Optional[pd.DataFrame]:
-    """
-    CSV/Excel 다운로드 전용 전체 DataFrame 선택.
-
-    화면 표시용은 df_display/sims_tables를 쓰더라도,
-    다운로드는 payload["df"] 또는 session_state["sims_export_tables"]의 전체 DataFrame을 우선 사용한다.
-    """
-    try:
-        for k in ("df", "df_full", "download_df", "export_df"):
-            v = item.get(k)
-            if isinstance(v, pd.DataFrame) and not v.empty:
-                return v
-
-        for k in ("df_full", "download_df", "export_df"):
-            v = meta.get(k)
-            if isinstance(v, pd.DataFrame) and not v.empty:
-                return v
-
-        table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
-        if table_key:
-            export_tables = st.session_state.get("sims_export_tables")
-            if isinstance(export_tables, dict):
-                v = export_tables.get(table_key)
-                if isinstance(v, pd.DataFrame) and not v.empty:
-                    return v
-
-            export_tables2 = st.session_state.get("__sims_export_tables_by_key")
-            if isinstance(export_tables2, dict):
-                v = export_tables2.get(table_key)
-                if isinstance(v, pd.DataFrame) and not v.empty:
-                    return v
-
-    except Exception:
-        pass
-
-    return None
+    """Backward-compatible DataFrame-only wrapper for the download source resolver."""
+    return _resolve_payload_full_df_for_download(item, meta)[0]
 
 def _get_full_download_df_for_sims_item(
     item: Dict[str, Any],
@@ -4530,6 +4692,40 @@ def _get_full_download_df_for_sims_item(
         return display_df
 
     action = str(item.get("action") or meta.get("action") or item.get("title") or "").strip()
+    detail_perf_started = time.perf_counter()
+
+    def _log_io_detail_perf(
+        stage: str,
+        *,
+        rows: int = 0,
+        cache_used: bool = False,
+    ) -> None:
+        if "출고명세" not in action:
+            return
+        params_for_log = item.get("params") or meta.get("params") or {}
+        if not isinstance(params_for_log, dict):
+            params_for_log = {}
+        condition_keys = (
+            "date_from", "date_to", "ven_cd", "ven_nm", "physic_cd",
+            "physic_nm", "maker_cd", "maker_nm", "product_ven_cd",
+            "product_ven_nm", "stock_cd", "stock_nm",
+        )
+        condition_type_count = sum(
+            1 for key in condition_keys if str(params_for_log.get(key) or "").strip()
+        )
+        log.info(
+            "[io.detail.perf] action=%s stage=%s mode=full_source "
+            "condition_type_count=%s display_rows=%s result_rows=%s "
+            "cache_used=%s elapsed_ms=%s source_call_count=%s",
+            action,
+            stage,
+            condition_type_count,
+            display_rows if "display_rows" in locals() else 0,
+            rows,
+            cache_used,
+            int((time.perf_counter() - detail_perf_started) * 1000),
+            int(meta.get("source_call_count") or 0),
+        )
 
     export_actions = {
         "입고명세 조회",
@@ -4567,6 +4763,7 @@ def _get_full_download_df_for_sims_item(
 
             st.session_state["sims_export_tables"][table_key] = export_df
             st.session_state["__sims_export_tables_by_key"][table_key] = export_df
+            _stash_sims_export_provenance(table_key, export_df, item, meta)
 
             meta["download_table_key"] = table_key
             meta["download_row_count"] = int(len(export_df))
@@ -4583,7 +4780,40 @@ def _get_full_download_df_for_sims_item(
         except Exception:
             log.warning("[chat.stash.export] full export cache failed")
 
-    full_df = _pick_payload_full_df_for_download(item, meta)
+    resolved_source = _resolve_payload_full_download_source(
+        item,
+        meta,
+        display_df=display_df,
+    )
+    full_df = resolved_source.get("df")
+    full_source = str(resolved_source.get("source_name") or "not_found")
+    company_match = not (
+        item.get("company_id")
+        and meta.get("company_id")
+        and str(item.get("company_id")) != str(meta.get("company_id"))
+    )
+    room_match = not (
+        item.get("room_id")
+        and meta.get("room_id")
+        and str(item.get("room_id")) != str(meta.get("room_id"))
+    )
+
+    def _log_download_source(*, source: str, export_rows: int, full_source_found: bool) -> None:
+        log.info(
+            "[chat.download.source] action=%s table_key_present=%s download_table_key_present=%s "
+            "source=%s expected_rows=%s display_rows=%s export_rows=%s full_source_found=%s "
+            "company_match=%s room_match=%s",
+            action,
+            bool(table_key),
+            bool(meta.get("download_table_key")),
+            source,
+            expected_rows,
+            display_rows,
+            export_rows,
+            full_source_found,
+            company_match,
+            room_match,
+        )
 
 
     if isinstance(full_df, pd.DataFrame) and not full_df.empty:
@@ -4622,6 +4852,11 @@ def _get_full_download_df_for_sims_item(
                     display_rows,
                     expected_rows,
                 )
+                _log_download_source(
+                    source=full_source,
+                    export_rows=full_rows,
+                    full_source_found=True,
+                )
                 return full_df
 
             _chat_log_info_once(
@@ -4638,6 +4873,19 @@ def _get_full_download_df_for_sims_item(
             return full_df
 
     if not is_exportable_action:
+        _log_download_source(
+            source="display_only_partial" if expected_rows > display_rows else "display_only_complete",
+            export_rows=display_rows,
+            full_source_found=False,
+        )
+        if expected_rows > display_rows:
+            log.warning(
+                "[chat.download.source] full export source missing; display dataframe is partial action=%s "
+                "expected_rows=%s display_rows=%s",
+                action,
+                expected_rows,
+                display_rows,
+            )
         return display_df
 
     # 전체건수가 화면건수와 같으면 굳이 재조회하지 않는다.
@@ -4659,6 +4907,11 @@ def _get_full_download_df_for_sims_item(
             query_cap = 0
 
         if not is_validation_action or not (query_cap > 0 and display_rows >= query_cap):
+            _log_download_source(
+                source="display_only_complete",
+                export_rows=display_rows,
+                full_source_found=False,
+            )
             return display_df
 
     params = _download_params_from_item(item, meta)
@@ -4689,6 +4942,11 @@ def _get_full_download_df_for_sims_item(
 
         if isinstance(cached, pd.DataFrame) and not cached.empty:
             _stash_export_df_by_table_key(cached)
+            _log_io_detail_perf(
+                "full_source_cache",
+                rows=int(len(cached)),
+                cache_used=True,
+            )
             return cached
 
         if action == "입고명세 조회":
@@ -4738,6 +4996,11 @@ def _get_full_download_df_for_sims_item(
         if isinstance(export_df, pd.DataFrame) and not export_df.empty:
             st.session_state["__sims_export_tables"][cache_key] = export_df
             _stash_export_df_by_table_key(export_df)
+
+            _log_io_detail_perf(
+                "full_source_query",
+                rows=int(len(export_df)),
+            )
 
             log.info(
                 "[chat] full download df prepared action=%s display_rows=%s export_rows=%s expected_rows=%s",
@@ -4956,6 +5219,7 @@ def _render_sims_result_actions_fragment(
     clicked_message_id: str = "",
     analysis_ctx: Optional[Dict[str, Any]] = None,
     context_source: str = "",
+    download_label_prefix: str = "",
 ) -> None:
     """
     SIMS 결과 하단 액션 영역.
@@ -4969,7 +5233,7 @@ def _render_sims_result_actions_fragment(
 
     with c1:
         st.download_button(
-            "CSV 저장",
+            f"{download_label_prefix}CSV 저장",
             data=csv_bytes,
             file_name=csv_name,
             mime="text/csv",
@@ -4980,7 +5244,7 @@ def _render_sims_result_actions_fragment(
     with c2:
         if isinstance(excel_bytes, (bytes, bytearray)):
             st.download_button(
-                "EXCEL 저장",
+                f"{download_label_prefix}EXCEL 저장",
                 data=excel_bytes,
                 file_name=xlsx_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -5242,6 +5506,7 @@ def _render_sims_result_actions_lazy(
     clicked_message_id: str = "",
     clicked_action: str = "",
     clicked_meta: Optional[Dict[str, Any]] = None,
+    download_label_prefix: str = "",
 ) -> None:    
 
     """
@@ -5335,7 +5600,7 @@ def _render_sims_result_actions_lazy(
 
         with c1:
             if st.button(
-                "Excel 다운로드 준비",
+                f"{download_label_prefix}Excel 다운로드 준비",
                 key=f"sims_prepare_download_{key_suffix}",
                 width="stretch",
             ):
@@ -5455,6 +5720,7 @@ def _render_sims_result_actions_lazy(
         clicked_message_id=clicked_message_id,
         analysis_ctx=analysis_ctx,
         context_source=analysis_ctx_source,
+        download_label_prefix=download_label_prefix,
     )
 
 
@@ -5639,6 +5905,85 @@ def _sims_result_datetime_text(item: Dict[str, Any], meta: Dict[str, Any]) -> st
         if text:
             return text
     return ""
+
+
+def _format_sims_elapsed_ms(value: Any) -> str:
+    """Format persisted response elapsed milliseconds without noisy decimals."""
+    try:
+        elapsed_ms = max(0, int(round(float(value))))
+    except Exception:
+        return ""
+
+    if elapsed_ms < 60_000:
+        return f"{elapsed_ms / 1000:.1f}초"
+
+    minutes, seconds = divmod(elapsed_ms // 1000, 60)
+    return f"{minutes}분 {seconds}초"
+
+
+def _sims_response_timing_text(meta: Dict[str, Any]) -> str:
+    completed_at = _coerce_sims_result_datetime((meta or {}).get("response_completed_at"))
+    elapsed_text = _format_sims_elapsed_ms((meta or {}).get("elapsed_ms"))
+    if not completed_at or not elapsed_text:
+        return ""
+    return f"응답완료 {completed_at} (처리 {elapsed_text})"
+
+
+def _attach_sims_response_timing(payload: Dict[str, Any], session_state: Dict[str, Any]) -> None:
+    """Finalize NLQ timing once and keep restored/history payloads immutable."""
+    if not isinstance(payload, dict):
+        return
+
+    meta = dict(payload.get("meta") or {})
+    if not bool(meta.get("nlq")):
+        return
+
+    # History restoration must never remeasure a completed response.
+    if (
+        _coerce_sims_result_datetime(meta.get("request_started_at"))
+        and _coerce_sims_result_datetime(meta.get("response_completed_at"))
+        and isinstance(meta.get("elapsed_ms"), (int, float))
+    ):
+        return
+
+    context = session_state.get("__sims_nlq_response_timing") or {}
+    started_at = _coerce_sims_result_datetime(context.get("request_started_at"))
+    if not started_at:
+        return
+
+    try:
+        elapsed_ms = max(
+            0,
+            int(round((time.monotonic() - float(context.get("request_started_monotonic"))) * 1000)),
+        )
+    except Exception:
+        elapsed_ms = 0
+
+    meta["request_started_at"] = started_at
+    meta["response_completed_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    meta["elapsed_ms"] = elapsed_ms
+    payload["meta"] = meta
+    session_state.pop("__sims_nlq_response_timing", None)
+
+
+def _append_finalized_nlq_case(payload: Dict[str, Any], session_state: Dict[str, Any]) -> None:
+    """Persist one safe case record only after chat delivery and timing are final."""
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    if not bool(meta.get("nlq")):
+        return
+    try:
+        question = sanitize_llm_text(str(meta.get("nlq_query") or ""), label="nlq_case_question")
+        append_nlq_case_record(
+            payload,
+            session_state,
+            runtime_context=_chat_runtime_log_context(),
+            question=question,
+            normalized_question=question,
+            logger=log,
+        )
+    except Exception as exc:
+        # Logging must never change a completed user response.
+        log.warning("[nlq.case] prepare_failed error_class=%s", type(exc).__name__)
 
 # SIMS 표 유지 정책
 # - reference: 사용자가 계속 보면서 판단해야 하는 기준표
@@ -6712,12 +7057,24 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     else:
                         msg = "해당 조회조건의 자료가 없습니다."
 
+                    entity_resolution_status = str(meta.get("entity_resolution_status") or "")
+                    preserve_resolution_guidance = entity_resolution_status in {
+                        "resolution_unavailable",
+                        "not_found",
+                    }
+                    guidance_message = str(payload.get("message") or payload.get("data") or "")
+                    guidance_title = str(payload.get("title") or "")
                     payload["type"] = "text"
                     payload["title"] = f"{action_name} 결과 없음"
                     payload["action"] = str(action_name or "")
                     payload["message"] = msg
                     payload["data"] = msg
                     payload["content"] = msg
+                    if preserve_resolution_guidance:
+                        payload["title"] = guidance_title
+                        payload["message"] = guidance_message
+                        payload["data"] = guidance_message
+                        payload["content"] = guidance_message
                     if query_summary:
                         meta["query_summary"] = query_summary
                         meta["condition"] = query_summary
@@ -6815,6 +7172,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 if isinstance(df_full_for_export, pd.DataFrame) and not df_full_for_export.empty:
                     ss["sims_export_tables"][table_key] = df_full_for_export
                     ss["__sims_export_tables_by_key"][table_key] = df_full_for_export
+                    _stash_sims_export_provenance(table_key, df_full_for_export, payload, meta)
                     meta["download_table_key"] = table_key
                     meta["download_row_count"] = int(len(df_full_for_export))
                     meta["display_row_count"] = int(len(df_display_for_ui))
@@ -6881,6 +7239,12 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                         ):
                             ss["sims_export_tables"][table_key] = full_df_for_followup
                             ss["__sims_export_tables_by_key"][table_key] = full_df_for_followup
+                            _stash_sims_export_provenance(
+                                table_key,
+                                full_df_for_followup,
+                                item_for_export,
+                                meta,
+                            )
 
                             meta["download_table_key"] = table_key
                             meta["download_row_count"] = int(len(full_df_for_followup))
@@ -7034,9 +7398,13 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
             log.warning("[chat.sims.push] display metadata failed error_type=%s", type(exc).__name__)
 
     # 5) 인박스에 넣고 drain
+    # NLQ 응답시간은 전체 원본 준비, 현재표 승격, 다운로드 원본 stash가 끝난
+    # 뒤에 한 번만 확정한다. 인박스 전달 이후의 history 복원/Streamlit rerender는 제외한다.
+    _attach_sims_response_timing(payload, ss)
     ss.setdefault("__chat_inbox", [])
     ss["__chat_inbox"].append(payload)
     drain_inbox_to_chat()
+    _append_finalized_nlq_case(payload, ss)
     ss["__sims_last_push_sig"] = sig
     try:
         import time as _time
@@ -7096,6 +7464,19 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         ss["__sims_push_count"],
         (payload.get("meta") or {}).get("table_key") if isinstance(payload.get("meta"), dict) else "",
     )
+    timing_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    if bool(timing_meta.get("nlq")):
+        log.info(
+            "[sims.response_timing] action=%s message_id=%s request_started_at=%s "
+            "response_completed_at=%s elapsed_ms=%s persisted=%s restored=%s",
+            action_name,
+            str(payload.get("id") or "")[:32],
+            timing_meta.get("request_started_at") or "",
+            timing_meta.get("response_completed_at") or "",
+            timing_meta.get("elapsed_ms") if isinstance(timing_meta.get("elapsed_ms"), (int, float)) else "",
+            True,
+            False,
+        )
     log.info(
         "[SIMS_PUSH] %s action=%s rows=%s cols=%s sig=%s count=%d",
         _chat_runtime_log_kv(),
@@ -7448,6 +7829,20 @@ def _fmt_metric_num(value: Any) -> str:
     return f"{n:,.2f}".rstrip("0").rstrip(".")
 
 
+def _render_sims_numeric_metric(label: str, value: Any) -> None:
+    """Render product-table metrics with a shared negative-value emphasis."""
+    numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    value_color = "#dc2626" if pd.notna(numeric_value) and float(numeric_value) < 0 else "#1f2937"
+    st.caption(label)
+    st.markdown(
+        (
+            "<div style=\"font-size:1.17rem;font-weight:700;line-height:1.25;"
+            f"color:{value_color};\">{_fmt_metric_num(value)}</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def _is_product_flow_action(action_name: str) -> bool:
     return action_name == "제품수불현황 조회"
 
@@ -7624,45 +8019,42 @@ def _should_show_product_inventory_info(meta: Dict[str, Any], data: Any = None) 
 def _render_product_flow_metrics(meta: Dict[str, Any]) -> None:
     labels = ["이월재고", "입고수량", "출고수량", "재고수량"]
     values = [
-        _fmt_metric_num(meta.get("carry_qty")),
-        _fmt_metric_num(meta.get("in_qty")),
-        _fmt_metric_num(meta.get("out_qty")),
-        _fmt_metric_num(meta.get("stock_qty")),
+        meta.get("carry_qty"),
+        meta.get("in_qty"),
+        meta.get("out_qty"),
+        meta.get("stock_qty"),
     ]
 
     cols = st.columns(4)
     for col, label, value in zip(cols, labels, values):
         with col:
-            st.caption(label)
-            st.markdown(f"### {value}")
+            _render_sims_numeric_metric(label, value)
 
 
 def _render_product_inventory_metrics(meta: Dict[str, Any]) -> None:
     top_labels = ["이월수량", "입고수량", "출고수량"]
     top_values = [
-        _fmt_metric_num(meta.get("sum_carry_qty")),
-        _fmt_metric_num(meta.get("sum_in_qty")),
-        _fmt_metric_num(meta.get("sum_out_qty")),
+        meta.get("sum_carry_qty"),
+        meta.get("sum_in_qty"),
+        meta.get("sum_out_qty"),
     ]
 
     bottom_labels = ["재고수량", "재고금액", "보험금액"]
     bottom_values = [
-        _fmt_metric_num(meta.get("sum_stock_qty")),
-        _fmt_metric_num(meta.get("sum_stock_amt")),
-        _fmt_metric_num(meta.get("sum_insu_amt")),
+        meta.get("sum_stock_qty"),
+        meta.get("sum_stock_amt"),
+        meta.get("sum_insu_amt"),
     ]
 
     top_cols = st.columns(3)
     for col, label, value in zip(top_cols, top_labels, top_values):
         with col:
-            st.caption(label)
-            st.markdown(f"### {value}")
+            _render_sims_numeric_metric(label, value)
 
     bottom_cols = st.columns(3)
     for col, label, value in zip(bottom_cols, bottom_labels, bottom_values):
         with col:
-            st.caption(label)
-            st.markdown(f"### {value}")
+            _render_sims_numeric_metric(label, value)
 
 def _render_monthly_stock_metrics(meta: Dict[str, Any]) -> None:
     if not meta.get("monthly_stock_summary"):
@@ -8443,7 +8835,9 @@ def _build_sims_result_header_view(
     query_summary, full_condition = _sims_query_summary_for_header(item, safe_meta)
 
     status_suffix = " · 표시 데이터 만료" if expired else ""
-    if expected_rows and full_rows and expected_rows > full_rows:
+    if str(safe_meta.get("entity_resolution_status") or "") == "resolution_unavailable":
+        line1 = "조회 조건 확인 필요"
+    elif expected_rows and full_rows and expected_rows > full_rows:
         line1 = f"결과: 조건 전체 {expected_rows:,}건 · 조회 {full_rows:,}건"
         if display_rows and display_rows < full_rows:
             line1 += f" · 표 데이터 {display_rows:,}건"
@@ -8469,6 +8863,9 @@ def _build_sims_result_header_view(
         line2_parts.append("저장된 조회정보만 표시합니다.")
     if followup_available:
         line2_parts.append("현재표 후속질문 가능")
+    response_timing = _sims_response_timing_text(safe_meta)
+    if response_timing:
+        line2_parts.append(response_timing)
     line2 = " · ".join(line2_parts)
 
     result_time_text = _sims_result_datetime_text(item, safe_meta)
@@ -8486,6 +8883,7 @@ def _build_sims_result_header_view(
     details: list[str] = []
     _sims_detail_add(details, "조회명", action_name)
     _sims_detail_add(details, "조회시각", result_time_text)
+    _sims_detail_add(details, "응답완료", response_timing)
     _sims_detail_add(details, "전체 조회조건", full_condition)
     _sims_detail_add(details, "NLQ 원문", nlq_query)
     if expected_rows and expected_rows != full_rows:
@@ -8762,9 +9160,6 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             with st.chat_message((item.get("role") or "assistant").lower() if (item.get("role") or "assistant").lower() in ("assistant", "user") else "assistant"):
                 _render_expired_sims_table_fallback(item, meta)
             return
-
-    if isinstance(data, pd.DataFrame):
-        data = normalize_display_df_for_streamlit(data)
 
     role = (item.get("role") or "assistant").lower()
     if role not in ("assistant", "user"):
@@ -9119,8 +9514,39 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             if bool(locals().get("old_history_table_forced", False)):
                 raw_download_df = data
                 defer_full_export = True
-            elif defer_full_export:
-                raw_download_df = data
+                download_source_result = {
+                    "df": data,
+                    "source_name": "history_display_only",
+                    "source_status": "display_only_partial",
+                    "source_table_key": str(meta.get("table_key") or ""),
+                    "source_rows": display_rows_initial,
+                    "expected_rows": expected_rows_initial,
+                }
+                file_generation_status = "deferred"
+            else:
+                # Source completeness and file-generation timing are separate
+                # contracts.  A deferred workbook may still have a verified full
+                # DataFrame in the export store.
+                download_source_result = _resolve_payload_full_download_source(
+                    item,
+                    meta,
+                    display_df=data,
+                )
+                raw_download_df = download_source_result.get("df")
+                if not isinstance(raw_download_df, pd.DataFrame):
+                    raw_download_df = _get_full_download_df_for_sims_item(item, meta, data)
+                    recovered_rows = int(len(raw_download_df)) if isinstance(raw_download_df, pd.DataFrame) else 0
+                    download_source_result["df"] = raw_download_df
+                    download_source_result["source_rows"] = recovered_rows
+                    if expected_rows_initial > display_rows_initial and recovered_rows < expected_rows_initial:
+                        download_source_result["source_status"] = "display_only_partial"
+                    elif isinstance(raw_download_df, pd.DataFrame):
+                        download_source_result["source_status"] = "full" if expected_rows_initial > display_rows_initial else "complete_display"
+
+                file_generation_status = "deferred" if defer_full_export else "ready"
+                download_source_result["file_generation_status"] = file_generation_status
+
+            if defer_full_export and not bool(locals().get("old_history_table_forced", False)):
                 _chat_log_info_once(
                     f"defer_full_download::{uid2}::{display_rows_initial}::{expected_rows_initial}",
                     "[chat] defer full download df until prepare action=%s display_rows=%s expected_rows=%s key=%s",
@@ -9129,8 +9555,6 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     expected_rows_initial,
                     uid2,
                 )
-            else:
-                raw_download_df = _get_full_download_df_for_sims_item(item, meta, data)
 
 
             # 표 렌더링 캐시 준비
@@ -9145,6 +9569,25 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             render_cache = _get_sims_table_render_cache()
 
             action_name = str(item.get("action") or meta.get("action") or title or "").strip()
+            if "제품수불" in action_name or "제품재고" in action_name:
+                fact_keys = (
+                    ("carry_qty", "in_qty", "out_qty", "stock_qty")
+                    if "제품수불" in action_name
+                    else ("sum_carry_qty", "sum_in_qty", "sum_out_qty", "sum_stock_qty", "sum_stock_amt", "sum_insu_amt")
+                )
+                facts = [_json_safe_finite_number(meta.get(key)) for key in fact_keys]
+                log.info(
+                    "[product.runtime.boundary] action=%s message_id=%s table_key=%s stage=render "
+                    "summary_present=%s summary_finite=%s date_non_null_count=%s source_status=%s file_generation_status=%s",
+                    action_name,
+                    str(item.get("id") or ""),
+                    str(meta.get("table_key") or item.get("table_key") or ""),
+                    bool(any(value is not None for value in facts)),
+                    bool(facts and all(value is not None for value in facts)),
+                    int(data.get("입출고일자").notna().sum()) if isinstance(data, pd.DataFrame) and "입출고일자" in data.columns else 0,
+                    str(download_source_result.get("source_status") or ""),
+                    str(locals().get("file_generation_status") or ""),
+                )
             is_nlq_table = _chat_is_nlq_table_meta(meta)
             is_stock_io_table = _chat_is_stock_io_action(action_name)
             nlq_table_key = str(meta.get("table_key") or item.get("table_key") or item.get("id") or "").strip()
@@ -9306,8 +9749,6 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         row_height=32,
                     )
 
-                    view_df = _chat_clean_display_none_values(view_df)
-                    column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
                     log_sims_display_fields(
                         data,
                         view_df,
@@ -9376,13 +9817,21 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     except Exception:
                         render_df = data
 
-                    render_df = _chat_clean_display_none_values(render_df)                        
+                    render_df, fallback_config, _fallback_width, fallback_height = build_sims_table_display_config(
+                        render_df,
+                        action_name=action_name,
+                        meta=meta,
+                        add_row_no=False,
+                        min_height=170,
+                        max_height=520,
+                    )
 
                     st.dataframe(
                         render_df,
                         width="stretch",
                         hide_index=True,
-                        height=520,
+                        height=fallback_height,
+                        column_config=fallback_config if fallback_config else None,
                     )
 
 
@@ -9433,7 +9882,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             )
                         else:
                             view_df, column_config, table_width, table_height = build_sims_table_display_config(
-                                normalize_display_df_for_streamlit(render_df.copy()),
+                                render_df,
                                 action_name=action_name,
                                 meta=meta,
                                 add_row_no=False,
@@ -9446,8 +9895,6 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 max_height=520,
                                 row_height=32,
                             )
-                            view_df = _preserve_product_flow_table_dtypes(_chat_clean_display_none_values(view_df))
-                            column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
                             log_sims_display_fields(
                                 data,
                                 view_df,
@@ -9488,7 +9935,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         log.exception("[chat] analysis table fast/styler render failed")
                         try:
                             fallback_df, column_config, _table_width, table_height = build_sims_table_display_config(
-                                normalize_display_df_for_streamlit(data.copy()),
+                                data,
                                 action_name=action_name,
                                 meta=meta,
                                 add_row_no=False,
@@ -9510,7 +9957,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             )
                         except Exception:
                             st.dataframe(
-                                normalize_display_df_for_streamlit(data),
+                                data,
                                 width="stretch",
                                 hide_index=True,
                                 height=520,
@@ -9547,9 +9994,6 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                             max_height=520,
                             row_height=32,
                         )
-
-                        view_df = _chat_clean_display_none_values(view_df)
-                        column_config = _chat_drop_number_config_for_blank_numeric_cols(view_df, column_config)
 
 #                        log.info(
                         log.debug(
@@ -9604,13 +10048,21 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         if "조회순번" not in fallback_df.columns and "순번" not in fallback_df.columns:
                             fallback_df.insert(0, "순번", range(1, len(fallback_df) + 1))
 
-                        fallback_df = _chat_clean_display_none_values(fallback_df)
+                        fallback_df, fallback_config, _fallback_width, fallback_height = build_sims_table_display_config(
+                            fallback_df,
+                            action_name=action_name,
+                            meta=meta,
+                            add_row_no=False,
+                            min_height=170,
+                            max_height=520,
+                        )
 
                         st.dataframe(
                             fallback_df,
                             width="stretch",
                             hide_index=True,
-                            height=520,
+                            height=fallback_height,
+                            column_config=fallback_config if fallback_config else None,
                         )
 
             if bool(locals().get("old_history_table_forced", False)):
@@ -9662,12 +10114,22 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 display_rows_for_download = int(len(data)) if isinstance(data, pd.DataFrame) else 0
                 download_rows = int(len(raw_download_df)) if isinstance(raw_download_df, pd.DataFrame) else 0
                 expected_rows = _expected_analysis_row_count(meta, display_rows_for_download)
+                download_source_status = str(
+                    (locals().get("download_source_result") or {}).get("source_status") or ""
+                )
+                display_only_download = _render_partial_download_source_notice(
+                    source_status=download_source_status,
+                    download_rows=download_rows,
+                    expected_rows=expected_rows,
+                )
 
-                if expected_rows > download_rows and bool(locals().get("defer_full_export", False)):
+                if (
+                    download_source_status == "full"
+                    and str(locals().get("file_generation_status") or "") == "deferred"
+                ):
                     st.caption(
-                        f"CSV/EXCEL 다운로드 기준: 전체 조회조건 {expected_rows:,}건 "
-                        f"(현재 화면 표시 {display_rows_for_download:,}건, "
-                        "[Excel 다운로드 준비] 후 전체 export 생성)"
+                        f"전체 {download_rows:,}건의 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누르면 생성합니다. "
+                        f"현재 화면에는 {display_rows_for_download:,}건이 표시됩니다."
                     )
                 elif download_rows > display_rows_for_download:
                     st.caption(
@@ -9699,6 +10161,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     clicked_message_id=str(item.get("id") or ""),
                     clicked_action=str(action or action_name or title or ""),
                     clicked_meta=meta,
+                    download_label_prefix="화면 데이터 " if display_only_download else "",
                 )
 
             except Exception:

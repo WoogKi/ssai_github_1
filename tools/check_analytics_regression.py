@@ -1405,6 +1405,41 @@ def run_basic_checks() -> list[CheckResult]:
             },
             raw_df=duplicate_vendor_df,
         )
+        vector_projection = mod._vectorized_forecast_projection(product_00439_summary)
+        row_projection = product_00439_summary.apply(mod._forecast_projection_from_row, axis=1)
+        vector_projection_mismatches = []
+        for pos, expected in enumerate(row_projection.tolist()):
+            actual = tuple(series.iloc[pos] for series in vector_projection[:3])
+            if (
+                str(actual[0]) != str(expected[0])
+                or abs(float(actual[1]) - float(expected[1])) > 1e-9
+                or abs(float(actual[2]) - float(expected[2])) > 1e-9
+            ):
+                vector_projection_mismatches.append(
+                    f"row={pos}, expected={expected}, actual={actual}"
+                )
+        trend_actual = mod._vectorized_trend_judge(
+            pd.Series([100.0, 100.0, -10.0, 0.0]),
+            pd.Series([120.0, 80.0, 100.0, 0.0]),
+            pd.Series([100.0, 100.0, 100.0, 0.0]),
+            pd.Series([False, False, False, False]),
+        ).tolist()
+        trend_expected = [
+            mod._trend_judge(total, recent3, recent6, negative)
+            for total, recent3, recent6, negative in zip(
+                [100.0, 100.0, -10.0, 0.0],
+                [120.0, 80.0, 100.0, 0.0],
+                [100.0, 100.0, 100.0, 0.0],
+                [False, False, False, False],
+            )
+        ]
+        if vector_projection_mismatches or trend_actual != trend_expected:
+            details = vector_projection_mismatches or [
+                f"trend_expected={trend_expected}, trend_actual={trend_actual}"
+            ]
+            results.append(_fail("sales forecast vectorized calculation contract", "; ".join(details)))
+        else:
+            results.append(_ok("sales forecast vectorized calculation contract", "projection and trend vector helpers match row-wise reference"))
         row_00439 = product_00439_summary.iloc[0].to_dict()
         meta_00439 = mod._period_policy_meta_from_summary_df(product_00439_summary)
         display_mismatches = []
@@ -3936,15 +3971,15 @@ def run_basic_checks() -> list[CheckResult]:
                 and display_df.loc[0, "현재고원천"] == "장부재고월집계(Rddbc220) 누계"
                 and display_df.loc[1, "수요예상기준"] == "최근3개월평균수요수량"
                 and display_df.loc[1, "현재고원천"] == "장부재고월집계(Rddbc220) 누계"
-                and display_df.loc[2, "재고기준"] == "None"
-                and display_df.loc[2, "수요예상기준"] == "NULL"
+                and display_df.loc[2, "재고기준"] == ""
+                and display_df.loc[2, "수요예상기준"] == ""
                 and display_df.loc[2, "분석자료원"] == ""
                 and display_df.loc[2, "현재고원천"] == ""
                 and display_df.loc[0, "부족예상수량"] == 0
                 and bool(display_df.loc[0, "flag"]) is False
             )
             if ok_display:
-                results.append(_ok("stock shortage display null cleanup", "display copy preserves business strings and blanks only actual nulls while numeric zero/False stay unchanged"))
+                results.append(_ok("stock shortage display null cleanup", "display copy preserves business strings, blanks actual and literal null tokens, and retains numeric zero/False"))
             else:
                 results.append(_fail("stock shortage display null cleanup", f"display={display_df.to_dict(orient='records')} source={src_df.to_dict(orient='records')}"))
         except Exception as e:
@@ -4024,7 +4059,11 @@ def run_basic_checks() -> list[CheckResult]:
                         continue
                     if not (pd.api.types.is_object_dtype(view[col]) or pd.api.types.is_string_dtype(view[col])):
                         route_failures.append(f"{route}:{col}:dtype={view[col].dtype}")
-                    expected_non_null = int(source_df.loc[view.index, col].notna().sum()) if len(view.index) else 0
+                    expected_non_null = (
+                        int(source_df.loc[view.index, col].map(lambda value: not display_mod._is_display_missing_token(value)).sum())
+                        if len(view.index)
+                        else 0
+                    )
                     actual_non_null = int(view[col].replace("", pd.NA).notna().sum())
                     if actual_non_null != expected_non_null:
                         route_failures.append(f"{route}:{col}:non_null={actual_non_null}/{expected_non_null}")
@@ -4033,8 +4072,8 @@ def run_basic_checks() -> list[CheckResult]:
                 if "current_followup" != route:
                     if view.loc[1, "\uc7ac\uace0\uae30\uc900"] != "":
                         route_failures.append(f"{route}:actual_none_not_blank")
-                    if view.loc[1, "\uc218\uc694\uc608\uc0c1\uae30\uc900"] != "None":
-                        route_failures.append(f"{route}:literal_none_not_preserved")
+                    if view.loc[1, "\uc218\uc694\uc608\uc0c1\uae30\uc900"] != "":
+                        route_failures.append(f"{route}:literal_none_not_blank")
                     if view.loc[0, "\ubd80\uc871\uc608\uc0c1\uc218\ub7c9"] != 0:
                         route_failures.append(f"{route}:numeric_zero_changed")
                     if bool(view.loc[0, "flag"]) is not False:
@@ -4045,7 +4084,7 @@ def run_basic_checks() -> list[CheckResult]:
             if route_failures or not source_unchanged or not numeric_preserved:
                 results.append(_fail("stock shortage renderer text field preservation", f"failures={route_failures} source_unchanged={source_unchanged} numeric_preserved={numeric_preserved}"))
             else:
-                results.append(_ok("stock shortage renderer text field preservation", "chat fast/small, panel fast/small, history reopen, and current-table followup preserve stock shortage business text fields while numeric columns stay numeric"))
+                results.append(_ok("stock shortage renderer text field preservation", "chat fast/small, panel fast/small, history reopen, and current-table followup blank missing text tokens while preserving business text and numeric columns"))
         except Exception as e:
             results.append(_fail("stock shortage renderer text field preservation", f"{type(e).__name__}: {e}"))
 
@@ -4611,8 +4650,12 @@ def run_basic_checks() -> list[CheckResult]:
             for col in [product_no_col, validation_col, product_code_col, biz_no_col, phone_col, zip_col]:
                 if display_mod._is_numeric_display_col(view_df, col):
                     failures.append(f"{col}_unexpected_number_column")
+            # A numeric column with a display missing value is formatted as text
+            # only in the display copy.  This avoids Streamlit rendering its
+            # NumberColumn nulls as a literal "None" while preserving the
+            # nullable integer source used by service and Excel paths.
             type_expectations = {
-                seq_col: ("number", 1),
+                seq_col: ("text", None),
                 product_no_col: ("text", None),
                 validation_col: ("text", None),
                 product_code_col: ("text", None),
@@ -7388,6 +7431,7 @@ def run_basic_checks() -> list[CheckResult]:
             manufacturer_summary_payload={"df": sales_df, "meta": {"evaluation_month": "2026-07"}},
             stock_shortage_payload={"df": stock_df, "meta": {}},
             inbound_facts_df=pd.DataFrame(),
+            sales_transaction_cycle_df=pd.DataFrame(columns=["trade_date", "io_code"]),
         )
         fact_errors: list[str] = []
         required_fact_keys = {
@@ -7495,11 +7539,74 @@ def run_basic_checks() -> list[CheckResult]:
         if not facts.get("additional_notes") or "sales_decline_targets" not in facts.get("additional_notes"):
             fact_errors.append("additional_notes_missing")
         if (
-            facts["turnover_days"].get("status") != "partial"
-            or facts.get("transaction_cycle", {}).get("sales_data_status") != "source_required"
+            facts["turnover_days"].get("status") != "no_data"
+            or facts.get("transaction_cycle", {}).get("sales_data_status") != "no_data"
             or facts.get("transaction_cycle", {}).get("period_days") != 90
         ):
             fact_errors.append("turnover_status_wrong")
+        cycle_source = pd.DataFrame(
+            [
+                {"trade_date": "20260409", "io_code": "501"},
+                {"trade_date": "20260701", "io_code": "501"},
+                {"trade_date": "20260703", "io_code": "601"},
+                {"trade_date": "20260703", "io_code": "501"},
+                {"trade_date": "20260708", "io_code": "501"},
+                {"trade_date": "20260709", "io_code": "501"},
+            ]
+        )
+        cycle_facts = dash_mod.build_dashboard_lite_facts(
+            {"month_from": "202601", "month_to": "202607", "evaluation_month": "202607", "policy_date": "20260708"},
+            manufacturer_summary_payload={"df": sales_df.copy(deep=True), "meta": {"evaluation_month": "2026-07"}},
+            stock_shortage_payload={"df": stock_df.copy(deep=True), "meta": {}},
+            inbound_facts_df=pd.DataFrame(),
+            sales_transaction_cycle_df=cycle_source,
+            today=date(2026, 7, 8),
+        )
+        cycle_meta = (cycle_facts.get("transaction_cycle") or {}).get("sales_transaction_cycle") or {}
+        if (
+            cycle_meta.get("result_status") != "success"
+            or cycle_meta.get("unique_trade_days") != 3
+            or cycle_meta.get("latest_normal_trade_date") != "20260708"
+            or cycle_meta.get("average_interval_days") != 3.5
+            or cycle_facts.get("performance", {}).get("sales_transaction_cycle_physical_query_count") != 0
+        ):
+            fact_errors.append(f"sales_transaction_cycle_contract={cycle_meta!r}")
+        cycle_timing = dash_mod.transaction_cycle_phase_timing(
+            source_started_at=0.0,
+            source_finished_at=0.120,
+            calculation_started_at=0.120,
+            calculation_finished_at=0.128,
+        )
+        if cycle_timing != {
+            "source_elapsed_ms": 120,
+            "calculation_elapsed_ms": 8,
+            "total_elapsed_ms": 128,
+        }:
+            fact_errors.append(f"sales_transaction_cycle_exclusive_timing={cycle_timing!r}")
+        expected_cycle_statuses = {
+            ("success", "success"): "ready",
+            ("single_trade_day", "success"): "ready",
+            ("success", "no_data"): "partial",
+            ("no_data", "no_data"): "no_data",
+            ("error", "success"): "degraded",
+            ("error", "error"): "error",
+        }
+        resolved_cycle_statuses = {
+            pair: dash_mod.resolve_transaction_cycle_status(*pair)
+            for pair in expected_cycle_statuses
+        }
+        if resolved_cycle_statuses != expected_cycle_statuses:
+            fact_errors.append(f"sales_transaction_cycle_overall_status={resolved_cycle_statuses!r}")
+        cycle_phases = cycle_facts.get("performance", {}).get("phase_metrics") or []
+        if any(
+            item.get("phase") == "sales_transaction_cycle_calculation"
+            and item.get("source_name") != "sales"
+            for item in cycle_phases
+        ):
+            fact_errors.append(f"sales_transaction_cycle_phase_source={cycle_phases!r}")
+        facts_source = Path("app/services/dashboard_lite_facts.py").read_text(encoding="utf-8")
+        if 'source="sales_transaction_cycle"' in facts_source or 'source="sales",\n                phase="sales_transaction_cycle_source"' not in facts_source:
+            fact_errors.append("sales_transaction_cycle_physical_source_contract")
         stock_risk_rows = [
             {"product_code": "MISSING", "current_stock_qty": 0, "current_stock_amt": 0, "remaining_expected_demand_qty": 10, "shortage_qty": 10, "shortage_amt": 100, "stock_readiness_pct": 0, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": False},
             {"product_code": "NO_DEMAND", "current_stock_qty": 100, "current_stock_amt": 1000, "remaining_expected_demand_qty": 0, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
@@ -9412,6 +9519,23 @@ def run_basic_checks() -> list[CheckResult]:
         synthetic_elapsed_ms = int((time.perf_counter() - synthetic_started) * 1000)
         if len(synthetic_facts) != 25_000 or synthetic_elapsed_ms > 10_000:
             inbound_errors.append(f"vectorized_synthetic={len(synthetic_facts)}rows/{synthetic_elapsed_ms}ms")
+        cycle_cases = {
+            "empty": inbound_mod.summarize_transaction_cycle_dates([], cutoff_date="20260708"),
+            "one": inbound_mod.summarize_transaction_cycle_dates(["20260708"], cutoff_date="20260708"),
+            "gaps": inbound_mod.summarize_transaction_cycle_dates(["20260701", "20260703", "20260708", "20260708"], cutoff_date="20260708"),
+            "boundary": inbound_mod.summarize_transaction_cycle_dates(["20260410", "20260409", "20260709"], cutoff_date="20260708"),
+        }
+        if (
+            cycle_cases["empty"].get("result_status") != "no_data"
+            or cycle_cases["empty"].get("latest_date") != ""
+            or cycle_cases["one"].get("result_status") != "single_trade_day"
+            or cycle_cases["one"].get("average_interval_days") is not None
+            or cycle_cases["gaps"].get("unique_trade_days") != 3
+            or cycle_cases["gaps"].get("latest_date") != "20260708"
+            or cycle_cases["gaps"].get("average_interval_days") != 3.5
+            or cycle_cases["boundary"].get("unique_trade_days") != 1
+        ):
+            inbound_errors.append(f"transaction_cycle_dates={cycle_cases!r}")
         if inbound_errors:
             results.append(_fail("Dashboard inbound-date facts", "; ".join(inbound_errors)))
         else:
@@ -11191,12 +11315,74 @@ def run_basic_checks() -> list[CheckResult]:
                     },
                     "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "visual_phase2_summary": {"inventory_count": 1, "cover_partition_valid": True, "briefing_lines": ["브리핑 1", "브리핑 2", "브리핑 3"], "additional_source_call_count": 0}, "purchase_trend_rows": [{"month": "202601", "amount": 10}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
                     "today_actions": [{"priority": 1}],
+                    "transaction_cycle": {
+                        "period_days": 90,
+                        "purchase_data_status": "normal",
+                        "sales_data_status": "success",
+                        "sales_transaction_cycle": {
+                            "window_days": 90,
+                            "window_start": "2026-04-09",
+                            "window_end": "2026-07-07",
+                            "latest_normal_trade_date": "2026-07-07",
+                            "elapsed_days": 0,
+                            "unique_trade_days": 12,
+                            "average_interval_days": 5.5,
+                            "result_status": "success",
+                            "source_mode": "rddbc120_minimal",
+                            "physical_query_count": 1,
+                            "source_rows": 12,
+                            "elapsed_ms": 7,
+                        },
+                    },
+                    "performance": {
+                        "logical_source_count": 3,
+                        "physical_query_count_total": 5,
+                        "physical_query_count_by_source": {"sales": 2, "stock": 2, "inbound": 1},
+                        "post_process_elapsed_ms": 9,
+                        "phase_metrics": [{"phase": "sales_merge", "elapsed_ms": 3}],
+                        "physical_queries": [{"query_name": "sensitive detail"}],
+                    },
                 },
             }
+            # The active Dashboard cache deliberately keeps raw drill-down and
+            # export data.  Persistence must project it without changing that
+            # runtime object or leaking raw row payloads into messages.jsonl.
+            full_cache["facts"]["inventory"]["risk_targets"] = [
+                {
+                    "product_code": f"P{index:04d}",
+                    "product_name": f"risk-product-{index}",
+                    "current_stock_qty": index,
+                    "stock_readiness_pct": float(index),
+                    "shortage_qty": float(index + 1),
+                    "shortage_amt": float(index + 10),
+                    "raw_drilldown_payload": "risk-detail-" * 500,
+                }
+                for index in range(30)
+            ]
+            full_cache["facts"]["today_actions"] = [
+                {
+                    "priority": index + 1,
+                    "product_code": f"P{index:04d}",
+                    "product_name": f"action-product-{index}",
+                    "recommended_action": "confirm supplier",
+                    "raw_action_detail": "action-detail-" * 500,
+                }
+                for index in range(10)
+            ]
+            full_cache["facts"]["inventory"]["risk_detail_rows"] = [
+                {"product_code": f"P{index:04d}", "raw_export_detail": "export-row-" * 500}
+                for index in range(30)
+            ]
+            runtime_cache_json = json.dumps(full_cache, ensure_ascii=False, sort_keys=True)
             compact_cache = view_mod.build_dashboard_lite_chat_snapshot(full_cache)
             compact_json = json.dumps(compact_cache, ensure_ascii=False).encode("utf-8")
-            if "readiness_rows" in json.dumps(compact_cache, ensure_ascii=False) or len(compact_json) > 65_536:
+            compact_text = json.dumps(compact_cache, ensure_ascii=False)
+            if "readiness_rows" in compact_text or "raw_drilldown_payload" in compact_text or "raw_action_detail" in compact_text or "risk_detail_rows" in compact_text or len(compact_json) > 50_000:
                 dashboard_roundtrip_errors.append(f"dashboard_snapshot_not_compact bytes={len(compact_json)}")
+            if json.dumps(full_cache, ensure_ascii=False, sort_keys=True) != runtime_cache_json:
+                dashboard_roundtrip_errors.append("dashboard_runtime_cache_mutated_by_snapshot")
+            if len(full_cache["facts"]["inventory"].get("risk_detail_rows") or []) != 30:
+                dashboard_roundtrip_errors.append("dashboard_runtime_detail_rows_lost")
             if not (compact_cache.get("facts", {}).get("sales", {}).get("chart_rows") and compact_cache.get("facts", {}).get("inventory", {}).get("risk_targets")):
                 dashboard_roundtrip_errors.append("dashboard_snapshot_render_inputs_lost")
             compact_visualization = compact_cache.get("facts", {}).get("sales", {}).get("visualization") or {}
@@ -11208,6 +11394,30 @@ def run_basic_checks() -> list[CheckResult]:
                 dashboard_roundtrip_errors.append("dashboard_stock_overstock_summary_missing")
             if "stock_demand_surge_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
                 dashboard_roundtrip_errors.append("dashboard_stock_demand_surge_summary_missing")
+            compact_sales_cycle = (
+                compact_cache.get("facts", {})
+                .get("transaction_cycle", {})
+                .get("sales_transaction_cycle", {})
+            )
+            if (
+                compact_sales_cycle.get("latest_normal_trade_date") != "2026-07-07"
+                or compact_sales_cycle.get("unique_trade_days") != 12
+                or compact_sales_cycle.get("average_interval_days") != 5.5
+                or "raw_rows" in compact_sales_cycle
+            ):
+                dashboard_roundtrip_errors.append(f"dashboard_sales_cycle_snapshot={compact_sales_cycle!r}")
+            compact_cycle_status = (compact_cache.get("facts", {}).get("transaction_cycle") or {}).get("status")
+            if compact_cycle_status != "ready":
+                dashboard_roundtrip_errors.append(f"dashboard_sales_cycle_legacy_status={compact_cycle_status!r}")
+            compact_performance = (compact_cache.get("facts") or {}).get("performance") or {}
+            if (
+                compact_performance.get("physical_query_count_total") != 5
+                or compact_performance.get("physical_query_count_by_source", {}).get("sales") != 2
+                or compact_performance.get("post_process_elapsed_ms") != 9
+                or "phase_metrics" in compact_performance
+                or "physical_queries" in compact_performance
+            ):
+                dashboard_roundtrip_errors.append(f"dashboard_snapshot_performance_summary={compact_performance!r}")
             if not compact_cache.get("facts", {}).get("inventory", {}).get("vendor_stock_risk_top_rows"):
                 dashboard_roundtrip_errors.append("dashboard_vendor_stock_risk_top_rows_missing")
             compact_inventory = compact_cache.get("facts", {}).get("inventory", {})
@@ -11231,7 +11441,18 @@ def run_basic_checks() -> list[CheckResult]:
             }
             partitioned_full = partition_ns["_partition_message_payload"](full_payload)
             partitioned_json = json.dumps(partitioned_full, ensure_ascii=False).encode("utf-8")
-            if b"readiness_rows" in partitioned_json or len(partitioned_json) > 65_536:
+            partitioned_meta = partitioned_full.get("meta") or {}
+            partitioned_cache = partitioned_meta.get("dashboard_cache") or {}
+            if (
+                b"readiness_rows" in partitioned_json
+                or b"raw_drilldown_payload" in partitioned_json
+                or b"raw_action_detail" in partitioned_json
+                or b"risk_detail_rows" in partitioned_json
+                or len(partitioned_json) > 50_000
+                or partitioned_full.get("id") != "dashboard-event-full"
+                or partitioned_meta.get("dashboard_event_id") != "dashboard-event-full"
+                or partitioned_cache.get("dashboard_event_id") != "dashboard-event-full"
+            ):
                 dashboard_roundtrip_errors.append(f"partitioned_dashboard_payload_not_compact bytes={len(partitioned_json)}")
 
             old_snapshot_builder = view_mod.build_dashboard_lite_chat_snapshot
@@ -11268,6 +11489,98 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("Dashboard Lite chat payload round-trip", "; ".join(dashboard_roundtrip_errors)))
         else:
             results.append(_ok("Dashboard Lite chat payload round-trip", "Dashboard id, room id, meta cache, and nested chart facts survive partition storage and renderer dispatch"))
+
+        dashboard_v2_errors: list[str] = []
+        original_view_st = view_mod.st
+        original_v2_preview_available = view_mod._DASHBOARD_V2_PREVIEW_AVAILABLE
+        try:
+            class PreviewSt:
+                def __init__(self) -> None:
+                    self.session_state: dict[str, object] = {}
+                    self.toggle_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+                def toggle(self, *args: object, **kwargs: object) -> bool:
+                    self.toggle_calls.append((args, kwargs))
+                    return bool(self.session_state.get(str(kwargs.get("key") or ""), False))
+
+            view_mod.st = PreviewSt()
+            preview_cache = {"dashboard_event_id": "dashboard-v2-event", "room_id": "room-v2"}
+            preview_key = view_mod._dashboard_layout_preview_key(preview_cache)
+            if preview_key != "__dashboard_layout_v2_preview":
+                dashboard_v2_errors.append("preview_default_or_session_key")
+            view_mod._DASHBOARD_V2_PREVIEW_AVAILABLE = False
+            for stale_value in (True, False):
+                view_mod.st.session_state[preview_key] = stale_value
+                if view_mod._dashboard_layout_v2_enabled(preview_cache):
+                    dashboard_v2_errors.append("preview_disabled_stale_state_enabled")
+                if preview_key in view_mod.st.session_state:
+                    dashboard_v2_errors.append("preview_disabled_stale_state_not_cleared")
+            view_mod._render_dashboard_layout_preview_toggle(preview_cache, render_mode="primary")
+            if view_mod.st.toggle_calls:
+                dashboard_v2_errors.append("preview_disabled_widget_rendered")
+
+            view_mod._DASHBOARD_V2_PREVIEW_AVAILABLE = True
+            view_mod._render_dashboard_layout_preview_toggle(preview_cache, render_mode="primary")
+            if (
+                len(view_mod.st.toggle_calls) != 1
+                or view_mod.st.session_state.get(preview_key) is not False
+                or view_mod._dashboard_layout_v2_enabled(preview_cache)
+            ):
+                dashboard_v2_errors.append("preview_available_default_off")
+            view_mod.st.session_state[preview_key] = True
+            if not view_mod._dashboard_layout_v2_enabled(preview_cache):
+                dashboard_v2_errors.append("preview_available_on_not_enabled")
+            preview_facts = {
+                "inventory": {
+                    "risk_detail_rows": [{"product_code": "R-1", "product_name": "risk", "status": "긴급 부족"}],
+                    "readiness_rows": [
+                        {"product_code": "F-1", "product_name": "follow", "major_purchase_vendor_name": "V-1", "stock_cover_status": "지연 후보"},
+                        {"product_code": "D-1", "product_name": "demand", "major_purchase_vendor_name": "V-2", "demand_surge": True},
+                    ],
+                }
+            }
+            if [row.get("product_code") for row in view_mod._dashboard_analysis_rows(preview_facts, "risk")] != ["R-1"]:
+                dashboard_v2_errors.append("risk_detail_source")
+            if [row.get("product_code") for row in view_mod._dashboard_analysis_rows(preview_facts, "followup")] != ["F-1", "D-1"]:
+                dashboard_v2_errors.append("followup_detail_source")
+            if [row.get("product_code") for row in view_mod._dashboard_analysis_rows(preview_facts, "demand")] != ["D-1"]:
+                dashboard_v2_errors.append("demand_detail_source")
+            detail_frame = view_mod._dashboard_analysis_frame(
+                view_mod._dashboard_analysis_rows(preview_facts, "followup"), "followup"
+            )
+            if detail_frame.shape[0] != 2 or "제품코드" not in detail_frame.columns or "주요매입처" not in detail_frame.columns:
+                dashboard_v2_errors.append("detail_frame_contract")
+            preview_snapshot = view_mod.build_dashboard_lite_chat_snapshot({
+                **preview_cache,
+                "facts": preview_facts,
+            })
+            snapshot_text = json.dumps(preview_snapshot, ensure_ascii=False)
+            if "readiness_rows" in snapshot_text or "risk_detail_rows" in snapshot_text:
+                dashboard_v2_errors.append("compact_snapshot_detail_leak")
+            view_src_for_v2 = Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8")
+            for token in (
+                "def _render_dashboard_facts_v2",
+                "_DASHBOARD_V2_PREVIEW_AVAILABLE = False",
+                "if not _DASHBOARD_V2_PREVIEW_AVAILABLE:",
+                "_render_dashboard_layout_preview_toggle(cache, render_mode=\"primary\")",
+                "_render_today_actions(facts, cache, render_mode=render_mode)",
+                "_render_risk_detail(facts, cache, render_mode=render_mode)",
+                "[dashboard.layout_preview]",
+                "[dashboard.layout_section]",
+                "[dashboard.analysis_detail]",
+                "_render_dashboard_cycle_compact",
+            ):
+                if token not in view_src_for_v2:
+                    dashboard_v2_errors.append(f"v2_contract_missing={token}")
+        except Exception as exc:
+            dashboard_v2_errors.append(f"v2_runtime={type(exc).__name__}:{exc}")
+        finally:
+            view_mod.st = original_view_st
+            view_mod._DASHBOARD_V2_PREVIEW_AVAILABLE = original_v2_preview_available
+        if dashboard_v2_errors:
+            results.append(_fail("Dashboard V2 preview and analysis detail", "; ".join(dashboard_v2_errors)))
+        else:
+            results.append(_ok("Dashboard V2 preview and analysis detail", "Preview availability defaults off, stale state is cleared into Legacy, re-enabled preview defaults off, and compact snapshots remain detail-free"))
 
         stock_timing_errors: list[str] = []
         try:
@@ -12654,6 +12967,192 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("SIMS action buttons independent Excel failure", "; ".join(action_errors)))
         else:
             results.append(_ok("SIMS action buttons independent Excel failure", "CSV and LLM controls render when Excel bytes are unavailable"))
+
+        import app.db.mssql_client as mssql_mod
+
+        class _DashboardMeasurementConn:
+            def __enter__(self):
+                return object()
+
+            def __exit__(self, *_exc):
+                return False
+
+        measurement_errors: list[str] = []
+        original_get_conn = mssql_mod.get_conn
+        original_read_sql = mssql_mod.pd.read_sql
+        try:
+            mssql_mod.get_conn = lambda: _DashboardMeasurementConn()
+            mssql_mod.pd.read_sql = lambda *_args, **_kwargs: pd.DataFrame({"value": [1, 2]})
+            measurement = mssql_mod.DashboardQueryMeasurement(request_id="fixture-dashboard", company_id=4)
+            with mssql_mod.dashboard_query_measurement(
+                measurement,
+                source="sales",
+                phase="sales_bundle",
+                source_mode="monthly_book",
+            ):
+                with mssql_mod.dashboard_query_measurement(
+                    measurement,
+                    source="sales",
+                    phase="sales_product_master",
+                ):
+                    measured_df = mssql_mod.read_df("SELECT * FROM dbo.Rddbc210 AS S JOIN dbo.Rddbc040 AS P ON 1 = 1")
+                with mssql_mod.dashboard_query_measurement(
+                    measurement,
+                    source="sales",
+                    phase="sales_vendor_master",
+                ):
+                    mssql_mod.read_df("SELECT * FROM dbo.Rddbc030 AS V")
+            measurement_summary = measurement.summary()
+            records = list(measurement_summary.get("physical_queries") or [])
+            if measured_df.shape != (2, 1):
+                measurement_errors.append(f"result_shape={measured_df.shape}")
+            if measurement_summary.get("logical_source_count") != 3:
+                measurement_errors.append(f"logical_source_count={measurement_summary.get('logical_source_count')!r}")
+            if measurement_summary.get("physical_query_count") != 2:
+                measurement_errors.append(f"physical_query_count={measurement_summary.get('physical_query_count')!r}")
+            if measurement_summary.get("physical_query_count_by_source") != {"sales": 2}:
+                measurement_errors.append(f"physical_query_count_by_source={measurement_summary.get('physical_query_count_by_source')!r}")
+            if [record.get("phase") for record in records] != ["sales_product_master", "sales_vendor_master"]:
+                measurement_errors.append(f"phases={[record.get('phase') for record in records]!r}")
+            if [record.get("source_mode") for record in records] != ["monthly_book", "monthly_book"]:
+                measurement_errors.append(f"source_modes={[record.get('source_mode') for record in records]!r}")
+            if any(record.get("result_rows") != 2 or record.get("cache_used") is not False for record in records):
+                measurement_errors.append(f"records={records!r}")
+            if "Rddbc210" not in str(records[0].get("table_names") if records else "") or "Rddbc040" not in str(records[0].get("table_names") if records else ""):
+                measurement_errors.append(f"table_names={records!r}")
+            if mssql_mod._dashboard_table_names("WITH StockAgg AS (SELECT * FROM dbo.Rddbc210) SELECT * FROM StockAgg AS S JOIN dbo.Rddbc040 AS P ON 1 = 1") != "Rddbc210,Rddbc040":
+                measurement_errors.append("cte_name_exposed_as_table")
+            measurement.add_phase(
+                phase="facts_payload_build",
+                source_name="facts",
+                result_rows=2,
+                elapsed_ms=1,
+                physical_query_count_before=2,
+                physical_query_count_after=2,
+            )
+            phase_metric = measurement.summary().get("phase_metrics", [{}])[-1]
+            if (
+                phase_metric.get("physical_query_count_before") != 2
+                or phase_metric.get("physical_query_count_after") != 2
+                or phase_metric.get("physical_query_count_delta") != 0
+            ):
+                measurement_errors.append(f"phase_metric_physical_delta={phase_metric!r}")
+
+            with mssql_mod.dashboard_measurement_phase(
+                measurement,
+                phase="exclusive_fixture_phase",
+                source="facts",
+                input_rows=2,
+                input_cols=1,
+            ) as phase_state:
+                phase_state["result_rows"] = 2
+                phase_state["result_cols"] = 1
+            exclusive_metric = measurement.summary().get("phase_metrics", [{}])[-1]
+            if (
+                exclusive_metric.get("phase") != "exclusive_fixture_phase"
+                or exclusive_metric.get("physical_query_count_before") != 2
+                or exclusive_metric.get("physical_query_count_after") != 2
+                or exclusive_metric.get("physical_query_count_delta") != 0
+                or exclusive_metric.get("input_rows") != 2
+                or exclusive_metric.get("result_rows") != 2
+            ):
+                measurement_errors.append(f"exclusive_phase_metric={exclusive_metric!r}")
+        except Exception as exc:
+            measurement_errors.append(f"runtime={type(exc).__name__}:{exc}")
+        finally:
+            mssql_mod.get_conn = original_get_conn
+            mssql_mod.pd.read_sql = original_read_sql
+        facts_source = (PROJECT_ROOT / "app" / "services" / "dashboard_lite_facts.py").read_text(encoding="utf-8")
+        if "physical_query_count" not in facts_source or "[dashboard.phase]" not in facts_source:
+            measurement_errors.append("dashboard_facts_measurement_fields_missing")
+        required_leaf_phases = (
+            "dashboard_scope_prepare",
+            "inventory_input_prepare",
+            "inventory_code_normalize",
+            "inventory_sales_merge",
+            "inventory_inbound_merge",
+            "inventory_stock_merge",
+            "inventory_groupby",
+            "inventory_amount_calculation",
+            "inventory_risk_classification",
+            "inventory_rows_finalize",
+            "risk_detail_rows",
+        )
+        missing_leaf_phases = [phase for phase in required_leaf_phases if phase not in facts_source]
+        if missing_leaf_phases:
+            measurement_errors.append(f"dashboard_leaf_phases_missing={missing_leaf_phases!r}")
+        if 'phase="inventory_facts"' in facts_source:
+            measurement_errors.append("dashboard_inventory_parent_phase_still_measured")
+        stock_source = (PROJECT_ROOT / "app" / "services" / "analytics_sales_trend_service.py").read_text(encoding="utf-8")
+        required_stock_phases = (
+            "stock_source_policy",
+            "stock_params_prepare",
+            "stock_product_universe_prepare",
+            "stock_batch_plan",
+            "stock_batch_query",
+            "stock_batch_concat",
+            "stock_current_normalize",
+            "stock_master_merge",
+            "stock_sales_forecast_merge",
+            "stock_shortage_calculation",
+            "stock_risk_base_prepare",
+            "stock_source_finalize",
+        )
+        missing_stock_phases = [phase for phase in required_stock_phases if phase not in stock_source]
+        if missing_stock_phases:
+            measurement_errors.append(f"dashboard_stock_leaf_phases_missing={missing_stock_phases!r}")
+        if measurement_errors:
+            results.append(_fail("Dashboard physical query measurement", "; ".join(measurement_errors)))
+        else:
+            results.append(_ok("Dashboard physical query measurement", "nested source phases record physical queries without changing DataFrame results"))
+
+        bundle_finalize_errors: list[str] = []
+        try:
+            bundle_raw = pd.DataFrame([
+                {"_dashboard_source_kind": "sales", "기준월": "202601", "제품코드": " P1 ", "매입처코드": " V1 ", "재고적용처코드": " V2 ", "출고수량": 3.0, "출고할증수량": 0.0, "매출공급가액": 30.0, "매출세액": 3.0, "매출합계": 33.0, "집계건수": 1, "매입처수": 1, "입고수량": 0.0, "매입금액": 0.0, "매입발생건수": 0, "분석자료원": "월집계"},
+                {"_dashboard_source_kind": "sales", "기준월": "202602", "제품코드": " P1 ", "매입처코드": " V1 ", "재고적용처코드": " V2 ", "출고수량": 4.0, "출고할증수량": 0.0, "매출공급가액": 40.0, "매출세액": 4.0, "매출합계": 44.0, "집계건수": 1, "매입처수": 1, "입고수량": 0.0, "매입금액": 0.0, "매입발생건수": 0, "분석자료원": "월집계"},
+                {"_dashboard_source_kind": "purchase_vendor", "기준월": "202602", "제품코드": " P1 ", "매입처코드": " V1 ", "재고적용처코드": "", "출고수량": 0.0, "출고할증수량": 0.0, "매출공급가액": 0.0, "매출세액": 0.0, "매출합계": 0.0, "집계건수": 0, "매입처수": 0, "입고수량": 5.0, "매입금액": 50.0, "매입발생건수": 1, "분석자료원": "월집계"},
+            ])
+            bundle_raw_before = bundle_raw.copy(deep=True)
+            product_master_fixture = pd.DataFrame([{
+                "제품코드": "P1", "제품명": "fixture", "규격": "EA", "제조사코드": "M1", "제조사명": "maker",
+                "제품그룹Gcode": "0013", "제품그룹코드": "A", "제품그룹명": "group", "제품구분Gcode": "0004", "제품구분코드": "B", "제품구분명": "kind", "제품분류Gcode": "0031", "제품분류코드": "C", "제품분류명": "class",
+            }])
+            vendor_master_fixture = pd.DataFrame([{"거래처코드": "V1", "거래처명": "purchase"}, {"거래처코드": "V2", "거래처명": "stock"}])
+            old_bundle_query = sales_mod.query_to_df
+            old_bundle_product_master = sales_mod._load_monthly_product_master_for_codes
+            old_bundle_vendor_master = sales_mod._load_monthly_vendor_names_for_codes
+            sales_mod.query_to_df = lambda _sql, _params: bundle_raw.copy(deep=True)
+            sales_mod._load_monthly_product_master_for_codes = lambda _codes: product_master_fixture.copy(deep=True)
+            sales_mod._load_monthly_vendor_names_for_codes = lambda _codes: vendor_master_fixture.copy(deep=True)
+            try:
+                bundle_measurement = mssql_mod.DashboardQueryMeasurement(request_id="fixture-sales-bundle", company_id=4)
+                with mssql_mod.dashboard_query_measurement(bundle_measurement, source="sales", phase="fixture_sales_bundle"):
+                    bundle_result = sales_mod.get_dashboard_sales_source_bundle({"source_mode": "monthly_book", "month_from": "202601", "month_to": "202602"})
+            finally:
+                sales_mod.query_to_df = old_bundle_query
+                sales_mod._load_monthly_product_master_for_codes = old_bundle_product_master
+                sales_mod._load_monthly_vendor_names_for_codes = old_bundle_vendor_master
+            sales_bundle_df = bundle_result["sales_df"]
+            purchase_bundle_df = bundle_result["purchase_vendor_df"]
+            if not bundle_raw.equals(bundle_raw_before):
+                bundle_finalize_errors.append("raw_bundle_mutated")
+            if list(sales_bundle_df["제품코드"]) != ["P1", "P1"] or list(purchase_bundle_df["제품코드"]) != ["P1"]:
+                bundle_finalize_errors.append(f"code_normalize_contract={list(sales_bundle_df['제품코드'])!r}/{list(purchase_bundle_df['제품코드'])!r}")
+            if list(sales_bundle_df["매입처명"]) != ["purchase", "purchase"] or list(sales_bundle_df["재고적용처명"]) != ["stock", "stock"]:
+                bundle_finalize_errors.append("vendor_master_merge_contract")
+            if sales_bundle_df["출고수량"].tolist() != [3.0, 4.0] or purchase_bundle_df["입고수량"].tolist() != [5.0]:
+                bundle_finalize_errors.append("numeric_value_contract")
+            phase_names = {str(row.get("phase")) for row in bundle_measurement.summary().get("phase_metrics", [])}
+            required_bundle_phases = {"sales_branch_prepare", "purchase_branch_prepare", "code_normalize", "sales_merge", "final_column_build", "sales_trend_columns", "numeric_normalize", "sales_bundle_finalize"}
+            if not required_bundle_phases.issubset(phase_names) or "sales_concat" in phase_names:
+                bundle_finalize_errors.append(f"bundle_phase_contract={sorted(phase_names)!r}")
+        except Exception as exc:
+            bundle_finalize_errors.append(f"runtime={type(exc).__name__}:{exc}")
+        if bundle_finalize_errors:
+            results.append(_fail("Dashboard sales bundle finalize contract", "; ".join(bundle_finalize_errors)))
+        else:
+            results.append(_ok("Dashboard sales bundle finalize contract", "branch copies are normalized once, master enrichment is preserved, raw SQL data stays immutable, and leaf phase metrics match actual work"))
 
         facts_json = json.dumps(facts, ensure_ascii=False, default=str)
         if "완료월 총매출과 당월 부분월 현재매출의 직접 우열 판단" not in facts_json or "sample_records 또는 화면 일부 행으로 전체 순위/총합 판단" not in facts_json:

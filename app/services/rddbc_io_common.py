@@ -182,6 +182,44 @@ def add_filter(clauses: list[str], sql: str) -> None:
         clauses.append(sql.strip())
 
 
+def add_unlabeled_name_like_filter(
+    clauses: list[str],
+    params: Dict[str, Any],
+    *,
+    vendor_name_exprs: Iterable[str] = (),
+    product_name_expr: str = "",
+    manufacturer_name_expr: str = "",
+    manufacturer_predicate: str = "",
+) -> bool:
+    """Apply the NLQ label-free name contract without changing result cardinality.
+
+    Detail and inventory searches intentionally keep every matching record.  The
+    caller supplies already-joined name expressions so this helper can build a
+    single OR predicate, rather than resolving a name to one arbitrary code.
+    """
+    pattern = like_value(params.get("nlq_unlabeled_name"))
+    if not pattern:
+        return False
+
+    params["nlq_unlabeled_name_like"] = pattern
+    expressions = [str(expr).strip() for expr in vendor_name_exprs if str(expr).strip()]
+    if str(product_name_expr).strip():
+        expressions.append(str(product_name_expr).strip())
+    if str(manufacturer_name_expr).strip():
+        expressions.append(str(manufacturer_name_expr).strip())
+    predicates = [f"{expr} LIKE %(nlq_unlabeled_name_like)s" for expr in expressions]
+    if str(manufacturer_predicate).strip():
+        predicates.append(str(manufacturer_predicate).strip())
+    if not predicates:
+        return False
+
+    add_filter(
+        clauses,
+        "(" + " OR ".join(predicates) + ")",
+    )
+    return True
+
+
 def make_date_filters(field: str, params: Dict[str, Any], start_key: str = "date_from", end_key: str = "date_to") -> list[str]:
     clauses: list[str] = []
     if clean_text(params.get(start_key)):

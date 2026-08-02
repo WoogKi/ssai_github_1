@@ -11,6 +11,7 @@ import pandas as pd
 
 from app.services.rddbc_io_common import (
     add_filter,
+    add_unlabeled_name_like_filter,
     build_result_payload,
     apply_labels_safe,
     clean_text,
@@ -91,6 +92,18 @@ def _base_filters(params: Dict[str, Any]) -> str:
                   AND Make_Ven.Rd03_Ven_Nm LIKE %(product_ven_nm_like)s
             )""",
         )
+
+    add_unlabeled_name_like_filter(
+        clauses,
+        params,
+        vendor_name_exprs=("Ven_Cd.Rd03_Ven_Nm",),
+        product_name_expr="Physic_Cd.Rd04_Physic_Nm",
+        manufacturer_predicate=(
+            "EXISTS (SELECT 1 FROM dbo.Rddbc030 AS Make_Ven_Nlq "
+            "WHERE Make_Ven_Nlq.Rd03_Ven_Cd = Physic_Cd.Rd04_Ven_Cd "
+            "AND Make_Ven_Nlq.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s)"
+        ),
+    )
 
     if like_value(params.get("product_group_nm")):
         params["product_group_nm_like"] = like_value(params.get("product_group_nm"))

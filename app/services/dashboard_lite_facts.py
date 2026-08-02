@@ -19,6 +19,12 @@ from typing import Any, Mapping
 
 import pandas as pd
 
+from app.db.mssql_client import (
+    DashboardQueryMeasurement,
+    dashboard_measurement_phase,
+    dashboard_query_measurement,
+    get_active_dashboard_query_measurement,
+)
 from app.services.product_supplier_scope_service import apply_product_supplier_scope, supplier_scope_filter_active
 
 
@@ -216,6 +222,55 @@ def _dashboard_inbound_cutoff_date(params: Mapping[str, Any], *, today: date) ->
     except ValueError:
         policy_day = today
     return min(policy_day, today).strftime("%Y%m%d")
+
+
+def resolve_transaction_cycle_status(purchase_status: Any, sales_status: Any) -> str:
+    """Resolve the combined status without mutating the individual cycle states."""
+    legacy_statuses = {
+        "normal": "success",
+        "insufficient": "single_trade_day",
+        "missing": "no_data",
+        "insufficient_days": "single_trade_day",
+        "source_required": "unavailable",
+        "": "unavailable",
+    }
+
+    def _normalized(value: Any) -> str:
+        status = str(value or "").strip().lower()
+        return legacy_statuses.get(status, status or "unavailable")
+
+    purchase = _normalized(purchase_status)
+    sales = _normalized(sales_status)
+    available = {"success", "single_trade_day"}
+    unavailable = {"no_data", "unavailable"}
+    if purchase == "error" and sales == "error":
+        return "error"
+    if "error" in {purchase, sales}:
+        return "degraded"
+    if purchase in available and sales in available:
+        return "ready"
+    if purchase in available or sales in available:
+        return "partial"
+    if purchase in unavailable and sales in unavailable:
+        return "no_data"
+    return "partial"
+
+
+def transaction_cycle_phase_timing(
+    *,
+    source_started_at: float,
+    source_finished_at: float,
+    calculation_started_at: float,
+    calculation_finished_at: float,
+) -> dict[str, int]:
+    """Keep source and local-cycle calculation timings explicitly non-overlapping."""
+    source_elapsed_ms = max(0, int((source_finished_at - source_started_at) * 1000))
+    calculation_elapsed_ms = max(0, int((calculation_finished_at - calculation_started_at) * 1000))
+    return {
+        "source_elapsed_ms": source_elapsed_ms,
+        "calculation_elapsed_ms": calculation_elapsed_ms,
+        "total_elapsed_ms": source_elapsed_ms + calculation_elapsed_ms,
+    }
 
 
 def _stock_timing_meta(stock_attrs: Mapping[str, Any] | None, *, fallback_total_ms: int) -> dict[str, int]:
@@ -2248,15 +2303,47 @@ def _build_inventory_facts(
     source_call_count: int = 0,
     inbound_source_call_count: int = 0,
     stock_mode: str = "real",
+    measurement: DashboardQueryMeasurement | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
+    phase_measurement = measurement or get_active_dashboard_query_measurement()
+
+    def _record_inventory_phase(
+        phase: str,
+        started_at: float,
+        *,
+        input_rows: int = 0,
+        result_rows: int = 0,
+        input_cols: int = 0,
+        result_cols: int = 0,
+    ) -> None:
+        if phase_measurement is None:
+            return
+        phase_measurement.add_phase(
+            phase=phase,
+            source_name="facts",
+            input_rows=input_rows,
+            result_rows=result_rows,
+            input_cols=input_cols,
+            result_cols=result_cols,
+            elapsed_ms=int((time.perf_counter() - started_at) * 1000),
+        )
+
+    input_started = time.perf_counter()
     df = _payload_df(payload)
     meta = _payload_meta(payload)
+    _record_inventory_phase(
+        "inventory_input_prepare",
+        input_started,
+        result_rows=len(df),
+        result_cols=len(df.columns),
+    )
     rows: list[dict[str, Any]] = []
     if not df.empty:
         name_col = "제품명" if "제품명" in df.columns else ("제품코드" if "제품코드" in df.columns else df.columns[0])
         code_col = "제품코드" if "제품코드" in df.columns else name_col
         maker_cols = ["제약사명", "제조사명", "매입처명"]
+        normalize_started = time.perf_counter()
         work_rows: list[dict[str, Any]] = []
         for _, row in df.iterrows():
             product_code = str(row.get(code_col) or "").strip()
@@ -2300,7 +2387,15 @@ def _build_inventory_facts(
                     ),
                 }
             )
+        _record_inventory_phase(
+            "inventory_code_normalize",
+            normalize_started,
+            input_rows=len(df),
+            result_rows=len(work_rows),
+            input_cols=len(df.columns),
+        )
 
+        groupby_started = time.perf_counter()
         grouped: dict[str, dict[str, Any]] = {}
         for item in work_rows:
             key = item["product_code"] or item["product_name"] or f"__row_{len(grouped)}"
@@ -2346,7 +2441,14 @@ def _build_inventory_facts(
             acc["_stock_risk_required_values_present"] = bool(acc["_stock_risk_required_values_present"]) and bool(item.get("_stock_risk_required_values_present"))
             acc["_stock_cover_stock_present"] = bool(acc["_stock_cover_stock_present"]) and bool(item.get("_stock_cover_stock_present"))
             acc["_stock_cover_demand_present"] = bool(acc["_stock_cover_demand_present"]) and bool(item.get("_stock_cover_demand_present"))
+        _record_inventory_phase(
+            "inventory_groupby",
+            groupby_started,
+            input_rows=len(work_rows),
+            result_rows=len(grouped),
+        )
 
+        amount_started = time.perf_counter()
         for row in grouped.values():
             stock = float(row.get("current_stock_qty") or 0)
             remaining = float(row.get("remaining_expected_demand_qty") or 0)
@@ -2394,7 +2496,14 @@ def _build_inventory_facts(
                     "status": status,
                 }
             )
+        _record_inventory_phase(
+            "inventory_amount_calculation",
+            amount_started,
+            input_rows=len(grouped),
+            result_rows=len(rows),
+        )
 
+    sales_merge_started = time.perf_counter()
     demand_surge_context = _apply_current_month_demand_surge(
         rows,
         evaluation_month=evaluation_month,
@@ -2405,10 +2514,24 @@ def _build_inventory_facts(
         history=demand_surge_history or {},
         evaluation_month=evaluation_month,
     )
+    _record_inventory_phase(
+        "inventory_sales_merge",
+        sales_merge_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
+    risk_classification_started = time.perf_counter()
     stock_risk_summary = _classify_stock_risk_rows(
         rows,
         readiness_warning_pct=readiness_warning_pct,
     )
+    _record_inventory_phase(
+        "inventory_risk_classification",
+        risk_classification_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
+    inbound_merge_started = time.perf_counter()
     vendor_stock_risk = _attach_major_purchase_vendors(
         rows,
         purchase_vendor_df,
@@ -2421,11 +2544,32 @@ def _build_inventory_facts(
         inbound_facts_df,
         inbound_source_call_count=inbound_source_call_count,
     )
+    _record_inventory_phase(
+        "inventory_inbound_merge",
+        inbound_merge_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
+    stock_merge_started = time.perf_counter()
     stock_extension_summary = _attach_stock_extension_facts(
         rows,
         evaluation_remaining_days=demand_surge_context["evaluation_remaining_days"],
     )
+    _record_inventory_phase(
+        "inventory_stock_merge",
+        stock_merge_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
+    risk_detail_started = time.perf_counter()
     risk_detail_rows, risk_detail_summary = _build_dashboard_risk_detail(rows, stock_mode=stock_mode)
+    _record_inventory_phase(
+        "risk_detail_rows",
+        risk_detail_started,
+        input_rows=len(rows),
+        result_rows=len(risk_detail_rows),
+    )
+    rows_finalize_started = time.perf_counter()
     demand_rows = [r for r in rows if r.get("재고위험상태") != "판정 제외"]
     ready_rows = [r for r in rows if r.get("재고위험상태") == "적정"]
     shortage_rows = [r for r in rows if r.get("재고위험상태") in {"긴급 부족", "부족 주의"}]
@@ -2494,6 +2638,12 @@ def _build_inventory_facts(
         int((time.perf_counter() - started) * 1000),
     )
 
+    _record_inventory_phase(
+        "inventory_rows_finalize",
+        rows_finalize_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
     return {
         "metrics": {
             "ready_sku_count": _fact(
@@ -2690,6 +2840,7 @@ def build_dashboard_lite_facts(
     manufacturer_summary_payload: Mapping[str, Any] | None = None,
     stock_shortage_payload: Mapping[str, Any] | None = None,
     inbound_facts_df: pd.DataFrame | None = None,
+    sales_transaction_cycle_df: pd.DataFrame | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
     """Build Dashboard Lite v0.1 facts from existing analytics payloads."""
@@ -2708,6 +2859,13 @@ def build_dashboard_lite_facts(
         except Exception:
             service_params = default_dashboard_lite_scope(today=today)
 
+    request_id = str(service_params.get("request_id") or f"dashboard-{int(t0 * 1_000_000)}")
+    physical_measurement = DashboardQueryMeasurement(
+        request_id=request_id,
+        company_id=service_params.get("company_id") or "",
+    )
+
+    scope_phase_started = time.perf_counter()
     source_params = _dashboard_internal_source_params(service_params, today=today)
     sales_io_filter_mode, sales_io_selected_count = _dashboard_sales_io_scope_meta(service_params)
     existing_support_params = {
@@ -2726,6 +2884,12 @@ def build_dashboard_lite_facts(
         "trend_support_month_from": source_params.get("dashboard_lite_trend_month_from"),
         "basis": "조회 종료일 기준 당월은 부분월로 표시",
     }
+    physical_measurement.add_phase(
+        phase="dashboard_scope_prepare",
+        source_name="facts",
+        result_rows=0,
+        elapsed_ms=int((time.perf_counter() - scope_phase_started) * 1000),
+    )
     log.info(
         "[dashboard.scope] company_id=%s month_from=%s month_to=%s evaluation_month=%s elapsed_ms=%s",
         service_params.get("company_id") or "",
@@ -2755,21 +2919,33 @@ def build_dashboard_lite_facts(
     stock_timing = _stock_timing_meta({}, fallback_total_ms=0)
     purchase_vendor_df: pd.DataFrame | None = None
     purchase_bundle_perf: dict[str, Any] = {}
+    sales_source_elapsed_ms = 0
+    stock_source_elapsed_ms = 0
     inbound_source_elapsed_ms = 0
     inbound_query_elapsed_ms = 0
     inbound_build_elapsed_ms = 0
     inbound_source_rows = 0
+    sales_cycle_elapsed_ms = 0
+    sales_cycle_source_rows = 0
+    sales_cycle_physical_query_count = 0
+    sales_cycle_source_mode = "reused_daily_facts"
     inbound_cutoff_date = _dashboard_inbound_cutoff_date(service_params, today=today)
     if needs_inbound_source:
         from app.services.dashboard_inbound_facts_service import get_dashboard_inbound_facts
 
         inbound_started = time.perf_counter()
-        inbound_facts_df = get_dashboard_inbound_facts(
-            dict(service_params),
-            data_cutoff_date=inbound_cutoff_date,
-            cycle_lookback_days=365,
-            vendor_lookback_days=90,
-        )
+        with dashboard_query_measurement(
+            physical_measurement,
+            source="inbound",
+            phase="inbound_facts",
+            source_mode="detail_required",
+        ):
+            inbound_facts_df = get_dashboard_inbound_facts(
+                dict(service_params),
+                data_cutoff_date=inbound_cutoff_date,
+                cycle_lookback_days=365,
+                vendor_lookback_days=90,
+            )
         inbound_source_elapsed_ms = int((time.perf_counter() - inbound_started) * 1000)
         inbound_source_rows = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_source_rows") or 0)
         inbound_query_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_query_elapsed_ms") or 0)
@@ -2792,11 +2968,18 @@ def build_dashboard_lite_facts(
         from app.services.analytics_sales_trend_service import get_dashboard_sales_source_bundle
 
         t_source = time.perf_counter()
-        source_bundle = get_dashboard_sales_source_bundle(dict(source_params))
+        with dashboard_query_measurement(
+            physical_measurement,
+            source="sales",
+            phase="sales_bundle",
+            source_mode=str(source_params.get("source_mode") or ""),
+        ):
+            source_bundle = get_dashboard_sales_source_bundle(dict(source_params))
         expanded_sales_source_df = source_bundle.get("sales_df")
         purchase_vendor_df = source_bundle.get("purchase_vendor_df")
         purchase_bundle_perf = dict(source_bundle.get("perf") or {})
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
+        sales_source_elapsed_ms = source_elapsed_ms
         t_filter = time.perf_counter()
         expanded_sales_source_df = _filter_sales_source_for_dashboard(expanded_sales_source_df, service_params)
         if isinstance(purchase_vendor_df, pd.DataFrame) and isinstance(expanded_sales_source_df, pd.DataFrame) and "제품코드" in purchase_vendor_df.columns and "제품코드" in expanded_sales_source_df.columns:
@@ -2857,6 +3040,14 @@ def build_dashboard_lite_facts(
             int(purchase_bundle_perf.get("purchase_min_frame_ms") or 0),
             int((time.perf_counter() - t_source) * 1000),
         )
+        log.info(
+            "[dashboard.phase] request_id=%s phase=sales_bundle input_rows=%s result_rows=%s physical_query_count=%s elapsed_ms=%s",
+            request_id,
+            int(purchase_bundle_perf.get("raw_bundle_rows") or 0),
+            0 if expanded_sales_source_df is None else len(expanded_sales_source_df),
+            physical_measurement.summary()["physical_query_count"],
+            sales_source_elapsed_ms,
+        )
 
     if manufacturer_summary_payload is None:
         from app.services.analytics_manufacturer_sales_trend_service import get_manufacturer_sales_trend_summary_result
@@ -2886,17 +3077,24 @@ def build_dashboard_lite_facts(
         )
         forecast_elapsed_ms = int((time.perf_counter() - t_forecast) * 1000)
         t_source = time.perf_counter()
-        stock_shortage_payload = get_stock_shortage_result(
-            {
-                **service_params,
-                "month_to": service_params.get("evaluation_month"),
-                "date_to": source_params.get("date_to"),
-            },
-            sales_raw_df=visible_sales_df,
-            sales_forecast_df=shared_sales_forecast_df,
-            product_universe_df=inbound_facts_df if scope_filter_active else None,
-        )
+        with dashboard_query_measurement(
+            physical_measurement,
+            source="stock",
+            phase="stock_shortage",
+            source_mode=str(service_params.get("stock_mode") or ""),
+        ):
+            stock_shortage_payload = get_stock_shortage_result(
+                {
+                    **service_params,
+                    "month_to": service_params.get("evaluation_month"),
+                    "date_to": source_params.get("date_to"),
+                },
+                sales_raw_df=visible_sales_df,
+                sales_forecast_df=shared_sales_forecast_df,
+                product_universe_df=inbound_facts_df if scope_filter_active else None,
+            )
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
+        stock_source_elapsed_ms = source_elapsed_ms
         t_master_merge = time.perf_counter()
         stock_shortage_payload = _attach_dashboard_product_code_pairs(stock_shortage_payload, existing_support_sales_df)
         master_merge_elapsed_ms = int((time.perf_counter() - t_master_merge) * 1000)
@@ -2958,6 +3156,14 @@ def build_dashboard_lite_facts(
         len(sales.get("chart_rows") or []),
         int((time.perf_counter() - t_sales) * 1000),
     )
+    physical_measurement.add_phase(
+        phase="sales_facts",
+        source_name="sales",
+        source_mode=str(source_params.get("source_mode") or ""),
+        input_rows=len(_payload_df(manufacturer_summary_payload)),
+        result_rows=len(sales.get("chart_rows") or []),
+        elapsed_ms=int((time.perf_counter() - t_sales) * 1000),
+    )
     t_stock = time.perf_counter()
     inventory = _build_inventory_facts(
         stock_shortage_payload,
@@ -2971,6 +3177,7 @@ def build_dashboard_lite_facts(
         source_call_count=int(needs_sales_source) + int(needs_stock_source),
         inbound_source_call_count=int(needs_inbound_source),
         stock_mode=str(service_params.get("stock_mode") or "real"),
+        measurement=physical_measurement,
     )
     def _product_codes(frame: Any, *columns: str) -> set[str]:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -3017,8 +3224,98 @@ def build_dashboard_lite_facts(
     purchase_cycle = {}
     if isinstance(inbound_facts_df, pd.DataFrame):
         purchase_cycle = dict(inbound_facts_df.attrs.get("purchase_transaction_cycle") or {})
+    from app.services.dashboard_inbound_facts_service import summarize_transaction_cycle_dates
+
+    sales_cycle_cutoff_date = _dashboard_inbound_cutoff_date(service_params, today=today)
+    sales_cycle_source_started = time.perf_counter()
+    if sales_transaction_cycle_df is None:
+        from app.services.analytics_sales_trend_service import get_dashboard_sales_transaction_dates
+
+        sales_cycle_source_mode = "rddbc120_minimal"
+        try:
+            with dashboard_query_measurement(
+                physical_measurement,
+                source="sales",
+                phase="sales_transaction_cycle_source",
+                source_mode=sales_cycle_source_mode,
+            ):
+                sales_transaction_cycle_df = get_dashboard_sales_transaction_dates(
+                    dict(source_params),
+                    date_from=(pd.Timestamp(sales_cycle_cutoff_date) - pd.Timedelta(days=89)).strftime("%Y%m%d"),
+                    date_to=sales_cycle_cutoff_date,
+                )
+            sales_cycle_physical_query_count = 1
+        except Exception as exc:
+            sales_transaction_cycle_df = pd.DataFrame(columns=["trade_date", "io_code"])
+            sales_cycle_source_mode = "error"
+            log.warning(
+                "[dashboard.sales_transaction_cycle] status=error error_type=%s elapsed_ms=%s",
+                type(exc).__name__,
+                int((time.perf_counter() - sales_cycle_source_started) * 1000),
+            )
+    elif isinstance(sales_transaction_cycle_df, pd.DataFrame):
+        sales_cycle_source_mode = str(sales_transaction_cycle_df.attrs.get("source_mode") or sales_cycle_source_mode)
+        sales_cycle_physical_query_count = int(sales_transaction_cycle_df.attrs.get("physical_query_count") or 0)
+
+    sales_cycle_source_finished = time.perf_counter()
+    sales_cycle_calculation_started = sales_cycle_source_finished
+    cycle_source = sales_transaction_cycle_df if isinstance(sales_transaction_cycle_df, pd.DataFrame) else pd.DataFrame()
+    sales_cycle_source_rows = int(len(cycle_source))
+    normal_sale_dates = pd.Series(dtype="object")
+    if not cycle_source.empty and {"trade_date", "io_code"}.issubset(cycle_source.columns):
+        # Existing sales facts use 5xx for sales and 6xx for returns.  A return
+        # on a normal-sale date therefore cannot erase that date.
+        normal_sale_dates = cycle_source.loc[
+            cycle_source["io_code"].fillna("").astype(str).str.strip().str.startswith("5"),
+            "trade_date",
+        ]
+    sales_cycle = summarize_transaction_cycle_dates(
+        normal_sale_dates,
+        cutoff_date=sales_cycle_cutoff_date,
+        period_days=90,
+    )
+    if sales_cycle_source_mode == "error":
+        sales_cycle["result_status"] = "error"
+    sales_cycle_calculation_finished = time.perf_counter()
+    sales_cycle_timing = transaction_cycle_phase_timing(
+        source_started_at=sales_cycle_source_started,
+        source_finished_at=sales_cycle_source_finished,
+        calculation_started_at=sales_cycle_calculation_started,
+        calculation_finished_at=sales_cycle_calculation_finished,
+    )
+    sales_cycle_source_elapsed_ms = sales_cycle_timing["source_elapsed_ms"]
+    sales_cycle_calculation_elapsed_ms = sales_cycle_timing["calculation_elapsed_ms"]
+    sales_cycle_total_elapsed_ms = sales_cycle_timing["total_elapsed_ms"]
+    sales_cycle.update(
+        {
+            "window_days": sales_cycle["period_days"],
+            "latest_normal_trade_date": sales_cycle["latest_date"] or None,
+            "source_mode": sales_cycle_source_mode,
+            "physical_query_count": sales_cycle_physical_query_count,
+            "source_rows": sales_cycle_source_rows,
+            "source_elapsed_ms": sales_cycle_source_elapsed_ms,
+            "calculation_elapsed_ms": sales_cycle_calculation_elapsed_ms,
+            "total_elapsed_ms": sales_cycle_total_elapsed_ms,
+            "elapsed_ms": sales_cycle_total_elapsed_ms,
+        }
+    )
+    physical_measurement.add_phase(
+        phase="sales_transaction_cycle_calculation",
+        source_name="sales",
+        input_rows=sales_cycle_source_rows,
+        result_rows=int(sales_cycle.get("unique_trade_days") or 0),
+        elapsed_ms=sales_cycle_calculation_elapsed_ms,
+    )
+    log.info(
+        "[dashboard.sales_transaction_cycle] status=%s source_mode=%s window_start=%s window_end=%s source_rows=%s unique_trade_days=%s physical_query_count=%s source_elapsed_ms=%s calculation_elapsed_ms=%s total_elapsed_ms=%s",
+        sales_cycle["result_status"], sales_cycle_source_mode, sales_cycle["window_start"], sales_cycle["window_end"],
+        sales_cycle_source_rows, sales_cycle["unique_trade_days"], sales_cycle_physical_query_count,
+        sales_cycle_source_elapsed_ms, sales_cycle_calculation_elapsed_ms, sales_cycle_total_elapsed_ms,
+    )
+    purchase_cycle_status = purchase_cycle.get("result_status") or purchase_cycle.get("data_status")
+    sales_cycle_status = sales_cycle.get("result_status")
     turnover = {
-        "status": "partial",
+        "status": resolve_transaction_cycle_status(purchase_cycle_status, sales_cycle_status),
         "period_days": int(purchase_cycle.get("period_days") or 90),
         "cutoff_date": str(purchase_cycle.get("cutoff_date") or ""),
         "purchase_latest_date": str(purchase_cycle.get("latest_date") or ""),
@@ -3026,18 +3323,28 @@ def build_dashboard_lite_facts(
         "purchase_unique_trade_days": purchase_cycle.get("unique_trade_days"),
         "purchase_average_interval_days": purchase_cycle.get("average_interval_days"),
         "purchase_data_status": str(purchase_cycle.get("data_status") or "missing"),
-        "sales_latest_date": "",
-        "sales_elapsed_days": None,
-        "sales_unique_trade_days": None,
-        "sales_average_interval_days": None,
-        "sales_data_status": "source_required",
+        "sales_latest_date": str(sales_cycle.get("latest_date") or ""),
+        "sales_elapsed_days": sales_cycle.get("elapsed_days"),
+        "sales_unique_trade_days": sales_cycle.get("unique_trade_days"),
+        "sales_average_interval_days": sales_cycle.get("average_interval_days"),
+        "sales_data_status": str(sales_cycle_status or "no_data"),
+        "sales_transaction_cycle": sales_cycle,
         "purchase_turnover_days": purchase_cycle.get("average_interval_days"),
-        "sales_turnover_days": None,
+        "sales_turnover_days": sales_cycle.get("average_interval_days"),
         "definition": "최근 90일 정상 매입·매출 고유 거래일 사이 평균 일수",
-        "data_quality": ["매출 일자 단위 정상 거래일 facts 연결 필요"],
+        "data_quality": [],
     }
     t_actions = time.perf_counter()
     today_actions = _build_today_actions(sales, inventory, turnover)
+    actions_elapsed_ms = int((time.perf_counter() - t_actions) * 1000)
+    physical_measurement.add_phase(
+        phase="today_actions",
+        source_name="facts",
+        input_rows=len(inventory.get("readiness_rows") or []),
+        result_rows=len(today_actions),
+        elapsed_ms=actions_elapsed_ms,
+    )
+    t_visual_phase2 = time.perf_counter()
     visual_phase2_summary, purchase_trend_rows = _build_visual_phase2_summary(
         list(inventory.get("readiness_rows") or []),
         purchase_vendor_df,
@@ -3064,6 +3371,7 @@ def build_dashboard_lite_facts(
     visual_phase2_summary["vendor_top_count"] = min(10, len(inventory.get("vendor_stock_risk_top_rows") or []))
     inventory["visual_phase2_summary"] = visual_phase2_summary
     inventory["purchase_trend_rows"] = purchase_trend_rows
+    visual_phase2_elapsed_ms = int((time.perf_counter() - t_visual_phase2) * 1000)
     log.info(
         "[dashboard.visual_phase2] inventory_rows=%s cover_zero_stock_rows=%s cover_shortfall_rows=%s cover_sufficient_rows=%s cover_no_demand_rows=%s cover_insufficient_rows=%s inbound_delay_candidate_rows=%s overstock_candidate_rows=%s recent_purchase_none_rows=%s demand_surge_rows=%s purchase_trend_status=%s purchase_trend_points=%s vendor_top_count=%s briefing_line_count=%s build_elapsed_ms=%s additional_source_call_count=0",
         visual_phase2_summary["inventory_count"], visual_phase2_summary["cover_zero_stock_count"], visual_phase2_summary["cover_shortfall_count"], visual_phase2_summary["cover_sufficient_count"], visual_phase2_summary["cover_no_demand_count"], visual_phase2_summary["cover_insufficient_count"], visual_phase2_summary["inbound_delay_candidate_count"], visual_phase2_summary["overstock_candidate_count"], visual_phase2_summary["recent_purchase_none_count"], visual_phase2_summary["demand_surge_count"], visual_phase2_summary["purchase_trend_status"], visual_phase2_summary["purchase_trend_points"], visual_phase2_summary["vendor_top_count"], len(visual_phase2_summary["briefing_lines"]), visual_phase2_summary["elapsed_ms"],
@@ -3084,9 +3392,26 @@ def build_dashboard_lite_facts(
         service_params.get("month_to"),
         service_params.get("evaluation_month"),
         len(today_actions),
-        int((time.perf_counter() - t_actions) * 1000),
+        actions_elapsed_ms,
+    )
+    physical_measurement.add_phase(
+        phase="visual_phase2",
+        source_name="facts",
+        input_rows=len(inventory.get("readiness_rows") or []),
+        result_rows=len(purchase_trend_rows or []),
+        elapsed_ms=visual_phase2_elapsed_ms,
+    )
+    physical_query_summary = physical_measurement.summary()
+    log.info(
+        "[dashboard.phase] request_id=%s phase=facts_assembly input_rows=%s result_rows=%s physical_query_count=%s elapsed_ms=%s",
+        request_id,
+        len(source_df) if isinstance(source_df, pd.DataFrame) else 0,
+        len(inventory.get("risk_detail_rows") or []),
+        physical_query_summary["physical_query_count"],
+        int((time.perf_counter() - t_stock) * 1000),
     )
 
+    facts_payload_started = time.perf_counter()
     facts = {
         "kind": FACTS_KIND,
         "scope": "Dashboard Lite v0.1",
@@ -3143,8 +3468,41 @@ def build_dashboard_lite_facts(
     facts["performance"]["inbound_query_elapsed_ms"] = inbound_query_elapsed_ms
     facts["performance"]["inbound_build_elapsed_ms"] = inbound_build_elapsed_ms
     facts["performance"]["inbound_source_rows"] = inbound_source_rows
+    facts["performance"]["sales_source_elapsed_ms"] = sales_source_elapsed_ms
+    facts["performance"]["stock_source_elapsed_ms"] = stock_source_elapsed_ms
+    facts["performance"]["sales_transaction_cycle_elapsed_ms"] = sales_cycle_total_elapsed_ms
+    facts["performance"]["sales_transaction_cycle_source_elapsed_ms"] = sales_cycle_source_elapsed_ms
+    facts["performance"]["sales_transaction_cycle_calculation_elapsed_ms"] = sales_cycle_calculation_elapsed_ms
+    facts["performance"]["sales_transaction_cycle_total_elapsed_ms"] = sales_cycle_total_elapsed_ms
+    facts["performance"]["sales_transaction_cycle_source_rows"] = sales_cycle_source_rows
+    facts["performance"]["sales_transaction_cycle_physical_query_count"] = sales_cycle_physical_query_count
+    facts["performance"].update(physical_query_summary)
+    physical_measurement.add_phase(
+        phase="facts_payload_build",
+        source_name="facts",
+        result_rows=len(inventory.get("risk_detail_rows") or []),
+        elapsed_ms=int((time.perf_counter() - facts_payload_started) * 1000),
+    )
+    total_elapsed_ms = int((time.perf_counter() - t0) * 1000)
+    measurement_summary = physical_measurement.summary()
+    measured_phase_total_ms = sum(int(item.get("elapsed_ms") or 0) for item in measurement_summary["phase_metrics"])
+    facts["performance"].update(measurement_summary)
+    facts["performance"]["post_process_elapsed_ms"] = sum(
+        int(item.get("elapsed_ms") or 0)
+        for item in measurement_summary.get("phase_metrics") or []
+        if item.get("source_name") == "facts"
+    )
+    facts["performance"].update(
+        {
+            "total_elapsed_ms": total_elapsed_ms,
+            "measured_phase_total_ms": measured_phase_total_ms,
+            "unaccounted_elapsed_ms": max(0, total_elapsed_ms - measured_phase_total_ms),
+            "unaccounted_ratio_pct": round(max(0, total_elapsed_ms - measured_phase_total_ms) * 100.0 / max(1, total_elapsed_ms), 2),
+        }
+    )
     log.info(
-        "[dashboard.finish] company_id=%s month_from=%s month_to=%s evaluation_month=%s base_source_call_count=%s inbound_source_call_count=%s source_call_count=%s dashboard_total_ms=%s elapsed_ms=%s",
+        "[dashboard.finish] request_id=%s company_id=%s month_from=%s month_to=%s evaluation_month=%s base_source_call_count=%s inbound_source_call_count=%s source_call_count=%s logical_source_count=%s physical_query_count=%s physical_query_count_by_source=%s sales_elapsed_ms=%s stock_elapsed_ms=%s inbound_elapsed_ms=%s stock_and_facts_elapsed_ms=%s dashboard_total_ms=%s elapsed_ms=%s",
+        request_id,
         service_params.get("company_id") or "",
         service_params.get("month_from"),
         service_params.get("month_to"),
@@ -3152,7 +3510,14 @@ def build_dashboard_lite_facts(
         facts["base_source_call_count"],
         facts["inbound_source_call_count"],
         facts["source_call_count"],
-        int((time.perf_counter() - t0) * 1000),
-        int((time.perf_counter() - t0) * 1000),
+        physical_query_summary["logical_source_count"],
+        physical_query_summary["physical_query_count"],
+        physical_query_summary["physical_query_count_by_source"],
+        sales_source_elapsed_ms,
+        stock_source_elapsed_ms,
+        inbound_source_elapsed_ms,
+        int((time.perf_counter() - t_stock) * 1000),
+        total_elapsed_ms,
+        total_elapsed_ms,
     )
     return facts

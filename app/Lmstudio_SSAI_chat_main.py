@@ -7580,10 +7580,32 @@ _CHAT_PARTITION_META_ALLOW_KEYS = {
     "condition_summary",
     "params",
     "nlq",
+    # Immutable completion facts must survive compact history restoration.
+    "request_started_at",
+    "response_completed_at",
+    "elapsed_ms",
     "current_table_followup",
     "supplier_detail_key",
     "supplier_detail_rows",
     "excel_sheet_names",
+    # Product flow/inventory history cards read these bounded facts directly
+    # from meta after partition restore.  Keep the render contract rather than
+    # attempting to recompute totals from a display slice.
+    "carry_qty",
+    "in_qty",
+    "out_qty",
+    "stock_qty",
+    "stock_amt",
+    "insurance_amt",
+    "sum_carry_qty",
+    "sum_in_qty",
+    "sum_out_qty",
+    "sum_stock_qty",
+    "sum_stock_amt",
+    "sum_insu_amt",
+    "product_label",
+    "product_count",
+    "stock_location_count",
     # Dashboard cards are not DataFrame tables. Keep their deterministic render
     # cache so a room restore can dispatch the Dashboard-specific renderer.
     "analysis_type",
