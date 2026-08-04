@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.sims.nlq.action_inventory import (  # noqa: E402
+    ANALYTICS_INTENT_ACTIONS,
     CANONICAL_ACTIONS,
     DASHBOARD_ONLY,
     IMPLEMENTED,
@@ -164,6 +165,21 @@ def _check_handler_coverage() -> None:
         _fail("aggregate IO view에 사용 금지 fallback alias가 노출됐습니다.")
 
 
+def _check_analytics_intent_matrix() -> None:
+    analytics_actions = {
+        spec.canonical_action
+        for spec in CANONICAL_ACTIONS
+        if spec.handler_kind == "analytics" and spec.implementation_status == IMPLEMENTED
+    }
+    matrix_actions = set(ANALYTICS_INTENT_ACTIONS.values())
+    if matrix_actions != analytics_actions:
+        _fail(
+            "Analytics metric/grouping matrix와 canonical action이 다릅니다: "
+            f"matrix_only={sorted(matrix_actions - analytics_actions)}, "
+            f"inventory_only={sorted(analytics_actions - matrix_actions)}"
+        )
+
+
 def _check_product_flow_inventory_aliases() -> None:
     cases = (
         ("제품수불현황 조회", "제품수불현황 조회"),
@@ -213,6 +229,7 @@ def main() -> int:
         ("panel registry / inventory coverage", _check_panel_inventory),
         ("implementation status contract", _check_statuses),
         ("handler and IO fallback callable coverage", _check_handler_coverage),
+        ("analytics metric/grouping matrix coverage", _check_analytics_intent_matrix),
         ("product flow / inventory parser aliases", _check_product_flow_inventory_aliases),
         ("canonical NLQ period policy classification", _check_period_policy_classification),
     )

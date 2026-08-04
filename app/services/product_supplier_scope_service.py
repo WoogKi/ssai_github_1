@@ -19,6 +19,12 @@ SCOPE_MANUFACTURER = "manufacturer"
 SCOPE_ORDER_VENDOR = "order_vendor"
 SCOPE_MODES = {SCOPE_ALL, SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR}
 
+# Match the established manufacturer lookup screen. Vendor codes are fixed
+# width business strings and must therefore remain strings for this check.
+MANUFACTURER_VENDOR_CODE_MIN = "10001"
+MANUFACTURER_VENDOR_CODE_MAX = "18999"
+PURCHASE_VENDOR_CODE_EXCLUSIVE_MAX = "50000"
+
 
 def _codes(value: Any) -> list[str]:
     values = value if isinstance(value, (list, tuple, set)) else [value]
@@ -32,6 +38,59 @@ def _codes(value: Any) -> list[str]:
             seen.add(code)
             result.append(code)
     return result
+
+
+def is_manufacturer_vendor_code(value: Any) -> bool:
+    """Return whether a vendor code is in the established maker role range."""
+    if not isinstance(value, str):
+        return False
+    code = value.strip()
+    return MANUFACTURER_VENDOR_CODE_MIN <= code <= MANUFACTURER_VENDOR_CODE_MAX
+
+
+def is_purchase_vendor_code(value: Any) -> bool:
+    """Return whether a vendor code belongs to the established purchase range."""
+    if not isinstance(value, str):
+        return False
+    code = value.strip()
+    return len(code) == 5 and code.isascii() and code.isdigit() and code < PURCHASE_VENDOR_CODE_EXCLUSIVE_MAX
+
+
+def resolve_common_vendor_candidates(search_text: Any) -> list[dict[str, str]]:
+    """Run the active vendor-master LIKE lookup once and retain its role data."""
+    text = " ".join(str(search_text or "").split())
+    if not text or text == "전체":
+        return []
+
+    from app.services.rddbc030_service import search_vendors_full
+
+    df = search_vendors_full(ven_nm=text, scope="", only_active=True, top=200)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for _, row in df.iterrows():
+        code = str(row.get("Rd03_Ven_Cd") or "").strip()
+        name = str(row.get("Rd03_Ven_Nm") or "").strip()
+        if not code or not name or code in seen:
+            continue
+        seen.add(code)
+        if is_manufacturer_vendor_code(code):
+            role = "manufacturer"
+        elif is_purchase_vendor_code(code):
+            role = "purchase_vendor"
+        else:
+            role = "vendor"
+        rows.append(
+            {
+                "entity_code": code,
+                "canonical_name": name,
+                "entity_role": role,
+                "role_source": "rddbc030_vendor_code_scope",
+            }
+        )
+    return rows
 
 
 def normalize_product_supplier_scope(params: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -152,7 +211,9 @@ def resolve_supplier_vendor_codes(search_text: Any, *, mode: str) -> list[dict[s
     rows: list[dict[str, str]] = []
     for _, row in df.iterrows():
         code = str(row.get("vendor_code") or "").strip()
-        if code:
+        # Product-master supplier links can also point to purchase/order
+        # vendors. Keep only the same role set the manufacturer UI offers.
+        if code and (mode != SCOPE_MANUFACTURER or is_manufacturer_vendor_code(code)):
             rows.append({"code": code, "name": str(row.get("vendor_name") or "").strip()})
     return rows
 

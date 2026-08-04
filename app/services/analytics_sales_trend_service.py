@@ -838,7 +838,42 @@ def _resolve_source_mode(params: Dict[str, Any]) -> str:
     if _needs_detail_source(params):
         return "detail"
 
-    return "monthly_book"
+    return "monthly_real"
+
+
+def normalize_analytics_stock_source_params(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Resolve the shared Analytics stock basis without overriding detail sources."""
+    out = dict(params or {})
+    mode = clean_text(out.get("source_mode")).lower()
+    stock_mode = clean_text(out.get("stock_mode")).lower()
+
+    if stock_mode not in {"real", "book"}:
+        stock_mode = "book" if mode in {"monthly_book", "book", "rddbc220", "장부재고", "월집계장부"} else "real"
+    out["stock_mode"] = stock_mode
+
+    if mode in {"detail", "rddbc120", "출고상세", "상세"}:
+        out["source_mode"] = "detail"
+    elif mode in {"monthly_real", "real", "rddbc210", "실재고", "월집계실재고"}:
+        out["source_mode"] = "monthly_real"
+        out["stock_mode"] = "real"
+    elif mode in {"monthly_book", "book", "rddbc220", "장부재고", "월집계장부"}:
+        out["source_mode"] = "monthly_book"
+        out["stock_mode"] = "book"
+    elif mode and mode != "auto":
+        # Group forecast handlers own non-stock source modes such as transaction_statement.
+        return out
+    elif not _needs_detail_source(out):
+        out["source_mode"] = "monthly_real" if stock_mode == "real" else "monthly_book"
+
+    return out
+
+
+def _resolved_stock_mode(source_mode: str, params: Dict[str, Any]) -> str:
+    if source_mode == "monthly_real":
+        return "real"
+    if source_mode == "monthly_book":
+        return "book"
+    return clean_text(params.get("stock_mode")).lower()
 
 
 def _monthly_spec(source_mode: str) -> Dict[str, str]:
@@ -3223,6 +3258,7 @@ def get_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str,
     log.info("[analytics.sales_trend] rows=%s meta=%s", row_count, _safe_analytics_log_meta(params))
 
     source_mode = _resolve_source_mode(params)
+    stock_mode = _resolved_stock_mode(source_mode, params)
     source_label = _effective_source_label(source_mode, df)
     query_summary = _fmt_analytics_query_summary(params, source_label)
     trend_judge_filter = _normalize_trend_judge_filter(params.get("trend_judge"))    
@@ -3243,6 +3279,7 @@ def get_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str,
                 "analytics": True,
                 "analysis_type": "sales_trend",
                 "source_mode": source_mode,
+                "stock_mode": stock_mode,
                 "source_label": source_label,
                 "trend_judge_counts": trend_judge_counts,
                 "query_summary": query_summary,
@@ -3276,6 +3313,7 @@ def get_sales_trend_result(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         "analytics": True,
         "analysis_type": "sales_trend",
         "source_mode": source_mode,
+        "stock_mode": stock_mode,
         "source_label": source_label,
         "trend_judge_counts": trend_judge_counts,
         "trend_judge_filter": trend_judge_filter,
@@ -3450,6 +3488,7 @@ def get_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> D
     log.info("[analytics.sales_trend_summary] rows=%s meta=%s", row_count, _safe_analytics_log_meta(params))
 
     source_mode = _resolve_source_mode(params)
+    stock_mode = _resolved_stock_mode(source_mode, params)
     source_label = _effective_source_label(source_mode, raw_df)
     query_summary = _fmt_analytics_query_summary(params, source_label)
 
@@ -3471,6 +3510,7 @@ def get_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> D
                 "sales_trend_summary": True,
                 "summary_type": "product_summary",
                 "source_mode": source_mode,
+                "stock_mode": stock_mode,
                 "source_label": source_label,
                 "trend_judge_counts": trend_counts,
                 "trend_judge_filter": trend_judge_filter,
@@ -3500,6 +3540,7 @@ def get_sales_trend_summary_result(params: Optional[Dict[str, Any]] = None) -> D
         "sales_trend_summary": True,
         "summary_type": "product_summary",
         "source_mode": source_mode,
+        "stock_mode": stock_mode,
         "source_label": source_label,
         "trend_judge_counts": trend_counts,
         "trend_judge_filter": trend_judge_filter,
@@ -3838,6 +3879,7 @@ def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
         df = pd.DataFrame()
 
     source_mode = _resolve_source_mode(params)
+    stock_mode = _resolved_stock_mode(source_mode, params)
     source_label = _effective_source_label(source_mode, df)
     trend_judge_filter = _normalize_trend_judge_filter(params.get("trend_judge"))
     query_summary = _fmt_analytics_query_summary(params, source_label)
@@ -3879,6 +3921,7 @@ def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
                 "sales_trend_summary": True,
                 "summary_type": "product_forecast",
                 "source_mode": source_mode,
+                "stock_mode": stock_mode,
                 "source_label": source_label,
                 "trend_judge_counts": {},
                 "trend_judge_counts_all": trend_counts_all,
@@ -3918,6 +3961,7 @@ def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
         "sales_trend_summary": True,
         "summary_type": "product_forecast",
         "source_mode": source_mode,
+        "stock_mode": stock_mode,
         "source_label": source_label,
 
         # 현재 조회대상 기준
@@ -3954,7 +3998,7 @@ def get_sales_forecast_result(params: Optional[Dict[str, Any]] = None) -> Dict[s
     return payload
 
 def _stock_mode_label(stock_mode: str) -> str:
-    return STOCK_MODE_LABELS.get(str(stock_mode or "").strip(), "장부재고")
+    return STOCK_MODE_LABELS.get(str(stock_mode or "").strip(), "실재고")
 
 
 def _stock_qty_col(stock_mode: str) -> str:
@@ -4764,7 +4808,7 @@ def get_stock_shortage_df(
         )
 
     params_started = time.perf_counter()
-    stock_mode = str(params.get("stock_mode") or "book").strip()
+    stock_mode = str(params.get("stock_mode") or "real").strip()
     stock_label = _stock_mode_label(stock_mode)
     source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
     _record_stock_phase("stock_params_prepare", params_started)
@@ -5278,7 +5322,7 @@ def get_stock_shortage_result(
 
     log.info("[analytics.stock_shortage] rows=%s meta=%s", row_count, _safe_analytics_log_meta(params))
 
-    stock_mode = str(params.get("stock_mode") or "book").strip()
+    stock_mode = str(params.get("stock_mode") or "real").strip()
     stock_label = _stock_mode_label(stock_mode)
     stock_source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
     source_mode = _resolve_source_mode(params)

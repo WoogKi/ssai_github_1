@@ -7057,11 +7057,22 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     else:
                         msg = "해당 조회조건의 자료가 없습니다."
 
-                    entity_resolution_status = str(meta.get("entity_resolution_status") or "")
-                    preserve_resolution_guidance = entity_resolution_status in {
+                    terminal_statuses = {
+                        str(meta.get(key) or "").strip()
+                        for key in (
+                            "execution_status",
+                            "result_status",
+                            "entity_resolution_status",
+                        )
+                    }
+                    preserve_resolution_guidance = bool(terminal_statuses & {
+                        "unsupported",
+                        "routing_error",
+                        "candidate_required",
                         "resolution_unavailable",
                         "not_found",
-                    }
+                        "role_mismatch",
+                    })
                     guidance_message = str(payload.get("message") or payload.get("data") or "")
                     guidance_title = str(payload.get("title") or "")
                     payload["type"] = "text"

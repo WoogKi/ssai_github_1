@@ -177,14 +177,14 @@ def _ns() -> str:
 
 
 _ANALYTICS_DEFAULT_KEYS = {
-    "sales_trend": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "sales_forecast": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "manufacturer_sales_trend": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "manufacturer_sales_trend_summary": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "customer_sales_forecast": {"io_gu_list"},
-    "salesperson_sales_forecast": {"io_gu_list"},
-    "region_sales_forecast": {"io_gu_list"},
+    "sales_trend": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "sales_trend_summary": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "sales_forecast": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "manufacturer_sales_trend": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "manufacturer_sales_trend_summary": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "customer_sales_forecast": {"stock_mode", "io_gu_list"},
+    "salesperson_sales_forecast": {"stock_mode", "io_gu_list"},
+    "region_sales_forecast": {"stock_mode", "io_gu_list"},
     "stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
     "supplier_stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
 }
@@ -287,9 +287,10 @@ def _analytics_default_pair_key(widget_key: str) -> str:
 def _attach_analytics_company_io(
     params: Dict[str, Any], adapter: Mapping[str, Any] | None
 ) -> Dict[str, Any]:
-    """Inject the persisted company IO scope; KPI screens never override it."""
+    """Inject persisted Analytics defaults without overriding an explicit source."""
     out = dict(params or {})
-    raw_values = dict(adapter or {}).get("effective", {}).get("io_gu_list", [])
+    effective = dict(adapter or {}).get("effective", {})
+    raw_values = effective.get("io_gu_list", [])
     codes = list(dict.fromkeys(
         str(value).split(":", 1)[-1].strip()
         for value in (raw_values or [])
@@ -303,7 +304,15 @@ def _attach_analytics_company_io(
     else:
         out.pop("io_gu_list", None)
         out["__company_io_missing"] = True
-    return out
+
+    if not _clean_text(out.get("stock_mode")):
+        default_stock_mode = _clean_text(effective.get("stock_mode")).lower()
+        if default_stock_mode in {"real", "book"}:
+            out["stock_mode"] = default_stock_mode
+
+    from app.services.analytics_sales_trend_service import normalize_analytics_stock_source_params
+
+    return normalize_analytics_stock_source_params(out)
 
 
 def _attach_analytics_default_code_pairs(
@@ -2778,7 +2787,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
             if stock_mode_key in st.session_state:
                 stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], key=stock_mode_key)
             else:
-                stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], index=0, key=stock_mode_key)
+                stock_label = st.selectbox("재고기준", ["실재고", "장부재고"], index=0, key=stock_mode_key)
         with c6:
             physic_cd = st.text_input("제품코드", value="", key=f"__analytics_stock_shortage_physic_cd__{ns}")
         with c7:
@@ -2985,7 +2994,7 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
             if stock_mode_key in st.session_state:
                 stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], key=stock_mode_key)
             else:
-                stock_label = st.selectbox("재고기준", ["장부재고", "실재고"], index=0, key=stock_mode_key)
+                stock_label = st.selectbox("재고기준", ["실재고", "장부재고"], index=0, key=stock_mode_key)
         with c6:
             physic_cd = st.text_input("제품코드", value="", key=f"__analytics_supplier_stock_shortage_physic_cd__{ns}")
         with c7:

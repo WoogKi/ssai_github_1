@@ -1270,6 +1270,7 @@ def run_basic_checks() -> list[CheckResult]:
                 "month_to": "202608",
                 "date_from": "20260101",
                 "date_to": "20260831",
+                "policy_date": "20260712",
                 "source_mode": "monthly_book",
             },
             raw_df=raw_df,
@@ -1765,6 +1766,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "month_to": "202608",
                     "date_from": "20260101",
                     "date_to": "20260831",
+                    "policy_date": "20260712",
                     "source_mode": "monthly_book",
                     "stock_mode": "book",
                 }
@@ -1884,6 +1886,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "month_to": "202608",
                     "date_from": "20260101",
                     "date_to": "20260831",
+                    "policy_date": "20260712",
                     "source_mode": "monthly_real",
                     "stock_mode": "real",
                 }
@@ -8586,7 +8589,8 @@ def run_basic_checks() -> list[CheckResult]:
                     analytics_view_mod._load_code_options = old_code_loader
                     analytics_view_mod.get_sales_trend_summary_result = old_summary_service
                 if (
-                    not any("회사 Default 초기값: 재고위치 · 제품구분 · 제품분류" in caption for caption in summary_view_st.captions)
+                    not any("회사 Default 초기값: 재고기준 · 재고위치 · 제품구분 · 제품분류" in caption for caption in summary_view_st.captions)
+                    or summary_view_capture.get("stock_mode") != "real"
                     or summary_view_capture.get("stock_cd_list") != []
                     or summary_view_capture.get("product_di_list") != []
                     or summary_view_capture.get("dashboard_product_di_list") != []
@@ -8876,8 +8880,21 @@ def run_basic_checks() -> list[CheckResult]:
                 old_resolver = nlq_router_mod._resolve_analytics_action
                 old_handler = nlq_router_mod._get_analytics_handler
                 old_case_push = chat_middleware_mod.push_sims_result_to_chat
+                old_manufacturer_filter = nlq_router_mod._resolve_analytics_manufacturer_filter
                 old_explicit_option_loader = analytics_view_mod._load_code_options
+                supplier_scope_mod = importlib.import_module("app.services.product_supplier_scope_service")
+                old_supplier_resolver = supplier_scope_mod.resolve_supplier_vendor_codes
                 try:
+                    supplier_scope_mod.resolve_supplier_vendor_codes = lambda _text, *, mode: [
+                        {"code": "000123", "name": "한미제약"}
+                    ]
+                    # Company Default parsing is DB-free; manufacturer candidate
+                    # resolution is covered by its dedicated Analytics fixture.
+                    nlq_router_mod._resolve_analytics_manufacturer_filter = (
+                        lambda _text, params, _intent, _logger: {
+                            "status": "not_needed", "params": dict(params), "candidates": [],
+                        }
+                    )
                     analytics_view_mod._load_code_options = lambda gcode: (
                         [{"code": "01", "name": "일반", "label": "01 - 일반"}]
                         if gcode == "0031" else []
@@ -8965,8 +8982,10 @@ def run_basic_checks() -> list[CheckResult]:
                 finally:
                     nlq_router_mod._resolve_analytics_action = old_resolver
                     nlq_router_mod._get_analytics_handler = old_handler
+                    nlq_router_mod._resolve_analytics_manufacturer_filter = old_manufacturer_filter
                     chat_middleware_mod.push_sims_result_to_chat = old_case_push
                     analytics_view_mod._load_code_options = old_explicit_option_loader
+                    supplier_scope_mod.resolve_supplier_vendor_codes = old_supplier_resolver
 
                 actual_code_params, actual_code_payload = actual_parser_results["code"]
                 actual_clear_params, _actual_clear_payload = actual_parser_results["clear"]
@@ -13163,6 +13182,683 @@ def run_basic_checks() -> list[CheckResult]:
         results.append(_fail("Dashboard Lite v0.1 facts", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}"))
 
     results.extend(_run_customer_sales_forecast_basic_checks())
+    results.extend(_run_analytics_grouping_guard_checks())
+    results.extend(_run_analytics_period_and_grouping_contract_checks())
+    return results
+
+
+def _run_analytics_period_and_grouping_contract_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    try:
+        io_mod = importlib.import_module("app.services.io_nlq")
+        sales_mod = importlib.import_module("app.services.analytics_sales_trend_service")
+        router_mod = importlib.import_module("app.sims.nlq.nlq_router")
+        chat_mod = importlib.import_module("app.ui.chat_middleware")
+        case_log_mod = importlib.import_module("app.services.nlq_case_log_service")
+        inventory_mod = importlib.import_module("app.sims.nlq.action_inventory")
+
+        as_of = date(2026, 8, 3)
+        analytics_actions = (
+            "품목별 매출 추세 분석",
+            "품목별 매출 추세 요약표",
+            "제약사별 매출 추세 분석",
+            "제약사별 매출 추세 분석 요약표",
+            "품목별 매출 예상",
+            "매출처별 매출 예상",
+            "영업사원별 매출 예상",
+            "지역별 매출 예상",
+            "품목별 재고부족현황",
+            "매입처별 재고부족 현황",
+        )
+        inventory_analytics_actions = {
+            spec.canonical_action
+            for spec in inventory_mod.implemented_actions()
+            if spec.handler_kind == "analytics"
+        }
+        if set(analytics_actions) != inventory_analytics_actions:
+            raise AssertionError(
+                f"aggregate_action_coverage={set(analytics_actions)!r}/{inventory_analytics_actions!r}"
+            )
+        expected_period = ("20260201", "20260731")
+        for action in analytics_actions:
+            resolved, policy = io_mod.apply_nlq_default_period_policy(
+                {"policy_date": "20260803"}, action, today=as_of
+            )
+            actual_period = (resolved.get("date_from"), resolved.get("date_to"))
+            if (
+                actual_period != expected_period
+                or policy.get("default_policy") == "none"
+                or not policy.get("auto_applied")
+                or policy.get("explicit_period_present")
+            ):
+                raise AssertionError(f"analytics_default_period={action!r}/{actual_period!r}/{policy!r}")
+
+            explicit, explicit_policy = io_mod.apply_nlq_default_period_policy(
+                {"date_from": "20260710", "date_to": "20260720"}, action, today=as_of
+            )
+            if (
+                (explicit.get("date_from"), explicit.get("date_to")) != ("20260710", "20260720")
+                or not explicit_policy.get("explicit_period_present")
+                or explicit_policy.get("auto_applied")
+            ):
+                raise AssertionError(f"analytics_explicit_period={action!r}/{explicit!r}/{explicit_policy!r}")
+
+        expected_non_analytics_policies = {
+            "list_detail": (("20260803", "20260803"), "recent_1day"),
+            "single_entity_history": (("20260728", "20260803"), "recent_7days"),
+            "inventory_movement": (("20260801", "20260803"), "current_month_inventory"),
+        }
+        for spec in inventory_mod.implemented_actions():
+            action_class = io_mod.get_nlq_period_action_class(spec.canonical_action)
+            if action_class == "aggregate_analysis":
+                if spec.handler_kind != "analytics":
+                    raise AssertionError(f"aggregate_scope={spec!r}")
+                continue
+            if spec.handler_kind != "io_service":
+                continue
+            resolved, policy = io_mod.apply_nlq_default_period_policy(
+                {}, spec.canonical_action, today=as_of
+            )
+            expected = expected_non_analytics_policies.get(action_class)
+            if expected is None:
+                if policy.get("default_policy") == "completed_6months" or policy.get("auto_applied"):
+                    raise AssertionError(f"non_analytics_policy_changed={spec.canonical_action!r}/{policy!r}")
+                continue
+            if (
+                (resolved.get("date_from"), resolved.get("date_to")) != expected[0]
+                or policy.get("default_policy") != expected[1]
+                or not policy.get("auto_applied")
+            ):
+                raise AssertionError(
+                    f"non_analytics_policy_changed={spec.canonical_action!r}/{resolved!r}/{policy!r}"
+                )
+
+        group_params = {
+            "매입처별 재고부족현황 조회": ("purchase_vendor", "buy_nm"),
+            "제약사별 매출추세 조회": ("manufacturer", "maker_nm"),
+        }
+        for question, (expected_grouping, excluded_filter) in group_params.items():
+            action = router_mod._resolve_analytics_action(question)
+            params = router_mod._build_analytics_params(question, action)
+            policy_params, policy = io_mod.apply_nlq_default_period_policy(params, action, today=as_of)
+            if (
+                router_mod._classify_analytics_metric_grouping(question).get("requested_grouping") != expected_grouping
+                or str(policy_params.get(excluded_filter) or "").strip()
+                or "vendor" in policy.get("explicit_condition_names", [])
+                or "manufacturer" in policy.get("explicit_condition_names", [])
+            ):
+                raise AssertionError(f"analytics_grouping_not_filter={question!r}/{params!r}/{policy!r}")
+
+        filter_question = "제약사 한미 품목별 매출예상 조회"
+        filter_action = router_mod._resolve_analytics_action(filter_question)
+        filter_params = router_mod._build_analytics_params(filter_question, filter_action)
+        _, filter_policy = io_mod.apply_nlq_default_period_policy(filter_params, filter_action, today=as_of)
+        if (
+            router_mod._analytics_intent_for_action(filter_action, filter_question).get("requested_grouping") != "product"
+            or str(filter_params.get("maker_nm") or filter_params.get("product_ven_nm") or "").strip() != "한미"
+            or "manufacturer" not in filter_policy.get("explicit_condition_names", [])
+        ):
+            raise AssertionError(f"analytics_manufacturer_filter={filter_action!r}/{filter_params!r}/{filter_policy!r}")
+
+        captured: dict[str, Any] = {}
+        old_handler_getter = router_mod._get_analytics_handler
+        old_push = chat_mod.push_sims_result_to_chat
+        old_period_policy = io_mod.apply_nlq_default_period_policy
+        try:
+            def _fixed_period_policy(
+                policy_params: dict[str, Any],
+                policy_action: str,
+                *,
+                today: date | None = None,
+            ) -> tuple[dict[str, Any], dict[str, Any]]:
+                return old_period_policy(policy_params, policy_action, today=as_of)
+
+            def _handler(params: dict[str, Any]) -> dict[str, Any]:
+                captured["params"] = dict(params)
+                return {"title": "품목별 매출 예상", "action": "품목별 매출 예상", "params": dict(params), "meta": {"row_count": 1, "row_count_total": 1}}
+
+            io_mod.apply_nlq_default_period_policy = _fixed_period_policy
+            router_mod._get_analytics_handler = lambda _action: _handler
+            chat_mod.push_sims_result_to_chat = lambda payload, _action: captured.update(payload=dict(payload))
+            if not router_mod._try_handle_analytics_nlq(
+                "품목별 매출예상 조회",
+                room={}, session_state={}, make_ts=lambda: "", next_seq=lambda: 1,
+                logger=logging.getLogger("ssai.regression"),
+            ):
+                raise AssertionError("analytics_router_not_handled")
+        finally:
+            io_mod.apply_nlq_default_period_policy = old_period_policy
+            router_mod._get_analytics_handler = old_handler_getter
+            chat_mod.push_sims_result_to_chat = old_push
+
+        service_params = dict(captured.get("params") or {})
+        payload = dict(captured.get("payload") or {})
+        meta = dict(payload.get("meta") or {})
+        runtime_period = (service_params.get("date_from"), service_params.get("date_to"))
+        runtime_policy = dict(meta.get("period_policy") or {})
+        service_query_summary = str(sales_mod._fmt_analytics_query_summary(service_params) or "")
+        if (
+            runtime_period != expected_period
+            or service_params.get("stock_mode") != "real"
+            or service_params.get("source_mode") != "monthly_real"
+            or "2026-02-01" not in service_query_summary
+            or "2026-07-31" not in service_query_summary
+            or not runtime_policy.get("auto_applied")
+            or meta.get("execution_status") != "success"
+            or meta.get("intent_validation_status") != "not_checked"
+            or meta.get("requested_metric") != "sales_forecast"
+            or meta.get("requested_grouping") != "product"
+        ):
+            raise AssertionError(f"analytics_router_period_meta={service_params!r}/{meta!r}")
+
+        source_contract_cases = {
+            "한미 품목별 매출예상 조회": ("real", "monthly_real"),
+            "한미 품목별 매출예상 장부기준 조회": ("book", "monthly_book"),
+            "품목별 재고부족현황 조회": ("real", "monthly_real"),
+            "품목별 재고부족현황 장부재고 기준 조회": ("book", "monthly_book"),
+        }
+        for question, expected_source in source_contract_cases.items():
+            action = router_mod._resolve_analytics_action(question)
+            prepared = router_mod._build_analytics_params(question, action)
+            normalized = sales_mod.normalize_analytics_stock_source_params(prepared)
+            actual_source = (normalized.get("stock_mode"), normalized.get("source_mode"))
+            if actual_source != expected_source:
+                raise AssertionError(f"analytics_stock_basis={question!r}/{actual_source!r}")
+
+        from app.services.ssai_analysis_profile_service import build_company_default_adapter
+
+        default_adapter = build_company_default_adapter(
+            {"stock_mode": "book"},
+            supported_keys={"stock_mode"},
+            explicit={},
+            explicit_keys=set(),
+        )
+        default_source = sales_mod.normalize_analytics_stock_source_params(
+            dict(default_adapter.get("effective") or {})
+        )
+        explicit_adapter = build_company_default_adapter(
+            {"stock_mode": "book"},
+            supported_keys={"stock_mode"},
+            explicit={"stock_mode": "real"},
+            explicit_keys={"stock_mode"},
+        )
+        explicit_source = sales_mod.normalize_analytics_stock_source_params(
+            dict(explicit_adapter.get("effective") or {})
+        )
+        if (
+            (default_source.get("stock_mode"), default_source.get("source_mode")) != ("book", "monthly_book")
+            or (explicit_source.get("stock_mode"), explicit_source.get("source_mode")) != ("real", "monthly_real")
+        ):
+            raise AssertionError(
+                f"analytics_stock_basis_precedence={default_source!r}/{explicit_source!r}"
+            )
+
+        detail_source = sales_mod.normalize_analytics_stock_source_params(
+            {"source_mode": "auto", "ven_nm": "sample"}
+        )
+        if (
+            detail_source.get("source_mode") != "auto"
+            or detail_source.get("stock_mode") != "real"
+            or sales_mod._resolve_source_mode(detail_source) != "detail"
+        ):
+            raise AssertionError(f"analytics_detail_source_preserved={detail_source!r}")
+
+        verified_intent = router_mod._analytics_success_intent_validation(
+            action=str(payload.get("action") or ""),
+            payload={
+                "action": payload.get("action"),
+                "title": payload.get("title"),
+                "meta": {"result_grain": "product"},
+            },
+            analytics_intent={"requested_metric": "sales_forecast", "requested_grouping": "product"},
+        )
+        if verified_intent != {"intent_validation_status": "pass", "consistency_flags": []}:
+            raise AssertionError(f"analytics_verified_intent={verified_intent!r}")
+
+        success_payload = dict(payload)
+        success_payload["meta"] = {**meta, "nlq_trace_request_id": "analytics-period-success"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir) / "nlq_cases.jsonl"
+            old_case_path = case_log_mod.resolve_nlq_case_log_path
+            try:
+                case_log_mod.resolve_nlq_case_log_path = lambda **_kwargs: case_path
+                if not case_log_mod.append_nlq_case_record(success_payload, {}, runtime_context={}):
+                    raise AssertionError("analytics_success_case_log_not_written")
+            finally:
+                case_log_mod.resolve_nlq_case_log_path = old_case_path
+            record = json.loads(case_path.read_text(encoding="utf-8").strip())
+        if (
+            record.get("requested_metric") != "sales_forecast"
+            or record.get("requested_grouping") != "product"
+            or record.get("resolved_action") != "품목별 매출 예상"
+            or record.get("execution_status") != "success"
+            or record.get("intent_validation_status") != "not_checked"
+            or record.get("period_policy") != "completed_6months"
+            or record.get("period_auto_applied") is not True
+        ):
+            raise AssertionError(f"analytics_success_case_log={record!r}")
+        results.append(_ok("Analytics period and grouping/filter contract", "completed six-month defaults, explicit-period priority, grouping cleanup, router service params, and success case logging are aligned"))
+    except Exception as exc:
+        results.append(_fail("Analytics period and grouping/filter contract", f"{type(exc).__name__}: {exc}"))
+    return results
+
+
+def _run_analytics_grouping_guard_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    try:
+        router_mod = importlib.import_module("app.sims.nlq.nlq_router")
+        chat_mod = importlib.import_module("app.ui.chat_middleware")
+        case_log_mod = importlib.import_module("app.services.nlq_case_log_service")
+
+        supported_cases = {
+            "품목별 매출예상 조회": "품목별 매출 예상",
+            "매출처별 매출예상 조회": "매출처별 매출 예상",
+            "영업사원별 매출예상 조회": "영업사원별 매출 예상",
+            "지역별 매출예상 조회": "지역별 매출 예상",
+            "제약사별 매출추세 조회": "제약사별 매출 추세 분석",
+            "제약사별 매출추세요약 조회": "제약사별 매출 추세 분석 요약표",
+            "품목별 재고부족현황 조회": "품목별 재고부족현황",
+            "매입처별 재고부족현황 조회": "매입처별 재고부족 현황",
+            "한미 품목별 매출예상 조회": "품목별 매출 예상",
+            "제약사 한미 품목별 매출예상 조회": "품목별 매출 예상",
+        }
+        for question, expected_action in supported_cases.items():
+            resolved = router_mod._resolve_analytics_action(question)
+            if resolved != expected_action or router_mod._analytics_grouping_guard(question, resolved) is not None:
+                raise AssertionError(f"supported_intent={question!r}/{resolved!r}")
+
+        summary_intent_cases = {
+            "품목별 매출추세요약 조회": ("sales_trend_summary", "product", "품목별 매출 추세 요약"),
+            "제약사별 매출추세요약 조회": ("sales_trend_summary", "manufacturer", "제약사별 매출 추세 요약"),
+        }
+        for question, expected_intent in summary_intent_cases.items():
+            intent = router_mod._classify_analytics_metric_grouping(question)
+            actual_intent = (
+                str((intent or {}).get("requested_metric") or ""),
+                str((intent or {}).get("requested_grouping") or ""),
+                str((intent or {}).get("requested_action_label") or ""),
+            )
+            if actual_intent != expected_intent:
+                raise AssertionError(f"summary_metric_contract={question!r}/{actual_intent!r}")
+
+        for question in (
+            "제약사별 입고추세요약",
+            "제품별 출고추세요약",
+            "재고위치별 재고추세요약",
+            "거래처별 주문부족현황",
+        ):
+            resolved = router_mod._resolve_analytics_action(question)
+            candidate = router_mod.resolve_new_sims_nlq_candidate(question)
+            if (
+                router_mod._classify_analytics_metric_grouping(question) is not None
+                or router_mod._analytics_grouping_guard(question, resolved) is not None
+                or (candidate is not None and candidate.get("route") == "analytics")
+            ):
+                raise AssertionError(f"non_sales_or_stock_analytics_intercepted={question!r}/{resolved!r}/{candidate!r}")
+
+        blocked_cases = {
+            "제약사별 매출예상 조회": ("sales_forecast", "manufacturer"),
+            "제조사별 매출예상 조회": ("sales_forecast", "manufacturer"),
+            "제약사 한미 매출예상 조회": ("sales_forecast", "manufacturer"),
+            "제조사 한미 매출예상 조회": ("sales_forecast", "manufacturer"),
+            "한미 제약사별 매출예상 조회": ("sales_forecast", "manufacturer"),
+            "매출처별 매출추세 조회": ("sales_trend", "customer"),
+            "매출처별 매출추세요약 조회": ("sales_trend_summary", "customer"),
+            "영업사원별 매출추세 조회": ("sales_trend", "salesperson"),
+            "영업사원별 매출추세요약 조회": ("sales_trend_summary", "salesperson"),
+            "지역별 매출추세 조회": ("sales_trend", "region"),
+            "지역별 매출추세요약 조회": ("sales_trend_summary", "region"),
+            "제조사별 재고부족현황 조회": ("stock_shortage", "manufacturer"),
+            "발주처별 재고부족현황 조회": ("stock_shortage", "order_vendor"),
+            "공급처별 재고부족현황 조회": ("stock_shortage", "supplier"),
+            "발주처별 매출예상 조회": ("sales_forecast", "order_vendor"),
+        }
+        captured_payloads: list[dict[str, Any]] = []
+        calls = {"handler": 0, "params": 0}
+        old_handler_getter = router_mod._get_analytics_handler
+        old_param_builder = router_mod._build_analytics_params
+        old_action_resolver = router_mod._resolve_analytics_action
+        old_push = chat_mod.push_sims_result_to_chat
+        try:
+            router_mod._get_analytics_handler = lambda _action: calls.__setitem__("handler", calls["handler"] + 1)
+            router_mod._build_analytics_params = lambda _text, _action: calls.__setitem__("params", calls["params"] + 1)
+            chat_mod.push_sims_result_to_chat = lambda payload, _action: captured_payloads.append(dict(payload))
+            for question, (metric, grouping) in blocked_cases.items():
+                before = len(captured_payloads)
+                resolved = router_mod._resolve_analytics_action(question)
+                candidate = router_mod.resolve_new_sims_nlq_candidate(question)
+                handled = router_mod._try_handle_analytics_nlq(
+                    question,
+                    room={},
+                    session_state={},
+                    make_ts=lambda: "",
+                    next_seq=lambda: 1,
+                    logger=logging.getLogger("ssai.regression"),
+                )
+                if not handled or candidate != {"route": "analytics", "action": "analytics_grouping_unsupported"}:
+                    raise AssertionError(f"unsupported_route={question!r}/{candidate!r}/{handled!r}")
+                if grouping in {"order_vendor", "supplier"} and resolved == "매입처별 재고부족 현황":
+                    raise AssertionError(f"order_or_supplier_routed_as_purchase_vendor={question!r}")
+                if len(captured_payloads) != before + 1:
+                    raise AssertionError(f"unsupported_payload_missing={question!r}")
+                payload = captured_payloads[-1]
+                meta = dict(payload.get("meta") or {})
+                if (
+                    payload.get("df") is not None
+                    or meta.get("requested_metric") != metric
+                    or meta.get("requested_grouping") != grouping
+                    or meta.get("execution_status") != "unsupported"
+                    or meta.get("intent_validation_status") != "fail"
+                    or meta.get("consistency_flags") != ["requested_grouping_unsupported"]
+                    or meta.get("result_status") != "unsupported"
+                    or meta.get("row_count") != 0
+                    or meta.get("row_count_total") != 0
+                    or (
+                        not (metric == "sales_forecast" and grouping == "manufacturer")
+                        and "다른 집계 결과로 대신 조회하지 않았습니다." not in str(payload.get("message") or "")
+                    )
+                ):
+                    raise AssertionError(f"unsupported_payload_contract={question!r}/{payload!r}")
+                if metric == "sales_forecast" and grouping == "manufacturer":
+                    expected_message = (
+                        "요청한 제조사 단위 매출 예상은 현재 지원되지 않습니다. "
+                        "요청과 다른 품목별 결과로 바꾸지 않고 조회를 중단했습니다."
+                    )
+                    if str(payload.get("message") or "") != expected_message:
+                        raise AssertionError(
+                            f"manufacturer_forecast_unsupported_message={question!r}/{payload!r}"
+                        )
+
+            mismatch_question = "제약사별 매출추세 조회"
+            router_mod._resolve_analytics_action = lambda _txt: "품목별 매출 추세 분석"
+            mismatch_candidate = router_mod.resolve_new_sims_nlq_candidate(mismatch_question)
+            mismatch_handled = router_mod._try_handle_analytics_nlq(
+                mismatch_question,
+                room={},
+                session_state={},
+                make_ts=lambda: "",
+                next_seq=lambda: 1,
+                logger=logging.getLogger("ssai.regression"),
+            )
+            mismatch_payload = captured_payloads[-1]
+            mismatch_meta = dict(mismatch_payload.get("meta") or {})
+            if (
+                not mismatch_handled
+                or mismatch_candidate != {"route": "analytics", "action": "analytics_grouping_routing_error"}
+                or mismatch_meta.get("execution_status") != "routing_error"
+                or mismatch_meta.get("result_status") != "routing_error"
+                or mismatch_meta.get("consistency_flags") != ["requested_grouping_action_mismatch"]
+                or "요청한 집계와 실행 경로가 일치하지 않아 조회하지 않았습니다." not in str(mismatch_payload.get("message") or "")
+            ):
+                raise AssertionError(f"routing_error_payload_contract={mismatch_candidate!r}/{mismatch_payload!r}")
+        finally:
+            router_mod._get_analytics_handler = old_handler_getter
+            router_mod._build_analytics_params = old_param_builder
+            router_mod._resolve_analytics_action = old_action_resolver
+            chat_mod.push_sims_result_to_chat = old_push
+        if calls != {"handler": 0, "params": 0}:
+            raise AssertionError(f"unsupported_service_or_params_called={calls!r}")
+
+        # The real chat push must preserve terminal guidance instead of rewriting
+        # unsupported analytics intent as an ordinary no-data result.
+        special_payload = next(
+            payload for payload in captured_payloads
+            if str((payload.get("meta") or {}).get("nlq_query") or "") == "제약사 한미 매출예상 조회"
+        )
+
+        class _FakeStreamlit:
+            def __init__(self) -> None:
+                self.session_state: dict[str, Any] = {"__sims_push_count": 0}
+                self.info_messages: list[str] = []
+
+            def info(self, message: Any) -> None:
+                self.info_messages.append(str(message))
+
+            def chat_message(self, *_args, **_kwargs):
+                return self
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args) -> bool:
+                return False
+
+            def __getattr__(self, _name: str):
+                return lambda *_args, **_kwargs: None
+
+        fake_st = _FakeStreamlit()
+        old_st = chat_mod.st
+        old_wire_context = chat_mod.wire_chat_context
+        old_company_match = chat_mod._chat_payload_matches_current_company
+        old_drain = chat_mod.drain_inbox_to_chat
+        old_case_finalize = chat_mod._append_finalized_nlq_case
+        try:
+            chat_mod.st = fake_st
+            chat_mod.wire_chat_context = lambda: None
+            chat_mod._chat_payload_matches_current_company = lambda _payload: True
+            chat_mod.drain_inbox_to_chat = lambda: None
+            chat_mod._append_finalized_nlq_case = lambda *_args, **_kwargs: None
+            chat_mod.wssz(dict(special_payload), str(special_payload.get("action") or ""))
+            rendered_payload = fake_st.session_state["__chat_inbox"][-1]
+            chat_mod._render_chat_item_body(rendered_payload)
+        finally:
+            chat_mod.st = old_st
+            chat_mod.wire_chat_context = old_wire_context
+            chat_mod._chat_payload_matches_current_company = old_company_match
+            chat_mod.drain_inbox_to_chat = old_drain
+            chat_mod._append_finalized_nlq_case = old_case_finalize
+        rendered_message = "요청한 제조사 단위 매출 예상은 현재 지원되지 않습니다. 요청과 다른 품목별 결과로 바꾸지 않고 조회를 중단했습니다."
+        if (
+            rendered_payload.get("title") != special_payload.get("title")
+            or rendered_payload.get("message") != rendered_message
+            or str((rendered_payload.get("meta") or {}).get("result_status") or "") != "unsupported"
+            or fake_st.info_messages != [rendered_message]
+            or "해당 조회조건의 자료가 없습니다." in fake_st.info_messages
+            or "결과 정보가 저장되어 있습니다." in fake_st.info_messages
+        ):
+            raise AssertionError(
+                f"unsupported_final_renderer_contract={rendered_payload!r}/{fake_st.info_messages!r}"
+            )
+
+        io_mod = importlib.import_module("app.services.io_nlq")
+        scope_mod = importlib.import_module("app.services.product_supplier_scope_service")
+        vendor_mod = importlib.import_module("app.services.rddbc030_service")
+        forecast_calls: list[dict[str, Any]] = []
+        forecast_payloads: list[dict[str, Any]] = []
+        old_scope_query = scope_mod.query_to_df
+        old_vendor_search = vendor_mod.search_vendors_full
+        old_handler_getter = router_mod._get_analytics_handler
+        old_apply_default = io_mod.apply_nlq_default_period_policy
+        old_company_default = router_mod._apply_company_default_to_analytics_nlq
+        old_push = chat_mod.push_sims_result_to_chat
+        try:
+            def _manufacturer_scope_query(sql, params):
+                if "LIKE ?" not in str(sql):
+                    return pd.DataFrame(columns=["vendor_code", "vendor_name"])
+                return pd.DataFrame([
+                    {"vendor_code": "21744", "vendor_name": "\ud55c\ubbf8\ubc14\uc774\uc624(\ub9e4\uc785)"},
+                    {"vendor_code": "10140", "vendor_name": "\ud55c\ubbf8\uc57d\ud488"},
+                    {"vendor_code": "21746", "vendor_name": "\ud55c\ubbf8\uc57d\ud488(\ub9e4\uc785)"},
+                ])
+
+            scope_mod.query_to_df = _manufacturer_scope_query
+            scoped_candidates = scope_mod.resolve_supplier_vendor_codes(
+                "한미",
+                mode=scope_mod.SCOPE_MANUFACTURER,
+            )
+            if scoped_candidates != [{"code": "10140", "name": "한미약품"}]:
+                raise AssertionError(
+                    f"manufacturer_role_scope_candidates={scoped_candidates!r}"
+                )
+            common_lookup_calls: list[dict[str, Any]] = []
+
+            def _common_vendor_search(**kwargs):
+                common_lookup_calls.append(dict(kwargs))
+                return pd.DataFrame([
+                    {"Rd03_Ven_Cd": "21744", "Rd03_Ven_Nm": "한미바이오(매입)"},
+                    {"Rd03_Ven_Cd": "10140", "Rd03_Ven_Nm": "한미약품"},
+                    {"Rd03_Ven_Cd": "21746", "Rd03_Ven_Nm": "한미약품(매입)"},
+                ])
+
+            vendor_mod.search_vendors_full = _common_vendor_search
+            common_candidates = scope_mod.resolve_common_vendor_candidates("한미")
+            if common_candidates != [
+                {"entity_code": "21744", "canonical_name": "한미바이오(매입)", "entity_role": "purchase_vendor", "role_source": "rddbc030_vendor_code_scope"},
+                {"entity_code": "10140", "canonical_name": "한미약품", "entity_role": "manufacturer", "role_source": "rddbc030_vendor_code_scope"},
+                {"entity_code": "21746", "canonical_name": "한미약품(매입)", "entity_role": "purchase_vendor", "role_source": "rddbc030_vendor_code_scope"},
+            ]:
+                raise AssertionError(f"common_vendor_candidates={common_candidates!r}")
+            if common_lookup_calls != [{"ven_nm": "한미", "scope": "", "only_active": True, "top": 200}]:
+                raise AssertionError(f"common_vendor_lookup_count={common_lookup_calls!r}")
+            if (
+                not scope_mod.is_purchase_vendor_code("40000")
+                or scope_mod.is_purchase_vendor_code("50000")
+                or scope_mod.is_purchase_vendor_code("5000")
+            ):
+                raise AssertionError("purchase_vendor_code_range_contract")
+            router_mod._apply_company_default_to_analytics_nlq = lambda params, **_kwargs: dict(params)
+            io_mod.apply_nlq_default_period_policy = lambda params, _action: (
+                {**dict(params), "date_from": "20260201", "date_to": "20260731"},
+                {
+                    "default_policy": "completed_6months",
+                    "auto_applied": True,
+                    "explicit_period_present": False,
+                    "date_from": "20260201",
+                    "date_to": "20260731",
+                },
+            )
+            router_mod._get_analytics_handler = lambda _action: (
+                lambda params: forecast_calls.append(dict(params)) or {
+                    "action": "품목별 매출 예상",
+                    "title": "품목별 매출 예상",
+                    "params": dict(params),
+                    "df": pd.DataFrame([{"품목": "A"}, {"품목": "B"}]),
+                    "meta": {"result_grain": "product"},
+                }
+            )
+            chat_mod.push_sims_result_to_chat = lambda payload, _action: forecast_payloads.append(dict(payload))
+            manufacturer_stock_mode_cases = (
+                ("한미 품목별 매출예상 조회", "real", "monthly_real"),
+                ("한미 품목별 매출예상 실기준 조회", "real", "monthly_real"),
+                ("한미 품목별 매출예상 실 기준 조회", "real", "monthly_real"),
+                ("한미 품목별 매출예상 실재고 기준 조회", "real", "monthly_real"),
+                ("한미 품목별 매출예상 장부기준 조회", "book", "monthly_book"),
+                ("한미 품목별 매출예상 장부 기준 조회", "book", "monthly_book"),
+                ("한미 품목별 매출예상 장부재고 기준 조회", "book", "monthly_book"),
+            )
+            for question, _stock_mode, _source_mode in manufacturer_stock_mode_cases:
+                if not router_mod._try_handle_analytics_nlq(
+                    question,
+                    room={}, session_state={}, make_ts=lambda: "", next_seq=lambda: 1,
+                    logger=logging.getLogger("ssai.regression"),
+                ):
+                    raise AssertionError(f"manufacturer_product_forecast_not_handled={question!r}")
+            if (
+                len(forecast_calls) != len(manufacturer_stock_mode_cases)
+                or [call.get("product_ven_cd") for call in forecast_calls] != ["10140"] * len(manufacturer_stock_mode_cases)
+                or [call.get("maker_cd") for call in forecast_calls] != ["10140"] * len(manufacturer_stock_mode_cases)
+                or any(call.get("date_from") != "20260201" or call.get("date_to") != "20260731" for call in forecast_calls)
+                or [(call.get("stock_mode"), call.get("source_mode")) for call in forecast_calls]
+                != [(stock_mode, source_mode) for _question, stock_mode, source_mode in manufacturer_stock_mode_cases]
+                or [len(payload.get("df")) for payload in forecast_payloads] != [2] * len(manufacturer_stock_mode_cases)
+                or any(
+                    str((payload.get("meta") or {}).get("requested_metric") or "") != "sales_forecast"
+                    or str((payload.get("meta") or {}).get("requested_grouping") or "") != "product"
+                    or str((payload.get("meta") or {}).get("resolved_action") or "") != "품목별 매출 예상"
+                    or str(((payload.get("meta") or {}).get("period_policy") or {}).get("default_policy") or "") != "completed_6months"
+                    for payload in forecast_payloads
+                )
+                or len(common_lookup_calls) != 1 + len(manufacturer_stock_mode_cases)
+                or any(payload.get("title") != "품목별 매출 예상" or payload.get("action") != "품목별 매출 예상" for payload in forecast_payloads)
+                or [str((payload.get("meta") or {}).get("entity_resolution_scope") or "") for payload in forecast_payloads] != ["common_vendor"] * len(manufacturer_stock_mode_cases)
+                or [int((payload.get("meta") or {}).get("entity_lookup_call_count") or 0) for payload in forecast_payloads] != [1] * len(manufacturer_stock_mode_cases)
+                or int((forecast_payloads[0].get("meta") or {}).get("candidate_count_total") or 0) != 3
+                or int((forecast_payloads[0].get("meta") or {}).get("compatible_candidate_count") or 0) != 1
+                or any(
+                    str((payload.get("meta") or {}).get("resolved_entity_role") or "") != "manufacturer"
+                    or str((payload.get("meta") or {}).get("resolved_entity_code") or "") != "10140"
+                    for payload in forecast_payloads
+                )
+            ):
+                raise AssertionError(f"manufacturer_product_forecast_contract={forecast_calls!r}/{forecast_payloads!r}")
+        finally:
+            scope_mod.query_to_df = old_scope_query
+            vendor_mod.search_vendors_full = old_vendor_search
+            router_mod._get_analytics_handler = old_handler_getter
+            io_mod.apply_nlq_default_period_policy = old_apply_default
+            router_mod._apply_company_default_to_analytics_nlq = old_company_default
+            chat_mod.push_sims_result_to_chat = old_push
+
+        case_payload = dict(captured_payloads[0])
+        case_payload["meta"] = {**dict(case_payload.get("meta") or {}), "nlq_trace_request_id": "guard-fixture"}
+        routing_payload = dict(captured_payloads[-1])
+        routing_payload["meta"] = {**dict(routing_payload.get("meta") or {}), "nlq_trace_request_id": "guard-routing-fixture"}
+        manufacturer_case_payload = dict(forecast_payloads[-1])
+        manufacturer_case_payload["meta"] = {
+            **dict(manufacturer_case_payload.get("meta") or {}),
+            "nlq_trace_request_id": "guard-manufacturer-resolution-fixture",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            case_path = Path(temp_dir) / "nlq_cases.jsonl"
+            old_case_path = case_log_mod.resolve_nlq_case_log_path
+            try:
+                case_log_mod.resolve_nlq_case_log_path = lambda **_kwargs: case_path
+                if not case_log_mod.append_nlq_case_record(
+                    case_payload,
+                    {},
+                    runtime_context={},
+                    question="제약사별 매출예상 조회",
+                ):
+                    raise AssertionError("unsupported_case_log_not_written")
+                if not case_log_mod.append_nlq_case_record(
+                    routing_payload,
+                    {},
+                    runtime_context={},
+                    question="제약사별 매출추세 조회",
+                ):
+                    raise AssertionError("routing_error_case_log_not_written")
+                if not case_log_mod.append_nlq_case_record(
+                    manufacturer_case_payload,
+                    {},
+                    runtime_context={},
+                    question="한미 품목별 매출예상 장부재고 기준 조회",
+                ):
+                    raise AssertionError("manufacturer_resolution_case_log_not_written")
+            finally:
+                case_log_mod.resolve_nlq_case_log_path = old_case_path
+            records = [json.loads(line) for line in case_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            record = records[0]
+            routing_record = records[1]
+            manufacturer_record = records[2]
+        if (
+            record.get("result_status") != "unsupported"
+            or record.get("execution_status") != "unsupported"
+            or record.get("intent_validation_status") != "fail"
+            or record.get("requested_metric") != "sales_forecast"
+            or record.get("requested_grouping") != "manufacturer"
+            or record.get("llm_explanation_used") is not False
+            or record.get("llm_explanation_status") != "disabled"
+            or record.get("intent_consistency_flags") != ["requested_grouping_unsupported"]
+            or routing_record.get("result_status") != "routing_error"
+            or routing_record.get("execution_status") != "routing_error"
+            or routing_record.get("intent_consistency_flags") != ["requested_grouping_action_mismatch"]
+            or manufacturer_record.get("entity_resolution_scope") != "common_vendor"
+            or manufacturer_record.get("entity_lookup_call_count") != 1
+            or manufacturer_record.get("candidate_count_total") != 3
+            or manufacturer_record.get("compatible_candidate_count") != 1
+            or manufacturer_record.get("resolved_entity_role") != "manufacturer"
+            or manufacturer_record.get("resolved_entity_code") != "10140"
+            or manufacturer_record.get("manufacturer_code") != "10140"
+            or manufacturer_record.get("manufacturer_name") != "한미약품"
+            or manufacturer_record.get("stock_mode") != "book"
+            or manufacturer_record.get("source_mode") != "monthly_book"
+            or manufacturer_record.get("final_date_from") != "20260201"
+            or manufacturer_record.get("final_date_to") != "20260731"
+        ):
+            raise AssertionError(f"analytics_guard_case_log_contract={records!r}")
+        results.append(_ok("Analytics metric/grouping fallback guard", "supported action matrix is preserved; unsupported groups stop before params/service and retain intent metadata in case logs"))
+    except Exception as exc:
+        results.append(_fail("Analytics metric/grouping fallback guard", f"{type(exc).__name__}: {exc}"))
     return results
 
 

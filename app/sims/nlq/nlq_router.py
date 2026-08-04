@@ -15,6 +15,7 @@ from app.services.ssai_analysis_profile_service import (
     normalize_business_code,
     normalize_business_code_pair,
 )
+from app.sims.nlq.action_inventory import ANALYTICS_INTENT_ACTIONS
  
 # =============================================================================
 # 키보드 보정(2벌식): 영문으로 잘못 입력된 한글을 한글로 변환
@@ -660,10 +661,6 @@ _ANALYTICS_ACTION_SPECS = (
             "매입처별 재고 부족",
             "매입처별 부족예상",
             "매입처별 부족금액",
-            "발주처별 재고부족",
-            "발주처별 재고 부족",
-            "공급처별 재고부족",
-            "공급처별 재고 부족",
         ),
     },
     {
@@ -851,6 +848,164 @@ _ANALYTICS_TAIL_PATTERNS = (
 )
 
 
+_ANALYTICS_GROUPING_TERMS: tuple[tuple[str, str, str], ...] = (
+    ("manufacturer", "제약사", "제약사별"),
+    ("manufacturer", "제조사", "제조사별"),
+    ("customer", "매출처", "매출처별"),
+    ("customer", "거래처", "거래처별"),
+    ("customer", "고객", "고객별"),
+    ("salesperson", "영업사원", "영업사원별"),
+    ("salesperson", "담당자", "담당자별"),
+    ("region", "지역", "지역별"),
+    ("region", "시도", "시도별"),
+    ("region", "시군구", "시군구별"),
+    ("purchase_vendor", "매입처", "매입처별"),
+    ("order_vendor", "발주처", "발주처별"),
+    ("supplier", "공급처", "공급처별"),
+    ("product", "품목", "품목별"),
+    ("product", "제품", "제품별"),
+)
+
+_ANALYTICS_METRIC_LABELS = {
+    "sales_forecast": "매출 예상",
+    "sales_trend": "매출 추세",
+    "sales_trend_summary": "매출 추세 요약",
+    "stock_shortage": "재고부족현황",
+}
+
+
+def _classify_analytics_metric_grouping(txt: str) -> Dict[str, str] | None:
+    """Extract explicit Analytics metric and grouping without treating filters as groups."""
+    compact = re.sub(r"\s+", "", str(txt or "").strip())
+    if not compact:
+        return None
+
+    if "매출예상" in compact or "예상매출" in compact:
+        metric = "sales_forecast"
+    elif "매출추세" in compact:
+        metric = "sales_trend_summary" if "요약" in compact else "sales_trend"
+    elif "재고" in compact and "부족" in compact:
+        metric = "stock_shortage"
+    else:
+        return None
+
+    grouping = ""
+    grouping_label = ""
+    # A requested product grain wins over a manufacturer role used as a
+    # filter (for example, "제약사 한미 품목별 매출예상").
+    product_term = next(
+        (
+            (candidate_grouping, candidate_label)
+            for candidate_grouping, candidate_label, grouping_phrase in _ANALYTICS_GROUPING_TERMS
+            if candidate_grouping == "product" and grouping_phrase in compact
+        ),
+        None,
+    )
+    if product_term:
+        grouping, grouping_label = product_term
+    else:
+        for candidate_grouping, candidate_label, grouping_phrase in _ANALYTICS_GROUPING_TERMS:
+            if grouping_phrase in compact:
+                grouping = candidate_grouping
+                grouping_label = candidate_label
+                break
+        # "제약사 한미 매출예상" is a manufacturer-grain request even
+        # without the suffix "별".  The actual name remains a filter only
+        # when the user explicitly requested product grain above.
+        if (
+            not grouping
+            and metric == "sales_forecast"
+            and ("제약사" in compact or "제조사" in compact)
+        ):
+            grouping = "manufacturer"
+            grouping_label = "제약사" if "제약사" in compact else "제조사"
+
+    matrix_grouping = grouping
+    requested_label = f"{grouping_label}별 {_ANALYTICS_METRIC_LABELS[metric]}" if grouping_label else ""
+
+    return {
+        "requested_metric": metric,
+        "requested_grouping": grouping,
+        "requested_grouping_label": grouping_label,
+        "matrix_grouping": matrix_grouping,
+        "requested_action_label": requested_label,
+    }
+
+
+def _analytics_grouping_guard(txt: str, resolved_action: str | None) -> Dict[str, str] | None:
+    """Return an intent failure only for an explicit grouping that cannot run as resolved."""
+    intent = _classify_analytics_metric_grouping(txt)
+    if not intent or not intent["requested_grouping"]:
+        return None
+
+    supported_action = ANALYTICS_INTENT_ACTIONS.get(
+        (intent["requested_metric"], intent["matrix_grouping"])
+    )
+    if not supported_action:
+        return {
+            **intent,
+            "resolved_action": str(resolved_action or ""),
+            "guard_status": "unsupported",
+            "consistency_flag": "requested_grouping_unsupported",
+        }
+    if str(resolved_action or "") != supported_action:
+        return {
+            **intent,
+            "resolved_action": str(resolved_action or ""),
+            "guard_status": "routing_error",
+            "consistency_flag": "requested_grouping_action_mismatch",
+        }
+    return None
+
+
+def _analytics_grouping_guard_payload(
+    *,
+    text: str,
+    guard: Dict[str, str],
+) -> Dict[str, Any]:
+    requested_action = str(guard.get("requested_action_label") or "요청한 집계")
+    guard_status = str(guard.get("guard_status") or "unsupported")
+    requested_metric = str(guard.get("requested_metric") or "")
+    requested_grouping = str(guard.get("requested_grouping") or "")
+    if guard_status == "routing_error":
+        message = "요청한 집계와 실행 경로가 일치하지 않아 조회하지 않았습니다."
+    elif requested_metric == "sales_forecast" and requested_grouping == "manufacturer":
+        message = (
+            "요청한 제조사 단위 매출 예상은 현재 지원되지 않습니다. "
+            "요청과 다른 품목별 결과로 바꾸지 않고 조회를 중단했습니다."
+        )
+    else:
+        message = "요청한 집계는 아직 지원되지 않습니다. 다른 집계 결과로 대신 조회하지 않았습니다."
+    return {
+        "final": True,
+        "type": "text",
+        "title": f"{requested_action} 안내",
+        "action": requested_action,
+        "data": message,
+        "message": message,
+        "meta": {
+            "nlq": True,
+            "nlq_query": text,
+            "analysis_nlq": True,
+            "analytics": True,
+            "route": "analytics",
+            "action": requested_action,
+            "canonical_action": "",
+            "requested_metric": requested_metric,
+            "requested_grouping": requested_grouping,
+            "resolved_action": guard["resolved_action"],
+            "execution_status": guard_status,
+            "intent_validation_status": "fail",
+            "consistency_flags": [guard["consistency_flag"]],
+            "result_status": guard_status,
+            "llm_explanation_used": False,
+            "llm_explanation_status": "disabled",
+            "row_count": 0,
+            "row_count_total": 0,
+        },
+    }
+
+
 def _resolve_analytics_action(txt: str) -> str | None:
     """
     분석/KPI 문장에서 실행할 action을 결정한다.
@@ -870,6 +1025,18 @@ def _resolve_analytics_action(txt: str) -> str | None:
         return None
 
     compact_t = re.sub(r"\s+", "", t)
+    # Broad legacy aliases such as "부족현황" and "추세요약" belong to
+    # Analytics only when their business metric is explicit.  Otherwise an
+    # inbound/outbound/order question could be replaced by a product analysis.
+    if ("추세" in compact_t and "매출" not in compact_t) or ("부족" in compact_t and "재고" not in compact_t):
+        return None
+    explicit_intent = _classify_analytics_metric_grouping(t)
+    if explicit_intent and explicit_intent["requested_grouping"]:
+        supported_action = ANALYTICS_INTENT_ACTIONS.get(
+            (explicit_intent["requested_metric"], explicit_intent["matrix_grouping"])
+        )
+        if supported_action:
+            return supported_action
 
     for spec in _ANALYTICS_ACTION_SPECS:
         for phrase in spec["phrases"]:
@@ -892,7 +1059,7 @@ def _looks_like_analytics_nlq(txt: str) -> bool:
     분석/KPI NLQ 여부.
     별도 signal word를 중복 관리하지 않고 action 판정으로 일원화한다.
     """
-    return _resolve_analytics_action(txt) is not None
+    return _resolve_analytics_action(txt) is not None or _classify_analytics_metric_grouping(txt) is not None
 
 
 def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
@@ -907,6 +1074,9 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return None
 
     analytics_action = _resolve_analytics_action(normalized)
+    analytics_guard = _analytics_grouping_guard(normalized, analytics_action)
+    if analytics_guard:
+        return {"route": "analytics", "action": f"analytics_grouping_{analytics_guard['guard_status']}"}
     if analytics_action:
         return {"route": "analytics", "action": str(analytics_action)}
 
@@ -999,7 +1169,7 @@ def _apply_analytics_period_defaults(params: Dict[str, Any], txt: str) -> Dict[s
     1. io_nlq.extract_params()가 잡은 date_from/date_to
     2. io_nlq.extract_params()가 잡은 month_from/month_to
     3. 2025년 같은 연도 표현
-    4. 없으면 올해 1월 1일 ~ 오늘
+    4. 없으면 공통 NLQ 기간 정책에 위임
     """
     out = dict(params or {})
 
@@ -1038,16 +1208,6 @@ def _apply_analytics_period_defaults(params: Dict[str, Any], txt: str) -> Dict[s
         str(out.get(k) or "").strip()
         for k in ("date_from", "date_to", "month_from", "month_to")
     )
-
-    # 아무 기간도 없으면 올해 1월 1일 ~ 오늘
-    if not has_period:
-        today = dt.date.today()
-        first_day = dt.date(today.year, 1, 1)
-        out["date_from"] = first_day.strftime("%Y%m%d")
-        out["date_to"] = today.strftime("%Y%m%d")
-        out["month_from"] = first_day.strftime("%Y%m")
-        out["month_to"] = today.strftime("%Y%m")
-        out["_default_date_applied"] = "Y"
 
     return out
 
@@ -1092,6 +1252,27 @@ def _extract_analytics_top(txt: str, default: int = 0) -> int:
     return int(default)
 
 
+_ANALYTICS_STOCK_BASIS_RE = re.compile(
+    r"장부\s*재고\s*기준|실\s*재고\s*기준|장부\s*기준|실\s*기준|장부\s*재고|실\s*재고"
+)
+
+
+def _resolve_analytics_stock_basis(text: Any) -> Dict[str, Any]:
+    """Resolve an explicit stock basis and remove every basis phrase from text."""
+    raw_text = str(text or "")
+    matched_phrases = _ANALYTICS_STOCK_BASIS_RE.findall(raw_text)
+    normalized_phrases = [re.sub(r"\s+", "", phrase) for phrase in matched_phrases]
+    # Preserve the previous explicit precedence when both basis terms occur.
+    stock_mode = "real" if any(phrase.startswith("실") for phrase in normalized_phrases) else ""
+    if not stock_mode and any(phrase.startswith("장부") for phrase in normalized_phrases):
+        stock_mode = "book"
+    return {
+        "stock_mode": stock_mode,
+        "explicit": bool(stock_mode),
+        "text_without_stock_basis": _ANALYTICS_STOCK_BASIS_RE.sub(" ", raw_text),
+    }
+
+
 def _apply_analytics_source_params(params: Dict[str, Any], txt: str, action: str) -> Dict[str, Any]:
     """
     분석자료원 / 재고기준 해석.
@@ -1100,40 +1281,34 @@ def _apply_analytics_source_params(params: Dict[str, Any], txt: str, action: str
     - 출고상세 / 상세자료 / 상세 기준 -> detail
     - 월집계 + 실재고 -> monthly_real
     - 월집계 + 장부재고 -> monthly_book
-    - 월집계 단독 -> monthly_book
+    - 월집계 단독 -> 공통 재고기준 resolver가 결정
     - 그 외 -> auto
 
     stock_mode:
-    - 품목별 재고부족현황에서만 사용
     - 실재고 기준 -> real
     - 장부재고 기준 -> book
-    - 기본 -> book
+    - 기본값은 Company Default 병합 후 공통 resolver가 결정
     """
     out = dict(params or {})
     t = str(txt or "").strip()
+    stock_basis = _resolve_analytics_stock_basis(t)
+    stock_mode = str(stock_basis.get("stock_mode") or "")
 
     has_monthly = ("월집계" in t) or ("월 집계" in t)
-    has_real = "실재고" in t
-    has_book = "장부재고" in t
 
     if "출고상세" in t or "상세자료" in t or "상세 기준" in t:
         out["source_mode"] = "detail"
-    elif has_monthly and has_real:
+    elif has_monthly and stock_mode == "real":
         out["source_mode"] = "monthly_real"
-    elif has_monthly and has_book:
+    elif has_monthly and stock_mode == "book":
         out["source_mode"] = "monthly_book"
     elif has_monthly:
-        out["source_mode"] = "monthly_book"
+        out.setdefault("source_mode", "auto")
     else:
         out.setdefault("source_mode", "auto")
 
-    if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"}:
-        if has_real:
-            out["stock_mode"] = "real"
-        elif has_book:
-            out["stock_mode"] = "book"
-        else:
-            out.setdefault("stock_mode", "book")
+    if stock_mode:
+        out["stock_mode"] = stock_mode
 
     return out
 
@@ -1261,6 +1436,75 @@ def _cleanup_analytics_named_params(
 
     return out
 
+
+def _clear_analytics_grouping_artifacts(params: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Do not turn the trailing '별' from a grouping label into a filter."""
+    out = dict(params or {})
+    compact = re.sub(r"\s+", "", str(text or ""))
+    grouping_fields = (
+        ("품목별", ("physic_nm", "physic_cd")),
+        ("제약사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
+        ("제조사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
+        ("매입처별", ("buy_nm", "buy_cd")),
+    )
+    for phrase, fields in grouping_fields:
+        if phrase not in compact:
+            continue
+        for field in fields:
+            value = str(out.get(field) or "").strip()
+            if value.startswith("별"):
+                out[field] = ""
+    return out
+
+
+def _analytics_intent_for_action(action: str, text: str) -> Dict[str, str]:
+    """Use the metric/grouping contract in successful Analytics case records."""
+    explicit = _classify_analytics_metric_grouping(text) or {}
+    for (metric, grouping), mapped_action in ANALYTICS_INTENT_ACTIONS.items():
+        if mapped_action == str(action or ""):
+            return {
+                "requested_metric": str(explicit.get("requested_metric") or metric),
+                "requested_grouping": str(explicit.get("requested_grouping") or grouping),
+            }
+    return {
+        "requested_metric": str(explicit.get("requested_metric") or ""),
+        "requested_grouping": str(explicit.get("requested_grouping") or ""),
+    }
+
+
+def _analytics_success_intent_validation(
+    *,
+    action: str,
+    payload: Dict[str, Any],
+    analytics_intent: Dict[str, str],
+) -> Dict[str, Any]:
+    """Only mark success intent as verified when the result states its grain."""
+    requested_metric = str(analytics_intent.get("requested_metric") or "")
+    requested_grouping = str(analytics_intent.get("requested_grouping") or "")
+    expected_action = ANALYTICS_INTENT_ACTIONS.get(
+        (requested_metric, requested_grouping)
+    )
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    payload_action = str(payload.get("action") or "").strip()
+    payload_title = str(payload.get("title") or "").strip()
+    result_grain = str(meta.get("result_grain") or "").strip()
+
+    if (
+        expected_action == str(action or "").strip()
+        and payload_action == expected_action
+        and payload_title == expected_action
+        and result_grain == requested_grouping
+    ):
+        return {
+            "intent_validation_status": "pass",
+            "consistency_flags": [],
+        }
+    return {
+        "intent_validation_status": "not_checked",
+        "consistency_flags": [],
+    }
+
+
 def _extract_analytics_trend_judge(txt: str) -> str:
     t = str(txt or "").replace(" ", "")
 
@@ -1311,6 +1555,7 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
 
     params = _cleanup_analytics_named_params(params, text=txt, action=action)
     params = _apply_analytics_condition_aliases(params, txt)
+    params = _clear_analytics_grouping_artifacts(params, txt)
     params = _apply_analytics_period_defaults(params, txt)
 
     params = _apply_analytics_source_params(params, txt, action)
@@ -1358,14 +1603,14 @@ def _apply_analytics_condition_aliases(params: Dict[str, Any], txt: str) -> Dict
 
 
 _ANALYTICS_NLQ_DEFAULT_KEYS = {
-    "품목별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "품목별 매출 추세 요약표": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "품목별 매출 예상": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "제약사별 매출 추세 분석": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "제약사별 매출 추세 분석 요약표": {"stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "매출처별 매출 예상": {"io_gu_list"},
-    "영업사원별 매출 예상": {"io_gu_list"},
-    "지역별 매출 예상": {"io_gu_list"},
+    "품목별 매출 추세 분석": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 매출 추세 요약표": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 매출 예상": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "제약사별 매출 추세 분석": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "제약사별 매출 추세 분석 요약표": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "매출처별 매출 예상": {"stock_mode", "io_gu_list"},
+    "영업사원별 매출 예상": {"stock_mode", "io_gu_list"},
+    "지역별 매출 예상": {"stock_mode", "io_gu_list"},
     "품목별 재고부족현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
     "매입처별 재고부족 현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
 }
@@ -1640,11 +1885,10 @@ def _apply_company_default_to_analytics_nlq(
 
     out = dict(params or {})
     text_compact = re.sub(r"\s+", "", str(text or ""))
+    stock_basis = _resolve_analytics_stock_basis(text)
     explicit_keys: set[str] = set()
     clear_keys: set[str] = set()
-    if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"} and any(
-        token in text_compact for token in ("실재고", "장부재고")
-    ):
+    if stock_basis.get("explicit"):
         explicit_keys.add("stock_mode")
     stock_code_values = _analytics_nlq_code_values(out, "stock_cd_list")
     stock_name_values = _analytics_nlq_name_values(out, "stock_cd_list")
@@ -1883,6 +2127,212 @@ def _get_analytics_handler(action: str):
 
     return fn_map.get(str(action or "").strip())
 
+
+def _analytics_manufacturer_filter_text(
+    text: str,
+    params: Dict[str, Any],
+    intent: Dict[str, str],
+) -> str:
+    """Return one manufacturer search phrase for a product-forecast request."""
+    if (
+        intent.get("requested_metric") != "sales_forecast"
+        or intent.get("requested_grouping") != "product"
+    ):
+        return ""
+
+    for key in ("maker_nm", "product_ven_nm", "manufacturer_nm"):
+        value = str((params or {}).get(key) or "").strip()
+        if value and value != "별":
+            return value
+
+    source = _resolve_analytics_stock_basis(text).get("text_without_stock_basis") or ""
+    # An explicit product condition must never be repurposed as a
+    # manufacturer condition merely because a product-grain forecast was
+    # requested.
+    if re.search(r"(?:제품명|품목명|상품명|제품)\s+[^\s]+", source):
+        return ""
+
+    residual = re.sub(r"\d{4}[./-]?\d{1,2}[./-]?\d{0,2}|\d{4}년", " ", source)
+    residual = re.sub(
+        r"제약사|제조사|품목별|제품별|매출\s*예상|예상\s*매출|"
+        r"월\s*집계|조회|검색|보여줘|알려줘|해줘",
+        " ",
+        residual,
+    )
+    tokens = re.findall(r"[가-힣A-Za-z][가-힣A-Za-z0-9_-]*", residual)
+    return tokens[0] if len(tokens) == 1 else ""
+
+
+def _resolve_analytics_manufacturer_filter(
+    text: str,
+    params: Dict[str, Any],
+    intent: Dict[str, str],
+    logger,
+) -> Dict[str, Any]:
+    """Resolve one product-forecast manufacturer filter from the shared vendor set."""
+    out = dict(params or {})
+    if any(str(out.get(key) or "").strip() for key in ("maker_cd", "product_ven_cd", "manufacturer_cd")):
+        return {"status": "not_needed", "params": out, "candidates": []}
+
+    search_text = _analytics_manufacturer_filter_text(text, out, intent)
+    if not search_text:
+        return {"status": "not_needed", "params": out, "candidates": []}
+
+    allowed_roles = {"manufacturer"}
+    started = time.perf_counter()
+    try:
+        from app.services.product_supplier_scope_service import resolve_common_vendor_candidates
+
+        candidates = resolve_common_vendor_candidates(search_text)
+        resolution_scope = "common_vendor"
+        lookup_call_count = 1
+    except Exception as exc:
+        logger.info(
+            "[nlq.entity_resolver] resolver_type=analytics_manufacturer status=error "
+            "candidate_count=0 elapsed_ms=%s exception_class=%s final_decision=resolution_unavailable",
+            int((time.perf_counter() - started) * 1000),
+            type(exc).__name__,
+        )
+        return {
+            "status": "resolution_unavailable",
+            "params": out,
+            "candidates": [],
+            "entity_query": search_text,
+            "entity_resolution_scope": "common_vendor",
+            "entity_lookup_call_count": 1,
+            "candidate_count_total": 0,
+            "compatible_candidate_count": 0,
+        }
+
+    normalized = [
+        {
+            "code": str(row.get("entity_code") or "").strip(),
+            "name": str(row.get("canonical_name") or "").strip(),
+            "role": str(row.get("entity_role") or "").strip(),
+            "role_source": str(row.get("role_source") or "").strip(),
+        }
+        for row in candidates
+        if isinstance(row, dict) and str(row.get("entity_code") or "").strip()
+    ]
+    compatible = [row for row in normalized if row["role"] in allowed_roles]
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    resolution_meta = {
+        "entity_query": search_text,
+        "entity_resolution_scope": resolution_scope,
+        "entity_lookup_call_count": lookup_call_count,
+        "candidate_count_total": len(normalized),
+        "compatible_candidate_count": len(compatible),
+    }
+    if not normalized:
+        logger.info(
+            "[nlq.entity_resolver] resolver_type=analytics_manufacturer status=%s "
+            "candidate_count=%s elapsed_ms=%s exception_class= final_decision=%s",
+            "not_found", 0, elapsed_ms, "not_found",
+        )
+        return {"status": "not_found", "params": out, "candidates": [], **resolution_meta}
+    if not compatible:
+        logger.info(
+            "[nlq.entity_resolver] resolver_type=analytics_manufacturer status=role_mismatch "
+            "candidate_count=%s elapsed_ms=%s exception_class= final_decision=role_mismatch",
+            len(normalized), elapsed_ms,
+        )
+        return {"status": "role_mismatch", "params": out, "candidates": [], **resolution_meta}
+    if len(compatible) > 1:
+        logger.info(
+            "[nlq.entity_resolver] resolver_type=analytics_manufacturer status=ambiguous "
+            "candidate_count=%s elapsed_ms=%s exception_class= final_decision=candidate_required",
+            len(compatible), elapsed_ms,
+        )
+        return {"status": "candidate_required", "params": out, "candidates": compatible, **resolution_meta}
+
+    candidate = compatible[0]
+    out.update({
+        "maker_cd": candidate["code"],
+        "product_ven_cd": candidate["code"],
+        "maker_nm": candidate["name"],
+        "product_ven_nm": candidate["name"],
+        "resolved_kind": "manufacturer",
+        "resolved_entity_types": ["manufacturer"],
+    })
+    logger.info(
+        "[nlq.entity_resolver] resolver_type=analytics_manufacturer status=success "
+        "candidate_count=1 elapsed_ms=%s exception_class= final_decision=resolved",
+        elapsed_ms,
+    )
+    return {
+        "status": "resolved",
+        "params": out,
+        "candidates": compatible,
+        "resolved_entity_role": candidate["role"],
+        "resolved_entity_code": candidate["code"],
+        "resolved_entity_name": candidate["name"],
+        **resolution_meta,
+    }
+
+
+def _analytics_manufacturer_resolution_payload(
+    *,
+    text: str,
+    action: str,
+    resolution: Dict[str, Any],
+    intent: Dict[str, str],
+) -> Dict[str, Any]:
+    status = str(resolution.get("status") or "candidate_required")
+    if status == "resolution_unavailable":
+        message = "제조사 조건을 확인하는 중 오류가 발생했습니다. 제조사명을 명시해 다시 조회해 주세요."
+        result_status = "resolution_unavailable"
+        table = None
+        title = "업체 조건 확인 필요"
+    elif status == "not_found":
+        message = "해당 조건과 일치하는 제조사를 찾지 못했습니다. 제조사명을 확인해 다시 조회해 주세요."
+        result_status = "not_found"
+        table = None
+        title = "업체 조건 확인 필요"
+    elif status == "role_mismatch":
+        message = "입력한 업체명은 이 조회의 제조사 조건으로 사용할 수 없습니다. 제조사명을 명시해 다시 조회해 주세요."
+        result_status = "role_mismatch"
+        table = None
+        title = "업체 조건 확인 필요"
+    else:
+        message = "제조사 조건을 하나로 확인할 수 없습니다. 제조사명을 더 구체적으로 입력해 주세요."
+        result_status = "candidate_required"
+        rows = list(resolution.get("candidates") or [])
+        table = pd.DataFrame(rows, columns=["code", "name", "role"]) if rows else None
+        title = "업체 조건 선택 필요"
+    return {
+        "final": True,
+        "type": "text",
+        "title": title,
+        "action": action,
+        "data": message,
+        "message": message,
+        "df": table,
+        "meta": {
+            "nlq": True,
+            "nlq_query": text,
+            "analysis_nlq": True,
+            "analytics": True,
+            "action": action,
+            "requested_metric": intent["requested_metric"],
+            "requested_grouping": intent["requested_grouping"],
+            "resolved_action": action,
+            "execution_status": result_status,
+            "intent_validation_status": "not_checked",
+            "consistency_flags": [],
+            "result_status": result_status,
+            "candidate_table": table is not None,
+            "candidate_count": len(resolution.get("candidates") or []),
+            "entity_query": str(resolution.get("entity_query") or ""),
+            "entity_resolution_scope": str(resolution.get("entity_resolution_scope") or ""),
+            "entity_lookup_call_count": int(resolution.get("entity_lookup_call_count") or 0),
+            "candidate_count_total": int(resolution.get("candidate_count_total") or 0),
+            "compatible_candidate_count": int(resolution.get("compatible_candidate_count") or 0),
+            "row_count": 0,
+            "row_count_total": 0,
+            "llm_explanation_used": False,
+        },
+    }
+
 #=============================================================================
 # 분석/KPI NLQ 라우팅
 # - _looks_like_analytics_nlq()로 판정된 문장은 _try_handle_analytics_nlq()로 처리한다.
@@ -1921,6 +2371,25 @@ def _try_handle_analytics_nlq(
         logger.exception("[nlq.router] failed to import chat_middleware")
         return False
 
+    grouping_guard = _analytics_grouping_guard(t, action)
+    if grouping_guard:
+        payload = _analytics_grouping_guard_payload(text=t, guard=grouping_guard)
+        try:
+            push_sims_result_to_chat(payload, str(payload["action"]))
+        except Exception:
+            logger.exception("[nlq.router] push blocked analytics grouping failed")
+            return False
+        logger.info(
+            "[nlq.router] analytics grouping blocked guard_status=%s requested_metric=%s "
+            "requested_grouping=%s resolved_action=%s consistency_flag=%s",
+            grouping_guard["guard_status"],
+            grouping_guard["requested_metric"],
+            grouping_guard["requested_grouping"],
+            grouping_guard["resolved_action"],
+            grouping_guard["consistency_flag"],
+        )
+        return True
+
     try:
         fn = _get_analytics_handler(action)
     except Exception:
@@ -1931,9 +2400,35 @@ def _try_handle_analytics_nlq(
         return False
 
     params = _build_analytics_params(t, action)
+    analytics_intent = _analytics_intent_for_action(action, t)
+    manufacturer_resolution = _resolve_analytics_manufacturer_filter(
+        t,
+        params,
+        analytics_intent,
+        logger,
+    )
+    if manufacturer_resolution["status"] in {
+        "candidate_required",
+        "resolution_unavailable",
+        "not_found",
+        "role_mismatch",
+    }:
+        payload = _analytics_manufacturer_resolution_payload(
+            text=t,
+            action=action,
+            resolution=manufacturer_resolution,
+            intent=analytics_intent,
+        )
+        try:
+            push_sims_result_to_chat(payload, action)
+        except Exception:
+            logger.exception("[nlq.router] push analytics manufacturer resolution payload failed")
+            return False
+        return True
+    params = dict(manufacturer_resolution["params"])
     from app.services.io_nlq import apply_nlq_default_period_policy
 
-    _, period_policy = apply_nlq_default_period_policy(params, action)
+    params, period_policy = apply_nlq_default_period_policy(params, action)
     _log_nlq_period_policy(logger, action, period_policy, params)
     params = _apply_company_default_to_analytics_nlq(
         params,
@@ -1942,6 +2437,8 @@ def _try_handle_analytics_nlq(
         session_state=session_state,
         logger=logger,
     )
+    from app.services.analytics_sales_trend_service import normalize_analytics_stock_source_params
+    params = normalize_analytics_stock_source_params(params)
     adapter_sources = dict(params.pop("__analysis_default_sources", {}) or {})
     service_params = dict(params)
     log_summary = _analytics_nlq_param_log_summary(service_params, adapter_sources)
@@ -2030,6 +2527,11 @@ def _try_handle_analytics_nlq(
     payload["params"] = effective_params
 
     meta = dict(payload.get("meta") or {})
+    intent_validation = _analytics_success_intent_validation(
+        action=action,
+        payload=payload,
+        analytics_intent=analytics_intent,
+    )
     source_summary = _analytics_nlq_condition_sources(effective_params, adapter_sources)
     if source_summary:
         existing_summary = str(meta.get("query_summary") or meta.get("condition") or "").strip()
@@ -2043,7 +2545,26 @@ def _try_handle_analytics_nlq(
         "_nlq_nonce": str(uuid.uuid4()),
         "analysis_nlq": True,
         "period_policy": period_policy,
+        "source_mode": str(effective_params.get("source_mode") or ""),
+        "stock_mode": str(effective_params.get("stock_mode") or ""),
+        "requested_metric": analytics_intent["requested_metric"],
+        "requested_grouping": analytics_intent["requested_grouping"],
+        "resolved_action": action,
+        "execution_status": "success",
+        **intent_validation,
     })
+    for key in (
+        "entity_query",
+        "entity_resolution_scope",
+        "entity_lookup_call_count",
+        "candidate_count_total",
+        "compatible_candidate_count",
+        "resolved_entity_role",
+        "resolved_entity_code",
+        "resolved_entity_name",
+    ):
+        if key in manufacturer_resolution:
+            meta[key] = manufacturer_resolution[key]
     payload["meta"] = meta
 
     try:
@@ -2215,6 +2736,7 @@ def _period_policy_summary_label(period_policy: Dict[str, Any] | None) -> str:
         names = list(policy.get("explicit_condition_names") or [])
         return f"최근 1개월 자동적용({condition_labels.get(str(names[0]), '명시 조건')})"
     return {
+        "completed_6months": "직전 완료 6개월 자동적용",
         "recent_1day": "최근 1일 자동적용(추가 조건 없음)",
         "recent_7days": "최근 7일 자동적용(단일 제품 수불)",
         "current_month_inventory": "현재월 자동적용(재고 월조회)",

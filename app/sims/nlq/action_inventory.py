@@ -14,6 +14,23 @@ DASHBOARD_ONLY = "dashboard_only"
 DEPRECATED = "deprecated"
 
 
+# Analytics NLQ is intentionally modeled as metric x grouping rather than as
+# a phrase-to-action fallback.  The router uses this data to reject a requested
+# grouping that has no canonical action before it can call a service.
+ANALYTICS_INTENT_ACTIONS: dict[tuple[str, str], str] = {
+    ("sales_forecast", "product"): "품목별 매출 예상",
+    ("sales_forecast", "customer"): "매출처별 매출 예상",
+    ("sales_forecast", "salesperson"): "영업사원별 매출 예상",
+    ("sales_forecast", "region"): "지역별 매출 예상",
+    ("sales_trend", "product"): "품목별 매출 추세 분석",
+    ("sales_trend", "manufacturer"): "제약사별 매출 추세 분석",
+    ("sales_trend_summary", "product"): "품목별 매출 추세 요약표",
+    ("sales_trend_summary", "manufacturer"): "제약사별 매출 추세 분석 요약표",
+    ("stock_shortage", "product"): "품목별 재고부족현황",
+    ("stock_shortage", "purchase_vendor"): "매입처별 재고부족 현황",
+}
+
+
 @dataclass(frozen=True)
 class CanonicalAction:
     canonical_action: str

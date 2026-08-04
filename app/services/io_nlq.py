@@ -438,6 +438,25 @@ def get_nlq_explicit_condition_names(params: Dict[str, Any]) -> list[str]:
     ]
 
 
+def _policy_today(params: Dict[str, Any], today: date | None) -> date:
+    """Resolve a testable policy date without treating it as a user period."""
+    if today is not None:
+        return today
+    for key in ("policy_date", "as_of_date"):
+        raw = clean_text((params or {}).get(key))
+        if re.fullmatch(r"\d{8}", raw):
+            try:
+                return date(int(raw[:4]), int(raw[4:6]), int(raw[6:8]))
+            except ValueError:
+                pass
+    return date.today()
+
+
+def _subtract_months(month_start: date, months: int) -> date:
+    index = month_start.year * 12 + (month_start.month - 1) - int(months)
+    return date(index // 12, index % 12 + 1, 1)
+
+
 def apply_nlq_default_period_policy(
     params: Dict[str, Any],
     action: str,
@@ -479,11 +498,17 @@ def apply_nlq_default_period_policy(
         })
         return out, policy
 
-    if explicit_period_present or action_class == "aggregate_analysis":
+    if explicit_period_present:
         return out, policy
 
-    current_day = today or date.today()
-    if action_class == "single_entity_history":
+    current_day = _policy_today(out, today)
+    if action_class == "aggregate_analysis":
+        completed_month_end = current_day.replace(day=1) - timedelta(days=1)
+        date_from = _subtract_months(completed_month_end.replace(day=1), 5)
+        date_to = completed_month_end
+        default_policy = "completed_6months"
+        policy_reason = "analytics_completed_months"
+    elif action_class == "single_entity_history":
         date_from = current_day - timedelta(days=6)
         default_policy = "recent_7days"
         policy_reason = "single_product_history"
@@ -507,9 +532,9 @@ def apply_nlq_default_period_policy(
         return out, policy
 
     out["date_from"] = date_from.strftime("%Y%m%d")
-    out["date_to"] = current_day.strftime("%Y%m%d")
+    out["date_to"] = date_to.strftime("%Y%m%d") if action_class == "aggregate_analysis" else current_day.strftime("%Y%m%d")
     out["month_from"] = date_from.strftime("%Y%m")
-    out["month_to"] = current_day.strftime("%Y%m")
+    out["month_to"] = out["date_to"][:6]
     out.pop("_default_date_applied", None)
     policy.update({
         "default_policy": default_policy,

@@ -220,7 +220,7 @@ def load_supplier_product_stock(product_codes: list[str], params: Dict[str, Any]
     if not codes:
         return pd.DataFrame(columns=columns)
 
-    stock_mode = str(params.get("stock_mode") or "book").strip()
+    stock_mode = str(params.get("stock_mode") or "real").strip()
     stock_spec = _stock_current_monthly_spec(stock_mode)
     policy = _resolve_period_source_policy(params)
     table = stock_spec["table"]
@@ -594,9 +594,11 @@ def build_supplier_shortage_summary(detail: pd.DataFrame, params: Optional[Dict[
     total_alloc = float(summary["배정부족예상금액"].sum())
     summary["전체부족금액비중"] = (summary["배정부족예상금액"] / total_alloc * 100) if abs(total_alloc) >= 1e-12 else 0
 
+    summary_before_vendor_filter_rows = int(len(summary))
     buy_nm = clean_text((params or {}).get("buy_nm"))
     if buy_nm:
         summary = summary[summary["매입처명"].fillna("").astype(str).str.contains(buy_nm, na=False)].copy()
+    summary_after_vendor_filter_rows = int(len(summary))
 
     summary = summary.sort_values(
         ["배정부족예상금액", "배정1개월부족금액", "음수재고금액", "부족제품수", "매입처명"],
@@ -607,7 +609,13 @@ def build_supplier_shortage_summary(detail: pd.DataFrame, params: Optional[Dict[
     for col in SUPPLIER_SUMMARY_COLUMNS:
         if col not in summary.columns:
             summary[col] = ""
-    return _normalize_analytics_numeric_columns(summary[SUPPLIER_SUMMARY_COLUMNS].copy())
+    result = _normalize_analytics_numeric_columns(summary[SUPPLIER_SUMMARY_COLUMNS].copy())
+    result.attrs.update({
+        "supplier_summary_before_vendor_filter_rows": summary_before_vendor_filter_rows,
+        "supplier_summary_after_vendor_filter_rows": summary_after_vendor_filter_rows,
+        "supplier_vendor_filter_applied": bool(buy_nm),
+    })
+    return result
 
 
 def _meta_from_frames(summary: pd.DataFrame, detail: pd.DataFrame, product_base: pd.DataFrame, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -641,14 +649,14 @@ def _meta_from_frames(summary: pd.DataFrame, detail: pd.DataFrame, product_base:
         "stock_shortage_judge_counts": _count_values(detail, "재고부족판정"),
         "stock_consistency_distribution": _count_values(detail, "재고정합성"),
         "allocation_consistency_distribution": _count_values(detail, "배분정합성"),
-        "stock_mode": str(params.get("stock_mode") or "book"),
+        "stock_mode": str(params.get("stock_mode") or "real"),
     }
 
 
 def get_supplier_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     params = _apply_period_source_policy_params(_apply_month_or_date_params(coalesce_params(params)))
     t0 = time.perf_counter()
-    stock_mode = str(params.get("stock_mode") or "book").strip()
+    stock_mode = str(params.get("stock_mode") or "real").strip()
     stock_spec = _stock_current_monthly_spec(stock_mode)
     policy = _resolve_period_source_policy(params)
     source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
@@ -679,6 +687,7 @@ def get_supplier_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> p
     summary = build_supplier_shortage_summary(detail, params)
     t_summary = time.perf_counter()
     meta = _meta_from_frames(summary, detail, product_base, params)
+    meta.update(dict(summary.attrs or {}))
     supplier_detail_key = _stash_supplier_detail_df(detail)
     meta.update(
         {
@@ -688,6 +697,19 @@ def get_supplier_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> p
         }
     )
     summary.attrs.update(meta)
+
+    log.info(
+        "[analytics.supplier_stock_shortage.stage] demand_shortage_rows=%s current_stock_rows=%s "
+        "shortage_product_count=%s allocation_rows=%s supplier_summary_before_vendor_filter_rows=%s "
+        "supplier_summary_after_vendor_filter_rows=%s supplier_vendor_filter_applied=%s",
+        int(len(product_base)),
+        int(len(supplier_stock)),
+        int(meta.get("shortage_product_count") or 0),
+        int(len(detail)),
+        int(meta.get("supplier_summary_before_vendor_filter_rows") or 0),
+        int(meta.get("supplier_summary_after_vendor_filter_rows") or 0),
+        bool(meta.get("supplier_vendor_filter_applied")),
+    )
 
     alloc_basis = meta.get("allocation_basis_distribution") or {}
     log.info(
