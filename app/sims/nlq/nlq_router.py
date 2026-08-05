@@ -1029,7 +1029,13 @@ def _resolve_analytics_action(txt: str) -> str | None:
     # Broad legacy aliases such as "부족현황" and "추세요약" belong to
     # Analytics only when their business metric is explicit.  Otherwise an
     # inbound/outbound/order question could be replaced by a product analysis.
-    if ("추세" in compact_t and "매출" not in compact_t) or ("부족" in compact_t and "재고" not in compact_t):
+    trend_judge = _extract_analytics_trend_judge(t)
+    allows_sales_data_shortage = trend_judge == "자료부족" and "매출" in compact_t
+    if ("추세" in compact_t and "매출" not in compact_t) or (
+        "부족" in compact_t
+        and "재고" not in compact_t
+        and not allows_sales_data_shortage
+    ):
         return None
     explicit_intent = _classify_analytics_metric_grouping(t)
     if explicit_intent and explicit_intent["requested_grouping"]:
@@ -1506,24 +1512,38 @@ def _analytics_success_intent_validation(
     }
 
 
-def _extract_analytics_trend_judge(txt: str) -> str:
-    t = str(txt or "").replace(" ", "")
+_ANALYTICS_TREND_JUDGE_PATTERNS = (
+    ("반품주의", ("반품주의",)),
+    ("자료부족", ("자료부족", "데이터부족")),
+    ("신규/증가", ("신규/증가", "신규증가")),
+    ("감소", ("감소",)),
+    ("증가", ("증가",)),
+    ("안정", ("안정",)),
+)
 
-    # 긴 표현 먼저
-    if "반품주의" in t:
-        return "반품주의"
-    if "자료부족" in t or "데이터부족" in t:
-        return "자료부족"
-    if "신규/증가" in t or "신규증가" in t:
-        return "신규/증가"
-    if "감소" in t:
-        return "감소"
-    if "증가" in t:
-        return "증가"
-    if "안정" in t:
-        return "안정"
+
+def _analytics_trend_judge_phrase_regex(phrase: str) -> re.Pattern[str]:
+    """Match one official trend phrase with optional whitespace between tokens."""
+    compact = re.sub(r"\s+", "", str(phrase or ""))
+    return re.compile(r"\s*".join(re.escape(char) for char in compact))
+
+
+def _extract_analytics_trend_judge(txt: str) -> str:
+    text = str(txt or "")
+    for canonical, patterns in _ANALYTICS_TREND_JUDGE_PATTERNS:
+        if any(_analytics_trend_judge_phrase_regex(pattern).search(text) for pattern in patterns):
+            return canonical
 
     return ""
+
+
+def _strip_analytics_trend_judge_phrases(txt: str) -> str:
+    """Remove official trend filters before residual manufacturer parsing."""
+    out = str(txt or "")
+    for _canonical, patterns in _ANALYTICS_TREND_JUDGE_PATTERNS:
+        for pattern in patterns:
+            out = _analytics_trend_judge_phrase_regex(pattern).sub(" ", out)
+    return re.sub(r"\s+", " ", out).strip()
 
 
 def _extract_analytics_shortage_grade(txt: str) -> str:
@@ -2147,6 +2167,7 @@ def _analytics_manufacturer_filter_text(
             return value
 
     source = _resolve_analytics_stock_basis(text).get("text_without_stock_basis") or ""
+    source = _strip_analytics_trend_judge_phrases(source)
     # An explicit product condition must never be repurposed as a
     # manufacturer condition merely because a product-grain forecast was
     # requested.

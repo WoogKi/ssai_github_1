@@ -13951,6 +13951,37 @@ def _run_analytics_period_and_grouping_contract_checks() -> list[CheckResult]:
         ):
             raise AssertionError(f"analytics_manufacturer_filter={filter_action!r}/{filter_params!r}/{filter_policy!r}")
 
+        trend_judge_cases = (
+            ("품목별 매출 예상 2025년 감소 조회", "감소"),
+            ("품목별 매출 예상 2025년 안정 조회", "안정"),
+            ("품목별 매출 예상 2025년 증가 조회", "증가"),
+            ("품목별 매출 예상 2025년 신규/증가 조회", "신규/증가"),
+            ("품목별 매출 예상 2025년 신규 / 증가 조회", "신규/증가"),
+            ("품목별 매출 예상 2025년 자료부족 조회", "자료부족"),
+            ("품목별 매출 예상 2025년 자료 부족 조회", "자료부족"),
+            ("품목별 매출 예상 2025년 데이터 부족 조회", "자료부족"),
+            ("품목별 매출 예상 2025년 반품주의 조회", "반품주의"),
+            ("품목별 매출 예상 2025년 반품 주의 조회", "반품주의"),
+        )
+        for question, expected_judge in trend_judge_cases:
+            action = router_mod._resolve_analytics_action(question)
+            prepared = router_mod._build_analytics_params(question, action)
+            intent = router_mod._analytics_intent_for_action(action, question)
+            manufacturer_text = router_mod._analytics_manufacturer_filter_text(
+                question,
+                prepared,
+                intent,
+            )
+            if (
+                action != "품목별 매출 예상"
+                or prepared.get("trend_judge") != expected_judge
+                or (prepared.get("date_from"), prepared.get("date_to")) != ("20250101", "20251231")
+                or manufacturer_text
+            ):
+                raise AssertionError(
+                    f"analytics_trend_judge={question!r}/{action!r}/{prepared!r}/manufacturer={manufacturer_text!r}"
+                )
+
         captured: dict[str, Any] = {}
         old_handler_getter = router_mod._get_analytics_handler
         old_push = chat_mod.push_sims_result_to_chat
@@ -14137,6 +14168,9 @@ def _run_analytics_grouping_guard_checks() -> list[CheckResult]:
             "제품별 출고추세요약",
             "재고위치별 재고추세요약",
             "거래처별 주문부족현황",
+            "거래처별 주문 자료부족 현황",
+            "제품별 출고 자료 부족 조회",
+            "제품별 입고 데이터 부족 조회",
         ):
             resolved = router_mod._resolve_analytics_action(question)
             candidate = router_mod.resolve_new_sims_nlq_candidate(question)
@@ -15180,7 +15214,7 @@ def _next_seq_factory() -> Callable[[], int]:
 def _nlq_cases() -> list[NlqCase]:
     base_tokens = ("2025-01-01", "2025-12-31")
 
-    return [
+    cases = [
         NlqCase(
             "품목별 매출 추세 2025년 조회",
             "품목별 매출 추세 분석",
@@ -15235,15 +15269,31 @@ def _nlq_cases() -> list[NlqCase]:
             expected_params={"trend_judge": "증가"},
             expected_condition_tokens=base_tokens + ("추세판정", "증가"),
         ),
+    ]
+    cases.extend(
         NlqCase(
-            "품목별 매출 예상 2025년 반품주의 조회",
+            question,
             "품목별 매출 예상",
             expected_analysis_type="sales_forecast",
             expected_meta_key="forecast_grade_counts",
-            expected_params={"trend_judge": "반품주의"},
-            expected_condition_tokens=base_tokens + ("추세판정", "반품주의"),
-        ),
-    ]
+            expected_params={"trend_judge": trend_judge},
+            expected_condition_tokens=base_tokens + ("추세판정", trend_judge),
+            allow_empty_meta_counts=True,
+        )
+        for question, trend_judge in (
+            ("품목별 매출 예상 2025년 감소 조회", "감소"),
+            ("품목별 매출 예상 2025년 안정 조회", "안정"),
+            ("품목별 매출 예상 2025년 증가 조회", "증가"),
+            ("품목별 매출 예상 2025년 신규/증가 조회", "신규/증가"),
+            ("품목별 매출 예상 2025년 신규 / 증가 조회", "신규/증가"),
+            ("품목별 매출 예상 2025년 자료부족 조회", "자료부족"),
+            ("품목별 매출 예상 2025년 자료 부족 조회", "자료부족"),
+            ("품목별 매출 예상 2025년 데이터 부족 조회", "자료부족"),
+            ("품목별 매출 예상 2025년 반품주의 조회", "반품주의"),
+            ("품목별 매출 예상 2025년 반품 주의 조회", "반품주의"),
+        )
+    )
+    return cases
 
 def _evaluate_nlq_case(case: NlqCase, handled: bool, payload: dict[str, Any] | None) -> CheckResult:
     name = f"nlq: {case.query}"
