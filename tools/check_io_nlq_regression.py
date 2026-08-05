@@ -24,6 +24,7 @@ payload 확인:
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib
 import inspect
@@ -34,6 +35,8 @@ import re
 import sys
 import tempfile
 import traceback
+import types
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -467,6 +470,54 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
                 and bool(parsed_params.get("only_mismatch_tax")) is (mismatch and tax)
                 and parsed_params.get("validation_intent_source") == "user_text",
                 f"action={parsed.get('action')!r}, params={parsed_params!r}",
+            )
+        )
+
+    p0_outbound_validation_cases = (
+        ("출고 거래명세서 불일치 2026 조회", "출고↔거래명세서 검증"),
+        ("출고 거래명세서 불일치 조회", "출고↔거래명세서 검증"),
+        ("출고 세금계산서 불일치 조회", "출고↔세금계산서 검증"),
+        ("출고 세금계산서 불일치 2026 조회", "출고↔세금계산서 검증"),
+    )
+    for query, expected_action in p0_outbound_validation_cases:
+        parsed = io_nlq.resolve_io_nlq(query) or {}
+        results.append(
+            CheckResult(
+                f"P0 outbound validation parser: {query}",
+                str(parsed.get("action") or "") == expected_action,
+                f"parsed={parsed!r}",
+            )
+        )
+
+    generic_document_cases = (
+        ("거래명세서 조회", "거래명세서 공통 조회"),
+        ("세금계산서 조회", "세금계산서 공통 조회"),
+    )
+    for query, expected_action in generic_document_cases:
+        parsed = io_nlq.resolve_io_nlq(query) or {}
+        results.append(
+            CheckResult(
+                f"generic document route remains unchanged: {query}",
+                str(parsed.get("action") or "") == expected_action,
+                f"parsed={parsed!r}",
+            )
+        )
+
+    outbound_validation_gate_cases = {
+        "출고 거래명세서 불일치 조회": True,
+        "매출 세금계산서 검증 조회": True,
+        "출고 불일치 조회": False,
+        "출고 검증 조회": False,
+        "거래명세서 불일치 조회": False,
+        "세금계산서 검증 조회": False,
+    }
+    for query, expected in outbound_validation_gate_cases.items():
+        actual = io_nlq._is_structured_outbound_validation_request(query)
+        results.append(
+            CheckResult(
+                f"outbound validation three-part gate: {query}",
+                actual is expected,
+                f"actual={actual!r} expected={expected!r}",
             )
         )
 
@@ -1484,7 +1535,7 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
     )
 
     targetless_validation = io_nlq.resolve_io_nlq(
-        "20260801 출고명세 검증"
+        "20260801 출고 거래명세서 세금계산서 검증"
     ) or {}
     targetless_params = dict(targetless_validation.get("params") or {})
     results.append(
@@ -2142,8 +2193,14 @@ def run_nlq_case_log_checks() -> list[CheckResult]:
                 "row_count_total": 3,
                 "display_row_count": 2,
                 "download_row_count": 3,
+                "expected_rows": 5,
+                "prepared_rows": 3,
+                "download_limit_rows": 3,
+                "applied_download_limit_rows": 3,
+                "limit_hit": True,
                 "source_call_count": 2, "cache_used": False,
                 "display_source_status": "queried", "full_source_status": "queried",
+                "download_source_status": "partial_limit",
                 "elapsed_ms": 125,
                 "parsed_action": "출고명세 조회",
                 "canonical_action": "출고명세 조회",
@@ -2183,11 +2240,17 @@ def run_nlq_case_log_checks() -> list[CheckResult]:
                 and success.get("total_rows") == 3
                 and success.get("display_rows") == 2
                 and success.get("full_source_rows") == 3
+                and success.get("expected_rows") == 5
+                and success.get("prepared_rows") == 3
+                and success.get("download_limit_rows") == 3
+                and success.get("applied_download_limit_rows") == 3
+                and success.get("limit_hit") is True
                 and success.get("source_call_count") == 2
                 and success.get("elapsed_ms") == 125
                 and success.get("result_status_source") == "payload"
                 and success.get("display_source_status") == "queried"
                 and success.get("full_source_status") == "queried"
+                and success.get("download_source_status") == "partial_limit"
                 and success.get("conditions") == {"date_from": "20260801", "date_to": "20260801", "transaction_vendor_codes": ["00001"]}
                 and success.get("interpretation", {}).get("condition_summary") == "기간 2026-08-01 / 명시기간"
                 and "must-not-log" not in serialized
@@ -2315,6 +2378,261 @@ def run_nlq_case_log_checks() -> list[CheckResult]:
                 f"derived={derived!r}",
             )
         )
+
+        current_table_question = "추세판정별 요약"
+        current_table_payload = {
+            "id": "case-current-table-question",
+            "action": "현재표 추세판정별 요약",
+            "meta": {
+                "nlq": True,
+                "current_table_followup": True,
+                "nlq_query": current_table_question,
+                "result_status": "success",
+                "row_count": 2,
+                "row_count_total": 2,
+                "execution_status": "success",
+                "requested_metrics": ["sales"],
+                "requested_groupings": ["trend_judgement"],
+                "requested_metric": "sales",
+                "requested_grouping": "trend_judgement",
+                "issue_codes": [],
+                "source_action": "제약사별 매출 추세 분석 요약표",
+                "source_table_key": "current-table-fixture",
+                "source_call_count": 0,
+                "filter_column": "추세판정",
+                "filter_value": "감소",
+                "missing_columns": [],
+                "result_metric": "sales",
+                "result_grain": "trend_judgement_summary",
+                "table_created": True,
+            },
+        }
+        with patch.dict(os.environ, {"SIMS_NLQ_CASE_LOG_FILE": str(case_path)}):
+            append_nlq_case_record(
+                current_table_payload,
+                direct_state,
+                runtime_context={"company_id": 4, "room_id": "room-fixture"},
+            )
+        current_table_case = json.loads(case_path.read_text(encoding="utf-8").splitlines()[-1])
+        chat_main_source = (
+            PROJECT_ROOT / "app" / "Lmstudio_SSAI_chat_main.py"
+        ).read_text(encoding="utf-8")
+        results.append(
+            CheckResult(
+                "current-table case log preserves the actual user question",
+                current_table_case.get("question") == current_table_question
+                and current_table_case.get("execution_status") == "success"
+                and current_table_case.get("requested_metrics") == ["sales"]
+                and current_table_case.get("requested_groupings") == ["trend_judgement"]
+                and current_table_case.get("requested_grouping") == "trend_judgement"
+                and current_table_case.get("source_action") == "제약사별 매출 추세 분석 요약표"
+                and current_table_case.get("source_table_key") == "current-table-fixture"
+                and current_table_case.get("source_call_count") == 0
+                and current_table_case.get("filter_column") == "추세판정"
+                and current_table_case.get("filter_value") == "감소"
+                and current_table_case.get("missing_columns") == []
+                and current_table_case.get("result_metric") == "sales"
+                and current_table_case.get("result_grain") == "trend_judgement_summary"
+                and current_table_case.get("table_created") is True
+                and current_table_case.get("issue_codes") == []
+                and "__sims_current_table_followup_case_query" in chat_main_source
+                and '"nlq_query": case_query' in chat_main_source,
+                f"current_table_case={current_table_case!r}",
+            )
+        )
+
+        results.append(
+            CheckResult(
+                "case log table_created preserves true false none",
+                success.get("table_created") is None
+                and current_table_case.get("table_created") is True,
+                (
+                    f"generic_success={success.get('table_created')!r} "
+                    f"current_table_success={current_table_case.get('table_created')!r}"
+                ),
+            )
+        )
+
+        source_tree = ast.parse(chat_main_source)
+        source_constants = [
+            ast.get_source_segment(chat_main_source, node) or ""
+            for node in source_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_CURRENT_TABLE_PUSH_META_PROTECTED_KEYS"
+                for target in node.targets
+            )
+        ]
+        source_functions = {
+            node.name: ast.get_source_segment(chat_main_source, node) or ""
+            for node in source_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "_merge_current_table_push_meta",
+                "_current_table_push_table",
+                "_current_table_push_notice",
+            }
+        }
+        production_pushes: list[dict[str, Any]] = []
+        production_session = {
+            "__sims_current_table_source_action": "제약사별 매출 추세 분석 요약표",
+            "__sims_current_table_followup_case_query": "현재표 제조사별 요약",
+        }
+        production_namespace: dict[str, Any] = {
+            "pd": pd,
+            "uuid": uuid,
+            "st": types.SimpleNamespace(session_state=production_session),
+            "log": types.SimpleNamespace(debug=lambda *_args, **_kwargs: None),
+            "_current_table_fill_alias_values": lambda frame: frame,
+            "_current_table_clean_none_for_display": lambda frame: frame,
+        }
+        production_source = "\n\n".join(
+            [*source_constants]
+            + [
+                source_functions.get(name, "")
+                for name in (
+                    "_merge_current_table_push_meta",
+                    "_current_table_push_table",
+                    "_current_table_push_notice",
+                )
+            ]
+        )
+        try:
+            exec(compile(production_source, "Lmstudio_SSAI_chat_main.py", "exec"), production_namespace)
+            with patch.object(
+                middleware,
+                "push_sims_result_to_chat",
+                side_effect=lambda pushed, _action: production_pushes.append(dict(pushed)),
+            ):
+                production_namespace["_current_table_push_table"](
+                    title="현재표 제조사별 요약",
+                    action="현재표 제조사별 요약",
+                    df=pd.DataFrame({"제조사명": ["제조사A"], "매출금액": [100]}),
+                    query_summary="현재표 / 제조사별 요약",
+                    source_query="현재표 제조사별 요약",
+                    source_table_key="source-fixture",
+                    source_rows=3,
+                    extra_meta={
+                        "execution_status": "success",
+                        "result_status": "success",
+                        "requested_metrics": ["sales"],
+                        "requested_groupings": ["manufacturer"],
+                        "requested_metric": "sales",
+                        "requested_grouping": "manufacturer",
+                        "missing_columns": [],
+                        "result_metric": "sales",
+                        "result_grain": "manufacturer_summary",
+                        "issue_codes": [],
+                        "table_created": True,
+                        "source_action": "잘못된 원본 action",
+                        "source_call_count": 99,
+                        "nlq_query": "잘못된 질문",
+                        "source_table_key": "잘못된 key",
+                    },
+                )
+                production_session["__sims_current_table_followup_case_query"] = "현재표 제품그룹별 요약"
+                production_namespace["_current_table_push_table"](
+                    title="현재표 결과 없음",
+                    action="현재표 결과 없음",
+                    df=pd.DataFrame(),
+                    query_summary="현재표 / 결과 없음",
+                    source_query="현재표 제품그룹별 요약",
+                    source_table_key="source-fixture",
+                    source_rows=3,
+                    extra_meta={
+                        "execution_status": "no_data",
+                        "result_status": "no_data",
+                        "requested_metrics": ["sales"],
+                        "requested_groupings": ["product_group"],
+                        "requested_metric": "sales",
+                        "requested_grouping": "product_group",
+                        "missing_columns": [],
+                        "result_metric": "sales",
+                        "result_grain": "product_group_summary",
+                        "issue_codes": [],
+                        "table_created": False,
+                    },
+                )
+                production_session["__sims_current_table_followup_case_query"] = "현재표 제품별 매출 TOP 20"
+                production_namespace["_current_table_push_notice"](
+                    title="현재표 컬럼 부족",
+                    action="현재표 컬럼 부족",
+                    message="제품 컬럼이 없습니다.",
+                    query_summary="현재표 / 컬럼 부족",
+                    source_query="현재표 제품별 매출 TOP 20",
+                    source_table_key="source-fixture",
+                    source_rows=3,
+                    extra_meta={
+                        "execution_status": "column_unavailable",
+                        "result_status": "column_unavailable",
+                        "requested_metrics": ["sales"],
+                        "requested_groupings": ["product"],
+                        "requested_metric": "sales",
+                        "requested_grouping": "product",
+                        "missing_columns": ["제품"],
+                        "result_metric": "",
+                        "result_grain": "",
+                        "issue_codes": [],
+                        "table_created": False,
+                    },
+                )
+        except Exception as exc:
+            results.append(_fail("production current-table push boundary", f"{type(exc).__name__}: {exc}"))
+        else:
+            production_metas = [dict(payload.get("meta") or {}) for payload in production_pushes]
+            production_case_state: dict[str, Any] = {}
+            for index, payload in enumerate(production_pushes, start=1):
+                payload["id"] = f"production-current-table-{index}"
+                with patch.dict(os.environ, {"SIMS_NLQ_CASE_LOG_FILE": str(case_path)}):
+                    append_nlq_case_record(
+                        payload,
+                        production_case_state,
+                        runtime_context={"company_id": 4, "room_id": "room-fixture"},
+                    )
+            production_records = [
+                json.loads(line)
+                for line in case_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ][-3:]
+            table_meta, empty_meta, notice_meta = production_metas
+            results.append(
+                CheckResult(
+                    "production current-table push helpers preserve capability meta and source identity",
+                    len(production_metas) == 3
+                    and table_meta.get("result_status") == "success"
+                    and empty_meta.get("result_status") == "no_data"
+                    and notice_meta.get("result_status") == "column_unavailable"
+                    and all(meta.get("source_call_count") == 0 for meta in production_metas)
+                    and table_meta.get("source_action") == "제약사별 매출 추세 분석 요약표"
+                    and table_meta.get("source_table_key") == "source-fixture"
+                    and table_meta.get("nlq_query") == "현재표 제조사별 요약"
+                    and table_meta.get("result_metric") == "sales"
+                    and table_meta.get("requested_metrics") == ["sales"]
+                    and table_meta.get("requested_groupings") == ["manufacturer"]
+                    and table_meta.get("issue_codes") == []
+                    and table_meta.get("table_created") is True
+                    and empty_meta.get("requested_grouping") == "product_group"
+                    and empty_meta.get("table_created") is False
+                    and notice_meta.get("missing_columns") == ["제품"]
+                    and notice_meta.get("source_table_key") == "source-fixture"
+                    and notice_meta.get("table_created") is False
+                    and [record.get("question") for record in production_records]
+                    == ["현재표 제조사별 요약", "현재표 제품그룹별 요약", "현재표 제품별 매출 TOP 20"]
+                    and [record.get("result_status") for record in production_records]
+                    == ["success", "no_data", "column_unavailable"]
+                    and all(record.get("source_call_count") == 0 for record in production_records)
+                    and [record.get("requested_metrics") for record in production_records]
+                    == [["sales"], ["sales"], ["sales"]]
+                    and [record.get("requested_groupings") for record in production_records]
+                    == [["manufacturer"], ["product_group"], ["product"]]
+                    and [record.get("issue_codes") for record in production_records] == [[], [], []]
+                    and [record.get("table_created") for record in production_records] == [True, False, False]
+                    and [record.get("source_table_key") for record in production_records]
+                    == ["source-fixture", "source-fixture", "source-fixture"],
+                    f"metas={production_metas!r}, records={production_records!r}",
+                )
+            )
 
         unlabeled_payload = {
             "id": "case-unlabeled",
@@ -2836,7 +3154,7 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         CheckResult(
             "product inventory partial export cache is never promoted to full",
             partial_source.get("df") is None
-            and partial_source.get("source_status") == "display_only_partial"
+            and partial_source.get("source_status") == "partial_unverified"
             and partial_source.get("expected_rows") == 542,
             f"partial_source={partial_source}",
         )
@@ -2861,6 +3179,254 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
             and "CSV/EXCEL은 현재 화면 데이터 300건만 포함합니다." in captions
             and "전체 예상 결과는 542건입니다." in captions,
             f"warnings={warnings!r}, captions={captions!r}",
+        )
+    )
+
+    required_partial_limit_keys = (
+        '"expected_rows"',
+        '"prepared_rows"',
+        '"download_row_count"',
+        '"download_limit_rows"',
+        '"applied_download_limit_rows"',
+        '"limit_hit"',
+        '"download_source_status"',
+        '"source_call_count"',
+    )
+    results.append(
+        CheckResult(
+            "partitioned history retains verified partial-limit diagnostics",
+            all(key in main_source for key in required_partial_limit_keys),
+            "required_partial_limit_keys=" + ",".join(required_partial_limit_keys),
+        )
+    )
+
+    capped_rows = 100_000
+    capped_expected_rows = 1_159_102
+    capped_df = pd.DataFrame({"순번": range(1, capped_rows + 1)})
+    capped_meta = {
+        **meta,
+        "download_row_count": capped_rows,
+        "download_limit_rows": capped_rows,
+        "limit_hit": True,
+        "row_count_total": capped_expected_rows,
+        "expected_rows": capped_expected_rows,
+    }
+    capped_provenance = {**expected_provenance, "rows": capped_rows}
+    capped_session = {
+        "sims_export_tables": {"history-product-inventory": capped_df},
+        "__sims_export_tables_by_key": {"history-product-inventory": capped_df},
+        "__sims_export_table_provenance_by_key": {
+            "history-product-inventory": capped_provenance,
+        },
+    }
+    with patch.object(chat_middleware.st, "session_state", capped_session):
+        capped_source = chat_middleware._resolve_payload_full_download_source(
+            item,
+            capped_meta,
+            display_df=display_df.head(200),
+        )
+    capped_warnings: list[str] = []
+    capped_captions: list[str] = []
+    with (
+        patch.object(chat_middleware.st, "warning", lambda message, **_kwargs: capped_warnings.append(str(message))),
+        patch.object(chat_middleware.st, "caption", lambda message, **_kwargs: capped_captions.append(str(message))),
+    ):
+        capped_notice = chat_middleware._render_partial_download_source_notice(
+            source_status="partial_limit",
+            download_rows=capped_rows,
+            expected_rows=capped_expected_rows,
+        )
+    results.append(
+        CheckResult(
+            "capped full source is reported as partial limit instead of missing",
+            isinstance(capped_source.get("df"), pd.DataFrame)
+            and len(capped_source["df"]) == capped_rows
+            and capped_source.get("source_status") == "partial_limit"
+            and capped_notice
+            and capped_warnings == [
+                "전체 예상 1,159,102건 중 다운로드 상한 100,000건이 준비되었습니다. 현재 파일은 전체 자료가 아닙니다."
+            ]
+            and any("100,000건" in caption and "1,159,102건" in caption for caption in capped_captions),
+            f"capped_source={capped_source}, warnings={capped_warnings!r}, captions={capped_captions!r}",
+        )
+    )
+
+    generated_limit_meta = {"row_count_total": capped_expected_rows}
+    generated_limit_status = chat_middleware._record_io_full_source_limit_meta(
+        generated_limit_meta,
+        action="출고명세 조회",
+        prepared_rows=capped_rows,
+        expected_rows=capped_expected_rows,
+        applied_limit_rows=capped_rows,
+    )
+    below_limit_meta = {"row_count_total": capped_expected_rows}
+    below_limit_status = chat_middleware._record_io_full_source_limit_meta(
+        below_limit_meta,
+        action="출고명세 조회",
+        prepared_rows=capped_rows - 1,
+        expected_rows=capped_expected_rows,
+        applied_limit_rows=capped_rows,
+    )
+    results.append(
+        CheckResult(
+            "outbound full-source boundary records the actual applied export cap",
+            generated_limit_status == "partial_limit"
+            and generated_limit_meta.get("applied_download_limit_rows") == capped_rows
+            and generated_limit_meta.get("download_limit_rows") == capped_rows
+            and generated_limit_meta.get("limit_hit") is True
+            and generated_limit_meta.get("download_row_count") == capped_rows
+            and generated_limit_meta.get("prepared_rows") == capped_rows
+            and generated_limit_meta.get("expected_rows") == capped_expected_rows
+            and generated_limit_meta.get("download_source_status") == "partial_limit"
+            and generated_limit_meta.get("source_call_count") == 0,
+            f"generated_limit_meta={generated_limit_meta!r}",
+        )
+    )
+
+    outbound_query_meta = {
+        "action": "출고명세 조회",
+        "table_key": "outbound-cap-fixture",
+        "row_count_total": capped_expected_rows,
+        "expected_rows": capped_expected_rows,
+        "company_id": "4",
+        "room_id": "room-outbound-cap",
+    }
+    outbound_query_item = {
+        "action": "출고명세 조회",
+        "params": {"date_from": "20260101", "date_to": "20261231"},
+        "meta": outbound_query_meta,
+        "company_id": "4",
+        "room_id": "room-outbound-cap",
+    }
+    outbound_query_session: dict[str, Any] = {}
+    import app.services.rddbc120_service as rddbc120_service
+
+    with (
+        patch.object(chat_middleware.st, "session_state", outbound_query_session),
+        patch.object(rddbc120_service, "get_rddbc120_export_limit_rows", lambda: capped_rows),
+        patch.object(rddbc120_service, "get_rddbc120_export_df", lambda _params: capped_df),
+    ):
+        outbound_query_df = chat_middleware._get_full_download_df_for_sims_item(
+            outbound_query_item,
+            outbound_query_meta,
+            display_df.head(200),
+        )
+    outbound_query_provenance = (
+        outbound_query_session.get("__sims_export_table_provenance_by_key", {}).get(
+            "outbound-cap-fixture", {}
+        )
+    )
+    results.append(
+        CheckResult(
+            "outbound export query payload carries verified partial-limit metadata end to end",
+            isinstance(outbound_query_df, pd.DataFrame)
+            and len(outbound_query_df) == capped_rows
+            and outbound_query_meta.get("applied_download_limit_rows") == capped_rows
+            and outbound_query_meta.get("download_limit_rows") == capped_rows
+            and outbound_query_meta.get("limit_hit") is True
+            and outbound_query_meta.get("download_row_count") == capped_rows
+            and outbound_query_meta.get("prepared_rows") == capped_rows
+            and outbound_query_meta.get("expected_rows") == capped_expected_rows
+            and outbound_query_meta.get("download_source_status") == "partial_limit"
+            and outbound_query_meta.get("source_call_count") == 0
+            and outbound_query_provenance.get("download_source_status") == "partial_limit"
+            and outbound_query_provenance.get("limit_hit") is True,
+            f"meta={outbound_query_meta!r}, provenance={outbound_query_provenance!r}",
+        )
+    )
+    results.append(
+        CheckResult(
+            "outbound result below its applied cap is not reported as partial limit",
+            below_limit_status == "partial_unverified"
+            and below_limit_meta.get("limit_hit") is False
+            and below_limit_meta.get("download_source_status") == "partial_unverified",
+            f"below_limit_meta={below_limit_meta!r}",
+        )
+    )
+
+    unverified_meta = {
+        key: value
+        for key, value in capped_meta.items()
+        if key not in {"download_limit_rows", "limit_hit"}
+    }
+    with patch.object(chat_middleware.st, "session_state", capped_session):
+        unverified_source = chat_middleware._resolve_payload_full_download_source(
+            item,
+            unverified_meta,
+            display_df=display_df.head(200),
+        )
+    results.append(
+        CheckResult(
+            "partial source without an explicit cap is not reported as partial limit",
+            unverified_source.get("df") is None
+            and unverified_source.get("source_status") == "partial_unverified"
+            and unverified_source.get("source_rows") == capped_rows
+            and unverified_source.get("expected_rows") == capped_expected_rows,
+            f"unverified_source={unverified_source}",
+        )
+    )
+
+    capped_status = chat_middleware._partial_download_source_status(
+        capped_meta,
+        prepared_rows=capped_rows,
+        expected_rows=capped_expected_rows,
+    )
+    download_count_only_status = chat_middleware._partial_download_source_status(
+        unverified_meta,
+        prepared_rows=capped_rows,
+        expected_rows=capped_expected_rows,
+    )
+    middleware_source = inspect.getsource(chat_middleware)
+    results.append(
+        CheckResult(
+            "all partial download and history restore paths share the explicit-cap classifier",
+            capped_status == "partial_limit"
+            and download_count_only_status == "partial_unverified"
+            and middleware_source.count("_partial_download_source_status(") >= 4
+            and middleware_source.count("_record_io_full_source_limit_meta(") >= 3
+            and "declared_download_rows == recovered_rows" not in middleware_source,
+            f"capped={capped_status}, download_count_only={download_count_only_status}",
+        )
+    )
+    derived_context = chat_middleware._download_source_context(
+        item,
+        {
+            **meta,
+            "result_metric": "sales",
+            "result_grain": "product",
+            "filter_column": "판정결과",
+            "filter_value": "안정",
+        },
+        table_key="history-product-inventory",
+    )
+
+    limit_context = chat_middleware._download_source_context(
+        item,
+        generated_limit_meta,
+        table_key="history-product-inventory",
+    )
+    results.append(
+        CheckResult(
+            "export provenance retains partial-limit ownership diagnostics",
+            limit_context.get("applied_download_limit_rows") == capped_rows
+            and limit_context.get("download_limit_rows") == capped_rows
+            and limit_context.get("download_row_count") == capped_rows
+            and limit_context.get("prepared_rows") == capped_rows
+            and limit_context.get("expected_rows") == capped_expected_rows
+            and limit_context.get("limit_hit") is True
+            and limit_context.get("download_source_status") == "partial_limit"
+            and limit_context.get("source_call_count") == 0,
+            f"limit_context={limit_context!r}",
+        )
+    )
+    results.append(
+        CheckResult(
+            "derived table provenance keeps the official metric, grain, and judgement filter",
+            derived_context.get("result_metric") == "sales"
+            and derived_context.get("result_grain") == "product"
+            and derived_context.get("filter_column") == "판정결과"
+            and derived_context.get("filter_value") == "안정",
+            f"derived_context_keys={sorted(derived_context)}",
         )
     )
 
@@ -2907,12 +3473,45 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         )
     results.append(
         CheckResult(
-            "product inventory export provenance blocks foreign scope and current-table fallback",
+            "product inventory export provenance blocks foreign scope and unverified current-table fallback",
             mismatch_source.get("df") is None
             and mismatch_source.get("source_status") in {"not_found", "display_only_partial"}
             and current_source.get("df") is None
-            and current_source.get("source_name") == "current_table_no_fallback",
+            and current_source.get("source_status") in {"not_found", "display_only_partial"},
             f"mismatch_source={mismatch_source}, current_source={current_source}",
+        )
+    )
+
+    derived_key = "derived-stable-detail"
+    derived_meta = {
+        **meta,
+        "table_key": derived_key,
+        "current_table_followup": True,
+        "analysis_row_count": 61981,
+    }
+    derived_full = pd.DataFrame({"제품코드": ["P-1"] * 61981, "제품명": ["안정제품"] * 61981})
+    derived_provenance = {**expected_provenance, "table_key": derived_key, "rows": 61981}
+    derived_session = {
+        "sims_export_tables": {derived_key: derived_full, "history-product-inventory": full_df},
+        "__sims_export_table_provenance_by_key": {
+            derived_key: derived_provenance,
+            "history-product-inventory": expected_provenance,
+        },
+    }
+    with patch.object(chat_middleware.st, "session_state", derived_session):
+        derived_source = chat_middleware._resolve_payload_full_download_source(
+            {**item, "table_key": derived_key, "df": display_df},
+            derived_meta,
+            display_df=display_df,
+        )
+    results.append(
+        CheckResult(
+            "derived current-table export uses only its own verified full source",
+            isinstance(derived_source.get("df"), pd.DataFrame)
+            and len(derived_source["df"]) == 61981
+            and derived_source.get("source_table_key") == derived_key
+            and derived_source.get("source_status") == "full",
+            f"derived_source={derived_source}",
         )
     )
 
@@ -3326,6 +3925,27 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
             "product flow fast renderer passes normalized date display dataframe",
             flow_render_boundary_ok,
             f"source_dates={flow_history['입출고일자'].tolist()}, rendered_rows={len(flow_final_frame)}, dates={flow_final_frame['입출고일자'].tolist() if '입출고일자' in flow_final_frame else []}, invoice_dates={flow_final_frame['명세서일자'].tolist() if '명세서일자' in flow_final_frame else []}, in={flow_final_frame['입고수량'].tolist() if '입고수량' in flow_final_frame else []}, out={flow_final_frame['출고수량'].tolist() if '출고수량' in flow_final_frame else []}, in_dtype={flow_final_frame['입고수량'].dtype if '입고수량' in flow_final_frame else ''}, config_keys={list((flow_rendered_kwargs[0].get('column_config') or {}).keys()) if flow_rendered_kwargs else []}, token_values={flow_final_frame.loc[flow_final_frame.index[0], ['단가적용거래처','재고적용거래처','재고위치','매입처']].tolist() if len(flow_final_frame) else []}, text={flow_text_rendered!r}",
+        )
+    )
+
+    carryover_display_source = pd.DataFrame(
+        {
+            "입출고일자": ["이월재고", "2026/07/29"],
+            "명세서번호": ["None", "None"],
+            "제조번호": [None, "M-01"],
+            "검수확인": [pd.NA, "Y"],
+        }
+    )
+    carryover_display = chat_middleware._preserve_product_flow_table_dtypes(carryover_display_source)
+    results.append(
+        CheckResult(
+            "product flow carryover display clears only synthetic-row missing text",
+            carryover_display.loc[0, "명세서번호"] == ""
+            and carryover_display.loc[0, "제조번호"] == ""
+            and carryover_display.loc[0, "검수확인"] == ""
+            and carryover_display.loc[1, "명세서번호"] == "None"
+            and carryover_display_source.loc[0, "명세서번호"] == "None",
+            f"display={carryover_display.to_dict(orient='records')}, source={carryover_display_source.to_dict(orient='records')}",
         )
     )
 

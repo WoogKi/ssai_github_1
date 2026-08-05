@@ -151,6 +151,23 @@ def classify_current_table_followup_intent(query: str) -> str:
     if any(marker in intent_compact for marker in explicit_table_markers):
         return "dataframe_table"
 
+    current_table_summary_dimensions = (
+        "추세판정별",
+        "제조사별",
+        "제조사명별",
+        "예상등급별",
+        "제품그룹별",
+        "제품구분별",
+        "제품분류별",
+        "판정결과별",
+    )
+    current_table_summary_requests = ("요약", "집계", "분석", "매출")
+    if (
+        any(dimension in intent_compact for dimension in current_table_summary_dimensions)
+        and any(request in intent_compact for request in current_table_summary_requests)
+    ):
+        return "dataframe_table"
+
     dimension_markers = (
         "거래처별",
         "제품별",
@@ -315,7 +332,522 @@ def detect_current_table_kind(source_action: str) -> str:
     ):
         return "analytics_kpi"
 
+    if s.startswith("현재표") and any(
+        marker in s
+        for marker in ("매출", "예상", "재고부족", "부족등급", "추세판정", "판정결과")
+    ):
+        return "analytics_kpi"
+
     return "generic"
+
+
+_CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("product", "제품", ("제품별", "품목별"), ("제품명", "품목명", "상품명", "제품코드", "품목코드", "상품코드")),
+    ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
+    ("product_group", "제품그룹", ("제품그룹별",), ("제품그룹명", "제품그룹")),
+    ("product_category", "제품구분", ("제품구분별",), ("제품구분명", "제품구분")),
+    ("product_class", "제품분류", ("제품분류별",), ("제품분류명", "제품분류")),
+    ("forecast_grade", "예상등급", ("예상등급별",), ("예상등급",)),
+    ("trend_judgement", "추세판정", ("추세판정별",), ("추세판정",)),
+    ("judgement_result", "판정결과", ("판정결과별",), ("판정결과",)),
+)
+
+_CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "sales",
+        "매출액",
+        (
+            "매출합계",
+            "총매출액",
+            "총매출공급가액",
+            "매출공급가액",
+            "매출금액",
+            "매출액",
+            "월시점 실제매출",
+        ),
+    ),
+    (
+        "shortage",
+        "부족등급 또는 부족수량 또는 현재재고수량",
+        (
+            "부족등급",
+            "1개월부족수량",
+            "2개월부족수량",
+            "3개월부족수량",
+            "부족예상수량",
+            "배정부족예상수량",
+            "현재재고수량",
+        ),
+    ),
+    (
+        "forecast_sales",
+        "예상매출",
+        (
+            "당월 예상매출",
+            "월시점 예상매출",
+            "평가월 예상매출",
+            "예상매출",
+        ),
+    ),
+)
+
+_CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
+    "sales": frozenset(
+        {
+            "product",
+            "manufacturer",
+            "product_group",
+            "product_category",
+            "product_class",
+            "forecast_grade",
+            "trend_judgement",
+            "judgement_result",
+        }
+    ),
+    "shortage": frozenset(
+        {
+            "product",
+            "manufacturer",
+            "product_group",
+            "product_category",
+            "product_class",
+            "forecast_grade",
+        }
+    ),
+    "forecast_sales": frozenset(
+        {
+            "product",
+            "manufacturer",
+            "product_group",
+            "product_category",
+            "product_class",
+            "forecast_grade",
+            "trend_judgement",
+            "judgement_result",
+        }
+    ),
+}
+
+
+def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tuple[str, ...]]]:
+    compact = re.sub(r"\s+", "", str(query or ""))
+    requested: list[tuple[int, tuple[str, str, tuple[str, ...]]]] = []
+    for key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
+        positions = [compact.find(phrase) for phrase in phrases if compact.find(phrase) >= 0]
+        if positions:
+            requested.append((min(positions), (key, label, aliases)))
+    return [item for _position, item in sorted(requested, key=lambda entry: entry[0])]
+
+
+def _current_table_dimension_columns(df: pd.DataFrame, aliases: tuple[str, ...]) -> list[str]:
+    normalized_aliases = {re.sub(r"\s+", "", alias) for alias in aliases}
+    return [
+        str(column)
+        for column in df.columns
+        if re.sub(r"\s+", "", str(column)) in normalized_aliases
+    ]
+
+
+def _current_table_metric_columns(df: pd.DataFrame, metric: str) -> list[str]:
+    for key, _label, aliases in _CURRENT_TABLE_METRIC_SPECS:
+        if key == metric:
+            return _current_table_dimension_columns(df, aliases)
+    return []
+
+
+def _current_table_metric_label(metric: str) -> str:
+    for key, label, _aliases in _CURRENT_TABLE_METRIC_SPECS:
+        if key == metric:
+            return label
+    return ""
+
+
+def _current_table_requested_metrics(query: str) -> list[str]:
+    compact = re.sub(r"\s+", "", str(query or ""))
+    metrics: list[str] = []
+    if "예상매출" in compact:
+        metrics.append("forecast_sales")
+    elif "매출" in compact:
+        metrics.append("sales")
+    if "부족" in compact:
+        metrics.append("shortage")
+    # 재고부족은 shortage 단일 metric이다. 단순 재고는 별도 공식 metric이
+    # 아직 없으므로 stock으로 보존한 뒤 capability에서 명시적으로 차단한다.
+    # `재고수량`은 제품수불/재고표의 기존 수량 열 이름이다. 독립 재고
+    # metric 요청으로 오인하면 영업사원별 재고수량 TOP 같은 정상 집계를 막는다.
+    stock_quantity_terms = ("재고수량", "현재재고수량", "최종재고수량")
+    if (
+        "재고" in compact
+        and "부족" not in compact
+        and not any(term in compact for term in stock_quantity_terms)
+    ):
+        metrics.append("stock")
+    return metrics
+
+
+def _is_sales_trend_current_table(source_action: str) -> bool:
+    return "매출추세" in re.sub(r"\s+", "", str(source_action or ""))
+
+
+def _current_table_source_metric_hint(
+    source_action: str,
+    df: pd.DataFrame | None = None,
+    source_meta: dict[str, Any] | None = None,
+) -> str:
+    """Infer a metric only from an unambiguous source action and real metric column."""
+    if isinstance(source_meta, dict):
+        persisted_metric = str(
+            source_meta.get("result_metric") or source_meta.get("source_metric") or ""
+        ).strip()
+        if persisted_metric in _CURRENT_TABLE_METRIC_GROUPING_SUPPORT:
+            if df is None or _current_table_metric_columns(df, persisted_metric):
+                return persisted_metric
+
+    compact = re.sub(r"\s+", "", str(source_action or ""))
+    if "재고부족" in compact:
+        candidate = "shortage"
+    elif "예상매출" in compact:
+        candidate = "forecast_sales"
+    elif "매출추세" in compact or ("현재표" in compact and "매출" in compact):
+        candidate = "sales"
+    else:
+        return ""
+    if df is not None and not _current_table_metric_columns(df, candidate):
+        return ""
+    return candidate
+
+
+def _is_product_top_request(query: str) -> bool:
+    compact = re.sub(r"\s+", "", str(query or ""))
+    return (
+        any(word in compact for word in ("제품", "품목"))
+        and any(marker in compact for marker in ("TOP", "top", "상위"))
+    )
+
+
+def _current_table_followup_intent(
+    query: str,
+    source_action: str = "",
+    df: pd.DataFrame | None = None,
+    source_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    requested_dimensions = _requested_current_table_dimensions(query)
+    metrics = _current_table_requested_metrics(query)
+    source_metric = _current_table_source_metric_hint(source_action, df, source_meta)
+    if not metrics and source_metric and (
+        _is_product_top_request(query) or len(requested_dimensions) == 1
+    ):
+        # 질문이 지표를 생략한 경우에도 원본 action과 실제 컬럼이 함께 하나의
+        # 공식 지표를 확정할 때만 이를 재사용한다.
+        metrics.append(source_metric)
+    groupings = [key for key, _label, _aliases in requested_dimensions]
+    if not groupings and len(metrics) == 1:
+        inferred_grouping = _current_table_requested_grouping(query, metrics[0], source_action)
+        if inferred_grouping:
+            groupings.append(inferred_grouping)
+    return {
+        "requested_metrics": metrics,
+        "requested_groupings": groupings,
+        "requested_metric": metrics[0] if len(metrics) == 1 else "",
+        "requested_grouping": groupings[0] if len(groupings) == 1 else "",
+        "requested_dimensions": requested_dimensions,
+    }
+
+
+def _current_table_requested_grouping(query: str, metric: str, source_action: str = "") -> str:
+    requested = _requested_current_table_dimensions(query)
+    if len(requested) == 1:
+        return requested[0][0]
+
+    # "재고부족 품목 TOP"은 문장상 "품목별"이 생략됐어도 제품 단위
+    # 부족 순위를 요구한다. 일반 제품 단어만으로 차원을 추정하지 않는다.
+    compact = re.sub(r"\s+", "", str(query or ""))
+    if metric == "shortage" and any(word in compact for word in ("제품", "품목")):
+        return "product"
+    if metric == "shortage" and any(word in compact for word in ("TOP", "top", "상위")):
+        return "product"
+    if metric == "sales" and _is_sales_trend_current_table(source_action) and _is_product_top_request(query):
+        return "product"
+    return ""
+
+
+def _looks_like_formatted_amount(value: Any) -> bool:
+    """Detect a money-formatted value in a product-name output without flagging normal codes/names."""
+    if value is None or pd.isna(value):
+        return False
+    text = str(value).strip()
+    return bool(re.fullmatch(r"[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}", text))
+
+
+def _current_table_result_contract_error(
+    df: Any,
+    capability: dict[str, Any],
+) -> str:
+    """Return a stable reason when a metric/grouping result cannot be delivered safely."""
+    if not capability.get("requires_result_contract"):
+        return ""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return ""
+
+    grouping = str(capability.get("requested_grouping") or "")
+    metric = str(capability.get("requested_metric") or "")
+    dimension_aliases = next(
+        (aliases for key, _label, _phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS if key == grouping),
+        (),
+    )
+    if not _current_table_dimension_columns(df, dimension_aliases):
+        return "result_grouping_missing"
+    if not _current_table_metric_columns(df, metric):
+        return "result_metric_missing"
+
+    if grouping == "product":
+        product_code_cols = _current_table_dimension_columns(df, ("제품코드", "품목코드", "상품코드"))
+        product_name_cols = _current_table_dimension_columns(df, ("제품명", "품목명", "상품명"))
+        if not product_code_cols and not product_name_cols:
+            return "result_product_missing"
+        product_key = product_code_cols[0] if product_code_cols else product_name_cols[0]
+        if df[product_key].astype(str).str.strip().duplicated().any():
+            return "result_product_grain_mismatch"
+        if product_name_cols and df[product_name_cols[0]].map(_looks_like_formatted_amount).any():
+            return "result_product_name_metric_contamination"
+        if product_code_cols and product_name_cols:
+            mapping_counts = (
+                df[[product_code_cols[0], product_name_cols[0]]]
+                .dropna(subset=[product_code_cols[0]])
+                .groupby(product_code_cols[0], dropna=False)[product_name_cols[0]]
+                .nunique(dropna=True)
+            )
+            if (mapping_counts > 1).any():
+                return "result_product_code_name_mapping_mismatch"
+    return ""
+
+
+def _current_table_followup_capability(
+    *,
+    df: pd.DataFrame,
+    query: str,
+    source_action: str,
+    kind: str,
+    source_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    intent = _current_table_followup_intent(query, source_action, df, source_meta)
+    metrics = intent["requested_metrics"]
+    groupings = intent["requested_groupings"]
+    metric = intent["requested_metric"]
+    grouping = intent["requested_grouping"]
+    requested = intent["requested_dimensions"]
+    missing_columns: list[str] = []
+    available_columns: list[str] = []
+    for _, label, aliases in requested:
+        matches = _current_table_dimension_columns(df, aliases)
+        if matches:
+            available_columns.extend(matches)
+        else:
+            missing_columns.append(label)
+
+    metric_columns = _current_table_metric_columns(df, metric)
+    base = {
+        "requested_metrics": metrics,
+        "requested_groupings": groupings,
+        "requested_metric": metric,
+        "requested_grouping": grouping,
+        "missing_columns": missing_columns,
+        "available_columns": available_columns,
+        "metric_columns": metric_columns,
+        "issue_codes": [],
+    }
+    compact_query = re.sub(r"\s+", "", str(query or ""))
+    if (
+        any(token in compact_query for token in ("판정결과", "추세판정"))
+        and any(token in compact_query for token in ("TOP", "top", "상위"))
+        and not grouping
+    ):
+        return {
+            **base,
+            "status": "unsupported",
+            "requires_result_contract": False,
+            "issue_codes": ["filter_grouping_required"],
+        }
+    if len(metrics) > 1 or len(groupings) > 1:
+        return {
+            **base,
+            "status": "unsupported",
+            "requires_result_contract": False,
+            "issue_codes": ["multiple_metric_or_grouping_unsupported"],
+        }
+    if metric == "stock":
+        return {
+            **base,
+            "status": "unsupported",
+            "requires_result_contract": False,
+            "issue_codes": ["stock_metric_undefined"],
+        }
+    # A requested metric must be present even when the question does not name a
+    # grouping. Otherwise a generic TOP path could silently rank another value.
+    metric_missing = bool(metric and not metric_columns)
+    if missing_columns:
+        return {
+            **base,
+            "status": "column_unavailable",
+            "requires_result_contract": bool(metric and grouping),
+        }
+
+    if metric_missing:
+        return {
+            **base,
+            "status": "column_unavailable",
+            "missing_columns": [_current_table_metric_label(metric)],
+            "metric_columns": [],
+            "requires_result_contract": True,
+        }
+
+    if requested and not any(
+        df[column].notna().astype(bool).any()
+        and df[column].astype(str).str.strip().replace({"nan": "", "None": "", "<NA>": ""}).ne("").any()
+        for column in available_columns
+    ):
+        return {
+            **base,
+            "status": "no_data",
+            "requires_result_contract": bool(metric and grouping),
+        }
+
+    if (
+        kind == "analytics_kpi"
+        and metric
+        and grouping
+        and grouping not in _CURRENT_TABLE_METRIC_GROUPING_SUPPORT.get(metric, frozenset())
+    ):
+        return {
+            **base,
+            "status": "unsupported",
+            "requires_result_contract": True,
+        }
+
+    if kind in {"sales_detail", "purchase_detail"} and len(requested) > 1:
+        return {
+            **base,
+            "status": "unsupported",
+            "requested_grouping": "",
+            "requires_result_contract": False,
+        }
+
+    return {
+        **base,
+        "status": "success",
+        "requires_result_contract": bool(metric and grouping),
+    }
+
+
+def _current_table_exact_filter_value(df: pd.DataFrame, column: str, query: str) -> str:
+    """Return one exact, maximal judgement value mentioned by the user."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    values = [
+        str(value).strip()
+        for value in df[column].dropna().astype("string").tolist()
+        if str(value).strip() and str(value).strip().lower() not in {"nan", "none", "<na>"}
+    ]
+    unique_values = list(dict.fromkeys(values))
+    matches = [value for value in unique_values if re.sub(r"\s+", "", value) in compact]
+    maximal = [
+        value for value in matches
+        if not any(
+            value != other
+            and re.sub(r"\s+", "", value) in re.sub(r"\s+", "", other)
+            for other in matches
+        )
+    ]
+    return maximal[0] if len(maximal) == 1 else ""
+
+
+def _has_unlabeled_judgement_value(query: str) -> bool:
+    compact = re.sub(r"\s+", "", str(query or ""))
+    return any(
+        re.sub(r"\s+", "", value) in compact
+        for value in ("감소", "안정", "증가", "신규/증가", "자료부족", "반품주의")
+    )
+
+
+def _current_table_product_top_filter(
+    *,
+    df: pd.DataFrame,
+    query: str,
+    source_action: str,
+    source_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply a canonical trend-judgement filter before an analytics product TOP."""
+    result = {
+        "df": df,
+        "status": "success",
+        "filter_column": "",
+        "filter_value": "",
+        "missing_columns": [],
+        "issue_codes": [],
+    }
+    if (
+        _current_table_source_metric_hint(source_action, df, source_meta) != "sales"
+        or not _is_product_top_request(query)
+    ):
+        return result
+
+    compact = re.sub(r"\s+", "", str(query or ""))
+
+    explicit_columns = []
+    explicit_label = ""
+    if "판정결과" in compact:
+        explicit_columns = _current_table_dimension_columns(df, ("판정결과",))
+        explicit_label = "판정결과"
+    elif "추세판정" in compact:
+        explicit_columns = _current_table_dimension_columns(df, ("추세판정",))
+        explicit_label = "추세판정"
+
+    if explicit_label and not explicit_columns:
+        return {
+            **result,
+            "status": "column_unavailable",
+            "missing_columns": [explicit_label],
+            "issue_codes": ["filter_column_missing"],
+        }
+
+    judgement_columns = explicit_columns
+    if not explicit_label:
+        judgement_columns = [
+            column
+            for column in _current_table_dimension_columns(df, ("추세판정", "판정결과"))
+            if _current_table_exact_filter_value(df, column, query)
+        ]
+        if not judgement_columns:
+            if not _has_unlabeled_judgement_value(query):
+                return result
+            return {
+                **result,
+                "status": "unsupported",
+                "issue_codes": ["filter_value_not_found"],
+            }
+    if len(judgement_columns) != 1:
+        return {
+            **result,
+            "status": "unsupported" if judgement_columns else "column_unavailable",
+            "missing_columns": ([] if judgement_columns else [explicit_label or "판정 컬럼"]),
+            "issue_codes": ["filter_column_ambiguous" if judgement_columns else "filter_column_missing"],
+        }
+
+    column = judgement_columns[0]
+    filter_value = _current_table_exact_filter_value(df, column, query)
+    if not filter_value:
+        return {
+            **result,
+            "status": "unsupported",
+            "issue_codes": ["filter_value_ambiguous_or_missing"],
+        }
+    filtered = df[df[column].astype("string").str.strip().eq(filter_value)].copy()
+    return {
+        **result,
+        "df": filtered,
+        "status": "no_data" if filtered.empty else "success",
+        "filter_column": column,
+        "filter_value": filter_value,
+    }
 
 
 
@@ -384,6 +916,7 @@ def _push_dispatch_notice(
     message: str,
     query_summary: str,
     source_query: str,
+    extra_meta: dict[str, Any] | None = None,
 ) -> bool:
     push_notice = helpers.get("push_notice")
     if not callable(push_notice):
@@ -395,6 +928,7 @@ def _push_dispatch_notice(
             message=message,
             query_summary=query_summary,
             source_query=source_query,
+            extra_meta=extra_meta,
         )
     )
 
@@ -422,6 +956,7 @@ def handle_current_table_followup_by_action(
     source_action: str,
     helpers: dict[str, Callable[..., Any]],
     log: Any,
+    source_meta: dict[str, Any] | None = None,
 ) -> bool:
     """
     현재표 후속질문을 원본 action 기준으로 먼저 처리한다.
@@ -435,6 +970,181 @@ def handle_current_table_followup_by_action(
       질문에 답 없이 끝나는 일을 막는다.
     """
     kind = detect_current_table_kind(source_action)
+    if (
+        kind == "generic"
+        and isinstance(source_meta, dict)
+        and str(source_meta.get("result_metric") or "").strip()
+        in _CURRENT_TABLE_METRIC_GROUPING_SUPPORT
+    ):
+        kind = "analytics_kpi"
+    filter_result = _current_table_product_top_filter(
+        df=df,
+        query=query,
+        source_action=source_action,
+        source_meta=source_meta,
+    )
+    dispatch_df = filter_result["df"]
+    dispatch_query = str(query or "")
+    if filter_result["filter_column"]:
+        # The generic analytics handler must not rediscover the already-applied
+        # source filter as a second, differently named column filter.
+        for token in ("추세판정", "판정결과", filter_result["filter_value"]):
+            dispatch_query = dispatch_query.replace(str(token), " ")
+    capability = _current_table_followup_capability(
+        df=dispatch_df,
+        query=query,
+        source_action=source_action,
+        kind=kind,
+        source_meta=source_meta,
+    )
+    if filter_result["status"] != "success":
+        capability = {
+            **capability,
+            "status": filter_result["status"],
+            "missing_columns": filter_result["missing_columns"],
+            "issue_codes": filter_result["issue_codes"],
+        }
+    capability_meta = {
+        "source_action": source_action,
+        "source_call_count": 0,
+        "requested_metrics": capability["requested_metrics"],
+        "requested_groupings": capability["requested_groupings"],
+        "requested_metric": capability["requested_metric"],
+        "requested_grouping": capability["requested_grouping"],
+        "missing_columns": capability["missing_columns"],
+        "issue_codes": capability["issue_codes"],
+        "filter_column": filter_result["filter_column"] or str(
+            (source_meta or {}).get("filter_column") or ""
+        ).strip(),
+        "filter_value": filter_result["filter_value"] or str(
+            (source_meta or {}).get("filter_value") or ""
+        ).strip(),
+    }
+
+    def _push_table_with_capability(**kwargs: Any) -> bool:
+        extra_meta = dict(kwargs.pop("extra_meta", {}) or {})
+        contract_error = _current_table_result_contract_error(kwargs.get("df"), capability)
+        if contract_error:
+            return _push_notice_with_capability(
+                title="현재표 결과 계약 불일치",
+                action="현재표 결과 계약 불일치",
+                message=(
+                    "현재표 후속분석 결과가 요청한 지표와 집계 단위를 충족하지 않아 표를 만들지 않았습니다.\n"
+                    "다른 지표나 집계 결과로 대신 조회하지 않았습니다."
+                ),
+                query_summary=f"현재표 / 결과 계약 불일치 / 원본={source_action}",
+                source_query=query,
+                source_table_key=table_key,
+                source_rows=len(df),
+                extra_meta={
+                    "execution_status": "routing_error",
+                    "result_status": "routing_error",
+                    "consistency_flags": ["result_contract_mismatch"],
+                    "issue_codes": ["result_contract_mismatch", contract_error],
+                },
+            )
+        extra_meta.setdefault("execution_status", "success")
+        extra_meta.setdefault("result_status", "success")
+        extra_meta.setdefault("result_metric", capability["requested_metric"])
+        extra_meta.setdefault("result_grain", capability["requested_grouping"])
+        extra_meta.setdefault(
+            "intent_validation_status",
+            "pass" if capability["requires_result_contract"] else "not_checked",
+        )
+        extra_meta.setdefault("table_created", True)
+        extra_meta.setdefault("issue_codes", [])
+        for key, value in capability_meta.items():
+            extra_meta.setdefault(key, value)
+        if filter_result["filter_column"]:
+            kwargs["source_query"] = query
+            title = str(kwargs.get("title") or "")
+            if title.startswith("현재표 제품별"):
+                kwargs["title"] = f"{filter_result['filter_column']} ‘{filter_result['filter_value']}’{title[3:]}"
+                kwargs["action"] = kwargs["title"]
+        kwargs.setdefault("source_table_key", table_key)
+        kwargs.setdefault("source_rows", len(df))
+        return bool(helpers["push_table"](**kwargs, extra_meta=extra_meta))
+
+    def _push_notice_with_capability(**kwargs: Any) -> bool:
+        extra_meta = dict(kwargs.pop("extra_meta", {}) or {})
+        status = str(extra_meta.get("execution_status") or capability["status"] or "unsupported")
+        extra_meta.setdefault("execution_status", status)
+        extra_meta.setdefault("result_status", status)
+        extra_meta.setdefault("result_metric", "")
+        extra_meta.setdefault("result_grain", "")
+        extra_meta.setdefault("intent_validation_status", "not_checked")
+        extra_meta.setdefault("table_created", False)
+        extra_meta.setdefault("issue_codes", capability["issue_codes"])
+        for key, value in capability_meta.items():
+            extra_meta.setdefault(key, value)
+        kwargs.setdefault("source_table_key", table_key)
+        kwargs.setdefault("source_rows", len(df))
+        return bool(helpers["push_notice"](**kwargs, extra_meta=extra_meta))
+
+    dispatch_helpers = dict(helpers)
+    dispatch_helpers["push_table"] = _push_table_with_capability
+    dispatch_helpers["push_notice"] = _push_notice_with_capability
+
+    if capability["status"] == "column_unavailable":
+        labels = ", ".join(capability["missing_columns"])
+        requested_label = " / ".join(
+            value
+            for value in (
+                _current_table_metric_label(capability["requested_metric"]),
+                next(
+                    (
+                        label
+                        for key, label, _phrases, _aliases in _CURRENT_TABLE_DIMENSION_SPECS
+                        if key == capability["requested_grouping"]
+                    ),
+                    "",
+                ),
+            )
+            if value
+        )
+        shortage_hint = ""
+        if capability["requested_metric"] == "shortage":
+            shortage_hint = (
+                "\n먼저 `품목별 재고부족현황 2026 조회`를 실행한 뒤, "
+                "새 결과표에서 부족등급별 요약 또는 재고부족 품목 TOP을 요청해 주세요."
+            )
+        return _push_dispatch_notice(
+            helpers=dispatch_helpers,
+            title="현재표 컬럼 부족",
+            action="현재표 컬럼 부족",
+            message=(
+                f"현재표에 {labels} 컬럼이 없어 요청한 {requested_label or '집계'}를 만들 수 없습니다.\n"
+                f"다른 집계 결과로 대신 조회하지 않았습니다.{shortage_hint}"
+            ),
+            query_summary=f"현재표 / 컬럼 부족 / 원본={source_action}",
+            source_query=query,
+            extra_meta={"execution_status": "column_unavailable", "result_status": "column_unavailable"},
+        )
+
+    if capability["status"] == "unsupported":
+        return _push_dispatch_notice(
+            helpers=dispatch_helpers,
+            title="현재표 후속분석 미지원",
+            action="현재표 후속분석 미지원",
+            message=(
+                f"현재표 원본 [{source_action}]에서는 요청한 복합 집계를 지원하지 않습니다.\n"
+                "다른 집계 결과로 대신 조회하지 않았습니다."
+            ),
+            query_summary=f"현재표 / 미지원 / 원본={source_action}",
+            source_query=query,
+            extra_meta={"execution_status": "unsupported", "result_status": "unsupported"},
+        )
+
+    if capability["status"] == "no_data":
+        return _push_dispatch_notice(
+            helpers=dispatch_helpers,
+            title="현재표 계산 결과 없음",
+            action="현재표 계산 결과 없음",
+            message="현재표의 요청 차원으로 계산한 결과가 없습니다.",
+            query_summary=f"현재표 / 결과 없음 / 원본={source_action}",
+            source_query=query,
+            extra_meta={"execution_status": "no_data", "result_status": "no_data"},
+        )
 
     if kind == "generic":
         # generic/마스터류는 기존 전용 요약을 먼저 시도하고,
@@ -447,7 +1157,7 @@ def handle_current_table_followup_by_action(
                     top_n=top_n,
                     table_key=table_key,
                     source_action=source_action,
-                    helpers=helpers,
+                    helpers=dispatch_helpers,
                     log=log,
                 )
             )
@@ -467,7 +1177,7 @@ def handle_current_table_followup_by_action(
                     top_n=top_n,
                     table_key=table_key,
                     source_action=source_action,
-                    helpers=helpers,
+                    helpers=dispatch_helpers,
                     log=log,
                 )
             )
@@ -487,7 +1197,7 @@ def handle_current_table_followup_by_action(
                     top_n=top_n,
                     table_key=table_key,
                     source_action=source_action,
-                    helpers=helpers,
+                    helpers=dispatch_helpers,
                     log=log,
                 )
             )
@@ -518,6 +1228,67 @@ def handle_current_table_followup_by_action(
         return False
 
     label = _current_followup_kind_label(kind, source_action)
+    normalized_query = re.sub(r"\s+", "", str(query or ""))
+    requires_manufacturer_dimension = kind == "analytics_kpi" and any(
+        marker in normalized_query
+        for marker in ("제조사별", "제조사명별", "제조사분석")
+    )
+    has_manufacturer_dimension = any(
+        "제조사" in str(column) or "제약사" in str(column)
+        for column in df.columns
+    )
+    if requires_manufacturer_dimension and not has_manufacturer_dimension:
+        return _push_dispatch_notice(
+            helpers=dispatch_helpers,
+            title="현재표 제조사별 분석 불가",
+            action="현재표 제조사별 분석 불가",
+            message="현재표에서 제조사명 또는 제약사명 컬럼을 찾지 못했습니다.",
+            query_summary=f"현재표 / 제조사별 분석 불가 / 전체 {len(df):,}건 기준",
+            source_query=query,
+        )
+
+    # 매출/재고부족처럼 지표와 집계 단위가 함께 명시된 분석/KPI 질문은
+    # 제품별 매출/재고부족 TOP은 원본 행을 집계해야 하므로 일반 컬럼 TOP보다
+    # action 전용 집계를 먼저 실행한다. 기존 제조사·추세판정 공통 집계는 유지한다.
+    requires_metric_grouping_handler = (
+        kind == "analytics_kpi"
+        and capability["requires_result_contract"]
+        and capability["requested_grouping"] in {"product", "manufacturer"}
+        and capability["requested_metric"] in {"sales", "shortage"}
+    )
+    if requires_metric_grouping_handler:
+        try:
+            if handler(
+                df=dispatch_df,
+                query=dispatch_query,
+                top_n=top_n,
+                table_key=table_key,
+                source_action=source_action,
+                helpers=dispatch_helpers,
+                log=log,
+            ):
+                return True
+        except Exception:
+            try:
+                log.exception("[chat.followup_table] analytics metric/grouping handler failed")
+            except Exception:
+                pass
+        return _push_dispatch_notice(
+            helpers=dispatch_helpers,
+            title="현재표 후속분석 미지원",
+            action="현재표 후속분석 미지원",
+            message=(
+                "현재표에서 요청한 지표와 집계 단위를 처리하지 못했습니다.\n"
+                "다른 지표나 집계 결과로 대신 조회하지 않았습니다."
+            ),
+            query_summary=f"현재표 / 미지원 / 원본={source_action}",
+            source_query=query,
+            extra_meta={
+                "execution_status": "unsupported",
+                "result_status": "unsupported",
+                "consistency_flags": ["requested_metric_grouping_handler_unavailable"],
+            },
+        )
 
     # "현재표 <컬럼명> <값> 상세히" 형태는 action별 미지원 안내보다 먼저
     # 실제 현재표 df.columns 기반 공통 필터 상세표로 처리한다.
@@ -528,7 +1299,7 @@ def handle_current_table_followup_by_action(
             top_n=top_n,
             table_key=table_key,
             source_action=source_action,
-            helpers=helpers,
+            helpers=dispatch_helpers,
             log=log,
         ):
             return True
@@ -548,7 +1319,7 @@ def handle_current_table_followup_by_action(
             top_n=top_n,
             table_key=table_key,
             source_action=source_action,
-            helpers=helpers,
+            helpers=dispatch_helpers,
             log=log,
         ):
             return True
@@ -566,7 +1337,7 @@ def handle_current_table_followup_by_action(
                 top_n=top_n,
                 table_key=table_key,
                 source_action=source_action,
-                helpers=helpers,
+                helpers=dispatch_helpers,
                 log=log,
             )
         )
@@ -577,7 +1348,7 @@ def handle_current_table_followup_by_action(
             pass
 
         return _push_dispatch_notice(
-            helpers=helpers,
+            helpers=dispatch_helpers,
             title=f"현재표 {label} 후속분석 오류",
             action=f"현재표 {label} 후속분석 오류",
             message=(
@@ -604,7 +1375,7 @@ def handle_current_table_followup_by_action(
             top_n=top_n,
             table_key=table_key,
             source_action=source_action,
-            helpers=helpers,
+            helpers=dispatch_helpers,
             log=log,
         ):
             return True
@@ -623,7 +1394,7 @@ def handle_current_table_followup_by_action(
             top_n=top_n,
             table_key=table_key,
             source_action=source_action,
-            helpers=helpers,
+            helpers=dispatch_helpers,
             log=log,
         ):
             return True
@@ -637,7 +1408,7 @@ def handle_current_table_followup_by_action(
     # 예: 입고명세 현재표에서 '매출거래처별 매출금액'을 물으면
     #     매입표로 오답을 만들지 말고 명확한 notice를 낸다.
     return _push_dispatch_notice(
-        helpers=helpers,
+        helpers=dispatch_helpers,
         title=f"현재표 {label} 후속분석 미지원",
         action=f"현재표 {label} 후속분석 미지원",
         message=(

@@ -80,6 +80,15 @@ def _ak_is_dimension_col(col: str | None) -> bool:
     return True
 
 
+def _ak_explicit_column(df: pd.DataFrame, aliases: tuple[str, ...]) -> str:
+    """Return only an exact business alias; never infer a dimension from position or dtype."""
+    normalized_aliases = {re.sub(r"\s+", "", alias) for alias in aliases}
+    for column in df.columns:
+        if re.sub(r"\s+", "", str(column)) in normalized_aliases:
+            return str(column)
+    return ""
+
+
 def _ak_clean_dimension_col(col: str | None) -> str | None:
     return col if _ak_is_dimension_col(col) else None
 
@@ -778,8 +787,8 @@ def find_similar_column(candidate: str, columns) -> str | None:
         return norm_to_col[norm_cand]
 
     aliases = {
-        "제조사": ("제조사명", "제조사"),
-        "제조사명": ("제조사명", "제조사"),
+        "제조사": ("제조사명", "제조사", "제약사명", "제약사"),
+        "제조사명": ("제조사명", "제조사", "제약사명", "제약사"),
         "제품그룹": ("제품그룹명", "제품그룹"),
         "제품그룹명": ("제품그룹명", "제품그룹"),
         "제품구분": ("제품구분명", "제품구분"),
@@ -882,18 +891,8 @@ def handle_analytics_kpi_followup(
         exclude_any=("등록", "수정"),
     )
 
-    product_col = find_col(
-        df,
-        exact=("제품명", "품목명", "상품명"),
-        include_any=("제품명", "품목명", "상품명"),
-        exclude_any=("코드", "번호", "분류", "구분"),
-    )
-    product_code_col = find_col(
-        df,
-        exact=("제품코드", "품목코드", "상품코드"),
-        include_any=("제품코드", "품목코드", "상품코드"),
-        exclude_any=("그룹", "분류", "구분"),
-    )
+    product_col = _ak_explicit_column(df, ("제품명", "품목명", "상품명"))
+    product_code_col = _ak_explicit_column(df, ("제품코드", "품목코드", "상품코드"))
     spec_col = find_col(
         df,
         exact=("규격", "제품규격"),
@@ -902,14 +901,14 @@ def handle_analytics_kpi_followup(
     )
     maker_col = find_col(
         df,
-        exact=("제조사명", "제조사"),
-        include_any=("제조사",),
+        exact=("제조사명", "제조사", "제약사명", "제약사"),
+        include_any=("제조사", "제약사"),
         exclude_any=("코드", "번호"),
     )
     maker_code_col = find_col(
         df,
-        exact=("제조사코드",),
-        include_any=("제조사코드",),
+        exact=("제조사코드", "제약사코드"),
+        include_any=("제조사코드", "제약사코드"),
         exclude_any=("그룹", "분류", "구분"),
     )
 
@@ -1726,7 +1725,7 @@ def handle_analytics_kpi_followup(
     # ------------------------------------------------------------
 
     wants_sales_maker = (
-        "제조사별" in compact
+        any(marker in compact for marker in ("제조사별", "제조사분석"))
         and any(w in compact for w in ("매출", "분석", "요약", "집계", "금액", "TOP", "상위"))
     )
 

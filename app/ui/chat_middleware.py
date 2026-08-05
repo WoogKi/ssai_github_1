@@ -1148,9 +1148,34 @@ def _preserve_product_flow_table_dtypes(df: pd.DataFrame) -> pd.DataFrame:
         if not target_cols:
             return out
         fixed = _finalize_display_df_250(out[target_cols].copy())
+        carryover_col = next((c for c in out.columns if str(c) == "입출고일자"), None)
+        if carryover_col is not None:
+            carryover_mask = out[carryover_col].astype("string").str.strip().eq("이월재고")
+            for col in target_cols:
+                if col not in fixed.columns:
+                    continue
+                display_values = fixed[col].astype(object)
+                missing = display_values.isna() | display_values.astype(str).str.strip().isin({"None", "<NA>", "nan", "NaN", "NaT"})
+                display_values.loc[carryover_mask & missing] = ""
+                fixed[col] = display_values
         for col in target_cols:
             if col in fixed.columns:
                 out[col] = fixed[col]
+        if carryover_col is not None:
+            carryover_mask = out[carryover_col].astype("string").str.strip().eq("이월재고")
+            for col in target_cols:
+                values = out[col].astype(object)
+                missing = values.isna() | values.astype(str).str.strip().isin({"None", "<NA>", "nan", "NaN", "NaT"})
+                values.loc[carryover_mask & missing] = ""
+                original_values = df[col].astype(object)
+                literal_missing = original_values.map(
+                    lambda value: isinstance(value, str)
+                    and value.strip() in {"None", "<NA>", "nan", "NaN", "NaT"}
+                )
+                values.loc[~carryover_mask & literal_missing] = original_values.loc[
+                    ~carryover_mask & literal_missing
+                ]
+                out[col] = values
         return out
     except Exception:
         log.debug("[chat] product flow dtype preservation skipped", exc_info=True)
@@ -4475,12 +4500,79 @@ def _expected_analysis_row_count(meta: Dict[str, Any], fallback_rows: int) -> in
 
     return fallback_rows
 
+
+def _partial_download_source_status(
+    meta: Dict[str, Any],
+    *,
+    prepared_rows: int,
+    expected_rows: int,
+) -> str:
+    """Classify an incomplete source only when an applied cap is explicit."""
+    prepared = max(0, _safe_int_for_download(prepared_rows, 0))
+    expected = max(0, _safe_int_for_download(expected_rows, 0))
+    if expected <= 0 or expected <= prepared:
+        return ""
+
+    applied_limit = 0
+    for key in ("download_limit_rows", "applied_download_limit_rows"):
+        applied_limit = _safe_int_for_download(meta.get(key), 0)
+        if applied_limit > 0:
+            break
+
+    if (
+        applied_limit > 0
+        and meta.get("limit_hit") is True
+        and prepared == applied_limit
+        and expected > prepared
+    ):
+        return "partial_limit"
+    return "partial_unverified"
+
+
+def _record_io_full_source_limit_meta(
+    meta: Dict[str, Any],
+    *,
+    action: str,
+    prepared_rows: int,
+    expected_rows: int,
+    applied_limit_rows: int,
+) -> str:
+    """Record an IO export cap only at the full-source query/cache boundary."""
+    if str(action or "").strip() != "출고명세 조회":
+        return ""
+
+    prepared = max(0, _safe_int_for_download(prepared_rows, 0))
+    expected = max(0, _safe_int_for_download(expected_rows, 0))
+    applied_limit = max(0, _safe_int_for_download(applied_limit_rows, 0))
+    if applied_limit <= 0:
+        return ""
+
+    meta["applied_download_limit_rows"] = applied_limit
+    meta["download_limit_rows"] = applied_limit
+    meta["download_row_count"] = prepared
+    meta["prepared_rows"] = prepared
+    if expected > 0:
+        meta["expected_rows"] = expected
+    meta["limit_hit"] = bool(
+        expected > prepared and prepared == applied_limit
+    )
+    meta.setdefault("source_call_count", 0)
+
+    source_status = _partial_download_source_status(
+        meta,
+        prepared_rows=prepared,
+        expected_rows=expected,
+    )
+    if source_status:
+        meta["download_source_status"] = source_status
+    return source_status
+
 def _download_source_context(
     item: Dict[str, Any],
     meta: Dict[str, Any],
     *,
     table_key: str = "",
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     """Build a minimal, non-display download ownership context."""
     runtime = _chat_runtime_log_context()
 
@@ -4491,7 +4583,7 @@ def _download_source_context(
                 return normalized
         return ""
 
-    return {
+    context = {
         "user_id": _first(meta.get("user_id"), item.get("user_id"), runtime.get("user_id")),
         "company_id": _first(
             meta.get("_ssai_company_id"), meta.get("company_id"),
@@ -4502,6 +4594,23 @@ def _download_source_context(
         "table_key": _first(table_key, meta.get("download_table_key"), meta.get("table_key"), item.get("table_key")),
         "event_id": _first(meta.get("dashboard_event_id"), item.get("id")),
     }
+    for key in ("result_metric", "result_grain", "filter_column", "filter_value"):
+        value = str(meta.get(key) or "").strip()
+        if value:
+            context[key] = value
+    for key in (
+        "applied_download_limit_rows",
+        "download_limit_rows",
+        "download_row_count",
+        "prepared_rows",
+        "expected_rows",
+        "limit_hit",
+        "download_source_status",
+        "source_call_count",
+    ):
+        if key in meta:
+            context[key] = meta.get(key)
+    return context
 
 
 def _stash_sims_export_provenance(
@@ -4524,7 +4633,7 @@ def _stash_sims_export_provenance(
 
 def _download_source_provenance_matches(
     provenance: Any,
-    expected_context: Dict[str, str],
+    expected_context: Dict[str, Any],
     *,
     candidate_rows: int,
 ) -> tuple[bool, str]:
@@ -4564,26 +4673,31 @@ def _resolve_payload_full_download_source(
         "provenance_status": "not_found",
     }
 
-    # Current-table follow-ups must use their own captured source and never borrow history exports.
-    if bool(meta.get("current_table_followup")):
-        result["source_name"] = "current_table_no_fallback"
-        return result
+    # Current-table follow-ups may use only their own verified export source. They must
+    # never borrow a parent/history payload or a different table key.
+    current_table_followup = bool(meta.get("current_table_followup"))
 
     partial_seen = False
+    partial_source_rows = 0
+    partial_source_name = ""
+    partial_source_table_key = table_key
+    partial_provenance_status = "not_found"
     expected_context = _download_source_context(item, meta, table_key=table_key)
     candidates: list[tuple[pd.DataFrame, str, str, Any]] = []
     try:
-        for scope_name, scope in (("payload", item), ("meta", meta)):
-            for key in ("df_full", "download_df", "export_df"):
-                value = scope.get(key)
-                if isinstance(value, pd.DataFrame) and not value.empty:
-                    candidates.append((value, f"{scope_name}.{key}", table_key, None))
+        if not current_table_followup:
+            for scope_name, scope in (("payload", item), ("meta", meta)):
+                for key in ("df_full", "download_df", "export_df"):
+                    value = scope.get(key)
+                    if isinstance(value, pd.DataFrame) and not value.empty:
+                        candidates.append((value, f"{scope_name}.{key}", table_key, None))
 
         table_keys: list[str] = []
-        for key in (
+        source_key_values = (meta.get("table_key"), item.get("table_key")) if current_table_followup else (
             meta.get("table_key"), item.get("table_key"),
             meta.get("download_table_key"), item.get("download_table_key"),
-        ):
+        )
+        for key in source_key_values:
             normalized = str(key or "").strip()
             if normalized and normalized not in table_keys:
                 table_keys.append(normalized)
@@ -4597,14 +4711,20 @@ def _resolve_payload_full_download_source(
                     provenance = provenance_store.get(candidate_key) if isinstance(provenance_store, dict) else None
                     candidates.append((value, f"{store_name}.{candidate_key}", candidate_key, provenance))
 
-        payload_df = item.get("df")
-        if isinstance(payload_df, pd.DataFrame) and not payload_df.empty:
-            candidates.append((payload_df, "payload.df", table_key, None))
+        if not current_table_followup:
+            payload_df = item.get("df")
+            if isinstance(payload_df, pd.DataFrame) and not payload_df.empty:
+                candidates.append((payload_df, "payload.df", table_key, None))
 
         for candidate, source_name, candidate_key, provenance in candidates:
             rows = int(len(candidate))
             candidate_context = dict(expected_context)
             candidate_context["table_key"] = str(candidate_key or table_key or "").strip()
+            if current_table_followup and (
+                not isinstance(provenance, dict)
+                or str(provenance.get("table_key") or "").strip() != table_key
+            ):
+                continue
             provenance_ok, provenance_status = _download_source_provenance_matches(
                 provenance,
                 candidate_context,
@@ -4622,7 +4742,29 @@ def _resolve_payload_full_download_source(
 
             is_complete = expected_rows <= 0 or rows >= expected_rows
             if expected_rows > display_rows and not is_complete:
+                partial_status = _partial_download_source_status(
+                    meta,
+                    prepared_rows=rows,
+                    expected_rows=expected_rows,
+                )
+                if partial_status == "partial_limit":
+                    result.update(
+                        {
+                            "df": candidate,
+                            "source_name": source_name,
+                            "source_status": "partial_limit",
+                            "source_table_key": candidate_key or table_key,
+                            "source_rows": rows,
+                            "provenance_status": provenance_status,
+                        }
+                    )
+                    return result
                 partial_seen = True
+                if rows > partial_source_rows:
+                    partial_source_rows = rows
+                    partial_source_name = source_name
+                    partial_source_table_key = candidate_key or table_key
+                    partial_provenance_status = provenance_status
                 continue
 
             result.update(
@@ -4639,8 +4781,20 @@ def _resolve_payload_full_download_source(
     except Exception:
         log.warning("[chat.download.source] full source resolver failed")
 
-    result["source_status"] = "display_only_partial" if partial_seen or expected_rows > display_rows else "not_found"
-    result["source_name"] = result["source_status"]
+    result["source_status"] = "partial_unverified" if partial_seen else (
+        "display_only_partial" if expected_rows > display_rows else "not_found"
+    )
+    if partial_seen:
+        result.update(
+            {
+                "source_name": partial_source_name or "partial_unverified",
+                "source_table_key": partial_source_table_key,
+                "source_rows": partial_source_rows,
+                "provenance_status": partial_provenance_status,
+            }
+        )
+    else:
+        result["source_name"] = result["source_status"]
     return result
 
 
@@ -4659,8 +4813,24 @@ def _render_partial_download_source_notice(
     download_rows: int,
     expected_rows: int,
 ) -> bool:
-    """Explain that CSV/Excel contain only the displayed slice when full source is absent."""
-    if source_status != "display_only_partial" or expected_rows <= download_rows:
+    """Explain verified partial sources without confusing them with a missing source."""
+    if expected_rows <= download_rows:
+        return False
+    if source_status == "partial_limit":
+        st.warning(
+            f"전체 예상 {expected_rows:,}건 중 다운로드 상한 {download_rows:,}건이 준비되었습니다. "
+            "현재 파일은 전체 자료가 아닙니다."
+        )
+        st.caption(f"다운로드 준비 {download_rows:,}건 / 전체 예상 {expected_rows:,}건")
+        return True
+    if source_status == "partial_unverified":
+        st.warning("전체 예상 결과보다 적은 원본만 준비되어 있습니다.")
+        st.caption(
+            f"다운로드 준비 {download_rows:,}건 / 전체 예상 {expected_rows:,}건 "
+            "(다운로드 상한 도달 여부는 확인되지 않았습니다.)"
+        )
+        return True
+    if source_status != "display_only_partial":
         return False
     st.warning("전체 원본을 찾지 못했습니다.")
     st.caption(f"CSV/EXCEL은 현재 화면 데이터 {download_rows:,}건만 포함합니다.")
@@ -4693,6 +4863,18 @@ def _get_full_download_df_for_sims_item(
 
     action = str(item.get("action") or meta.get("action") or item.get("title") or "").strip()
     detail_perf_started = time.perf_counter()
+    applied_download_limit_rows = 0
+    if action == "출고명세 조회":
+        try:
+            from app.services.rddbc120_service import get_rddbc120_export_limit_rows
+
+            applied_download_limit_rows = get_rddbc120_export_limit_rows()
+        except Exception as exc:
+            log.warning(
+                "[io.detail.perf] action=출고명세 조회 stage=export_limit "
+                "error_type=%s",
+                type(exc).__name__,
+            )
 
     def _log_io_detail_perf(
         stage: str,
@@ -4839,6 +5021,13 @@ def _get_full_download_df_for_sims_item(
 
             # payload 안의 df가 이미 기대 전체건수를 만족하면 재조회하지 않는다.
             # 단, 검증 조회가 조회상한에 딱 걸린 경우에는 더 있을 수 있으므로 export 재조회 여지를 둔다.
+            if str(resolved_source.get("source_status") or "") == "partial_limit":
+                _log_download_source(
+                    source=full_source,
+                    export_rows=full_rows,
+                    full_source_found=True,
+                )
+                return full_df
             if (not is_exportable_action) or (
                 full_rows >= expected_rows and not (is_validation_action and hit_query_cap)
             ) or (
@@ -4941,6 +5130,13 @@ def _get_full_download_df_for_sims_item(
         cached = st.session_state["__sims_export_tables"].get(cache_key)
 
         if isinstance(cached, pd.DataFrame) and not cached.empty:
+            _record_io_full_source_limit_meta(
+                meta,
+                action=action,
+                prepared_rows=len(cached),
+                expected_rows=expected_rows,
+                applied_limit_rows=applied_download_limit_rows,
+            )
             _stash_export_df_by_table_key(cached)
             _log_io_detail_perf(
                 "full_source_cache",
@@ -4994,6 +5190,13 @@ def _get_full_download_df_for_sims_item(
             export_df = display_df
 
         if isinstance(export_df, pd.DataFrame) and not export_df.empty:
+            _record_io_full_source_limit_meta(
+                meta,
+                action=action,
+                prepared_rows=len(export_df),
+                expected_rows=expected_rows,
+                applied_limit_rows=applied_download_limit_rows,
+            )
             st.session_state["__sims_export_tables"][cache_key] = export_df
             _stash_export_df_by_table_key(export_df)
 
@@ -6895,8 +7098,8 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         )
         return
 
-    # 현재표 후속표는 새로 생성된 파생표를 화면 최신표로 보여주더라도,
-    # 다음 "현재표 ... TOP/상세표"의 기준 DF는 원본 상세표/export DF로 유지한다.
+    # 현재표 후속표는 부모 table_key를 provenance로 보존한다. 다만 다음
+    # "현재표" 질문의 기준은 아래 stash 단계에서 파생표 자체로 승격된다.
     if bool(meta.get("current_table_followup")):
         source_table_key = str(
             meta.get("source_table_key")
@@ -6905,7 +7108,6 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         ).strip()
         if source_table_key:
             meta["source_table_key"] = source_table_key
-            ss["__sims_current_table_source_key"] = source_table_key
 
     payload["meta"] = meta
     payload.setdefault("title", action_name)
@@ -7151,7 +7353,8 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
 
                 # 현재표 후속표 기준 DF/source key 관리
                 # - 일반 SIMS/IO 표: 이 표가 새로운 원본 기준표가 된다.
-                # - 현재표 후속 파생표: 화면 최신표는 바뀌지만, 후속 집계 기준은 기존 원본 key를 유지한다.
+                # - 현재표 후속 파생표: 파생표 자체가 다음 현재표 후속분석의 최신 기준표가 된다.
+                #   부모 key는 provenance로만 보존한다.
                 if bool(meta.get("current_table_followup")):
                     source_table_key = str(
                         meta.get("source_table_key")
@@ -7160,7 +7363,6 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     ).strip()
                     if source_table_key:
                         meta["source_table_key"] = source_table_key
-                        ss["__sims_current_table_source_key"] = source_table_key
                 else:
                     previous_source_key = str(ss.get("__sims_current_table_source_key") or "").strip()
                     if previous_source_key and previous_source_key != str(table_key):
@@ -7187,6 +7389,18 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     meta["download_table_key"] = table_key
                     meta["download_row_count"] = int(len(df_full_for_export))
                     meta["display_row_count"] = int(len(df_display_for_ui))
+                    expected_download_rows = _safe_int_for_download(
+                        meta.get("row_count_total") or meta.get("expected_rows"),
+                        0,
+                    )
+                    prepared_download_rows = int(len(df_full_for_export))
+                    partial_status = _partial_download_source_status(
+                        meta,
+                        prepared_rows=prepared_download_rows,
+                        expected_rows=expected_download_rows,
+                    )
+                    if partial_status:
+                        meta["download_source_status"] = partial_status
 
                     log.info(
                         "[chat.stash.export] %s table_key=%s rows=%s display_rows=%s action=%s",
@@ -7283,6 +7497,13 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 except Exception as exc:
                     log.warning("[chat.stash.export] followup full dataframe failed error_type=%s", type(exc).__name__)
 
+
+                if bool(meta.get("current_table_followup")):
+                    # 파생표의 own full source가 이미 table_key에 검증되어 저장됐다.
+                    # 다음 '현재표'는 부모가 아니라 가장 최근 파생표를 기준으로 삼는다.
+                    if isinstance(ss.get("__sims_export_tables_by_key", {}).get(table_key), pd.DataFrame):
+                        ss["__sims_current_table_source_key"] = str(table_key)
+                        ss["__sims_current_table_source_action"] = str(action_name or "")
 
                 ss["__sims_last_table_key"] = table_key
                 ss["__sims_last_table_action"] = action_name
@@ -9550,7 +9771,15 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     download_source_result["df"] = raw_download_df
                     download_source_result["source_rows"] = recovered_rows
                     if expected_rows_initial > display_rows_initial and recovered_rows < expected_rows_initial:
-                        download_source_result["source_status"] = "display_only_partial"
+                        partial_status = _partial_download_source_status(
+                            meta,
+                            prepared_rows=recovered_rows,
+                            expected_rows=expected_rows_initial,
+                        )
+                        download_source_result["source_status"] = partial_status
+                        if partial_status == "partial_unverified":
+                            download_source_result["df"] = None
+                            raw_download_df = None
                     elif isinstance(raw_download_df, pd.DataFrame):
                         download_source_result["source_status"] = "full" if expected_rows_initial > display_rows_initial else "complete_display"
 
@@ -10128,7 +10357,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 download_source_status = str(
                     (locals().get("download_source_result") or {}).get("source_status") or ""
                 )
-                display_only_download = _render_partial_download_source_notice(
+                _render_partial_download_source_notice(
                     source_status=download_source_status,
                     download_rows=download_rows,
                     expected_rows=expected_rows,
@@ -10141,6 +10370,11 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     st.caption(
                         f"전체 {download_rows:,}건의 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누르면 생성합니다. "
                         f"현재 화면에는 {display_rows_for_download:,}건이 표시됩니다."
+                    )
+                elif download_source_status == "partial_limit":
+                    st.caption(
+                        f"CSV/EXCEL 다운로드 기준: 준비된 원본 {download_rows:,}건 "
+                        f"(전체 예상 {expected_rows:,}건)"
                     )
                 elif download_rows > display_rows_for_download:
                     st.caption(
@@ -10172,7 +10406,11 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     clicked_message_id=str(item.get("id") or ""),
                     clicked_action=str(action or action_name or title or ""),
                     clicked_meta=meta,
-                    download_label_prefix="화면 데이터 " if display_only_download else "",
+                    download_label_prefix=(
+                        "화면 데이터 "
+                        if download_source_status == "display_only_partial"
+                        else ""
+                    ),
                 )
 
             except Exception:

@@ -2123,7 +2123,11 @@ def _is_structured_outbound_validation_request(raw: str) -> bool:
     # This comparison is intentionally limited to validation intent. The
     # general parser still receives its original normalized text.
     normalized = re.sub(r"\s+", "", _norm(raw))
-    if not ("출고명세" in normalized and any(word in normalized for word in ("검증", "불일치"))):
+    if not (
+        any(word in normalized for word in ("출고", "매출"))
+        and any(document in normalized for document in ("거래명세서", "세금계산서"))
+        and any(word in normalized for word in ("검증", "불일치"))
+    ):
         return False
     return not is_io_validation_explanation_request(normalized)
 

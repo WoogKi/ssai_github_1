@@ -65,6 +65,11 @@ def _io_export_top() -> int:
     return _env_int("SIMS_EXPORT_MAX_ROWS", 100000)
 
 
+def get_rddbc120_export_limit_rows() -> int:
+    """Return the configured outbound-detail export cap used by the query."""
+    return _io_export_top()
+
+
 # 출고명세 조회
 # 다양한 필터 조건을 적용하여 출고명세 데이터를 조회하는 함수입니다.
 def _base_filters(params: Dict[str, Any], *, include_validation_filters: bool = True) -> str:
@@ -794,7 +799,7 @@ def get_rddbc120_export_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFr
     단, 무제한은 위험하므로 SIMS_EXPORT_MAX_ROWS 기본 100000건까지 허용한다.
     """
     qparams = coalesce_params(params)
-    export_top = _io_export_top()
+    export_top = get_rddbc120_export_limit_rows()
 
     qparams["top"] = export_top
     qparams["_max_top"] = export_top

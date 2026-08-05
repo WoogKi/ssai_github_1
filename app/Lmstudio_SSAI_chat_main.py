@@ -3617,6 +3617,7 @@ def _implicit_analytics_query_matches_source(text: str, source_action: str) -> b
         for w in (
             "매출추세",
             "추세판정",
+            "판정결과",
             "추세판정별",
             "추세판정요약",
             "추세판정분석",
@@ -3698,6 +3699,7 @@ def _looks_like_implicit_analytics_current_followup(text: str) -> bool:
         # 매출추세/추세판정
         "매출추세",
         "추세판정",
+        "판정결과",
         "추세",
         "감소",
         "증가",
@@ -4139,6 +4141,29 @@ def _current_table_numeric_filter_op(text: str) -> tuple[str, float, str]:
 
     return "", threshold, ""
 
+_CURRENT_TABLE_PUSH_META_PROTECTED_KEYS = frozenset(
+    {
+        "nlq_query",
+        "source_query",
+        "source_action",
+        "source_call_count",
+        "source_table_key",
+        "source_rows",
+    }
+)
+
+
+def _merge_current_table_push_meta(base_meta: dict, extra_meta: dict | None) -> dict:
+    """Merge derived capability metadata without replacing source-table identity."""
+    merged = dict(base_meta)
+    if not isinstance(extra_meta, dict):
+        return merged
+    for key, value in extra_meta.items():
+        if key not in _CURRENT_TABLE_PUSH_META_PROTECTED_KEYS:
+            merged[key] = value
+    return merged
+
+
 # 현재표 후속 질문에 대한 답변이 표일 때, SIMS_JSON 컨텍스트를 붙여서 푸시한다.
 def _current_table_push_table(
     *,
@@ -4156,6 +4181,12 @@ def _current_table_push_table(
     from app.ui.chat_middleware import push_sims_result_to_chat
 
     source_table_key = str(source_table_key or "").strip()
+    source_action = str(st.session_state.get("__sims_current_table_source_action") or "").strip()
+    case_query = str(
+        st.session_state.pop("__sims_current_table_followup_case_query", "")
+        or source_query
+        or ""
+    ).strip()
 
     def _supplier_shortage_followup_meta() -> dict:
         source_action = str(st.session_state.get("__sims_current_table_source_action") or "").strip()
@@ -4224,12 +4255,22 @@ def _current_table_push_table(
                 "summary_md": f"조회조건: {query_summary}",
                 "source": "현재표 후속표",
                 "source_query": source_query,
+                "source_action": source_action,
+                "source_call_count": 0,
+                "execution_status": "no_data",
+                "result_status": "no_data",
+                "missing_columns": [],
+                "result_metric": "",
+                "result_grain": "",
+                "table_created": False,
+                "nlq_query": case_query,
                 "source_table_key": source_table_key,
                 "source_rows": source_rows_int,
                 "hide_meta_expander": True,
                 "hide_table_key_caption": True,
             },
         }
+        payload["meta"] = _merge_current_table_push_meta(payload["meta"], extra_meta)
         push_sims_result_to_chat(payload, action)
         return True
 
@@ -4279,6 +4320,15 @@ def _current_table_push_table(
             "summary_md": f"조회조건: {query_summary}",
             "source": "현재표 후속표",
             "source_query": source_query,
+            "source_action": source_action,
+            "source_call_count": 0,
+            "execution_status": "success",
+            "result_status": "success",
+            "missing_columns": [],
+            "result_metric": "",
+            "result_grain": "derived_table",
+            "table_created": True,
+            "nlq_query": case_query,
             "source_table_key": source_table_key,
             "source_rows": source_rows_int,
             "table_profile": "current_table_followup",
@@ -4286,11 +4336,10 @@ def _current_table_push_table(
             "hide_table_key_caption": True,
         },
     }
-    if isinstance(extra_meta, dict) and extra_meta:
-        payload["meta"].update(extra_meta)
+    payload["meta"] = _merge_current_table_push_meta(payload["meta"], extra_meta)
     supplier_meta = _supplier_shortage_followup_meta()
     if supplier_meta:
-        payload["meta"].update(supplier_meta)
+        payload["meta"] = _merge_current_table_push_meta(payload["meta"], supplier_meta)
 
     push_sims_result_to_chat(payload, action)
     return True
@@ -4304,8 +4353,23 @@ def _current_table_push_notice(
     message: str,
     query_summary: str,
     source_query: str,
+    source_table_key: str = "",
+    source_rows: int | None = None,
+    extra_meta: dict | None = None,
 ) -> bool:
     from app.ui.chat_middleware import push_sims_result_to_chat
+
+    case_query = str(
+        st.session_state.pop("__sims_current_table_followup_case_query", "")
+        or source_query
+        or ""
+    ).strip()
+    source_action = str(st.session_state.get("__sims_current_table_source_action") or "").strip()
+    source_table_key = str(source_table_key or "").strip()
+    try:
+        source_rows_int = int(source_rows) if source_rows is not None else 0
+    except Exception:
+        source_rows_int = 0
 
     payload = {
         "final": True,
@@ -4327,11 +4391,23 @@ def _current_table_push_notice(
             "summary_md": f"조회조건: {query_summary}",
             "source": "현재표 후속계산",
             "source_query": source_query,
+            "source_action": source_action,
+            "source_call_count": 0,
+            "execution_status": "unsupported",
+            "result_status": "unsupported",
+            "missing_columns": [],
+            "result_metric": "",
+            "result_grain": "",
+            "table_created": False,
+            "nlq_query": case_query,
+            "source_table_key": source_table_key,
+            "source_rows": source_rows_int,
             "render_as_text": True,
             "hide_meta_expander": True,
             "hide_table_key_caption": True,
         },
     }
+    payload["meta"] = _merge_current_table_push_meta(payload["meta"], extra_meta)
 
     push_sims_result_to_chat(payload, action)
     return True
@@ -4660,11 +4736,10 @@ def _try_handle_current_table_dataframe_followup(
     intent = classify_current_table_followup_intent(t)
     if intent != "dataframe_table":
         log.info(
-            "[current_table.route] intent=%s stage=pandas_handler_skip query=%r",
+            "[current_table.route] intent=%s stage=pandas_handler_skip capability_check=true query=%r",
             intent,
             str(t or "")[:120],
         )
-        return False
     
     source_action_current = str(
         st.session_state.get("__sims_current_table_source_action")
@@ -4794,11 +4869,19 @@ def _try_handle_current_table_dataframe_followup(
     )
 
     if not wants_table and not is_calc_followup:
-        return False
+        # Explicit current-table requests must resolve to a deterministic table or
+        # a structured availability notice instead of falling through to LLM.
+        wants_table = True
 
     df, table_key = _current_table_get_latest_df()
     if not isinstance(df, pd.DataFrame) or df.empty:
         return False
+    source_meta: dict[str, Any] = {}
+    provenance_store = st.session_state.get("__sims_export_table_provenance_by_key")
+    if isinstance(provenance_store, dict):
+        stored_meta = provenance_store.get(table_key)
+        if isinstance(stored_meta, dict):
+            source_meta = dict(stored_meta)
 
     # TOP N
     top_n = 20
@@ -4829,6 +4912,7 @@ def _try_handle_current_table_dataframe_followup(
             "push_notice": _current_table_push_notice,
         },
         log=log,
+        source_meta=source_meta,
     )
 
     if handled_by_action:
@@ -7572,6 +7656,14 @@ _CHAT_PARTITION_META_ALLOW_KEYS = {
     "full_rows",
     "display_rows",
     "expected_rows",
+    "display_row_count",
+    "download_row_count",
+    "prepared_rows",
+    "download_limit_rows",
+    "applied_download_limit_rows",
+    "limit_hit",
+    "download_source_status",
+    "source_call_count",
     "column_count",
     "columns",
     "summary_md",
@@ -11001,6 +11093,8 @@ if user_input and user_input.strip():
         or is_current_table_forced_followup
         or is_implicit_analytics_current_followup
     ):
+        if is_current_table_forced_followup or is_implicit_analytics_current_followup:
+            st.session_state["__sims_current_table_followup_case_query"] = str(user_input or "").strip()
         # 1) 현재표 후속 "표 생성" 요청은 LLM으로 보내지 말고 실제 pandas 표를 만든다.
         # 예:
         # - 현재표 거래처명 대학약국 상세표 만들어줘

@@ -857,6 +857,7 @@ _ANALYTICS_GROUPING_TERMS: tuple[tuple[str, str, str], ...] = (
     ("salesperson", "영업사원", "영업사원별"),
     ("salesperson", "담당자", "담당자별"),
     ("region", "지역", "지역별"),
+    ("region", "지역", "지역"),
     ("region", "시도", "시도별"),
     ("region", "시군구", "시군구별"),
     ("purchase_vendor", "매입처", "매입처별"),

@@ -23,6 +23,7 @@ _FINAL_STATUSES = frozenset(
     {
         "success",
         "no_data",
+        "column_unavailable",
         "input_required",
         "candidate_required",
         "unsupported",
@@ -321,6 +322,11 @@ def _source_status(meta: Mapping[str, Any], key: str) -> str | None:
     return value if value in {"queried", "cache", "not_required", "unavailable"} else None
 
 
+def _download_source_status(meta: Mapping[str, Any]) -> str | None:
+    value = str(meta.get("download_source_status") or "").strip().lower()
+    return value if value in {"full", "partial_limit", "partial_unverified", "display_only", "unavailable"} else None
+
+
 def append_nlq_case_record(
     payload: Mapping[str, Any],
     session_state: MutableMapping[str, Any],
@@ -400,10 +406,16 @@ def append_nlq_case_record(
         "total_rows": total_rows,
         "display_rows": display_rows,
         "full_source_rows": full_source_rows,
+        "expected_rows": _first_int(meta.get("expected_rows"), meta.get("row_count_total")),
+        "prepared_rows": _first_int(meta.get("prepared_rows"), meta.get("download_row_count")),
+        "download_limit_rows": _first_int(meta.get("download_limit_rows")),
+        "applied_download_limit_rows": _first_int(meta.get("applied_download_limit_rows")),
+        "limit_hit": meta.get("limit_hit") if isinstance(meta.get("limit_hit"), bool) else None,
         "source_call_count": source_call_count,
         "cache_used": meta.get("cache_used") if isinstance(meta.get("cache_used"), bool) else None,
         "display_source_status": _source_status(meta, "display_source_status"),
         "full_source_status": _source_status(meta, "full_source_status"),
+        "download_source_status": _download_source_status(meta),
         "elapsed_ms": elapsed_ms,
         "total_elapsed_ms": _first_int(meta.get("total_elapsed_ms"), elapsed_ms),
         "error_class": str(meta.get("error_class") or ""),
@@ -412,9 +424,36 @@ def append_nlq_case_record(
         "candidate_count": candidate_count,
         "requested_metric": str(meta.get("requested_metric") or ""),
         "requested_grouping": str(meta.get("requested_grouping") or ""),
+        "requested_metrics": [
+            str(metric) for metric in (meta.get("requested_metrics") or [])
+            if str(metric).strip()
+        ][:8] if isinstance(meta.get("requested_metrics"), (list, tuple, set)) else [],
+        "requested_groupings": [
+            str(grouping) for grouping in (meta.get("requested_groupings") or [])
+            if str(grouping).strip()
+        ][:8] if isinstance(meta.get("requested_groupings"), (list, tuple, set)) else [],
         "resolved_action": str(meta.get("resolved_action") or ""),
         "execution_status": str(meta.get("execution_status") or ""),
         "intent_validation_status": str(meta.get("intent_validation_status") or ""),
+        "source_action": str(meta.get("source_action") or ""),
+        "source_table_key": str(meta.get("source_table_key") or ""),
+        "filter_column": str(meta.get("filter_column") or ""),
+        "filter_value": str(meta.get("filter_value") or ""),
+        "missing_columns": [
+            str(column) for column in (meta.get("missing_columns") or [])
+            if str(column).strip()
+        ][:16] if isinstance(meta.get("missing_columns"), (list, tuple, set)) else [],
+        "result_metric": str(meta.get("result_metric") or ""),
+        "result_grain": str(meta.get("result_grain") or ""),
+        "table_created": (
+            meta.get("table_created")
+            if isinstance(meta.get("table_created"), bool)
+            else None
+        ),
+        "issue_codes": [
+            str(code) for code in (meta.get("issue_codes") or [])
+            if str(code).strip()
+        ][:16] if isinstance(meta.get("issue_codes"), (list, tuple, set)) else [],
         "entity_query": str(meta.get("entity_query") or "")[:128],
         "entity_resolution_scope": str(meta.get("entity_resolution_scope") or ""),
         "entity_lookup_call_count": _first_int(meta.get("entity_lookup_call_count")),

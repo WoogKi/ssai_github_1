@@ -1182,6 +1182,7 @@ def run_basic_checks() -> list[CheckResult]:
                 ("매출처별 매출 예상 2025년 조회", "매출처별 매출 예상"),
                 ("영업사원별 매출 예상 2025년 조회", "영업사원별 매출 예상"),
                 ("지역별 매출 예상 2025년 조회", "지역별 매출 예상"),
+                ("지역 매출 예상 2026 조회", "지역별 매출 예상"),
                 ("품목별 재고부족현황 2025년 조회", "품목별 재고부족현황"),
                 ("매입처별 재고부족 현황 2025년 조회", "매입처별 재고부족 현황"),
             ]
@@ -1202,6 +1203,11 @@ def run_basic_checks() -> list[CheckResult]:
                 ("품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
                 ("한미제약 품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
                 ("정상출고만 품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
+                ("지역 매출 예상 2026 조회", "analytics", "지역별 매출 예상"),
+                ("출고 거래명세서 불일치 2026 조회", "io", "출고↔거래명세서 검증"),
+                ("출고 거래명세서 불일치 조회", "io", "출고↔거래명세서 검증"),
+                ("출고 세금계산서 불일치 조회", "io", "출고↔세금계산서 검증"),
+                ("출고 세금계산서 불일치 2026 조회", "io", "출고↔세금계산서 검증"),
                 ("정상출고 내역 조회", "io", "출고명세 조회"),
             ]
             for query, expected_route, expected_action in candidate_cases:
@@ -1240,6 +1246,48 @@ def run_basic_checks() -> list[CheckResult]:
                     _ok(
                         "new SIMS/NLQ versus current-table route guards",
                         "new actions route before implicit follow-ups; explicit current-table references retain priority",
+                    )
+                )
+
+            implicit_question = "판정결과 안정 품목 TOP 20"
+            implicit_candidate = resolve_candidate(implicit_question)
+            main_tree = ast.parse(main_src)
+            helper_names = {
+                "_implicit_analytics_query_matches_source",
+                "_looks_like_explicit_analytics_base_nlq",
+                "_looks_like_implicit_analytics_current_followup",
+            }
+            helper_nodes = [
+                node for node in main_tree.body
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in helper_names
+            ]
+            implicit_ns = {
+                "re": re,
+                "_ANALYTICS_KPI_SOURCE_ACTIONS": {
+                    "품목별 매출 추세 분석",
+                    "품목별 매출 추세 요약표",
+                },
+                "_current_analytics_source_action_for_followup": lambda: "품목별 매출 추세 분석",
+                "_looks_like_master_nlq_guard": lambda _text: False,
+            }
+            exec(compile(ast.Module(body=helper_nodes, type_ignores=[]), "<implicit-current-table-fixture>", "exec"), implicit_ns)
+            implicit_routed = implicit_ns["_looks_like_implicit_analytics_current_followup"](implicit_question)
+            if (
+                implicit_candidate is not None
+                or not implicit_routed
+                or "_try_handle_current_table_dataframe_followup" not in main_src
+            ):
+                results.append(
+                    _fail(
+                        "judgement result implicit current-table route",
+                        f"candidate={implicit_candidate!r}, implicit_routed={implicit_routed}",
+                    )
+                )
+            else:
+                results.append(
+                    _ok(
+                        "judgement result implicit current-table route",
+                        "판정결과 product TOP bypasses new NLQ/LLM routing and enters the deterministic current-table dispatcher",
                     )
                 )
     except Exception as e:
@@ -2437,6 +2485,600 @@ def run_basic_checks() -> list[CheckResult]:
                         if "현재표 분석/KPI 후속분석 불가" in str(group_payload.get("title") or ""):
                             followup_mismatches.append("trend judge group fell through to analytics kpi unsupported notice")
 
+                for query in (
+                    "현재표 추세판정별 요약",
+                    "현재표 제조사별 매출분석",
+                    "현재표 제조사명별 요약",
+                ):
+                    pushed_tables.clear()
+                    pushed_notices.clear()
+                    handled = handle_current_table_followup_by_action(
+                        df=summary,
+                        query=query,
+                        top_n=20,
+                        table_key=source_key,
+                        source_action=source_action,
+                        helpers=helpers,
+                        log=_NoopLog(),
+                    )
+                    if not handled or not pushed_tables:
+                        followup_mismatches.append(
+                            f"followup summary should return table query={query} "
+                            f"notice={(pushed_notices[-1] if pushed_notices else None)!r}"
+                        )
+
+                maker_columns = [
+                    column
+                    for column in summary.columns
+                    if "제조사" in str(column) or "제약사" in str(column)
+                ]
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=summary.drop(columns=maker_columns),
+                    query="현재표 제조사별 매출분석",
+                    top_n=20,
+                    table_key=source_key,
+                    source_action=source_action,
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                if not handled or not pushed_notices:
+                    followup_mismatches.append("manufacturer sales followup should return an explicit missing-column notice")
+
+                # Current-table capability is based on actual columns, not source titles.
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=summary,
+                    query="현재표 제품별 매출 TOP 20",
+                    top_n=20,
+                    table_key=source_key,
+                    source_action=source_action,
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                capability_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or capability_meta.get("result_status") != "column_unavailable"
+                    or "제품" not in capability_meta.get("missing_columns", [])
+                    or capability_meta.get("source_call_count") != 0
+                ):
+                    followup_mismatches.append("missing product column must return column_unavailable without a replacement table")
+
+                product_sales_df = pd.DataFrame(
+                    {
+                        "제품코드": ["P-01", "P-01", "P-02"],
+                        "제품명": ["제품A", "제품A", "제품B"],
+                        "기준월": ["2026-06", "2026-07", "2026-07"],
+                        "매출합계": [100.0, 200.0, 250.0],
+                    }
+                )
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=product_sales_df,
+                    query="현재표 제품별 매출 TOP 20",
+                    top_n=20,
+                    table_key="product_sales_source",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                product_meta = (pushed_tables[-1].get("extra_meta") or {}) if pushed_tables else {}
+                product_out = pushed_tables[-1].get("df") if pushed_tables else None
+                if (
+                    not handled
+                    or not isinstance(product_out, pd.DataFrame)
+                    or product_out.empty
+                    or "제품코드" not in product_out.columns
+                    or "제품명" not in product_out.columns
+                    or product_out["제품코드"].duplicated().any()
+                    or not product_out["제품명"].map(lambda value: isinstance(value, str)).all()
+                    or product_meta.get("requested_metric") != "sales"
+                    or product_meta.get("requested_grouping") != "product"
+                    or product_meta.get("requested_metrics") != ["sales"]
+                    or product_meta.get("requested_groupings") != ["product"]
+                    or product_meta.get("result_metric") != "sales"
+                    or product_meta.get("result_grain") != "product"
+                    or product_meta.get("result_status") != "success"
+                    or product_meta.get("table_created") is not True
+                    or str(pushed_tables[-1].get("title") or "") != "현재표 제품별 매출 TOP 20"
+                ):
+                    followup_mismatches.append("product sales TOP must aggregate to one row per product with the requested metric/grain contract")
+                elif float(pd.to_numeric(product_out.loc[product_out["제품코드"] == "P-01", "매출합계"], errors="coerce").iloc[0]) != 300.0:
+                    followup_mismatches.append("product sales TOP must aggregate monthly source rows before ranking")
+
+                latest_product_top_df = pd.DataFrame(
+                    {
+                        "제품코드": [f"P-{index:02d}" for index in range(1, 21)],
+                        "제품명": [f"제품{index:02d}" for index in range(1, 21)],
+                        "제조사명": [f"제조사{min(index, 17):02d}" for index in range(1, 21)],
+                        "매출합계": [float(index * 100) for index in range(1, 21)],
+                    }
+                )
+                manufacturer_results = []
+                for manufacturer_query in ("현재표 제조사별 매출 분석", "현재표 제조사 분석"):
+                    pushed_tables.clear()
+                    pushed_notices.clear()
+                    handled = handle_current_table_followup_by_action(
+                        df=latest_product_top_df,
+                        query=manufacturer_query,
+                        top_n=20,
+                        table_key="latest_product_top_20",
+                        source_action="판정결과 ‘안정’ 제품별 매출 TOP 20",
+                        helpers=helpers,
+                        log=_NoopLog(),
+                        source_meta={
+                            "result_metric": "sales",
+                            "result_grain": "product",
+                            "filter_column": "판정결과",
+                            "filter_value": "안정",
+                        },
+                    )
+                    maker_meta = (pushed_tables[-1].get("extra_meta") or {}) if pushed_tables else {}
+                    maker_out = pushed_tables[-1].get("df") if pushed_tables else None
+                    if (
+                        not handled
+                        or not isinstance(maker_out, pd.DataFrame)
+                        or len(maker_out) != 17
+                        or maker_meta.get("requested_metric") != "sales"
+                        or maker_meta.get("requested_grouping") != "manufacturer"
+                        or maker_meta.get("result_metric") != "sales"
+                        or maker_meta.get("result_grain") != "manufacturer"
+                        or maker_meta.get("source_call_count") != 0
+                        or maker_meta.get("table_created") is not True
+                        or maker_meta.get("filter_column") != "판정결과"
+                        or maker_meta.get("filter_value") != "안정"
+                        or pushed_tables[-1].get("source_table_key") != "latest_product_top_20"
+                    ):
+                        followup_mismatches.append(
+                            f"manufacturer wording must preserve sales/manufacturer contract query={manufacturer_query}"
+                        )
+                    else:
+                        manufacturer_results.append(maker_out.reset_index(drop=True))
+                if len(manufacturer_results) == 2 and not manufacturer_results[0].equals(manufacturer_results[1]):
+                    followup_mismatches.append("manufacturer wording variants must return the same 17-row result")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=latest_product_top_df,
+                    query="현재표 제조사별 매출 분석",
+                    top_n=20,
+                    table_key="trend_filtered_product_top_20",
+                    source_action="추세판정 ‘감소’ 제품별 매출 TOP 20",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                    source_meta={
+                        "result_metric": "sales",
+                        "result_grain": "product",
+                        "filter_column": "추세판정",
+                        "filter_value": "감소",
+                    },
+                )
+                trend_maker_meta = (pushed_tables[-1].get("extra_meta") or {}) if pushed_tables else {}
+                trend_maker_out = pushed_tables[-1].get("df") if pushed_tables else None
+                if (
+                    not handled
+                    or not isinstance(trend_maker_out, pd.DataFrame)
+                    or len(trend_maker_out) != 17
+                    or trend_maker_meta.get("requested_metric") != "sales"
+                    or trend_maker_meta.get("requested_grouping") != "manufacturer"
+                    or trend_maker_meta.get("result_metric") != "sales"
+                    or trend_maker_meta.get("result_grain") != "manufacturer"
+                    or trend_maker_meta.get("filter_column") != "추세판정"
+                    or trend_maker_meta.get("filter_value") != "감소"
+                    or trend_maker_meta.get("source_call_count") != 0
+                ):
+                    followup_mismatches.append("trend-filtered product TOP must retain its sales metric and filter provenance for manufacturer analysis")
+
+                if manufacturer_results:
+                    pushed_tables.clear()
+                    pushed_notices.clear()
+                    handled = handle_current_table_followup_by_action(
+                        df=manufacturer_results[-1],
+                        query="현재표 재고부족 품목 TOP 20",
+                        top_n=20,
+                        table_key="latest_manufacturer_17",
+                        source_action="현재표 제조사별 매출 분석",
+                        helpers=helpers,
+                        log=_NoopLog(),
+                    )
+                    shortage_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                    if (
+                        not handled
+                        or pushed_tables
+                        or shortage_meta.get("result_status") != "column_unavailable"
+                        or pushed_notices[-1].get("source_table_key") != "latest_manufacturer_17"
+                    ):
+                        followup_mismatches.append("manufacturer result must not fall back for a shortage product TOP")
+
+                latest_trend_summary_df = pd.DataFrame(
+                    {"추세판정": ["감소", "안정", "증가", "신규/증가", "자료부족"], "총매출액": [5, 4, 3, 2, 1]}
+                )
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=latest_trend_summary_df,
+                    query="현재표 제조사 분석",
+                    top_n=20,
+                    table_key="latest_trend_summary_5",
+                    source_action="현재표 추세판정별 집계",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                trend_maker_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or trend_maker_meta.get("result_status") != "column_unavailable"
+                    or pushed_notices[-1].get("source_table_key") != "latest_trend_summary_5"
+                ):
+                    followup_mismatches.append("latest 5-row trend summary must report its missing manufacturer column")
+
+                stable_product_sales_df = pd.DataFrame(
+                    {
+                        "제품코드": ["P-01", "P-01", "P-02", "P-02"],
+                        "제품명": ["안정제품", "안정제품", "주의제품", "주의제품"],
+                        "기준월": ["2026-06", "2026-07", "2026-06", "2026-07"],
+                        "추세판정": ["감소", "감소", "증가", "증가"],
+                        "판정결과": ["안정", "안정", "주의", "주의"],
+                        "매출합계": [100.0, 200.0, 1000.0, 10.0],
+                    }
+                )
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=stable_product_sales_df,
+                    query="현재표 판정결과 안정 품목 TOP 20",
+                    top_n=20,
+                    table_key="stable_product_sales_source",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                stable_meta = (pushed_tables[-1].get("extra_meta") or {}) if pushed_tables else {}
+                stable_out = pushed_tables[-1].get("df") if pushed_tables else None
+                if (
+                    not handled
+                    or not isinstance(stable_out, pd.DataFrame)
+                    or stable_out["제품코드"].tolist() != ["P-01"]
+                    or stable_meta.get("filter_column") != "판정결과"
+                    or stable_meta.get("filter_value") != "안정"
+                    or stable_meta.get("requested_metric") != "sales"
+                    or stable_meta.get("requested_grouping") != "product"
+                    or stable_meta.get("result_metric") != "sales"
+                    or stable_meta.get("result_grain") != "product"
+                    or stable_meta.get("source_call_count") != 0
+                    or stable_meta.get("table_created") is not True
+                    or str(pushed_tables[-1].get("title") or "") != "판정결과 ‘안정’ 제품별 매출 TOP 20"
+                ):
+                    followup_mismatches.append("stable trend filter must precede product aggregation and TOP ranking")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=stable_product_sales_df,
+                    query="현재표 추세판정 감소 품목 TOP 20",
+                    top_n=20,
+                    table_key="explicit_trend_filter",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                trend_meta = (pushed_tables[-1].get("extra_meta") or {}) if pushed_tables else {}
+                if (
+                    not handled
+                    or not pushed_tables
+                    or trend_meta.get("filter_column") != "추세판정"
+                    or trend_meta.get("filter_value") != "감소"
+                    or str(pushed_tables[-1].get("title") or "") != "추세판정 ‘감소’ 제품별 매출 TOP 20"
+                ):
+                    followup_mismatches.append("explicit trend judgement filter must use only the trend judgement column")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=stable_product_sales_df.drop(columns=["판정결과"]),
+                    query="현재표 판정결과 안정 품목 TOP 20",
+                    top_n=20,
+                    table_key="missing_explicit_judgement_column",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                missing_judgement_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or missing_judgement_meta.get("result_status") != "column_unavailable"
+                    or missing_judgement_meta.get("missing_columns") != ["판정결과"]
+                    or "filter_column_missing" not in missing_judgement_meta.get("issue_codes", [])
+                ):
+                    followup_mismatches.append("an explicit missing judgement column must not substitute another judgement column")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=stable_product_sales_df,
+                    query="현재표 판정결과 안정 TOP 20",
+                    top_n=20,
+                    table_key="ungrouped_judgement_filter",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                ungrouped_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or ungrouped_meta.get("result_status") != "unsupported"
+                    or "filter_grouping_required" not in ungrouped_meta.get("issue_codes", [])
+                ):
+                    followup_mismatches.append("ungrouped judgement TOP must not fall back to product or source-row TOP")
+
+                ambiguous_judgement_df = stable_product_sales_df.assign(판정결과="안정", 추세판정="안정")
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=ambiguous_judgement_df,
+                    query="현재표 안정 품목 TOP 20",
+                    top_n=20,
+                    table_key="ambiguous_trend_filter",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                ambiguous_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or ambiguous_meta.get("result_status") != "unsupported"
+                    or "filter_column_ambiguous" not in ambiguous_meta.get("issue_codes", [])
+                ):
+                    followup_mismatches.append("ambiguous trend filter must not create a replacement product TOP table")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                unmatched_judgement_df = stable_product_sales_df.assign(
+                    판정결과="주의",
+                    추세판정="감소",
+                )
+                handled = handle_current_table_followup_by_action(
+                    df=unmatched_judgement_df,
+                    query="현재표 안정 품목 TOP 20",
+                    top_n=20,
+                    table_key="unmatched_unlabeled_judgement",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                unmatched_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or unmatched_meta.get("result_status") != "unsupported"
+                    or "filter_value_not_found" not in unmatched_meta.get("issue_codes", [])
+                    or unmatched_meta.get("table_created") is not False
+                ):
+                    followup_mismatches.append("an unmatched unlabeled judgement must stop without a replacement product TOP table")
+
+                contaminated_product_df = product_sales_df.copy()
+                contaminated_product_df["제품명"] = ["4,000,010,082,500.00", "4,000,010,082,500.00", "제품B"]
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=contaminated_product_df,
+                    query="현재표 제품별 매출 TOP 20",
+                    top_n=20,
+                    table_key="contaminated_product_name",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                contamination_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or contamination_meta.get("result_status") != "routing_error"
+                    or contamination_meta.get("table_created") is not False
+                    or "result_contract_mismatch" not in contamination_meta.get("issue_codes", [])
+                ):
+                    followup_mismatches.append("formatted amount in product name must block the result contract")
+
+                shortage_df = pd.DataFrame(
+                    {
+                        "제품코드": ["S-01", "S-02"],
+                        "제품명": ["부족품목A", "부족품목B"],
+                        "부족등급": ["긴급 부족", "부족 주의"],
+                        "부족예상수량": [8.0, 3.0],
+                        "현재재고수량": [0.0, 1.0],
+                    }
+                )
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=shortage_df,
+                    query="현재표 재고부족 품목 TOP 20",
+                    top_n=20,
+                    table_key="shortage_product_source",
+                    source_action="품목별 재고부족현황",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                shortage_meta = (pushed_tables[-1].get("extra_meta") or {}) if pushed_tables else {}
+                shortage_out = pushed_tables[-1].get("df") if pushed_tables else None
+                if (
+                    not handled
+                    or not isinstance(shortage_out, pd.DataFrame)
+                    or shortage_out.empty
+                    or "제품코드" not in shortage_out.columns
+                    or shortage_out["제품코드"].duplicated().any()
+                    or shortage_meta.get("requested_metric") != "shortage"
+                    or shortage_meta.get("requested_grouping") != "product"
+                    or shortage_meta.get("result_metric") != "shortage"
+                    or shortage_meta.get("result_grain") != "product"
+                    or shortage_meta.get("result_status") != "success"
+                    or shortage_meta.get("table_created") is not True
+                ):
+                    followup_mismatches.append("shortage product TOP must preserve shortage metric and product grain")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=product_sales_df,
+                    query="현재표 재고부족 품목 TOP 20",
+                    top_n=20,
+                    table_key="trend_without_shortage",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                shortage_missing_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or shortage_missing_meta.get("result_status") != "column_unavailable"
+                    or shortage_missing_meta.get("execution_status") != "column_unavailable"
+                    or shortage_missing_meta.get("requested_metric") != "shortage"
+                    or shortage_missing_meta.get("requested_grouping") != "product"
+                    or shortage_missing_meta.get("table_created") is not False
+                ):
+                    followup_mismatches.append("shortage TOP without shortage columns must be column_unavailable without a replacement table")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=product_sales_df,
+                    query="현재표 예상매출 TOP 20",
+                    top_n=20,
+                    table_key="trend_without_forecast",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                forecast_missing_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or forecast_missing_meta.get("result_status") != "column_unavailable"
+                    or forecast_missing_meta.get("execution_status") != "column_unavailable"
+                    or forecast_missing_meta.get("requested_metric") != "forecast_sales"
+                    or "예상매출" not in forecast_missing_meta.get("missing_columns", [])
+                    or forecast_missing_meta.get("table_created") is not False
+                ):
+                    followup_mismatches.append("forecast sales TOP without forecast columns must be column_unavailable without a replacement table")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=shortage_df,
+                    query="현재표 재고부족 품목별 매출 TOP 20",
+                    top_n=20,
+                    table_key="multiple_metrics",
+                    source_action="품목별 재고부족현황",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                multi_metric_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or multi_metric_meta.get("result_status") != "unsupported"
+                    or multi_metric_meta.get("requested_metrics") != ["sales", "shortage"]
+                    or multi_metric_meta.get("requested_metric")
+                    or multi_metric_meta.get("table_created") is not False
+                    or multi_metric_meta.get("source_call_count") != 0
+                ):
+                    followup_mismatches.append("multiple metrics must not discard one metric or create a table")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=product_sales_df,
+                    query="현재표 제품별 재고 TOP 20",
+                    top_n=20,
+                    table_key="undefined_stock_metric",
+                    source_action="품목별 매출 추세 분석",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                stock_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or stock_meta.get("result_status") != "unsupported"
+                    or stock_meta.get("requested_metrics") != ["stock"]
+                    or stock_meta.get("missing_columns")
+                    or stock_meta.get("table_created") is not False
+                ):
+                    followup_mismatches.append("undefined stock metric must be unsupported without blank missing-column metadata")
+
+                detail_df = pd.DataFrame(
+                    {
+                        "제조사명": ["제조사A", "제조사B"],
+                        "제품명": ["제품A", "제품B"],
+                        "제품그룹명": ["그룹1", "그룹2"],
+                        "추세판정": ["감소", "증가"],
+                        "총매출액": [100, 200],
+                    }
+                )
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=detail_df,
+                    query="현재표 제조사별 요약",
+                    top_n=20,
+                    table_key="detail_with_maker_column",
+                    source_action="출고명세 조회",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                success_meta = (pushed_tables[-1].get("extra_meta") or {}) if pushed_tables else {}
+                if not handled or not pushed_tables or success_meta.get("result_status") != "success":
+                    followup_mismatches.append("actual manufacturer column must support deterministic manufacturer summary")
+
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=detail_df,
+                    query="현재표 제조사별 제품별 매출분석",
+                    top_n=20,
+                    table_key="detail_composite_analysis",
+                    source_action="출고명세 조회",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                unsupported_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if (
+                    not handled
+                    or pushed_tables
+                    or unsupported_meta.get("result_status") != "unsupported"
+                    or unsupported_meta.get("requested_groupings") != ["manufacturer", "product"]
+                    or unsupported_meta.get("requested_grouping")
+                    or unsupported_meta.get("source_call_count") != 0
+                ):
+                    followup_mismatches.append("unsupported outbound composite analysis must not create a replacement table")
+
+                empty_dimension_df = detail_df.assign(제품그룹명=pd.NA)
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=empty_dimension_df,
+                    query="현재표 제품그룹별 요약",
+                    top_n=20,
+                    table_key="detail_empty_group",
+                    source_action="출고명세 조회",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                no_data_meta = (pushed_notices[-1].get("extra_meta") or {}) if pushed_notices else {}
+                if not handled or pushed_tables or no_data_meta.get("result_status") != "no_data":
+                    followup_mismatches.append("valid empty dimension calculation must return no_data")
+
                 for query, expected_col in [
                     ("현재표 추세판정 감소만 보여줘", "추세판정"),
                     ("현재표 제약사명 제약A 상세", "제약사명"),
@@ -3562,6 +4204,9 @@ def run_basic_checks() -> list[CheckResult]:
                 "현재표 이상 항목 중 100만원 이상만 보여줘": "dataframe_table",
                 "현재표 문제점을 요약표로 만들어줘": "dataframe_table",
                 "현재표 주의사항을 표로 정리해줘": "dataframe_table",
+                "현재표 추세판정별 요약": "dataframe_table",
+                "현재표 제조사별 매출분석": "dataframe_table",
+                "현재표 제조사명별 요약": "dataframe_table",
             }
             intent_edge_mismatches = []
             for query, expected_intent in intent_edge_cases.items():
@@ -5605,6 +6250,8 @@ def run_basic_checks() -> list[CheckResult]:
                 group_item = _find_item(history_after_followups, "sims_group_prodpath")
                 top_source = str(((top_item or {}).get("meta") or {}).get("source_table_key") or "")
                 group_source = str(((group_item or {}).get("meta") or {}).get("source_table_key") or "")
+                derived_current_key = st.session_state.get("__sims_current_table_source_key")
+                derived_current_df = (st.session_state.get("__sims_export_tables_by_key") or {}).get("sims_group_prodpath")
 
                 chat_mod.push_sims_result_to_chat(
                     _payload("sims_vendor_b_prodpath", "거래처 목록", vendor_df),
@@ -5621,8 +6268,12 @@ def run_basic_checks() -> list[CheckResult]:
                 product_item = _find_item(room_history, "sims_product_a_prodpath")
 
                 mismatches = []
-                if top_source != "sims_product_a_prodpath" or group_source != "sims_product_a_prodpath":
-                    mismatches.append(f"production followup source meta missing top={top_source} group={group_source}")
+                if top_source != "sims_product_a_prodpath" or group_source != "sims_top_prodpath":
+                    mismatches.append(f"production followup source meta chain mismatch top={top_source} group={group_source}")
+                if derived_current_key != "sims_group_prodpath":
+                    mismatches.append(f"latest derived table was not promoted as current source={derived_current_key}")
+                if not isinstance(derived_current_df, pd.DataFrame) or len(derived_current_df) != len(group_df):
+                    mismatches.append("latest derived table did not retain its own full source")
                 if "sims_product_a_prodpath" not in room_keys:
                     mismatches.append(f"product A missing from room.history keys={room_keys}")
                 if "sims_product_a_prodpath" not in session_keys:
