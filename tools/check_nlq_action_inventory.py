@@ -88,8 +88,8 @@ def _check_panel_inventory() -> None:
 
     if len(panel_labels) != 39:
         _fail(f"panel label 수가 예상과 다릅니다: {len(panel_labels)} != 39")
-    if len(CANONICAL_ACTIONS) != 33:
-        _fail(f"canonical action 수가 예상과 다릅니다: {len(CANONICAL_ACTIONS)} != 33")
+    if len(CANONICAL_ACTIONS) != 35:
+        _fail(f"canonical action 수가 예상과 다릅니다: {len(CANONICAL_ACTIONS)} != 35")
     if len(set(panel_labels)) != len(panel_labels):
         _fail("panel action label에 중복이 있습니다.")
     if len(set(inventory_labels)) != len(inventory_labels):
@@ -105,6 +105,8 @@ def _check_panel_inventory() -> None:
         label: category for category, labels in panel_categories.items() for label in labels
     }
     for spec in CANONICAL_ACTIONS:
+        if not spec.panel_registered:
+            continue
         for label in (spec.panel_action, *spec.label_aliases):
             if category_by_label.get(label) != spec.panel_category:
                 _fail(f"{label}: panel category와 inventory category가 다릅니다.")
@@ -122,7 +124,7 @@ def _check_statuses() -> None:
         for spec in CANONICAL_ACTIONS
         if spec.implementation_status not in {IMPLEMENTED, DASHBOARD_ONLY}
     ]
-    if len(implemented) != 32 or len(dashboard_only) != 1 or other:
+    if len(implemented) != 34 or len(dashboard_only) != 1 or other:
         _fail(
             "implementation status count 불일치: "
             f"implemented={len(implemented)}, dashboard_only={len(dashboard_only)}, other={len(other)}"
@@ -190,6 +192,8 @@ def _check_product_flow_inventory_aliases() -> None:
         ("제품 재고 현황 조회", "제품재고현황 조회"),
         ("제품재고장 조회", "제품재고현황 조회"),
         ("장부재고 제품재고현황 조회", "제품재고현황 조회"),
+        ("현재고 한미", "현재고 조회"),
+        ("현재고 제품명 타이레놀", "현재고 조회"),
     )
     for query, expected_action in cases:
         parsed = resolve_io_nlq(query)
@@ -205,6 +209,7 @@ def _check_period_policy_classification() -> None:
     expected = {
         "제품수불현황 조회": "single_entity_history",
         "제품재고현황 조회": "inventory_movement",
+        "현재고 조회": "inventory_movement",
         "실재고월집계 조회": "inventory_snapshot",
         "장부재고월집계 조회": "inventory_snapshot",
     }
@@ -214,7 +219,7 @@ def _check_period_policy_classification() -> None:
         actual = get_nlq_period_action_class(spec.canonical_action)
         if spec.handler_kind == "analytics":
             wanted = "aggregate_analysis"
-        elif spec.handler_kind == "io_service":
+        elif spec.handler_kind in {"io_service", "io_alias"}:
             wanted = expected.get(spec.canonical_action, "list_detail")
         else:
             wanted = "other"
@@ -249,7 +254,7 @@ def main() -> int:
     print(
         "RESULT: OK "
         f"(canonical_actions={len(CANONICAL_ACTIONS)}, panel_labels={len(all_panel_labels())}, "
-        "implemented=32, dashboard_only=1, aliases=6)"
+        "implemented=34, dashboard_only=1, aliases=6)"
     )
     return 0
 

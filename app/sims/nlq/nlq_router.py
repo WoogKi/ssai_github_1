@@ -16,6 +16,23 @@ from app.services.ssai_analysis_profile_service import (
     normalize_business_code_pair,
 )
 from app.sims.nlq.action_inventory import ANALYTICS_INTENT_ACTIONS
+
+
+_DASHBOARD_NLQ_ACTION = "SIMS 일일점검"
+_DASHBOARD_NLQ_PHRASES = (
+    "SIMS 일일점검",
+    "오늘의 경영점검",
+    "SIMS 운영점검",
+)
+_DASHBOARD_NLQ_CONDITION_LABELS = ("제약사", "제조사", "발주처", "담당자")
+
+
+def _resolve_dashboard_nlq_action(text: str) -> str:
+    compact = re.sub(r"\s+", "", str(text or "")).lower()
+    for phrase in _DASHBOARD_NLQ_PHRASES:
+        if re.sub(r"\s+", "", phrase).lower() in compact:
+            return _DASHBOARD_NLQ_ACTION
+    return ""
  
 # =============================================================================
 # 키보드 보정(2벌식): 영문으로 잘못 입력된 한글을 한글로 변환
@@ -1079,6 +1096,10 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     normalized = keyboard_fix(str(txt or "").strip())
     if not normalized:
         return None
+
+    dashboard_action = _resolve_dashboard_nlq_action(normalized)
+    if dashboard_action:
+        return {"route": "dashboard", "action": dashboard_action}
 
     analytics_action = _resolve_analytics_action(normalized)
     analytics_guard = _analytics_grouping_guard(normalized, analytics_action)
@@ -4787,6 +4808,390 @@ def _ensure_io_summary_meta(
 
     return payload
 
+def _dashboard_nlq_residual(text: str) -> str:
+    residual = str(text or "")
+    for phrase in sorted(_DASHBOARD_NLQ_PHRASES, key=len, reverse=True):
+        residual = re.sub(re.escape(phrase), " ", residual, flags=re.IGNORECASE)
+    residual = re.sub(r"(?:19|20)\d{2}\s*년(?:\s*(?:부터|~|-)\s*(?:19|20)\d{2}\s*년?)?", " ", residual)
+    residual = re.sub(r"(?:19|20)\d{2}\s*년(?:\s*\d{1,2}\s*월)?", " ", residual)
+    residual = re.sub(r"(?:19|20)\d{4,6}", " ", residual)
+    # Dashboard 별칭 뒤에 붙는 일반 요청 종결어는 공급처 후보로 넘기지 않는다.
+    # 문장 끝에만 적용해 실제 제약사/발주처 이름은 보존한다.
+    residual = re.sub(
+        r"(?:\s*(?:조회|검색|보여\s*줘|알려\s*줘|찾아\s*줘|실행(?:\s*해)?\s*줘|점검(?:\s*해)?\s*줘|해\s*줘))+\s*$",
+        " ",
+        residual,
+    )
+    residual = re.sub(r"\b(?:부터|까지|조회|보여줘|알려줘|실행)\b", " ", residual)
+    return re.sub(r"\s+", " ", residual).strip(" ,:/-~")
+
+
+def _extract_dashboard_nlq_conditions(text: str) -> tuple[dict[str, str], str]:
+    """Extract labelled Dashboard conditions without depending on their order."""
+    source = str(text or "")
+    labels = "|".join(map(re.escape, _DASHBOARD_NLQ_CONDITION_LABELS))
+    # Korean labels are word characters, so a \b boundary can fail when a
+    # label is followed by punctuation or another condition.  The label list
+    # itself is the boundary contract.
+    boundary = rf"(?=\s*(?:{labels})(?=\s|[:=]|$)|\s*(?:19|20)\d{{2}}\s*년|\s*(?:19|20)\d{{4,8}}\b|\s*$)"
+    pattern = re.compile(rf"(?P<label>{labels})\s*[:=]?\s*(?P<value>.*?){boundary}")
+    conditions: dict[str, str] = {}
+    residual_parts: list[str] = []
+    cursor = 0
+    for match in pattern.finditer(source):
+        residual_parts.append(source[cursor:match.start()])
+        label = str(match.group("label") or "").strip()
+        value = _dashboard_nlq_residual(str(match.group("value") or ""))
+        # A bare supplier label (for example, "발주처 담당자 김") still
+        # explicitly selects the Dashboard supplier mode.  Keep it even when
+        # the label has no supplier-name value.
+        if label:
+            conditions[label] = value
+        cursor = match.end()
+    residual_parts.append(source[cursor:])
+    return conditions, _dashboard_nlq_residual(" ".join(residual_parts))
+
+
+def _dashboard_next_month(yyyymm: str) -> str:
+    year, month = int(yyyymm[:4]), int(yyyymm[4:6])
+    return f"{year + 1:04d}01" if month == 12 else f"{year:04d}{month + 1:02d}"
+
+
+def _dashboard_nlq_text_payload(
+    message: str,
+    *,
+    status: str,
+    params: Dict[str, Any],
+    question: str,
+    source_call_count: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "final": True, "type": "text", "title": _DASHBOARD_NLQ_ACTION,
+        "action": _DASHBOARD_NLQ_ACTION, "params": dict(params),
+        "data": message, "message": message,
+        "meta": {
+            "nlq": True, "nlq_query": question, "result_status": status,
+            "row_count": 0, "row_count_total": 0, "source_call_count": int(source_call_count or 0),
+            "tableless_result": True, "notice_codes": [status],
+            "_force_push": True, "_nlq_nonce": str(uuid.uuid4()),
+        },
+    }
+
+
+def _dashboard_nlq_scope_label(rows: list[dict[str, str]], *, query: str) -> str:
+    """Use the Dashboard's established compact supplier-label policy."""
+    codes = [str(row.get("code") or "").strip() for row in rows if str(row.get("code") or "").strip()]
+    names = [str(row.get("name") or "").strip() for row in rows]
+    if not codes:
+        return "전체"
+    if len(codes) == 1:
+        return f"{names[0]} [{codes[0]}]" if names and names[0] else codes[0]
+    return f"'{query}' 포함 {len(codes)}개사"
+
+
+def _dashboard_nlq_manager_label(rows: list[dict[str, str]]) -> str:
+    codes = [str(row.get("code") or "").strip() for row in rows if str(row.get("code") or "").strip()]
+    names = [str(row.get("name") or "").strip() for row in rows]
+    if not codes:
+        return "전체"
+    if len(codes) == 1:
+        return f"{names[0]} [{codes[0]}]" if names and names[0] else codes[0]
+    return f"{len(codes)}명"
+
+
+def _build_dashboard_nlq_params(
+    text: str, *, session_state: Dict[str, Any], logger
+) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
+    """Merge explicit Dashboard NLQ conditions over one company Default."""
+    from app.services.dashboard_lite_facts import default_dashboard_lite_scope, normalize_dashboard_lite_params
+    from app.services.io_nlq import extract_params
+    from app.services.product_supplier_scope_service import (
+        SCOPE_ALL, SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR,
+        load_supplier_manager_options, resolve_supplier_vendor_codes,
+    )
+    from app.services.ssai_analysis_profile_service import load_dashboard_profile, normalize_company_default_conditions
+    from app.ui.ssai_login import get_selected_company
+
+    company_id = str((get_selected_company() or {}).get("company_id") or "").strip()
+    if not company_id:
+        return {}, _dashboard_nlq_text_payload(
+            "회사를 먼저 선택해 주세요.", status="input_required", params={}, question=text
+        )
+
+    cache = session_state.setdefault("__analysis_profile_company_cache", {})
+    cached = cache.get(company_id) if isinstance(cache, dict) else None
+    profile = cached if isinstance(cached, dict) else load_dashboard_profile(company_id=int(company_id))
+    if isinstance(cache, dict) and not isinstance(cached, dict):
+        cache[company_id] = dict(profile or {})
+    params: Dict[str, Any] = {
+        **default_dashboard_lite_scope(),
+        **normalize_company_default_conditions(profile),
+        "company_id": company_id,
+    }
+
+    parsed_period = _apply_analytics_period_defaults(extract_params(text), text)
+    explicit_period = any(
+        str(parsed_period.get(key) or "").strip()
+        for key in ("date_from", "date_to", "month_from", "month_to")
+    )
+    if explicit_period:
+        month_from = str(parsed_period.get("month_from") or parsed_period.get("date_from") or "")[:6]
+        month_to = str(parsed_period.get("month_to") or parsed_period.get("date_to") or "")[:6]
+        month_from, month_to = month_from or month_to, month_to or month_from
+        params.update({
+            "month_from": month_from, "month_to": month_to,
+            "date_from": str(parsed_period.get("date_from") or f"{month_from}01")[:8],
+            "evaluation_month": _dashboard_next_month(month_to),
+        })
+        date_to = str(parsed_period.get("date_to") or "")[:8]
+        if date_to:
+            params["date_to"] = date_to
+        else:
+            params.pop("date_to", None)
+    params["dashboard_nlq_explicit_period"] = explicit_period
+
+    conditions, residual = _extract_dashboard_nlq_conditions(text)
+    mode, supplier_text = SCOPE_ALL, ""
+    supplier_mode_explicit = False
+    if "발주처" in conditions:
+        mode, supplier_text = SCOPE_ORDER_VENDOR, conditions["발주처"]
+        supplier_mode_explicit = True
+    elif "제약사" in conditions or "제조사" in conditions:
+        mode = SCOPE_MANUFACTURER
+        supplier_text = conditions.get("제약사") or conditions.get("제조사") or ""
+        supplier_mode_explicit = True
+    elif residual:
+        mode, supplier_text = SCOPE_MANUFACTURER, residual
+
+    # Dashboard permits both "제약사 한미" and "한미 제약사".  The
+    # extractor intentionally retains a bare mode label, so consume the
+    # remaining supplier phrase only when that explicit label has no value.
+    if supplier_mode_explicit and not supplier_text and residual:
+        supplier_text = residual
+        residual = ""
+
+    # A Dashboard manager-only question has one deterministic default: order
+    # vendor.  This avoids an artificial manufacturer/order-vendor ambiguity
+    # while preserving explicit supplier modes and unlabelled supplier names.
+    manager_text = str(conditions.get("담당자") or "").strip()
+    supplier_mode_defaulted = False
+    if manager_text and not supplier_mode_explicit and not supplier_text:
+        mode = SCOPE_ORDER_VENDOR
+        supplier_mode_defaulted = True
+
+    supplier_rows: list[dict[str, str]] = []
+    if supplier_text and supplier_text != "전체":
+        supplier_rows = resolve_supplier_vendor_codes(supplier_text, mode=mode)
+        if not supplier_rows:
+            logger.info(
+                "[dashboard.nlq.resolve] stage=supplier status=no_match mode=%s supplier_query_present=True "
+                "supplier_code_count=0 manager_query_present=%s",
+                mode,
+                bool(conditions.get("담당자")),
+            )
+            return {}, _dashboard_nlq_text_payload(
+                "해당 제약사 또는 발주처를 찾을 수 없습니다.",
+                status="no_data", params=params, question=text,
+            )
+        logger.info(
+            "[dashboard.nlq.resolve] stage=supplier status=resolved mode=%s supplier_query_present=True "
+            "supplier_code_count=%s manager_query_present=%s facts_called=False",
+            mode,
+            len(supplier_rows),
+            bool(conditions.get("담당자")),
+        )
+    else:
+        logger.info(
+            "[dashboard.nlq.resolve] stage=supplier status=%s mode=%s supplier_query_present=False "
+            "supplier_code_count=0 manager_query_present=%s facts_called=False",
+            "mode_only" if supplier_mode_explicit else "not_requested",
+            mode,
+            bool(conditions.get("담당자")),
+        )
+    supplier_label = _dashboard_nlq_scope_label(supplier_rows, query=supplier_text)
+    params.update({
+        "product_supplier_scope_mode": mode,
+        "manufacturer_codes": [row["code"] for row in supplier_rows] if mode == SCOPE_MANUFACTURER else [],
+        "order_vendor_codes": [row["code"] for row in supplier_rows] if mode == SCOPE_ORDER_VENDOR else [],
+        "manufacturer_manager_codes": [], "purchase_manager_codes": [],
+        "manufacturer_test_query": supplier_text if mode == SCOPE_MANUFACTURER else "",
+        "supplier_scope_label": supplier_label,
+        "supplier_scope_names": [str(row.get("name") or "").strip() for row in supplier_rows],
+        "supplier_manager_label": "전체",
+        "supplier_manager_labels": [],
+    })
+
+    if manager_text:
+        modes = [mode] if (supplier_mode_explicit or supplier_mode_defaulted) else [SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR]
+        matched_by_mode: dict[str, list[dict[str, str]]] = {}
+        for candidate_mode in modes:
+            # Resolve the manager across the selected supplier *mode*, not
+            # only inside a separately named supplier.  The facts SQL applies
+            # both code ranges as an AND condition.  Restricting this lookup
+            # first turns a valid explicit supplier+manager query into a
+            # resolver no-match before facts can distinguish real no-data.
+            options = load_supplier_manager_options(mode=candidate_mode)
+            matches = [row for row in options if manager_text == str(row.get("code") or "").strip() or manager_text in str(row.get("name") or "").strip()]
+            if matches:
+                matched_by_mode[candidate_mode] = matches
+        if len(matched_by_mode) != 1:
+            ambiguous = bool(matched_by_mode)
+            message = (
+                "담당자 조건이 제약사와 발주처에 모두 존재합니다. 제약사 또는 발주처를 지정해 주세요."
+                if ambiguous else "해당 담당자를 찾을 수 없습니다."
+            )
+            logger.info(
+                "[dashboard.nlq.resolve] stage=manager status=%s supplier_mode=%s supplier_code_count=%s "
+                "manager_match_mode_count=%s manager_code_count=0 facts_called=False",
+                "ambiguous" if ambiguous else "no_match",
+                mode,
+                len(params.get("manufacturer_codes") or params.get("order_vendor_codes") or []),
+                len(matched_by_mode),
+            )
+            return {}, _dashboard_nlq_text_payload(
+                message, status="input_required" if ambiguous else "no_data",
+                params=params, question=text,
+            )
+        resolved_mode, rows = next(iter(matched_by_mode.items()))
+        params["product_supplier_scope_mode"] = resolved_mode
+        manager_key = "manufacturer_manager_codes" if resolved_mode == SCOPE_MANUFACTURER else "purchase_manager_codes"
+        params[manager_key] = list(dict.fromkeys(str(row.get("code") or "").strip() for row in rows))
+        params["supplier_manager_label"] = _dashboard_nlq_manager_label(rows)
+        params["supplier_manager_labels"] = [str(row.get("name") or "").strip() for row in rows]
+        logger.info(
+            "[dashboard.nlq.resolve] stage=manager status=resolved supplier_mode=%s supplier_code_count=%s "
+            "manager_match_mode_count=1 manager_code_count=%s manager_lookup_supplier_restricted=False facts_called=False",
+            resolved_mode,
+            len(params.get("manufacturer_codes") or params.get("order_vendor_codes") or []),
+            len(params.get(manager_key) or []),
+        )
+
+    normalized = normalize_dashboard_lite_params(params)
+    logger.info(
+        "[dashboard.nlq.params] explicit_period=%s supplier_mode=%s supplier_mode_explicit=%s supplier_mode_defaulted=%s supplier_count=%s manager_count=%s "
+        "supplier_query_present=%s manager_query_present=%s profile_found=%s",
+        explicit_period, normalized.get("product_supplier_scope_mode"), supplier_mode_explicit, supplier_mode_defaulted,
+        len(normalized.get("manufacturer_codes") or normalized.get("order_vendor_codes") or []),
+        len(normalized.get("manufacturer_manager_codes") or normalized.get("purchase_manager_codes") or []),
+        bool(supplier_text), bool(manager_text),
+        bool(profile),
+    )
+    return normalized, None
+
+
+def _dashboard_nlq_has_no_facts(facts: Any) -> bool:
+    """A deterministic Dashboard NLQ is empty when its product facts are empty."""
+    if not isinstance(facts, dict):
+        return True
+    inventory = facts.get("inventory")
+    if not isinstance(inventory, dict):
+        return True
+    return not bool(inventory.get("readiness_rows") or [])
+
+
+def _try_handle_dashboard_nlq(
+    text: str, *, room: Dict[str, Any], session_state: Dict[str, Any], logger
+) -> bool:
+    if not _resolve_dashboard_nlq_action(text):
+        return False
+    from app.ui.chat_middleware import get_current_chat_room_id, push_sims_result_to_chat
+    try:
+        from app.sims.views.dashboard_lite import build_dashboard_lite_result_payload
+
+        params, notice = _build_dashboard_nlq_params(text, session_state=session_state, logger=logger)
+        if notice is not None:
+            push_sims_result_to_chat(notice, _DASHBOARD_NLQ_ACTION)
+            return True
+        room_id = str(get_current_chat_room_id() or room.get("id") or "").strip()
+        payload, cache = build_dashboard_lite_result_payload(
+            params, room_id=room_id, company_id=str(params.get("company_id") or ""), action=_DASHBOARD_NLQ_ACTION
+        )
+        facts_params = dict(cache.get("params") or {})
+        facts = dict(cache.get("facts") or {})
+        source_call_count = int(facts.get("source_call_count") or 0)
+        facts_empty = _dashboard_nlq_has_no_facts(facts)
+        logger.info(
+            "[dashboard.nlq.facts] supplier_mode=%s supplier_code_count=%s manager_code_count=%s "
+            "explicit_period=%s facts_called=True valid_fact_rows=%s source_call_count=%s result_status=%s",
+            facts_params.get("product_supplier_scope_mode") or "",
+            len(facts_params.get("manufacturer_codes") or facts_params.get("order_vendor_codes") or []),
+            len(facts_params.get("manufacturer_manager_codes") or facts_params.get("purchase_manager_codes") or []),
+            bool(facts_params.get("dashboard_nlq_explicit_period")),
+            len((facts.get("inventory") or {}).get("readiness_rows") or []),
+            source_call_count,
+            "no_data" if facts_empty else "success",
+        )
+        if facts_empty:
+            push_sims_result_to_chat(
+                _dashboard_nlq_text_payload(
+                    "해당 조회조건의 자료가 없습니다.",
+                    status="no_data",
+                    params=facts_params,
+                    question=text,
+                    source_call_count=source_call_count,
+                ),
+                _DASHBOARD_NLQ_ACTION,
+            )
+            return True
+        meta = dict(payload.get("meta") or {})
+        meta.update({
+            "nlq": True, "nlq_query": text, "canonical_action": _DASHBOARD_NLQ_ACTION,
+            "_force_push": True, "_nlq_nonce": str(uuid.uuid4()),
+        })
+        meta.setdefault("result_status", "success")
+        payload["meta"] = meta
+        session_state["__dashboard_lite_result"] = cache
+        push_sims_result_to_chat(payload, _DASHBOARD_NLQ_ACTION)
+        return True
+    except Exception as exc:
+        logger.exception("[nlq.router] dashboard-nlq deterministic handler failed error_type=%s", type(exc).__name__)
+        error_payload = _dashboard_nlq_text_payload(
+            "SIMS 일일점검을 완료하지 못했습니다. 조회 조건을 확인한 뒤 다시 시도해 주세요.",
+            status="routing_error",
+            params={},
+            question=text,
+        )
+        push_sims_result_to_chat(error_payload, _DASHBOARD_NLQ_ACTION)
+        return True
+
+
+def _apply_current_stock_defaults(
+    params: Dict[str, Any], *, session_state: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Apply only saved stock location/basis; current stock ignores IO kinds."""
+    from app.services.ssai_analysis_profile_service import load_dashboard_profile, normalize_company_default_conditions
+    from app.ui.ssai_login import get_selected_company
+
+    out = dict(params or {})
+    company_id = str((get_selected_company() or {}).get("company_id") or "").strip()
+    profile: Dict[str, Any] = {}
+    if company_id:
+        cache = session_state.setdefault("__analysis_profile_company_cache", {})
+        cached = cache.get(company_id) if isinstance(cache, dict) else None
+        profile = cached if isinstance(cached, dict) else dict(load_dashboard_profile(company_id=int(company_id)) or {})
+        if isinstance(cache, dict) and not isinstance(cached, dict):
+            cache[company_id] = dict(profile)
+    defaults = normalize_company_default_conditions(profile)
+    explicit_stock = any(out.get(key) for key in ("stock_cd", "stock_cds", "stock_cd_list", "stock_nm", "stock_names"))
+    if not explicit_stock:
+        stock_codes = _profile_tcodes(defaults.get("stock_cd_list"))
+        out["stock_cd_list"] = stock_codes
+        out["stock_cds"] = stock_codes
+        if len(stock_codes) == 1:
+            out["stock_cd"] = stock_codes[0]
+    if not str(out.get("stock_mode") or "").strip():
+        out["stock_mode"] = str(defaults.get("stock_mode") or "real")
+    for key in (
+        "io_gu", "io_gu_list", "io_gu_pairs", "dashboard_io_gu_list",
+        "sales_io_gu_list", "io_gu_prefix",
+    ):
+        out.pop(key, None)
+    out["group_basis"] = "stock"
+    out["current_stock_query"] = True
+    out["io_gu_scope"] = "all"
+    return out
+
+
 #=============================================================================
 # 입출고/명세서/재고 NLQ 라우팅
 # - _looks_like_io_nlq()로 판정된 문장은 _try_handle_io_nlq()로 처리한다.
@@ -4865,6 +5270,7 @@ def _try_handle_io_nlq(
     try:
         from app.services.io_nlq import (
             resolve_io_nlq,
+            resolve_current_stock_entity_condition,
             resolve_unlabeled_io_entity_condition,
         )
     except Exception:
@@ -4989,13 +5395,13 @@ def _try_handle_io_nlq(
     # Label-free proper nouns are never assigned to a condition by wording
     # alone.  The IO master relationships must identify exactly one semantic
     # target; otherwise retain the existing candidate-table result contract.
-    entity_resolution = resolve_unlabeled_io_entity_condition(
-        txt_for_io,
-        action=action,
-        params=params,
+    entity_resolution = (
+        resolve_current_stock_entity_condition(txt_for_io, params=params)
+        if action == "현재고 조회"
+        else resolve_unlabeled_io_entity_condition(txt_for_io, action=action, params=params)
     )
     entity_status = str(entity_resolution.get("status") or "")
-    if entity_status in {"candidate_required", "not_found", "resolution_unavailable"}:
+    if entity_status in {"input_required", "candidate_required", "not_found", "resolution_unavailable"}:
         candidates = list(entity_resolution.get("candidates") or [])
         show_candidates = entity_status == "candidate_required"
         candidate_labels = {
@@ -5011,11 +5417,13 @@ def _try_handle_io_nlq(
             for row in candidates
         ]) if show_candidates else pd.DataFrame()
         if entity_status == "candidate_required":
-            message = "조건 이름을 확인할 수 없습니다. 거래처, 제약사, 제품 중 하나를 지정해 다시 조회해 주세요."
+            message = "후보가 여러 개입니다. 제조사 또는 제품 후보 중 하나를 선택해 다시 조회해 주세요." if action == "현재고 조회" else "조건 이름을 확인할 수 없습니다. 거래처, 제약사, 제품 중 하나를 지정해 다시 조회해 주세요."
+        elif entity_status == "input_required":
+            message = "현재고 조회에는 제조사명 또는 제품명이 필요합니다."
         elif entity_status == "resolution_unavailable":
             message = "조회 조건을 확인하는 중 오류가 발생했습니다. 거래처·제약사·제품 중 조건 종류를 명시해 다시 조회해 주세요."
         else:
-            message = "해당 조건과 일치하는 거래처·제약사·제품을 찾지 못했습니다."
+            message = "해당 제조사 또는 제품을 찾을 수 없습니다." if action == "현재고 조회" else "해당 조건과 일치하는 거래처·제약사·제품을 찾지 못했습니다."
         payload = {
             "final": True,
             "type": "table" if not candidate_df.empty else "text",
@@ -5030,8 +5438,12 @@ def _try_handle_io_nlq(
                 "nlq": True,
                 "nlq_query": txt,
                 "nlq_trace_request_id": trace_request_id,
-                "result_status": "candidate_required" if entity_status == "candidate_required" else "input_required",
-                "input_required": entity_status != "candidate_required",
+                "result_status": (
+                    "candidate_required" if entity_status == "candidate_required"
+                    else "no_data" if entity_status == "not_found"
+                    else "input_required"
+                ),
+                "input_required": entity_status in {"input_required", "resolution_unavailable"},
                 "candidate_table": show_candidates,
                 "entity_resolution_status": entity_status,
                 "candidate_count": int(len(candidates)),
@@ -5077,6 +5489,10 @@ def _try_handle_io_nlq(
             action,
             str(entity_resolution.get("resolved_kind") or ""),
         )
+
+    if action == "현재고 조회":
+        params = _apply_current_stock_defaults(params, session_state=session_state)
+        parsed["params"] = params
 
     # 제품수불은 단일 제품이 필수다. 빈 조건은 서비스/DB 호출 전에 안내만 남긴다.
     if action == "제품수불현황 조회" and not (
@@ -5238,7 +5654,7 @@ def _try_handle_io_nlq(
             meta = dict(payload.get("meta") or {})
             meta.setdefault("row_count", int(len(df)))
             meta.setdefault("row_count_total", int(len(df)))
-            if action in {"제품수불현황 조회", "제품재고현황 조회"}:
+            if action in {"제품수불현황 조회", "제품재고현황 조회", "현재고 조회"}:
                 meta.setdefault("result_status", "success")
             payload["meta"] = meta
 
@@ -5276,7 +5692,7 @@ def _try_handle_io_nlq(
         meta.setdefault("query_summary", query_summary)
         meta.setdefault("condition", query_summary)
         meta.setdefault("summary_md", msg)
-        if action in {"제품수불현황 조회", "제품재고현황 조회"}:
+        if action in {"제품수불현황 조회", "제품재고현황 조회", "현재고 조회"}:
             meta.setdefault("result_status", "no_data")
         payload["meta"] = meta
 
@@ -5328,6 +5744,10 @@ def _try_handle_io_nlq(
             ["get_product_flow_result"],
         ),
         "제품재고현황 조회": (
+            "app.services.product_inventory_service",
+            ["get_product_inventory_result"],
+        ),
+        "현재고 조회": (
             "app.services.product_inventory_service",
             ["get_product_inventory_result"],
         ),
@@ -5401,6 +5821,26 @@ def _try_handle_io_nlq(
         except Exception as exc:
             _trace("error", trace_action=action, trace_params=params, error=exc, source_stage="display")
             logger.exception("[nlq.router] io service failed action=%r module=%r", action, module_name)
+
+    if payload is None:
+        if action == "현재고 조회":
+            payload = {
+                "final": True,
+                "type": "text",
+                "title": action,
+                "action": action,
+                "params": dict(params),
+                "data": "현재고 조회를 완료하지 못했습니다. 조회 조건을 확인한 뒤 다시 시도해 주세요.",
+                "message": "현재고 조회를 완료하지 못했습니다. 조회 조건을 확인한 뒤 다시 시도해 주세요.",
+                "meta": {
+                    "result_status": "routing_error",
+                    "row_count": 0,
+                    "row_count_total": 0,
+                    "source_call_count": 0,
+                    "tableless_result": True,
+                    "notice_codes": ["routing_error"],
+                },
+            }
 
     if payload is None:
         try:
@@ -5975,7 +6415,21 @@ def try_handle_nlq(
     except Exception:
         logger.exception("[nlq.router] failed in codes-category-first routing")
 
-    # 2-1) 분석/KPI NLQ
+    # 2-1) Dashboard deterministic NLQ.  It owns its facts and never falls
+    # through to Analytics/IO/LLM routing once the canonical phrase matches.
+    try:
+        if _try_handle_dashboard_nlq(
+            txt,
+            room=room,
+            session_state=session_state,
+            logger=logger,
+        ):
+            return True
+    except Exception:
+        logger.exception("[nlq.router] dashboard-nlq handler failed")
+        return True
+
+    # 2-2) 분석/KPI NLQ
     # 반드시 io_nlq보다 먼저 태운다.
     # 이유:
     # - "품목별 재고부족현황" 같은 문장은 "재고" 신호 때문에 입출고 계열과 혼동될 수 있다.

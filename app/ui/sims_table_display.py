@@ -916,7 +916,11 @@ def _format_numeric_display_value(value: Any, kind: str) -> str:
         return ""
 
 
-def _format_numeric_null_columns_for_display(df: pd.DataFrame) -> tuple[pd.DataFrame, set[Any]]:
+def _format_numeric_null_columns_for_display(
+    df: pd.DataFrame,
+    *,
+    preserve_numeric_nulls: bool = False,
+) -> tuple[pd.DataFrame, set[Any]]:
     """Convert only numeric columns with missing values for the display copy.
 
     Streamlit 1.59 renders numeric nulls in ``NumberColumn`` cells as the
@@ -925,6 +929,9 @@ def _format_numeric_null_columns_for_display(df: pd.DataFrame) -> tuple[pd.DataF
     missing cells can remain visually blank.
     """
     if not isinstance(df, pd.DataFrame):
+        return df, set()
+
+    if preserve_numeric_nulls:
         return df, set()
 
     out = df.copy()
@@ -947,6 +954,44 @@ def _format_numeric_null_columns_for_display(df: pd.DataFrame) -> tuple[pd.DataF
         ).astype("string")
         text_columns.add(col)
 
+    return out, text_columns
+
+
+def _normalize_current_stock_numeric_nulls(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep current-stock numeric blanks as nullable numbers for NumberColumn."""
+    if not isinstance(df, pd.DataFrame):
+        return df
+
+    out = df.copy()
+    for col in ("재고수량", "현보험약가", "보험금액"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce").astype("Float64")
+    return out
+
+
+def _prepare_current_stock_number_cells(df: pd.DataFrame) -> tuple[pd.DataFrame, set[Any]]:
+    """Build right-aligned text cells only where current-stock needs blanks."""
+    if not isinstance(df, pd.DataFrame):
+        return df, set()
+
+    out = df.copy()
+    text_columns: set[Any] = set()
+    for col in ("순번", "현보험약가", "보험금액"):
+        if col not in out.columns:
+            continue
+        numeric = pd.to_numeric(out[col], errors="coerce")
+        if not bool(numeric.isna().any()):
+            continue
+        kind = _numeric_display_kind(col)
+        def _display(value: Any) -> str:
+            if _is_display_missing_token(value):
+                return ""
+            numeric_value = float(value)
+            if numeric_value == 0:
+                return "0"
+            return _format_numeric_display_value(value, kind)
+        out[col] = numeric.map(_display).astype("string")
+        text_columns.add(col)
     return out, text_columns
 
 
@@ -1065,6 +1110,7 @@ def _make_column_config(
     width: int,
     pinned: bool,
     force_text: bool = False,
+    force_number: bool = False,
 ) -> Any:
     name = _clean_text(col)
 
@@ -1076,7 +1122,7 @@ def _make_column_config(
     if pinned and _supports_pinned():
         kwargs["pinned"] = True
 
-    if _is_numeric_display_col(df, col) and not force_text:
+    if (_is_numeric_display_col(df, col) or force_number) and not force_text:
         kind = _numeric_display_kind(name)
 
         if kind == "int":
@@ -1099,6 +1145,8 @@ def _make_column_config(
             step=0.01,
         )
     
+    if force_text and _numeric_display_kind(name):
+        kwargs["alignment"] = "right"
     return st.column_config.TextColumn(**kwargs)
 
 
@@ -1330,12 +1378,15 @@ def build_sims_table_display_config(
     if not isinstance(df, pd.DataFrame):
         return df, {}, min_width, min_height
 
-    view_df = prepare_sims_table_display_df(df, action_name=action_name)
+    meta = meta or {}
+    # Current-stock already arrives as a display copy.  The generic IO
+    # normalizer fills numeric nulls with zero, which is incorrect for its
+    # repeated-location and subtotal rows.
+    view_df = df.copy() if bool(meta.get("current_stock_query")) else prepare_sims_table_display_df(df, action_name=action_name)
 
     if add_row_no:
         view_df = ensure_row_no(view_df, col_name=row_no_name)
 
-    meta = meta or {}
     pinned_cols = set(
         _default_pinned_cols(
             view_df.columns,
@@ -1347,7 +1398,15 @@ def build_sims_table_display_config(
         else []
     )
 
-    final_view_df, formatted_numeric_columns = _format_numeric_null_columns_for_display(view_df)
+    current_stock_text_columns: set[Any] = set()
+    if bool(meta.get("current_stock_query")):
+        view_df = _normalize_current_stock_numeric_nulls(view_df)
+        view_df, current_stock_text_columns = _prepare_current_stock_number_cells(view_df)
+
+    final_view_df, formatted_numeric_columns = _format_numeric_null_columns_for_display(
+        view_df,
+        preserve_numeric_nulls=bool(meta.get("current_stock_query")),
+    )
     column_config: Dict[str, Any] = {}
     total_width = 60
 
@@ -1361,7 +1420,7 @@ def build_sims_table_display_config(
                 col,
                 width=width,
                 pinned=_clean_text(col) in pinned_cols,
-                force_text=col in formatted_numeric_columns,
+                force_text=col in formatted_numeric_columns or col in current_stock_text_columns,
             )
         except TypeError:
             # 혹시 pinned 미지원/인자 차이가 있으면 pinned 없이 재시도

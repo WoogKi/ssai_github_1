@@ -37,6 +37,7 @@ import tempfile
 import traceback
 import types
 import uuid
+import warnings as py_warnings
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -987,6 +988,41 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
             and "P.Rd04_Physic_Nm LIKE %(nlq_unlabeled_name_like)s" in inventory_unlabeled_where
             and "MakerVen.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s" in inventory_unlabeled_where,
             f"where={inventory_unlabeled_where!r}",
+        )
+    )
+
+    inventory_summary_cfg = product_inventory_service._settings(
+        {"stock_mode": "real", "group_basis": "maker", "price_mode": "avg"}
+    )
+    inventory_summary_common = {
+        "date_from": "20260801",
+        "date_to": "20260809",
+        "cfg": inventory_summary_cfg,
+        "work_params": {},
+    }
+    unlabeled_inventory_summary = product_inventory_service._build_inventory_query_summary(
+        **inventory_summary_common,
+        params={"nlq_unlabeled_name": "fixture-name"},
+    )
+    maker_inventory_summary = product_inventory_service._build_inventory_query_summary(
+        **inventory_summary_common,
+        params={"maker_nm": "fixture-name"},
+    )
+    product_inventory_summary = product_inventory_service._build_inventory_query_summary(
+        **inventory_summary_common,
+        params={"physic_nm": "fixture-name"},
+    )
+    results.append(
+        CheckResult(
+            "inventory unlabeled search summary uses the neutral integrated-search label",
+            "통합검색 fixture-name" in unlabeled_inventory_summary
+            and "제조사명 fixture-name" not in unlabeled_inventory_summary
+            and "제품명 fixture-name" not in unlabeled_inventory_summary
+            and "통합검색 fixture-name" not in maker_inventory_summary
+            and "제조사명 fixture-name" in maker_inventory_summary
+            and "통합검색 fixture-name" not in product_inventory_summary
+            and "제품명 fixture-name" in product_inventory_summary,
+            f"unlabeled={unlabeled_inventory_summary!r}, maker={maker_inventory_summary!r}, product={product_inventory_summary!r}",
         )
     )
 
@@ -3759,6 +3795,66 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         )
     )
 
+    stock_grouped_inventory = _prepare_grouped_df(
+        inventory_source,
+        pd.DataFrame(columns=["physic_cd", "last_unit_cost"]),
+        {"group_basis": "stock", "price_mode": "avg"},
+        {"date_to": "20260731", "fetch_top": 0},
+    )
+    with py_warnings.catch_warnings(record=True) as stock_display_warnings:
+        py_warnings.simplefilter("always")
+        stock_inventory_display, stock_inventory_meta = _final_display_df(
+            stock_grouped_inventory,
+            {"group_basis": "stock", "price_mode": "avg"},
+        )
+    stock_subtotals = stock_inventory_display.loc[
+        stock_inventory_display["재고위치"].astype(str).eq("제품 합계")
+    ]
+    stock_final_totals = stock_inventory_display.loc[
+        stock_inventory_display["재고위치"].astype(str).eq("합계")
+    ]
+    unexpected_future_warnings = [
+        warning for warning in stock_display_warnings
+        if issubclass(warning.category, FutureWarning)
+    ]
+    stock_group_contract_ok = (
+        int(stock_inventory_meta.get("detail_count") or 0) == 2
+        and int(len(stock_subtotals)) == 0
+        and int(len(stock_final_totals)) == 1
+        and int(len(stock_inventory_display)) == 3
+        and not unexpected_future_warnings
+    )
+    results.append(
+        CheckResult(
+            "general product inventory stock grouping keeps detail plus final total",
+            stock_group_contract_ok,
+            f"detail_rows={stock_inventory_meta.get('detail_count')}, product_subtotals={len(stock_subtotals)}, "
+            f"final_totals={len(stock_final_totals)}, warnings={len(unexpected_future_warnings)}, meta={stock_inventory_meta}",
+        )
+    )
+
+    inventory_service = importlib.import_module("app.services.product_inventory_service")
+    general_display_source = inspect.getsource(inventory_service._final_display_df)
+    current_stock_display_source = inspect.getsource(inventory_service._build_current_stock_table_frames)
+    perf_source = inspect.getsource(inventory_service._collect_source_df) + inspect.getsource(
+        inventory_service.get_product_inventory_result
+    )
+    results.append(
+        _ok("product subtotal remains current-stock-only", "general=0/current-stock=present")
+        if "제품 합계" not in general_display_source and "제품 합계" in current_stock_display_source
+        else _fail("product subtotal remains current-stock-only", "subtotal boundary regression")
+    )
+    required_perf_stages = (
+        '"month_carry"', '"period_in"', '"period_out"', '"last_cost"',
+        "filter_prepare_ms", "group_aggregate_ms", "unit_calc_ms",
+        "amount_calc_ms", "dc_calc_ms", "final_display_frame_ms", "final_total_ms",
+    )
+    results.append(
+        _ok("product inventory performance stages are independently logged", "sql/group/calc/display")
+        if all(marker in perf_source for marker in required_perf_stages)
+        else _fail("product inventory performance stages are independently logged", "missing performance marker")
+    )
+
     inventory_rendered_frames: list[pd.DataFrame] = []
     inventory_rendered_kwargs: list[dict[str, Any]] = []
     with (
@@ -4981,6 +5077,508 @@ def run_live_checks(*, live_all: bool = False, show_payload: bool = False) -> li
     return results
 
 
+def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    io_nlq = importlib.import_module("app.services.io_nlq")
+    supplier = importlib.import_module("app.services.product_supplier_scope_service")
+    goods_service = importlib.import_module("app.services.rddbc040_service")
+    shared = importlib.import_module("app.sims.views.rddbc_io_shared")
+    router = importlib.import_module("app.sims.nlq.nlq_router")
+    inventory_service = importlib.import_module("app.services.product_inventory_service")
+    profile_service = importlib.import_module("app.services.ssai_analysis_profile_service")
+    login = importlib.import_module("app.ui.ssai_login")
+    originals = {
+        "vendor": supplier.resolve_common_vendor_candidates,
+        "goods": goods_service.search_goods_full,
+        "stocks": shared._load_stock_code_options,
+        "profile": profile_service.load_dashboard_profile,
+        "company": login.get_selected_company,
+    }
+    try:
+        supplier.resolve_common_vendor_candidates = lambda text: (
+            [
+                {"entity_code": "10047", "canonical_name": "한미약품", "entity_role": "manufacturer"},
+                {"entity_code": "10048", "canonical_name": "한미정밀", "entity_role": "manufacturer"},
+            ] if "한미" in str(text) else []
+        )
+        def _goods_like_fixture(**kwargs):
+            keyword = str(kwargs.get("keyword") or "")
+            if "타이레놀" in keyword:
+                return pd.DataFrame([{"Rd04_Physic_Cd": "00001", "Rd04_Physic_Nm": "타이레놀"}])
+            if "아스피린" in keyword:
+                return pd.DataFrame([
+                    {"Rd04_Physic_Cd": "00101", "Rd04_Physic_Nm": "아스피린100"},
+                    {"Rd04_Physic_Cd": "00102", "Rd04_Physic_Nm": "아스피린500"},
+                ])
+            if "아모크라" in keyword:
+                return pd.DataFrame([
+                    {"Rd04_Physic_Cd": "00201", "Rd04_Physic_Nm": "아모크라정"},
+                    {"Rd04_Physic_Cd": "00202", "Rd04_Physic_Nm": "아모크라듀오"},
+                ])
+            return pd.DataFrame()
+        goods_service.search_goods_full = _goods_like_fixture
+        shared._load_stock_code_options = lambda: [(".본사 창고 (00001)", "00001", ".본사 창고")]
+
+        empty = io_nlq.resolve_current_stock_entity_condition("현재고", params={})
+        results.append(_ok("current stock requires manufacturer/product", "input_required") if empty.get("status") == "input_required" else _fail("current stock requires manufacturer/product", repr(empty)))
+
+        maker = io_nlq.resolve_current_stock_entity_condition("현재고 한미", params={})
+        maker_params = dict(maker.get("params") or {})
+        results.append(_ok("current stock unlabeled manufacturer LIKE", "manufacturer scope") if maker.get("status") == "resolved" and maker_params.get("maker_nm") == "한미" else _fail("current stock unlabeled manufacturer LIKE", repr(maker)))
+
+        product = io_nlq.resolve_current_stock_entity_condition("현재고 제품명 타이레놀", params={"physic_nm": "타이레놀"})
+        product_params = dict(product.get("params") or {})
+        results.append(_ok("current stock product LIKE", "타이레놀 scope") if product.get("status") == "resolved" and product_params.get("physic_nm") == "타이레놀" else _fail("current stock product LIKE", repr(product)))
+
+        located_params_input = io_nlq.extract_params("현재고 재고위치 본사 창고 제품명 타이레놀")
+        located = io_nlq.resolve_current_stock_entity_condition("현재고 재고위치 본사 창고 제품명 타이레놀", params=located_params_input)
+        located_params = dict(located.get("params") or {})
+        results.append(_ok("current stock explicit location", "00001") if located.get("status") == "resolved" and located_params.get("stock_cds") == ["00001"] and located_params.get("physic_nm") == "타이레놀" else _fail("current stock explicit location", repr(located)))
+        results.append(_ok("current stock location code/name map", "00001=.본사 창고") if located_params.get("stock_location_name_map") == {"00001": ".본사 창고"} else _fail("current stock location code/name map", repr(located_params)))
+
+        compound_cases = {
+            "현재고 제약사 바이엘 제품 아스피린": {"maker_nm": "바이엘", "physic_nm": "아스피린"},
+            "현재고 제품 아스피린 제약사 바이엘": {"maker_nm": "바이엘", "physic_nm": "아스피린"},
+            "현재고 재고위치 본사 창고 제품명 아스피린": {"stock_nm": "본사 창고", "physic_nm": "아스피린"},
+        }
+        compound_parser_ok = all(
+            all(io_nlq.extract_params(question).get(key) == expected for key, expected in expected_params.items())
+            for question, expected_params in compound_cases.items()
+        )
+        results.append(
+            _ok("current stock compound labelled parser", "labels stop at the next label")
+            if compound_parser_ok
+            else _fail("current stock compound labelled parser", repr({q: io_nlq.extract_params(q) for q in compound_cases}))
+        )
+
+        aspirin = io_nlq.resolve_current_stock_entity_condition("현재고 제품명 아스피린", params=io_nlq.extract_params("현재고 제품명 아스피린"))
+        aspirin_params = dict(aspirin.get("params") or {})
+        aspirin_ok = aspirin.get("status") == "resolved" and aspirin_params.get("physic_nm") == "아스피린" and len(aspirin.get("candidates") or []) == 2
+        results.append(_ok("current stock explicit product LIKE multi", "no candidate table") if aspirin_ok else _fail("current stock explicit product LIKE multi", repr(aspirin)))
+
+        amocra = io_nlq.resolve_current_stock_entity_condition("현재고 제품명 아모크라", params=io_nlq.extract_params("현재고 제품명 아모크라"))
+        amocra_params = dict(amocra.get("params") or {})
+        amocra_ok = amocra.get("status") == "resolved" and amocra_params.get("physic_nm") == "아모크라" and len(amocra.get("candidates") or []) == 2
+        results.append(_ok("current stock explicit product LIKE multi amocra", "all LIKE products") if amocra_ok else _fail("current stock explicit product LIKE multi amocra", repr(amocra)))
+
+        maker_labeled = io_nlq.resolve_current_stock_entity_condition("현재고 제조사명 한미", params=io_nlq.extract_params("현재고 제조사명 한미"))
+        maker_labeled_params = dict(maker_labeled.get("params") or {})
+        maker_labeled_ok = maker_labeled.get("status") == "resolved" and maker_labeled_params.get("maker_nm") == "한미" and len(maker_labeled.get("candidates") or []) == 2
+        results.append(_ok("current stock explicit manufacturer LIKE multi", "all LIKE manufacturers") if maker_labeled_ok else _fail("current stock explicit manufacturer LIKE multi", repr(maker_labeled)))
+
+        supplier.resolve_common_vendor_candidates = lambda _text: [
+            {"entity_code": "20001", "canonical_name": "바이엘", "entity_role": "manufacturer"}
+        ]
+        compound_left_question = "현재고 제약사 바이엘 제품 아스피린"
+        compound_right_question = "현재고 제품 아스피린 제약사 바이엘"
+        compound_left = io_nlq.resolve_current_stock_entity_condition(
+            compound_left_question, params=io_nlq.extract_params(compound_left_question)
+        )
+        compound_right = io_nlq.resolve_current_stock_entity_condition(
+            compound_right_question, params=io_nlq.extract_params(compound_right_question)
+        )
+        compound_left_params = dict(compound_left.get("params") or {})
+        compound_right_params = dict(compound_right.get("params") or {})
+        compound_sql, _compound_sql_params = inventory_service._build_month_carry_sql(
+            {**compound_left_params, "base_month": "202608", "stock_mode": "real", "stock_cds": ["00001"]},
+            inventory_service._settings({"stock_mode": "real"}),
+        )
+        compound_and_ok = (
+            compound_left.get("status") == compound_right.get("status") == "resolved"
+            and compound_left_params.get("maker_nm") == compound_right_params.get("maker_nm") == "바이엘"
+            and compound_left_params.get("physic_nm") == compound_right_params.get("physic_nm") == "아스피린"
+            and compound_left_params.get("current_stock_entity_scope") == "manufacturer_and_product"
+            and compound_left_params.get("current_stock_manufacturer_codes") == compound_right_params.get("current_stock_manufacturer_codes")
+            and compound_left_params.get("current_stock_product_codes") == compound_right_params.get("current_stock_product_codes")
+            and "P.Rd04_Ven_Cd IN" in compound_sql
+            and "P.Rd04_Physic_Cd IN" in compound_sql
+            and " OR " not in compound_sql.split("WHERE", 1)[1].split("GROUP BY", 1)[0]
+        )
+        results.append(
+            _ok("current stock explicit manufacturer/product AND is order independent", "independent code IN predicates")
+            if compound_and_ok
+            else _fail("current stock explicit manufacturer/product AND is order independent", repr({"left": compound_left, "right": compound_right}))
+        )
+
+        current_stock_frame = pd.DataFrame([{
+            "group_cd": "00001", "group_nm": "00001", "physic_cd": "00001", "physic_nm": "타이레놀",
+            "standard": "500mg", "kd_cd": "", "edi_cd": "", "std_cd": "", "pack_unit": "EA",
+            "buy_cd": "", "buy_nm": "", "order_cd": "", "order_nm": "", "maker_cd": "10047", "maker_nm": "한미",
+            "product_group_nm": "", "product_di_nm": "", "product_class_nm": "", "special_manage_nm": "",
+            "carry_qty": 0, "carry_unit": 0, "carry_dc": 0, "carry_amt": 0,
+            "now_in_qty": 0, "in_unit": 0, "in_dc": 0, "in_amt": 0,
+            "now_out_qty": 0, "out_unit": 0, "out_dc": 0, "out_amt": 0,
+            "stock_qty": 12, "stock_unit": 100, "stock_dc": 0, "stock_amt": 1200,
+            "curr_insu_unit": 10, "insu_amt": 120,
+        }, {
+            "group_cd": "00002", "group_nm": "00002", "physic_cd": "00001", "physic_nm": "타이레놀",
+            "standard": "500mg", "kd_cd": "", "edi_cd": "", "std_cd": "", "pack_unit": "EA",
+            "buy_cd": "", "buy_nm": "", "order_cd": "", "order_nm": "", "maker_cd": "10047", "maker_nm": "한미",
+            "product_group_nm": "", "product_di_nm": "", "product_class_nm": "", "special_manage_nm": "",
+            "carry_qty": 0, "carry_unit": 0, "carry_dc": 0, "carry_amt": 0,
+            "now_in_qty": 0, "in_unit": 0, "in_dc": 0, "in_amt": 0,
+            "now_out_qty": 0, "out_unit": 0, "out_dc": 0, "out_amt": 0,
+            "stock_qty": 8, "stock_unit": 100, "stock_dc": 0, "stock_amt": 800,
+            "curr_insu_unit": 10, "insu_amt": 80,
+        }, {
+            "group_cd": "00001", "group_nm": "00001", "physic_cd": "00002", "physic_nm": "타이레놀 ER",
+            "standard": "650mg", "kd_cd": "", "edi_cd": "", "std_cd": "", "pack_unit": "EA",
+            "buy_cd": "", "buy_nm": "", "order_cd": "", "order_nm": "", "maker_cd": "10047", "maker_nm": "한미",
+            "product_group_nm": "", "product_di_nm": "", "product_class_nm": "", "special_manage_nm": "",
+            "carry_qty": 0, "carry_unit": 0, "carry_dc": 0, "carry_amt": 0,
+            "now_in_qty": 0, "in_unit": 0, "in_dc": 0, "in_amt": 0,
+            "now_out_qty": 0, "out_unit": 0, "out_dc": 0, "out_amt": 0,
+            "stock_qty": 4, "stock_unit": 100, "stock_dc": 0, "stock_amt": 400,
+            "curr_insu_unit": 10, "insu_amt": 40,
+        }, {
+            "group_cd": "00002", "group_nm": "00002", "physic_cd": "00002", "physic_nm": "타이레놀 ER",
+            "standard": "650mg", "kd_cd": "", "edi_cd": "", "std_cd": "", "pack_unit": "EA",
+            "buy_cd": "", "buy_nm": "", "order_cd": "", "order_nm": "", "maker_cd": "10047", "maker_nm": "한미",
+            "product_group_nm": "", "product_di_nm": "", "product_class_nm": "", "special_manage_nm": "",
+            "carry_qty": 0, "carry_unit": 0, "carry_dc": 0, "carry_amt": 0,
+            "now_in_qty": 0, "in_unit": 0, "in_dc": 0, "in_amt": 0,
+            "now_out_qty": 0, "out_unit": 0, "out_dc": 0, "out_amt": 0,
+            "stock_qty": 6, "stock_unit": 100, "stock_dc": 0, "stock_amt": 600,
+            "curr_insu_unit": 10, "insu_amt": 60,
+        }, {
+            "group_cd": "00001", "group_nm": "00001", "physic_cd": "00003", "physic_nm": "타이레놀 8시간",
+            "standard": "650mg", "kd_cd": "KD3", "edi_cd": "EDI3", "std_cd": "STD3", "pack_unit": "EA",
+            "buy_cd": "", "buy_nm": "", "order_cd": "10003", "order_nm": "발주처3", "maker_cd": "10047", "maker_nm": "한미",
+            "product_group_nm": "전문의약품", "product_di_nm": "보험", "product_class_nm": "내복제", "special_manage_nm": "",
+            "carry_qty": 0, "carry_unit": 0, "carry_dc": 0, "carry_amt": 0,
+            "now_in_qty": 0, "in_unit": 0, "in_dc": 0, "in_amt": 0,
+            "now_out_qty": 0, "out_unit": 0, "out_dc": 0, "out_amt": 0,
+            "stock_qty": 7, "stock_unit": 100, "stock_dc": 0, "stock_amt": 700,
+            "curr_insu_unit": 0, "insu_amt": 700,
+        }])
+        stock_display, stock_source, stock_meta = inventory_service._build_current_stock_table_frames(current_stock_frame, {
+            "group_basis": "stock", "current_stock_query": True,
+            "stock_location_name_map": {"00001": "본사 창고", "00002": "지점 창고"},
+        })
+        expected_current_stock_columns = [
+            "순번", "제품코드", "제품명", "규격", "재고위치명", "재고수량", "현보험약가", "보험금액", "표준코드",
+            "제품그룹명", "제품구분명", "제품분류명", "발주처코드", "발주처명", "제조사코드",
+            "재고위치코드", "KD코드", "EDI코드", "제조사명", "포장단위",
+        ]
+        display_ok = (
+            list(stock_display.columns) == expected_current_stock_columns
+            and stock_display.iloc[0]["재고위치코드"] == "00001"
+            and stock_display.iloc[0]["재고위치명"] == "본사 창고"
+            and int((stock_display["재고위치명"] == "합계").sum()) == 0
+            and int((stock_display["재고위치명"] == "제품 합계").sum()) == 2
+            and stock_display.loc[stock_display["제품코드"] == "00001", "순번"].nunique() == 1
+            and stock_display["제품코드"].tolist() == ["00001", "", "", "00002", "", "", "00003"]
+            and stock_display["재고위치명"].tolist() == ["본사 창고", "지점 창고", "제품 합계", "본사 창고", "지점 창고", "제품 합계", "본사 창고"]
+            and stock_display.loc[1, "제품명"] == ""
+            and (stock_display.loc[1, "순번"] == "" or pd.isna(stock_display.loc[1, "순번"]))
+            and (stock_display.loc[1, "보험금액"] in ("", None) or pd.isna(stock_display.loc[1, "보험금액"]))
+            and stock_display.loc[stock_display["제품코드"] == "00003", "재고위치명"].iloc[0] != "제품 합계"
+            and all(
+                stock_display.loc[stock_display["재고위치명"] == "제품 합계", column].fillna("").eq("").all()
+                for column in (
+                    "순번", "제품코드", "제품명", "규격", "현보험약가", "표준코드",
+                    "제품그룹명", "제품구분명", "제품분류명", "발주처코드", "발주처명",
+                    "제조사코드", "제조사명", "재고위치코드", "KD코드", "EDI코드", "포장단위",
+                )
+            )
+            and float(stock_display.loc[stock_display["재고위치명"] == "제품 합계", "재고수량"].sum()) == 30.0
+            and float(stock_display.loc[stock_display["재고위치명"] == "제품 합계", "보험금액"].sum()) == 300.0
+            and stock_meta.get("current_stock_query") is True
+            and inventory_service._build_inventory_header_md(stock_meta) == ""
+            and current_stock_frame.loc[current_stock_frame["physic_cd"] == "00001", "physic_nm"].eq("타이레놀").all()
+        )
+        results.append(_ok("current stock final 20-column display", "detail/subtotal serials, no grand total") if display_ok else _fail("current stock final 20-column display", repr(stock_display.head().to_dict("records"))))
+
+        numeric_display_ok = all(
+            pd.api.types.is_numeric_dtype(stock_display[column])
+            for column in ("재고수량", "현보험약가", "보험금액")
+        ) and (
+            pd.isna(stock_display.loc[1, "현보험약가"])
+            and pd.isna(stock_display.loc[1, "보험금액"])
+        )
+        results.append(
+            _ok("current stock display numeric dtypes", "numeric blanks remain NaN")
+            if numeric_display_ok
+            else _fail("current stock display numeric dtypes", str(stock_display.dtypes.to_dict()))
+        )
+
+        from app.ui.sims_table_display import build_sims_table_display_config
+
+        stock_fast_view, stock_fast_config, _stock_fast_width, _stock_fast_height = (
+            build_sims_table_display_config(
+                stock_display,
+                action_name=inventory_service.ACTION,
+                meta=stock_meta,
+            )
+        )
+        stock_fast_number_config_ok = all(
+            isinstance(stock_fast_config.get(column), dict)
+            and stock_fast_config[column].get("type_config", {}).get("type") == "number"
+            and stock_fast_config[column].get("type_config", {}).get("format") == "localized"
+            for column in ("재고수량",)
+        ) and all(
+            stock_fast_config.get(column, {}).get("type_config", {}).get("type") == "text"
+            and stock_fast_config.get(column, {}).get("alignment") == "right"
+            for column in ("순번", "현보험약가", "보험금액")
+        )
+        results.append(
+            _ok("current stock fast display column contract", "numeric stock / right-aligned blank-safe text")
+            if stock_fast_number_config_ok
+            else _fail("current stock fast display column contract", repr(stock_fast_config))
+        )
+        stock_fast_blank_cells_ok = (
+            stock_fast_view.loc[1, "현보험약가"] == ""
+            and stock_fast_view.loc[1, "보험금액"] == ""
+            and stock_fast_view.loc[2, "현보험약가"] == ""
+            and stock_fast_view.loc[2, "보험금액"] == "200"
+            and stock_fast_view.loc[0, "현보험약가"] == "10.00"
+            and not any(
+                isinstance(value, str) and value.strip() in {"None", "<NA>", "NaN", "nan"}
+                for value in stock_fast_view.to_numpy().ravel()
+            )
+        )
+        results.append(
+            _ok("current stock fast display blanks", "empty cells with NumberColumn; no visible null tokens")
+            if stock_fast_blank_cells_ok
+            else _fail("current stock fast display blanks", repr(stock_fast_view.loc[:2, ["순번", "현보험약가", "보험금액"]].to_dict("records")))
+        )
+
+        current_stock_source = inspect.getsource(inventory_service._collect_source_df)
+        current_stock_prepare = inspect.getsource(inventory_service._prepare_grouped_df)
+        current_stock_display_builder = inspect.getsource(inventory_service._build_current_stock_table_frames)
+        current_stock_fast_path_ok = (
+            "if current_stock_query:" in current_stock_source
+            and "return all_df, pd.DataFrame()" in current_stock_source
+            and "if bool(cfg.get(\"current_stock_query\"))" in current_stock_prepare
+            and "last_unit_cost" not in current_stock_prepare.split("if bool(cfg.get(\"current_stock_query\"))", 1)[1].split("if last_df", 1)[0]
+        )
+        results.append(
+            _ok("current stock skips last-cost and unit/DC calculations", "current-stock-only fast path")
+            if current_stock_fast_path_ok
+            else _fail("current stock skips last-cost and unit/DC calculations", "fast path missing")
+        )
+        results.append(
+            _ok("current stock display keeps source frame separate", "display-only numeric empty cells")
+            if "source_parts.append" in current_stock_display_builder and "df_full" not in current_stock_display_builder
+            else _fail("current stock display keeps source frame separate", "source/display separation missing")
+        )
+
+        real_month_sql, _ = inventory_service._build_month_carry_sql(
+            {"base_month": "202608", "stock_mode": "real", "physic_cd": "21545", "stock_cds": ["00001"]},
+            inventory_service._settings({"stock_mode": "real"}),
+        )
+        book_month_sql, _ = inventory_service._build_month_carry_sql(
+            {"base_month": "202608", "stock_mode": "book", "physic_cd": "21545", "stock_cds": ["00001"]},
+            inventory_service._settings({"stock_mode": "book"}),
+        )
+        monthly_formula_ok = (
+            "dbo.Rddbc210" in real_month_sql
+            and "Rd21_In_Quantity" in real_month_sql
+            and "Rd21_In_Oquantity" in real_month_sql
+            and "Rd21_Out_Quantity" in real_month_sql
+            and "Rd21_Out_Oquantity" in real_month_sql
+            and "dbo.Rddbc220" in book_month_sql
+            and "Rd22_In_Quantity" in book_month_sql
+            and "Rd22_Out_Quantity" in book_month_sql
+        )
+        results.append(
+            _ok("inventory monthly stock formula contract", "210/220 in/out bonus columns")
+            if monthly_formula_ok
+            else _fail("inventory monthly stock formula contract", "monthly quantity expression missing")
+        )
+
+        flow_service = importlib.import_module("app.services.product_flow_service")
+        original_flow_stock_resolver = flow_service.resolve_inventory_stock_codes
+        original_flow_master_info = flow_service._get_product_master_info
+        try:
+            captured_flow_params: list[dict] = []
+            flow_service.resolve_inventory_stock_codes = lambda _params: ["00001"]
+            def _capture_flow_location_params(work_params):
+                captured_flow_params.append(dict(work_params))
+                raise RuntimeError("fixture stops after stock-location resolution")
+            flow_service._get_product_master_info = _capture_flow_location_params
+            flow_location_result = flow_service.get_product_flow_result({
+                "physic_cd": "00001",
+                "stock_nm": "본사창고",
+                "date_from": "20260101",
+                "date_to": "20260131",
+            })
+            flow_location_ok = (
+                bool(captured_flow_params)
+                and captured_flow_params[0].get("stock_cds") == ["00001"]
+                and captured_flow_params[0].get("stock_cd") == "00001"
+            )
+            results.append(
+                _ok("product flow resolves named stock location", "본사창고 -> 00001")
+                if flow_location_ok
+                else _fail("product flow resolves named stock location", repr(flow_location_result))
+            )
+
+            flow_service.resolve_inventory_stock_codes = lambda _params: []
+            flow_location_missing = flow_service.get_product_flow_result({
+                "physic_cd": "00001",
+                "stock_nm": "없는창고",
+                "date_from": "20260101",
+                "date_to": "20260131",
+            })
+            flow_missing_ok = (
+                flow_location_missing.get("meta", {}).get("result_status") == "no_data"
+                and flow_location_missing.get("df") is None
+            )
+            results.append(
+                _ok("product flow rejects unresolved named stock location", "no unfiltered fallback")
+                if flow_missing_ok
+                else _fail("product flow rejects unresolved named stock location", repr(flow_location_missing))
+            )
+        finally:
+            flow_service.resolve_inventory_stock_codes = original_flow_stock_resolver
+            flow_service._get_product_master_info = original_flow_master_info
+
+        inventory_followup = importlib.import_module("app.ui.current_table_followups.inventory")
+        followup_payloads: list[dict[str, Any]] = []
+        def _find_col(frame, *, exact=(), include_any=(), exclude_any=()):
+            for column in frame.columns:
+                text = str(column).strip()
+                if text in exact:
+                    return text
+            for column in frame.columns:
+                text = str(column).strip()
+                if any(token in text for token in include_any) and not any(token in text for token in exclude_any):
+                    return text
+            return None
+        followup_helpers = {
+            "find_col": _find_col,
+            "to_num": lambda series: pd.to_numeric(series, errors="coerce").fillna(0),
+            "push_table": lambda **kwargs: (followup_payloads.append(kwargs) or True),
+            "push_notice": lambda **kwargs: (followup_payloads.append(kwargs) or True),
+        }
+        followup_handled = inventory_followup.handle_inventory_followup(
+            df=stock_source,
+            query="현재표 제품별 재고수량 TOP 20",
+            top_n=20,
+            table_key="current-stock-fixture",
+            source_action="현재고 조회",
+            helpers=followup_helpers,
+            log=logging.getLogger("io-current-stock-followup"),
+        )
+        followup_df = (followup_payloads[0].get("df") if followup_payloads else pd.DataFrame())
+        no_double_count_ok = (
+            followup_handled is True
+            and isinstance(followup_df, pd.DataFrame)
+            and float(followup_df.loc[followup_df["제품코드"] == "00001", "재고수량"].iloc[0]) == 20.0
+            and float(followup_df.loc[followup_df["제품코드"] == "00002", "재고수량"].iloc[0]) == 10.0
+            and float(followup_df.loc[followup_df["제품코드"] == "00003", "재고수량"].iloc[0]) == 7.0
+            and list(followup_df.columns) == ["순번", "제품코드", "제품명", "규격", "제조사명", "재고수량", "보험금액"]
+        )
+        results.append(_ok("current stock followup uses product subtotal once", "20 and 10") if no_double_count_ok else _fail("current stock followup uses product subtotal once", repr(followup_payloads)))
+
+        chat_middleware = importlib.import_module("app.ui.chat_middleware")
+        fast_renderer_source = inspect.getsource(chat_middleware._render_chat_fast_dataframe)
+        middleware_source = Path(chat_middleware.__file__).read_text(encoding="utf-8")
+        display_mode_ok = (
+            "_build_io_display_styler" not in fast_renderer_source
+            and "[chat] io small table styler skipped" in middleware_source
+            and "_build_io_display_styler(view_df, add_row_no=False, band_size=5)" in middleware_source
+        )
+        results.append(_ok("current stock preserves small styler and fast no-styler contract", "small=IO Styler, fast=common dataframe") if display_mode_ok else _fail("current stock preserves small styler and fast no-styler contract", "renderer contract changed"))
+
+        captured_fast_render: dict[str, Any] = {}
+        original_st_dataframe = chat_middleware.st.dataframe
+        try:
+            chat_middleware.st.dataframe = lambda data, **kwargs: captured_fast_render.update({"df": data, "kwargs": kwargs})
+            chat_middleware._render_chat_fast_dataframe(
+                stock_display,
+                action_name=inventory_service.ACTION,
+                meta=stock_meta,
+            )
+        finally:
+            chat_middleware.st.dataframe = original_st_dataframe
+        rendered_current_stock_df = captured_fast_render.get("df")
+        rendered_current_stock_cfg = dict(captured_fast_render.get("kwargs") or {}).get("column_config") or {}
+        renderer_blank_contract_ok = (
+            isinstance(rendered_current_stock_df, pd.DataFrame)
+            and rendered_current_stock_df.loc[1, "순번"] in ("", None)
+            and rendered_current_stock_df.loc[1, "현보험약가"] == ""
+            and rendered_current_stock_df.loc[1, "보험금액"] == ""
+            and rendered_current_stock_df.loc[2, "현보험약가"] == ""
+            and rendered_current_stock_df.loc[2, "보험금액"] == "200"
+            and not any(
+                isinstance(value, str) and value.strip() in {"None", "<NA>", "NaN", "nan"}
+                for value in rendered_current_stock_df.to_numpy().ravel()
+            )
+            and all(
+                isinstance(rendered_current_stock_cfg.get(column), dict)
+                and rendered_current_stock_cfg[column].get("type_config", {}).get("type") == "number"
+                for column in ("재고수량",)
+            )
+            and all(
+                rendered_current_stock_cfg.get(column, {}).get("type_config", {}).get("type") == "text"
+                and rendered_current_stock_cfg.get(column, {}).get("alignment") == "right"
+                for column in ("순번", "현보험약가", "보험금액")
+            )
+        )
+        results.append(
+            _ok("current stock final Streamlit fast dataframe", "blank-safe text cells and numeric stock passed to st.dataframe")
+            if renderer_blank_contract_ok
+            else _fail("current stock final Streamlit fast dataframe", repr(rendered_current_stock_df.loc[:2, ["순번", "현보험약가", "보험금액"]].to_dict("records") if isinstance(rendered_current_stock_df, pd.DataFrame) else captured_fast_render))
+        )
+
+        supplier.resolve_common_vendor_candidates = lambda text: []
+        no_data = io_nlq.resolve_current_stock_entity_condition("현재고 없는이름", params={})
+        results.append(_ok("current stock no_data candidate", "not_found") if no_data.get("status") == "not_found" else _fail("current stock no_data candidate", repr(no_data)))
+
+        supplier.resolve_common_vendor_candidates = lambda text: [
+            {"entity_code": "10047", "canonical_name": "공통명", "entity_role": "manufacturer"}
+        ]
+        goods_service.search_goods_full = lambda **kwargs: pd.DataFrame([
+            {"Rd04_Physic_Cd": "00002", "Rd04_Physic_Nm": "공통명"}
+        ])
+        ambiguous = io_nlq.resolve_current_stock_entity_condition("현재고 공통명", params={})
+        ambiguous_params = dict(ambiguous.get("params") or {})
+        union_sql, union_sql_params = inventory_service._build_month_carry_sql(
+            {
+                **ambiguous_params,
+                "base_month": "202608",
+                "stock_mode": "real",
+                "stock_cds": ["00001"],
+            },
+            inventory_service._settings({"stock_mode": "real"}),
+        )
+        union_scope_ok = (
+            ambiguous.get("status") == "resolved"
+            and ambiguous_params.get("current_stock_entity_scope") == "manufacturer_or_product"
+            and ambiguous_params.get("current_stock_manufacturer_codes") == ["10047"]
+            and ambiguous_params.get("current_stock_product_codes") == ["00002"]
+            and "P.Rd04_Ven_Cd IN" in union_sql
+            and "P.Rd04_Physic_Cd IN" in union_sql
+            and "current_stock_entity_like" not in union_sql_params
+        )
+        results.append(_ok("current stock unlabeled union scope", "resolved master codes without candidate table") if union_scope_ok else _fail("current stock unlabeled union scope", repr(ambiguous)))
+
+        profile_service.load_dashboard_profile = lambda **kwargs: {
+            "stock_mode": "book", "stock_cd_list": ["0018:00001"], "io_gu_list": ["0012:501"]
+        }
+        login.get_selected_company = lambda: {"company_id": 4}
+        effective = router._apply_current_stock_defaults(
+            {"physic_cd": "00001", "io_gu_list": ["501"]}, session_state={}
+        )
+        defaults_ok = (
+            effective.get("stock_mode") == "book"
+            and effective.get("stock_cds") == ["00001"]
+            and "io_gu_list" not in effective
+            and effective.get("io_gu_scope") == "all"
+            and effective.get("group_basis") == "stock"
+        )
+        results.append(_ok("current stock saved stock / all io", repr(effective)) if defaults_ok else _fail("current stock saved stock / all io", repr(effective)))
+    finally:
+        supplier.resolve_common_vendor_candidates = originals["vendor"]
+        goods_service.search_goods_full = originals["goods"]
+        shared._load_stock_code_options = originals["stocks"]
+        profile_service.load_dashboard_profile = originals["profile"]
+        login.get_selected_company = originals["company"]
+    return results
+
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
@@ -5045,6 +5643,9 @@ def main() -> int:
         "PRODUCT INVENTORY DISPLAY / EXPORT CHECKS",
         product_inventory_display_results,
     )
+
+    current_stock_results = run_current_stock_nlq_contract_checks()
+    failed += _print_results("CURRENT STOCK NLQ CONTRACT CHECKS", current_stock_results)
 
     if args.live or args.live_all:
 

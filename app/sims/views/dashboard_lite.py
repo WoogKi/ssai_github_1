@@ -3647,6 +3647,68 @@ def render_dashboard_lite_chat_item(cache: dict[str, Any], *, render_mode: str =
     return True
 
 
+def build_dashboard_lite_result_payload(
+    params: dict[str, Any],
+    *,
+    room_id: str,
+    company_id: str = "",
+    cache_key: str = "",
+    action: str = "Dashboard Lite v0.1",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build one Dashboard result through the same facts/snapshot contract as the panel."""
+    work_params = dict(params or {})
+    if company_id:
+        work_params["company_id"] = str(company_id)
+    started = time.perf_counter()
+    facts = build_dashboard_lite_facts(work_params)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    requested_amount_unit = str(work_params.get("amount_display_unit") or "auto").strip().lower()
+    resolved_amount_unit = _resolved_dashboard_amount_unit(facts, requested_amount_unit)
+    work_params["amount_display_unit_requested"] = requested_amount_unit
+    work_params["amount_display_unit_resolved"] = resolved_amount_unit
+    facts_filters = dict(facts.get("filters") or {})
+    facts_filters["amount_display_unit_requested"] = requested_amount_unit
+    facts_filters["amount_display_unit_resolved"] = resolved_amount_unit
+    facts_filters["amount_display_unit"] = resolved_amount_unit
+    facts["filters"] = facts_filters
+
+    event_id = str(uuid.uuid4())
+    result_cache = {
+        "cache_key": cache_key,
+        "query_fingerprint": _dashboard_cache_key(work_params, run_seq=0),
+        "company_id": str(company_id or work_params.get("company_id") or ""),
+        "room_id": str(room_id or ""),
+        "params": work_params,
+        "facts": facts,
+        "elapsed_ms": elapsed_ms,
+        "elapsed_seconds": round(elapsed_ms / 1000.0, 3),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "dashboard_event_id": event_id,
+    }
+    for today_action in facts.get("today_actions") or []:
+        if isinstance(today_action, dict):
+            today_action["source_dashboard_event_id"] = event_id
+    payload = {
+        "id": event_id,
+        "final": True,
+        "type": "dashboard_lite",
+        "title": "SIMS 일일점검" if action == "SIMS 일일점검" else "Dashboard Lite",
+        "action": action,
+        "params": dict(work_params),
+        "data": None,
+        "meta": {
+            "analysis_type": "dashboard_lite",
+            "facts_kind": facts.get("kind"),
+            "room_id": result_cache["room_id"],
+            "dashboard_event_id": event_id,
+            "dashboard_cache": build_dashboard_lite_chat_snapshot(result_cache),
+            "query_summary": _dashboard_scope_header(work_params),
+            "source_call_count": int(facts.get("source_call_count") or 0),
+        },
+    }
+    return payload, result_cache
+
+
 def render_dashboard_lite() -> dict[str, Any]:
     """Render Dashboard Lite without changing current-table routing."""
     st.subheader("일일 재고·매출 보고")
@@ -3738,10 +3800,14 @@ def render_dashboard_lite() -> dict[str, Any]:
         0,
         0,
     )
-    started = time.perf_counter()
     try:
         with st.spinner("Dashboard 조회 중"):
-            facts = build_dashboard_lite_facts(params)
+            payload, result_cache = build_dashboard_lite_result_payload(
+                params,
+                room_id=get_current_chat_room_id(),
+                company_id=identity.get("company_id") or "",
+                cache_key=cache_key,
+            )
     except Exception as exc:
         st.error("Dashboard Lite facts를 생성하지 못했습니다. 기존 상세 조회 화면을 사용해 주세요.")
         return {
@@ -3753,49 +3819,6 @@ def render_dashboard_lite() -> dict[str, Any]:
             "meta": {"analysis_type": "dashboard_lite", "error_type": type(exc).__name__},
         }
 
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
-    requested_amount_unit = str(params.get("amount_display_unit") or "auto").strip().lower()
-    resolved_amount_unit = _resolved_dashboard_amount_unit(facts, requested_amount_unit)
-    params["amount_display_unit_requested"] = requested_amount_unit
-    params["amount_display_unit_resolved"] = resolved_amount_unit
-    facts_filters = dict(facts.get("filters") or {})
-    facts_filters["amount_display_unit_requested"] = requested_amount_unit
-    facts_filters["amount_display_unit_resolved"] = resolved_amount_unit
-    # Renderers read this event-local value, never the current form widget.
-    facts_filters["amount_display_unit"] = resolved_amount_unit
-    facts["filters"] = facts_filters
-    result_cache = {
-        "cache_key": cache_key,
-        "query_fingerprint": _dashboard_cache_key(params, run_seq=0),
-        "company_id": identity.get("company_id") or "",
-        "room_id": get_current_chat_room_id(),
-        "params": params,
-        "facts": facts,
-        "elapsed_ms": elapsed_ms,
-        "elapsed_seconds": round(elapsed_ms / 1000.0, 3),
-        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }
-    event_id = str(uuid.uuid4())
-    result_cache["dashboard_event_id"] = event_id
-    for action in facts.get("today_actions") or []:
-        if isinstance(action, dict):
-            action["source_dashboard_event_id"] = event_id
     st.session_state["__dashboard_lite_result"] = result_cache
     _mark_dashboard_room_title()
-    return {
-        "id": event_id,
-        "final": True,
-        "type": "dashboard_lite",
-        "title": "Dashboard Lite",
-        "action": "Dashboard Lite v0.1",
-        "params": dict(params),
-        "data": None,
-        "meta": {
-            "analysis_type": "dashboard_lite",
-            "facts_kind": facts.get("kind"),
-            "room_id": result_cache["room_id"],
-            "dashboard_event_id": event_id,
-            "dashboard_cache": build_dashboard_lite_chat_snapshot(result_cache),
-            "query_summary": _dashboard_scope_header(params),
-        },
-    }
+    return payload

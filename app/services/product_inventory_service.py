@@ -6,7 +6,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
+import logging
 import os
+import re
+import time
 
 import pandas as pd
 
@@ -21,6 +24,7 @@ from app.services.rddbc_io_common import (
 TABLE = "product_inventory"
 TITLE = "제품재고현황 조회"
 ACTION = "제품재고현황 조회"
+log = logging.getLogger("ssai")
 
 
 # -----------------------------------------------------------------------------
@@ -154,9 +158,11 @@ def _group_basis_label(value: Any) -> str:
         "maker": "제조사",
         "order": "발주처",
         "purchase": "매입처",
+        "stock": "재고위치",
         "제조사": "제조사",
         "발주처": "발주처",
         "매입처": "매입처",
+        "재고위치": "재고위치",
     }.get(text, clean_text(value) or "제조사")
 
 
@@ -270,6 +276,10 @@ def _build_inventory_query_summary(
     elif buy_nm:
         bits.append(f"매입처명 {buy_nm}")
 
+    unlabeled_name = clean_text(params.get("nlq_unlabeled_name"))
+    if unlabeled_name:
+        bits.append(f"통합검색 {unlabeled_name}")
+
     stock_text = _stock_condition_text(work_params)
 
     if stock_text:
@@ -291,6 +301,23 @@ def _fmt_header_num(value: Any) -> str:
 
 
 def _build_inventory_header_md(meta: Dict[str, Any]) -> str:
+    # 현재고 조회는 위치별 상세 표 자체가 조건과 합계를 충분히 보여 준다.
+    # 화면 상단의 별도 요약은 현재고 전용 계약에서 제외한다.
+    if bool(meta.get("current_stock_query")):
+        return ""
+
+    current_stock_summary = meta.get("current_stock_summary") or {}
+    if isinstance(current_stock_summary, dict):
+        maker_name = clean_text(current_stock_summary.get("maker_name"))
+        product_count = int(current_stock_summary.get("product_count") or 0)
+        condition = f"제조사 {maker_name}" if maker_name else "검색 조건"
+        return (
+            f"현재고 조건: {condition}\n\n"
+            "```text\n"
+            f"제품수    전체 재고수량\n{product_count:,}        "
+            f"{_fmt_header_num(meta.get('sum_stock_qty'))}\n```"
+        )
+
     info = meta.get("product_info") or {}
     if not isinstance(info, dict):
         info = {}
@@ -477,6 +504,8 @@ def _resolve_stock_mode(value: Any) -> str:
 
 def _resolve_group_basis(value: Any) -> str:
     text = clean_text(value).lower()
+    if text in {"재고위치", "stock", "warehouse"}:
+        return "stock"
     if text in {"매입처", "purchase", "buy"}:
         return "purchase"
     if text in {"발주처", "order", "ord"}:
@@ -586,17 +615,33 @@ def _resolve_stock_codes(params: Dict[str, Any]) -> list[str]:
     if not stock_nm:
         return []
 
+    # User input may omit the ERP display-name prefix or spaces.  Normalize
+    # only for matching; the displayed stock-location name remains unchanged.
+    normalized_stock_nm = re.sub(r"[.\s]+", "", stock_nm)
+    if normalized_stock_nm.isdigit() and len(normalized_stock_nm) <= 6:
+        normalized_stock_nm = normalized_stock_nm.zfill(5)
+
     sql = """
 SELECT
     LTRIM(RTRIM(Rd01_Tcode)) AS stock_cd
 FROM dbo.Rddbc010
 WHERE Rd01_Gcode = '0018'
   AND ISNULL(Rd01_Del_Flag, '') <> 'E'
-  AND LTRIM(RTRIM(ISNULL(Rd01_Hnm, ''))) LIKE %(stock_nm_like)s
+  AND (
+        LTRIM(RTRIM(Rd01_Tcode)) = %(stock_cd_exact)s
+        OR REPLACE(REPLACE(LTRIM(RTRIM(ISNULL(Rd01_Hnm, ''))), '.', ''), ' ', '')
+           LIKE %(stock_nm_normalized_like)s
+      )
 ORDER BY Rd01_Tcode
 """
     try:
-        df = query_to_df(sql, {"stock_nm_like": f"%{stock_nm}%"})
+        df = query_to_df(
+            sql,
+            {
+                "stock_cd_exact": normalized_stock_nm,
+                "stock_nm_normalized_like": f"%{normalized_stock_nm}%",
+            },
+        )
     except Exception:
         return []
 
@@ -611,6 +656,11 @@ ORDER BY Rd01_Tcode
             seen.add(v)
 
     return out
+
+
+def resolve_inventory_stock_codes(params: Dict[str, Any]) -> list[str]:
+    """Resolve inventory stock-location codes from explicit codes or a name."""
+    return _resolve_stock_codes(params)
 
 def _stock_not_found_message(*, stock_name: str = "", stock_codes: list[str] | None = None) -> str:
     codes = [clean_text(x) for x in (stock_codes or []) if clean_text(x)]
@@ -712,6 +762,7 @@ def _group_label(basis: str) -> str:
         "maker": "제조사",
         "order": "발주처",
         "purchase": "매입처",
+        "stock": "재고위치",
     }.get(basis, "제조사")
 
 
@@ -760,7 +811,29 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
         "month_in_amt_expr": month_in_amt_expr,
         "in_exclude_prefix": in_exclude_prefix,
         "out_exclude_prefix": out_exclude_prefix,
+        "current_stock_query": bool(params.get("current_stock_query")),
+        "stock_location_name_map": {
+            clean_text(code): clean_text(name)
+            for code, name in dict(params.get("stock_location_name_map") or {}).items()
+            if clean_text(code) and clean_text(name)
+        },
     }
+
+
+def _inventory_predicate_mode(params: Dict[str, Any]) -> str:
+    if clean_text(params.get("nlq_unlabeled_name")):
+        return "unlabeled_like_or"
+    if clean_text(params.get("maker_cd")):
+        return "manufacturer_code"
+    if clean_text(params.get("maker_nm")):
+        return "manufacturer_like"
+    if clean_text(params.get("physic_cd")):
+        return "product_code"
+    if clean_text(params.get("physic_nm")):
+        return "product_like"
+    if clean_text(params.get("ven_cd")) or clean_text(params.get("ven_nm")):
+        return "vendor"
+    return "standard"
 
 
 def _prefix_not_in(field_expr: str, prefixes: tuple[str, ...]) -> str:
@@ -803,7 +876,9 @@ def _common_descriptor_sql(group_cd_expr: str, group_nm_expr: str) -> str:
     """
 
 
-def _vendor_group_expr(basis: str, purchase_field: str) -> tuple[str, str]:
+def _vendor_group_expr(basis: str, purchase_field: str, stock_field: str = "") -> tuple[str, str]:
+    if basis == "stock" and stock_field:
+        return stock_field, f"LTRIM(RTRIM(ISNULL({stock_field}, '')))"
     if basis == "purchase":
         return purchase_field, f"ISNULL(BuyVen.Rd03_Ven_Nm, {purchase_field})"
     if basis == "order":
@@ -817,11 +892,54 @@ def _apply_master_filters(
     params: Dict[str, Any],
     buy_field_expr: str,
 ) -> None:
+    current_stock_scope = clean_text(params.get("current_stock_entity_scope"))
+    current_stock_scoped = current_stock_scope in {
+        "manufacturer", "product", "manufacturer_or_product", "manufacturer_and_product",
+    }
     if clean_text(params.get("physic_cd")):
         where.append("P.Rd04_Physic_Cd = %(physic_cd)s")
-    if clean_text(params.get("physic_nm")):
+    if clean_text(params.get("physic_nm")) and not current_stock_scoped:
         sql_params["physic_nm_like"] = f"%{clean_text(params.get('physic_nm'))}%"
         where.append("P.Rd04_Physic_Nm LIKE %(physic_nm_like)s")
+
+    if current_stock_scoped:
+        manufacturer_codes = list(dict.fromkeys(
+            clean_text(value) for value in (params.get("current_stock_manufacturer_codes") or []) if clean_text(value)
+        ))
+        product_codes = list(dict.fromkeys(
+            clean_text(value) for value in (params.get("current_stock_product_codes") or []) if clean_text(value)
+        ))
+        maker_where: list[str] = []
+        product_where: list[str] = []
+        if manufacturer_codes and params.get("current_stock_maker_filter_mode") == "code_in":
+            entity_params: dict[str, Any] = {}
+            _append_in_clause(maker_where, entity_params, "P.Rd04_Ven_Cd", manufacturer_codes, "current_stock_maker")
+            sql_params.update(entity_params)
+        elif clean_text(params.get("maker_nm")):
+            sql_params["current_stock_maker_like"] = f"%{clean_text(params.get('maker_nm'))}%"
+            maker_where.append("MakerVen.Rd03_Ven_Nm LIKE %(current_stock_maker_like)s")
+        if product_codes and params.get("current_stock_product_filter_mode") == "code_in":
+            entity_params = {}
+            _append_in_clause(product_where, entity_params, "P.Rd04_Physic_Cd", product_codes, "current_stock_product")
+            sql_params.update(entity_params)
+        elif clean_text(params.get("physic_nm")):
+            sql_params["current_stock_product_like"] = f"%{clean_text(params.get('physic_nm'))}%"
+            product_where.append("P.Rd04_Physic_Nm LIKE %(current_stock_product_like)s")
+
+        if current_stock_scope == "manufacturer_and_product":
+            where.extend(maker_where + product_where)
+        elif current_stock_scope == "manufacturer":
+            where.extend(maker_where)
+        elif current_stock_scope == "product":
+            where.extend(product_where)
+        elif maker_where or product_where:
+            where.append("(" + " OR ".join(maker_where + product_where) + ")")
+        elif clean_text(params.get("current_stock_entity_phrase")):
+            sql_params["current_stock_entity_like"] = f"%{clean_text(params.get('current_stock_entity_phrase'))}%"
+            where.append(
+                "(MakerVen.Rd03_Ven_Nm LIKE %(current_stock_entity_like)s "
+                "OR P.Rd04_Physic_Nm LIKE %(current_stock_entity_like)s)"
+            )
 
     # 제품재고장의 거래처 라벨은 제품 마스터에 연결된 매입처/발주처
     # 이름만 대상으로 한다. 제품·제조사 조건과 섞지 않는다.
@@ -834,7 +952,7 @@ def _apply_master_filters(
 
     if clean_text(params.get("maker_cd")):
         where.append("P.Rd04_Ven_Cd = %(maker_cd)s")
-    if clean_text(params.get("maker_nm")):
+    if clean_text(params.get("maker_nm")) and not current_stock_scoped:
         sql_params["maker_nm_like"] = f"%{clean_text(params.get('maker_nm'))}%"
         where.append("MakerVen.Rd03_Ven_Nm LIKE %(maker_nm_like)s")
 
@@ -878,8 +996,10 @@ def _build_month_carry_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple
     stock_codes = _normalize_stock_codes(params)
 
     month_table = cfg["month_table"]
-    group_cd_expr, group_nm_expr = _vendor_group_expr(cfg["group_basis"], f"M.{cfg['month_alias']}_Ven_Cd")
     stock_field = f"M.{cfg['month_alias']}_Stock_Cd"
+    group_cd_expr, group_nm_expr = _vendor_group_expr(
+        cfg["group_basis"], f"M.{cfg['month_alias']}_Ven_Cd", stock_field
+    )
 
     where = [
         "1 = 1",
@@ -1001,7 +1121,7 @@ def _build_detail_sql(direction: str, params: Dict[str, Any], cfg: Dict[str, Any
     _append_in_clause(where, sql_params, stock_field, stock_codes, f"{direction}_{bucket}_stock")
     _apply_master_filters(where, sql_params, params, buy_field)
 
-    group_cd_expr, group_nm_expr = _vendor_group_expr(cfg["group_basis"], buy_field)
+    group_cd_expr, group_nm_expr = _vendor_group_expr(cfg["group_basis"], buy_field, stock_field)
 
     if bucket == "carry":
         old_in_qty_sql = f"CAST(SUM({qty_expr}) AS decimal(18, 4))" if direction == "in" else "CAST(0 AS decimal(18, 4))"
@@ -1207,7 +1327,9 @@ def _build_last_in_unit_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tupl
     _append_in_clause(where, sql_params, "T.Rd11_Stock_Cd", stock_codes, "last_stock")
     _apply_master_filters(where, sql_params, params, "T.Rd11_Ven_Cd")
 
-    group_cd_expr, group_nm_expr = _vendor_group_expr(cfg["group_basis"], "T.Rd11_Ven_Cd")
+    group_cd_expr, group_nm_expr = _vendor_group_expr(
+        cfg["group_basis"], "T.Rd11_Ven_Cd", "T.Rd11_Stock_Cd"
+    )
 
     sql = f"""
 WITH X AS (
@@ -1259,31 +1381,79 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
     sql_params["base_month"] = base_month
 
     frames: list[pd.DataFrame] = []
+    current_stock_query = bool(cfg.get("current_stock_query"))
+    query_perf: dict[str, dict[str, Any]] = {}
+    predicate_mode = (
+        clean_text(params.get("current_stock_predicate_mode"))
+        if current_stock_query
+        else _inventory_predicate_mode(params)
+    ) or "standard"
+
+    def _fetch(stage: str, sql: str, sql_params: Dict[str, Any]) -> pd.DataFrame:
+        started = time.perf_counter()
+        df = _query_df_safe(sql, sql_params)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        query_perf[stage] = {
+            "rows": int(len(df)),
+            "sql_fetch_ms": elapsed_ms,
+            "predicate_mode": predicate_mode,
+        }
+        if current_stock_query:
+            query_perf[stage].update({
+                "manufacturer_code_count": int(len(params.get("current_stock_manufacturer_codes") or [])),
+                "product_code_count": int(len(params.get("current_stock_product_codes") or [])),
+            })
+            log.info(
+                "[current_stock.perf] stage=%s rows=%s sql_fetch_ms=%s predicate_mode=%s manufacturer_code_count=%s product_code_count=%s code_in_used=%s fallback_to_like_or=%s fallback_reason=%s",
+                stage,
+                int(len(df)),
+                elapsed_ms,
+                predicate_mode,
+                int(len(params.get("current_stock_manufacturer_codes") or [])),
+                int(len(params.get("current_stock_product_codes") or [])),
+                bool(params.get("current_stock_code_in_used")),
+                bool(params.get("current_stock_fallback_to_like_or")),
+                clean_text(params.get("current_stock_fallback_reason")),
+            )
+        else:
+            log.info(
+                "[product_inventory.perf] stage=sql sql_stage=%s rows=%s elapsed_ms=%s predicate_mode=%s",
+                stage,
+                int(len(df)),
+                elapsed_ms,
+                predicate_mode,
+            )
+        return df
 
     month_sql, month_params = _build_month_carry_sql(sql_params, cfg)
-    frames.append(_query_df_safe(month_sql, month_params))
+    frames.append(_fetch("month_carry", month_sql, month_params))
 
     first_day = _month_first(date_from)
     prev_day = _prev_day(date_from)
     if first_day <= prev_day:
         in_sql, in_params = _build_detail_sql("in", sql_params, cfg, first_day, prev_day, "carry")
         out_sql, out_params = _build_detail_sql("out", sql_params, cfg, first_day, prev_day, "carry")
-        frames.append(_query_df_safe(in_sql, in_params))
-        frames.append(_query_df_safe(out_sql, out_params))
+        frames.append(_fetch("carry_in", in_sql, in_params))
+        frames.append(_fetch("carry_out", out_sql, out_params))
 
     in_sql, in_params = _build_detail_sql("in", sql_params, cfg, date_from, date_to, "period")
     out_sql, out_params = _build_detail_sql("out", sql_params, cfg, date_from, date_to, "period")
-    frames.append(_query_df_safe(in_sql, in_params))
-    frames.append(_query_df_safe(out_sql, out_params))
+    frames.append(_fetch("period_in", in_sql, in_params))
+    frames.append(_fetch("period_out", out_sql, out_params))
 
     frames = [df for df in frames if isinstance(df, pd.DataFrame) and not df.empty]
     if not frames:
         return pd.DataFrame(), pd.DataFrame()
 
     all_df = pd.concat(frames, ignore_index=True, sort=False)
+    params["_product_inventory_query_perf"] = query_perf
+
+    if current_stock_query:
+        params["_current_stock_query_perf"] = query_perf
+        return all_df, pd.DataFrame()
 
     last_sql, last_params = _build_last_cost_sql(sql_params, cfg)
-    last_df = _query_df_safe(last_sql, last_params)
+    last_df = _fetch("last_cost", last_sql, last_params)
 
     return all_df, last_df
 
@@ -1307,10 +1477,18 @@ def _calc_current_insu_unit(df: pd.DataFrame, asof_yyyymmdd: str) -> pd.Series:
     return (base_price * acc_unit).round(4)
 
 
-def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[str, Any], params: Dict[str, Any]) -> pd.DataFrame:
+def _prepare_grouped_df(
+    src_df: pd.DataFrame,
+    last_df: pd.DataFrame,
+    cfg: Dict[str, Any],
+    params: Dict[str, Any],
+    perf: Optional[Dict[str, Any]] = None,
+) -> pd.DataFrame:
     if src_df is None or src_df.empty:
         return pd.DataFrame()
 
+    perf = perf if isinstance(perf, dict) else {}
+    prepare_started = time.perf_counter()
     work = src_df.copy()
 
     num_cols = [
@@ -1344,6 +1522,7 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
         if c not in work.columns:
             work[c] = 0
         work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+    perf["normalize_ms"] = round((time.perf_counter() - prepare_started) * 1000, 1)
 
     # 핵심:
     # 제품재고현황은 "선택한 집계기준 + 제품" 단위로 누적되어야 함
@@ -1370,11 +1549,15 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
         "special_manage_nm": "first",        
     })
 
+    aggregate_started = time.perf_counter()
     grp = (
         work.groupby(group_key, dropna=False, as_index=False)
         .agg(agg_map)
         .copy()
     )
+    perf["group_aggregate_ms"] = round((time.perf_counter() - aggregate_started) * 1000, 1)
+    perf["master_merge_ms"] = 0.0
+    perf["master_merge_mode"] = "sql_join_in_source_queries"
 
     # 선택한 집계기준과 group_cd/group_nm 을 다시 명확히 맞춤
     basis = cfg["group_basis"]
@@ -1384,13 +1567,33 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
     elif basis == "order":
         grp["order_cd"] = grp["group_cd"]
         grp["order_nm"] = grp["group_nm"]
-    else:  # maker
+    elif basis == "maker":
         grp["maker_cd"] = grp["group_cd"]
         grp["maker_nm"] = grp["group_nm"]
 
     grp["carry_qty"] = _to_num(grp["old_in_qty"]) - _to_num(grp["old_out_qty"])
     grp["stock_qty"] = _to_num(grp["carry_qty"]) + _to_num(grp["now_in_qty"]) - _to_num(grp["now_out_qty"])
 
+    if bool(cfg.get("current_stock_query")):
+        current_calc_started = time.perf_counter()
+        grp["curr_insu_unit"] = _calc_current_insu_unit(grp, params["date_to"])
+        grp["insu_amt"] = _round_money(_to_num(grp["stock_qty"]) * _to_num(grp["curr_insu_unit"]))
+        keep_mask = (
+            (_to_num(grp["carry_qty"]) != 0)
+            | (_to_num(grp["now_in_qty"]) != 0)
+            | (_to_num(grp["now_out_qty"]) != 0)
+            | (_to_num(grp["stock_qty"]) != 0)
+        )
+        result = grp.loc[keep_mask].sort_values(
+            ["group_nm", "physic_nm", "physic_cd"],
+            ascending=[True, True, True],
+            kind="stable",
+        ).reset_index(drop=True)
+        perf["current_stock_calc_ms"] = round((time.perf_counter() - current_calc_started) * 1000, 1)
+        perf["total_group_prepare_ms"] = round((time.perf_counter() - prepare_started) * 1000, 1)
+        return result
+
+    last_cost_merge_started = time.perf_counter()
     if last_df is not None and not last_df.empty:
         last_df = last_df.copy()
         last_df["physic_cd"] = last_df["physic_cd"].fillna("").astype(str).str.strip()
@@ -1401,7 +1604,9 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
         )
     else:
         grp["last_unit_cost"] = 0
+    perf["last_cost_merge_ms"] = round((time.perf_counter() - last_cost_merge_started) * 1000, 1)
 
+    unit_calc_started = time.perf_counter()
     grp["last_unit_cost"] = _to_num(grp.get("last_unit_cost", 0))
     grp["master_unit_cost"] = _to_num(grp["master_unit_cost"])
     grp["curr_insu_unit"] = _calc_current_insu_unit(grp, params["date_to"])
@@ -1437,18 +1642,24 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
 
     grp["in_unit"] = _unit_price_from_amount_qty(grp["now_in_amt"], grp["now_in_qty"])
     grp["out_unit"] = _unit_price_from_amount_qty(grp["now_out_amt"], grp["now_out_qty"])
+    perf["unit_calc_ms"] = round((time.perf_counter() - unit_calc_started) * 1000, 1)
 
+    amount_calc_started = time.perf_counter()
     grp["carry_amt"] = _round_money(_to_num(grp["carry_qty"]) * _to_num(grp["carry_unit"]))
     grp["in_amt"] = _round_money(_to_num(grp["now_in_amt"]))
     grp["out_amt"] = _round_money(_to_num(grp["now_out_amt"]))
     grp["stock_amt"] = _round_money(_to_num(grp["stock_qty"]) * _to_num(grp["stock_unit"]))
     grp["insu_amt"] = _round_money(_to_num(grp["stock_qty"]) * _to_num(grp["curr_insu_unit"]))
+    perf["amount_calc_ms"] = round((time.perf_counter() - amount_calc_started) * 1000, 1)
 
+    dc_calc_started = time.perf_counter()
     grp["carry_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["carry_unit"])
     grp["in_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["in_unit"])
     grp["out_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["out_unit"])
     grp["stock_dc"] = _dc_rate_from_unit(grp["curr_insu_unit"], grp["stock_unit"])
+    perf["dc_calc_ms"] = round((time.perf_counter() - dc_calc_started) * 1000, 1)
 
+    finalize_started = time.perf_counter()
     keep_mask = (
         (_to_num(grp["carry_qty"]) != 0)
         | (_to_num(grp["now_in_qty"]) != 0)
@@ -1472,14 +1683,28 @@ def _prepare_grouped_df(src_df: pd.DataFrame, last_df: pd.DataFrame, cfg: Dict[s
     fetch_top = _inventory_fetch_top(params)
     if fetch_top and len(grp) > fetch_top:
         grp = grp.head(fetch_top).copy()
+    perf["group_finalize_ms"] = round((time.perf_counter() - finalize_started) * 1000, 1)
+    perf["total_group_prepare_ms"] = round((time.perf_counter() - prepare_started) * 1000, 1)
     return grp
     
-def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFrame, Dict[str, Any]]:
+def _final_display_df(
+    grp: pd.DataFrame,
+    cfg: Dict[str, Any],
+    perf: Optional[Dict[str, Any]] = None,
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    if bool(cfg.get("current_stock_query")):
+        return _final_current_stock_display_df(grp, cfg)
+
+    perf = perf if isinstance(perf, dict) else {}
+    display_started = time.perf_counter()
+
     group_label = _group_label(cfg["group_basis"])
+    current_stock_query = False
+    location_columns = [group_label]
 
     if grp is None or grp.empty:
         cols = [
-            group_label, "제품명", "규격", "제품코드", "KD코드", "EDI코드",
+            *location_columns, "제품명", "규격", "제품코드", "KD코드", "EDI코드",
             "이월수량", "이월단가", "이월DC율", "이월금액",
             "입고수량", "입고단가", "입고DC율", "입고금액",
             "출고수량", "출고단가", "출고DC율", "출고금액",
@@ -1527,7 +1752,12 @@ def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFr
         "특수관리제품명": clean_text(first_row.get("special_manage_nm")),
     }
 
-    work[group_label] = work["group_nm"]
+    if current_stock_query:
+        location_names = dict(cfg.get("stock_location_name_map") or {})
+        work["재고위치코드"] = work["group_cd"].fillna("").astype(str).str.strip()
+        work["재고위치명"] = work["재고위치코드"].map(location_names).fillna(work["group_nm"])
+    else:
+        work[group_label] = work["group_nm"]
     work["제품명"] = work["physic_nm"]
     work["규격"] = work["standard"]
     work["제품코드"] = work["physic_cd"]
@@ -1573,7 +1803,7 @@ def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFr
 
 
     cols = [
-        group_label, "제품명", "규격", "제품코드", "KD코드", "EDI코드",
+        *location_columns, "제품명", "규격", "제품코드", "KD코드", "EDI코드",
         "이월수량", "이월단가", "이월DC율", "이월금액",
         "입고수량", "입고단가", "입고DC율", "입고금액",
         "출고수량", "출고단가", "출고DC율", "출고금액",
@@ -1588,8 +1818,10 @@ def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFr
 
     ]
     out = work[cols].copy()
+    perf["final_display_frame_ms"] = round((time.perf_counter() - display_started) * 1000, 1)
 
     # 합계는 상세행 기준으로 먼저 계산
+    total_started = time.perf_counter()
     sum_carry_qty = float(pd.to_numeric(out["이월수량"], errors="coerce").fillna(0).sum())
     sum_in_qty = float(pd.to_numeric(out["입고수량"], errors="coerce").fillna(0).sum())
     sum_out_qty = float(pd.to_numeric(out["출고수량"], errors="coerce").fillna(0).sum())
@@ -1602,7 +1834,7 @@ def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFr
         for c in cols
     }
 
-    total_row[group_label] = "합계"
+    total_row["재고위치명" if current_stock_query else group_label] = "합계"
     total_row["이월수량"] = sum_carry_qty
     total_row["이월금액"] = float(pd.to_numeric(out["이월금액"], errors="coerce").fillna(0).sum())
     total_row["입고수량"] = sum_in_qty
@@ -1614,12 +1846,21 @@ def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFr
     total_row["보험금액"] = sum_insu_amt
 
 
-    out = pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+    detail_count = int(len(out))
+    perf["subtotal_ms"] = 0.0
+    perf["subtotal_rows"] = 0
+    total_frame = out.iloc[[0]].copy()
+    total_frame.index = [0]
+    for column, value in total_row.items():
+        total_frame.at[0, column] = float("nan") if value is None else value
+    out = pd.concat([out, total_frame], ignore_index=True)
     out = _finalize_display_df_260(out)
+    perf["final_total_ms"] = round((time.perf_counter() - total_started) * 1000, 1)
+    perf["total_display_ms"] = round((time.perf_counter() - display_started) * 1000, 1)
 
     meta = {
         "row_count": int(len(out)),
-        "detail_count": int(len(out) - 1),
+        "detail_count": detail_count,
         "sum_carry_qty": sum_carry_qty,
         "sum_in_qty": sum_in_qty,
         "sum_out_qty": sum_out_qty,
@@ -1630,6 +1871,149 @@ def _final_display_df(grp: pd.DataFrame, cfg: Dict[str, Any]) -> tuple[pd.DataFr
         "product_info": product_info,        
     }
     return out, meta
+
+
+_CURRENT_STOCK_DISPLAY_COLUMNS = [
+    "순번", "제품코드", "제품명", "규격",
+    "재고위치명", "재고수량", "현보험약가", "보험금액", "표준코드",
+    "제품그룹명", "제품구분명", "제품분류명",
+    "발주처코드", "발주처명", "제조사코드",
+    "재고위치코드", "KD코드", "EDI코드", "제조사명", "포장단위",
+]
+
+
+def _build_current_stock_table_frames(
+    grp: pd.DataFrame,
+    cfg: Dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    """Build separate current-stock source and display frames."""
+    if grp is None or grp.empty:
+        empty = pd.DataFrame(columns=_CURRENT_STOCK_DISPLAY_COLUMNS)
+        return empty, empty.copy(), {
+            "row_count": 0,
+            "detail_count": 0,
+            "sum_carry_qty": 0.0,
+            "sum_in_qty": 0.0,
+            "sum_out_qty": 0.0,
+            "sum_stock_qty": 0.0,
+            "sum_stock_amt": 0.0,
+            "sum_insu_amt": 0.0,
+            "group_label": "재고위치",
+            "product_info": {},
+            "current_stock_summary": {"product_count": 0, "maker_name": ""},
+        }
+
+    work = grp.copy()
+    location_names = dict(cfg.get("stock_location_name_map") or {})
+    work["재고위치코드"] = work["group_cd"].fillna("").astype(str).str.strip()
+    work["재고위치명"] = work["재고위치코드"].map(location_names).fillna(work["group_nm"])
+
+    aliases = {
+        "제품코드": "physic_cd", "제품명": "physic_nm", "규격": "standard",
+        "KD코드": "kd_cd", "EDI코드": "edi_cd", "표준코드": "std_cd",
+        "제품그룹명": "product_group_nm", "제품구분명": "product_di_nm",
+        "제품분류명": "product_class_nm", "발주처코드": "order_cd",
+        "발주처명": "order_nm", "제조사코드": "maker_cd", "제조사명": "maker_nm",
+        "포장단위": "pack_unit",
+    }
+    for display_col, source_col in aliases.items():
+        work[display_col] = work[source_col]
+    work["재고수량"] = _to_num(work["stock_qty"])
+    work["현보험약가"] = _to_num(work["curr_insu_unit"]).round(2)
+    work["보험금액"] = _round_money(work["insu_amt"])
+
+    product_key_columns = ["제품코드", "제품명", "규격"]
+    work["_현재고제품키"] = (
+        work[product_key_columns]
+        .fillna("")
+        .astype(str)
+        .agg("\x1f".join, axis=1)
+    )
+    product_keys = work["_현재고제품키"].drop_duplicates().tolist()
+    product_serials = {key: index + 1 for index, key in enumerate(product_keys)}
+    work["순번"] = work["_현재고제품키"].map(product_serials).astype(int)
+
+    detail_count = int(len(work))
+    sum_stock_qty = float(pd.to_numeric(work["재고수량"], errors="coerce").fillna(0).sum())
+    sum_insu_amt = float(pd.to_numeric(work["보험금액"], errors="coerce").fillna(0).sum())
+
+    display_parts: list[pd.DataFrame] = []
+    source_parts: list[pd.DataFrame] = []
+    for _, product_rows in work.groupby("_현재고제품키", sort=False, dropna=False):
+        source_details = product_rows[_CURRENT_STOCK_DISPLAY_COLUMNS].copy()
+        source_parts.append(source_details)
+        details = source_details.copy()
+        if len(details) > 1:
+            sequence_column = _CURRENT_STOCK_DISPLAY_COLUMNS[0]
+            location_name_column = _CURRENT_STOCK_DISPLAY_COLUMNS[4]
+            location_code_column = _CURRENT_STOCK_DISPLAY_COLUMNS[15]
+            repeated_text_columns = [
+                column for column in _CURRENT_STOCK_DISPLAY_COLUMNS
+                if column not in _DISPLAY_NUMERIC_COLS_260
+                and column not in {sequence_column, location_name_column, location_code_column}
+            ]
+            details.loc[details.index[1:], repeated_text_columns] = ""
+            details[sequence_column] = pd.to_numeric(details[sequence_column], errors="coerce").astype("Int64")
+            details.loc[details.index[1:], sequence_column] = pd.NA
+            details.loc[details.index[1:], ["현보험약가", "보험금액"]] = float("nan")
+        display_parts.append(details)
+        if len(product_rows) <= 1:
+            continue
+
+        first = source_details.iloc[0]
+        source_subtotal = {column: first.get(column, "") for column in _CURRENT_STOCK_DISPLAY_COLUMNS}
+        source_subtotal["재고위치코드"] = ""
+        source_subtotal["재고위치명"] = "제품 합계"
+        source_subtotal["재고수량"] = float(pd.to_numeric(product_rows["재고수량"], errors="coerce").fillna(0).sum())
+        source_subtotal["보험금액"] = float(pd.to_numeric(product_rows["보험금액"], errors="coerce").fillna(0).sum())
+        source_parts.append(pd.DataFrame([source_subtotal], columns=_CURRENT_STOCK_DISPLAY_COLUMNS))
+        subtotal = {column: "" for column in _CURRENT_STOCK_DISPLAY_COLUMNS}
+        # 제품 합계는 위치별 상세를 닫는 행이다. 화면용 copy에서만
+        # 제품정보를 반복하지 않고 위치명과 집계 수치만 남긴다.
+        subtotal["재고위치명"] = "제품 합계"
+        subtotal["재고수량"] = float(pd.to_numeric(product_rows["재고수량"], errors="coerce").fillna(0).sum())
+        subtotal["보험금액"] = float(pd.to_numeric(product_rows["보험금액"], errors="coerce").fillna(0).sum())
+        display_parts.append(pd.DataFrame([subtotal], columns=_CURRENT_STOCK_DISPLAY_COLUMNS))
+
+    out = _finalize_display_df_260(pd.concat(display_parts, ignore_index=True))
+    source_out = _finalize_display_df_260(pd.concat(source_parts, ignore_index=True))
+
+    product_count = int(len(product_keys))
+    product_info = {} if product_count > 1 else {
+        "제품코드": clean_text(work.iloc[0].get("제품코드")),
+        "제품명": clean_text(work.iloc[0].get("제품명")),
+        "규격": clean_text(work.iloc[0].get("규격")),
+        "현보험약가": float(pd.to_numeric(work.iloc[0].get("현보험약가"), errors="coerce") or 0.0),
+        "보험코드": clean_text(work.iloc[0].get("KD코드")),
+        "표준코드": clean_text(work.iloc[0].get("표준코드")),
+        "제조사명": clean_text(work.iloc[0].get("제조사명")),
+        "발주처명": clean_text(work.iloc[0].get("발주처명")),
+        "제품그룹명": clean_text(work.iloc[0].get("제품그룹명")),
+        "제품구분명": clean_text(work.iloc[0].get("제품구분명")),
+        "제품분류명": clean_text(work.iloc[0].get("제품분류명")),
+    }
+    return out, source_out, {
+        "row_count": int(len(out)),
+        "detail_count": detail_count,
+        "sum_carry_qty": 0.0,
+        "sum_in_qty": 0.0,
+        "sum_out_qty": 0.0,
+        "sum_stock_qty": sum_stock_qty,
+        "sum_stock_amt": 0.0,
+        "sum_insu_amt": sum_insu_amt,
+        "group_label": "재고위치",
+        "product_info": product_info,
+        "current_stock_query": True,
+    }
+
+
+def _final_current_stock_display_df(
+    grp: pd.DataFrame,
+    cfg: Dict[str, Any],
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Return the current-stock display copy for existing display-only callers."""
+    display_df, _source_df, meta = _build_current_stock_table_frames(grp, cfg)
+    return display_df, meta
 
 # -----------------------------------------------------------------------------
 # 외부 공개 함수
@@ -1671,10 +2055,12 @@ def get_product_inventory_df(params: Optional[Dict[str, Any]] = None) -> pd.Data
 
 
 def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    request_started = time.perf_counter()
     params = coalesce_params(params)
     cfg = _settings(params)
 
     try:
+        filter_prepare_started = time.perf_counter()
         date_from, date_to = _resolve_inventory_dates(params)
 
         work_params = dict(params)
@@ -1731,11 +2117,75 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                         "row_count_total": 0,
                     },
                 )
-            
-        src_df, last_df = _collect_source_df(work_params, cfg)
 
-        grp = _prepare_grouped_df(src_df, last_df, cfg, work_params)
-        df_display, meta = _final_display_df(grp, cfg)
+        filter_prepare_ms = round((time.perf_counter() - filter_prepare_started) * 1000, 1)
+        service_started = time.perf_counter()
+        src_df, last_df = _collect_source_df(work_params, cfg)
+        source_elapsed_ms = round((time.perf_counter() - service_started) * 1000, 1)
+        group_started = time.perf_counter()
+        group_perf: Dict[str, Any] = {}
+        grp = _prepare_grouped_df(src_df, last_df, cfg, work_params, perf=group_perf)
+        group_elapsed_ms = round((time.perf_counter() - group_started) * 1000, 1)
+        if bool(cfg.get("current_stock_query")):
+            frame_started = time.perf_counter()
+            df_display, df_full, meta = _build_current_stock_table_frames(grp, cfg)
+            frame_elapsed_ms = round((time.perf_counter() - frame_started) * 1000, 1)
+            meta["current_stock_query_perf"] = dict(work_params.get("_current_stock_query_perf") or {})
+            meta["current_stock_source_elapsed_ms"] = source_elapsed_ms
+            meta["current_stock_group_elapsed_ms"] = group_elapsed_ms
+            meta["current_stock_frame_elapsed_ms"] = frame_elapsed_ms
+            meta["current_stock_service_elapsed_ms"] = round((time.perf_counter() - service_started) * 1000, 1)
+            log.info(
+                "[current_stock.perf] stage=service_complete source_elapsed_ms=%s group_elapsed_ms=%s frame_elapsed_ms=%s total_elapsed_ms=%s detail_rows=%s predicate_mode=%s",
+                source_elapsed_ms,
+                group_elapsed_ms,
+                frame_elapsed_ms,
+                meta["current_stock_service_elapsed_ms"],
+                int(meta.get("detail_count", 0) or 0),
+                clean_text(work_params.get("current_stock_predicate_mode")) or "standard",
+            )
+        else:
+            display_perf: Dict[str, Any] = {}
+            df_display, meta = _final_display_df(grp, cfg, perf=display_perf)
+            df_full = df_display
+            service_total_ms = round((time.perf_counter() - request_started) * 1000, 1)
+            query_perf = dict(work_params.get("_product_inventory_query_perf") or {})
+            perf_meta = {
+                "predicate_mode": _inventory_predicate_mode(work_params),
+                "filter_prepare_ms": filter_prepare_ms,
+                "source_elapsed_ms": source_elapsed_ms,
+                "sql": query_perf,
+                "group": group_perf,
+                "display": display_perf,
+                "service_total_ms": service_total_ms,
+            }
+            meta["product_inventory_perf"] = perf_meta
+            log.info(
+                "[product_inventory.perf] stage=service_complete predicate_mode=%s "
+                "filter_prepare_ms=%s source_elapsed_ms=%s normalize_ms=%s "
+                "group_aggregate_ms=%s master_merge_ms=%s last_cost_merge_ms=%s "
+                "unit_calc_ms=%s amount_calc_ms=%s dc_calc_ms=%s group_finalize_ms=%s "
+                "final_display_frame_ms=%s subtotal_ms=%s subtotal_rows=%s final_total_ms=%s "
+                "service_total_ms=%s source_rows=%s result_rows=%s",
+                perf_meta["predicate_mode"],
+                filter_prepare_ms,
+                source_elapsed_ms,
+                group_perf.get("normalize_ms", 0),
+                group_perf.get("group_aggregate_ms", 0),
+                group_perf.get("master_merge_ms", 0),
+                group_perf.get("last_cost_merge_ms", 0),
+                group_perf.get("unit_calc_ms", 0),
+                group_perf.get("amount_calc_ms", 0),
+                group_perf.get("dc_calc_ms", 0),
+                group_perf.get("group_finalize_ms", 0),
+                display_perf.get("final_display_frame_ms", 0),
+                display_perf.get("subtotal_ms", 0),
+                display_perf.get("subtotal_rows", 0),
+                display_perf.get("final_total_ms", 0),
+                service_total_ms,
+                int(len(src_df)),
+                int(len(df_display)),
+            )
 
         detail_count = int(meta.get("detail_count", 0) or 0)
 
@@ -1778,7 +2228,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 "stock_cds": _resolve_stock_codes(work_params),
             },
             "columns": list(df_display.columns),
-            "df": df_display,
+            "df": df_full,
             "df_display": df_display,
             "records": df_display.to_dict(orient="records"),
             "final": True,

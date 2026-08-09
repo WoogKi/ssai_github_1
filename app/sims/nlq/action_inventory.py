@@ -37,11 +37,13 @@ class CanonicalAction:
     panel_category: str
     panel_action: str
     label_aliases: tuple[str, ...]
+    nlq_aliases: tuple[str, ...]
     nlq_action: str
     handler_kind: str
     handler_target: str
     implementation_status: str = IMPLEMENTED
     dashboard_only_reason: str = ""
+    panel_registered: bool = True
 
 
 def _spec(
@@ -49,6 +51,9 @@ def _spec(
     category: str,
     *,
     aliases: tuple[str, ...] = (),
+    nlq_aliases: tuple[str, ...] = (),
+    panel_action: str | None = None,
+    panel_registered: bool = True,
     handler_kind: str,
     handler_target: str,
     status: str = IMPLEMENTED,
@@ -57,13 +62,15 @@ def _spec(
     return CanonicalAction(
         canonical_action=action,
         panel_category=category,
-        panel_action=action,
+        panel_action=panel_action or action,
         label_aliases=aliases,
+        nlq_aliases=nlq_aliases,
         nlq_action=action if status == IMPLEMENTED else "",
         handler_kind=handler_kind,
         handler_target=handler_target,
         implementation_status=status,
         dashboard_only_reason=dashboard_only_reason,
+        panel_registered=panel_registered,
     )
 
 
@@ -79,6 +86,14 @@ CANONICAL_ACTIONS: tuple[CanonicalAction, ...] = (
     _spec("제품코드 목록", "제품", aliases=("제품코드목록",), handler_kind="master", handler_target="app.sims.nlq.nlq_goods.try_handle_goods_nlq"),
     _spec("제품코드 상세", "제품", aliases=("제품코드상세",), handler_kind="master", handler_target="app.sims.nlq.nlq_goods.try_handle_goods_nlq"),
     _spec("Dashboard Lite v0.1", "분석/KPI", handler_kind="dashboard", handler_target="app.sims.views.dashboard_lite.render_dashboard_lite", status=DASHBOARD_ONLY, dashboard_only_reason="Dashboard는 저장 프로필과 조회 폼을 사용하는 전용 화면이며 일반 NLQ action으로 등록하지 않는다."),
+    _spec(
+        "SIMS 일일점검",
+        "분석/KPI",
+        nlq_aliases=("오늘의 경영점검", "SIMS 운영점검"),
+        panel_registered=False,
+        handler_kind="router",
+        handler_target="app.sims.nlq.nlq_router._try_handle_dashboard_nlq",
+    ),
     _spec("제약사별 매출 추세 분석", "분석/KPI", handler_kind="analytics", handler_target="app.sims.nlq.nlq_router._get_analytics_handler"),
     _spec("제약사별 매출 추세 분석 요약표", "분석/KPI", handler_kind="analytics", handler_target="app.sims.nlq.nlq_router._get_analytics_handler"),
     _spec("품목별 매출 추세 분석", "분석/KPI", handler_kind="analytics", handler_target="app.sims.nlq.nlq_router._get_analytics_handler"),
@@ -101,6 +116,14 @@ CANONICAL_ACTIONS: tuple[CanonicalAction, ...] = (
     _spec("출고↔세금계산서 검증", "입출고/명세서/재고", handler_kind="io_service", handler_target="app.services.rddbc120_service.get_rddbc120_result"),
     _spec("제품수불현황 조회", "입출고/명세서/재고", aliases=("제품수불현황",), handler_kind="io_service", handler_target="app.services.product_flow_service.get_product_flow_result"),
     _spec("제품재고현황 조회", "입출고/명세서/재고", aliases=("제품재고현황",), handler_kind="io_service", handler_target="app.services.product_inventory_service.get_product_inventory_result"),
+    _spec(
+        "현재고 조회",
+        "입출고/명세서/재고",
+        nlq_aliases=("현재고",),
+        panel_registered=False,
+        handler_kind="io_alias",
+        handler_target="app.services.product_inventory_service.get_product_inventory_result",
+    ),
 )
 
 
@@ -127,6 +150,8 @@ def implemented_actions() -> tuple[CanonicalAction, ...]:
 def all_panel_labels() -> tuple[str, ...]:
     labels: list[str] = []
     for item in CANONICAL_ACTIONS:
+        if not item.panel_registered:
+            continue
         labels.append(item.panel_action)
         labels.extend(item.label_aliases)
     return tuple(labels)

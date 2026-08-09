@@ -10024,7 +10024,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         )
 
                     rendered_with_style = False
-                    if is_nlq_table or is_stock_io_table:
+                    if (is_nlq_table or is_stock_io_table) and not bool(meta.get("current_stock_query")):
                         try:
                             styled_view = _build_io_display_styler(view_df, add_row_no=False, band_size=5)
                             styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)

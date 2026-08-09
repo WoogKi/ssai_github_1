@@ -301,7 +301,7 @@ def detect_current_table_kind(source_action: str) -> str:
     if "실재고월집계" in s or "장부재고월집계" in s:
         return "monthly_stock"
 
-    if "제품재고현황" in s or "제품재고" in s:
+    if "제품재고현황" in s or "제품재고" in s or "현재고조회" in s:
         return "inventory"
 
     if "제품수불현황" in s or "제품수불" in s:
@@ -675,7 +675,7 @@ def _current_table_followup_capability(
             "requires_result_contract": False,
             "issue_codes": ["multiple_metric_or_grouping_unsupported"],
         }
-    if metric == "stock":
+    if metric == "stock" and not (kind == "inventory" and grouping == "product"):
         return {
             **base,
             "status": "unsupported",
@@ -1084,6 +1084,36 @@ def handle_current_table_followup_by_action(
     dispatch_helpers = dict(helpers)
     dispatch_helpers["push_table"] = _push_table_with_capability
     dispatch_helpers["push_notice"] = _push_notice_with_capability
+    handlers = _known_action_handlers()
+    handler = handlers.get(kind)
+    normalized_query = re.sub(r"\s+", "", str(query or ""))
+
+    # Current-stock product quantity TOP has a fixed product-identifying
+    # output contract.  Let the inventory handler consume it before the
+    # generic column grouper can reduce the result to quantity-only rows.
+    inventory_product_stock_top = (
+        kind == "inventory"
+        and "재고수량" in normalized_query
+        and any(marker in normalized_query for marker in ("제품별", "품목별"))
+        and any(marker in normalized_query for marker in ("TOP", "top", "상위"))
+    )
+    if inventory_product_stock_top:
+        try:
+            if handler(
+                df=df,
+                query=query,
+                top_n=top_n,
+                table_key=table_key,
+                source_action=source_action,
+                helpers=dispatch_helpers,
+                log=log,
+            ):
+                return True
+        except Exception:
+            try:
+                log.exception("[chat.followup_table] inventory product stock TOP handler failed")
+            except Exception:
+                pass
 
     if capability["status"] == "column_unavailable":
         labels = ", ".join(capability["missing_columns"])

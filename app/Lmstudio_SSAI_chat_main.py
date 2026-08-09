@@ -11088,6 +11088,7 @@ if user_input and user_input.strip():
 
     if (
         is_sims_input
+        or is_new_sims_nlq
         or is_pending_product_pick
         or is_pending_product_cancel
         or is_current_table_forced_followup

@@ -45,6 +45,8 @@ _PRODUCT_INVENTORY_WORDS = (
     "재고장",
 )
 
+_CURRENT_STOCK_WORDS = ("현재고",)
+
 _PRODUCT_IO_WORDS = _PRODUCT_FLOW_WORDS + _PRODUCT_INVENTORY_WORDS
 
 _TRANSACTION_SIGNAL_WORDS = (
@@ -1210,6 +1212,45 @@ def _extract_named_text(text: str, labels: tuple[str, ...]) -> Optional[str]:
 
     return None
 
+
+def _trim_io_named_value_at_next_label(value: Optional[str]) -> str:
+    """Keep one labelled IO value from absorbing the next labelled condition."""
+    raw = clean_text(value)
+    if not raw:
+        return ""
+    next_label = re.compile(
+        r"\s+(?=(?:제품명|제품코드|제품|제조사명|제조사|제약사명|제약사|발주처명|발주처|"
+        r"매입처명|매입처|재고위치명|재고위치)\s*(?:[:=]|\s))"
+    )
+    return clean_text(next_label.split(raw, maxsplit=1)[0])
+
+
+def _extract_io_compound_named_values(text: str) -> dict[str, str]:
+    """Extract labelled IO values without letting one label consume the next."""
+    raw = _norm(text)
+    if not raw:
+        return {}
+
+    label_specs = (
+        ("physic_nm", ("제품명", "제품")),
+        ("maker_nm", ("제조사명", "제조사", "제약사명", "제약사")),
+        ("stock_nm", ("재고위치명", "재고위치")),
+    )
+    all_labels = tuple(label for _, labels in label_specs for label in labels)
+    all_labels_pat = "|".join(re.escape(label) for label in sorted(all_labels, key=len, reverse=True))
+    values: dict[str, str] = {}
+    for key, labels in label_specs:
+        labels_pat = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+        match = re.search(
+            rf"(?:^|\s)(?:{labels_pat})\s*[:=]?\s*(.+?)(?=\s+(?:{all_labels_pat})\s*(?:[:=]|\s)|$)",
+            raw,
+        )
+        if match:
+            value = _trim_named_value(match.group(1))
+            if value:
+                values[key] = value
+    return values
+
 def _extract_implicit_product_name(text: str) -> Optional[str]:
     m = re.search(r"([가-힣A-Za-z0-9._()\-/]+)\s+제품(?:\s|$)", text)
     if not m:
@@ -1456,6 +1497,7 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
         r"세금\s*계산서(?:\s*공통)?",
         r"제품\s*수불(?:현황|부)?",
         r"제품\s*재고(?:현황|장)?",
+        r"현재\s*고",
         re.escape(action.replace(" 조회", "")),
         r"조회|검색|찾아줘|찾아봐|보여줘|알려줘|확인",
     )
@@ -1802,6 +1844,220 @@ def resolve_unlabeled_io_entity_condition(
         "resolver_outcomes": outcomes,
     }
 
+
+def _resolve_current_stock_code_sets(
+    maker_phrase: str = "",
+    product_phrase: str = "",
+) -> dict[str, Any]:
+    """Resolve current-stock master scopes once and retain safe diagnostics."""
+    maker_phrase = clean_text(maker_phrase)
+    product_phrase = clean_text(product_phrase)
+    maker_rows: list[dict[str, str]] = []
+    product_rows: list[dict[str, str]] = []
+    errors: list[str] = []
+    maker_started = time.perf_counter()
+    if maker_phrase:
+        try:
+            from app.services.product_supplier_scope_service import resolve_common_vendor_candidates
+
+            maker_rows = [
+                {
+                    "match_type": "manufacturer",
+                    "match_code": clean_text(row.get("entity_code")),
+                    "match_value": clean_text(row.get("canonical_name")),
+                }
+                for row in resolve_common_vendor_candidates(maker_phrase)
+                if str(row.get("entity_role") or "") == "manufacturer" and clean_text(row.get("entity_code"))
+            ]
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+    maker_elapsed_ms = round((time.perf_counter() - maker_started) * 1000, 1)
+
+    product_started = time.perf_counter()
+    if product_phrase:
+        try:
+            from app.services.rddbc040_service import search_goods_full
+
+            goods = search_goods_full(top=2000, keyword=product_phrase, with_count=False)
+            if isinstance(goods, pd.DataFrame):
+                for _, row in goods.iterrows():
+                    code = clean_text(row.get("Rd04_Physic_Cd") or row.get("제품코드") or row.get("physic_cd"))
+                    name = clean_text(row.get("Rd04_Physic_Nm") or row.get("제품명") or row.get("physic_nm"))
+                    if code and name:
+                        product_rows.append({"match_type": "product", "match_code": code, "match_value": name})
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+    product_elapsed_ms = round((time.perf_counter() - product_started) * 1000, 1)
+
+    def _unique(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+        return list({clean_text(row.get("match_code")): row for row in rows if clean_text(row.get("match_code"))}.values())
+
+    maker_rows = _unique(maker_rows)
+    product_rows = _unique(product_rows)
+    return {
+        "maker_rows": maker_rows,
+        "product_rows": product_rows,
+        "maker_elapsed_ms": maker_elapsed_ms,
+        "product_elapsed_ms": product_elapsed_ms,
+        "errors": errors,
+    }
+
+
+def _apply_current_stock_code_scope(
+    out: Dict[str, Any],
+    *,
+    scope: str,
+    maker_rows: list[dict[str, str]],
+    product_rows: list[dict[str, str]],
+) -> None:
+    maker_codes = list(dict.fromkeys(clean_text(row.get("match_code")) for row in maker_rows if clean_text(row.get("match_code"))))
+    product_codes = list(dict.fromkeys(clean_text(row.get("match_code")) for row in product_rows if clean_text(row.get("match_code"))))
+    maker_complete = len(maker_codes) < 200
+    product_complete = len(product_codes) < 2000
+    out["current_stock_entity_scope"] = scope
+    out["current_stock_manufacturer_codes"] = maker_codes if maker_complete else []
+    out["current_stock_product_codes"] = product_codes if product_complete else []
+    out["current_stock_maker_filter_mode"] = "code_in" if maker_codes and maker_complete else "like"
+    out["current_stock_product_filter_mode"] = "code_in" if product_codes and product_complete else "like"
+    out["current_stock_code_in_used"] = bool(
+        (scope in {"manufacturer", "manufacturer_or_product", "manufacturer_and_product"} and maker_codes and maker_complete)
+        or (scope in {"product", "manufacturer_or_product", "manufacturer_and_product"} and product_codes and product_complete)
+    )
+    fallback_reasons = []
+    if maker_codes and not maker_complete:
+        fallback_reasons.append("manufacturer_code_limit")
+    if product_codes and not product_complete:
+        fallback_reasons.append("product_code_limit")
+    out["current_stock_fallback_to_like_or"] = bool(fallback_reasons)
+    out["current_stock_fallback_reason"] = ",".join(fallback_reasons)
+    out["current_stock_predicate_mode"] = (
+        f"maker_{out['current_stock_maker_filter_mode']}_and_product_{out['current_stock_product_filter_mode']}"
+        if scope == "manufacturer_and_product"
+        else f"maker_{out['current_stock_maker_filter_mode']}_or_product_{out['current_stock_product_filter_mode']}"
+        if scope == "manufacturer_or_product"
+        else f"maker_{out['current_stock_maker_filter_mode']}"
+        if scope == "manufacturer"
+        else f"product_{out['current_stock_product_filter_mode']}"
+    )
+
+
+def resolve_current_stock_entity_condition(
+    text: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve the required manufacturer-or-product scope for current stock."""
+    out = dict(params or {})
+    lookup_text = str(text or "")
+    stock_location_name_map: dict[str, str] = {}
+    try:
+        from app.sims.views.rddbc_io_shared import _load_stock_code_options
+
+        for option in _load_stock_code_options():
+            # Shared UI options are (label, code, name); older test helpers
+            # return (code, name), so accept both without changing the source.
+            if not isinstance(option, (tuple, list)):
+                continue
+            if len(option) >= 3:
+                _, code, name = option[:3]
+            elif len(option) == 2:
+                code, name = option
+            else:
+                continue
+            code = clean_text(code)
+            name = clean_text(name)
+            if code and name:
+                stock_location_name_map[code] = name
+    except Exception:
+        stock_location_name_map = {}
+    if stock_location_name_map:
+        out["stock_location_name_map"] = stock_location_name_map
+    if "재고위치" in lookup_text and not (out.get("stock_cds") or out.get("stock_cd_list")):
+        # ERP 표시명은 선행 기호를 포함할 수 있지만, 사용자가 입력한 이름과
+        # 비교할 때만 그 기호를 무시한다. 결과 표의 원래 표시명은 바꾸지 않는다.
+        normalized_lookup_text = re.sub(r"\s+", " ", lookup_text.replace(".", " ")).strip()
+        stock_matches = [
+            (code, name)
+            for code, name in stock_location_name_map.items()
+            if re.sub(r"\s+", " ", name.lstrip(".").strip()) in normalized_lookup_text
+        ]
+        if stock_matches:
+            longest = max(len(name) for _, name in stock_matches)
+            selected_stocks = [(code, name) for code, name in stock_matches if len(name) == longest]
+            out["stock_cds"] = list(dict.fromkeys(code for code, _ in selected_stocks))
+            out["stock_cd_list"] = list(out["stock_cds"])
+            for _, name in selected_stocks:
+                lookup_text = lookup_text.replace(name, " ")
+            lookup_text = re.sub(r"재고위치(?:명|코드)?", " ", lookup_text)
+            out.pop("stock_nm", None)
+    explicit_maker = clean_text(out.get("maker_nm") or out.get("maker_cd"))
+    explicit_product = clean_text(out.get("physic_nm") or out.get("physic_cd"))
+    has_explicit_label = _has_explicit_name_label(text)
+    if not has_explicit_label and not clean_text(out.get("physic_cd")):
+        explicit_product = ""
+        out.pop("physic_nm", None)
+    phrase = explicit_maker or explicit_product or _extract_unlabeled_entity_phrase(lookup_text, "현재고 조회")
+    if not phrase:
+        return {"status": "input_required", "params": out, "candidates": []}
+
+    # Explicit labels are independent AND conditions.  They must never be
+    # reinterpreted through the unlabeled manufacturer-or-product resolver.
+    search_maker = bool(explicit_maker) or not explicit_product
+    search_product = bool(explicit_product) or not explicit_maker
+    resolved = _resolve_current_stock_code_sets(
+        maker_phrase=(explicit_maker or phrase) if search_maker else "",
+        product_phrase=(explicit_product or phrase) if search_product else "",
+    )
+    maker_rows = list(resolved["maker_rows"])
+    product_rows = list(resolved["product_rows"])
+    candidates = maker_rows + product_rows
+    errors = list(resolved["errors"])
+    if errors and not candidates:
+        return {"status": "resolution_unavailable", "params": out, "candidates": [], "error_types": errors}
+    if not candidates:
+        return {"status": "not_found", "params": out, "candidates": []}
+
+    if explicit_maker and explicit_product:
+        resolved_kind = "manufacturer_and_product"
+    elif explicit_maker:
+        resolved_kind = "manufacturer"
+        out["maker_nm"] = explicit_maker
+        out["maker_nm_display"] = explicit_maker
+    elif explicit_product:
+        resolved_kind = "product"
+        out["physic_nm"] = explicit_product
+        out["physic_nm_display"] = explicit_product
+    elif maker_rows and product_rows:
+        resolved_kind = "manufacturer_or_product"
+        out["current_stock_entity_phrase"] = phrase
+    elif maker_rows:
+        resolved_kind = "manufacturer"
+        out["maker_nm"] = phrase
+        out["maker_nm_display"] = phrase
+    else:
+        resolved_kind = "product"
+        out["physic_nm"] = phrase
+        out["physic_nm_display"] = phrase
+
+    _apply_current_stock_code_scope(
+        out,
+        scope=resolved_kind,
+        maker_rows=maker_rows,
+        product_rows=product_rows,
+    )
+    log.info(
+        "[current_stock.resolver] scope=%s manufacturer_elapsed_ms=%s manufacturer_candidate_count=%s manufacturer_code_count=%s product_elapsed_ms=%s product_candidate_count=%s product_code_count=%s code_in_used=%s fallback_to_like_or=%s fallback_reason=%s",
+        resolved_kind,
+        resolved["maker_elapsed_ms"], len(maker_rows), len(out.get("current_stock_manufacturer_codes") or []),
+        resolved["product_elapsed_ms"], len(product_rows), len(out.get("current_stock_product_codes") or []),
+        bool(out.get("current_stock_code_in_used")), bool(out.get("current_stock_fallback_to_like_or")),
+        clean_text(out.get("current_stock_fallback_reason")),
+    )
+    return {
+        "status": "resolved", "params": out, "phrase": phrase,
+        "resolved_kind": resolved_kind, "candidates": candidates,
+    }
+
 def extract_params(text: str) -> Dict[str, Any]:
     text = _norm(text)
     params: Dict[str, Any] = {}
@@ -1825,7 +2081,11 @@ def extract_params(text: str) -> Dict[str, Any]:
     real_ven_cd = _extract_code(text, "실납처", 5) or _extract_code(text, "실납처코드", 5)
     sales_man = _extract_code(text, "영업사원", 5) or _extract_code(text, "영업사원코드", 5)
 
-    physic_nm = (
+    # The broader IO parser intentionally keeps legacy product-code wording
+    # such as "제품코드 ABCDE" intact.  Compound name boundaries are needed
+    # for the current-stock NLQ contract only.
+    compound_named_values = _extract_io_compound_named_values(text) if "현재고" in text else {}
+    physic_nm = compound_named_values.get("physic_nm") or (
         _extract_named_text(text, ("제품명", "품목명", "상품명"))
         or (
             _extract_product_name_after_label_for_io(text)
@@ -1856,7 +2116,7 @@ def extract_params(text: str) -> Dict[str, Any]:
         ):
             physic_nm = ""
 
-    maker_nm = _extract_named_text(text, ("제조사명", "제약사명", "제조사", "제약사"))
+    maker_nm = compound_named_values.get("maker_nm") or _extract_named_text(text, ("제조사명", "제약사명", "제조사", "제약사"))
     order_nm = _extract_named_text(text, ("발주처명", "발주처"))
     buy_nm = _extract_named_text(text, ("매입처명", "매입처"))
     real_ven_nm = _extract_named_text(text, ("실납처명", "실납처"))
@@ -1885,7 +2145,7 @@ def extract_params(text: str) -> Dict[str, Any]:
     trans_di = _extract_code(text, "거래명세서구분", 1)
     tax_di = _extract_code(text, "세금계산서구분", 1)
 
-    stock_nm = _extract_named_text(text, ("재고위치명", "재고명"))
+    stock_nm = compound_named_values.get("stock_nm") or _extract_named_text(text, ("재고위치명", "재고명"))
     stock_apply_cd = _extract_code(text, "재고적용처", 5) or _extract_code(text, "재고적용처코드", 5)
     stock_apply_nm = _extract_named_text(text, ("재고적용처명", "재고적용처"))
 
@@ -1898,6 +2158,7 @@ def extract_params(text: str) -> Dict[str, Any]:
     # 단, "재고위치 000001"처럼 숫자 코드는 stock_cds로 이미 잡히므로 이름으로 중복 처리하지 않는다.
     if not stock_nm and not stock_cds:
         stock_nm = _extract_named_text(text, ("재고위치",))
+    stock_nm = _trim_io_named_value_at_next_label(stock_nm)
 
     if ven_cd:
         params["ven_cd"] = ven_cd
@@ -2244,6 +2505,10 @@ def resolve_io_nlq(text: str) -> Optional[Dict[str, Any]]:
         and any(k in raw for k in ("입고명세", "출고명세", "거래명세서", "세금계산서", "입고", "출고", "매입", "매출"))
     ):
         params = _apply_date_params_for_io_detail(params, raw)
+
+    if _has_any(raw, _CURRENT_STOCK_WORDS):
+        params = _apply_date_params_for_product_inventory(params, raw)
+        return _result("현재고 조회", params)
 
     if _has_any(raw, _PRODUCT_FLOW_WORDS):
 

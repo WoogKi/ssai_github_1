@@ -3115,6 +3115,40 @@ def run_basic_checks() -> list[CheckResult]:
                     if expected_col in {"당월 진척률", "총매출액"} and meta_extra.get("filter_column") != expected_col:
                         followup_mismatches.append(f"numeric filter meta column mismatch query={query} meta={meta_extra}")
 
+                current_stock_source = pd.DataFrame(
+                    [
+                        {"순번": 1, "제품코드": "P1", "제품명": "제품A", "규격": "10T", "제조사명": "제조사A", "재고위치코드": "00001", "재고위치명": "본사 창고", "재고수량": 10, "보험금액": 100},
+                        {"순번": "", "제품코드": "P1", "제품명": "제품A", "규격": "10T", "제조사명": "제조사A", "재고위치코드": "00247", "재고위치명": "전주 창고", "재고수량": 20, "보험금액": 200},
+                        {"순번": "", "제품코드": "P1", "제품명": "제품A", "규격": "10T", "제조사명": "제조사A", "재고위치코드": "", "재고위치명": "제품 합계", "재고수량": 30, "보험금액": 300},
+                        {"순번": 2, "제품코드": "P2", "제품명": "제품B", "규격": "20T", "제조사명": "제조사B", "재고위치코드": "00001", "재고위치명": "본사 창고", "재고수량": 40, "보험금액": 400},
+                    ]
+                )
+                pushed_tables.clear()
+                pushed_notices.clear()
+                handled = handle_current_table_followup_by_action(
+                    df=current_stock_source,
+                    query="현재표 제품별 재고수량 TOP 20",
+                    top_n=20,
+                    table_key="current-stock-full-source",
+                    source_action="현재고 조회",
+                    helpers=helpers,
+                    log=_NoopLog(),
+                )
+                current_stock_top = pushed_tables[-1].get("df") if pushed_tables else None
+                expected_columns = ["순번", "제품코드", "제품명", "규격", "제조사명", "재고수량", "보험금액"]
+                current_stock_top_ok = (
+                    handled
+                    and not pushed_notices
+                    and isinstance(current_stock_top, pd.DataFrame)
+                    and list(current_stock_top.columns) == expected_columns
+                    and current_stock_top["제품코드"].tolist() == ["P2", "P1"]
+                    and current_stock_top["제품명"].tolist() == ["제품B", "제품A"]
+                    and current_stock_top["재고수량"].tolist() == [40, 30]
+                    and current_stock_top["보험금액"].tolist() == [400, 300]
+                )
+                if not current_stock_top_ok:
+                    followup_mismatches.append(f"current stock product TOP contract={current_stock_top!r}, notices={pushed_notices!r}")
+
                 if followup_mismatches:
                     results.append(_fail("current table generic group/filter followups", "; ".join(followup_mismatches)))
                 else:
@@ -10527,13 +10561,15 @@ def run_basic_checks() -> list[CheckResult]:
             ):
                 render_errors.append("dashboard_event_id_not_created_before_snapshot")
             render_tree = ast.parse(Path("app/sims/views/dashboard_lite.py").read_text(encoding="utf-8"))
-            render_node = next(
+            render_nodes = [
                 node
                 for node in render_tree.body
-                if isinstance(node, ast.FunctionDef) and node.name == "render_dashboard_lite"
-            )
+                if isinstance(node, ast.FunctionDef)
+                and node.name in {"render_dashboard_lite", "build_dashboard_lite_result_payload"}
+            ]
             dashboard_uuid_calls = [
                 node
+                for render_node in render_nodes
                 for node in ast.walk(render_node)
                 if isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -11773,7 +11809,7 @@ def run_basic_checks() -> list[CheckResult]:
             or 'build_dashboard_lite_chat_snapshot' not in view_src
             or 'manufacturer_codes = _clean_list(option_cache.get("manufacturer_codes"))' in view_src
             or 'form_submit_button("대시보드 조회"' not in view_src
-            or 'build_dashboard_lite_facts(params)' not in view_src
+            or 'build_dashboard_lite_facts(work_params)' not in view_src
             or '"type": "dashboard_lite"' not in view_src
             or 'render_dashboard_lite_chat_item' not in chat_middleware_dashboard_src
             or 'elif str(payload.get("type") or "").strip().lower() != "dashboard_lite"' not in chat_middleware_dashboard_src
@@ -15416,6 +15452,365 @@ def run_nlq_live_checks() -> list[CheckResult]:
     return results
 
 
+def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    router = importlib.import_module("app.sims.nlq.nlq_router")
+    profile_service = importlib.import_module("app.services.ssai_analysis_profile_service")
+    supplier_service = importlib.import_module("app.services.product_supplier_scope_service")
+    login = importlib.import_module("app.ui.ssai_login")
+    dashboard_view = importlib.import_module("app.sims.views.dashboard_lite")
+    chat_middleware = importlib.import_module("app.ui.chat_middleware")
+    originals = {
+        "profile": profile_service.load_dashboard_profile,
+        "supplier": supplier_service.resolve_supplier_vendor_codes,
+        "manager": supplier_service.load_supplier_manager_options,
+        "company": login.get_selected_company,
+        "facts": dashboard_view.build_dashboard_lite_facts,
+        "snapshot": dashboard_view.build_dashboard_lite_chat_snapshot,
+        "chat_push": chat_middleware.push_sims_result_to_chat,
+        "current_room": chat_middleware.get_current_chat_room_id,
+    }
+    try:
+        profile_service.load_dashboard_profile = lambda **kwargs: {
+            "stock_mode": "book", "stock_cd_list": ["0018:00001"],
+            "io_gu_list": ["0012:501"], "readiness_warning_pct": 97.5,
+        }
+        login.get_selected_company = lambda: {"company_id": 4}
+        supplier_service.resolve_supplier_vendor_codes = lambda text, *, mode: (
+            [{"code": "10047", "name": "한미약품"}] if "한미" in str(text) else
+            [{"code": "10048", "name": "삼진제약"}] if "삼진" in str(text) else []
+        )
+        manager_resolver_calls: list[dict[str, Any]] = []
+
+        def _manager_options_fixture(**kwargs):
+            manager_resolver_calls.append(dict(kwargs))
+            mode = kwargs.get("mode")
+            if mode == "manufacturer":
+                return [{"code": "KIM", "name": "김담당"}, {"code": "SHIN", "name": "신민우"}]
+            if mode == "order_vendor":
+                return [{"code": "SHIN", "name": "신민우"}]
+            return []
+
+        supplier_service.load_supplier_manager_options = _manager_options_fixture
+
+        cases = (
+            # The shared supplier-scope service represents semantic "all" as
+            # the manufacturer family with empty vendor/manager code lists.
+            ("SIMS 일일점검", "manufacturer", 0, 0),
+            ("오늘의 경영점검 한미", "manufacturer", 1, 0),
+            ("SIMS 운영점검 발주처 한미", "order_vendor", 1, 0),
+            ("SIMS 일일점검 담당자 신민우", "order_vendor", 0, 1),
+            ("SIMS 일일점검 해줘", "manufacturer", 0, 0),
+            ("오늘의 경영점검 해줘", "manufacturer", 0, 0),
+            ("SIMS 운영점검 실행해줘", "manufacturer", 0, 0),
+        )
+        for query, mode, supplier_count, manager_count in cases:
+            params, notice = router._build_dashboard_nlq_params(query, session_state={}, logger=log)
+            actual_supplier_count = len(params.get("manufacturer_codes") or params.get("order_vendor_codes") or [])
+            actual_manager_count = len(params.get("manufacturer_manager_codes") or params.get("purchase_manager_codes") or [])
+            ok = (
+                notice is None
+                and params.get("product_supplier_scope_mode") == mode
+                and actual_supplier_count == supplier_count
+                and actual_manager_count == manager_count
+                and params.get("stock_mode") == "book"
+            )
+            results.append(_ok(f"dashboard NLQ params: {query}", repr(params)) if ok else _fail(f"dashboard NLQ params: {query}", f"notice={notice!r}, params={params!r}"))
+
+        shorthand_params, shorthand_notice = router._build_dashboard_nlq_params(
+            "오늘의 경영점검 한미", session_state={}, logger=log
+        )
+        shorthand_label_ok = (
+            shorthand_notice is None
+            and shorthand_params.get("supplier_scope_label") == "한미약품 [10047]"
+            and shorthand_params.get("supplier_manager_label") == "전체"
+        )
+        results.append(
+            _ok("dashboard NLQ shorthand scope label", repr(shorthand_params))
+            if shorthand_label_ok
+            else _fail("dashboard NLQ shorthand scope label", repr(shorthand_params))
+        )
+
+        postfix_params, postfix_notice = router._build_dashboard_nlq_params(
+            "오늘의 경영점검 한미 제약사", session_state={}, logger=log
+        )
+        prefix_params, prefix_notice = router._build_dashboard_nlq_params(
+            "오늘의 경영점검 제약사 한미", session_state={}, logger=log
+        )
+        postfix_ok = (
+            postfix_notice is None
+            and prefix_notice is None
+            and postfix_params.get("product_supplier_scope_mode") == "manufacturer"
+            and postfix_params.get("manufacturer_codes") == shorthand_params.get("manufacturer_codes")
+            and prefix_params.get("manufacturer_codes") == shorthand_params.get("manufacturer_codes")
+            and postfix_params.get("supplier_scope_label") == shorthand_params.get("supplier_scope_label")
+            and prefix_params.get("supplier_scope_label") == shorthand_params.get("supplier_scope_label")
+        )
+        results.append(
+            _ok("dashboard NLQ postfix supplier mode", repr(postfix_params))
+            if postfix_ok
+            else _fail("dashboard NLQ postfix supplier mode", repr(postfix_params))
+        )
+
+        period_params, period_notice = router._build_dashboard_nlq_params(
+            "SIMS 일일점검 2025년", session_state={}, logger=log
+        )
+        period_ok = period_notice is None and period_params.get("month_from") == "202501" and period_params.get("month_to") == "202512" and period_params.get("evaluation_month") == "202601"
+        results.append(_ok("dashboard NLQ explicit period", repr(period_params)) if period_ok else _fail("dashboard NLQ explicit period", repr(period_params)))
+
+        compound_cases = (
+            ("SIMS 일일점검 2025년 제약사 한미", "manufacturer", 1, 0),
+            ("SIMS 일일점검 제약사 한미 2025년", "manufacturer", 1, 0),
+            ("오늘의 경영점검 2025년 발주처 한미 담당자 신민우", "order_vendor", 1, 1),
+            ("SIMS 운영점검 담당자 김 제약사 한미 2025년", "manufacturer", 1, 1),
+        )
+        parsed_conditions, parsed_residual = router._extract_dashboard_nlq_conditions(
+            "SIMS 운영점검 담당자 신민우 제약사 삼진 2025년"
+        )
+        parse_ok = (
+            parsed_conditions.get("담당자") == "신민우"
+            and parsed_conditions.get("제약사") == "삼진"
+            and "2025" not in parsed_conditions.get("담당자", "")
+            and "2025" not in parsed_conditions.get("제약사", "")
+            and not parsed_residual
+        )
+        results.append(_ok("dashboard NLQ labelled condition boundaries", repr(parsed_conditions)) if parse_ok else _fail("dashboard NLQ labelled condition boundaries", f"conditions={parsed_conditions!r}, residual={parsed_residual!r}"))
+        for query, mode, supplier_count, manager_count in compound_cases:
+            params, notice = router._build_dashboard_nlq_params(query, session_state={}, logger=log)
+            actual_supplier_count = len(params.get("manufacturer_codes") or params.get("order_vendor_codes") or [])
+            actual_manager_count = len(params.get("manufacturer_manager_codes") or params.get("purchase_manager_codes") or [])
+            compound_ok = (
+                notice is None
+                and params.get("product_supplier_scope_mode") == mode
+                and actual_supplier_count == supplier_count
+                and actual_manager_count == manager_count
+                and params.get("month_from") == "202501"
+                and params.get("month_to") == "202512"
+                and params.get("evaluation_month") == "202601"
+            )
+            results.append(_ok(f"dashboard NLQ compound params: {query}", repr(params)) if compound_ok else _fail(f"dashboard NLQ compound params: {query}", f"notice={notice!r}, params={params!r}"))
+
+        runtime_params, runtime_notice = router._build_dashboard_nlq_params(
+            "SIMS 운영점검 담당자 신민우 제약사 삼진 2025년", session_state={}, logger=log
+        )
+        runtime_conditions_ok = (
+            runtime_notice is None
+            and runtime_params.get("month_from") == "202501"
+            and runtime_params.get("month_to") == "202512"
+            and runtime_params.get("manufacturer_codes") == ["10048"]
+            and runtime_params.get("manufacturer_manager_codes") == ["SHIN"]
+            and runtime_params.get("supplier_scope_label") == "삼진제약 [10048]"
+            and runtime_params.get("supplier_manager_label") == "신민우 [SHIN]"
+        )
+        results.append(_ok("dashboard NLQ runtime condition separation", repr(runtime_params)) if runtime_conditions_ok else _fail("dashboard NLQ runtime condition separation", repr(runtime_params)))
+
+        supplier_manager_calls_before = len(manager_resolver_calls)
+        supplier_manager_params, supplier_manager_notice = router._build_dashboard_nlq_params(
+            "SIMS 운영점검 담당자 신민우 제약사 삼진 2025년", session_state={}, logger=log,
+        )
+        supplier_manager_calls = manager_resolver_calls[supplier_manager_calls_before:]
+        resolver_boundary_ok = (
+            supplier_manager_notice is None
+            and supplier_manager_params.get("manufacturer_codes") == ["10048"]
+            and supplier_manager_params.get("manufacturer_manager_codes") == ["SHIN"]
+            and supplier_manager_calls
+            and all(not call.get("vendor_codes") for call in supplier_manager_calls)
+        )
+        results.append(
+            _ok("dashboard NLQ manager resolver keeps named supplier for facts AND", repr(supplier_manager_calls))
+            if resolver_boundary_ok else _fail("dashboard NLQ manager resolver keeps named supplier for facts AND", f"notice={supplier_manager_notice!r}, calls={supplier_manager_calls!r}, params={supplier_manager_params!r}")
+        )
+
+        ambiguous_params, ambiguous_notice = router._build_dashboard_nlq_params(
+            "SIMS 운영점검 담당자 신민우", session_state={}, logger=log
+        )
+        ambiguous_ok = (
+            ambiguous_notice is None
+            and ambiguous_params.get("product_supplier_scope_mode") == "order_vendor"
+            and ambiguous_params.get("purchase_manager_codes") == ["SHIN"]
+            and not ambiguous_params.get("manufacturer_manager_codes")
+        )
+        results.append(
+            _ok("dashboard NLQ manager default supplier mode", repr(ambiguous_params))
+            if ambiguous_ok else _fail("dashboard NLQ manager default supplier mode", repr(ambiguous_params))
+        )
+
+        mode_only_cases = (
+            ("SIMS 운영점검 발주처 담당자 신민우", "order_vendor", "purchase_manager_codes"),
+            ("SIMS 운영점검 제약사 담당자 신민우", "manufacturer", "manufacturer_manager_codes"),
+        )
+        for query, expected_mode, manager_key in mode_only_cases:
+            params, notice = router._build_dashboard_nlq_params(query, session_state={}, logger=log)
+            mode_only_ok = (
+                notice is None
+                and params.get("product_supplier_scope_mode") == expected_mode
+                and params.get(manager_key) == ["SHIN"]
+                and not params.get("manufacturer_codes")
+                and not params.get("order_vendor_codes")
+            )
+            results.append(
+                _ok(f"dashboard NLQ explicit supplier mode manager scope: {query}", repr(params))
+                if mode_only_ok else _fail(f"dashboard NLQ explicit supplier mode manager scope: {query}", f"notice={notice!r}, params={params!r}")
+            )
+
+        ordered_queries = (
+            "SIMS 운영점검 담당자 신민우 제약사 삼진 2025년",
+            "SIMS 운영점검 제약사 삼진 담당자 신민우 2025년",
+        )
+        ordered_params = [router._build_dashboard_nlq_params(query, session_state={}, logger=log) for query in ordered_queries]
+        ordered_ok = all(
+            notice is None
+            and params.get("product_supplier_scope_mode") == "manufacturer"
+            and params.get("manufacturer_codes") == ["10048"]
+            and params.get("manufacturer_manager_codes") == ["SHIN"]
+            and params.get("month_from") == "202501"
+            and params.get("month_to") == "202512"
+            for params, notice in ordered_params
+        ) and ordered_params[0][0].get("manufacturer_codes") == ordered_params[1][0].get("manufacturer_codes")
+        results.append(
+            _ok("dashboard NLQ supplier/manager/period order independence", repr([item[0] for item in ordered_params]))
+            if ordered_ok else _fail("dashboard NLQ supplier/manager/period order independence", repr(ordered_params))
+        )
+
+        route_ok = all(
+            (router.resolve_new_sims_nlq_candidate(query) or {}).get("action") == "SIMS 일일점검"
+            for query in ("SIMS 일일점검", "오늘의 경영점검", "SIMS 운영점검")
+        )
+        results.append(_ok("dashboard NLQ aliases", "canonical=SIMS 일일점검") if route_ok else _fail("dashboard NLQ aliases", "alias mismatch"))
+
+        facts_calls: list[dict[str, Any]] = []
+        def _facts_fixture(params):
+            facts_calls.append(dict(params or {}))
+            return {
+                "kind": "SIMS_DASHBOARD_FACTS_V01", "source_call_count": 3,
+                "filters": {}, "today_actions": [],
+                "inventory": {"readiness_rows": [{"product_code": "fixture"}]},
+            }
+        dashboard_view.build_dashboard_lite_facts = _facts_fixture
+        dashboard_view.build_dashboard_lite_chat_snapshot = lambda cache: {
+            "company_id": cache.get("company_id"), "room_id": cache.get("room_id"),
+            "dashboard_event_id": cache.get("dashboard_event_id"),
+        }
+        payload, cache = dashboard_view.build_dashboard_lite_result_payload(
+            period_params, room_id="room-test", company_id="4", action="SIMS 일일점검"
+        )
+        source_ok = (payload.get("meta") or {}).get("source_call_count") == 3 and (cache.get("facts") or {}).get("source_call_count") == 3
+        results.append(_ok("dashboard NLQ source_call_count", "3") if source_ok else _fail("dashboard NLQ source_call_count", repr(payload.get("meta"))))
+
+        pushed: list[dict[str, Any]] = []
+        chat_middleware.get_current_chat_room_id = lambda: "room-fixture"
+        chat_middleware.push_sims_result_to_chat = lambda payload, _action: pushed.append(dict(payload))
+        for query in ("SIMS 일일점검", "오늘의 경영점검 한미", "SIMS 운영점검", "SIMS 운영점검 담당자 신민우"):
+            pushed.clear()
+            handled = router._try_handle_dashboard_nlq(
+                query, room={"id": "room-fixture"}, session_state={}, logger=log
+            )
+            success_meta = dict((pushed[0].get("meta") or {}) if pushed else {})
+            success_ok = (
+                handled is True
+                and len(pushed) == 1
+                and success_meta.get("result_status") == "success"
+                and success_meta.get("source_call_count") == 3
+            )
+            results.append(_ok(f"dashboard NLQ handler alias: {query}", "success, source_call_count=3") if success_ok else _fail(f"dashboard NLQ handler alias: {query}", f"handled={handled}, pushed={pushed!r}"))
+
+        pushed.clear()
+        facts_calls.clear()
+        handled = router._try_handle_dashboard_nlq(
+            "SIMS 운영점검 담당자 신민우 제약사 삼진 2025년",
+            room={"id": "room-fixture"}, session_state={}, logger=log,
+        )
+        facts_params = facts_calls[0] if facts_calls else {}
+        facts_scope_ok = (
+            handled is True
+            and len(pushed) == 1
+            and facts_params.get("month_from") == "202501"
+            and facts_params.get("month_to") == "202512"
+            and facts_params.get("manufacturer_codes") == ["10048"]
+            and facts_params.get("manufacturer_manager_codes") == ["SHIN"]
+            and facts_params.get("supplier_scope_label") == "삼진제약 [10048]"
+            and facts_params.get("supplier_manager_label") == "신민우 [SHIN]"
+        )
+        results.append(_ok("dashboard NLQ facts receives separated runtime conditions", repr(facts_params)) if facts_scope_ok else _fail("dashboard NLQ facts receives separated runtime conditions", repr(facts_params)))
+
+        dashboard_view.build_dashboard_lite_facts = lambda _params: {
+            "kind": "SIMS_DASHBOARD_FACTS_V01", "source_call_count": 3,
+            "filters": {}, "today_actions": [], "inventory": {"readiness_rows": []},
+        }
+        pushed.clear()
+        handled = router._try_handle_dashboard_nlq(
+            "SIMS 운영점검 담당자 신민우 제약사 삼진 2025년",
+            room={"id": "room-fixture"}, session_state={}, logger=log,
+        )
+        no_data_payload = pushed[0] if pushed else {}
+        no_data_meta = dict(no_data_payload.get("meta") or {})
+        no_data_ok = (
+            handled is True
+            and len(pushed) == 1
+            and no_data_payload.get("message") == "해당 조회조건의 자료가 없습니다."
+            and no_data_meta.get("result_status") == "no_data"
+            and no_data_meta.get("source_call_count") == 3
+            and no_data_meta.get("tableless_result") is True
+        )
+        results.append(
+            _ok("dashboard NLQ empty facts returns no_data", "one tableless no_data payload, source_call_count=3")
+            if no_data_ok else _fail("dashboard NLQ empty facts returns no_data", repr(pushed))
+        )
+        dashboard_view.build_dashboard_lite_facts = _facts_fixture
+
+        for query, expected_mode, expected_supplier, expected_manager_key in (
+            ("오늘의 경영점검 한미", "manufacturer", ["10047"], "manufacturer_manager_codes"),
+            ("SIMS 운영점검 발주처 담당자 신민우", "order_vendor", [], "purchase_manager_codes"),
+            ("SIMS 운영점검 제약사 담당자 신민우", "manufacturer", [], "manufacturer_manager_codes"),
+            ("SIMS 운영점검 제약사 삼진 담당자 신민우 2025년", "manufacturer", ["10048"], "manufacturer_manager_codes"),
+        ):
+            pushed.clear()
+            facts_calls.clear()
+            handled = router._try_handle_dashboard_nlq(
+                query, room={"id": "room-fixture"}, session_state={}, logger=log,
+            )
+            facts_params = facts_calls[0] if facts_calls else {}
+            fact_codes = facts_params.get("manufacturer_codes") or facts_params.get("order_vendor_codes") or []
+            fact_mode_ok = (
+                handled is True
+                and len(pushed) == 1
+                and (pushed[0].get("meta") or {}).get("result_status") == "success"
+                and facts_params.get("product_supplier_scope_mode") == expected_mode
+                and fact_codes == expected_supplier
+                and facts_params.get(expected_manager_key) == (["SHIN"] if "신민우" in query else [])
+                and (pushed[0].get("meta") or {}).get("source_call_count") == 3
+            )
+            results.append(
+                _ok(f"dashboard NLQ facts supplier-mode contract: {query}", repr(facts_params))
+                if fact_mode_ok else _fail(f"dashboard NLQ facts supplier-mode contract: {query}", f"handled={handled}, facts={facts_params!r}, pushed={pushed!r}")
+            )
+
+        dashboard_view.build_dashboard_lite_facts = lambda _params: (_ for _ in ()).throw(RuntimeError("fixture"))
+        pushed.clear()
+        handled = router._try_handle_dashboard_nlq(
+            "SIMS 일일점검", room={"id": "room-fixture"}, session_state={}, logger=log
+        )
+        error_meta = dict((pushed[0].get("meta") or {}) if pushed else {})
+        error_ok = (
+            handled is True
+            and len(pushed) == 1
+            and error_meta.get("result_status") == "routing_error"
+            and error_meta.get("source_call_count") == 0
+            and error_meta.get("tableless_result") is True
+        )
+        results.append(_ok("dashboard NLQ facts error pushes one routing_error", "single tableless payload") if error_ok else _fail("dashboard NLQ facts error pushes one routing_error", f"handled={handled}, pushed={pushed!r}"))
+    finally:
+        profile_service.load_dashboard_profile = originals["profile"]
+        supplier_service.resolve_supplier_vendor_codes = originals["supplier"]
+        supplier_service.load_supplier_manager_options = originals["manager"]
+        login.get_selected_company = originals["company"]
+        dashboard_view.build_dashboard_lite_facts = originals["facts"]
+        dashboard_view.build_dashboard_lite_chat_snapshot = originals["snapshot"]
+        chat_middleware.push_sims_result_to_chat = originals["chat_push"]
+        chat_middleware.get_current_chat_room_id = originals["current_room"]
+    return results
+
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
@@ -15439,6 +15834,9 @@ def main() -> int:
 
     basic_results = run_basic_checks()
     failed += _print_results("BASIC IMPORT / HELPER CHECKS", basic_results)
+
+    dashboard_nlq_results = run_dashboard_nlq_contract_checks()
+    failed += _print_results("DASHBOARD NLQ CONTRACT CHECKS", dashboard_nlq_results)
 
     if args.live:
         service_results = run_service_live_checks()

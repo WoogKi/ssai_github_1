@@ -14,6 +14,7 @@ from app.services.rddbc_io_common import (
     normalize_top,
     query_to_df,
 )
+from app.services.product_inventory_service import resolve_inventory_stock_codes
 
 import logging
 
@@ -1385,6 +1386,34 @@ def get_product_flow_result(params: Optional[Dict[str, Any]] = None) -> Dict[str
         work_params["date_to"] = date_to
         work_params["base_month"] = date_from[:6]
         work_params["top"] = normalize_top(params.get("top", 20000), default=20000, max_value=50000)
+
+        # Reuse the current-stock location resolver.  A named location must
+        # never silently degrade to an unfiltered product-flow query.
+        requested_stock_name = clean_text(
+            work_params.get("stock_nm")
+            or work_params.get("stock_name")
+            or work_params.get("stock_location_nm")
+        )
+        resolved_stock_codes = resolve_inventory_stock_codes(work_params)
+        if resolved_stock_codes:
+            work_params["stock_cds"] = resolved_stock_codes
+            if len(resolved_stock_codes) == 1:
+                work_params["stock_cd"] = resolved_stock_codes[0]
+        elif requested_stock_name:
+            return _flow_text_payload(
+                message="입력한 재고위치에 해당하는 코드가 없습니다. 재고위치명 또는 코드를 확인해 주세요.",
+                params=params,
+                settings=settings,
+                date_from=date_from,
+                date_to=date_to,
+                work_params=work_params,
+                meta={
+                    "result_status": "no_data",
+                    "row_count": 0,
+                    "row_count_total": 0,
+                    "tableless_result": True,
+                },
+            )
 
         work_params["__product_info__"] = _get_product_master_info(work_params)
 
