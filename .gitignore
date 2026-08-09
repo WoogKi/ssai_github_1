@@ -120,13 +120,15 @@ Zip_File/
 # Selective Git policy after Phase 3
 # =========================================================
 
-# docs: track only official Markdown source areas, ignore generated/binary artifacts
+# docs: Markdown source-of-truth policy
+# - Keep local/history/generated material ignored by default.
+# - Track active Markdown only in the official source areas below.
+# - Versioned roadmap files must follow the official name/version/date convention.
 docs/**
 !docs/
 !docs/README.md
 !docs/00_roadmap/
-!docs/00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.2_20260719.md
-!docs/00_roadmap/SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.1_20260719.md
+!docs/00_roadmap/SIMS_AI_PLATFORM_*_v[0-9]*_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].md
 !docs/01_phase_reports/
 !docs/01_phase_reports/**/
 !docs/01_phase_reports/**/*.md
@@ -139,6 +141,10 @@ docs/**
 !docs/04_test_results/
 !docs/04_test_results/**/
 !docs/04_test_results/**/*.md
+# Historical trees stay excluded until the archive migration is performed.
+docs/archive/**
+docs/90_archive/**
+# Generated/export artifacts are never source-of-truth.
 docs/**/*.docx
 docs/**/*.pdf
 docs/**/*.xlsx
