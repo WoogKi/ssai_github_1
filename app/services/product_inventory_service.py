@@ -751,6 +751,88 @@ def _append_in_clause(where: list[str], sql_params: Dict[str, Any], field_expr: 
     where.append(f"{field_expr} IN ({', '.join(bind_keys)})")
 
 
+def _bounded_product_scope_safe_limit(base_sql: str, *, bind_occurrences: int = 2) -> int:
+    fixed_bind_count = len(re.findall(r"%\(([^)]+)\)s", base_sql))
+    return max(
+        0,
+        (
+            SQL_SERVER_PARAMETER_LIMIT
+            - fixed_bind_count
+            - SQL_PARAMETER_SAFETY_MARGIN
+        ) // max(1, int(bind_occurrences)),
+    )
+
+
+def _resolve_explicit_product_name_scope(
+    params: Dict[str, Any],
+    *,
+    safe_limit: int,
+) -> tuple[list[str], Dict[str, Any]]:
+    """Resolve the complete explicit product-name LIKE set within a safe SQL bound."""
+    started = time.perf_counter()
+    product_name = clean_text(params.get("physic_nm"))
+    meta: Dict[str, Any] = {
+        "product_name_scope": bool(product_name),
+        "candidate_count": 0,
+        "scope_applied": False,
+        "safe_limit": max(0, int(safe_limit)),
+        "fallback_reason": "",
+        "candidate_elapsed_ms": 0.0,
+    }
+    if (
+        not product_name
+        or clean_text(params.get("physic_cd"))
+        or clean_text(params.get("nlq_unlabeled_name"))
+        or bool(params.get("current_stock_query"))
+    ):
+        meta["product_name_scope"] = False
+        meta["fallback_reason"] = "not_explicit_product_name"
+        return [], meta
+    if safe_limit <= 0:
+        meta["fallback_reason"] = "sql_parameter_limit"
+        return [], meta
+
+    sql = f"""
+SELECT DISTINCT TOP ({safe_limit + 1})
+    LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS physic_cd
+FROM dbo.Rddbc040 AS P
+WHERE ISNULL(P.Rd04_Del_Flag, '') <> 'E'
+  AND P.Rd04_Physic_Nm LIKE %(explicit_product_name_like)s
+ORDER BY LTRIM(RTRIM(P.Rd04_Physic_Cd))
+"""
+    try:
+        candidates = query_to_df(
+            sql,
+            {"explicit_product_name_like": f"%{product_name}%"},
+        )
+    except Exception:
+        meta["fallback_reason"] = "candidate_query_failed"
+        meta["candidate_elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        return [], meta
+
+    if not isinstance(candidates, pd.DataFrame) or "physic_cd" not in candidates.columns:
+        meta["fallback_reason"] = "candidate_result_unavailable"
+        meta["candidate_elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        return [], meta
+
+    product_codes = list(dict.fromkeys(
+        clean_text(value)
+        for value in candidates["physic_cd"].tolist()
+        if clean_text(value)
+    ))
+    meta["candidate_count"] = len(product_codes)
+    meta["candidate_elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    if not product_codes:
+        meta["fallback_reason"] = "no_candidates"
+        return [], meta
+    if len(product_codes) > safe_limit:
+        meta["fallback_reason"] = "sql_parameter_limit"
+        return [], meta
+
+    meta["scope_applied"] = True
+    return product_codes, meta
+
+
 def _last_cost_product_scope_plan(
     params: Dict[str, Any],
     source_df: pd.DataFrame,
@@ -759,13 +841,9 @@ def _last_cost_product_scope_plan(
     """Bound an unlabeled last-cost lookup to products already in its source rows."""
     fixed_bind_count = len(re.findall(r"%\(([^)]+)\)s", base_sql))
     product_bind_occurrences = 2
-    safe_limit = max(
-        0,
-        (
-            SQL_SERVER_PARAMETER_LIMIT
-            - fixed_bind_count
-            - SQL_PARAMETER_SAFETY_MARGIN
-        ) // product_bind_occurrences,
+    safe_limit = _bounded_product_scope_safe_limit(
+        base_sql,
+        bind_occurrences=product_bind_occurrences,
     )
     meta: Dict[str, Any] = {
         "applied": False,
@@ -881,6 +959,8 @@ def _inventory_predicate_mode(params: Dict[str, Any]) -> str:
         return "manufacturer_like"
     if clean_text(params.get("physic_cd")):
         return "product_code"
+    if params.get("_product_inventory_explicit_product_scope_applied"):
+        return "product_code_scope"
     if clean_text(params.get("physic_nm")):
         return "product_like"
     if clean_text(params.get("ven_cd")) or clean_text(params.get("ven_nm")):
@@ -948,9 +1028,26 @@ def _apply_master_filters(
     current_stock_scoped = current_stock_scope in {
         "manufacturer", "product", "manufacturer_or_product", "manufacturer_and_product",
     }
+    explicit_product_codes = list(dict.fromkeys(
+        clean_text(value)
+        for value in (params.get("_product_inventory_explicit_product_codes") or [])
+        if clean_text(value)
+    ))
+    explicit_product_scope_applied = bool(
+        params.get("_product_inventory_explicit_product_scope_applied")
+        and explicit_product_codes
+    )
     if clean_text(params.get("physic_cd")):
         where.append("P.Rd04_Physic_Cd = %(physic_cd)s")
-    if clean_text(params.get("physic_nm")) and not current_stock_scoped:
+    if explicit_product_scope_applied and not current_stock_scoped:
+        _append_in_clause(
+            where,
+            sql_params,
+            "P.Rd04_Physic_Cd",
+            explicit_product_codes,
+            "explicit_product",
+        )
+    elif clean_text(params.get("physic_nm")) and not current_stock_scoped:
         sql_params["physic_nm_like"] = f"%{clean_text(params.get('physic_nm'))}%"
         where.append("P.Rd04_Physic_Nm LIKE %(physic_nm_like)s")
 
@@ -2251,6 +2348,62 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                     },
                 )
 
+        product_scope_meta: Dict[str, Any] = {
+            "product_name_scope": False,
+            "candidate_count": 0,
+            "scope_applied": False,
+            "safe_limit": 0,
+            "fallback_reason": "not_explicit_product_name",
+            "candidate_elapsed_ms": 0.0,
+        }
+        if (
+            clean_text(work_params.get("physic_nm"))
+            and not clean_text(work_params.get("physic_cd"))
+            and not clean_text(work_params.get("nlq_unlabeled_name"))
+            and not bool(cfg.get("current_stock_query"))
+        ):
+            last_cost_base_sql, _ = _build_last_cost_sql(work_params, cfg)
+            safe_limit = _bounded_product_scope_safe_limit(
+                last_cost_base_sql,
+                bind_occurrences=2,
+            )
+            product_codes, product_scope_meta = _resolve_explicit_product_name_scope(
+                work_params,
+                safe_limit=safe_limit,
+            )
+            if product_scope_meta.get("scope_applied"):
+                work_params["_product_inventory_explicit_product_codes"] = product_codes
+                work_params["_product_inventory_explicit_product_scope_applied"] = True
+        work_params["_product_inventory_product_name_scope"] = product_scope_meta
+        log.info(
+            "[product_inventory.perf] stage=product_name_scope product_name_scope=%s "
+            "candidate_count=%s scope_applied=%s safe_limit=%s fallback_reason=%s "
+            "candidate_elapsed_ms=%s predicate_mode=%s",
+            bool(product_scope_meta.get("product_name_scope")),
+            int(product_scope_meta.get("candidate_count") or 0),
+            bool(product_scope_meta.get("scope_applied")),
+            int(product_scope_meta.get("safe_limit") or 0),
+            clean_text(product_scope_meta.get("fallback_reason")),
+            product_scope_meta.get("candidate_elapsed_ms", 0),
+            _inventory_predicate_mode(work_params),
+        )
+
+        if product_scope_meta.get("fallback_reason") == "no_candidates":
+            return _inventory_text_payload(
+                message="해당 조회조건의 자료가 없습니다.",
+                params=params,
+                cfg=cfg,
+                date_from=date_from,
+                date_to=date_to,
+                work_params=work_params,
+                meta={
+                    "result_status": "no_data",
+                    "row_count": 0,
+                    "row_count_total": 0,
+                    "product_name_scope": product_scope_meta,
+                },
+            )
+
         filter_prepare_ms = round((time.perf_counter() - filter_prepare_started) * 1000, 1)
         service_started = time.perf_counter()
         src_df, last_df = _collect_source_df(work_params, cfg)
@@ -2291,6 +2444,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 "group": group_perf,
                 "display": display_perf,
                 "last_cost_scope": dict(work_params.get("_product_inventory_last_cost_scope") or {}),
+                "product_name_scope": dict(work_params.get("_product_inventory_product_name_scope") or {}),
                 "service_total_ms": service_total_ms,
             }
             meta["product_inventory_perf"] = perf_meta

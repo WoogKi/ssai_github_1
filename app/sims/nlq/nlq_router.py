@@ -5192,6 +5192,70 @@ def _apply_current_stock_defaults(
     return out
 
 
+def _apply_product_inventory_defaults(
+    params: Dict[str, Any], *, text: str, session_state: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Apply the saved stock basis/location to a product-inventory NLQ."""
+    from app.services.ssai_analysis_profile_service import (
+        build_company_default_adapter,
+        load_dashboard_profile,
+    )
+    from app.ui.ssai_login import get_selected_company
+
+    out = dict(params or {})
+    company_id = str((get_selected_company() or {}).get("company_id") or "").strip()
+    profile: Dict[str, Any] = {}
+    if company_id:
+        cache = session_state.setdefault("__analysis_profile_company_cache", {})
+        cached = cache.get(company_id) if isinstance(cache, dict) else None
+        profile = cached if isinstance(cached, dict) else dict(load_dashboard_profile(company_id=int(company_id)) or {})
+        if isinstance(cache, dict) and not isinstance(cached, dict):
+            cache[company_id] = dict(profile)
+
+    compact_text = re.sub(r"\s+", "", str(text or ""))
+    clear_stock = any(token in compact_text for token in (
+        "전체재고위치", "재고위치전체", "모든재고위치", "전재고위치",
+        "전체창고", "창고전체", "모든창고", "전창고",
+    ))
+    explicit_stock_codes = _analytics_nlq_values(out, "stock_cd_list", "stock_cds", "stock_cd")
+    explicit_stock_names = _analytics_nlq_values(out, "stock_nm", "stock_nm_list", "stock_names")
+    explicit_keys: set[str] = set()
+    if str(out.get("stock_mode") or "").strip():
+        explicit_keys.add("stock_mode")
+    if explicit_stock_codes or explicit_stock_names:
+        explicit_keys.add("stock_cd_list")
+
+    adapter = build_company_default_adapter(
+        profile,
+        supported_keys={"stock_mode", "stock_cd_list"},
+        explicit={
+            "stock_mode": out.get("stock_mode"),
+            "stock_cd_list": explicit_stock_codes,
+        },
+        explicit_keys=explicit_keys,
+        clear_keys={"stock_cd_list"} if clear_stock else set(),
+    )
+    sources = dict(adapter.get("sources") or {})
+    effective = dict(adapter.get("effective") or {})
+
+    if sources.get("stock_mode") == "default":
+        out["stock_mode"] = effective.get("stock_mode")
+    stock_source = sources.get("stock_cd_list")
+    if stock_source == "default":
+        stock_codes = _profile_tcodes(effective.get("stock_cd_list"))
+        out["stock_cd_list"] = stock_codes
+        out["stock_cds"] = stock_codes
+        out["stock_cd"] = stock_codes[0] if len(stock_codes) == 1 else ""
+    elif stock_source == "explicit_clear":
+        out["stock_cd_list"] = []
+        out["stock_cds"] = []
+        out["stock_cd"] = ""
+        for key in ("stock_nm", "stock_nm_list", "stock_names"):
+            out.pop(key, None)
+
+    return out
+
+
 #=============================================================================
 # 입출고/명세서/재고 NLQ 라우팅
 # - _looks_like_io_nlq()로 판정된 문장은 _try_handle_io_nlq()로 처리한다.
@@ -5532,6 +5596,10 @@ def _try_handle_io_nlq(
         return True
 
     params, period_policy = _apply_io_period_policy(params, action)
+    if action == "제품재고현황 조회":
+        params = _apply_product_inventory_defaults(
+            params, text=txt_for_io, session_state=session_state
+        )
     parsed["params"] = params
 
     _log_nlq_period_policy(logger, action, period_policy, params)

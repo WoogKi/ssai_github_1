@@ -889,6 +889,16 @@ def _extract_stock_codes(text: str) -> list[str]:
 
     return codes
 
+
+_ALL_STOCK_LOCATIONS_RE = re.compile(
+    r"(?:(?:전체|모든|전)\s*(?:재고\s*위치|창고)|(?:재고\s*위치|창고)\s*전체)"
+)
+
+
+def _has_explicit_all_stock_locations(text: str) -> bool:
+    """Return whether the question explicitly clears the stock-location scope."""
+    return bool(_ALL_STOCK_LOCATIONS_RE.search(_norm(text)))
+
 _NAME_STOP_WORDS = (
     # 공통 종료어
     "조회", "검색", "보여줘", "알려줘", "찾아줘", "찾아", "목록",
@@ -1506,6 +1516,8 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
             candidate = re.sub(pattern, " ", candidate)
 
     candidate = re.sub(r"(?:19|20)\d{6}|(?:19|20)\d{4}", " ", candidate)
+    candidate = re.sub(r"(?:실\s*재고|장부\s*재고|실\s*수불|장부\s*수불)", " ", candidate)
+    candidate = _ALL_STOCK_LOCATIONS_RE.sub(" ", candidate)
     candidate = re.sub(r"\s+", " ", candidate).strip(" ,:/-~")
     if not candidate or _looks_like_date_token(candidate):
         return ""
@@ -2156,7 +2168,7 @@ def extract_params(text: str) -> Dict[str, Any]:
 
     # "재고위치 본사창고" 같은 이름 조건 보정
     # 단, "재고위치 000001"처럼 숫자 코드는 stock_cds로 이미 잡히므로 이름으로 중복 처리하지 않는다.
-    if not stock_nm and not stock_cds:
+    if not stock_nm and not stock_cds and not _has_explicit_all_stock_locations(text):
         stock_nm = _extract_named_text(text, ("재고위치",))
     stock_nm = _trim_io_named_value_at_next_label(stock_nm)
 

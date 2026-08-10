@@ -597,6 +597,33 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
         )
     )
 
+    inventory_cases = (
+        ("제품재고장 한미", {"nlq_unlabeled_name": "한미"}, ("physic_nm", "maker_nm")),
+        ("제품재고장 실재고 한미", {"stock_mode": "실재고", "nlq_unlabeled_name": "한미"}, ("physic_nm",)),
+        ("제품재고장 장부재고 한미", {"stock_mode": "장부재고", "nlq_unlabeled_name": "한미"}, ("physic_nm",)),
+        ("제품재고장 전체 재고위치 한미", {"nlq_unlabeled_name": "한미"}, ("physic_nm", "stock_nm")),
+        ("제품재고장 제품 타심주", {"physic_nm": "타심주"}, ("nlq_unlabeled_name",)),
+        ("제품재고장 제품 38093", {"physic_cd": "38093"}, ("nlq_unlabeled_name", "physic_nm")),
+        ("제품재고장 제조사 한미", {"maker_nm": "한미"}, ("nlq_unlabeled_name", "physic_nm")),
+    )
+    for query, expected, absent_keys in inventory_cases:
+        parsed_inventory = io_nlq.resolve_io_nlq(query) or {}
+        resolved_inventory = io_nlq.resolve_unlabeled_io_entity_condition(
+            query,
+            action=str(parsed_inventory.get("action") or ""),
+            params=dict(parsed_inventory.get("params") or {}),
+        )
+        final_inventory_params = dict(resolved_inventory.get("params") or {})
+        results.append(
+            CheckResult(
+                f"product inventory stock qualifier preserves search semantics: {query}",
+                parsed_inventory.get("action") == "제품재고현황 조회"
+                and all(final_inventory_params.get(key) == value for key, value in expected.items())
+                and all(not final_inventory_params.get(key) for key in absent_keys),
+                f"parsed={parsed_inventory!r}, resolved={resolved_inventory!r}",
+            )
+        )
+
     for query in (
         "삼진 출고명세 20260731",
         "삼진 출고 명세 20260731",
@@ -4018,6 +4045,103 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         else _fail("product inventory last-cost scope safe fallback", repr({"named": named_meta, "overflow": overflow_meta}))
     )
 
+    explicit_scope_candidates = pd.DataFrame({"physic_cd": ["P002", "P001", "P002", ""]})
+    with patch.object(inventory_service, "query_to_df", return_value=explicit_scope_candidates):
+        explicit_scope, explicit_meta = inventory_service._resolve_explicit_product_name_scope(
+            {"physic_nm": "fixture-product"},
+            safe_limit=10,
+        )
+    explicit_sql_params = {
+        "physic_nm": "fixture-product",
+        "_product_inventory_explicit_product_codes": explicit_scope,
+        "_product_inventory_explicit_product_scope_applied": True,
+    }
+    explicit_where: list[str] = []
+    inventory_service._apply_master_filters(
+        explicit_where,
+        explicit_sql_params,
+        explicit_sql_params,
+        "T.Rd11_Ven_Cd",
+    )
+    explicit_scope_ok = (
+        explicit_scope == ["P002", "P001"]
+        and explicit_meta.get("scope_applied") is True
+        and explicit_meta.get("candidate_count") == 2
+        and "P.Rd04_Physic_Cd IN (%(explicit_product_0)s, %(explicit_product_1)s)" in explicit_where
+        and not any("Rd04_Physic_Nm LIKE" in clause for clause in explicit_where)
+        and explicit_sql_params.get("explicit_product_0") == "P002"
+        and explicit_sql_params.get("explicit_product_1") == "P001"
+    )
+    results.append(
+        _ok("product inventory explicit product-name uses complete bounded code scope", repr(explicit_meta))
+        if explicit_scope_ok
+        else _fail("product inventory explicit product-name uses complete bounded code scope", repr({"scope": explicit_scope, "meta": explicit_meta, "where": explicit_where}))
+    )
+
+    with patch.object(inventory_service, "query_to_df", return_value=pd.DataFrame({"physic_cd": []})):
+        empty_scope, empty_scope_meta = inventory_service._resolve_explicit_product_name_scope(
+            {"physic_nm": "missing-product"},
+            safe_limit=10,
+        )
+    with patch.object(
+        inventory_service,
+        "query_to_df",
+        return_value=pd.DataFrame({"physic_cd": ["P001", "P002", "P003"]}),
+    ):
+        overflow_explicit_scope, overflow_explicit_meta = inventory_service._resolve_explicit_product_name_scope(
+            {"physic_nm": "many-products"},
+            safe_limit=2,
+        )
+    fallback_explicit_params = {"physic_nm": "many-products"}
+    fallback_explicit_where: list[str] = []
+    inventory_service._apply_master_filters(
+        fallback_explicit_where,
+        fallback_explicit_params,
+        fallback_explicit_params,
+        "T.Rd11_Ven_Cd",
+    )
+    explicit_fallback_ok = (
+        empty_scope == []
+        and empty_scope_meta.get("fallback_reason") == "no_candidates"
+        and overflow_explicit_scope == []
+        and overflow_explicit_meta.get("scope_applied") is False
+        and overflow_explicit_meta.get("fallback_reason") == "sql_parameter_limit"
+        and "P.Rd04_Physic_Nm LIKE %(physic_nm_like)s" in fallback_explicit_where
+    )
+    results.append(
+        _ok("product inventory explicit product-name zero and overflow contracts", repr({"empty": empty_scope_meta, "overflow": overflow_explicit_meta}))
+        if explicit_fallback_ok
+        else _fail("product inventory explicit product-name zero and overflow contracts", repr({"empty": empty_scope_meta, "overflow": overflow_explicit_meta, "where": fallback_explicit_where}))
+    )
+
+    unaffected_unlabeled_params = {"nlq_unlabeled_name": "fixture-name"}
+    unaffected_unlabeled_where: list[str] = []
+    inventory_service._apply_master_filters(
+        unaffected_unlabeled_where,
+        unaffected_unlabeled_params,
+        unaffected_unlabeled_params,
+        "T.Rd11_Ven_Cd",
+    )
+    unaffected_maker_params = {"maker_nm": "fixture-maker"}
+    unaffected_maker_where: list[str] = []
+    inventory_service._apply_master_filters(
+        unaffected_maker_where,
+        unaffected_maker_params,
+        unaffected_maker_params,
+        "T.Rd11_Ven_Cd",
+    )
+    unaffected_paths_ok = (
+        any("nlq_unlabeled_name_like" in clause for clause in unaffected_unlabeled_where)
+        and not any("explicit_product" in clause for clause in unaffected_unlabeled_where)
+        and "MakerVen.Rd03_Ven_Nm LIKE %(maker_nm_like)s" in unaffected_maker_where
+        and not any("explicit_product" in clause for clause in unaffected_maker_where)
+    )
+    results.append(
+        _ok("product inventory explicit product scope leaves unlabeled and maker paths unchanged", "unlabeled four-role/maker LIKE")
+        if unaffected_paths_ok
+        else _fail("product inventory explicit product scope leaves unlabeled and maker paths unchanged", repr({"unlabeled": unaffected_unlabeled_where, "maker": unaffected_maker_where}))
+    )
+
     month_carry_sql, month_carry_params = inventory_service._build_month_carry_sql(
         {
             "date_from": "20260801",
@@ -5291,6 +5415,195 @@ def run_live_checks(*, live_all: bool = False, show_payload: bool = False) -> li
     return results
 
 
+def run_product_inventory_default_scope_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    router = importlib.import_module("app.sims.nlq.nlq_router")
+    profile_service = importlib.import_module("app.services.ssai_analysis_profile_service")
+    login = importlib.import_module("app.ui.ssai_login")
+    original_profile = profile_service.load_dashboard_profile
+    original_company = login.get_selected_company
+    company = {"id": 4}
+    profiles = {
+        4: {"stock_mode": "real", "stock_cd_list": ["00001", "00247", "00901"]},
+        5: {"stock_mode": "book", "stock_cd_list": ["00555"]},
+    }
+    try:
+        profile_service.load_dashboard_profile = lambda **kwargs: profiles.get(int(kwargs["company_id"]))
+        login.get_selected_company = lambda: {"company_id": company["id"]}
+
+        default_params = router._apply_product_inventory_defaults(
+            {"nlq_unlabeled_name": "한미"},
+            text="제품재고장 한미 조회",
+            session_state={},
+        )
+        results.append(
+            _ok("product inventory NLQ applies company stock defaults", repr(default_params))
+            if default_params.get("stock_mode") == "real"
+            and default_params.get("stock_cds") == ["00001", "00247", "00901"]
+            and default_params.get("nlq_unlabeled_name") == "한미"
+            else _fail("product inventory NLQ applies company stock defaults", repr(default_params))
+        )
+
+        explicit_stock_mode = router._apply_product_inventory_defaults(
+            {"stock_mode": "book", "nlq_unlabeled_name": "한미"},
+            text="제품재고장 장부재고 한미 조회",
+            session_state={},
+        )
+        results.append(
+            _ok("product inventory explicit stock mode overrides company default", repr(explicit_stock_mode))
+            if explicit_stock_mode.get("stock_mode") == "book"
+            and explicit_stock_mode.get("stock_cds") == ["00001", "00247", "00901"]
+            else _fail("product inventory explicit stock mode overrides company default", repr(explicit_stock_mode))
+        )
+
+        explicit_code = router._apply_product_inventory_defaults(
+            {"stock_cds": ["00999"], "stock_cd": "00999"},
+            text="제품재고장 재고위치 00999 조회",
+            session_state={},
+        )
+        results.append(
+            _ok("product inventory explicit stock code overrides default", repr(explicit_code))
+            if explicit_code.get("stock_cds") == ["00999"] and explicit_code.get("stock_cd") == "00999"
+            else _fail("product inventory explicit stock code overrides default", repr(explicit_code))
+        )
+
+        explicit_name = router._apply_product_inventory_defaults(
+            {"stock_nm": "본사 창고", "physic_nm": "아스피린"},
+            text="제품재고장 재고위치 본사 창고 제품명 아스피린 조회",
+            session_state={},
+        )
+        results.append(
+            _ok("product inventory explicit stock name keeps resolver contract", repr(explicit_name))
+            if explicit_name.get("stock_nm") == "본사 창고"
+            and "stock_cds" not in explicit_name
+            and explicit_name.get("physic_nm") == "아스피린"
+            else _fail("product inventory explicit stock name keeps resolver contract", repr(explicit_name))
+        )
+
+        explicit_clear = router._apply_product_inventory_defaults(
+            {"stock_nm": "전체"},
+            text="제품재고장 전체 재고위치 한미 조회",
+            session_state={},
+        )
+        results.append(
+            _ok("product inventory explicit all stock locations blocks default", repr(explicit_clear))
+            if explicit_clear.get("stock_cds") == []
+            and explicit_clear.get("stock_cd_list") == []
+            and not explicit_clear.get("stock_nm")
+            else _fail("product inventory explicit all stock locations blocks default", repr(explicit_clear))
+        )
+
+        shared_state: dict[str, Any] = {}
+        company["id"] = 4
+        company_four = router._apply_product_inventory_defaults(
+            {}, text="제품재고장 한미 조회", session_state=shared_state
+        )
+        company["id"] = 5
+        company_five = router._apply_product_inventory_defaults(
+            {}, text="제품재고장 한미 조회", session_state=shared_state
+        )
+        results.append(
+            _ok("product inventory stock defaults stay company isolated", repr({4: company_four, 5: company_five}))
+            if company_four.get("stock_cds") == ["00001", "00247", "00901"]
+            and company_five.get("stock_cds") == ["00555"]
+            and company_five.get("stock_mode") == "book"
+            else _fail("product inventory stock defaults stay company isolated", repr({4: company_four, 5: company_five}))
+        )
+
+        company["id"] = 6
+        no_profile = router._apply_product_inventory_defaults(
+            {"nlq_unlabeled_name": "한미", "physic_nm": "타심주"},
+            text="제품재고장 제품명 타심주 조회",
+            session_state={},
+        )
+        results.append(
+            _ok("product inventory missing profile preserves safe existing params", repr(no_profile))
+            if no_profile == {"nlq_unlabeled_name": "한미", "physic_nm": "타심주"}
+            else _fail("product inventory missing profile preserves safe existing params", repr(no_profile))
+        )
+
+        io_nlq = importlib.import_module("app.services.io_nlq")
+        inventory_service = importlib.import_module("app.services.product_inventory_service")
+        chat_middleware = importlib.import_module("app.ui.chat_middleware")
+        original_inventory_result = inventory_service.get_product_inventory_result
+        original_push = chat_middleware.push_sims_result_to_chat
+        service_calls: list[dict[str, Any]] = []
+        try:
+            def _capture_inventory_params(params=None, **kwargs):
+                final_params = dict(params or kwargs.get("params") or {})
+                service_calls.append(final_params)
+                return {
+                    "final": True,
+                    "type": "text",
+                    "title": "제품재고현황 조회",
+                    "action": "제품재고현황 조회",
+                    "params": final_params,
+                    "data": "해당 조회조건의 자료가 없습니다.",
+                    "message": "해당 조회조건의 자료가 없습니다.",
+                    "meta": {
+                        "result_status": "no_data",
+                        "row_count": 0,
+                        "row_count_total": 0,
+                        "tableless_result": True,
+                    },
+                }
+
+            inventory_service.get_product_inventory_result = _capture_inventory_params
+            chat_middleware.push_sims_result_to_chat = lambda *_args, **_kwargs: None
+            company["id"] = 4
+            public_results = []
+            for query in (
+                "제품재고장 한미",
+                "제품재고장 실재고 한미",
+                "제품재고장 전체 재고위치 한미",
+            ):
+                public_results.append(router._try_handle_io_nlq(
+                    query,
+                    room={"messages": []},
+                    session_state={},
+                    make_ts=_make_ts,
+                    next_seq=_next_seq_factory(),
+                    logger=log,
+                ))
+        finally:
+            inventory_service.get_product_inventory_result = original_inventory_result
+            chat_middleware.push_sims_result_to_chat = original_push
+
+        public_params = service_calls[0] if len(service_calls) >= 1 else {}
+        results.append(
+            _ok("product inventory public router applies company stock defaults before service", repr(public_params))
+            if public_results[0]
+            and len(service_calls) == 3
+            and public_params.get("stock_mode") == "real"
+            and public_params.get("stock_cds") == ["00001", "00247", "00901"]
+            else _fail("product inventory public router applies company stock defaults before service", repr(public_params))
+        )
+        explicit_real_params = service_calls[1] if len(service_calls) >= 2 else {}
+        results.append(
+            _ok("product inventory public router preserves stock mode with unlabeled search", repr(explicit_real_params))
+            if public_results[1]
+            and explicit_real_params.get("stock_mode") == "실재고"
+            and explicit_real_params.get("stock_cds") == ["00001", "00247", "00901"]
+            and explicit_real_params.get("nlq_unlabeled_name") == "한미"
+            and not explicit_real_params.get("physic_nm")
+            else _fail("product inventory public router preserves stock mode with unlabeled search", repr(explicit_real_params))
+        )
+        clear_params = service_calls[2] if len(service_calls) >= 3 else {}
+        results.append(
+            _ok("product inventory public router preserves unlabeled search with explicit stock clear", repr(clear_params))
+            if public_results[2]
+            and clear_params.get("stock_cds") == []
+            and clear_params.get("stock_cd_list") == []
+            and clear_params.get("nlq_unlabeled_name") == "한미"
+            and not clear_params.get("stock_nm")
+            else _fail("product inventory public router preserves unlabeled search with explicit stock clear", repr(clear_params))
+        )
+    finally:
+        profile_service.load_dashboard_profile = original_profile
+        login.get_selected_company = original_company
+    return results
+
+
 def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
     io_nlq = importlib.import_module("app.services.io_nlq")
@@ -5856,6 +6169,12 @@ def main() -> int:
     failed += _print_results(
         "PRODUCT INVENTORY DISPLAY / EXPORT CHECKS",
         product_inventory_display_results,
+    )
+
+    product_inventory_default_results = run_product_inventory_default_scope_checks()
+    failed += _print_results(
+        "PRODUCT INVENTORY COMPANY DEFAULT SCOPE CHECKS",
+        product_inventory_default_results,
     )
 
     current_stock_results = run_current_stock_nlq_contract_checks()
