@@ -15811,6 +15811,192 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
     return results
 
 
+def run_general_current_table_rule_checks() -> list[CheckResult]:
+    """Protect common FIELD + METRIC + GROUPING + RANK interpretation."""
+    results: list[CheckResult] = []
+    try:
+        dispatcher = importlib.import_module("app.ui.current_table_followups.action_dispatcher")
+        source_df = pd.DataFrame(
+            [
+                {
+                    "제품코드": "P1",
+                    "제품명": "제품1",
+                    "제조사명": "한미약품",
+                    "발주처명": "발주처A",
+                    "매입처명": "매입처A",
+                    "재고위치명": "본사 창고",
+                    "재고수량": 9,
+                    "재고금액": 900,
+                },
+                {
+                    "제품코드": "P2",
+                    "제품명": "제품2",
+                    "제조사명": "한미약품",
+                    "발주처명": "발주처B",
+                    "매입처명": "매입처B",
+                    "재고위치명": "전주 창고",
+                    "재고수량": 1,
+                    "재고금액": 100,
+                },
+                {
+                    "제품코드": "P3",
+                    "제품명": "제품3",
+                    "제조사명": "제조사B",
+                    "발주처명": "발주처A",
+                    "매입처명": "매입처A",
+                    "재고위치명": "본사 창고",
+                    "재고수량": 5,
+                    "재고금액": 500,
+                },
+                {
+                    "제품코드": "P4",
+                    "제품명": "제품4",
+                    "제조사명": "제조사B",
+                    "발주처명": "발주처B",
+                    "매입처명": "매입처B",
+                    "재고위치명": "전주 창고",
+                    "재고수량": -2,
+                    "재고금액": 200,
+                },
+            ]
+        )
+        cases = (
+            ("현재표 제품별 재고금액 TOP 20", 20, "product", "stock_amount", "제품명", "재고금액", [("제품1", 900), ("제품3", 500), ("제품4", 200), ("제품2", 100)]),
+            ("현재표 제조사별 재고금액 TOP 20", 20, "manufacturer", "stock_amount", "제조사명", "재고금액", [("한미약품", 1000), ("제조사B", 700)]),
+            ("현재표 발주처별 재고수량", 20, "order_vendor", "stock_quantity", "발주처명", "재고수량", [("발주처A", 14), ("발주처B", -1)]),
+            ("현재표 매입처별 재고수량", 20, "purchase_vendor", "stock_quantity", "매입처명", "재고수량", [("매입처A", 14), ("매입처B", -1)]),
+            ("현재표 재고위치별 재고금액", 20, "stock_location", "stock_amount", "재고위치명", "재고금액", [("본사 창고", 1400), ("전주 창고", 300)]),
+            ("현재결과 제조사 기준 재고금액 상위 2", 2, "manufacturer", "stock_amount", "제조사명", "재고금액", [("한미약품", 1000), ("제조사B", 700)]),
+            ("현재표 제조사별 재고금액 최고", 20, "manufacturer", "stock_amount", "제조사명", "재고금액", [("한미약품", 1000)]),
+        )
+        errors: list[str] = []
+        for query, top_n, grouping, metric, group_col, metric_col, expected_pairs in cases:
+            pushed: list[tuple[str, dict[str, Any]]] = []
+
+            def push_table(**kwargs: Any) -> bool:
+                pushed.append(("table", kwargs))
+                return True
+
+            def push_notice(**kwargs: Any) -> bool:
+                pushed.append(("notice", kwargs))
+                return True
+
+            handled = dispatcher.handle_current_table_followup_by_action(
+                df=source_df.copy(deep=True),
+                query=query,
+                top_n=top_n,
+                table_key="fixture-current-table",
+                source_action="제품재고현황 조회",
+                helpers={"push_table": push_table, "push_notice": push_notice},
+                log=log,
+                source_meta={"result_status": "success"},
+            )
+            if not handled or len(pushed) != 1 or pushed[0][0] != "table":
+                errors.append(f"{query}: route={handled!r}/{pushed!r}")
+                continue
+            payload = pushed[0][1]
+            result_df = payload.get("df")
+            meta = dict(payload.get("extra_meta") or {})
+            if not isinstance(result_df, pd.DataFrame):
+                errors.append(f"{query}: result_not_dataframe")
+                continue
+            if meta.get("requested_grouping") != grouping or meta.get("requested_metric") != metric:
+                errors.append(
+                    f"{query}: intent={meta.get('requested_grouping')!r}/{meta.get('requested_metric')!r}"
+                )
+            if group_col not in result_df.columns or metric_col not in result_df.columns:
+                errors.append(f"{query}: columns={list(result_df.columns)!r}")
+            actual_pairs = list(
+                zip(
+                    result_df[group_col].astype(str).tolist(),
+                    pd.to_numeric(result_df[metric_col], errors="coerce").tolist(),
+                )
+            ) if group_col in result_df.columns and metric_col in result_df.columns else []
+            if actual_pairs != expected_pairs:
+                errors.append(f"{query}: values={actual_pairs!r} expected={expected_pairs!r}")
+            expected_seq = list(range(1, len(expected_pairs) + 1))
+            actual_seq = pd.to_numeric(result_df.get("순번"), errors="coerce").tolist() if "순번" in result_df.columns else []
+            if actual_seq != expected_seq:
+                errors.append(f"{query}: sequence={actual_seq!r} expected={expected_seq!r}")
+        filter_cases = (
+            ("현재표 제조사명 한미약품 상세히 보여줘", 2),
+            ("현재표 재고수량 0 이하 목록", 1),
+            ("현재결과 재고수량 0 초과 목록", 3),
+        )
+        for query, expected_rows in filter_cases:
+            pushed = []
+
+            def push_table(**kwargs: Any) -> bool:
+                pushed.append(("table", kwargs))
+                return True
+
+            def push_notice(**kwargs: Any) -> bool:
+                pushed.append(("notice", kwargs))
+                return True
+
+            handled = dispatcher.handle_current_table_followup_by_action(
+                df=source_df.copy(deep=True),
+                query=query,
+                top_n=20,
+                table_key="fixture-current-table",
+                source_action="제품재고현황 조회",
+                helpers={"push_table": push_table, "push_notice": push_notice},
+                log=log,
+                source_meta={"result_status": "success"},
+            )
+            result_df = pushed[0][1].get("df") if len(pushed) == 1 and pushed[0][0] == "table" else None
+            if not handled or not isinstance(result_df, pd.DataFrame) or len(result_df) != expected_rows:
+                errors.append(f"{query}: route={handled!r} rows={len(result_df) if isinstance(result_df, pd.DataFrame) else None}")
+
+        pushed = []
+
+        def push_table(**kwargs: Any) -> bool:
+            pushed.append(("table", kwargs))
+            return True
+
+        def push_notice(**kwargs: Any) -> bool:
+            pushed.append(("notice", kwargs))
+            return True
+
+        handled = dispatcher.handle_current_table_followup_by_action(
+            df=source_df.copy(deep=True),
+            query="현재표 제품별 재고 TOP 20",
+            top_n=20,
+            table_key="fixture-current-table",
+            source_action="제품재고현황 조회",
+            helpers={"push_table": push_table, "push_notice": push_notice},
+            log=log,
+            source_meta={"result_status": "success"},
+        )
+        unsupported_meta = dict(pushed[0][1].get("extra_meta") or {}) if len(pushed) == 1 else {}
+        if (
+            not handled
+            or len(pushed) != 1
+            or pushed[0][0] != "notice"
+            or unsupported_meta.get("result_status") != "unsupported"
+            or unsupported_meta.get("requested_grouping") != "product"
+            or unsupported_meta.get("requested_metric") != "stock"
+        ):
+            errors.append(f"unsupported bare-stock contract: handled={handled!r} pushed={pushed!r}")
+        if errors:
+            results.append(_fail("general current-table interpretation families", "; ".join(errors)))
+        else:
+            results.append(
+                _ok(
+                    "general current-table interpretation families",
+                    "inventory vendor/location dimensions, explicit metrics, 기준 variants, and rank limits share one dispatcher path",
+                )
+            )
+    except Exception as exc:
+        results.append(
+            _fail(
+                "general current-table interpretation families",
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}",
+            )
+        )
+    return results
+
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
@@ -15837,6 +16023,9 @@ def main() -> int:
 
     dashboard_nlq_results = run_dashboard_nlq_contract_checks()
     failed += _print_results("DASHBOARD NLQ CONTRACT CHECKS", dashboard_nlq_results)
+
+    general_rule_results = run_general_current_table_rule_checks()
+    failed += _print_results("GENERAL CURRENT-TABLE RULE CHECKS", general_rule_results)
 
     if args.live:
         service_results = run_service_live_checks()

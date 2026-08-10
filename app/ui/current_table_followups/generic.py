@@ -739,7 +739,7 @@ def _has_common_group_intent(query: str) -> bool:
     if not any(anchor in compact for anchor in ("현재표", "현재조회결과", "현재결과")):
         return False
     body = _common_filter_body(query)
-    return any(w in body for w in ("별", "집계", "분석", "현황", "요약"))
+    return any(w in body for w in ("별", "기준", "집계", "분석", "현황", "요약"))
 
 
 def _group_aliases(col: str) -> list[str]:
@@ -774,7 +774,7 @@ def _find_common_group_column(df: pd.DataFrame, query: str) -> str:
     body = _common_filter_body(query)
     body_norm = _norm_col_name(body)
     body_stripped = _strip_group_words(body)
-    candidates: list[tuple[int, int, str]] = []
+    candidates: list[tuple[int, int, int, str]] = []
 
     for col in [str(c) for c in df.columns]:
         if col in _COMMON_FILTER_SKIP_COLUMNS:
@@ -782,18 +782,21 @@ def _find_common_group_column(df: pd.DataFrame, query: str) -> str:
         aliases = _group_aliases(col)
         col_norm = _norm_col_name(col)
         if body_norm == col_norm or body_stripped == col_norm:
-            candidates.append((10_000, len(col_norm), col))
+            candidates.append((2, 10_000, len(col_norm), col))
             continue
         for alias in aliases:
             if not alias:
                 continue
             if alias in compact or alias in body_norm or alias == body_stripped:
-                candidates.append((compact.find(alias) if alias in compact else 9999, len(alias), col))
+                position = compact.find(alias) if alias in compact else 9999
+                suffix = compact[position + len(alias):] if position >= 0 and position < 9999 else ""
+                grouping_marker = int(suffix.startswith(("별", "기준")))
+                candidates.append((grouping_marker, -position, len(alias), col))
 
     if not candidates:
         return ""
-    candidates.sort(key=lambda x: (x[1], -x[0]), reverse=True)
-    return candidates[0][2]
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    return candidates[0][3]
 
 
 def _is_sum_candidate_column(col: str) -> bool:
@@ -915,6 +918,27 @@ def _select_common_group_top_metric(out: pd.DataFrame, query: str) -> tuple[str,
 
     compact = _compact(query)
 
+    # 질문에 실제 집계 컬럼명이 명시되면 고정 목록보다 먼저 사용한다.
+    # 이 규칙은 재고금액/거래금액처럼 action마다 이름이 다른 지표도
+    # DataFrame 계약 안에서 동일하게 처리한다.
+    named_numeric_candidates: list[tuple[int, str]] = []
+    for column in [str(c) for c in out.columns]:
+        if column == "순번" or not _is_sum_candidate_column(column):
+            continue
+        column_norm = _compact(column)
+        if column_norm and column_norm in compact:
+            nums = _to_numeric_for_common_filter(out[column])
+            if nums.notna().any():
+                named_numeric_candidates.append((len(column_norm), column))
+    if named_numeric_candidates:
+        named_numeric_candidates.sort(reverse=True)
+        selected = named_numeric_candidates[0][1]
+        if "금액" in selected or "매출" in selected or "공급가액" in selected:
+            return selected, "금액"
+        if "수량" in selected:
+            return selected, "수량"
+        return selected, "지표"
+
     def _first_existing(names: tuple[str, ...]) -> str:
         for name in names:
             if name in out.columns:
@@ -1007,6 +1031,15 @@ def _select_common_group_top_metric(out: pd.DataFrame, query: str) -> tuple[str,
     return "", ""
 
 
+def _common_rank_limit(query: str, top_n: int) -> tuple[bool, int]:
+    compact = _compact(query)
+    if any(marker in compact for marker in ("가장많은", "제일많은", "최고", "1위")):
+        return True, 1
+    if any(marker in compact for marker in ("TOP", "top", "상위")):
+        return True, max(int(top_n or 0), 1)
+    return False, 0
+
+
 def handle_common_column_group_followup(
     *,
     df: pd.DataFrame,
@@ -1030,10 +1063,10 @@ def handle_common_column_group_followup(
         return False
 
     out = _build_common_group_summary(df, group_col)
-    has_top = any(w in _compact(t) for w in ("TOP", "top", "상위"))
+    has_top, rank_limit = _common_rank_limit(t, top_n)
     metric_col = ""
     metric_label = ""
-    if has_top and top_n:
+    if has_top and rank_limit:
         metric_col, metric_label = _select_common_group_top_metric(out, t)
         if metric_col and metric_col in out.columns:
             nums = _to_numeric_for_common_filter(out[metric_col])
@@ -1043,11 +1076,11 @@ def handle_common_column_group_followup(
                 ascending=[False, True],
                 kind="mergesort",
             ).drop(columns=["__sort_metric"])
-        out = out.head(int(top_n)).copy()
+        out = out.head(rank_limit).copy()
         out = _add_seq_column(out)
     out = _drop_current_followup_detail_attrs(out)
 
-    title = f"현재표 {group_col}별 TOP {top_n}" if has_top and top_n else f"현재표 {group_col}별 집계"
+    title = f"현재표 {group_col}별 TOP {rank_limit}" if has_top and rank_limit else f"현재표 {group_col}별 집계"
     try:
         log.info(
             "[chat.followup.generic_group] query=%r source_action=%r group_column=%r metric_column=%r source_rows=%s result_rows=%s table_key=%s",
@@ -1067,14 +1100,14 @@ def handle_common_column_group_followup(
         action=title,
         df=out,
         query_summary=(
-            f"현재표 / {group_col}별 TOP {top_n} · 기준: {metric_col or metric_label or '건수'} / 전체 {len(df):,}건 기준"
-            if has_top and top_n
+            f"현재표 / {group_col}별 TOP {rank_limit} · 기준: {metric_col or metric_label or '건수'} / 전체 {len(df):,}건 기준"
+            if has_top and rank_limit
             else f"현재표 / {group_col}별 집계 / 전체 {len(df):,}건 기준"
         ),
         source_query=t,
         source_table_key=table_key,
         source_rows=len(df),
-        display_limit=top_n if has_top else None,
+        display_limit=rank_limit if has_top else None,
         extra_meta={
             "group_column": group_col,
             "group_top_metric": metric_col,

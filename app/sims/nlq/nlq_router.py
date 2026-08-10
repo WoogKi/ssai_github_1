@@ -2581,6 +2581,20 @@ def _try_handle_analytics_nlq(
         merged_summary = _merge_analytics_nlq_condition_summary(existing_summary, source_summary)
         meta["query_summary"] = merged_summary
         meta["condition"] = merged_summary
+    analytics_condition_sources = {
+        key: (
+            "company_default" if source == "default"
+            else "explicit_clear" if source == "explicit_clear"
+            else "explicit"
+        )
+        for key, source in adapter_sources.items()
+    }
+    analytics_period_source = (
+        "explicit" if bool(period_policy.get("explicit_period_present")) else "action_default"
+    )
+    for key in ("date_from", "date_to", "month_from", "month_to"):
+        if effective_params.get(key) not in (None, ""):
+            analytics_condition_sources.setdefault(key, analytics_period_source)
     meta.update({
         "nlq": True,
         "nlq_query": txt,
@@ -2594,6 +2608,7 @@ def _try_handle_analytics_nlq(
         "requested_grouping": analytics_intent["requested_grouping"],
         "resolved_action": action,
         "execution_status": "success",
+        "condition_sources": analytics_condition_sources,
         **intent_validation,
     })
     for key in (
@@ -5193,7 +5208,11 @@ def _apply_current_stock_defaults(
 
 
 def _apply_product_inventory_defaults(
-    params: Dict[str, Any], *, text: str, session_state: Dict[str, Any]
+    params: Dict[str, Any],
+    *,
+    text: str,
+    session_state: Dict[str, Any],
+    source_out: Dict[str, str] | None = None,
 ) -> Dict[str, Any]:
     """Apply the saved stock basis/location to a product-inventory NLQ."""
     from app.services.ssai_analysis_profile_service import (
@@ -5253,6 +5272,12 @@ def _apply_product_inventory_defaults(
         for key in ("stock_nm", "stock_nm_list", "stock_names"):
             out.pop(key, None)
 
+    if source_out is not None:
+        source_out.update({
+            key: ("company_default" if source == "default" else source)
+            for key, source in sources.items()
+            if key in {"stock_mode", "stock_cd_list"}
+        })
     return out
 
 
@@ -5263,6 +5288,23 @@ def _apply_product_inventory_defaults(
 # - 서비스 함수 우선 호출 
 # - 서비스 실패 시에만 view fallback 
 # - 결과를 채팅 pending 큐로 push
+def _io_nlq_log_search_fields(action: str, params: Dict[str, Any]) -> list[str]:
+    """Return semantic search roles without changing parser/service parameters."""
+    if str(params.get("nlq_unlabeled_name") or "").strip():
+        if action == "제품재고현황 조회":
+            return ["purchase_vendor", "order_vendor", "product", "manufacturer"]
+        if action == "현재고 조회":
+            return ["product", "manufacturer"]
+        return ["transaction_vendor", "product", "manufacturer"]
+    field_map = {
+        "ven_nm": "purchase_vendor" if action == "제품재고현황 조회" else "transaction_vendor",
+        "order_nm": "order_vendor",
+        "maker_nm": "manufacturer",
+        "physic_nm": "product",
+    }
+    return [role for key, role in field_map.items() if str(params.get(key) or "").strip()]
+
+
 def _try_handle_io_nlq(
     txt: str,
     *,
@@ -5306,10 +5348,7 @@ def _try_handle_io_nlq(
     ) -> None:
         current_params = trace_params if isinstance(trace_params, dict) else {}
         extracted_name = str(current_params.get("nlq_unlabeled_name") or "").strip()
-        search_fields = [
-            key for key in ("ven_nm", "maker_nm", "physic_nm", "nlq_unlabeled_name")
-            if current_params.get(key)
-        ]
+        search_fields = _io_nlq_log_search_fields(trace_action, current_params)
         error_text = str(error or "")
         error_number_match = re.search(r"\b(1205|[A-Z]{2,5}\d{3,5})\b", error_text)
         safe_error_number = error_number_match.group(1) if error_number_match else ""
@@ -5453,6 +5492,7 @@ def _try_handle_io_nlq(
     params = dict(parsed.get("params") or {})
     if not action:
         return False
+    parsed_condition_keys = set(params)
 
     _trace("parsed", trace_action=action, trace_params=params)
 
@@ -5545,9 +5585,11 @@ def _try_handle_io_nlq(
             len(candidates),
         )
         return True
+    resolved_kind = ""
     if entity_status == "resolved":
         params = dict(entity_resolution.get("params") or params)
         parsed["params"] = params
+        resolved_kind = str(entity_resolution.get("resolved_kind") or "").strip()
         logger.info(
             "[nlq.router] io unlabeled entity resolved action=%r resolved_kind=%s",
             action,
@@ -5596,10 +5638,40 @@ def _try_handle_io_nlq(
         return True
 
     params, period_policy = _apply_io_period_policy(params, action)
+    condition_sources: Dict[str, str] = {}
     if action == "제품재고현황 조회":
         params = _apply_product_inventory_defaults(
-            params, text=txt_for_io, session_state=session_state
+            params,
+            text=txt_for_io,
+            session_state=session_state,
+            source_out=condition_sources,
         )
+    explicit_source_keys = {
+        "physic_nm": "product_name",
+        "maker_nm": "manufacturer_name",
+        "product_ven_nm": "manufacturer_name",
+        "order_nm": "ordering_vendor_name",
+        "sales_man_nm": "sales_person_name",
+        "region_nm": "region_name",
+        "stock_nm": "stock_location_name",
+    }
+    explicit_source_keys["ven_nm"] = (
+        "purchase_vendor_name" if action == "제품재고현황 조회" else "transaction_vendor_name"
+    )
+    if resolved_kind != "unlabeled_like":
+        for param_key, condition_key in explicit_source_keys.items():
+            if param_key in parsed_condition_keys and params.get(param_key) not in (None, "", []):
+                condition_sources.setdefault(condition_key, "explicit")
+    if "stock_nm" in parsed_condition_keys and any(
+        key in params for key in ("stock_cd", "stock_cds", "stock_cd_list")
+    ):
+        condition_sources.setdefault("stock_codes", "explicit")
+    if resolved_kind == "unlabeled_like" and str(params.get("nlq_unlabeled_name") or "").strip():
+        condition_sources.setdefault("unlabeled_name", "explicit")
+    period_source = "explicit" if bool(period_policy.get("explicit_period_present")) else "action_default"
+    for key in ("date_from", "date_to", "month_from", "month_to"):
+        if params.get(key) not in (None, ""):
+            condition_sources.setdefault(key, period_source)
     parsed["params"] = params
 
     _log_nlq_period_policy(logger, action, period_policy, params)
@@ -5938,6 +6010,7 @@ def _try_handle_io_nlq(
     meta.update(
         {
             "nlq": True,
+            "route": "io",
             "nlq_query": txt,
             "_force_push": True,
             "_nlq_nonce": str(uuid.uuid4()),
@@ -5946,10 +6019,8 @@ def _try_handle_io_nlq(
             "parsed_action": action,
             "canonical_action": str(meta.get("canonical_action") or action),
             "search_mode": "unlabeled_or" if str(params.get("nlq_unlabeled_name") or "").strip() else "",
-            "search_fields": [
-                key for key in ("ven_nm", "maker_nm", "physic_nm", "nlq_unlabeled_name")
-                if str(params.get(key) or "").strip()
-            ],
+            "search_fields": _io_nlq_log_search_fields(action, params),
+            "condition_sources": condition_sources,
         }
     )
     payload["meta"] = meta

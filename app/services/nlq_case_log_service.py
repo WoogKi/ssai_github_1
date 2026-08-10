@@ -42,6 +42,7 @@ _SAFE_CONDITION_KEYS = frozenset(
         "stock_cd", "stock_cds", "stock_cd_list", "io_gu", "io_gu_list", "product_di",
         "product_di_list", "dashboard_product_di_list", "product_class", "product_class_list",
         "dashboard_product_class_list", "source_mode", "stock_mode", "date_basis", "flow_scope",
+        "group_basis", "price_mode",
         "trans_di", "tax_di", "only_mismatch_trans", "only_mismatch_tax",
         "product_supplier_scope_mode", "ven_nm", "physic_nm", "maker_nm", "product_ven_nm",
         "order_nm", "sales_man_nm", "region_nm", "stock_nm", "nlq_unlabeled_name",
@@ -58,6 +59,8 @@ _CANONICAL_CONDITION_ALIASES: dict[str, tuple[str, ...]] = {
     "ordering_vendor_codes": ("order_cd", "order_cds"),
     "sales_person_name": ("sales_man_nm",),
     "sales_person_codes": ("sales_man",),
+    "region_name": ("region_nm",),
+    "stock_location_name": ("stock_nm",),
     "unlabeled_name": ("nlq_unlabeled_name",),
     "stock_codes": ("stock_cd", "stock_cds", "stock_cd_list"),
     "io_codes": ("io_gu", "io_gu_list"),
@@ -69,6 +72,8 @@ _CANONICAL_CONDITION_ALIASES: dict[str, tuple[str, ...]] = {
     "month_to": ("month_to",),
     "stock_mode": ("stock_mode",),
     "source_mode": ("source_mode",),
+    "group_basis": ("group_basis",),
+    "price_mode": ("price_mode",),
 }
 _CODE_CONDITION_KEYS = frozenset(
     {
@@ -76,6 +81,16 @@ _CODE_CONDITION_KEYS = frozenset(
         "sales_person_codes", "stock_codes", "io_codes", "product_type_codes", "product_tax_codes",
     }
 )
+_PRODUCT_INVENTORY_ACTION = "제품재고현황 조회"
+_UNLABELED_SEARCH_FIELDS_BY_ACTION: dict[str, tuple[str, ...]] = {
+    _PRODUCT_INVENTORY_ACTION: (
+        "purchase_vendor",
+        "order_vendor",
+        "product",
+        "manufacturer",
+    ),
+    "현재고 조회": ("product", "manufacturer"),
+}
 
 
 def _safe_scalar(value: Any) -> Any:
@@ -137,11 +152,13 @@ def _as_text_values(value: Any) -> list[str]:
     return [str(item).strip() for item in values if str(item or "").strip()]
 
 
-def _canonical_conditions(params: Mapping[str, Any]) -> dict[str, Any]:
+def _canonical_conditions(params: Mapping[str, Any], *, action: str = "") -> dict[str, Any]:
     """Map already-final query parameters to stable, non-internal case-log keys."""
     safe_params = _safe_conditions(params)
     result: dict[str, Any] = {}
     for output_key, source_keys in _CANONICAL_CONDITION_ALIASES.items():
+        if action == _PRODUCT_INVENTORY_ACTION and output_key.startswith("transaction_vendor_"):
+            output_key = output_key.replace("transaction_vendor_", "purchase_vendor_", 1)
         values: list[str] = []
         for source_key in source_keys:
             values.extend(_as_text_values(safe_params.get(source_key)))
@@ -153,6 +170,73 @@ def _canonical_conditions(params: Mapping[str, Any]) -> dict[str, Any]:
         else:
             result[output_key] = values[0]
     return result
+
+
+def _canonical_condition_sources(meta: Mapping[str, Any]) -> dict[str, str]:
+    raw_sources = meta.get("condition_sources")
+    if not isinstance(raw_sources, Mapping):
+        return {}
+    aliases = {key: key for key in _CANONICAL_CONDITION_ALIASES}
+    aliases.update({
+        "purchase_vendor_name": "purchase_vendor_name",
+        "purchase_vendor_codes": "purchase_vendor_codes",
+        "ven_nm": "transaction_vendor_name",
+        "physic_nm": "product_name",
+        "physic_cd": "product_codes",
+        "physic_cds": "product_codes",
+        "maker_nm": "manufacturer_name",
+        "product_ven_nm": "manufacturer_name",
+        "maker_cd": "manufacturer_codes",
+        "maker_cds": "manufacturer_codes",
+        "product_ven_cd": "manufacturer_codes",
+        "product_ven_cds": "manufacturer_codes",
+        "order_nm": "ordering_vendor_name",
+        "order_cd": "ordering_vendor_codes",
+        "order_cds": "ordering_vendor_codes",
+        "sales_man_nm": "sales_person_name",
+        "sales_man": "sales_person_codes",
+        "region_nm": "region_name",
+        "stock_nm": "stock_location_name",
+        "nlq_unlabeled_name": "unlabeled_name",
+        "stock_mode": "stock_mode",
+        "stock_cd": "stock_codes",
+        "stock_cd_list": "stock_codes",
+        "stock_cds": "stock_codes",
+        "io_gu_list": "io_codes",
+        "product_di_list": "product_type_codes",
+        "product_class_list": "product_tax_codes",
+        "date_from": "date_from",
+        "date_to": "date_to",
+        "month_from": "month_from",
+        "month_to": "month_to",
+    })
+    allowed_sources = {"explicit", "explicit_clear", "company_default", "action_default"}
+    result: dict[str, str] = {}
+    for key, value in raw_sources.items():
+        canonical_key = aliases.get(str(key or "").strip())
+        source = str(value or "").strip()
+        if canonical_key and source in allowed_sources:
+            result[canonical_key] = source
+    return result
+
+
+def _action_handler_identity(action: str, meta: Mapping[str, Any]) -> tuple[str, str]:
+    if bool(meta.get("current_table_followup")):
+        return "current_table_followup", "app.ui.current_table_followups.action_dispatcher"
+    try:
+        from app.sims.nlq.action_inventory import implemented_actions
+
+        spec = next(
+            (item for item in implemented_actions() if item.canonical_action == action),
+            None,
+        )
+        if spec is not None:
+            return str(spec.handler_kind), str(spec.handler_target)
+    except Exception:
+        pass
+    if bool(meta.get("analysis_nlq")):
+        return "analytics_guard", "app.sims.nlq.nlq_router._analytics_grouping_guard"
+    return "", ""
 
 
 def _format_iso_kst(value: Any) -> str | None:
@@ -233,6 +317,7 @@ def _condition_summary(
     period_policy: Mapping[str, Any],
     *,
     search_mode: str,
+    search_fields: list[str],
 ) -> str:
     parts: list[str] = []
     date_from = _format_date_label(conditions.get("date_from"))
@@ -244,7 +329,8 @@ def _condition_summary(
         month_to = _format_date_label(conditions.get("month_to"), monthly=True)
         parts.append(f"기간 {month_from or month_to}" + (f" ~ {month_to}" if month_from and month_to and month_from != month_to else ""))
     labels = (
-        ("transaction_vendor_name", "거래처명"), ("product_name", "제품명"),
+        ("transaction_vendor_name", "거래처명"), ("purchase_vendor_name", "매입처명"),
+        ("product_name", "제품명"),
         ("manufacturer_name", "제조사명"), ("ordering_vendor_name", "발주처명"),
         ("sales_person_name", "영업사원명"), ("unlabeled_name", "무라벨명"),
     )
@@ -253,14 +339,26 @@ def _condition_summary(
         if value:
             parts.append(f"{label} {value}")
     if search_mode == "unlabeled_or":
-        parts.append("거래처·제품·제조사 OR")
+        role_labels = {
+            "purchase_vendor": "매입처",
+            "order_vendor": "발주처",
+            "transaction_vendor": "거래처",
+            "product": "제품",
+            "manufacturer": "제조사",
+        }
+        parts.append("·".join(role_labels.get(field, field) for field in search_fields) + " OR")
     policy_label = _period_policy_label(period_policy)
     if policy_label:
         parts.append(policy_label)
     return " / ".join(parts) if parts else "조건 없음"
 
 
-def _interpretation(meta: Mapping[str, Any], conditions: Mapping[str, Any]) -> dict[str, Any]:
+def _interpretation(
+    meta: Mapping[str, Any],
+    conditions: Mapping[str, Any],
+    *,
+    action: str,
+) -> dict[str, Any]:
     policy = meta.get("period_policy") if isinstance(meta.get("period_policy"), Mapping) else {}
     extracted = dict(conditions)
     search_mode = str(meta.get("search_mode") or "").strip()
@@ -271,7 +369,12 @@ def _interpretation(meta: Mapping[str, Any], conditions: Mapping[str, Any]) -> d
     }
     search_fields = [field_map.get(str(item), str(item)) for item in raw_fields if str(item).strip()] if isinstance(raw_fields, (list, tuple, set)) else []
     if search_mode == "unlabeled_or":
-        search_fields = ["transaction_vendor", "product", "manufacturer"]
+        search_fields = list(
+            _UNLABELED_SEARCH_FIELDS_BY_ACTION.get(
+                action,
+                ("transaction_vendor", "product", "manufacturer"),
+            )
+        )
     search_fields = list(dict.fromkeys(search_fields))[:8]
     resolved = _resolved_conditions(meta, conditions)
     missing_fields: list[str] = []
@@ -295,7 +398,12 @@ def _interpretation(meta: Mapping[str, Any], conditions: Mapping[str, Any]) -> d
         "period_auto_applied": bool(policy.get("auto_applied")),
         "search_mode": search_mode,
         "search_fields": search_fields,
-        "condition_summary": _condition_summary(conditions, policy, search_mode=search_mode),
+        "condition_summary": _condition_summary(
+            conditions,
+            policy,
+            search_mode=search_mode,
+            search_fields=search_fields,
+        ),
         "extracted_conditions": extracted,
         "resolved_conditions": resolved,
         "missing_fields": missing_fields,
@@ -352,7 +460,6 @@ def append_nlq_case_record(
     logged_ids.add(request_id)
 
     params = payload.get("params") if isinstance(payload.get("params"), Mapping) else {}
-    conditions = _canonical_conditions(params)
     raw_status_hint = str(meta.get("result_status") or "").strip()
     is_early_status = raw_status_hint in {"input_required", "candidate_required", "resolution_unavailable"}
     full_source_rows = None if is_early_status else _first_int(meta.get("download_row_count"), meta.get("full_source_row_count"))
@@ -363,7 +470,12 @@ def append_nlq_case_record(
         meta, total_rows=total_rows, candidate_count=candidate_count
     )
     action = str(meta.get("action") or payload.get("action") or payload.get("title") or "").strip()
-    interpretation = _interpretation(meta, conditions)
+    canonical_action = str(meta.get("canonical_action") or "").strip()
+    handler_kind, handler_target = _action_handler_identity(canonical_action or action, meta)
+    if not canonical_action and handler_target and handler_kind != "analytics_guard":
+        canonical_action = action
+    conditions = _canonical_conditions(params, action=canonical_action or action)
+    interpretation = _interpretation(meta, conditions, action=canonical_action or action)
     elapsed_ms = _first_int(meta.get("elapsed_ms"))
     runtime = dict(runtime_context or {})
     notice_codes = meta.get("notice_codes")
@@ -374,6 +486,7 @@ def append_nlq_case_record(
     completed_at = _format_iso_kst(meta.get("response_completed_at"))
     source_call_count = _first_int(meta.get("source_call_count"))
 
+    condition_sources = _canonical_condition_sources(meta)
     record = {
         "occurred_at": occurred_at,
         "completed_at": completed_at,
@@ -384,9 +497,16 @@ def append_nlq_case_record(
         "room_id": str(runtime.get("room_id") or ""),
         "question": _compact_text(question or meta.get("nlq_query")),
         "normalized_question": _compact_text(normalized_question or meta.get("nlq_query")),
-        "route": str(meta.get("route") or ("analytics" if meta.get("analysis_nlq") else "sims")),
+        "route": str(
+            meta.get("route")
+            or ("current_table" if meta.get("current_table_followup") else "")
+            or ("analytics" if meta.get("analysis_nlq") else "sims")
+        ),
         "action": action,
-        "canonical_action": str(meta.get("canonical_action") or ""),
+        "canonical_action": canonical_action,
+        "query_kind": "current_table_followup" if bool(meta.get("current_table_followup")) else "new_query",
+        "handler_kind": handler_kind,
+        "handler_target": handler_target,
         "interpretation": interpretation,
         "period_policy": str(interpretation.get("period_policy") or ""),
         "period_auto_applied": bool(interpretation.get("period_auto_applied")),
@@ -395,6 +515,15 @@ def append_nlq_case_record(
         "result_status_source": result_status_source,
         "stage": "delivery_finalized",
         "conditions": conditions,
+        "condition_sources": condition_sources,
+        "explicit_condition_names": sorted(
+            key for key, source in condition_sources.items()
+            if source in {"explicit", "explicit_clear"}
+        ),
+        "default_condition_names": sorted(
+            key for key, source in condition_sources.items()
+            if source in {"company_default", "action_default"}
+        ),
         "manufacturer_code": str((conditions.get("manufacturer_codes") or [""])[0] or ""),
         "manufacturer_name": str(conditions.get("manufacturer_name") or ""),
         "stock_mode": str(conditions.get("stock_mode") or ""),
@@ -433,7 +562,7 @@ def append_nlq_case_record(
             if str(grouping).strip()
         ][:8] if isinstance(meta.get("requested_groupings"), (list, tuple, set)) else [],
         "resolved_action": str(meta.get("resolved_action") or ""),
-        "execution_status": str(meta.get("execution_status") or ""),
+        "execution_status": str(meta.get("execution_status") or result_status),
         "intent_validation_status": str(meta.get("intent_validation_status") or ""),
         "source_action": str(meta.get("source_action") or ""),
         "source_table_key": str(meta.get("source_table_key") or ""),

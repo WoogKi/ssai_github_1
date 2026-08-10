@@ -344,6 +344,9 @@ def detect_current_table_kind(source_action: str) -> str:
 _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("product", "제품", ("제품별", "품목별"), ("제품명", "품목명", "상품명", "제품코드", "품목코드", "상품코드")),
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
+    ("purchase_vendor", "매입처", ("매입처별", "매입처명별"), ("매입처명", "매입처", "매입처코드")),
+    ("order_vendor", "발주처", ("발주처별", "발주처명별"), ("발주처명", "발주처", "발주처코드")),
+    ("stock_location", "재고위치", ("재고위치별", "재고위치명별"), ("재고위치명", "재고위치", "재고위치코드")),
     ("product_group", "제품그룹", ("제품그룹별",), ("제품그룹명", "제품그룹")),
     ("product_category", "제품구분", ("제품구분별",), ("제품구분명", "제품구분")),
     ("product_class", "제품분류", ("제품분류별",), ("제품분류명", "제품분류")),
@@ -353,6 +356,16 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
 )
 
 _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "stock_quantity",
+        "재고수량",
+        ("재고수량", "현재재고수량", "최종재고수량"),
+    ),
+    (
+        "stock_amount",
+        "재고금액",
+        ("재고금액",),
+    ),
     (
         "sales",
         "매출액",
@@ -392,6 +405,30 @@ _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
+    "stock_quantity": frozenset(
+        {
+            "product",
+            "manufacturer",
+            "purchase_vendor",
+            "order_vendor",
+            "stock_location",
+            "product_group",
+            "product_category",
+            "product_class",
+        }
+    ),
+    "stock_amount": frozenset(
+        {
+            "product",
+            "manufacturer",
+            "purchase_vendor",
+            "order_vendor",
+            "stock_location",
+            "product_group",
+            "product_category",
+            "product_class",
+        }
+    ),
     "sales": frozenset(
         {
             "product",
@@ -433,7 +470,16 @@ def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tupl
     compact = re.sub(r"\s+", "", str(query or ""))
     requested: list[tuple[int, tuple[str, str, tuple[str, ...]]]] = []
     for key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
-        positions = [compact.find(phrase) for phrase in phrases if compact.find(phrase) >= 0]
+        dimension_phrases = tuple(phrases) + tuple(
+            f"{alias}{suffix}"
+            for alias in aliases
+            for suffix in ("별", "기준")
+        )
+        positions = [
+            compact.find(phrase)
+            for phrase in dimension_phrases
+            if compact.find(phrase) >= 0
+        ]
         if positions:
             requested.append((min(positions), (key, label, aliases)))
     return [item for _position, item in sorted(requested, key=lambda entry: entry[0])]
@@ -471,16 +517,13 @@ def _current_table_requested_metrics(query: str) -> list[str]:
         metrics.append("sales")
     if "부족" in compact:
         metrics.append("shortage")
-    # 재고부족은 shortage 단일 metric이다. 단순 재고는 별도 공식 metric이
-    # 아직 없으므로 stock으로 보존한 뒤 capability에서 명시적으로 차단한다.
-    # `재고수량`은 제품수불/재고표의 기존 수량 열 이름이다. 독립 재고
-    # metric 요청으로 오인하면 영업사원별 재고수량 TOP 같은 정상 집계를 막는다.
-    stock_quantity_terms = ("재고수량", "현재재고수량", "최종재고수량")
-    if (
-        "재고" in compact
-        and "부족" not in compact
-        and not any(term in compact for term in stock_quantity_terms)
+    if "부족" not in compact and "재고금액" in compact:
+        metrics.append("stock_amount")
+    elif "부족" not in compact and any(
+        term in compact for term in ("재고수량", "현재재고수량", "최종재고수량")
     ):
+        metrics.append("stock_quantity")
+    elif "재고" in compact and "부족" not in compact:
         metrics.append("stock")
     return metrics
 
@@ -675,7 +718,7 @@ def _current_table_followup_capability(
             "requires_result_contract": False,
             "issue_codes": ["multiple_metric_or_grouping_unsupported"],
         }
-    if metric == "stock" and not (kind == "inventory" and grouping == "product"):
+    if metric == "stock":
         return {
             **base,
             "status": "unsupported",

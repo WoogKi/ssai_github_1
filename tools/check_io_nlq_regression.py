@@ -2699,18 +2699,27 @@ def run_nlq_case_log_checks() -> list[CheckResult]:
 
         unlabeled_payload = {
             "id": "case-unlabeled",
-            "action": "출고명세 조회",
-            "params": {"nlq_unlabeled_name": "삼진", "ven_cd": "00001", "date_from": "20260801"},
+            "action": "제품재고현황 조회",
+            "params": {
+                "nlq_unlabeled_name": "삼진",
+                "stock_cds": ["00001", "00247"],
+                "date_from": "20260801",
+            },
             "meta": {
                 "nlq": True,
                 "result_status": "success",
                 "row_count": 1,
-                "parsed_action": "출고명세 조회",
-                "canonical_action": "출고명세 조회",
+                "parsed_action": "제품재고현황 조회",
+                "canonical_action": "제품재고현황 조회",
                 "search_mode": "unlabeled_or",
-                "search_fields": ["ven_nm", "physic_nm", "maker_nm"],
+                "search_fields": ["nlq_unlabeled_name"],
                 "entity_resolution_status": "resolved",
                 "resolved_kind": "unlabeled_like",
+                "condition_sources": {
+                    "unlabeled_name": "explicit",
+                    "stock_cd_list": "company_default",
+                    "date_from": "action_default",
+                },
                 "display_source_status": "cache",
                 "full_source_status": "not_required",
                 "cache_used": True,
@@ -2723,13 +2732,136 @@ def run_nlq_case_log_checks() -> list[CheckResult]:
             CheckResult(
                 "unlabeled interpretation records OR search metadata and bounded resolved codes",
                 unlabeled.get("interpretation", {}).get("search_mode") == "unlabeled_or"
-                and unlabeled.get("interpretation", {}).get("search_fields") == ["transaction_vendor", "product", "manufacturer"]
-                and unlabeled.get("interpretation", {}).get("resolved_conditions", {}).get("resolved_code_samples") == ["00001"]
-                and unlabeled.get("interpretation", {}).get("condition_summary") == "기간 2026-08-01 / 무라벨명 삼진 / 거래처·제품·제조사 OR"
+                and unlabeled.get("interpretation", {}).get("search_fields") == ["purchase_vendor", "order_vendor", "product", "manufacturer"]
+                and unlabeled.get("interpretation", {}).get("resolved_conditions", {}).get("resolved_code_samples") == ["00001", "00247"]
+                and unlabeled.get("condition_sources") == {"unlabeled_name": "explicit", "stock_codes": "company_default", "date_from": "action_default"}
+                and unlabeled.get("explicit_condition_names") == ["unlabeled_name"]
+                and unlabeled.get("default_condition_names") == ["date_from", "stock_codes"]
+                and unlabeled.get("interpretation", {}).get("condition_summary") == "기간 2026-08-01 / 무라벨명 삼진 / 매입처·발주처·제품·제조사 OR"
+                and unlabeled.get("query_kind") == "new_query"
+                and unlabeled.get("handler_kind") == "io_service"
+                and unlabeled.get("handler_target") == "app.services.product_inventory_service.get_product_inventory_result"
+                and unlabeled.get("execution_status") == "success"
                 and unlabeled.get("display_source_status") == "cache"
                 and unlabeled.get("full_source_status") == "not_required"
                 and unlabeled.get("cache_used") is True,
                 f"unlabeled={unlabeled!r}",
+            )
+        )
+
+        results.append(
+            CheckResult(
+                "current-table case log has an explicit query kind and deterministic handler",
+                current_table_case.get("query_kind") == "current_table_followup"
+                and current_table_case.get("handler_kind") == "current_table_followup"
+                and current_table_case.get("handler_target") == "app.ui.current_table_followups.action_dispatcher",
+                f"current_table_case={current_table_case!r}",
+            )
+        )
+
+        labeled_inventory_payload = {
+            "id": "case-inventory-maker",
+            "action": "제품재고현황 조회",
+            "params": {"maker_nm": "한미"},
+            "meta": {
+                "nlq": True,
+                "result_status": "success",
+                "row_count": 1,
+                "search_mode": "labeled",
+                "search_fields": ["maker_nm"],
+                "condition_sources": {"manufacturer_name": "explicit"},
+            },
+        }
+        with patch.dict(os.environ, {"SIMS_NLQ_CASE_LOG_FILE": str(case_path)}):
+            append_nlq_case_record(labeled_inventory_payload, direct_state, runtime_context={})
+        labeled_inventory = json.loads(case_path.read_text(encoding="utf-8").splitlines()[-1])
+        results.append(
+            CheckResult(
+                "labeled product-inventory log stays manufacturer-specific",
+                labeled_inventory.get("canonical_action") == "제품재고현황 조회"
+                and labeled_inventory.get("interpretation", {}).get("search_fields") == ["manufacturer"]
+                and labeled_inventory.get("conditions", {}).get("manufacturer_name") == "한미"
+                and labeled_inventory.get("condition_sources") == {"manufacturer_name": "explicit"}
+                and labeled_inventory.get("explicit_condition_names") == ["manufacturer_name"],
+                f"labeled_inventory={labeled_inventory!r}",
+            )
+        )
+
+        explicit_source_cases = (
+            ("product", {"physic_nm": "타심주"}, {"product_name": "explicit"}, "product_name", "타심주"),
+            ("purchase_vendor", {"ven_nm": "한미"}, {"purchase_vendor_name": "explicit"}, "purchase_vendor_name", "한미"),
+            ("order_vendor", {"order_nm": "한미"}, {"ordering_vendor_name": "explicit"}, "ordering_vendor_name", "한미"),
+            ("salesperson", {"sales_man_nm": "김"}, {"sales_person_name": "explicit"}, "sales_person_name", "김"),
+            ("region", {"region_nm": "서울"}, {"region_name": "explicit"}, "region_name", "서울"),
+            ("stock_location", {"stock_nm": "본사 창고"}, {"stock_location_name": "explicit"}, "stock_location_name", "본사 창고"),
+        )
+        explicit_source_errors: list[str] = []
+        for case_name, case_params, case_sources, condition_key, expected_value in explicit_source_cases:
+            explicit_payload = {
+                "id": f"case-explicit-{case_name}",
+                "action": "제품재고현황 조회",
+                "params": case_params,
+                "meta": {
+                    "nlq": True,
+                    "result_status": "success",
+                    "row_count": 1,
+                    "condition_sources": case_sources,
+                },
+            }
+            with patch.dict(os.environ, {"SIMS_NLQ_CASE_LOG_FILE": str(case_path)}):
+                append_nlq_case_record(explicit_payload, direct_state, runtime_context={})
+            explicit_record = json.loads(case_path.read_text(encoding="utf-8").splitlines()[-1])
+            if (
+                explicit_record.get("conditions", {}).get(condition_key) != expected_value
+                or explicit_record.get("condition_sources", {}).get(condition_key) != "explicit"
+                or condition_key not in explicit_record.get("explicit_condition_names", [])
+            ):
+                explicit_source_errors.append(f"{case_name}={explicit_record!r}")
+        results.append(
+            _ok("explicit business condition sources remain canonical", "product/manufacturer/vendor/salesperson/region/stock-location")
+            if not explicit_source_errors
+            else _fail("explicit business condition sources remain canonical", "; ".join(explicit_source_errors))
+        )
+
+        analytics_cases = (
+            ("case-product-trend", "품목별 매출 추세 분석", "sales_trend", "product", "success"),
+            ("case-product-trend-summary", "품목별 매출 추세 요약표", "sales_trend_summary", "product", "success"),
+            ("case-maker-trend", "제약사별 매출 추세 분석", "sales_trend", "manufacturer", "success"),
+            ("case-purchase-shortage", "매입처별 재고부족 현황", "stock_shortage", "purchase_vendor", "success"),
+            ("case-order-shortage", "발주처별 재고부족현황", "stock_shortage", "order_vendor", "unsupported"),
+        )
+        analytics_records: list[dict[str, Any]] = []
+        for request_id, case_action, metric, grouping, status in analytics_cases:
+            analytics_payload = {
+                "id": request_id,
+                "action": case_action,
+                "meta": {
+                    "nlq": True,
+                    "analysis_nlq": True,
+                    "result_status": status,
+                    "execution_status": status,
+                    "row_count": 1 if status == "success" else 0,
+                    "requested_metric": metric,
+                    "requested_grouping": grouping,
+                    "resolved_action": case_action if status == "success" else "",
+                },
+            }
+            with patch.dict(os.environ, {"SIMS_NLQ_CASE_LOG_FILE": str(case_path)}):
+                append_nlq_case_record(analytics_payload, direct_state, runtime_context={})
+            analytics_records.append(json.loads(case_path.read_text(encoding="utf-8").splitlines()[-1]))
+        results.append(
+            CheckResult(
+                "analytics case logs preserve metric/action distinctions and unsupported intent",
+                [record.get("requested_metric") for record in analytics_records]
+                == ["sales_trend", "sales_trend_summary", "sales_trend", "stock_shortage", "stock_shortage"]
+                and [record.get("requested_grouping") for record in analytics_records]
+                == ["product", "product", "manufacturer", "purchase_vendor", "order_vendor"]
+                and [record.get("execution_status") for record in analytics_records]
+                == ["success", "success", "success", "success", "unsupported"]
+                and analytics_records[-1].get("result_status") == "unsupported"
+                and analytics_records[-1].get("canonical_action") == ""
+                and all(record.get("route") == "analytics" for record in analytics_records),
+                f"analytics_records={analytics_records!r}",
             )
         )
 
@@ -5528,6 +5660,7 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
         original_inventory_result = inventory_service.get_product_inventory_result
         original_push = chat_middleware.push_sims_result_to_chat
         service_calls: list[dict[str, Any]] = []
+        pushed_payloads: list[dict[str, Any]] = []
         try:
             def _capture_inventory_params(params=None, **kwargs):
                 final_params = dict(params or kwargs.get("params") or {})
@@ -5549,13 +5682,16 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
                 }
 
             inventory_service.get_product_inventory_result = _capture_inventory_params
-            chat_middleware.push_sims_result_to_chat = lambda *_args, **_kwargs: None
+            chat_middleware.push_sims_result_to_chat = lambda payload, *_args, **_kwargs: pushed_payloads.append(payload)
             company["id"] = 4
             public_results = []
             for query in (
                 "제품재고장 한미",
                 "제품재고장 실재고 한미",
                 "제품재고장 전체 재고위치 한미",
+                "제품재고장 제조사 한미",
+                "제품재고장 제품 타심주",
+                "제품재고장 재고위치 00001",
             ):
                 public_results.append(router._try_handle_io_nlq(
                     query,
@@ -5573,7 +5709,7 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
         results.append(
             _ok("product inventory public router applies company stock defaults before service", repr(public_params))
             if public_results[0]
-            and len(service_calls) == 3
+            and len(service_calls) == 6
             and public_params.get("stock_mode") == "real"
             and public_params.get("stock_cds") == ["00001", "00247", "00901"]
             else _fail("product inventory public router applies company stock defaults before service", repr(public_params))
@@ -5597,6 +5733,25 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
             and clear_params.get("nlq_unlabeled_name") == "한미"
             and not clear_params.get("stock_nm")
             else _fail("product inventory public router preserves unlabeled search with explicit stock clear", repr(clear_params))
+        )
+        public_source_errors: list[str] = []
+        source_expectations = (
+            (0, {"stock_mode": "company_default", "stock_cd_list": "company_default", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
+            (1, {"stock_mode": "explicit", "stock_cd_list": "company_default", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
+            (2, {"stock_mode": "company_default", "stock_cd_list": "explicit_clear", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
+            (3, {"manufacturer_name": "explicit", "stock_mode": "company_default", "stock_cd_list": "company_default"}),
+            (4, {"product_name": "explicit", "stock_mode": "company_default", "stock_cd_list": "company_default"}),
+            (5, {"stock_cd_list": "explicit", "stock_mode": "company_default"}),
+        )
+        for index, expected_sources in source_expectations:
+            actual_sources = dict((pushed_payloads[index].get("meta") or {}).get("condition_sources") or {}) if len(pushed_payloads) > index else {}
+            missing = {key: value for key, value in expected_sources.items() if actual_sources.get(key) != value}
+            if missing:
+                public_source_errors.append(f"index={index} expected={expected_sources!r} actual={actual_sources!r}")
+        results.append(
+            _ok("product inventory public router preserves explicit/default condition sources", repr(source_expectations))
+            if not public_source_errors
+            else _fail("product inventory public router preserves explicit/default condition sources", "; ".join(public_source_errors))
         )
     finally:
         profile_service.load_dashboard_profile = original_profile
