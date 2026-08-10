@@ -2716,11 +2716,16 @@ def _apply_io_recent_1month_default(
 def _apply_io_period_policy(
     params: Dict[str, Any],
     action: str,
+    condition_sources: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Apply the canonical policy and retain its display/logging metadata."""
     from app.services.io_nlq import apply_nlq_default_period_policy
 
-    return apply_nlq_default_period_policy(params, action)
+    return apply_nlq_default_period_policy(
+        params,
+        action,
+        condition_sources=condition_sources,
+    )
 
 
 def _log_nlq_period_policy(logger, action: str, policy: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -2790,6 +2795,7 @@ def _period_policy_summary_label(period_policy: Dict[str, Any] | None) -> str:
             "region": "지역 조건",
             "io_type": "입출고구분 조건",
             "product_category": "제품분류 조건",
+            "unlabeled_search": "통합검색 조건",
         }
         names = list(policy.get("explicit_condition_names") or [])
         return f"최근 1개월 자동적용({condition_labels.get(str(names[0]), '명시 조건')})"
@@ -2815,6 +2821,7 @@ def _build_io_query_summary(
     action: str,
     params: Dict[str, Any],
     period_policy: Dict[str, Any] | None = None,
+    condition_sources: Dict[str, Any] | None = None,
 ) -> str:
     """
     IO / 명세서 / 재고 NLQ 공통 조회조건 표시용 summary.
@@ -2893,6 +2900,14 @@ def _build_io_query_summary(
     _append_code_name(parts, "매입처", p.get("buy_cd"), p.get("buy_nm"))
     _append_code_name(parts, "실납처", p.get("real_ven_cd"), p.get("real_ven_nm"))
     _append_code_name(parts, "영업사원", p.get("sales_man"), p.get("sales_man_nm"))
+
+    sources = dict(condition_sources or {})
+    unlabeled_source = str(
+        sources.get("unlabeled_name") or sources.get("nlq_unlabeled_name") or ""
+    ).strip().lower()
+    unlabeled_name = str(p.get("nlq_unlabeled_name") or "").strip()
+    if unlabeled_name and unlabeled_source in {"explicit", "explicit_clear"}:
+        parts.append(f"통합검색 {unlabeled_name}")
 
     # 제품/거래처 분류
     if p.get("product_group_nm"):
@@ -4720,6 +4735,7 @@ def _ensure_io_summary_meta(
     action: str,
     params: Dict[str, Any],
     period_policy: Dict[str, Any] | None = None,
+    condition_sources: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     IO NLQ payload에 query_summary / condition / summary_md를 보강한다.
@@ -4736,11 +4752,24 @@ def _ensure_io_summary_meta(
         or ""
     ).strip()
 
+    unlabeled_summary = _build_io_query_summary(
+        action,
+        {"nlq_unlabeled_name": params.get("nlq_unlabeled_name")},
+        condition_sources=condition_sources,
+    )
+    if query_summary and unlabeled_summary and unlabeled_summary not in query_summary:
+        query_summary = f"{query_summary} / {unlabeled_summary}"
+
     policy_label = _period_policy_summary_label(period_policy)
     if query_summary and policy_label and policy_label not in query_summary:
         query_summary = f"{query_summary} / {policy_label}"
     elif not query_summary:
-        query_summary = _build_io_query_summary(action, params, period_policy)
+        query_summary = _build_io_query_summary(
+            action,
+            params,
+            period_policy,
+            condition_sources,
+        )
 
     if not query_summary:
         query_summary = "전체"
@@ -4751,7 +4780,14 @@ def _ensure_io_summary_meta(
     summary_md = str(meta.get("summary_md") or "").strip()
 
     if summary_md:
-        if "조회조건:" not in summary_md:
+        if "조회조건:" in summary_md:
+            meta["summary_md"] = re.sub(
+                r"(?m)^조회조건:\s*.*$",
+                f"조회조건: {query_summary}",
+                summary_md,
+                count=1,
+            )
+        else:
             meta["summary_md"] = f"조회조건: {query_summary}\n\n{summary_md}"
     else:
         meta["summary_md"] = f"조회조건: {query_summary}"
@@ -5637,15 +5673,7 @@ def _try_handle_io_nlq(
         _trace("finish", trace_action=action, trace_params=params, result_status="input_required")
         return True
 
-    params, period_policy = _apply_io_period_policy(params, action)
     condition_sources: Dict[str, str] = {}
-    if action == "제품재고현황 조회":
-        params = _apply_product_inventory_defaults(
-            params,
-            text=txt_for_io,
-            session_state=session_state,
-            source_out=condition_sources,
-        )
     explicit_source_keys = {
         "physic_nm": "product_name",
         "maker_nm": "manufacturer_name",
@@ -5668,6 +5696,19 @@ def _try_handle_io_nlq(
         condition_sources.setdefault("stock_codes", "explicit")
     if resolved_kind == "unlabeled_like" and str(params.get("nlq_unlabeled_name") or "").strip():
         condition_sources.setdefault("unlabeled_name", "explicit")
+
+    params, period_policy = _apply_io_period_policy(
+        params,
+        action,
+        condition_sources=condition_sources,
+    )
+    if action == "제품재고현황 조회":
+        params = _apply_product_inventory_defaults(
+            params,
+            text=txt_for_io,
+            session_state=session_state,
+            source_out=condition_sources,
+        )
     period_source = "explicit" if bool(period_policy.get("explicit_period_present")) else "action_default"
     for key in ("date_from", "date_to", "month_from", "month_to"):
         if params.get(key) not in (None, ""):
@@ -6004,7 +6045,13 @@ def _try_handle_io_nlq(
             logger.exception("[nlq.router] io view fallback failed action=%r params=%r", action, params)
             return False
 
-    payload = _ensure_io_summary_meta(payload, action, params, period_policy)
+    payload = _ensure_io_summary_meta(
+        payload,
+        action,
+        params,
+        period_policy,
+        condition_sources,
+    )
 
     meta = dict(payload.get("meta") or {})
     meta.update(

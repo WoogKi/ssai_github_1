@@ -651,6 +651,47 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
             )
         )
 
+    status_name_cases = (
+        ("한미 입고현황", "입고명세 조회"),
+        ("삼진 매입현황 조회", "입고명세 조회"),
+        ("한미 매출현황", "출고명세 조회"),
+        ("삼진 출고현황 조회", "출고명세 조회"),
+    )
+    for query, expected_action in status_name_cases:
+        parsed_status = io_nlq.resolve_io_nlq(query) or {}
+        resolved_status = io_nlq.resolve_unlabeled_io_entity_condition(
+            query,
+            action=str(parsed_status.get("action") or ""),
+            params=dict(parsed_status.get("params") or {}),
+        )
+        expected_name = "한미" if "한미" in query else "삼진"
+        results.append(
+            CheckResult(
+                f"status-style IO action preserves unlabeled condition: {query}",
+                parsed_status.get("action") == expected_action
+                and resolved_status.get("status") == "resolved"
+                and resolved_status.get("params", {}).get("nlq_unlabeled_name") == expected_name,
+                f"parsed={parsed_status!r}, resolved={resolved_status!r}",
+            )
+        )
+
+    labelled_boundary_cases = (
+        ("입고명세조회 매입처 온라인팜 제품 팔팔정", "온라인팜", "팔팔정"),
+        ("입고명세조회 제품 팔팔정 매입처 온라인팜", "온라인팜", "팔팔정"),
+    )
+    for query, expected_vendor, expected_product in labelled_boundary_cases:
+        parsed_boundary = io_nlq.resolve_io_nlq(query) or {}
+        boundary_params = dict(parsed_boundary.get("params") or {})
+        results.append(
+            CheckResult(
+                f"labelled IO values stop at the next condition label: {query}",
+                parsed_boundary.get("action") == "입고명세 조회"
+                and boundary_params.get("ven_nm") == expected_vendor
+                and boundary_params.get("physic_nm") == expected_product,
+                f"parsed={parsed_boundary!r}",
+            )
+        )
+
     with patch.object(
         io_nlq,
         "_lookup_unlabeled_io_entity_candidates",
@@ -1965,6 +2006,74 @@ def run_default_period_policy_checks() -> list[CheckResult]:
             manufacturer_summary,
         )
     )
+    unlabeled_sources = {"unlabeled_name": "explicit"}
+    unlabeled_resolved, unlabeled_policy = apply_nlq_default_period_policy(
+        {"nlq_unlabeled_name": "한미"},
+        "입고명세 조회",
+        today=date(2026, 8, 10),
+        condition_sources=unlabeled_sources,
+    )
+    unlabeled_summary = _build_io_query_summary(
+        "입고명세 조회",
+        unlabeled_resolved,
+        unlabeled_policy,
+        unlabeled_sources,
+    )
+    results.append(
+        CheckResult(
+            "unlabeled explicit condition uses current-month detail policy",
+            unlabeled_resolved.get("date_from") == "20260801"
+            and unlabeled_resolved.get("date_to") == "20260810"
+            and unlabeled_policy.get("default_policy") == "current_month"
+            and unlabeled_policy.get("explicit_condition_names") == ["unlabeled_search"]
+            and "통합검색 한미" in unlabeled_summary
+            and "최근 1개월 자동적용(통합검색 조건)" in unlabeled_summary,
+            f"params={unlabeled_resolved!r}, policy={unlabeled_policy!r}, summary={unlabeled_summary!r}",
+        )
+    )
+    outbound_unlabeled, outbound_unlabeled_policy = apply_nlq_default_period_policy(
+        {"nlq_unlabeled_name": "한미"},
+        "출고명세 조회",
+        today=date(2026, 8, 10),
+        condition_sources=unlabeled_sources,
+    )
+    results.append(
+        CheckResult(
+            "outbound unlabeled explicit condition uses the same period contract",
+            outbound_unlabeled.get("date_from") == "20260801"
+            and outbound_unlabeled.get("date_to") == "20260810"
+            and outbound_unlabeled_policy.get("default_policy") == "current_month",
+            f"params={outbound_unlabeled!r}, policy={outbound_unlabeled_policy!r}",
+        )
+    )
+    explicit_unlabeled_params = {
+        "date_from": "20260801",
+        "date_to": "20260831",
+        "nlq_unlabeled_name": "한미",
+    }
+    explicit_unlabeled, explicit_unlabeled_policy = apply_nlq_default_period_policy(
+        explicit_unlabeled_params,
+        "입고명세 조회",
+        today=date(2026, 8, 10),
+        condition_sources=unlabeled_sources,
+    )
+    explicit_unlabeled_summary = _build_io_query_summary(
+        "입고명세 조회",
+        explicit_unlabeled,
+        explicit_unlabeled_policy,
+        unlabeled_sources,
+    )
+    results.append(
+        CheckResult(
+            "explicit period still wins while unlabeled summary remains visible",
+            explicit_unlabeled == explicit_unlabeled_params
+            and bool(explicit_unlabeled_policy.get("explicit_period_present"))
+            and not bool(explicit_unlabeled_policy.get("auto_applied"))
+            and "기간 2026-08-01 ~ 2026-08-31" in explicit_unlabeled_summary
+            and "통합검색 한미" in explicit_unlabeled_summary,
+            f"params={explicit_unlabeled!r}, policy={explicit_unlabeled_policy!r}, summary={explicit_unlabeled_summary!r}",
+        )
+    )
     inventory_summary = _build_io_query_summary(
         "제품재고현황 조회",
         {"date_from": "20260701", "date_to": "20260731"},
@@ -1978,6 +2087,79 @@ def run_default_period_policy_checks() -> list[CheckResult]:
             "inventory summary uses one fixed monthly wording",
             "현재월 자동적용(재고 월조회)" in inventory_summary,
             inventory_summary,
+        )
+    )
+
+    router = importlib.import_module("app.sims.nlq.nlq_router")
+    io_module = importlib.import_module("app.services.io_nlq")
+    inbound_service = importlib.import_module("app.services.rddbc110_service")
+    chat_middleware = importlib.import_module("app.ui.chat_middleware")
+    original_entity_resolver = io_module.resolve_unlabeled_io_entity_condition
+    original_inbound_result = inbound_service.get_rddbc110_result
+    original_push = chat_middleware.push_sims_result_to_chat
+    service_params: list[dict[str, Any]] = []
+    pushed_payloads: list[dict[str, Any]] = []
+    try:
+        io_module.resolve_unlabeled_io_entity_condition = lambda _text, *, action, params: {
+            "status": "resolved",
+            "resolved_kind": "unlabeled_like",
+            "params": {**dict(params or {}), "nlq_unlabeled_name": "한미"},
+        }
+
+        def _capture_inbound(params=None, **kwargs):
+            final_params = dict(params or kwargs.get("params") or {})
+            service_params.append(final_params)
+            return {
+                "final": True,
+                "type": "text",
+                "title": "입고명세 조회",
+                "action": "입고명세 조회",
+                "params": final_params,
+                "data": "fixture",
+                "message": "fixture",
+                "meta": {
+                    "query_summary": (
+                        f"기간 {final_params.get('date_from')} ~ {final_params.get('date_to')}"
+                    ),
+                    "summary_md": "조회조건: 기존 서비스 조건\n\nfixture summary",
+                    "row_count": 0,
+                    "row_count_total": 0,
+                },
+            }
+
+        inbound_service.get_rddbc110_result = _capture_inbound
+        chat_middleware.push_sims_result_to_chat = (
+            lambda payload, *_args, **_kwargs: pushed_payloads.append(payload)
+        )
+        handled = router._try_handle_io_nlq(
+            "한미 입고현황",
+            room={"messages": []},
+            session_state={},
+            make_ts=_make_ts,
+            next_seq=_next_seq_factory(),
+            logger=log,
+        )
+    finally:
+        io_module.resolve_unlabeled_io_entity_condition = original_entity_resolver
+        inbound_service.get_rddbc110_result = original_inbound_result
+        chat_middleware.push_sims_result_to_chat = original_push
+
+    routed_params = service_params[0] if service_params else {}
+    routed_meta = dict((pushed_payloads[0].get("meta") or {})) if pushed_payloads else {}
+    routed_summary = str(routed_meta.get("query_summary") or "")
+    results.append(
+        CheckResult(
+            "public IO router connects unlabeled metadata to period and summary",
+            handled
+            and routed_params.get("nlq_unlabeled_name") == "한미"
+            and routed_params.get("date_from") == "20260801"
+            and routed_params.get("date_to") == "20260810"
+            and (routed_meta.get("period_policy") or {}).get("default_policy") == "current_month"
+            and (routed_meta.get("condition_sources") or {}).get("unlabeled_name") == "explicit"
+            and "통합검색 한미" in routed_summary
+            and "최근 1개월 자동적용(통합검색 조건)" in routed_summary
+            and "통합검색 한미" in str(routed_meta.get("summary_md") or ""),
+            f"params={routed_params!r}, meta={routed_meta!r}",
         )
     )
 

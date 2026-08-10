@@ -9,7 +9,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from app.services.rddbc_io_common import clean_text
 
@@ -431,13 +431,26 @@ _NLQ_EXPLICIT_CONDITION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def get_nlq_explicit_condition_names(params: Dict[str, Any]) -> list[str]:
+def get_nlq_explicit_condition_names(
+    params: Dict[str, Any],
+    condition_sources: Optional[Mapping[str, Any]] = None,
+) -> list[str]:
     """Return only user-parsed, result-narrowing condition categories."""
-    return [
+    names = [
         name
         for name, keys in _NLQ_EXPLICIT_CONDITION_GROUPS
         if _has_explicit_value(params, keys)
     ]
+    sources = dict(condition_sources or {})
+    unlabeled_source = clean_text(
+        sources.get("unlabeled_name") or sources.get("nlq_unlabeled_name")
+    ).lower()
+    if (
+        unlabeled_source in {"explicit", "explicit_clear"}
+        and clean_text((params or {}).get("nlq_unlabeled_name"))
+    ):
+        names.append("unlabeled_search")
+    return list(dict.fromkeys(names))
 
 
 def _policy_today(params: Dict[str, Any], today: date | None) -> date:
@@ -464,6 +477,7 @@ def apply_nlq_default_period_policy(
     action: str,
     *,
     today: date | None = None,
+    condition_sources: Optional[Mapping[str, Any]] = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     """Apply one canonical NLQ default-period policy after parsing user input.
 
@@ -477,7 +491,7 @@ def apply_nlq_default_period_policy(
     # over this policy.
     parser_default_date = clean_text(out.get("_default_date_applied")).upper() == "Y"
     explicit_period_present = _has_period_param(out) and not parser_default_date
-    explicit_condition_names = get_nlq_explicit_condition_names(out)
+    explicit_condition_names = get_nlq_explicit_condition_names(out, condition_sources)
     policy = {
         "action": str(action or "").strip(),
         "action_class": action_class,
@@ -1169,13 +1183,19 @@ def _normalize_io_detail_vendor_params(
     # 입고명세 매입처명 한미 → 거래처명 한미
     if is_in_detail and "매입처" in t:
         prefix_ven_nm = _extract_vendor_name_before_side_label(t, ("매입처명", "매입처"))
+        side_label_form = bool(re.search(
+            r"(?:매입처명|매입처)(?:에서|의)?(?:\s+(?:거래내역|내역|조회|검색)|$)",
+            t,
+        ))
 
-        if clean_text(prefix_ven_nm):
+        if clean_text(prefix_ven_nm) and side_label_form:
             out["ven_nm"] = clean_text(prefix_ven_nm)
             out.pop("buy_nm", None)
-        elif not clean_text(out.get("ven_nm")) and clean_text(out.get("buy_nm")):
+        elif clean_text(out.get("buy_nm")):
             out["ven_nm"] = clean_text(out.get("buy_nm"))
             out.pop("buy_nm", None)
+        elif clean_text(prefix_ven_nm):
+            out["ven_nm"] = clean_text(prefix_ven_nm)
 
         if not clean_text(out.get("ven_cd")) and clean_text(out.get("buy_cd")):
             out["ven_cd"] = clean_text(out.get("buy_cd"))
@@ -1242,15 +1262,25 @@ def _extract_io_compound_named_values(text: str) -> dict[str, str]:
         return {}
 
     label_specs = (
-        ("physic_nm", ("제품명", "제품")),
+        ("ven_nm", ("거래처명", "거래처")),
+        ("physic_nm", ("제품명", "품목명", "상품명", "제품")),
         ("maker_nm", ("제조사명", "제조사", "제약사명", "제약사")),
+        ("order_nm", ("발주처명", "발주처")),
+        ("buy_nm", ("매입처명", "매입처")),
+        ("real_ven_nm", ("실납처명", "실납처")),
+        ("sales_man_nm", ("영업사원명", "영업사원")),
         ("stock_nm", ("재고위치명", "재고위치")),
     )
+    def label_pattern(label: str) -> str:
+        if label == "제품":
+            return r"제품(?!그룹명|그룹|구분명|구분|분류명|분류|코드|명)"
+        return re.escape(label)
+
     all_labels = tuple(label for _, labels in label_specs for label in labels)
-    all_labels_pat = "|".join(re.escape(label) for label in sorted(all_labels, key=len, reverse=True))
+    all_labels_pat = "|".join(label_pattern(label) for label in sorted(all_labels, key=len, reverse=True))
     values: dict[str, str] = {}
     for key, labels in label_specs:
-        labels_pat = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+        labels_pat = "|".join(label_pattern(label) for label in sorted(labels, key=len, reverse=True))
         match = re.search(
             rf"(?:^|\s)(?:{labels_pat})\s*[:=]?\s*(.+?)(?=\s+(?:{all_labels_pat})\s*(?:[:=]|\s)|$)",
             raw,
@@ -1503,6 +1533,8 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     action_patterns = (
         r"입고\s*명세(?:서)?",
         r"출고\s*명세(?:서)?",
+        r"(?:입고|매입)\s*현황",
+        r"(?:출고|매출)\s*현황",
         r"거래\s*명세서(?:\s*공통)?",
         r"세금\s*계산서(?:\s*공통)?",
         r"제품\s*수불(?:현황|부)?",
@@ -2093,10 +2125,11 @@ def extract_params(text: str) -> Dict[str, Any]:
     real_ven_cd = _extract_code(text, "실납처", 5) or _extract_code(text, "실납처코드", 5)
     sales_man = _extract_code(text, "영업사원", 5) or _extract_code(text, "영업사원코드", 5)
 
-    # The broader IO parser intentionally keeps legacy product-code wording
-    # such as "제품코드 ABCDE" intact.  Compound name boundaries are needed
-    # for the current-stock NLQ contract only.
-    compound_named_values = _extract_io_compound_named_values(text) if "현재고" in text else {}
+    # Keep every labelled value inside its own condition boundary.  This also
+    # preserves legacy product-code handling because matching code values are
+    # removed from physic_nm below.
+    compound_named_values = _extract_io_compound_named_values(text)
+    ven_nm = compound_named_values.get("ven_nm") or ven_nm
     physic_nm = compound_named_values.get("physic_nm") or (
         _extract_named_text(text, ("제품명", "품목명", "상품명"))
         or (
@@ -2129,10 +2162,10 @@ def extract_params(text: str) -> Dict[str, Any]:
             physic_nm = ""
 
     maker_nm = compound_named_values.get("maker_nm") or _extract_named_text(text, ("제조사명", "제약사명", "제조사", "제약사"))
-    order_nm = _extract_named_text(text, ("발주처명", "발주처"))
-    buy_nm = _extract_named_text(text, ("매입처명", "매입처"))
-    real_ven_nm = _extract_named_text(text, ("실납처명", "실납처"))
-    sales_man_nm = _extract_named_text(text, ("영업사원명",))
+    order_nm = compound_named_values.get("order_nm") or _extract_named_text(text, ("발주처명", "발주처"))
+    buy_nm = compound_named_values.get("buy_nm") or _extract_named_text(text, ("매입처명", "매입처"))
+    real_ven_nm = compound_named_values.get("real_ven_nm") or _extract_named_text(text, ("실납처명", "실납처"))
+    sales_man_nm = compound_named_values.get("sales_man_nm") or _extract_named_text(text, ("영업사원명",))
 
     product_group_nm = _extract_named_text(text, ("제품그룹명", "제품그룹", "그룹명"))
     product_di_nm = _extract_named_text(text, ("제품구분명", "제품구분", "구분명"))
@@ -2170,6 +2203,8 @@ def extract_params(text: str) -> Dict[str, Any]:
     # 단, "재고위치 000001"처럼 숫자 코드는 stock_cds로 이미 잡히므로 이름으로 중복 처리하지 않는다.
     if not stock_nm and not stock_cds and not _has_explicit_all_stock_locations(text):
         stock_nm = _extract_named_text(text, ("재고위치",))
+    if _has_explicit_all_stock_locations(text):
+        stock_nm = ""
     stock_nm = _trim_io_named_value_at_next_label(stock_nm)
 
     if ven_cd:
