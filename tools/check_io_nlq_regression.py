@@ -3795,6 +3795,88 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         )
     )
 
+    descriptor_source = pd.concat(
+        [
+            inventory_source.iloc[[0]].assign(
+                physic_cd="SINGLE", physic_nm="single", buy_cd="B01", buy_nm="buy-01"
+            ),
+            inventory_source.iloc[[0]].assign(
+                physic_cd="MULTI", physic_nm="multi", buy_cd="B01", buy_nm="buy-01",
+                old_in_qty=3.0, old_in_amt=30.0,
+            ),
+            inventory_source.iloc[[0]].assign(
+                physic_cd="MULTI", physic_nm="multi", buy_cd="B02", buy_nm="buy-02",
+                old_in_qty=4.0, old_in_amt=40.0,
+            ),
+        ],
+        ignore_index=True,
+    )
+    descriptor_params = {"date_to": "20260731", "fetch_top": 0}
+    descriptor_cfg = {"group_basis": "maker", "price_mode": "avg"}
+    descriptor_grouped = _prepare_grouped_df(
+        descriptor_source,
+        pd.DataFrame(columns=["physic_cd", "last_unit_cost"]),
+        descriptor_cfg,
+        descriptor_params,
+    )
+    descriptor_shuffled = _prepare_grouped_df(
+        descriptor_source.sample(frac=1.0, random_state=20260810).reset_index(drop=True),
+        pd.DataFrame(columns=["physic_cd", "last_unit_cost"]),
+        descriptor_cfg,
+        descriptor_params,
+    )
+    descriptor_columns = [
+        "group_cd", "group_nm", "physic_cd", "buy_cd", "buy_nm",
+        "old_in_qty", "old_in_amt", "stock_qty", "stock_amt",
+    ]
+    descriptor_left = descriptor_grouped[descriptor_columns].sort_values(
+        ["group_cd", "physic_cd"], kind="stable"
+    ).reset_index(drop=True)
+    descriptor_right = descriptor_shuffled[descriptor_columns].sort_values(
+        ["group_cd", "physic_cd"], kind="stable"
+    ).reset_index(drop=True)
+    single_row = descriptor_left.loc[descriptor_left["physic_cd"].eq("SINGLE")].iloc[0]
+    multi_row = descriptor_left.loc[descriptor_left["physic_cd"].eq("MULTI")].iloc[0]
+    descriptor_shuffle_ok = (
+        descriptor_left.equals(descriptor_right)
+        and single_row["buy_cd"] == "B01"
+        and single_row["buy_nm"] == "buy-01"
+        and multi_row["buy_cd"] == ""
+        and multi_row["buy_nm"] == ""
+        and multi_row["old_in_qty"] == 7.0
+        and multi_row["old_in_amt"] == 70.0
+    )
+    results.append(
+        _ok("product inventory buy descriptor is row-order deterministic", repr(descriptor_left.to_dict("records")))
+        if descriptor_shuffle_ok
+        else _fail(
+            "product inventory buy descriptor is row-order deterministic",
+            repr({"ordered": descriptor_left.to_dict("records"), "shuffled": descriptor_right.to_dict("records")}),
+        )
+    )
+
+    purchase_source = descriptor_source.loc[descriptor_source["physic_cd"].eq("MULTI")].copy()
+    purchase_source["group_cd"] = purchase_source["buy_cd"]
+    purchase_source["group_nm"] = purchase_source["buy_nm"]
+    purchase_grouped = _prepare_grouped_df(
+        purchase_source,
+        pd.DataFrame(columns=["physic_cd", "last_unit_cost"]),
+        {"group_basis": "purchase", "price_mode": "avg"},
+        descriptor_params,
+    )
+    purchase_descriptor_ok = (
+        len(purchase_grouped) == 2
+        and purchase_grouped["buy_cd"].tolist() == purchase_grouped["group_cd"].tolist()
+        and purchase_grouped["buy_nm"].tolist() == purchase_grouped["group_nm"].tolist()
+        and float(purchase_grouped["old_in_qty"].sum()) == 7.0
+        and float(purchase_grouped["old_in_amt"].sum()) == 70.0
+    )
+    results.append(
+        _ok("product inventory purchase grouping keeps official buy descriptor", repr(purchase_grouped[["group_cd", "buy_cd"]].to_dict("records")))
+        if purchase_descriptor_ok
+        else _fail("product inventory purchase grouping keeps official buy descriptor", repr(purchase_grouped.to_dict("records")))
+    )
+
     stock_grouped_inventory = _prepare_grouped_df(
         inventory_source,
         pd.DataFrame(columns=["physic_cd", "last_unit_cost"]),
@@ -3853,6 +3935,138 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         _ok("product inventory performance stages are independently logged", "sql/group/calc/display")
         if all(marker in perf_source for marker in required_perf_stages)
         else _fail("product inventory performance stages are independently logged", "missing performance marker")
+    )
+
+    last_cost_base_params = {
+        "date_to": "20260809",
+        "nlq_unlabeled_name": "한미",
+    }
+    last_cost_cfg = inventory_service._settings({"stock_mode": "real"})
+    last_cost_base_sql, _ = inventory_service._build_last_cost_sql(
+        last_cost_base_params,
+        last_cost_cfg,
+    )
+    bounded_source = pd.DataFrame({"physic_cd": ["00001", "00002", "00001", ""]})
+    bounded_scope, bounded_meta = inventory_service._last_cost_product_scope_plan(
+        last_cost_base_params,
+        bounded_source,
+        last_cost_base_sql,
+    )
+    bounded_sql, bounded_params = inventory_service._build_last_cost_sql(
+        last_cost_base_params,
+        last_cost_cfg,
+        product_scope=bounded_scope,
+    )
+    unlabeled_predicates_preserved = all(
+        bounded_sql.count(marker) == 2
+        for marker in (
+            "BuyVen.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s",
+            "OrderVen.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s",
+            "P.Rd04_Physic_Nm LIKE %(nlq_unlabeled_name_like)s",
+            "MakerVen.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s",
+        )
+    )
+    bounded_scope_ok = (
+        bounded_scope == ["00001", "00002"]
+        and bounded_meta.get("applied") is True
+        and bounded_meta.get("product_bind_occurrences") == 2
+        and (
+            int(bounded_meta.get("fixed_parameter_count") or 0)
+            + int(bounded_meta.get("safe_limit") or 0) * 2
+            + inventory_service.SQL_PARAMETER_SAFETY_MARGIN
+            <= inventory_service.SQL_SERVER_PARAMETER_LIMIT
+        )
+        and bounded_sql.count("IN (%(last_cost_product_0)s, %(last_cost_product_1)s)") == 2
+        and "T.Rd11_Physic_Cd IN" in bounded_sql
+        and "T.Rd12_Physic_Cd IN" in bounded_sql
+        and bounded_params.get("last_cost_product_0") == "00001"
+        and bounded_params.get("last_cost_product_1") == "00002"
+        and unlabeled_predicates_preserved
+    )
+    results.append(
+        _ok("product inventory unlabeled last-cost bounded scope", repr(bounded_meta))
+        if bounded_scope_ok
+        else _fail("product inventory unlabeled last-cost bounded scope", repr({"scope": bounded_scope, "meta": bounded_meta}))
+    )
+
+    named_scope, named_meta = inventory_service._last_cost_product_scope_plan(
+        {"date_to": "20260809", "maker_nm": "한미"},
+        bounded_source,
+        last_cost_base_sql,
+    )
+    overflow_source = pd.DataFrame({
+        "physic_cd": [
+            f"P{i:05d}" for i in range(int(bounded_meta.get("safe_limit") or 0) + 1)
+        ]
+    })
+    overflow_scope, overflow_meta = inventory_service._last_cost_product_scope_plan(
+        last_cost_base_params,
+        overflow_source,
+        last_cost_base_sql,
+    )
+    fallback_contract_ok = (
+        named_scope == []
+        and named_meta.get("applied") is False
+        and named_meta.get("fallback_reason") == "not_unlabeled"
+        and overflow_scope == []
+        and overflow_meta.get("applied") is False
+        and overflow_meta.get("fallback_reason") == "sql_parameter_limit"
+    )
+    results.append(
+        _ok("product inventory last-cost scope safe fallback", repr({"named": named_meta, "overflow": overflow_meta}))
+        if fallback_contract_ok
+        else _fail("product inventory last-cost scope safe fallback", repr({"named": named_meta, "overflow": overflow_meta}))
+    )
+
+    month_carry_sql, month_carry_params = inventory_service._build_month_carry_sql(
+        {
+            "date_from": "20260801",
+            "date_to": "20260809",
+            "base_month": "202608",
+            "stock_mode": "real",
+            "group_basis": "maker",
+            "price_mode": "avg",
+            "nlq_unlabeled_name": "한미",
+        },
+        inventory_service._settings({"stock_mode": "real", "group_basis": "maker", "price_mode": "avg"}),
+    )
+    month_carry_exists_contract_ok = (
+        month_carry_params.get("nlq_unlabeled_name_like") == "%한미%"
+        and month_carry_sql.count("P.Rd04_Physic_Nm LIKE %(nlq_unlabeled_name_like)s") == 2
+        and month_carry_sql.count("BuyFilter.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s") == 1
+        and month_carry_sql.count("OrderFilter.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s") == 1
+        and month_carry_sql.count("MakerFilter.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s") == 1
+        and "BuyFilter.Rd03_Ven_Cd = M.Rd21_Ven_Cd" in month_carry_sql
+        and "OrderFilter.Rd03_Ven_Cd = P.Rd04_OrVen_Cd" in month_carry_sql
+        and "MakerFilter.Rd03_Ven_Cd = P.Rd04_Ven_Cd" in month_carry_sql
+        and month_carry_sql.count("BuyVen.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s") == 1
+        and month_carry_sql.count("OrderVen.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s") == 1
+        and month_carry_sql.count("MakerVen.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s") == 1
+    )
+    results.append(
+        _ok("product inventory month-carry unlabeled four-role EXISTS", "purchase/order/product/manufacturer")
+        if month_carry_exists_contract_ok
+        else _fail("product inventory month-carry unlabeled four-role EXISTS", month_carry_sql)
+    )
+
+    universe_last_cost = pd.DataFrame({
+        "physic_cd": ["31768", "39639", "LAST_ONLY"],
+        "last_unit_cost": [7000.0, 8000.0, 9999.0],
+    })
+    universe_grouped = _prepare_grouped_df(
+        inventory_source,
+        universe_last_cost,
+        {"group_basis": "maker", "price_mode": "last"},
+        {"date_to": "20260731", "fetch_top": 0},
+    )
+    universe_ok = (
+        set(universe_grouped["physic_cd"].astype(str)) == {"31768", "39639"}
+        and "LAST_ONLY" not in set(universe_grouped["physic_cd"].astype(str))
+    )
+    results.append(
+        _ok("product inventory source frame owns result product universe", "last-cost-only product excluded by left merge")
+        if universe_ok
+        else _fail("product inventory source frame owns result product universe", repr(universe_grouped.get("physic_cd", pd.Series(dtype=str)).tolist()))
     )
 
     inventory_rendered_frames: list[pd.DataFrame] = []

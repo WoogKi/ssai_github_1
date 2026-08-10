@@ -26,6 +26,9 @@ TITLE = "제품재고현황 조회"
 ACTION = "제품재고현황 조회"
 log = logging.getLogger("ssai")
 
+SQL_SERVER_PARAMETER_LIMIT = 2100
+SQL_PARAMETER_SAFETY_MARGIN = 32
+
 
 # -----------------------------------------------------------------------------
 # 기본 유틸
@@ -748,6 +751,55 @@ def _append_in_clause(where: list[str], sql_params: Dict[str, Any], field_expr: 
     where.append(f"{field_expr} IN ({', '.join(bind_keys)})")
 
 
+def _last_cost_product_scope_plan(
+    params: Dict[str, Any],
+    source_df: pd.DataFrame,
+    base_sql: str,
+) -> tuple[list[str], Dict[str, Any]]:
+    """Bound an unlabeled last-cost lookup to products already in its source rows."""
+    fixed_bind_count = len(re.findall(r"%\(([^)]+)\)s", base_sql))
+    product_bind_occurrences = 2
+    safe_limit = max(
+        0,
+        (
+            SQL_SERVER_PARAMETER_LIMIT
+            - fixed_bind_count
+            - SQL_PARAMETER_SAFETY_MARGIN
+        ) // product_bind_occurrences,
+    )
+    meta: Dict[str, Any] = {
+        "applied": False,
+        "product_code_count": 0,
+        "safe_limit": safe_limit,
+        "fixed_parameter_count": fixed_bind_count,
+        "product_bind_occurrences": product_bind_occurrences,
+        "fallback_reason": "",
+    }
+
+    if not clean_text(params.get("nlq_unlabeled_name")):
+        meta["fallback_reason"] = "not_unlabeled"
+        return [], meta
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty or "physic_cd" not in source_df.columns:
+        meta["fallback_reason"] = "source_product_scope_unavailable"
+        return [], meta
+
+    product_codes = list(dict.fromkeys(
+        clean_text(value)
+        for value in source_df["physic_cd"].tolist()
+        if clean_text(value)
+    ))
+    meta["product_code_count"] = len(product_codes)
+    if not product_codes:
+        meta["fallback_reason"] = "source_product_scope_empty"
+        return [], meta
+    if len(product_codes) > safe_limit:
+        meta["fallback_reason"] = "sql_parameter_limit"
+        return [], meta
+
+    meta["applied"] = True
+    return product_codes, meta
+
+
 def _month_first(date_yyyymmdd: str) -> str:
     return date_yyyymmdd[:6] + "01"
 
@@ -1008,7 +1060,27 @@ def _build_month_carry_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple
         "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
     ]
     _append_in_clause(where, sql_params, stock_field, stock_codes, "carry_stock")
-    _apply_master_filters(where, sql_params, params, f"M.{cfg['month_alias']}_Ven_Cd")
+    unlabeled_name = clean_text(params.get("nlq_unlabeled_name"))
+    master_params = dict(params)
+    if unlabeled_name:
+        # Preserve the shared four-role OR-LIKE contract and add equivalent
+        # semi-joins as a redundant optimizer scope for the month aggregate.
+        master_params["nlq_unlabeled_name"] = ""
+    _apply_master_filters(where, sql_params, master_params, f"M.{cfg['month_alias']}_Ven_Cd")
+    if unlabeled_name:
+        sql_params["nlq_unlabeled_name_like"] = f"%{unlabeled_name}%"
+        where.append(
+            "(P.Rd04_Physic_Nm LIKE %(nlq_unlabeled_name_like)s "
+            "OR EXISTS (SELECT 1 FROM dbo.Rddbc030 AS BuyFilter "
+            f"WHERE BuyFilter.Rd03_Ven_Cd = M.{cfg['month_alias']}_Ven_Cd "
+            "AND BuyFilter.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s) "
+            "OR EXISTS (SELECT 1 FROM dbo.Rddbc030 AS OrderFilter "
+            "WHERE OrderFilter.Rd03_Ven_Cd = P.Rd04_OrVen_Cd "
+            "AND OrderFilter.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s) "
+            "OR EXISTS (SELECT 1 FROM dbo.Rddbc030 AS MakerFilter "
+            "WHERE MakerFilter.Rd03_Ven_Cd = P.Rd04_Ven_Cd "
+            "AND MakerFilter.Rd03_Ven_Nm LIKE %(nlq_unlabeled_name_like)s))"
+        )
 
     sql = f"""
 SELECT
@@ -1197,7 +1269,12 @@ HAVING
 
 
 
-def _build_last_cost_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+def _build_last_cost_sql(
+    params: Dict[str, Any],
+    cfg: Dict[str, Any],
+    *,
+    product_scope: Optional[list[str]] = None,
+) -> tuple[str, Dict[str, Any]]:
     """
     문서 기준:
     - 최종매입가 = 재고위치와 무관한 제품 기준 최종 매입단가
@@ -1215,6 +1292,13 @@ def _build_last_cost_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[s
         "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
     ]
     _apply_master_filters(in_where, sql_params, params, "T.Rd11_Ven_Cd")
+    _append_in_clause(
+        in_where,
+        sql_params,
+        "T.Rd11_Physic_Cd",
+        list(product_scope or []),
+        "last_cost_product",
+    )
 
     out_where = [
         "1 = 1",
@@ -1225,6 +1309,13 @@ def _build_last_cost_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[s
         "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
     ]
     _apply_master_filters(out_where, sql_params, params, "T.Rd12_In_Ven_Cd")
+    _append_in_clause(
+        out_where,
+        sql_params,
+        "T.Rd12_Physic_Cd",
+        list(product_scope or []),
+        "last_cost_product",
+    )
 
     sql = f"""
 WITH Base AS (
@@ -1452,7 +1543,27 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
         params["_current_stock_query_perf"] = query_perf
         return all_df, pd.DataFrame()
 
-    last_sql, last_params = _build_last_cost_sql(sql_params, cfg)
+    base_last_sql, _ = _build_last_cost_sql(sql_params, cfg)
+    product_scope, scope_meta = _last_cost_product_scope_plan(
+        sql_params,
+        all_df,
+        base_last_sql,
+    )
+    params["_product_inventory_last_cost_scope"] = scope_meta
+    log.info(
+        "[product_inventory.perf] stage=last_cost_scope applied=%s product_code_count=%s "
+        "safe_limit=%s fixed_parameter_count=%s fallback_reason=%s",
+        bool(scope_meta.get("applied")),
+        int(scope_meta.get("product_code_count") or 0),
+        int(scope_meta.get("safe_limit") or 0),
+        int(scope_meta.get("fixed_parameter_count") or 0),
+        clean_text(scope_meta.get("fallback_reason")),
+    )
+    last_sql, last_params = _build_last_cost_sql(
+        sql_params,
+        cfg,
+        product_scope=product_scope,
+    )
     last_df = _fetch("last_cost", last_sql, last_params)
 
     return all_df, last_df
@@ -1475,6 +1586,18 @@ def _calc_current_insu_unit(df: pd.DataFrame, asof_yyyymmdd: str) -> pd.Series:
     base_price.loc[use_before] = before_price.loc[use_before]
 
     return (base_price * acc_unit).round(4)
+
+
+def _single_descriptor_pair(values: pd.Series) -> tuple[str, str]:
+    """Return one exact descriptor pair, or blanks when a group has many."""
+    pairs = {
+        (clean_text(code), clean_text(name))
+        for code, name in values.tolist()
+        if clean_text(code) or clean_text(name)
+    }
+    if len(pairs) != 1:
+        return "", ""
+    return next(iter(pairs))
 
 
 def _prepare_grouped_df(
@@ -1536,9 +1659,14 @@ def _prepare_grouped_df(
     ]
 
     agg_map = {c: "sum" for c in num_cols}
+    work["_buy_descriptor_pair"] = list(zip(work["buy_cd"], work["buy_nm"]))
+    buy_descriptors = (
+        work.groupby(group_key, dropna=False, as_index=False)["_buy_descriptor_pair"]
+        .agg(_single_descriptor_pair)
+        .copy()
+    )
+
     agg_map.update({
-        "buy_cd": "first",
-        "buy_nm": "first",
         "order_cd": "first",
         "order_nm": "first",
         "maker_cd": "first",
@@ -1554,6 +1682,11 @@ def _prepare_grouped_df(
         work.groupby(group_key, dropna=False, as_index=False)
         .agg(agg_map)
         .copy()
+    )
+    grp = grp.merge(buy_descriptors, on=group_key, how="left", validate="one_to_one")
+    grp[["buy_cd", "buy_nm"]] = pd.DataFrame(
+        grp.pop("_buy_descriptor_pair").tolist(),
+        index=grp.index,
     )
     perf["group_aggregate_ms"] = round((time.perf_counter() - aggregate_started) * 1000, 1)
     perf["master_merge_ms"] = 0.0
@@ -2157,6 +2290,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 "sql": query_perf,
                 "group": group_perf,
                 "display": display_perf,
+                "last_cost_scope": dict(work_params.get("_product_inventory_last_cost_scope") or {}),
                 "service_total_ms": service_total_ms,
             }
             meta["product_inventory_perf"] = perf_meta
