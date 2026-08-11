@@ -129,7 +129,7 @@ def handle_sales_detail_followup(
         name = s.fillna("").astype(str).str.strip()
         bad = (
             name.eq("")
-            | name.str.contains(r"^(합계|총계|소계|합계금액|전체|TOTAL)$", case=False, regex=True, na=False)
+            | name.str.contains(r"^(?:합계|총계|소계|합계금액|전체|TOTAL)$", case=False, regex=True, na=False)
             | name.str.contains(r"합계\s*금액", case=False, regex=True, na=False)
         )
         return ~bad
@@ -196,9 +196,15 @@ def handle_sales_detail_followup(
 
     # 1) 제품별 매출 TOP N
     # 주의: "제품별 출고수량 TOP 20"은 매출 TOP이 아니라 수량 TOP이므로 제외한다.
+    def _is_product_rank_request(metric_terms: tuple[str, ...]) -> bool:
+        return (
+            any(word in compact for word in ("제품", "품목"))
+            and any(metric in compact for metric in metric_terms)
+            and any(marker in compact for marker in ("TOP", "top", "상위", "1위", "최고", "가장많은", "가장큰"))
+        )
+
     wants_product_sales_top = (
-        ("제품별" in t or "품목별" in t)
-        and any(w in t for w in ("매출", "매출금액", "금액", "거래금액"))
+        _is_product_rank_request(("매출", "매출금액", "매출액", "금액", "거래금액"))
         and not any(w in t for w in ("수량", "출고수량", "판매수량"))
     )
 
@@ -240,8 +246,17 @@ def handle_sales_detail_followup(
             .sort_values("매출금액", ascending=False)
         )
 
-        out.insert(0, "순번", range(1, len(out) + 1))
-        out2 = out.head(top_n).copy()
+        has_explicit_top = bool(re.search(r"(?:TOP|top|상위)\s*(\d{1,4})", t))
+        out2 = out.head(top_n if has_explicit_top else 1).copy()
+        out2.insert(0, "순번", range(1, len(out2) + 1))
+        if has_explicit_top:
+            title = f"현재표 제품별 매출금액 TOP {top_n}"
+            query_summary = f"현재표 / 제품별 매출금액 TOP {top_n} / 전체 {len(df):,}건 기준"
+            display_limit = top_n
+        else:
+            title = "현재표 매출금액 1위 제품"
+            query_summary = f"현재표 / 매출금액이 가장 많은 제품 / 전체 {len(df):,}건 기준"
+            display_limit = 1
 
         log.info(
             "[chat.followup_table] sales detail product sales top built source_rows=%s rows=%s amount_label=%s table_key=%s",
@@ -252,14 +267,14 @@ def handle_sales_detail_followup(
         )
 
         return push_table(
-            title=f"현재표 제품별 매출 TOP {top_n}",
-            action=f"현재표 제품별 매출 TOP {top_n}",
+            title=title,
+            action=title,
             df=out2,
-            query_summary=f"현재표 / 제품별 매출 TOP {top_n} / 전체 {len(df):,}건 기준",
+            query_summary=query_summary,
             source_query=t,
             source_table_key=table_key,
             source_rows=len(df),
-            display_limit=top_n,
+            display_limit=display_limit,
         )
 
     # 2) 거래처/매출처/출고처별 매출금액 분석
@@ -534,40 +549,29 @@ def handle_sales_detail_followup(
             .sort_values("매출금액", ascending=False)
         )
 
-        # "일자와 요일" 질문은 최고 일자 1건 + 최고 요일 1건을 한 표로 반환한다.
-        if "요일" in t and any(w in t for w in ("최고", "가장", "많은")):
+        asks_best_date_with_weekday = (
+            "일자" in t
+            and "요일" in t
+            and any(w in t for w in ("최고", "가장", "많은"))
+        )
+        asks_best_weekday_only = (
+            "요일" in t
+            and "일자" not in t
+            and any(w in t for w in ("최고", "가장", "많은"))
+        )
+        if asks_best_date_with_weekday:
             top_day = daily.head(1).copy()
-            top_week = weekday.head(1).copy()
-
-            out = pd.DataFrame(
-                [
-                    {
-                        "구분": "매출 최고 일자",
-                        "값": str(top_day.iloc[0]["일자"]),
-                        "요일": str(top_day.iloc[0]["요일"]),
-                        "건수": top_day.iloc[0]["건수"],
-                        "수량": top_day.iloc[0]["수량"],
-                        "공급가액": top_day.iloc[0]["공급가액"],
-                        "세액": top_day.iloc[0]["세액"],
-                        "매출금액": top_day.iloc[0]["매출금액"],
-                    },
-                    {
-                        "구분": "매출 최고 요일",
-                        "값": str(top_week.iloc[0]["요일"]),
-                        "요일": str(top_week.iloc[0]["요일"]),
-                        "건수": top_week.iloc[0]["건수"],
-                        "수량": top_week.iloc[0]["수량"],
-                        "공급가액": top_week.iloc[0]["공급가액"],
-                        "세액": top_week.iloc[0]["세액"],
-                        "매출금액": top_week.iloc[0]["매출금액"],
-                    },
-                ]
-            )
+            out = top_day.reset_index(drop=True)
             out.insert(0, "순번", range(1, len(out) + 1))
-
-            title = "현재표 매출 최고 일자/요일"
-            query_summary = f"현재표 / 매출 최고 일자와 요일 / 전체 {len(df):,}건 기준"
-            display_limit = None
+            title = "현재표 매출금액 최고 일자와 요일"
+            query_summary = f"현재표 / 매출금액 최고 일자 1건과 해당 요일 / 전체 {len(df):,}건 기준"
+            display_limit = 1
+        elif asks_best_weekday_only:
+            out = weekday.head(1).reset_index(drop=True)
+            out.insert(0, "순번", range(1, len(out) + 1))
+            title = "현재표 매출금액 최고 요일"
+            query_summary = f"현재표 / 요일별 매출금액 최고 1건 / 전체 {len(df):,}건 기준"
+            display_limit = 1
         else:
             out = daily.reset_index(drop=True)
             out.insert(0, "순번", range(1, len(out) + 1))

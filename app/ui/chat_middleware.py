@@ -7098,8 +7098,9 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         )
         return
 
-    # 현재표 후속표는 부모 table_key를 provenance로 보존한다. 다만 다음
-    # "현재표" 질문의 기준은 아래 stash 단계에서 파생표 자체로 승격된다.
+    # 현재표 후속표는 부모 table_key를 provenance로 보존한다.
+    # 후속 결과 자체는 현재표로 승격하지 않고, 다음 성공 신규조회 전까지
+    # 가장 최근 성공 신규조회의 full source를 계속 사용한다.
     if bool(meta.get("current_table_followup")):
         source_table_key = str(
             meta.get("source_table_key")
@@ -7204,33 +7205,15 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 list(payload.keys()),
             )
 
-            # 0건/text 결과가 새로 들어온 경우,
-            # 직전 표/current source/LLM 분석 컨텍스트를 모두 비운다.
-            # 목적:
-            # - "현재표 ..." 질문이 이전 표를 잡지 않게 함
-            # - LLM fallback이 이전 SIMS_ANALYSIS_CONTEXT로 답하지 않게 함
+            # 신규 조회의 0건/error 결과는 직전 성공 신규조회의 현재표를
+            # 교체하지 않는다. 결과 메시지만 기록하고 기존 full source와
+            # 분석 컨텍스트는 다음 성공 신규조회까지 보존한다.
             try:
                 if not bool(meta.get("current_table_followup")):
-                    ss.pop("__sims_last_table_key", None)
-                    ss.pop("__sims_current_table_source_key", None)
-                    ss.pop("__sims_current_table_source_action", None)
-                    ss.pop("__sims_current_table_source_analysis_ctx", None)
-
-                    for k in (
-                        KEY_SIMS_CTX,
-                        "__sims_ctx",
-                        "__sims_ctx_hash",
-                        "__sims_context",
-                        "__sims_context_text",
-                        "__sims_context_obj",
-                        "__sims_analysis_ctx",
-                        "__sims_analysis_ctx_by_table_key",
-                        "__sims_latest_analysis_key",
-                    ):
-                        ss.pop(k, None)
-
-                    ss["__sims_ctx_dirty"] = True
                     ss["__sims_last_table_action"] = str(action_name or "")
+                    preserved_source_key = str(
+                        ss.get("__sims_current_table_source_key") or ""
+                    ).strip()
 
                     params = payload.get("params") or {}
                     meta = payload.get("meta") or {}
@@ -7295,13 +7278,15 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     meta["row_count"] = 0
                     meta["row_count_total"] = 0
                     meta["tableless_result"] = True
-                    meta["current_table_cleared"] = True
+                    meta["current_table_cleared"] = False
+                    meta["current_table_preserved"] = bool(preserved_source_key)
                     payload["meta"] = meta
                     
                     log.info(
-                        "[chat.tableless] cleared stale SIMS table/context %s action=%s",
+                        "[chat.tableless] preserved current SIMS source %s action=%s source_key=%s",
                         _chat_runtime_log_kv(),
                         action_name,
+                        preserved_source_key,
                     )
 
             except Exception as exc:
@@ -7351,10 +7336,9 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 meta = dict(payload.get("meta") or {})
                 table_key = meta.get("table_key") or f"sims_{uuid.uuid4().hex[:8]}"
 
-                # 현재표 후속표 기준 DF/source key 관리
-                # - 일반 SIMS/IO 표: 이 표가 새로운 원본 기준표가 된다.
-                # - 현재표 후속 파생표: 파생표 자체가 다음 현재표 후속분석의 최신 기준표가 된다.
-                #   부모 key는 provenance로만 보존한다.
+                # 현재표 기준 DF/source key 관리
+                # - 일반 SIMS/IO 표: 성공한 새 표가 새로운 원본 기준표가 된다.
+                # - 현재표 후속 파생표: 부모 원본 key만 provenance로 보존한다.
                 if bool(meta.get("current_table_followup")):
                     source_table_key = str(
                         meta.get("source_table_key")
@@ -7476,13 +7460,15 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                             meta["display_row_count"] = int(display_rows_for_followup)
                             meta["row_count_total_for_followup"] = int(len(full_df_for_followup))
 
-                            # 후속질문 기준 source는 전체 DF가 묶인 원본 table_key 유지
-                            previous_source_key = str(ss.get("__sims_current_table_source_key") or "").strip()
-                            if previous_source_key and previous_source_key != str(table_key):
-                                ss["__sims_previous_current_table_source_key_for_prune"] = previous_source_key
-                                ss["__sims_previous_current_table_source_target_key_for_prune"] = str(table_key)
-                            ss["__sims_current_table_source_key"] = str(table_key)
-                            ss["__sims_current_table_source_action"] = action_for_export
+                            # lazy full source 보정은 신규 조회에만 현재표를 교체한다.
+                            # 후속 결과는 자체 export DF를 보존하되 원본 포인터는 유지한다.
+                            if not bool(meta.get("current_table_followup")):
+                                previous_source_key = str(ss.get("__sims_current_table_source_key") or "").strip()
+                                if previous_source_key and previous_source_key != str(table_key):
+                                    ss["__sims_previous_current_table_source_key_for_prune"] = previous_source_key
+                                    ss["__sims_previous_current_table_source_target_key_for_prune"] = str(table_key)
+                                ss["__sims_current_table_source_key"] = str(table_key)
+                                ss["__sims_current_table_source_action"] = action_for_export
 
                             log.info(
                                 "[chat.stash.followup] %s action=%s table_key=%s display_rows=%s full_rows=%s expected_rows=%s",
@@ -7497,13 +7483,6 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                 except Exception as exc:
                     log.warning("[chat.stash.export] followup full dataframe failed error_type=%s", type(exc).__name__)
 
-
-                if bool(meta.get("current_table_followup")):
-                    # 파생표의 own full source가 이미 table_key에 검증되어 저장됐다.
-                    # 다음 '현재표'는 부모가 아니라 가장 최근 파생표를 기준으로 삼는다.
-                    if isinstance(ss.get("__sims_export_tables_by_key", {}).get(table_key), pd.DataFrame):
-                        ss["__sims_current_table_source_key"] = str(table_key)
-                        ss["__sims_current_table_source_action"] = str(action_name or "")
 
                 ss["__sims_last_table_key"] = table_key
                 ss["__sims_last_table_action"] = action_name

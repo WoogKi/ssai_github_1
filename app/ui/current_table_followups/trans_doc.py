@@ -324,6 +324,11 @@ def handle_trans_doc_followup(
             )
         )
 
+    def _has_explicit_transaction_side() -> bool:
+        has_purchase = any(w in compact for w in ("매입", "입고"))
+        has_sales = any(w in compact for w in ("매출", "출고"))
+        return has_purchase != has_sales
+
     # 0) 제품별 거래금액은 거래명세서 공통표에서는 기본 불가 안내
     if "제품별" in t or "품목별" in t or "상품별" in t:
         return push_notice(
@@ -544,7 +549,11 @@ def handle_trans_doc_followup(
                 extra_meta={"execution_status": "no_data", "result_status": "no_data"},
             )
 
-        split_rows = bool(trans_type_col and not _wants_total_time_amount())
+        split_rows = bool(
+            trans_type_col
+            and not _wants_total_time_amount()
+            and not _has_explicit_transaction_side()
+        )
 
         if split_rows:
             work["거래명세서구분"] = work["_type"].astype(str).str.strip().replace("", "(구분없음)")
@@ -683,7 +692,11 @@ def handle_trans_doc_followup(
         if work.empty:
             return False
 
-        split_rows = bool(trans_type_col and not _wants_total_time_amount())
+        split_rows = bool(
+            trans_type_col
+            and not _wants_total_time_amount()
+            and not _has_explicit_transaction_side()
+        )
 
         if split_rows:
             work["거래명세서구분"] = work["_type"].astype(str).str.strip().replace("", "(구분없음)")
@@ -782,20 +795,23 @@ def handle_trans_doc_followup(
         if split_rows:
             work["거래명세서구분"] = work["_type"].astype(str).str.strip().replace("", "(구분없음)")
 
+        metric_output_col = amount_title_word
+
         def _agg_by(keys: list[str]) -> pd.DataFrame:
+            aggregations: dict[str, tuple[str, str]] = {
+                "건수": ("_amount", "size"),
+                "공급가액": ("_supply", "sum"),
+                "세액": ("_tax", "sum"),
+                metric_output_col: ("_amount", "sum"),
+                "할인금액": ("_dc", "sum"),
+                "상세합_공급가액": ("_detail_supply", "sum"),
+                "상세합_세액": ("_detail_tax", "sum"),
+                "공급가액차이": ("_supply_diff", "sum"),
+                "세액차이": ("_tax_diff", "sum"),
+            }
             return (
                 work.groupby(keys, dropna=False)
-                .agg(
-                    건수=("_amount", "size"),
-                    공급가액=("_supply", "sum"),
-                    세액=("_tax", "sum"),
-                    거래금액=("_amount", "sum"),
-                    할인금액=("_dc", "sum"),
-                    상세합_공급가액=("_detail_supply", "sum"),
-                    상세합_세액=("_detail_tax", "sum"),
-                    공급가액차이=("_supply_diff", "sum"),
-                    세액차이=("_tax_diff", "sum"),
-                )
+                .agg(**aggregations)
                 .reset_index()
             )
 
@@ -804,17 +820,17 @@ def handle_trans_doc_followup(
             if split_rows:
                 group_keys.append("거래명세서구분")
 
-            out = _agg_by(group_keys).sort_values("거래금액", ascending=False).reset_index(drop=True)
+            out = _agg_by(group_keys).sort_values(metric_output_col, ascending=False).reset_index(drop=True)
             out.insert(0, "순번", range(1, len(out) + 1))
 
             if explicit_top:
                 out = out.head(top_n).copy()
-                title = f"현재표 요일별 거래금액 TOP {top_n}"
-                query_summary = f"현재표 / 요일별 거래금액 TOP {top_n} / {split_label} / 전체 {len(df):,}건 기준"
+                title = f"현재표 요일별 {metric_output_col} TOP {top_n}"
+                query_summary = f"현재표 / 요일별 {metric_output_col} TOP {top_n} / {split_label} / 전체 {len(df):,}건 기준"
                 display_limit = top_n
             else:
-                title = "현재표 요일별 거래금액" if split_rows else "현재표 요일별 거래금액 통합"
-                query_summary = f"현재표 / 요일별 거래금액 / {split_label} / 전체 {len(df):,}건 기준"
+                title = f"현재표 요일별 {metric_output_col}" if split_rows else f"현재표 요일별 {metric_output_col} 통합"
+                query_summary = f"현재표 / 요일별 {metric_output_col} / {split_label} / 전체 {len(df):,}건 기준"
                 display_limit = None
 
         else:
@@ -822,12 +838,12 @@ def handle_trans_doc_followup(
             if split_rows:
                 group_keys.append("거래명세서구분")
 
-            daily = _agg_by(group_keys).sort_values("거래금액", ascending=False).reset_index(drop=True)
+            daily = _agg_by(group_keys).sort_values(metric_output_col, ascending=False).reset_index(drop=True)
 
             weekday_keys = ["요일"]
             if split_rows:
                 weekday_keys.append("거래명세서구분")
-            weekday = _agg_by(weekday_keys).sort_values("거래금액", ascending=False).reset_index(drop=True)
+            weekday = _agg_by(weekday_keys).sort_values(metric_output_col, ascending=False).reset_index(drop=True)
 
             if asks_best_day_week:
                 top_day = daily.head(1).copy()
@@ -838,7 +854,7 @@ def handle_trans_doc_followup(
                     "건수": top_day.iloc[0]["건수"],
                     "공급가액": top_day.iloc[0]["공급가액"],
                     "세액": top_day.iloc[0]["세액"],
-                    "거래금액": top_day.iloc[0]["거래금액"],
+                    metric_output_col: top_day.iloc[0][metric_output_col],
                     "할인금액": top_day.iloc[0]["할인금액"],
                     "상세합_공급가액": top_day.iloc[0]["상세합_공급가액"],
                     "상세합_세액": top_day.iloc[0]["상세합_세액"],
@@ -862,7 +878,7 @@ def handle_trans_doc_followup(
                     "건수": top_week.iloc[0]["건수"],
                     "공급가액": top_week.iloc[0]["공급가액"],
                     "세액": top_week.iloc[0]["세액"],
-                    "거래금액": top_week.iloc[0]["거래금액"],
+                    metric_output_col: top_week.iloc[0][metric_output_col],
                     "할인금액": top_week.iloc[0]["할인금액"],
                     "상세합_공급가액": top_week.iloc[0]["상세합_공급가액"],
                     "상세합_세액": top_week.iloc[0]["상세합_세액"],
@@ -885,12 +901,12 @@ def handle_trans_doc_followup(
                 if explicit_top:
                     out = daily.head(top_n).copy()
                     out.insert(0, "순번", range(1, len(out) + 1))
-                    title = f"현재표 일자별 거래금액 TOP {top_n}"
-                    query_summary = f"현재표 / 일자별 거래금액 TOP {top_n} / {split_label} / 전체 {len(df):,}건 기준"
+                    title = f"현재표 일자별 {metric_output_col} TOP {top_n}"
+                    query_summary = f"현재표 / 일자별 {metric_output_col} TOP {top_n} / {split_label} / 전체 {len(df):,}건 기준"
                     display_limit = top_n
                 else:
-                    title = "현재표 일자별 거래금액" if split_rows else "현재표 일자별 거래금액 통합"
-                    query_summary = f"현재표 / 일자별 거래금액 / {split_label} / 전체 {len(df):,}건 기준"
+                    title = f"현재표 일자별 {metric_output_col}" if split_rows else f"현재표 일자별 {metric_output_col} 통합"
+                    query_summary = f"현재표 / 일자별 {metric_output_col} / {split_label} / 전체 {len(df):,}건 기준"
                     display_limit = None
 
                     

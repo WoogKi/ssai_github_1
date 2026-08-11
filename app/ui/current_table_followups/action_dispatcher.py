@@ -333,6 +333,7 @@ def detect_current_table_kind(source_action: str) -> str:
 
 _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("month", "월", ("월별", "월기준"), ("월", "기준월")),
+    ("day", "일자", ("일자별", "날짜별", "일별"), ("일자", "날짜")),
     ("product", "제품", ("제품별", "품목별"), ("제품명", "품목명", "상품명", "제품코드", "품목코드", "상품코드")),
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
     ("purchase_vendor", "매입처", ("매입처별", "매입처명별"), ("매입처명", "매입처", "매입처코드")),
@@ -402,19 +403,19 @@ _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
     "supply_amount": frozenset(
-        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "purchase_amount": frozenset(
-        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "transaction_amount": frozenset(
-        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "sales_quantity": frozenset(
-        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "inbound_quantity": frozenset(
-        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "stock_quantity": frozenset(
         {
@@ -443,6 +444,7 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
     "sales": frozenset(
         {
             "month",
+            "day",
             "product",
             "manufacturer",
             "product_group",
@@ -481,9 +483,18 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
 # Canonical follow-up fields can be derived from native source columns even
 # when the canonical result label does not yet exist in the current table.
 _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
-    "purchase_detail": {"month": ("입고일자", "매입일자", "일자")},
-    "sales_detail": {"month": ("출고일자", "매출일자", "일자")},
-    "trans_doc": {"month": ("거래명세서일자", "거래일자", "일자")},
+    "purchase_detail": {
+        "month": ("입고일자", "매입일자", "일자"),
+        "day": ("입고일자", "매입일자", "일자"),
+    },
+    "sales_detail": {
+        "month": ("출고일자", "매출일자", "일자"),
+        "day": ("출고일자", "매출일자", "일자"),
+    },
+    "trans_doc": {
+        "month": ("거래명세서일자", "거래일자", "일자"),
+        "day": ("거래명세서일자", "거래일자", "일자"),
+    },
 }
 
 _CURRENT_TABLE_SOURCE_METRIC_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
@@ -499,6 +510,7 @@ _CURRENT_TABLE_SOURCE_METRIC_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "trans_doc": {
         "transaction_amount": ("합계금액", "총금액", "거래금액", "공급가액", "세액"),
+        "purchase_amount": ("합계금액", "총금액", "거래금액", "공급가액", "세액"),
         "supply_amount": ("공급가액",),
     },
 }
@@ -642,7 +654,10 @@ def _is_product_top_request(query: str) -> bool:
     compact = re.sub(r"\s+", "", str(query or ""))
     return (
         any(word in compact for word in ("제품", "품목"))
-        and any(marker in compact for marker in ("TOP", "top", "상위"))
+        and any(
+            marker in compact
+            for marker in ("TOP", "top", "상위", "1위", "최고", "가장많은", "가장큰")
+        )
     )
 
 
@@ -687,7 +702,7 @@ def _current_table_requested_grouping(query: str, metric: str, source_action: st
         return "product"
     if metric == "shortage" and any(word in compact for word in ("TOP", "top", "상위")):
         return "product"
-    if metric == "sales" and _is_sales_trend_current_table(source_action) and _is_product_top_request(query):
+    if metric == "sales" and _is_product_top_request(query):
         return "product"
     return ""
 
@@ -1220,7 +1235,7 @@ def handle_current_table_followup_by_action(
 
     source_contract_priority = capability["status"] == "success" and ((
         kind in _CURRENT_TABLE_SOURCE_GROUPING_ALIASES
-        and capability["requested_grouping"] == "month"
+        and capability["requested_grouping"] in {"month", "day"}
     ) or (
         bool(_requested_source_semantic_filter(kind, query))
     ))

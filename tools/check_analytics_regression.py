@@ -6288,6 +6288,54 @@ def run_basic_checks() -> list[CheckResult]:
                 derived_current_df = (st.session_state.get("__sims_export_tables_by_key") or {}).get("sims_group_prodpath")
 
                 chat_mod.push_sims_result_to_chat(
+                    {
+                        "type": "text",
+                        "title": "신규 조회 결과 없음",
+                        "action": "거래처 목록",
+                        "message": "해당 조회조건의 자료가 없습니다.",
+                        "meta": {
+                            "execution_status": "no_data",
+                            "result_status": "no_data",
+                        },
+                    },
+                    "거래처 목록",
+                )
+                source_after_no_data = st.session_state.get("__sims_current_table_source_key")
+
+                chat_mod.push_sims_result_to_chat(
+                    {
+                        "type": "text",
+                        "title": "신규 조회 오류",
+                        "action": "거래처 목록",
+                        "message": "조회 중 오류가 발생했습니다.",
+                        "meta": {
+                            "execution_status": "error",
+                            "result_status": "error",
+                        },
+                    },
+                    "거래처 목록",
+                )
+                source_after_error = st.session_state.get("__sims_current_table_source_key")
+
+                source_item_before_b = _find_item(
+                    list(room.get("history") or []), "sims_product_a_prodpath"
+                )
+                source_meta_before_b = (
+                    source_item_before_b.get("meta")
+                    if isinstance(source_item_before_b, dict)
+                    and isinstance(source_item_before_b.get("meta"), dict)
+                    else {}
+                )
+                st.session_state["__sims_table_render_path"] = "history"
+                st.session_state["__ui_rerun_reason_current"] = "current_table_followup"
+                source_expanded_before_b = bool(
+                    isinstance(source_item_before_b, dict)
+                    and chat_mod._should_full_render_sims_table(
+                        source_item_before_b, source_meta_before_b, "prodpath-source"
+                    )
+                )
+
+                chat_mod.push_sims_result_to_chat(
                     _payload("sims_vendor_b_prodpath", "거래처 목록", vendor_df),
                     "거래처 목록",
                 )
@@ -6302,10 +6350,16 @@ def run_basic_checks() -> list[CheckResult]:
                 product_item = _find_item(room_history, "sims_product_a_prodpath")
 
                 mismatches = []
-                if top_source != "sims_product_a_prodpath" or group_source != "sims_top_prodpath":
-                    mismatches.append(f"production followup source meta chain mismatch top={top_source} group={group_source}")
-                if derived_current_key != "sims_group_prodpath":
-                    mismatches.append(f"latest derived table was not promoted as current source={derived_current_key}")
+                if top_source != "sims_product_a_prodpath" or group_source != "sims_product_a_prodpath":
+                    mismatches.append(f"production followup source meta mismatch top={top_source} group={group_source}")
+                if derived_current_key != "sims_product_a_prodpath":
+                    mismatches.append(f"followup changed current source={derived_current_key}")
+                if source_after_no_data != "sims_product_a_prodpath":
+                    mismatches.append(f"no_data changed current source={source_after_no_data}")
+                if source_after_error != "sims_product_a_prodpath":
+                    mismatches.append(f"error changed current source={source_after_error}")
+                if not source_expanded_before_b:
+                    mismatches.append("current source A was not expanded before successful B")
                 if not isinstance(derived_current_df, pd.DataFrame) or len(derived_current_df) != len(group_df):
                     mismatches.append("latest derived table did not retain its own full source")
                 if "sims_product_a_prodpath" not in room_keys:
@@ -6343,7 +6397,7 @@ def run_basic_checks() -> list[CheckResult]:
                 if mismatches:
                     results.append(_fail("old SIMS table production push prune boundary", "; ".join(mismatches)))
                 else:
-                    results.append(_ok("old SIMS table production push prune boundary", "production push fills followup source meta, preserves previous source before force, and force/collapse keeps latest current source"))
+                    results.append(_ok("old SIMS table production push prune boundary", "followups/no_data preserve source A and its expanded state; successful B alone replaces current source"))
             finally:
                 if force_key:
                     st.session_state.pop(force_key, None)
@@ -16140,7 +16194,12 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
         )
         errors: list[str] = []
 
-        def dispatch(source_action: str, query: str, df: pd.DataFrame) -> tuple[bool, list[tuple[str, dict[str, Any]]]]:
+        def dispatch(
+            source_action: str,
+            query: str,
+            df: pd.DataFrame,
+            top_n: int = 20,
+        ) -> tuple[bool, list[tuple[str, dict[str, Any]]]]:
             pushed: list[tuple[str, dict[str, Any]]] = []
 
             def push_table(**kwargs: Any) -> bool:
@@ -16154,7 +16213,7 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
             handled = dispatcher.handle_current_table_followup_by_action(
                 df=df.copy(deep=True),
                 query=query,
-                top_n=20,
+                top_n=top_n,
                 table_key="fixture-source-contract",
                 source_action=source_action,
                 helpers={
@@ -16204,6 +16263,98 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
                 or meta.get("requested_metric") != "supply_amount"
             ):
                 errors.append(f"{source_action} 월별 공급가액: pushed={pushed!r}")
+
+        sales_rank_df = pd.DataFrame(
+            [
+                {"출고일자": "20260801", "제품코드": "P1", "제품명": "제품A", "수량": 1, "공급가액": 100, "세액": 0},
+                {"출고일자": "20260808", "제품코드": "P1", "제품명": "제품A", "수량": 1, "공급가액": 90, "세액": 0},
+                {"출고일자": "20260802", "제품코드": "P2", "제품명": "제품B", "수량": 10, "공급가액": 150, "세액": 0},
+            ]
+        )
+        handled, pushed = dispatch(
+            "출고명세 조회",
+            "현재표 매출금액이 가장 많은 일자와 요일",
+            sales_rank_df,
+        )
+        date_week_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        if (
+            not isinstance(date_week_df, pd.DataFrame)
+            or len(date_week_df) != 1
+            or str(date_week_df.iloc[0].get("일자")) != "20260802"
+            or str(date_week_df.iloc[0].get("요일")) != "일요일"
+            or float(date_week_df.iloc[0].get("매출금액") or 0) != 150
+        ):
+            errors.append(f"sales best date with weekday: pushed={pushed!r}")
+
+        handled, pushed = dispatch(
+            "출고명세 조회",
+            "현재표 매출금액이 가장 많은 요일",
+            sales_rank_df,
+        )
+        weekday_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        if (
+            not isinstance(weekday_df, pd.DataFrame)
+            or len(weekday_df) != 1
+            or str(weekday_df.iloc[0].get("요일")) != "토요일"
+            or float(weekday_df.iloc[0].get("매출금액") or 0) != 190
+        ):
+            errors.append(f"sales best weekday: pushed={pushed!r}")
+
+        handled, pushed = dispatch(
+            "출고명세 조회",
+            "현재표 매출금액이 가장 많은 제품",
+            sales_rank_df,
+        )
+        product_amount_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        product_amount_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if (
+            not isinstance(product_amount_df, pd.DataFrame)
+            or len(product_amount_df) != 1
+            or str(product_amount_df.iloc[0].get("제품명")) != "제품A"
+            or float(product_amount_df.iloc[0].get("매출금액") or 0) != 190
+            or product_amount_meta.get("requested_grouping") != "product"
+            or product_amount_meta.get("requested_metric") != "sales"
+        ):
+            errors.append(f"sales product amount rank: pushed={pushed!r}")
+
+        handled, pushed = dispatch(
+            "출고명세 조회",
+            "현재표 매출수량이 가장 많은 제품",
+            sales_rank_df,
+        )
+        product_qty_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        if (
+            not isinstance(product_qty_df, pd.DataFrame)
+            or len(product_qty_df) != 1
+            or str(product_qty_df.iloc[0].get("제품명")) != "제품B"
+            or float(product_qty_df.iloc[0].get("출고수량") or 0) != 10
+        ):
+            errors.append(f"sales product quantity rank regression: pushed={pushed!r}")
+
+        trans_purchase_df = pd.DataFrame(
+            [
+                {"거래명세서일자": "20260801", "거래명세서구분": "1", "거래처명": "V1", "공급가액": 90, "세액": 10, "합계금액": 100},
+                {"거래명세서일자": "20260802", "거래명세서구분": "1", "거래처명": "V2", "공급가액": 180, "세액": 20, "합계금액": 200},
+                {"거래명세서일자": "20260801", "거래명세서구분": "3", "거래처명": "V3", "공급가액": 900, "세액": 99, "합계금액": 999},
+            ]
+        )
+        handled, pushed = dispatch(
+            "거래명세서 공통 조회",
+            "현재표 일별 매입금액 TOP 10",
+            trans_purchase_df,
+            top_n=10,
+        )
+        purchase_top_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        purchase_top_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if (
+            not isinstance(purchase_top_df, pd.DataFrame)
+            or purchase_top_df["일자"].tolist() != ["2026-08-02", "2026-08-01"]
+            or pd.to_numeric(purchase_top_df["매입금액"], errors="coerce").tolist() != [200, 100]
+            or "거래명세서구분" in purchase_top_df.columns
+            or purchase_top_meta.get("requested_grouping") != "day"
+            or purchase_top_meta.get("requested_metric") != "purchase_amount"
+        ):
+            errors.append(f"trans-doc daily purchase amount rank: pushed={pushed!r}")
 
         match_df = pd.DataFrame(
             [
