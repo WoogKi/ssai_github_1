@@ -16066,6 +16066,217 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
     return results
 
 
+def run_current_table_source_contract_checks() -> list[CheckResult]:
+    """Protect source-native columns used by deterministic current-table handlers."""
+    results: list[CheckResult] = []
+    try:
+        dispatcher = importlib.import_module("app.ui.current_table_followups.action_dispatcher")
+
+        def find_col(
+            df: pd.DataFrame,
+            *,
+            exact: tuple[str, ...] = (),
+            include_any: tuple[str, ...] = (),
+            exclude_any: tuple[str, ...] = (),
+        ) -> str | None:
+            columns = [str(column) for column in df.columns]
+            for candidate in exact:
+                if candidate in columns:
+                    return candidate
+            for column in columns:
+                if include_any and not any(token in column for token in include_any):
+                    continue
+                if any(token in column for token in exclude_any):
+                    continue
+                return column
+            return None
+
+        def to_num(series: pd.Series) -> pd.Series:
+            return pd.to_numeric(series, errors="coerce").fillna(0)
+
+        source_cases = (
+            (
+                "입고명세 조회",
+                "현재표 월별 매입금액 요약",
+                pd.DataFrame(
+                    [
+                        {"입고일자": "20260731", "제품명": "P1", "거래처명": "V1", "수량": 1, "공급가액": 30, "세액": 3},
+                        {"입고일자": "20260801", "제품명": "P1", "거래처명": "V1", "수량": 2, "공급가액": 100, "세액": 10},
+                        {"입고일자": "20260802", "제품명": "P2", "거래처명": "V2", "수량": 3, "공급가액": 50, "세액": 5},
+                    ]
+                ),
+                "purchase_amount",
+                "입고금액",
+                [("202607", 33), ("202608", 165)],
+            ),
+            (
+                "출고명세 조회",
+                "현재표 월별 매출금액 요약",
+                pd.DataFrame(
+                    [
+                        {"출고일자": "20260731", "제품명": "P1", "거래처명": "V1", "수량": 1, "공급가액": 40, "세액": 4},
+                        {"출고일자": "20260801", "제품명": "P1", "거래처명": "V1", "수량": 2, "공급가액": 200, "세액": 20},
+                        {"출고일자": "20260802", "제품명": "P2", "거래처명": "V2", "수량": 3, "공급가액": 50, "세액": 5},
+                    ]
+                ),
+                "sales",
+                "매출금액",
+                [("202607", 44), ("202608", 275)],
+            ),
+            (
+                "거래명세서 공통 조회",
+                "현재표 월별 거래금액 요약",
+                pd.DataFrame(
+                    [
+                        {"거래명세서일자": "20260731", "거래처명": "V1", "공급가액": 30, "세액": 3, "합계금액": 33, "상세합계일치": "Y"},
+                        {"거래명세서일자": "20260801", "거래처명": "V1", "공급가액": 100, "세액": 10, "합계금액": 110, "상세합계일치": "N"},
+                        {"거래명세서일자": "20260802", "거래처명": "V2", "공급가액": 50, "세액": 5, "합계금액": 55, "상세합계일치": "Y"},
+                    ]
+                ),
+                "transaction_amount",
+                "거래금액",
+                [("2026-07", 33), ("2026-08", 165)],
+            ),
+        )
+        errors: list[str] = []
+
+        def dispatch(source_action: str, query: str, df: pd.DataFrame) -> tuple[bool, list[tuple[str, dict[str, Any]]]]:
+            pushed: list[tuple[str, dict[str, Any]]] = []
+
+            def push_table(**kwargs: Any) -> bool:
+                pushed.append(("table", kwargs))
+                return True
+
+            def push_notice(**kwargs: Any) -> bool:
+                pushed.append(("notice", kwargs))
+                return True
+
+            handled = dispatcher.handle_current_table_followup_by_action(
+                df=df.copy(deep=True),
+                query=query,
+                top_n=20,
+                table_key="fixture-source-contract",
+                source_action=source_action,
+                helpers={
+                    "find_col": find_col,
+                    "to_num": to_num,
+                    "push_table": push_table,
+                    "push_notice": push_notice,
+                },
+                log=log,
+                source_meta={"result_status": "success"},
+            )
+            return handled, pushed
+
+        for source_action, query, source_df, metric, metric_col, expected in source_cases:
+            handled, pushed = dispatch(source_action, query, source_df)
+            payload = pushed[0][1] if handled and len(pushed) == 1 and pushed[0][0] == "table" else {}
+            result_df = payload.get("df")
+            meta = dict(payload.get("extra_meta") or {})
+            actual = (
+                list(zip(result_df["월"].astype(str), pd.to_numeric(result_df[metric_col], errors="coerce")))
+                if isinstance(result_df, pd.DataFrame) and {"월", metric_col}.issubset(result_df.columns)
+                else []
+            )
+            if (
+                actual != expected
+                or meta.get("requested_grouping") != "month"
+                or meta.get("requested_metric") != metric
+                or meta.get("result_status") != "success"
+            ):
+                errors.append(f"{query}: pushed={pushed!r} actual={actual!r}")
+
+        for source_action, date_col in (("입고명세 조회", "입고일자"), ("출고명세 조회", "출고일자")):
+            source_df = pd.DataFrame(
+                [
+                    {date_col: "20260801", "제품명": "P1", "거래처명": "V1", "수량": 2, "공급가액": 100, "세액": 10},
+                    {date_col: "20260802", "제품명": "P2", "거래처명": "V2", "수량": 3, "공급가액": 50, "세액": 5},
+                ]
+            )
+            handled, pushed = dispatch(source_action, "현재표 월별 공급가액 요약", source_df)
+            payload = pushed[0][1] if handled and len(pushed) == 1 and pushed[0][0] == "table" else {}
+            result_df = payload.get("df")
+            meta = dict(payload.get("extra_meta") or {})
+            if (
+                not isinstance(result_df, pd.DataFrame)
+                or result_df["공급가액"].sum() != 150
+                or meta.get("requested_grouping") != "month"
+                or meta.get("requested_metric") != "supply_amount"
+            ):
+                errors.append(f"{source_action} 월별 공급가액: pushed={pushed!r}")
+
+        match_df = pd.DataFrame(
+            [
+                {"거래명세서일자": "20260801", "거래처명": "V1", "공급가액": 10, "세액": 1, "합계금액": 11, "상세합계일치": "Y"},
+                {"거래명세서일자": "20260802", "거래처명": "V2", "공급가액": 20, "세액": 2, "합계금액": 22, "상세합계일치": "N"},
+                {"거래명세서일자": "20260803", "거래처명": "V3", "공급가액": 30, "세액": 3, "합계금액": 33, "상세합계일치": True},
+                {"거래명세서일자": "20260804", "거래처명": "V4", "공급가액": 40, "세액": 4, "합계금액": 44, "상세합계일치": False},
+            ]
+        )
+        handled, pushed = dispatch("거래명세서 공통 조회", "현재표 상세합계 불일치 목록", match_df)
+        mismatch_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        if not isinstance(mismatch_df, pd.DataFrame) or mismatch_df["거래처명"].tolist() != ["V2", "V4"]:
+            errors.append(f"semantic mismatch filter: pushed={pushed!r}")
+
+        handled, pushed = dispatch(
+            "거래명세서 공통 조회",
+            "현재표 상세합계 불일치 목록",
+            match_df.iloc[[0, 2]].copy(),
+        )
+        no_data_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if not handled or pushed[0][0] != "notice" or no_data_meta.get("result_status") != "no_data":
+            errors.append(f"semantic mismatch zero rows: pushed={pushed!r}")
+
+        missing_amount_df = pd.DataFrame(
+            [{"입고일자": "20260801", "제품명": "P1", "거래처명": "V1", "수량": 1}]
+        )
+        handled, pushed = dispatch(
+            "입고명세 조회",
+            "현재표 월별 매입금액 요약",
+            missing_amount_df,
+        )
+        missing_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if (
+            not handled
+            or pushed[0][0] != "notice"
+            or missing_meta.get("result_status") != "column_unavailable"
+        ):
+            errors.append(f"missing source metric status: pushed={pushed!r}")
+
+        invalid_month_df = pd.DataFrame(
+            [{"입고일자": "날짜없음", "제품명": "P1", "거래처명": "V1", "수량": 1, "공급가액": 10, "세액": 1}]
+        )
+        handled, pushed = dispatch(
+            "입고명세 조회",
+            "현재표 월별 매입금액 요약",
+            invalid_month_df,
+        )
+        invalid_month_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if (
+            not handled
+            or pushed[0][0] != "notice"
+            or invalid_month_meta.get("result_status") != "no_data"
+        ):
+            errors.append(f"invalid source month status: pushed={pushed!r}")
+
+        results.append(
+            _fail("current-table source contracts", "; ".join(errors))
+            if errors
+            else _ok(
+                "current-table source contracts",
+                "native date/amount columns derive month metrics and 상세합계일치 filters Y/N/bool deterministically",
+            )
+        )
+    except Exception as exc:
+        results.append(
+            _fail(
+                "current-table source contracts",
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}",
+            )
+        )
+    return results
+
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
@@ -16095,6 +16306,9 @@ def main() -> int:
 
     general_rule_results = run_general_current_table_rule_checks()
     failed += _print_results("GENERAL CURRENT-TABLE RULE CHECKS", general_rule_results)
+
+    source_contract_results = run_current_table_source_contract_checks()
+    failed += _print_results("CURRENT-TABLE SOURCE CONTRACT CHECKS", source_contract_results)
 
     if args.live:
         service_results = run_service_live_checks()

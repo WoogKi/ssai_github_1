@@ -667,6 +667,16 @@ def handle_purchase_detail_followup(
         )
         work = work[work["월"].astype(str).str.len().eq(6)].copy()
 
+        if work.empty:
+            return push_notice(
+                title="현재표 월별 입고 결과 없음",
+                action="현재표 월별 입고 결과 없음",
+                message="현재표에서 유효한 입고월을 찾지 못했습니다.",
+                query_summary="현재표 / 월별 입고 결과 없음 / 0건",
+                source_query=t,
+                extra_meta={"execution_status": "no_data", "result_status": "no_data"},
+            )
+
         out = (
             work.groupby("월", dropna=False)
             .agg(
@@ -682,10 +692,15 @@ def handle_purchase_detail_followup(
         out.insert(0, "순번", range(1, len(out) + 1))
 
         explicit_top = bool(re.search(r"(?:TOP|top|상위)\s*(\d{1,4})", t))
-        amount_title_word = "매입금액" if "매입" in t else "입고금액"
+        amount_title_word = (
+            "공급가액" if "공급가액" in t
+            else "매입금액" if "매입" in t
+            else "입고금액"
+        )
 
         if explicit_top:
-            out = out.sort_values("입고금액", ascending=False).head(top_n).reset_index(drop=True)
+            sort_metric = "공급가액" if amount_title_word == "공급가액" else "입고금액"
+            out = out.sort_values(sort_metric, ascending=False).head(top_n).reset_index(drop=True)
             out.insert(0, "순번", range(1, len(out) + 1))
             title = f"현재표 월별 {amount_title_word} TOP {top_n}"
             query_summary = f"현재표 / 월별 {amount_title_word} TOP {top_n} / 전체 {len(df):,}건 기준"
@@ -1025,5 +1040,3 @@ def handle_purchase_detail_followup(
         )
 
     return False
-
-   

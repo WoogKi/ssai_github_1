@@ -332,6 +332,7 @@ def detect_current_table_kind(source_action: str) -> str:
 
 
 _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("month", "월", ("월별", "월기준"), ("월", "기준월")),
     ("product", "제품", ("제품별", "품목별"), ("제품명", "품목명", "상품명", "제품코드", "품목코드", "상품코드")),
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
     ("purchase_vendor", "매입처", ("매입처별", "매입처명별"), ("매입처명", "매입처", "매입처코드")),
@@ -346,7 +347,8 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
 )
 
 _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("purchase_amount", "매입금액", ("매입금액",)),
+    ("supply_amount", "공급가액", ("공급가액",)),
+    ("purchase_amount", "매입금액", ("매입금액", "입고금액")),
     ("transaction_amount", "거래금액", ("거래금액",)),
     ("sales_quantity", "출고수량", ("출고수량", "매출수량")),
     ("inbound_quantity", "입고수량", ("입고수량", "매입수량")),
@@ -399,17 +401,20 @@ _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
+    "supply_amount": frozenset(
+        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+    ),
     "purchase_amount": frozenset(
-        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "transaction_amount": frozenset(
-        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "sales_quantity": frozenset(
-        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "inbound_quantity": frozenset(
-        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "stock_quantity": frozenset(
         {
@@ -437,6 +442,7 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
     ),
     "sales": frozenset(
         {
+            "month",
             "product",
             "manufacturer",
             "product_group",
@@ -472,6 +478,48 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
 }
 
 
+# Canonical follow-up fields can be derived from native source columns even
+# when the canonical result label does not yet exist in the current table.
+_CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "purchase_detail": {"month": ("입고일자", "매입일자", "일자")},
+    "sales_detail": {"month": ("출고일자", "매출일자", "일자")},
+    "trans_doc": {"month": ("거래명세서일자", "거래일자", "일자")},
+}
+
+_CURRENT_TABLE_SOURCE_METRIC_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "purchase_detail": {
+        "purchase_amount": ("합계금액", "총금액", "입고금액", "매입금액", "공급가액", "세액"),
+        "supply_amount": ("공급가액",),
+        "inbound_quantity": ("수량", "입고수량", "매입수량"),
+    },
+    "sales_detail": {
+        "sales": ("합계금액", "총금액", "출고금액", "매출금액", "공급가액", "세액"),
+        "supply_amount": ("공급가액",),
+        "sales_quantity": ("수량", "출고수량", "매출수량"),
+    },
+    "trans_doc": {
+        "transaction_amount": ("합계금액", "총금액", "거래금액", "공급가액", "세액"),
+        "supply_amount": ("공급가액",),
+    },
+}
+
+_CURRENT_TABLE_SOURCE_SEMANTIC_FILTER_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "trans_doc": {
+        "detail_total_match": ("상세합계일치",),
+    },
+}
+
+
+def _requested_source_semantic_filter(kind: str, query: str) -> str:
+    compact = re.sub(r"\s+", "", str(query or ""))
+    for key, aliases in _CURRENT_TABLE_SOURCE_SEMANTIC_FILTER_ALIASES.get(kind, {}).items():
+        if any(alias.replace("일치", "") in compact for alias in aliases) and any(
+            marker in compact for marker in ("일치", "불일치", "차이", "안맞", "맞지않")
+        ):
+            return key
+    return ""
+
+
 def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tuple[str, ...]]]:
     compact = re.sub(r"\s+", "", str(query or ""))
     requested: list[tuple[int, tuple[str, str, tuple[str, ...]]]] = []
@@ -501,7 +549,16 @@ def _current_table_dimension_columns(df: pd.DataFrame, aliases: tuple[str, ...])
     ]
 
 
-def _current_table_metric_columns(df: pd.DataFrame, metric: str) -> list[str]:
+def _current_table_metric_columns(
+    df: pd.DataFrame,
+    metric: str,
+    source_kind: str = "",
+) -> list[str]:
+    source_aliases = _CURRENT_TABLE_SOURCE_METRIC_ALIASES.get(source_kind, {}).get(metric, ())
+    if source_aliases:
+        matches = _current_table_dimension_columns(df, source_aliases)
+        if matches:
+            return matches
     for key, _label, aliases in _CURRENT_TABLE_METRIC_SPECS:
         if key == metric:
             return _current_table_dimension_columns(df, aliases)
@@ -518,7 +575,9 @@ def _current_table_metric_label(metric: str) -> str:
 def _current_table_requested_metrics(query: str) -> list[str]:
     compact = re.sub(r"\s+", "", str(query or ""))
     metrics: list[str] = []
-    if "매입금액" in compact:
+    if "공급가액" in compact:
+        metrics.append("supply_amount")
+    elif "매입금액" in compact:
         metrics.append("purchase_amount")
     elif "거래금액" in compact:
         metrics.append("transaction_amount")
@@ -700,14 +759,23 @@ def _current_table_followup_capability(
     requested = intent["requested_dimensions"]
     missing_columns: list[str] = []
     available_columns: list[str] = []
-    for _, label, aliases in requested:
-        matches = _current_table_dimension_columns(df, aliases)
+    for grouping_key, label, aliases in requested:
+        source_aliases = _CURRENT_TABLE_SOURCE_GROUPING_ALIASES.get(kind, {}).get(grouping_key, ())
+        matches = _current_table_dimension_columns(df, source_aliases or aliases)
         if matches:
             available_columns.extend(matches)
         else:
             missing_columns.append(label)
 
-    metric_columns = _current_table_metric_columns(df, metric)
+    metric_columns = _current_table_metric_columns(df, metric, kind)
+    semantic_filter = _requested_source_semantic_filter(kind, query)
+    if semantic_filter:
+        semantic_aliases = _CURRENT_TABLE_SOURCE_SEMANTIC_FILTER_ALIASES[kind][semantic_filter]
+        semantic_columns = _current_table_dimension_columns(df, semantic_aliases)
+        if semantic_columns:
+            available_columns.extend(semantic_columns)
+        else:
+            missing_columns.append("상세합계일치")
     base = {
         "requested_metrics": metrics,
         "requested_groupings": groupings,
@@ -1149,6 +1217,56 @@ def handle_current_table_followup_by_action(
     handlers = _known_action_handlers()
     handler = handlers.get(kind)
     normalized_query = re.sub(r"\s+", "", str(query or ""))
+
+    source_contract_priority = capability["status"] == "success" and ((
+        kind in _CURRENT_TABLE_SOURCE_GROUPING_ALIASES
+        and capability["requested_grouping"] == "month"
+    ) or (
+        bool(_requested_source_semantic_filter(kind, query))
+    ))
+    if source_contract_priority:
+        try:
+            if handler(
+                df=dispatch_df,
+                query=dispatch_query,
+                top_n=top_n,
+                table_key=table_key,
+                source_action=source_action,
+                helpers=dispatch_helpers,
+                log=log,
+            ):
+                return True
+        except Exception as exc:
+            try:
+                log.exception("[chat.followup_table] source-contract handler failed kind=%s", kind)
+            except Exception:
+                pass
+            return _push_dispatch_notice(
+                helpers=dispatch_helpers,
+                title="현재표 source 계약 처리 오류",
+                action="현재표 source 계약 처리 오류",
+                message="현재표 원본 컬럼 계약 처리 중 오류가 발생했습니다.",
+                query_summary=f"현재표 / source 계약 처리 오류 / 원본={source_action}",
+                source_query=query,
+                extra_meta={
+                    "execution_status": "routing_error",
+                    "result_status": "routing_error",
+                    "issue_codes": ["source_contract_handler_error", type(exc).__name__],
+                },
+            )
+        return _push_dispatch_notice(
+            helpers=dispatch_helpers,
+            title="현재표 source 계약 미지원",
+            action="현재표 source 계약 미지원",
+            message="현재표 원본 컬럼 계약에서 요청한 계산을 처리하지 못했습니다.",
+            query_summary=f"현재표 / source 계약 미지원 / 원본={source_action}",
+            source_query=query,
+            extra_meta={
+                "execution_status": "unsupported",
+                "result_status": "unsupported",
+                "issue_codes": ["source_contract_handler_unavailable"],
+            },
+        )
 
     # Current-stock product quantity TOP has a fixed product-identifying
     # output contract.  Let the inventory handler consume it before the

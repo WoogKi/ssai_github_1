@@ -605,6 +605,13 @@ def _display_filter_value(value: str) -> str:
     return str(value or "").strip() or "(빈값)"
 
 
+def semantic_boolean_mask(series: pd.Series, expected: bool) -> pd.Series:
+    """Normalize the boolean/status values used by current-table source contracts."""
+    normalized = series.fillna("").astype(str).str.strip().str.upper()
+    truthy = normalized.isin({"Y", "YES", "TRUE", "T", "1", "일치", "정상"})
+    return truthy if expected else ~truthy
+
+
 def _available_common_filter_columns(df: pd.DataFrame, limit: int = 40) -> list[str]:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return []

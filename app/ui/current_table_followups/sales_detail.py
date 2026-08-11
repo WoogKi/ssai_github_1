@@ -653,6 +653,7 @@ def handle_sales_detail_followup(
                 message="현재표에서 유효한 출고월을 찾지 못했습니다.",
                 query_summary="현재표 / 월별 매출 분석 불가",
                 source_query=t,
+                extra_meta={"execution_status": "no_data", "result_status": "no_data"},
             )
 
         out = (
@@ -674,9 +675,16 @@ def handle_sales_detail_followup(
             and not any(w in compact for w in ("매출", "매출금액", "금액", "공급가액", "세액"))
         )
 
+        wants_only_supply = "공급가액" in compact and not any(
+            w in compact for w in ("매출금액", "합계금액", "거래금액")
+        )
+
         if wants_only_qty:
             title = "현재표 월별 출고수량 요약"
             query_summary = f"현재표 / 월별 출고수량 요약 / 전체 {len(df):,}건 기준"
+        elif wants_only_supply:
+            title = "현재표 월별 공급가액 요약"
+            query_summary = f"현재표 / 월별 공급가액 요약 / 전체 {len(df):,}건 기준"
         else:
             title = "현재표 월별 매출 요약"
             query_summary = f"현재표 / 월별 매출 요약 / 전체 {len(df):,}건 기준"

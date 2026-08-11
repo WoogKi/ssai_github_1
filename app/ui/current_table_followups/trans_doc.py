@@ -9,6 +9,8 @@ import re
 
 import pandas as pd
 
+from app.ui.current_table_followups.generic import semantic_boolean_mask
+
 
 def handle_trans_doc_followup(
     *,
@@ -338,7 +340,10 @@ def handle_trans_doc_followup(
         )
 
     # 1) 상세합계 불일치 목록
-    if any(w in compact for w in ("불일치", "차이", "안맞", "맞지않")):
+    detail_match_requested = "상세합계" in compact and any(
+        w in compact for w in ("일치", "불일치", "차이", "안맞", "맞지않")
+    )
+    if detail_match_requested:
         if not detail_match_col:
             return push_notice(
                 title="현재표 상세합계 불일치 분석 불가",
@@ -348,8 +353,18 @@ def handle_trans_doc_followup(
                 source_query=t,
             )
 
-        match_s = _text_series(detail_match_col).str.upper()
-        out = df[base_mask & (match_s != "Y")].copy()
+        wants_mismatch = any(w in compact for w in ("불일치", "차이", "안맞", "맞지않"))
+        out = df[base_mask & semantic_boolean_mask(df[detail_match_col], not wants_mismatch)].copy()
+
+        if out.empty:
+            return push_notice(
+                title="현재표 상세합계 조건 결과 없음",
+                action="현재표 상세합계 조건 결과 없음",
+                message="현재표에서 요청한 상세합계 일치 조건에 해당하는 행이 없습니다.",
+                query_summary=f"현재표 / 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} / 0건",
+                source_query=t,
+                extra_meta={"execution_status": "no_data", "result_status": "no_data"},
+            )
 
         log.info(
             "[chat.followup_table] trans doc mismatch list built source_rows=%s rows=%s match_col=%s table_key=%s",
@@ -360,10 +375,10 @@ def handle_trans_doc_followup(
         )
 
         return push_table(
-            title="현재표 거래명세서 상세합계 불일치 목록",
-            action="현재표 거래명세서 상세합계 불일치 목록",
+            title=f"현재표 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} 목록",
+            action=f"현재표 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} 목록",
             df=out,
-            query_summary=f"현재표 / 거래명세서 상세합계 불일치 목록 / 전체 {len(df):,}건 기준",
+            query_summary=f"현재표 / 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} 목록 / 전체 {len(df):,}건 기준",
             source_query=t,
             source_table_key=table_key,
             source_rows=len(df),
@@ -520,7 +535,14 @@ def handle_trans_doc_followup(
         work["월"] = raw_month.str[:4] + "-" + raw_month.str[4:6]
         work = work[work["월"].str.len() == 7].copy()
         if work.empty:
-            return False
+            return push_notice(
+                title="현재표 월별 거래금액 결과 없음",
+                action="현재표 월별 거래금액 결과 없음",
+                message="현재표에서 유효한 거래명세서월을 찾지 못했습니다.",
+                query_summary="현재표 / 월별 거래금액 결과 없음 / 0건",
+                source_query=t,
+                extra_meta={"execution_status": "no_data", "result_status": "no_data"},
+            )
 
         split_rows = bool(trans_type_col and not _wants_total_time_amount())
 
@@ -551,13 +573,15 @@ def handle_trans_doc_followup(
         )
 
         amount_title_word = (
-            "매입금액" if ("매입" in t or "입고" in t)
+            "공급가액" if "공급가액" in t
+            else "매입금액" if ("매입" in t or "입고" in t)
             else "매출금액" if ("매출" in t or "출고" in t)
             else "거래금액"
         )
 
         if explicit_top:
-            out = out.sort_values("거래금액", ascending=False).head(top_n).reset_index(drop=True)
+            sort_metric = "공급가액" if amount_title_word == "공급가액" else "거래금액"
+            out = out.sort_values(sort_metric, ascending=False).head(top_n).reset_index(drop=True)
             title = f"현재표 월별 {amount_title_word} TOP {top_n}"
             query_summary = f"현재표 / 월별 {amount_title_word} TOP {top_n} / {split_label} / 전체 {len(df):,}건 기준"
             display_limit = top_n
