@@ -297,12 +297,19 @@ def _format_date_label(value: Any, *, monthly: bool = False) -> str:
 
 
 def _period_policy_label(policy: Mapping[str, Any]) -> str:
+    default_policy = str(policy.get("default_policy") or "").strip()
     if bool(policy.get("explicit_period_present")):
-        return "명시기간"
+        return {
+            "today": "사용자 지정일",
+            "calendar_month": "사용자 지정월",
+            "rolling_1month": "사용자 지정기간 최근 1개월",
+            "explicit_period": "명시기간",
+        }.get(default_policy, "명시기간")
     if not bool(policy.get("auto_applied")):
         return ""
-    default_policy = str(policy.get("default_policy") or "").strip()
     labels = {
+        "today": "기본기간 오늘",
+        "rolling_1month": "기본기간 최근 1개월",
         "recent_1day": "기본기간 최근 1일",
         "recent_1month": "기본기간 최근 1개월",
         "recent_7days": "제품수불 최근 7일",

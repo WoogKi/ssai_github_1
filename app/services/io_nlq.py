@@ -372,6 +372,82 @@ def _last_day_from_yyyymm(yyyymm: str) -> str:
     return (nxt - timedelta(days=1)).strftime("%Y%m%d")
 
 
+_NLQ_PERIOD_KIND_KEY = "_nlq_period_kind"
+
+
+def _extract_natural_period(
+    text: str,
+    *,
+    today: date | None = None,
+) -> Dict[str, str]:
+    """Resolve the shared natural-language period contract.
+
+    Policy source: docs/02_design/SIMS_AI_NLQ_기간정책_공식기준.md
+    """
+    raw = _norm(text)
+    if not raw:
+        return {}
+    current_day = today or date.today()
+
+    if re.search(r"(?:최근\s*)?(?:한\s*달|1\s*개월)", raw):
+        return {
+            "date_from": (current_day - timedelta(days=30)).strftime("%Y%m%d"),
+            "date_to": current_day.strftime("%Y%m%d"),
+            _NLQ_PERIOD_KIND_KEY: "rolling_1month",
+        }
+
+    if re.search(r"(?:^|\s)(?:오늘|당일|하루|최근\s*1\s*일)(?=\s|$)", raw):
+        value = current_day.strftime("%Y%m%d")
+        return {
+            "date_from": value,
+            "date_to": value,
+            _NLQ_PERIOD_KIND_KEY: "today",
+        }
+
+    if re.search(r"(?:이번\s*달|이번\s*월)", raw):
+        yyyymm = current_day.strftime("%Y%m")
+        return {
+            "month_from": yyyymm,
+            "month_to": yyyymm,
+            _NLQ_PERIOD_KIND_KEY: "calendar_month",
+        }
+
+    month_match = re.search(r"(?<![\d년])(?:^|\s)(1[0-2]|0?[1-9])\s*월(?=\s|$)", raw)
+    if month_match:
+        yyyymm = f"{current_day.year:04d}{int(month_match.group(1)):02d}"
+        return {
+            "month_from": yyyymm,
+            "month_to": yyyymm,
+            _NLQ_PERIOD_KIND_KEY: "calendar_month",
+        }
+    return {}
+
+
+def _classify_parsed_period(params: Dict[str, Any]) -> str:
+    if clean_text(params.get("date_from")) or clean_text(params.get("date_to")):
+        return "explicit_period"
+    month_from = clean_text(params.get("month_from"))
+    month_to = clean_text(params.get("month_to"))
+    if month_from or month_to:
+        return "calendar_month" if month_from and month_from == month_to else "explicit_period"
+    return ""
+
+
+def _strip_nlq_period_expressions(text: str) -> str:
+    """Remove period syntax before extracting an unlabeled business entity."""
+    out = str(text or "")
+    patterns = (
+        r"(?:최근\s*)?(?:한\s*달|1\s*개월)",
+        r"(?:오늘|당일|하루|최근\s*1\s*일)",
+        r"(?:이번\s*달|이번\s*월)",
+        r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
+        r"(?<!\d)\d{1,2}\s*월(?!\s*\d)",
+    )
+    for pattern in patterns:
+        out = re.sub(pattern, " ", out)
+    return out
+
+
 def get_nlq_period_action_class(action: str) -> str:
     """Return the canonical NLQ period policy class without importing UI code."""
     try:
@@ -490,7 +566,9 @@ def apply_nlq_default_period_policy(
     # action is known. That is not a user-specified period and must not win
     # over this policy.
     parser_default_date = clean_text(out.get("_default_date_applied")).upper() == "Y"
+    parsed_period_kind = clean_text(out.pop(_NLQ_PERIOD_KIND_KEY, ""))
     explicit_period_present = _has_period_param(out) and not parser_default_date
+    explicit_period_kind = parsed_period_kind or ("explicit_period" if explicit_period_present else "")
     explicit_condition_names = get_nlq_explicit_condition_names(out, condition_sources)
     policy = {
         "action": str(action or "").strip(),
@@ -498,7 +576,7 @@ def apply_nlq_default_period_policy(
         "explicit_period_present": explicit_period_present,
         "explicit_condition_names": explicit_condition_names,
         "explicit_condition_count": len(explicit_condition_names),
-        "default_policy": "none",
+        "default_policy": explicit_period_kind or "none",
         "policy_reason": "explicit_period" if explicit_period_present else "not_applicable",
         "auto_applied": False,
         "final_date_from": clean_text(out.get("date_from")),
@@ -537,12 +615,12 @@ def apply_nlq_default_period_policy(
         policy_reason = "inventory_month_query"
     elif action_class == "list_detail":
         if explicit_condition_names:
-            date_from = current_day.replace(day=1)
-            default_policy = "current_month"
+            date_from = current_day - timedelta(days=30)
+            default_policy = "rolling_1month"
             policy_reason = "explicit_condition"
         else:
             date_from = current_day
-            default_policy = "recent_1day"
+            default_policy = "today"
             policy_reason = "no_explicit_condition"
     else:
         return out, policy
@@ -634,7 +712,8 @@ _NAMED_CONDITION_VALUE_KEYS = (
 
 def _action_suffix_phrases(action: str) -> tuple[str, ...]:
     """Return registered action labels that are safe to remove only at value tails."""
-    phrases = {str(action or "").strip()}
+    normalized_action = str(action or "").strip()
+    phrases = {normalized_action}
     try:
         from app.sims.nlq.action_inventory import implemented_actions
 
@@ -649,6 +728,20 @@ def _action_suffix_phrases(action: str) -> tuple[str, ...]:
     # are action labels, not value-specific exceptions.
     phrases.update(_PRODUCT_FLOW_WORDS)
     phrases.update(_PRODUCT_INVENTORY_WORDS)
+
+    # Detail routing accepts compact transaction phrases such as 입고현황 and
+    # 출고내역 even though the canonical actions are 입고/출고명세 조회. Build
+    # those value boundaries from the shared routing vocabulary so FIELD +
+    # VALUE + ACTION and ACTION + FIELD + VALUE produce identical parameters.
+    detail_roots: tuple[str, ...] = ()
+    if normalized_action.startswith("입고"):
+        detail_roots = ("입고", "매입")
+    elif normalized_action.startswith("출고"):
+        detail_roots = ("출고", "매출")
+    for root in detail_roots:
+        for signal in (*_TRANSACTION_SIGNAL_WORDS, *_MASTER_QUERY_WORDS):
+            phrases.add(f"{root}{signal}")
+            phrases.add(f"{root} {signal}")
     return tuple(sorted((item for item in phrases if item), key=len, reverse=True))
 
 
@@ -1523,7 +1616,7 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     of truth, and a phrase is considered only when it is the sole residual token
     around a resolved IO action.
     """
-    candidate = _norm(text)
+    candidate = _norm(_strip_nlq_period_expressions(text))
     if not candidate:
         return ""
 
@@ -2102,12 +2195,17 @@ def resolve_current_stock_entity_condition(
         "resolved_kind": resolved_kind, "candidates": candidates,
     }
 
-def extract_params(text: str) -> Dict[str, Any]:
+def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
     text = _norm(text)
     params: Dict[str, Any] = {}
 
     params.update(_extract_date_range(text))
     params.update({k: v for k, v in _extract_month_range(text).items() if k not in params})
+    parsed_period_kind = _classify_parsed_period(params)
+    if not parsed_period_kind:
+        params.update(_extract_natural_period(text, today=today))
+    else:
+        params[_NLQ_PERIOD_KIND_KEY] = parsed_period_kind
 
     ven_cd = _extract_code(text, "거래처", 5) or _extract_code(text, "거래처코드", 5)
     ven_nm = _extract_named_text(text, ("거래처명", "거래처"))
@@ -2515,7 +2613,7 @@ def _apply_outbound_validation_intent(
 # 입출고/재고 NLQ 해석의 최상위 함수
 # 입출고/재고 관련 신호가 있는지 보고, 관련 신호가 있으면 extract_params()로 파싱한 뒤
 # 입출고/재고 NLQ 의도를 판정한다.
-def resolve_io_nlq(text: str) -> Optional[Dict[str, Any]]:
+def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str, Any]]:
     raw = _norm(text)
     if not raw:
         return None
@@ -2525,7 +2623,7 @@ def resolve_io_nlq(text: str) -> Optional[Dict[str, Any]]:
     if is_io_validation_explanation_request(raw):
         return None
 
-    params = extract_params(raw)
+    params = extract_params(raw, today=today)
 
     def _result(action: str, params_in: Dict[str, Any]) -> Dict[str, Any]:
         fixed_params = _normalize_io_detail_vendor_params(

@@ -2783,9 +2783,15 @@ def _append_code_name(parts: list[str], label: str, code: Any = "", name: Any = 
 
 def _period_policy_summary_label(period_policy: Dict[str, Any] | None) -> str:
     policy = dict(period_policy or {})
+    policy_name = str(policy.get("default_policy") or "")
     if not bool(policy.get("auto_applied")):
-        return ""
-    if str(policy.get("default_policy") or "") == "current_month":
+        return {
+            "today": "사용자 지정일",
+            "calendar_month": "사용자 지정월",
+            "rolling_1month": "사용자 지정기간(최근 1개월)",
+            "explicit_period": "사용자 지정기간",
+        }.get(policy_name, "")
+    if policy_name == "rolling_1month":
         condition_labels = {
             "manufacturer": "제약사 조건",
             "product": "제품 조건",
@@ -2801,6 +2807,7 @@ def _period_policy_summary_label(period_policy: Dict[str, Any] | None) -> str:
         return f"최근 1개월 자동적용({condition_labels.get(str(names[0]), '명시 조건')})"
     return {
         "completed_6months": "직전 완료 6개월 자동적용",
+        "today": "오늘 자동적용(추가 조건 없음)",
         "recent_1day": "최근 1일 자동적용(추가 조건 없음)",
         "recent_7days": "최근 7일 자동적용(단일 제품 수불)",
         "current_month_inventory": "현재월 자동적용(재고 월조회)",

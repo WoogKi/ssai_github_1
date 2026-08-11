@@ -13931,7 +13931,7 @@ def _run_analytics_period_and_grouping_contract_checks() -> list[CheckResult]:
                 raise AssertionError(f"analytics_explicit_period={action!r}/{explicit!r}/{explicit_policy!r}")
 
         expected_non_analytics_policies = {
-            "list_detail": (("20260803", "20260803"), "recent_1day"),
+            "list_detail": (("20260803", "20260803"), "today"),
             "single_entity_history": (("20260728", "20260803"), "recent_7days"),
             "inventory_movement": (("20260801", "20260803"), "current_month_inventory"),
         }

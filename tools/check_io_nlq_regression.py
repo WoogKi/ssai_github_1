@@ -234,6 +234,50 @@ def _norm_yyyymmdd(value: Any) -> str:
 def _parser_cases() -> list[ParserCase]:
     return [
         ParserCase(
+            query="제약사 한미 입고현황",
+            expected_action="입고명세 조회",
+            expected_params={"maker_nm": "한미", "product_ven_nm": "한미"},
+        ),
+        ParserCase(
+            query="입고현황 제약사 한미",
+            expected_action="입고명세 조회",
+            expected_params={"maker_nm": "한미", "product_ven_nm": "한미"},
+        ),
+        ParserCase(
+            query="제품 낙소졸 입고현황",
+            expected_action="입고명세 조회",
+            expected_params={"physic_nm": "낙소졸"},
+        ),
+        ParserCase(
+            query="입고현황 제품 낙소졸",
+            expected_action="입고명세 조회",
+            expected_params={"physic_nm": "낙소졸"},
+        ),
+        ParserCase(
+            query="매입처 온라인팜 입고현황",
+            expected_action="입고명세 조회",
+            expected_params={"ven_nm": "온라인팜"},
+            forbidden_params=("buy_nm",),
+        ),
+        ParserCase(
+            query="입고현황 매입처 온라인팜",
+            expected_action="입고명세 조회",
+            expected_params={"ven_nm": "온라인팜"},
+            forbidden_params=("buy_nm",),
+        ),
+        ParserCase(
+            query="매입처 온라인팜 제품 낙소졸 입고현황",
+            expected_action="입고명세 조회",
+            expected_params={"ven_nm": "온라인팜", "physic_nm": "낙소졸"},
+            forbidden_params=("buy_nm",),
+        ),
+        ParserCase(
+            query="입고현황 매입처 온라인팜 제품 낙소졸",
+            expected_action="입고명세 조회",
+            expected_params={"ven_nm": "온라인팜", "physic_nm": "낙소졸"},
+            forbidden_params=("buy_nm",),
+        ),
+        ParserCase(
             query="입고명세 매입처명 한미 2026-04-01~2026-04-30 조회",
             expected_action="입고명세 조회",
             expected_params={
@@ -1874,32 +1918,32 @@ def run_default_period_policy_checks() -> list[CheckResult]:
     from app.sims.nlq.nlq_router import _build_io_query_summary
 
     results: list[CheckResult] = []
-    reference_day = date(2026, 7, 31)
+    reference_day = date(2026, 8, 11)
 
     cases = (
         (
             "detail without condition uses one day",
-            {}, "입고명세 조회", "20260731", "20260731", "recent_1day", "list_detail",
+            {}, "입고명세 조회", "20260811", "20260811", "today", "list_detail",
         ),
         (
             "detail manufacturer condition uses current month",
-            {"maker_nm": "fixture-maker"}, "입고명세 조회", "20260701", "20260731", "current_month", "list_detail",
+            {"maker_nm": "fixture-maker"}, "입고명세 조회", "20260712", "20260811", "rolling_1month", "list_detail",
         ),
         (
             "detail product condition uses current month",
-            {"physic_cd": "39639"}, "출고명세 조회", "20260701", "20260731", "current_month", "list_detail",
+            {"physic_cd": "39639"}, "출고명세 조회", "20260712", "20260811", "rolling_1month", "list_detail",
         ),
         (
             "product flow always uses seven days",
-            {"physic_cd": "39639"}, "제품수불현황 조회", "20260725", "20260731", "recent_7days", "single_entity_history",
+            {"physic_cd": "39639"}, "제품수불현황 조회", "20260805", "20260811", "recent_7days", "single_entity_history",
         ),
         (
             "inventory without condition uses current month",
-            {}, "제품재고현황 조회", "20260701", "20260731", "current_month_inventory", "inventory_movement",
+            {}, "제품재고현황 조회", "20260801", "20260811", "current_month_inventory", "inventory_movement",
         ),
         (
             "inventory condition also uses current month",
-            {"stock_cd_list": ["00001"]}, "제품재고현황 조회", "20260701", "20260731", "current_month_inventory", "inventory_movement",
+            {"stock_cd_list": ["00001"]}, "제품재고현황 조회", "20260801", "20260811", "current_month_inventory", "inventory_movement",
         ),
     )
     for name, params, action, expected_from, expected_to, expected_policy, expected_class in cases:
@@ -1938,9 +1982,9 @@ def run_default_period_policy_checks() -> list[CheckResult]:
     results.append(
         CheckResult(
             "legacy parser defaults do not masquerade as explicit dates",
-            legacy_default_policy.get("default_policy") == "recent_1day"
-            and legacy_default_resolved.get("date_from") == "20260731"
-            and legacy_default_resolved.get("date_to") == "20260731"
+            legacy_default_policy.get("default_policy") == "today"
+            and legacy_default_resolved.get("date_from") == "20260811"
+            and legacy_default_resolved.get("date_to") == "20260811"
             and "_default_date_applied" not in legacy_default_resolved,
             f"params={legacy_default_resolved!r}, policy={legacy_default_policy!r}",
         )
@@ -1969,33 +2013,33 @@ def run_default_period_policy_checks() -> list[CheckResult]:
         CheckResult(
             "system defaults are not explicit conditions",
             system_default_policy.get("explicit_condition_names") == []
-            and system_default_resolved.get("date_from") == "20260731"
-            and system_default_policy.get("default_policy") == "recent_1day",
+            and system_default_resolved.get("date_from") == "20260811"
+            and system_default_policy.get("default_policy") == "today",
             f"params={system_default_resolved!r}, policy={system_default_policy!r}",
         )
     )
 
     summary = _build_io_query_summary(
         "입고명세 조회",
-        {"date_from": "20260731", "date_to": "20260731"},
+        {"date_from": "20260811", "date_to": "20260811"},
         {
             "auto_applied": True,
-            "default_policy": "recent_1day",
+            "default_policy": "today",
         },
     )
     results.append(
         CheckResult(
-            "period summary uses common one-day wording",
-            "최근 1일 자동적용(추가 조건 없음)" in summary,
+            "period summary uses official today wording",
+            "오늘 자동적용(추가 조건 없음)" in summary,
             summary,
         )
     )
     manufacturer_summary = _build_io_query_summary(
         "입고명세 조회",
-        {"date_from": "20260701", "date_to": "20260731"},
+        {"date_from": "20260712", "date_to": "20260811"},
         {
             "auto_applied": True,
-            "default_policy": "current_month",
+            "default_policy": "rolling_1month",
             "explicit_condition_names": ["manufacturer"],
         },
     )
@@ -2010,7 +2054,7 @@ def run_default_period_policy_checks() -> list[CheckResult]:
     unlabeled_resolved, unlabeled_policy = apply_nlq_default_period_policy(
         {"nlq_unlabeled_name": "한미"},
         "입고명세 조회",
-        today=date(2026, 8, 10),
+        today=date(2026, 8, 11),
         condition_sources=unlabeled_sources,
     )
     unlabeled_summary = _build_io_query_summary(
@@ -2022,9 +2066,9 @@ def run_default_period_policy_checks() -> list[CheckResult]:
     results.append(
         CheckResult(
             "unlabeled explicit condition uses current-month detail policy",
-            unlabeled_resolved.get("date_from") == "20260801"
-            and unlabeled_resolved.get("date_to") == "20260810"
-            and unlabeled_policy.get("default_policy") == "current_month"
+            unlabeled_resolved.get("date_from") == "20260712"
+            and unlabeled_resolved.get("date_to") == "20260811"
+            and unlabeled_policy.get("default_policy") == "rolling_1month"
             and unlabeled_policy.get("explicit_condition_names") == ["unlabeled_search"]
             and "통합검색 한미" in unlabeled_summary
             and "최근 1개월 자동적용(통합검색 조건)" in unlabeled_summary,
@@ -2034,15 +2078,15 @@ def run_default_period_policy_checks() -> list[CheckResult]:
     outbound_unlabeled, outbound_unlabeled_policy = apply_nlq_default_period_policy(
         {"nlq_unlabeled_name": "한미"},
         "출고명세 조회",
-        today=date(2026, 8, 10),
+        today=date(2026, 8, 11),
         condition_sources=unlabeled_sources,
     )
     results.append(
         CheckResult(
             "outbound unlabeled explicit condition uses the same period contract",
-            outbound_unlabeled.get("date_from") == "20260801"
-            and outbound_unlabeled.get("date_to") == "20260810"
-            and outbound_unlabeled_policy.get("default_policy") == "current_month",
+            outbound_unlabeled.get("date_from") == "20260712"
+            and outbound_unlabeled.get("date_to") == "20260811"
+            and outbound_unlabeled_policy.get("default_policy") == "rolling_1month",
             f"params={outbound_unlabeled!r}, policy={outbound_unlabeled_policy!r}",
         )
     )
@@ -2074,6 +2118,141 @@ def run_default_period_policy_checks() -> list[CheckResult]:
             f"params={explicit_unlabeled!r}, policy={explicit_unlabeled_policy!r}, summary={explicit_unlabeled_summary!r}",
         )
     )
+
+    from app.services.io_nlq import resolve_io_nlq
+
+    natural_period_cases = (
+        ("오늘 입고현황", "20260811", "20260811", "today"),
+        ("당일 입고현황", "20260811", "20260811", "today"),
+        ("하루 입고현황", "20260811", "20260811", "today"),
+        ("최근 1일 입고현황", "20260811", "20260811", "today"),
+        ("한달 입고현황", "20260712", "20260811", "rolling_1month"),
+        ("최근 한달 입고현황", "20260712", "20260811", "rolling_1month"),
+        ("최근 1개월 입고현황", "20260712", "20260811", "rolling_1month"),
+        ("8월 입고현황", "20260801", "20260831", "calendar_month"),
+        ("이번달 입고현황", "20260801", "20260831", "calendar_month"),
+        ("이번 월 입고현황", "20260801", "20260831", "calendar_month"),
+        ("2026년 8월 입고현황", "20260801", "20260831", "calendar_month"),
+        ("입고현황 202608", "20260801", "20260831", "calendar_month"),
+    )
+    for query, expected_from, expected_to, expected_policy in natural_period_cases:
+        parsed_natural = resolve_io_nlq(query, today=date(2026, 8, 11)) or {}
+        natural_params, natural_policy = apply_nlq_default_period_policy(
+            dict(parsed_natural.get("params") or {}),
+            str(parsed_natural.get("action") or ""),
+            today=date(2026, 8, 11),
+        )
+        results.append(
+            CheckResult(
+                f"official natural period: {query}",
+                natural_params.get("date_from") == expected_from
+                and natural_params.get("date_to") == expected_to
+                and natural_policy.get("default_policy") == expected_policy
+                and bool(natural_policy.get("explicit_period_present"))
+                and not bool(natural_policy.get("auto_applied")),
+                f"parsed={parsed_natural!r}, params={natural_params!r}, policy={natural_policy!r}",
+            )
+        )
+
+    boundary_cases = (
+        ("최근 한달 입고현황", date(2027, 1, 1), "20261202", "20270101"),
+        ("최근 한달 입고현황", date(2024, 3, 1), "20240131", "20240301"),
+        ("2월 입고현황", date(2024, 2, 10), "20240201", "20240229"),
+        ("12월 입고현황", date(2026, 8, 11), "20261201", "20261231"),
+    )
+    for query, policy_day, expected_from, expected_to in boundary_cases:
+        parsed_boundary = resolve_io_nlq(query, today=policy_day) or {}
+        boundary_params, boundary_policy = apply_nlq_default_period_policy(
+            dict(parsed_boundary.get("params") or {}),
+            str(parsed_boundary.get("action") or ""),
+            today=policy_day,
+        )
+        results.append(
+            CheckResult(
+                f"official period boundary: {query} as of {policy_day}",
+                boundary_params.get("date_from") == expected_from
+                and boundary_params.get("date_to") == expected_to
+                and bool(boundary_policy.get("explicit_period_present")),
+                f"params={boundary_params!r}, policy={boundary_policy!r}",
+            )
+        )
+
+    residual_period = resolve_io_nlq("한미 최근 한달 입고현황", today=date(2026, 8, 11)) or {}
+    residual_resolution = importlib.import_module("app.services.io_nlq").resolve_unlabeled_io_entity_condition(
+        "한미 최근 한달 입고현황",
+        action=str(residual_period.get("action") or ""),
+        params=dict(residual_period.get("params") or {}),
+    )
+    results.append(
+        CheckResult(
+            "natural period tokens do not consume the unlabeled business condition",
+            residual_resolution.get("status") == "resolved"
+            and residual_resolution.get("params", {}).get("nlq_unlabeled_name") == "한미",
+            f"parsed={residual_period!r}, resolved={residual_resolution!r}",
+        )
+    )
+
+    compound_period = resolve_io_nlq(
+        "입고명세조회 매입처 온라인팜 제품 낙소졸",
+        today=date(2026, 8, 11),
+    ) or {}
+    compound_params, compound_policy = apply_nlq_default_period_policy(
+        dict(compound_period.get("params") or {}),
+        str(compound_period.get("action") or ""),
+        today=date(2026, 8, 11),
+    )
+    results.append(
+        CheckResult(
+            "multiple explicit conditions use rolling month without losing either condition",
+            compound_params.get("ven_nm") == "온라인팜"
+            and compound_params.get("physic_nm") == "낙소졸"
+            and compound_params.get("date_from") == "20260712"
+            and compound_params.get("date_to") == "20260811"
+            and compound_policy.get("default_policy") == "rolling_1month"
+            and set(compound_policy.get("explicit_condition_names") or []) == {"product", "vendor"},
+            f"parsed={compound_period!r}, params={compound_params!r}, policy={compound_policy!r}",
+        )
+    )
+
+    calendar_summary = _build_io_query_summary(
+        "입고명세 조회",
+        {"date_from": "20260801", "date_to": "20260831"},
+        {
+            "explicit_period_present": True,
+            "auto_applied": False,
+            "default_policy": "calendar_month",
+        },
+    )
+    results.append(
+        CheckResult(
+            "calendar month summary distinguishes a user-specified month",
+            "기간 2026-08-01 ~ 2026-08-31" in calendar_summary
+            and "사용자 지정월" in calendar_summary,
+            calendar_summary,
+        )
+    )
+    case_log_service = importlib.import_module("app.services.nlq_case_log_service")
+    results.append(
+        CheckResult(
+            "case log preserves canonical official period policy names",
+            case_log_service._period_policy_label({
+                "explicit_period_present": False,
+                "auto_applied": True,
+                "default_policy": "today",
+            }) == "기본기간 오늘"
+            and case_log_service._period_policy_label({
+                "explicit_period_present": False,
+                "auto_applied": True,
+                "default_policy": "rolling_1month",
+            }) == "기본기간 최근 1개월"
+            and case_log_service._period_policy_label({
+                "explicit_period_present": True,
+                "auto_applied": False,
+                "default_policy": "calendar_month",
+            }) == "사용자 지정월",
+            "today/calendar_month/rolling_1month labels",
+        )
+    )
     inventory_summary = _build_io_query_summary(
         "제품재고현황 조회",
         {"date_from": "20260701", "date_to": "20260731"},
@@ -2097,9 +2276,16 @@ def run_default_period_policy_checks() -> list[CheckResult]:
     original_entity_resolver = io_module.resolve_unlabeled_io_entity_condition
     original_inbound_result = inbound_service.get_rddbc110_result
     original_push = chat_middleware.push_sims_result_to_chat
+    original_io_date = io_module.date
     service_params: list[dict[str, Any]] = []
     pushed_payloads: list[dict[str, Any]] = []
     try:
+        class _FixedPolicyDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 8, 11)
+
+        io_module.date = _FixedPolicyDate
         io_module.resolve_unlabeled_io_entity_condition = lambda _text, *, action, params: {
             "status": "resolved",
             "resolved_kind": "unlabeled_like",
@@ -2143,6 +2329,7 @@ def run_default_period_policy_checks() -> list[CheckResult]:
         io_module.resolve_unlabeled_io_entity_condition = original_entity_resolver
         inbound_service.get_rddbc110_result = original_inbound_result
         chat_middleware.push_sims_result_to_chat = original_push
+        io_module.date = original_io_date
 
     routed_params = service_params[0] if service_params else {}
     routed_meta = dict((pushed_payloads[0].get("meta") or {})) if pushed_payloads else {}
@@ -2152,9 +2339,9 @@ def run_default_period_policy_checks() -> list[CheckResult]:
             "public IO router connects unlabeled metadata to period and summary",
             handled
             and routed_params.get("nlq_unlabeled_name") == "한미"
-            and routed_params.get("date_from") == "20260801"
-            and routed_params.get("date_to") == "20260810"
-            and (routed_meta.get("period_policy") or {}).get("default_policy") == "current_month"
+            and routed_params.get("date_from") == "20260712"
+            and routed_params.get("date_to") == "20260811"
+            and (routed_meta.get("period_policy") or {}).get("default_policy") == "rolling_1month"
             and (routed_meta.get("condition_sources") or {}).get("unlabeled_name") == "explicit"
             and "통합검색 한미" in routed_summary
             and "최근 1개월 자동적용(통합검색 조건)" in routed_summary
@@ -2162,8 +2349,6 @@ def run_default_period_policy_checks() -> list[CheckResult]:
             f"params={routed_params!r}, meta={routed_meta!r}",
         )
     )
-
-    from app.services.io_nlq import resolve_io_nlq
 
     named_value_cases = (
         ("제약사 한미약품 출고명세 조회", "maker_nm", "한미약품"),
