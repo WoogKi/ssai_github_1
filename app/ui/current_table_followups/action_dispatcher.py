@@ -333,6 +333,7 @@ def detect_current_table_kind(source_action: str) -> str:
 
 _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("month", "월", ("월별", "월기준"), ("월", "기준월")),
+    ("weekday", "요일", ("요일별", "요일기준"), ("요일",)),
     ("day", "일자", ("일자별", "날짜별", "일별"), ("일자", "날짜")),
     ("product", "제품", ("제품별", "품목별"), ("제품명", "품목명", "상품명", "제품코드", "품목코드", "상품코드")),
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
@@ -403,19 +404,19 @@ _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
     "supply_amount": frozenset(
-        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "purchase_amount": frozenset(
-        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "transaction_amount": frozenset(
-        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "sales_quantity": frozenset(
-        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "inbound_quantity": frozenset(
-        {"month", "day", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "stock_quantity": frozenset(
         {
@@ -445,6 +446,7 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
         {
             "month",
             "day",
+            "weekday",
             "product",
             "manufacturer",
             "product_group",
@@ -486,14 +488,17 @@ _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = 
     "purchase_detail": {
         "month": ("입고일자", "매입일자", "일자"),
         "day": ("입고일자", "매입일자", "일자"),
+        "weekday": ("입고일자", "매입일자", "일자"),
     },
     "sales_detail": {
         "month": ("출고일자", "매출일자", "일자"),
         "day": ("출고일자", "매출일자", "일자"),
+        "weekday": ("출고일자", "매출일자", "일자"),
     },
     "trans_doc": {
         "month": ("거래명세서일자", "거래일자", "일자"),
         "day": ("거래명세서일자", "거래일자", "일자"),
+        "weekday": ("거래명세서일자", "거래일자", "일자"),
     },
 }
 
@@ -534,7 +539,7 @@ def _requested_source_semantic_filter(kind: str, query: str) -> str:
 
 def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tuple[str, ...]]]:
     compact = re.sub(r"\s+", "", str(query or ""))
-    requested: list[tuple[int, tuple[str, str, tuple[str, ...]]]] = []
+    candidates: list[tuple[int, int, str, str, tuple[str, ...]]] = []
     for key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
         field_terms = (label, *aliases)
         dimension_phrases = tuple(phrases) + tuple(
@@ -542,14 +547,25 @@ def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tupl
             for alias in field_terms
             for suffix in ("별", "기준", "분석", "집계", "요약")
         )
-        positions = [
-            compact.find(phrase)
-            for phrase in dimension_phrases
-            if compact.find(phrase) >= 0
-        ]
-        if positions:
-            requested.append((min(positions), (key, label, aliases)))
-    return [item for _position, item in sorted(requested, key=lambda entry: entry[0])]
+        for phrase in set(dimension_phrases):
+            position = compact.find(phrase)
+            if position >= 0:
+                candidates.append((position, position + len(phrase), key, label, aliases))
+
+    selected: list[tuple[int, int, str, str, tuple[str, ...]]] = []
+    selected_keys: set[str] = set()
+    for candidate in sorted(candidates, key=lambda item: (-(item[1] - item[0]), item[0])):
+        start, end, key, _label, _aliases = candidate
+        if key in selected_keys:
+            continue
+        if any(start < chosen_end and end > chosen_start for chosen_start, chosen_end, *_ in selected):
+            continue
+        selected.append(candidate)
+        selected_keys.add(key)
+    return [
+        (key, label, aliases)
+        for _start, _end, key, label, aliases in sorted(selected, key=lambda item: item[0])
+    ]
 
 
 def _current_table_dimension_columns(df: pd.DataFrame, aliases: tuple[str, ...]) -> list[str]:
@@ -698,6 +714,13 @@ def _current_table_requested_grouping(query: str, metric: str, source_action: st
     # "재고부족 품목 TOP"은 문장상 "품목별"이 생략됐어도 제품 단위
     # 부족 순위를 요구한다. 일반 제품 단어만으로 차원을 추정하지 않는다.
     compact = re.sub(r"\s+", "", str(query or ""))
+    rank_request = any(marker in compact for marker in ("TOP", "top", "상위", "1위", "최고", "가장많은", "가장큰"))
+    if rank_request and "요일" in compact:
+        day_only_text = compact.replace("요일별", "").replace("요일", "")
+        if not any(marker in day_only_text for marker in ("일자", "날짜", "일별")):
+            return "weekday"
+    if rank_request and any(marker in compact for marker in ("일자", "날짜", "일별")):
+        return "day"
     if metric == "shortage" and any(word in compact for word in ("제품", "품목")):
         return "product"
     if metric == "shortage" and any(word in compact for word in ("TOP", "top", "상위")):
@@ -1227,6 +1250,7 @@ def handle_current_table_followup_by_action(
         return bool(helpers["push_notice"](**kwargs, extra_meta=extra_meta))
 
     dispatch_helpers = dict(helpers)
+    dispatch_helpers["_requested_grouping"] = capability["requested_grouping"]
     dispatch_helpers["push_table"] = _push_table_with_capability
     dispatch_helpers["push_notice"] = _push_notice_with_capability
     handlers = _known_action_handlers()
@@ -1235,7 +1259,7 @@ def handle_current_table_followup_by_action(
 
     source_contract_priority = capability["status"] == "success" and ((
         kind in _CURRENT_TABLE_SOURCE_GROUPING_ALIASES
-        and capability["requested_grouping"] in {"month", "day"}
+        and capability["requested_grouping"] in {"month", "day", "weekday"}
     ) or (
         bool(_requested_source_semantic_filter(kind, query))
     ))

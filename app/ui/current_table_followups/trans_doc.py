@@ -297,6 +297,7 @@ def handle_trans_doc_followup(
 
     explicit_top = bool(re.search(r"(?:TOP|top|상위)\s*(\d{1,4})", t))
     wants_first = any(w in compact for w in ("1위", "최고", "가장많은", "가장큰"))
+    requested_grouping = str(helpers.get("_requested_grouping") or "").strip()
 
     amount_title_word = (
         "매입금액" if ("매입" in t or "입고" in t)
@@ -694,6 +695,7 @@ def handle_trans_doc_followup(
 
         split_rows = bool(
             trans_type_col
+            and requested_grouping != "weekday"
             and not _wants_total_time_amount()
             and not _has_explicit_transaction_side()
         )
@@ -722,8 +724,10 @@ def handle_trans_doc_followup(
         }
         work["요일"] = dt.dt.dayofweek.map(week_map).fillna("(일자없음)")
 
+        asks_best_weekday_only = requested_grouping == "weekday" and wants_first
         wants_weekday_amount = (
-            ("요일별" in t or "요일별" in compact)
+            requested_grouping == "weekday"
+            and not asks_best_weekday_only
             and any(
                 w in t or w in compact
                 for w in (
@@ -745,7 +749,7 @@ def handle_trans_doc_followup(
             and not any(w in compact for w in ("최고요일", "가장많은요일"))
         )
 
-        asks_best_day_week = (
+        asks_best_day_week = requested_grouping == "day" and (
             any(
                 w in compact
                 for w in (
@@ -768,27 +772,6 @@ def handle_trans_doc_followup(
                 and any(w in t for w in ("거래금액", "매입금액", "매출금액", "입고금액", "출고금액", "금액"))
                 and any(w in t for w in ("최고", "가장", "많은", "제일", "큰"))
                 and not wants_weekday_amount
-            )
-        )
-
-        asks_best_weekday_only = (
-            any(
-                w in compact
-                for w in (
-                    "거래금액최고요일",
-                    "매입금액최고요일",
-                    "매출금액최고요일",
-                    "입고금액최고요일",
-                    "출고금액최고요일",
-                    "최고요일",
-                    "가장많은요일",
-                )
-            )
-            or (
-                "요일" in t
-                and "일자" not in t
-                and any(w in t for w in ("거래금액", "매입금액", "매출금액", "입고금액", "출고금액", "금액"))
-                and any(w in t for w in ("최고", "가장", "많은", "제일", "큰"))
             )
         )
 

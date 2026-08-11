@@ -16356,6 +16356,64 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
         ):
             errors.append(f"trans-doc daily purchase amount rank: pushed={pushed!r}")
 
+        trans_weekday_df = pd.DataFrame(
+            [
+                {"거래명세서일자": "20260803", "거래명세서구분": "1", "거래처명": "V1", "공급가액": 90, "세액": 10, "합계금액": 100},
+                {"거래명세서일자": "20260810", "거래명세서구분": "3", "거래처명": "V2", "공급가액": 180, "세액": 20, "합계금액": 200},
+                {"거래명세서일자": "20260804", "거래명세서구분": "3", "거래처명": "V3", "공급가액": 45, "세액": 5, "합계금액": 50},
+            ]
+        )
+        handled, pushed = dispatch(
+            "거래명세서 공통 조회",
+            "현재표 요일별 거래금액",
+            trans_weekday_df,
+        )
+        weekday_summary_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        weekday_summary_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if (
+            not isinstance(weekday_summary_df, pd.DataFrame)
+            or weekday_summary_df["요일"].tolist() != ["월요일", "화요일"]
+            or pd.to_numeric(weekday_summary_df["거래금액"], errors="coerce").tolist() != [300, 50]
+            or "거래명세서구분" in weekday_summary_df.columns
+            or weekday_summary_meta.get("requested_grouping") != "weekday"
+            or weekday_summary_meta.get("requested_metric") != "transaction_amount"
+        ):
+            errors.append(f"trans-doc weekday amount summary: pushed={pushed!r}")
+
+        handled, pushed = dispatch(
+            "거래명세서 공통 조회",
+            "현재표 거래금액 최고 요일",
+            trans_weekday_df,
+        )
+        best_weekday_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        best_weekday_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if (
+            not isinstance(best_weekday_df, pd.DataFrame)
+            or len(best_weekday_df) != 1
+            or str(best_weekday_df.iloc[0].get("요일")) != "월요일"
+            or float(best_weekday_df.iloc[0].get("거래금액") or 0) != 300
+            or "일자" in best_weekday_df.columns
+            or best_weekday_meta.get("requested_grouping") != "weekday"
+        ):
+            errors.append(f"trans-doc best weekday: pushed={pushed!r}")
+
+        handled, pushed = dispatch(
+            "거래명세서 공통 조회",
+            "현재표 거래금액이 가장 많은 일자와 요일",
+            trans_weekday_df,
+        )
+        best_day_weekday_df = pushed[0][1].get("df") if handled and len(pushed) == 1 and pushed[0][0] == "table" else None
+        best_day_weekday_meta = dict(pushed[0][1].get("extra_meta") or {}) if handled and len(pushed) == 1 else {}
+        if (
+            not isinstance(best_day_weekday_df, pd.DataFrame)
+            or len(best_day_weekday_df) != 1
+            or str(best_day_weekday_df.iloc[0].get("일자")) != "2026-08-10"
+            or str(best_day_weekday_df.iloc[0].get("요일")) != "월요일"
+            or float(best_day_weekday_df.iloc[0].get("거래금액") or 0) != 200
+            or best_day_weekday_meta.get("requested_grouping") != "day"
+        ):
+            errors.append(f"trans-doc best date with weekday: pushed={pushed!r}")
+
         match_df = pd.DataFrame(
             [
                 {"거래명세서일자": "20260801", "거래처명": "V1", "공급가액": 10, "세액": 1, "합계금액": 11, "상세합계일치": "Y"},
