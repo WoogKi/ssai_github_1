@@ -15827,6 +15827,11 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "재고위치명": "본사 창고",
                     "재고수량": 9,
                     "재고금액": 900,
+                    "매입금액": 400,
+                    "출고수량": 5,
+                    "매출금액": 500,
+                    "부족예상수량": 1,
+                    "추세판정": "감소",
                 },
                 {
                     "제품코드": "P2",
@@ -15837,6 +15842,11 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "재고위치명": "전주 창고",
                     "재고수량": 1,
                     "재고금액": 100,
+                    "매입금액": 100,
+                    "출고수량": 2,
+                    "매출금액": 200,
+                    "부족예상수량": 0,
+                    "추세판정": "안정",
                 },
                 {
                     "제품코드": "P3",
@@ -15847,6 +15857,11 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "재고위치명": "본사 창고",
                     "재고수량": 5,
                     "재고금액": 500,
+                    "매입금액": 300,
+                    "출고수량": 4,
+                    "매출금액": 400,
+                    "부족예상수량": 2,
+                    "추세판정": "증가",
                 },
                 {
                     "제품코드": "P4",
@@ -15857,6 +15872,11 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "재고위치명": "전주 창고",
                     "재고수량": -2,
                     "재고금액": 200,
+                    "매입금액": 50,
+                    "출고수량": 1,
+                    "매출금액": 100,
+                    "부족예상수량": 3,
+                    "추세판정": "감소",
                 },
             ]
         )
@@ -15870,6 +15890,46 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
             ("현재표 제조사별 재고금액 최고", 20, "manufacturer", "stock_amount", "제조사명", "재고금액", [("한미약품", 1000)]),
         )
         errors: list[str] = []
+        intent_cases = (
+            ("추세판정 분석", "품목별 매출 추세 분석", "sales", "trend_judgement"),
+            ("추세판정 요약", "영업사원별 매출 예상", "", "trend_judgement"),
+            ("현재표 제품별 매입금액 TOP 20", "입고명세 조회", "purchase_amount", "product"),
+            ("현재표 제품별 출고수량 TOP 20", "출고명세 조회", "sales_quantity", "product"),
+            ("현재표 재고위치별 매출금액", "출고명세 조회", "sales", "stock_location"),
+        )
+        for query, source_action, expected_metric, expected_grouping in intent_cases:
+            source_meta = {"result_metric": "sales"} if "매출 추세" in source_action else {}
+            intent = dispatcher._current_table_followup_intent(
+                query, source_action, source_df, source_meta
+            )
+            capability = dispatcher._current_table_followup_capability(
+                df=source_df,
+                query=query,
+                source_action=source_action,
+                kind=dispatcher.detect_current_table_kind(source_action),
+                source_meta=source_meta,
+            )
+            if (
+                intent.get("requested_metric") != expected_metric
+                or intent.get("requested_grouping") != expected_grouping
+                or capability.get("status") != "success"
+                or dispatcher.classify_current_table_followup_intent(query) != "dataframe_table"
+            ):
+                errors.append(
+                    f"{query}: intent={intent!r} capability={capability!r}"
+                )
+
+        generic = importlib.import_module("app.ui.current_table_followups.generic")
+        if generic._find_common_column_filter(
+            source_df, "현재표 부족제품수 top 10 보여줘"
+        ) != ("", ""):
+            errors.append("rank-only shortage metric was misclassified as a text filter")
+        missing_filter = generic._find_common_column_filter(
+            source_df, "현재표 제조사명 존재하지않는회사 상세히 보여줘"
+        )
+        if missing_filter != ("제조사명", "존재하지않는회사"):
+            errors.append(f"missing-value filter intent was discarded={missing_filter!r}")
+
         for query, top_n, grouping, metric, group_col, metric_col, expected_pairs in cases:
             pushed: list[tuple[str, dict[str, Any]]] = []
 
@@ -15919,7 +15979,8 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
             if actual_seq != expected_seq:
                 errors.append(f"{query}: sequence={actual_seq!r} expected={expected_seq!r}")
         filter_cases = (
-            ("현재표 제조사명 한미약품 상세히 보여줘", 2),
+            ("현재표 제조사명 한미 상세히 보여줘", 2),
+            ("현재표 제조사명 존재하지않는회사 상세히 보여줘", 0),
             ("현재표 재고수량 0 이하 목록", 1),
             ("현재결과 재고수량 0 초과 목록", 3),
         )
@@ -15945,7 +16006,15 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                 source_meta={"result_status": "success"},
             )
             result_df = pushed[0][1].get("df") if len(pushed) == 1 and pushed[0][0] == "table" else None
-            if not handled or not isinstance(result_df, pd.DataFrame) or len(result_df) != expected_rows:
+            if expected_rows == 0:
+                if (
+                    not handled
+                    or len(pushed) != 1
+                    or pushed[0][0] != "notice"
+                    or "0건" not in str(pushed[0][1].get("query_summary") or "")
+                ):
+                    errors.append(f"{query}: zero-row filter route={handled!r}/{pushed!r}")
+            elif not handled or not isinstance(result_df, pd.DataFrame) or len(result_df) != expected_rows:
                 errors.append(f"{query}: route={handled!r} rows={len(result_df) if isinstance(result_df, pd.DataFrame) else None}")
 
         pushed = []

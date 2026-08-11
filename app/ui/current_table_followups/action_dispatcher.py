@@ -151,19 +151,9 @@ def classify_current_table_followup_intent(query: str) -> str:
     if any(marker in intent_compact for marker in explicit_table_markers):
         return "dataframe_table"
 
-    current_table_summary_dimensions = (
-        "추세판정별",
-        "제조사별",
-        "제조사명별",
-        "예상등급별",
-        "제품그룹별",
-        "제품구분별",
-        "제품분류별",
-        "판정결과별",
-    )
     current_table_summary_requests = ("요약", "집계", "분석", "매출")
     if (
-        any(dimension in intent_compact for dimension in current_table_summary_dimensions)
+        _requested_current_table_dimensions(text)
         and any(request in intent_compact for request in current_table_summary_requests)
     ):
         return "dataframe_table"
@@ -356,6 +346,10 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
 )
 
 _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    ("purchase_amount", "매입금액", ("매입금액",)),
+    ("transaction_amount", "거래금액", ("거래금액",)),
+    ("sales_quantity", "출고수량", ("출고수량", "매출수량")),
+    ("inbound_quantity", "입고수량", ("입고수량", "매입수량")),
     (
         "stock_quantity",
         "재고수량",
@@ -405,6 +399,18 @@ _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 )
 
 _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
+    "purchase_amount": frozenset(
+        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+    ),
+    "transaction_amount": frozenset(
+        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+    ),
+    "sales_quantity": frozenset(
+        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+    ),
+    "inbound_quantity": frozenset(
+        {"product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+    ),
     "stock_quantity": frozenset(
         {
             "product",
@@ -470,10 +476,11 @@ def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tupl
     compact = re.sub(r"\s+", "", str(query or ""))
     requested: list[tuple[int, tuple[str, str, tuple[str, ...]]]] = []
     for key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
+        field_terms = (label, *aliases)
         dimension_phrases = tuple(phrases) + tuple(
             f"{alias}{suffix}"
-            for alias in aliases
-            for suffix in ("별", "기준")
+            for alias in field_terms
+            for suffix in ("별", "기준", "분석", "집계", "요약")
         )
         positions = [
             compact.find(phrase)
@@ -511,7 +518,15 @@ def _current_table_metric_label(metric: str) -> str:
 def _current_table_requested_metrics(query: str) -> list[str]:
     compact = re.sub(r"\s+", "", str(query or ""))
     metrics: list[str] = []
-    if "예상매출" in compact:
+    if "매입금액" in compact:
+        metrics.append("purchase_amount")
+    elif "거래금액" in compact:
+        metrics.append("transaction_amount")
+    elif any(term in compact for term in ("출고수량", "매출수량")):
+        metrics.append("sales_quantity")
+    elif any(term in compact for term in ("입고수량", "매입수량")):
+        metrics.append("inbound_quantity")
+    elif "예상매출" in compact:
         metrics.append("forecast_sales")
     elif "매출" in compact:
         metrics.append("sales")
@@ -523,7 +538,11 @@ def _current_table_requested_metrics(query: str) -> list[str]:
         term in compact for term in ("재고수량", "현재재고수량", "최종재고수량")
     ):
         metrics.append("stock_quantity")
-    elif "재고" in compact and "부족" not in compact:
+    elif (
+        "재고" in compact
+        and "부족" not in compact
+        and not any(term in compact for term in ("재고위치", "재고처"))
+    ):
         metrics.append("stock")
     return metrics
 

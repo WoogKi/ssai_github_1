@@ -301,6 +301,15 @@ def _parser_cases() -> list[ParserCase]:
             },
         ),
         ParserCase(
+            query="매출거래명세서 매출처 소망약국 2026",
+            expected_action="거래명세서 공통 조회",
+            expected_params={
+                "ven_nm": "소망약국",
+                "date_from": "20260101",
+                "date_to": "20261231",
+            },
+        ),
+        ParserCase(
             query="한미 매입처 거래내역 조회",
             expected_action="입고명세 조회",
             expected_params={

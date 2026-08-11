@@ -580,6 +580,13 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
             continue
         if _looks_like_numeric_condition_value(value):
             continue
+        if re.fullmatch(
+            r"(?:금액|수량|건수|행수|품목수|제품수|거래처수|매입처수|수)?"
+            r"(?:top|상위|하위)\d*",
+            value,
+            re.IGNORECASE,
+        ):
+            continue
         if value in {"전체", "전부", "모두", "자료", "데이터"}:
             continue
         return col, value

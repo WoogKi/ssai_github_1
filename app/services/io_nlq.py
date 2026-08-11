@@ -1355,7 +1355,7 @@ def _extract_io_compound_named_values(text: str) -> dict[str, str]:
         return {}
 
     label_specs = (
-        ("ven_nm", ("거래처명", "거래처")),
+        ("ven_nm", ("거래처명", "거래처", "매출처명", "매출처")),
         ("physic_nm", ("제품명", "품목명", "상품명", "제품")),
         ("maker_nm", ("제조사명", "제조사", "제약사명", "제약사")),
         ("order_nm", ("발주처명", "발주처")),
