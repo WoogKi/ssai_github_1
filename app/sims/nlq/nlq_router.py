@@ -24,7 +24,11 @@ _DASHBOARD_NLQ_PHRASES = (
     "오늘의 경영점검",
     "SIMS 운영점검",
 )
-_DASHBOARD_NLQ_CONDITION_LABELS = ("제약사", "제조사", "발주처", "담당자")
+_DASHBOARD_NLQ_CONDITION_LABELS = (
+    "제약사", "제조사", "발주처", "담당자",
+    "재고기준", "재고위치", "제품그룹", "제품구분", "제품분류",
+    "거래처그룹", "거래처종류", "입출고구분",
+)
 
 
 def _resolve_dashboard_nlq_action(text: str) -> str:
@@ -1645,16 +1649,16 @@ def _apply_analytics_condition_aliases(params: Dict[str, Any], txt: str) -> Dict
 
 
 _ANALYTICS_NLQ_DEFAULT_KEYS = {
-    "품목별 매출 추세 분석": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "품목별 매출 추세 요약표": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "품목별 매출 예상": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "제약사별 매출 추세 분석": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "제약사별 매출 추세 분석 요약표": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 매출 추세 분석": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 매출 추세 요약표": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 매출 예상": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "제약사별 매출 추세 분석": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "제약사별 매출 추세 분석 요약표": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
     "매출처별 매출 예상": {"stock_mode", "io_gu_list"},
     "영업사원별 매출 예상": {"stock_mode", "io_gu_list"},
     "지역별 매출 예상": {"stock_mode", "io_gu_list"},
-    "품목별 재고부족현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "매입처별 재고부족 현황": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "품목별 재고부족현황": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "매입처별 재고부족 현황": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
 }
 
 
@@ -1946,11 +1950,21 @@ def _apply_company_default_to_analytics_nlq(
         clear_keys.add("product_di_list")
     if any(token in text_compact for token in ("전체제품분류", "전제품분류", "모든제품분류")):
         clear_keys.add("product_class_list")
-    # KPI NLQ never accepts a per-question IO override.  Preserve the shared
-    # parser behavior for non-KPI IO actions, but remove those aliases only
-    # at this KPI action boundary before the company Default is injected.
+    explicit_io_pairs = [
+        f"{gcode}:{tcode}"
+        for gcode, tcode in _context_business_code_pairs(text, ("입출고구분",))
+        if gcode == "0012"
+    ]
+    explicit_io_values = _analytics_nlq_code_values(out, "io_gu_list")
+    if explicit_io_pairs:
+        explicit_io_values = explicit_io_pairs
+    if explicit_io_values:
+        explicit_keys.add("io_gu_list")
+    # Keep only the one canonical exact-Tcode field at the KPI boundary.
     for key in ("io_gu", "io_gu_list", "io_gu_pairs", "dashboard_io_gu_list", "sales_io_gu_list", "io_gu_prefix"):
         out.pop(key, None)
+    if explicit_io_values:
+        out["io_gu_list"] = _profile_tcodes(explicit_io_values)
     product_di_code_values = _analytics_nlq_code_values(out, "product_di_list")
     product_di_name_values = _analytics_nlq_name_values(out, "product_di_list")
     explicit_product_di_pairs = _resolve_explicit_product_di_contract(text)
@@ -2054,6 +2068,10 @@ def _apply_company_default_to_analytics_nlq(
                 action, key, len(values), len(_analytics_nlq_option_codes(key)),
                 False, len(out["io_gu_list"]), source,
             )
+        elif key == "product_group_list":
+            pairs = [] if source == "explicit_clear" else _profile_code_pairs(value)
+            out["product_group_list"] = list(pairs)
+            out["dashboard_product_group_list"] = list(pairs)
         elif key in {"product_di_list", "product_class_list"}:
             pairs = [] if source == "explicit_clear" else _profile_code_pairs(value)
             normalized = normalize_analytics_multi_code_filter(
@@ -4986,8 +5004,11 @@ def _build_dashboard_nlq_params(
         **normalize_company_default_conditions(profile),
         "company_id": company_id,
     }
+    params["stock_cd_list"] = _profile_tcodes(params.get("stock_cd_list"))
+    params["io_gu_list"] = _profile_tcodes(params.get("io_gu_list"))
 
-    parsed_period = _apply_analytics_period_defaults(extract_params(text), text)
+    parsed_conditions = extract_params(text)
+    parsed_period = _apply_analytics_period_defaults(parsed_conditions, text)
     explicit_period = any(
         str(parsed_period.get(key) or "").strip()
         for key in ("date_from", "date_to", "month_from", "month_to")
@@ -5008,7 +5029,38 @@ def _build_dashboard_nlq_params(
             params.pop("date_to", None)
     params["dashboard_nlq_explicit_period"] = explicit_period
 
-    conditions, residual = _extract_dashboard_nlq_conditions(text)
+    stock_basis = _resolve_analytics_stock_basis(text)
+    if stock_basis.get("explicit"):
+        params["stock_mode"] = stock_basis["stock_mode"]
+    stock_codes = _analytics_nlq_code_values(parsed_conditions, "stock_cd_list")
+    if stock_codes:
+        params["stock_cd_list"] = list(stock_codes)
+    if any(token in re.sub(r"\s+", "", text) for token in ("전체재고위치", "전체창고", "전창고", "모든창고", "창고전체")):
+        params["stock_cd_list"] = []
+
+    for target_key, labels, expected_gcode in (
+        ("product_group_list", ("제품그룹",), "0013"),
+        ("product_di_list", ("제품구분",), "0004"),
+        ("product_class_list", ("제품분류",), "0031"),
+        ("vendor_group_list", ("거래처그룹",), "0019"),
+        ("vendor_kind_list", ("거래처종류",), "0009"),
+        ("io_gu_list", ("입출고구분",), "0012"),
+    ):
+        pairs = [
+            f"{gcode}:{tcode}"
+            for gcode, tcode in _context_business_code_pairs(text, labels)
+            if gcode == expected_gcode
+        ]
+        if pairs:
+            params[target_key] = (
+                _profile_tcodes(pairs)
+                if target_key == "io_gu_list"
+                else list(dict.fromkeys(pairs))
+            )
+
+    conditions, residual = _extract_dashboard_nlq_conditions(
+        stock_basis.get("text_without_stock_basis") or text
+    )
     mode, supplier_text = SCOPE_ALL, ""
     supplier_mode_explicit = False
     if "발주처" in conditions:

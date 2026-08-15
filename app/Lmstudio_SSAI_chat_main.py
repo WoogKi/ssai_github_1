@@ -170,7 +170,7 @@ from app.ui.sims_entry import (
     sims_mode_selector,
     render_sims_sidebar_controls,
 )
-from app.ui.sims_panel import _consume_dashboard_drilldown_request, render_sims_main, set_run_flag
+from app.ui.sims_panel import render_sims_main, set_run_flag
 from app.ui.sims_hub import render_sims_hub
 from app.db.db_config import load_mssql_config
 from app.ui.chat_middleware import set_chat_render_anchor,render_sims_chat_item
@@ -9668,16 +9668,6 @@ def _render_sims_sidebar_fragment() -> None:
     st.session_state.setdefault("__sims_q", "")
     st.session_state.setdefault("__sims_run", False)
 
-    # Dashboard 상세 보기 요청은 __sims_open 토글을 만들기 전에만 소비한다.
-    # 이 preflight가 실패하면 consumer가 요청을 폐기하고 기존 패널 상태를 보존한다.
-    _dashboard_drilldown_selected = _consume_dashboard_drilldown_request(
-        st.session_state.get("__sims_selected"),
-        widget_safe_phase=True,
-    )
-    if _dashboard_drilldown_selected:
-        st.session_state["__sims_selected"] = dict(_dashboard_drilldown_selected)
-        st.session_state["__sims_selected_snapshot"] = dict(_dashboard_drilldown_selected)
-
     sims_panel_open = st.toggle("SIMS 패널 열기", key="__sims_open")
 
     if not sims_panel_open:
@@ -9721,10 +9711,7 @@ def _render_sims_sidebar_fragment() -> None:
             except Exception:
                 selected = {}
 
-        dashboard_drilldown_active = isinstance(
-            st.session_state.get("__dashboard_drilldown_auto_run"), dict
-        )
-        if selected and not dashboard_drilldown_active:
+        if selected:
             new_selected = dict(selected)
             # 중요:
             # 카테고리/작업 선택만으로는 기존 SIMS 결과/채팅 표를 지우지 않는다.
@@ -9732,7 +9719,7 @@ def _render_sims_sidebar_fragment() -> None:
             st.session_state["__sims_selected"] = new_selected
             st.session_state["__sims_selected_snapshot"] = dict(new_selected)
             st.caption("선택됨. ‘SIMS 작업 열기’를 눌러 선택한 화면/폼을 여세요.")
-        elif not dashboard_drilldown_active:
+        else:
             st.session_state.pop("__sims_selected", None)
             st.session_state["__sims_selected_snapshot"] = {}
 

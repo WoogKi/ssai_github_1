@@ -63,52 +63,8 @@ SHORTAGE_GRADE_OPTIONS = [
 ]
 
 
-def _dashboard_stock_shortage_handoff(ns: str) -> dict[str, Any] | None:
-    """Seed the existing stock-shortage form for one consumed Dashboard request."""
-    request = st.session_state.get("__dashboard_drilldown_auto_run")
-    if not isinstance(request, dict) or str(request.get("target_action") or "") != "품목별 재고부족현황":
-        return None
-    params = dict(request.get("target_params") or {})
-    product_code = str(params.get("product_code") or "").strip()
-    if not product_code:
-        st.session_state.pop("__dashboard_drilldown_auto_run", None)
-        log.info("[dashboard.drilldown.handoff] action=discarded reason=missing_product_code")
-        return None
-    month_from = str(params.get("month_from") or "").strip()
-    evaluation_month = str(params.get("evaluation_month") or params.get("month_to") or "").strip()
-    try:
-        start_date = dt.date(int(month_from[:4]), int(month_from[4:6]), 1)
-        end_month_start = dt.date(int(evaluation_month[:4]), int(evaluation_month[4:6]), 1)
-        end_date = (end_month_start.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)
-    except (TypeError, ValueError):
-        st.session_state.pop("__dashboard_drilldown_auto_run", None)
-        log.info("[dashboard.drilldown.handoff] action=discarded reason=invalid_period")
-        return None
-    stock_label = "실재고" if str(params.get("stock_mode") or "") == "real" else "장부재고"
-    defaults = {
-        f"__analytics_stock_shortage_source__{ns}": "자동",
-        f"__analytics_stock_shortage_date_from__{ns}": start_date,
-        f"__analytics_stock_shortage_date_to__{ns}": end_date,
-        f"__analytics_stock_shortage_stock_mode__{ns}": stock_label,
-        f"__analytics_stock_shortage_physic_cd__{ns}": product_code,
-    }
-    for key, value in defaults.items():
-        st.session_state[key] = value
-    group_codes = list(params.get("product_group_list") or [])
-    code_prefills = {
-        f"__analytics_stock_shortage_product_group__{ns}": group_codes if len(group_codes) == 1 else [],
-        f"__analytics_stock_shortage_product_di__{ns}": list(params.get("product_di_list") or []),
-        f"__analytics_stock_shortage_product_class__{ns}": list(params.get("product_class_list") or []),
-        f"__analytics_stock_shortage_stock__{ns}": list(params.get("stock_cd_list") or []),
-    }
-    for widget_key, codes in code_prefills.items():
-        if codes:
-            st.session_state[f"__analytics_dashboard_prefill_codes::{widget_key}"] = [str(code) for code in codes]
-    return request
-
-
 def _apply_dashboard_code_prefill(key: str, options: list[dict[str, str]], *, multiple: bool) -> None:
-    """Translate a one-shot Dashboard code handoff into existing widget labels."""
+    """Translate company-profile code defaults into existing widget labels."""
     prefill_key = f"__analytics_dashboard_prefill_codes::{key}"
     codes = st.session_state.pop(prefill_key, None)
     if not isinstance(codes, list):
@@ -120,73 +76,21 @@ def _apply_dashboard_code_prefill(key: str, options: list[dict[str, str]], *, mu
     st.session_state[key] = labels if multiple else labels[0]
 
 
-def _apply_dashboard_stock_shortage_params(params: Dict[str, Any], request: dict[str, Any] | None) -> Dict[str, Any]:
-    """Retain code-only Dashboard scope in the existing stock-shortage query path."""
-    if not isinstance(request, dict):
-        return params
-    source = request.get("target_params") or {}
-    if not isinstance(source, dict):
-        return params
-    for key in (
-        "stock_cd_list", "vendor_group_list", "vendor_kind_list", "product_di_list",
-        "product_class_list", "io_gu_list", "io_gu_source", "manufacturer_test_codes", "amount_display_unit",
-        "product_supplier_scope_mode", "manufacturer_codes", "manufacturer_manager_codes",
-        "order_vendor_codes", "purchase_manager_codes",
-    ):
-        if key in source:
-            params[key] = list(source[key]) if isinstance(source[key], list) else source[key]
-    group_codes = source.get("product_group_list")
-    if isinstance(group_codes, list):
-        params["product_group_list"] = list(group_codes)
-        params["dashboard_product_group_list"] = list(group_codes)
-        # The target form has one legacy product-group selectbox.  Keep it empty
-        # for a multi-code Dashboard handoff so the code-pair OR filter is exact.
-        params["product_group"] = group_codes[0] if len(group_codes) == 1 else ""
-        params["product_group_nm"] = ""
-    for source_key, target_key in (
-        ("product_di_list", "dashboard_product_di_list"),
-        ("product_class_list", "dashboard_product_class_list"),
-        ("manufacturer_test_codes", "dashboard_manufacturer_codes"),
-    ):
-        if isinstance(source.get(source_key), list):
-            params[target_key] = list(source[source_key])
-    return params
-
-
-def _dashboard_stock_shortage_handoff_summary(params: Dict[str, Any]) -> str:
-    labels = (
-        ("stock_cd_list", "재고위치"),
-        ("vendor_group_list", "거래처그룹"),
-        ("vendor_kind_list", "거래처종류"),
-        ("product_group_list", "제품그룹"),
-        ("product_di_list", "제품구분"),
-        ("product_class_list", "제품분류"),
-        ("io_gu_list", "입출고구분"),
-        ("manufacturer_test_codes", "제약사코드"),
-    )
-    bits = []
-    for key, label in labels:
-        values = [str(value).strip() for value in (params.get(key) or []) if str(value).strip()]
-        if values:
-            bits.append(f"{label} {', '.join(values)}")
-    return " / ".join(bits)
-
-
 def _ns() -> str:
     return str(st.session_state.get("__sims_widget_ns", "0"))
 
 
 _ANALYTICS_DEFAULT_KEYS = {
-    "sales_trend": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "sales_trend_summary": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "sales_forecast": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "manufacturer_sales_trend": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "manufacturer_sales_trend_summary": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "sales_trend": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "sales_trend_summary": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "sales_forecast": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "manufacturer_sales_trend": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "manufacturer_sales_trend_summary": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
     "customer_sales_forecast": {"stock_mode", "io_gu_list"},
     "salesperson_sales_forecast": {"stock_mode", "io_gu_list"},
     "region_sales_forecast": {"stock_mode", "io_gu_list"},
-    "stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
-    "supplier_stock_shortage": {"stock_mode", "stock_cd_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "stock_shortage": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
+    "supplier_stock_shortage": {"stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "io_gu_list"},
 }
 
 _ANALYTICS_DEFAULT_OPTION_GCODES = {
@@ -309,6 +213,21 @@ def _attach_analytics_company_io(
         default_stock_mode = _clean_text(effective.get("stock_mode")).lower()
         if default_stock_mode in {"real", "book"}:
             out["stock_mode"] = default_stock_mode
+
+    explicit_product_group = bool(
+        _clean_text(out.get("product_group"))
+        or _clean_text(out.get("product_group_nm"))
+        or out.get("dashboard_product_group_list")
+    )
+    if not explicit_product_group:
+        product_group_pairs = [
+            str(value).strip()
+            for value in (effective.get("product_group_list") or [])
+            if str(value).strip()
+        ]
+        if product_group_pairs:
+            out["product_group_list"] = list(dict.fromkeys(product_group_pairs))
+            out["dashboard_product_group_list"] = list(dict.fromkeys(product_group_pairs))
 
     from app.services.analytics_sales_trend_service import normalize_analytics_stock_source_params
 
@@ -502,11 +421,12 @@ def _render_analytics_default_caption(adapter: Mapping[str, Any] | None) -> None
     labels = {
         "stock_mode": "재고기준",
         "stock_cd_list": "재고위치",
+        "product_group_list": "제품그룹",
         "product_di_list": "제품구분",
         "product_class_list": "제품분류",
     }
     applied = set(adapter.get("default_supported_keys") or [])
-    names = [labels[key] for key in ("stock_mode", "stock_cd_list", "product_di_list", "product_class_list") if key in applied]
+    names = [labels[key] for key in ("stock_mode", "stock_cd_list", "product_group_list", "product_di_list", "product_class_list") if key in applied]
     if names:
         st.caption(f"회사 Default 초기값: {' · '.join(names)} / 현재 화면에서 조건을 변경할 수 있습니다.")
 
@@ -2743,8 +2663,6 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
     ns = _ns()
     default_adapter = _prepare_analytics_company_defaults("stock_shortage", ns)
     _render_analytics_default_caption(default_adapter)
-    dashboard_handoff = _dashboard_stock_shortage_handoff(ns)
-
     with st.form(
         key=f"__analytics_stock_shortage_form__{ns}",
         clear_on_submit=False,
@@ -2831,10 +2749,6 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
 
         submitted = st.form_submit_button("조회", type="primary", width="stretch")
 
-    if dashboard_handoff is not None:
-        submitted = True
-        st.session_state.pop("__dashboard_drilldown_auto_run", None)
-
     if not submitted:
         return {
             "final": False,
@@ -2888,7 +2802,6 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         "shortage_grade": "" if shortage_grade == "전체" else shortage_grade,
         "top": int(top),
     }
-    params = _apply_dashboard_stock_shortage_params(params, dashboard_handoff)
     params = _attach_analytics_default_code_pairs(params, action_key="stock_shortage", ns=ns)
     params = _normalize_analytics_multi_code_params(params, action_key="stock_shortage")
     params = _attach_analytics_company_io(params, default_adapter)
@@ -2902,9 +2815,6 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         meta.setdefault("summary_type", "product_stock_shortage")
 
         query_condition = _build_sales_trend_query_condition(params, meta)
-        dashboard_scope_summary = _dashboard_stock_shortage_handoff_summary(params) if dashboard_handoff else ""
-        if dashboard_scope_summary:
-            query_condition = " / ".join(part for part in (query_condition, f"Dashboard 조건 {dashboard_scope_summary}") if part)
         if query_condition:
             query_condition = f"{query_condition} / 재고기준 {stock_label}"
             meta["query_summary"] = query_condition

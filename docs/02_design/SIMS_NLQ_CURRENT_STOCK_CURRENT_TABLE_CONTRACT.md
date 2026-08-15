@@ -1,10 +1,10 @@
 ---
 title: "SIMS NLQ·현재고·현재표 공식 계약"
-date: "2026-08-09"
-version: "v1.0"
+date: "2026-08-15"
+version: "v1.1"
 status: "official-design"
 baseline_branch: "feat/dashboard-stock-extension-20260727"
-baseline_commit: "6c83962bc1b079fe440d56a313de536cf9490651"
+baseline_commit: "091876e0149c5db6bd093885aebb7fe1d9a8e7e2"
 ---
 
 # SIMS NLQ·현재고·현재표 공식 계약
@@ -131,7 +131,14 @@ baseline_commit: "6c83962bc1b079fe440d56a313de536cf9490651"
 - 처리 가능한 질문은 deterministic current-table handler가 우선한다.
 - 현재 회사·방의 마지막 확정 full/current-table source를 사용한다.
 - display subtotal, 반복 공란, 화면 표본과 compact snapshot을 계산 원본으로 쓰지 않는다.
-- 최신 파생표 생성 후에는 latest-derived binding으로 해당 표를 다음 현재표로 사용한다.
+- 원본 current-table은 다음 성공한 일반 신규 표 조회 전까지 유지한다.
+- 현재표 후속질문의 파생 표시·집계·필터·TOP 결과는 자체 full source를 보존할 수
+  있지만 원본 current-table로 승격하지 않는다.
+- 후속질문은 원본 full source만 사용하며 `source_call_count=0`을 유지한다.
+- Dashboard payload(`data=None`)와 Dashboard local detail·필터·Excel은
+  current-table을 교체하지 않는다.
+- 실패, `no_data`, `unsupported`와 compact 렌더는 기존 current-table을 유지한다.
+- 일반 신규 표 조회가 성공한 경우에만 해당 full source로 current-table을 교체한다.
 - 필요한 컬럼이 없을 때 부모표로 자동 fallback하지 않는다.
 
 ### 5.2 현재고 제품별 재고수량 TOP
@@ -203,5 +210,7 @@ parsed -> resolved -> query -> result
 - display/full/current-table/export 분리와 실제 0 보존
 - 제품재고현황 무라벨 4-role 통합검색과 조건 라벨
 - 현재표 inventory TOP 7열과 중복 없는 합계
-- latest-derived binding과 foreign company/room 차단
+- 후속 파생표 비승격, 다음 성공 신규 표에서만 원본 교체
+- Dashboard·실패 상태·compact 렌더의 current-table 비변경
+- 후속 `source_call_count=0`과 foreign company/room 차단
 - 상태·metric·grouping·grain·기간 meta 정합성

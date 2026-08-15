@@ -1,8 +1,8 @@
 # SIMS AI Dashboard · KPI · NLQ 공통 조회조건 확정안 ver03
 
 - **최초 작성일:** 2026-07-22
-- **최종 개정일:** 2026-08-09
-- **기준 브랜치/커밋:** `feat/dashboard-stock-extension-20260727` / `6c83962`
+- **최종 개정일:** 2026-08-15
+- **기준 브랜치/커밋:** `feat/dashboard-stock-extension-20260727` / `091876e`
 - **상태:** 현재 운영 공식 정책
 - **연계 문서:** [NLQ·현재고·현재표 계약](SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md)
 
@@ -138,7 +138,14 @@ table_created=false
 
 - 현재 회사·현재 방의 마지막 확정 full source를 사용한다.
 - 화면의 일부 행, 반복값 공란 display copy와 compact snapshot을 원본으로 쓰지 않는다.
-- 최신 파생표가 생성되면 해당 파생표를 다음 현재표로 binding한다.
+- 원본 current-table은 다음 성공한 일반 신규 표 조회 전까지 유지한다.
+- 현재표 후속질문의 파생 표시·집계·필터·TOP 결과는 자체 full source를 보존할 수
+  있지만 새 원본 current-table로 승격하지 않는다.
+- 현재표 후속질문은 원본 full source를 사용하며 `source_call_count=0`을 유지한다.
+- Dashboard payload(`data=None`)와 Dashboard local detail·필터·Excel은
+  current-table을 교체하지 않는다.
+- 실패, `no_data`, `unsupported`와 compact 렌더도 기존 current-table을 유지한다.
+- 일반 신규 표 조회가 성공한 경우에만 해당 full source로 current-table을 교체한다.
 - 부모표로 자동 fallback하지 않는다.
 - current-table deterministic handler가 처리 가능한 질문은 DB와 LLM보다 우선한다.
 - source table에 필요한 컬럼이 없으면 `column_unavailable`로 종료한다.
@@ -161,5 +168,6 @@ table_created=false
 - 준비율 경고기준은 profile/current 설정값과 일치한다.
 - 현재고의 `io_gu_list` 예외가 다른 action에 확산되지 않는다.
 - unsupported 요청의 requested metric/grouping이 로그와 JSONL에 보존된다.
-- 현재표는 마지막 확정 full source만 사용한다.
+- 현재표는 다음 성공한 일반 신규 표 조회 전까지 마지막 확정 원본 full source를
+  유지하며 파생 결과, Dashboard, 실패 상태와 compact 렌더로 교체하지 않는다.
 - vendor role fallback과 회사 간 profile 혼입이 없다.

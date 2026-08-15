@@ -1364,122 +1364,6 @@ def _current_action_payload_key(action: str) -> Optional[str]:
     }.get(str(action or "").strip())
 
 
-def _consume_dashboard_drilldown_request(
-    selected: Optional[Dict[str, str]],
-    *,
-    widget_safe_phase: bool = True,
-) -> Optional[Dict[str, str]]:
-    """Fail closed and consume one Dashboard drill-down request before panel widgets."""
-    ss = st.session_state
-    request = ss.get("__dashboard_drilldown_request")
-    if not isinstance(request, dict):
-        return selected
-    token_present = bool(str(request.get("request_token") or "").strip())
-    target_category = str(request.get("target_category") or "").strip()
-    target_action = str(request.get("target_action") or "").strip()
-    current_room_id = get_current_chat_room_id()
-    current_company_id = str(_panel_current_company_stamp().get("company_id") or "")
-    cache = ss.get("__dashboard_lite_result")
-    cache_event = str((cache or {}).get("dashboard_event_id") or "") if isinstance(cache, dict) else ""
-    reasons: list[str] = []
-    if request.get("source") != "dashboard":
-        reasons.append("invalid_source")
-    if not token_present:
-        reasons.append("missing_token")
-    if str(request.get("source_room_id") or "") != current_room_id:
-        reasons.append("room_mismatch")
-    if str(request.get("company_id") or "") != current_company_id:
-        reasons.append("company_mismatch")
-    if not cache_event or str(request.get("source_dashboard_event_id") or "") != cache_event:
-        reasons.append("stale_event")
-    if target_action not in (_CATEGORIES.get(target_category, {}).get("actions", {})):
-        reasons.append("target_not_registered")
-    target_params = request.get("target_params") or {}
-    if not str(target_params.get("product_code") or "").strip():
-        reasons.append("missing_target_code")
-    if not widget_safe_phase:
-        reasons.append("unsafe_widget_phase")
-
-    panel_open_before = bool(ss.get("__sims_open"))
-    if reasons:
-        ss.pop("__dashboard_drilldown_request", None)
-        ss.pop("__dashboard_drilldown_auto_run", None)
-        log.info(
-            "[dashboard.drilldown.consume] stage=discarded request_token_present=%s "
-            "target_action=%s panel_open_before=%s panel_open_after=%s "
-            "widget_safe_phase=%s discard_reason=%s auto_run=False result_push_expected=False",
-            token_present,
-            target_action,
-            panel_open_before,
-            bool(ss.get("__sims_open")),
-            widget_safe_phase,
-            ",".join(reasons),
-        )
-        return selected
-
-    target = {"category": target_category, "action": target_action}
-    state_keys = (
-        "__dashboard_drilldown_auto_run",
-        "__sims_selected",
-        "__sims_selected_snapshot",
-        "__sims_panel_active",
-        "__sims_open",
-        "__sims_run_flag",
-    )
-    missing = object()
-    previous = {key: ss.get(key, missing) for key in state_keys}
-    try:
-        # This function is called by the sidebar preflight before the toggle is created.
-        ss["__dashboard_drilldown_auto_run"] = dict(request)
-        ss["__sims_selected"] = target
-        ss["__sims_selected_snapshot"] = dict(target)
-        ss["__sims_panel_active"] = True
-        ss["__sims_open"] = True
-        ss["__sims_run_flag"] = True
-    except Exception:
-        for key, value in previous.items():
-            if value is missing:
-                ss.pop(key, None)
-            else:
-                ss[key] = value
-        ss.pop("__dashboard_drilldown_request", None)
-        log.warning(
-            "[dashboard.drilldown.consume] stage=discarded request_token_present=%s "
-            "target_action=%s panel_open_before=%s panel_open_after=%s "
-            "widget_safe_phase=%s discard_reason=state_prepare_failed "
-            "auto_run=False result_push_expected=False",
-            token_present,
-            target_action,
-            panel_open_before,
-            bool(ss.get("__sims_open")),
-            widget_safe_phase,
-        )
-        return selected
-
-    log.info(
-        "[dashboard.drilldown.consume] stage=prepared request_token_present=%s "
-        "target_action=%s panel_open_before=%s panel_open_after=%s "
-        "widget_safe_phase=%s discard_reason= auto_run=True result_push_expected=True",
-        token_present,
-        target_action,
-        panel_open_before,
-        bool(ss.get("__sims_open")),
-        widget_safe_phase,
-    )
-    ss.pop("__dashboard_drilldown_request", None)
-    log.info(
-        "[dashboard.drilldown.consume] stage=consumed request_token_present=%s "
-        "target_action=%s panel_open_before=%s panel_open_after=%s "
-        "widget_safe_phase=%s discard_reason= auto_run=True result_push_expected=True",
-        token_present,
-        target_action,
-        panel_open_before,
-        bool(ss.get("__sims_open")),
-        widget_safe_phase,
-    )
-    return target
-
-
 def _clear_current_action_payload(action: str) -> None:
     key = _current_action_payload_key(action)
     if key:
@@ -2709,10 +2593,6 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
     # 최종 여부 플래그는 payload 렌더링 시점에 다시 세팅
     ss["__sims_was_final"] = False
 
-    # Dashboard 요청은 패널 컨텍스트 위젯보다 먼저 소비한다. 일반 경로에서는
-    # 사이드바 preflight가 이미 소비하므로 여기서는 no-op이다.
-    selected = _consume_dashboard_drilldown_request(selected, widget_safe_phase=False)
-
     # 사이드 컨트롤(열림/닫힘 등) — 필요 시 보이기
     render_sims_context_controls()
     if not selected or not selected.get("category") or not selected.get("action"):
@@ -3336,47 +3216,6 @@ def _render_simple_analysis_header(payload: Dict[str, Any]) -> None:
         with p6:
             st.success(f"당월 진척률 : {_fmt_header_num(current_progress, '%', decimals=2)}")
 
-# ==========================================================
-# 🧩 현재표 source 정리
-# ==========================================================
-def _clear_current_table_source_after_empty_payload(action: str, payload: Dict[str, Any], reason: str = "") -> None:
-    """
-    최종 조회가 표 없는 결과(0건/안내문)로 끝났을 때 이전 현재표가 계속 잡히는 것을 방지한다.
-
-    예:
-    - 검증 화면 조회 결과가 0건인데 이전 세금계산서 표가 현재표 source로 남는 경우
-    - 이후 사용자가 "현재표 불일치 목록"을 입력하면 이전 표를 분석하는 문제 차단
-    """
-    try:
-        ss = st.session_state
-        prev_key = ss.get("__sims_current_table_source_key")
-        prev_action = ss.get("__sims_current_table_source_action")
-
-        for key in (
-            "__sims_current_table_source_key",
-            "__sims_current_table_source_action",
-            "__sims_current_table_source_analysis_ctx",            
-            "__sims_last_table_key",
-            "__sims_last_table_action",
-            "__sims_context",
-            "__sims_context_text",
-            "__sims_context_obj",
-            "__sims_analysis_ctx",
-            "__sims_latest_analysis_key",            
-        ):
-            ss.pop(key, None)
-
-        log.info(
-            "[panel] cleared current table source after empty final payload action=%s prev_key=%s prev_action=%s reason=%s",
-            action,
-            prev_key,
-            prev_action,
-            reason or str(payload.get("action") or payload.get("title") or ""),
-        )
-    except Exception:
-        log.exception("[panel] clear current table source after empty final payload failed")
-
-
 def _payload_has_table_rows(payload: Dict[str, Any], df_full: Any, df_disp: Any) -> bool:
     """payload가 현재표 source로 승격할 수 있는 실제 표 행을 갖는지 판정."""
     try:
@@ -3603,15 +3442,9 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
     df_full = payload.get("df")
     df_disp = payload.get("df_display")
 
-    # 최종 조회가 표 없는 안내/0건으로 끝난 경우, 이전 현재표 source를 제거한다.
-    # 그렇지 않으면 다음 "현재표 ..." 질문이 이전 조회표를 잘못 잡는다.
+    # 표 없는 final 결과는 안내 메시지만 남긴다. 원본 current-table은 다음
+    # 성공한 일반 신규 표 조회 전까지 source/action/context/full source를 유지한다.
     if final and not _payload_has_table_rows(payload, df_full, df_disp):
-        _clear_current_table_source_after_empty_payload(
-            action,
-            payload,
-            reason="no_table_rows",
-        )
-
         # 0건 조회도 채팅창에 안내 메시지를 1회 올린다.
         # 표가 없다고 skip되면 사용자는 조회가 실행됐는지 알 수 없다.
         try:

@@ -29,7 +29,17 @@ from app.services.product_supplier_scope_service import apply_product_supplier_s
 
 
 FACTS_KIND = "SIMS_DASHBOARD_FACTS_V01"
-STOCK_READY_THRESHOLD_PCT = 98.0
+DASHBOARD_LITE_SETTING_DEFAULTS = {
+    "stock_mode": "real",
+    "major_purchase_vendor_days": 90,
+    "risk_analysis_days": 90,
+    "overstock_inactive_days": 90,
+    "readiness_warning_pct": 50.0,
+    "risk_quick_view_count": 30,
+    "amount_display_unit": "auto",
+}
+# Compatibility name for callers that use the service-level fallback directly.
+STOCK_READY_THRESHOLD_PCT = float(DASHBOARD_LITE_SETTING_DEFAULTS["readiness_warning_pct"])
 MAX_DASHBOARD_MONTHS = 13
 
 log = logging.getLogger("ssai.sims.dashboard_lite")
@@ -70,7 +80,12 @@ def _dashboard_month_count(month_from: str, month_to: str) -> int:
     return (y2 - y1) * 12 + (m2 - m1) + 1
 
 
-def default_dashboard_lite_scope(today: date | None = None, evaluation_month: Any = None) -> dict[str, str]:
+def default_dashboard_lite_settings() -> dict[str, Any]:
+    """Return a copy of the central non-date Dashboard defaults."""
+    return dict(DASHBOARD_LITE_SETTING_DEFAULTS)
+
+
+def default_dashboard_lite_scope(today: date | None = None, evaluation_month: Any = None) -> dict[str, Any]:
     """Return six completed display months and a separate evaluation month."""
     today = today or date.today()
     eval_month = _normalize_yyyymm(evaluation_month) or f"{today.year:04d}{today.month:02d}"
@@ -84,14 +99,8 @@ def default_dashboard_lite_scope(today: date | None = None, evaluation_month: An
         "date_to": _last_day_yyyymm(month_to),
         "policy_date": today.strftime("%Y%m%d"),
         "source_mode": "monthly_book",
-        "stock_mode": "real",
         "io_gu_list": [],
-        "major_purchase_vendor_days": 90,
-        "risk_analysis_days": 90,
-        "overstock_inactive_days": 90,
-        "readiness_warning_pct": 98.0,
-        "risk_quick_view_count": 30,
-        "amount_display_unit": "auto",
+        **default_dashboard_lite_settings(),
     }
 
 
@@ -103,8 +112,7 @@ def normalize_dashboard_lite_params(
     """Normalize and validate Dashboard Lite scope before any DB call."""
     today = today or date.today()
     raw = dict(params or {})
-    evaluation_month = _normalize_yyyymm(raw.get("evaluation_month")) or _normalize_yyyymm(raw.get("month_to"))
-    defaults = default_dashboard_lite_scope(today=today, evaluation_month=evaluation_month)
+    evaluation_month = _normalize_yyyymm(raw.get("evaluation_month"))
 
     month_from = _normalize_yyyymm(raw.get("month_from"))
     month_to = _normalize_yyyymm(raw.get("month_to"))
@@ -112,6 +120,10 @@ def normalize_dashboard_lite_params(
         raise ValueError("Dashboard Lite 조회에는 시작월과 종료월이 필요합니다.")
     if month_from > month_to:
         raise ValueError("Dashboard Lite 시작월이 종료월보다 늦습니다.")
+    evaluation_month = evaluation_month or _add_months(month_to, 1)
+    if evaluation_month <= month_to:
+        raise ValueError("Dashboard Lite 평가월은 종료월보다 뒤여야 합니다.")
+    defaults = default_dashboard_lite_scope(today=today, evaluation_month=evaluation_month)
 
     month_count = _dashboard_month_count(month_from, month_to)
     if month_count <= 0:
@@ -122,7 +134,7 @@ def normalize_dashboard_lite_params(
     out = dict(raw)
     out["month_from"] = month_from
     out["month_to"] = month_to
-    out["evaluation_month"] = evaluation_month or month_to
+    out["evaluation_month"] = evaluation_month
     out["date_from"] = re.sub(r"\D", "", str(out.get("date_from") or ""))[:8] or f"{month_from}01"
     out["date_to"] = re.sub(r"\D", "", str(out.get("date_to") or ""))[:8] or (
         today.strftime("%Y%m%d") if month_to == f"{today.year:04d}{today.month:02d}" else _last_day_yyyymm(month_to)
@@ -787,11 +799,11 @@ def _dashboard_filter_facts(params: Mapping[str, Any]) -> dict[str, Any]:
         "order_vendor_codes": supplier_scope["order_vendor_codes"],
         "purchase_manager_codes": supplier_scope["purchase_manager_codes"],
         "io_gu_tcodes": _clean_list_param(params.get("io_gu_list")),
+        "io_gu_source": str(params.get("io_gu_source") or ""),
         "stock_mode": str(params.get("stock_mode") or "real"),
         "amount_display_unit": str(params.get("amount_display_unit") or "auto"),
         "thresholds": {
             "major_purchase_vendor_days": params.get("major_purchase_vendor_days"),
-            "risk_analysis_days": params.get("risk_analysis_days"),
             "overstock_inactive_days": params.get("overstock_inactive_days"),
             "readiness_warning_pct": params.get("readiness_warning_pct"),
             "risk_quick_view_count": params.get("risk_quick_view_count"),
@@ -1155,6 +1167,7 @@ def _classify_stock_risk_rows(
     rows: list[dict[str, Any]],
     *,
     readiness_warning_pct: float,
+    overstock_inactive_days: int = 90,
 ) -> list[dict[str, Any]]:
     """Add v0.2 stock-risk facts without changing the existing shortage facts."""
     started = time.perf_counter()
@@ -1190,6 +1203,8 @@ def _classify_stock_risk_rows(
         "위험보정재고준비율",
         "위험보정부족예상수량",
         "위험보정부족예상금액",
+        "stock_cover_days",
+        "stock_cover_daily_demand_qty",
     ]
     numeric = pd.DataFrame(
         {
@@ -1205,7 +1220,15 @@ def _classify_stock_risk_rows(
     required_numeric_cols = [
         col
         for col in numeric_cols
-        if col not in {"3개월필요수량", "위험보정잔여예상수요", "위험보정재고준비율", "위험보정부족예상수량", "위험보정부족예상금액"}
+        if col not in {
+            "3개월필요수량",
+            "위험보정잔여예상수요",
+            "위험보정재고준비율",
+            "위험보정부족예상수량",
+            "위험보정부족예상금액",
+            "stock_cover_days",
+            "stock_cover_daily_demand_qty",
+        }
     ]
     required_present = required_present.fillna(False).astype(bool) & numeric[required_numeric_cols].notna().all(axis=1)
     demand = numeric["위험보정잔여예상수요"].where(
@@ -1245,9 +1268,12 @@ def _classify_stock_risk_rows(
     status.loc[normal] = "적정"
     reason.loc[normal] = "준비율 경고기준 이상"
 
-    three_month_required_qty = numeric["3개월필요수량"].fillna(0.0)
-    overstock_candidate = normal & ~demand_surge & three_month_required_qty.gt(0) & stock.gt(three_month_required_qty)
-    overstock_candidate_qty = (stock - three_month_required_qty).clip(lower=0).where(overstock_candidate, 0.0)
+    cover_days = numeric["stock_cover_days"]
+    daily_demand = numeric["stock_cover_daily_demand_qty"]
+    overstock_threshold = float(overstock_inactive_days)
+    overstock_candidate = normal & ~demand_surge & cover_days.ge(overstock_threshold)
+    threshold_required_qty = daily_demand * overstock_threshold
+    overstock_candidate_qty = (stock - threshold_required_qty).clip(lower=0).where(overstock_candidate, 0.0)
     overstock_candidate_amt = overstock_candidate_qty * numeric["stock_valuation_unit_price"]
 
     work["재고위험상태"] = status
@@ -1257,7 +1283,9 @@ def _classify_stock_risk_rows(
     work["과잉후보수량"] = overstock_candidate_qty.fillna(0.0)
     work["과잉후보금액"] = overstock_candidate_amt.fillna(0.0)
     work["과잉후보사유"] = pd.Series("", index=work.index, dtype="object")
-    work.loc[overstock_candidate, "과잉후보사유"] = "현재재고가 3개월 필요수량 초과"
+    work.loc[overstock_candidate, "과잉후보사유"] = f"재고커버일 {int(overstock_inactive_days)}일 이상"
+    work["과잉·저활성 근거"] = pd.Series("재고커버일 기준 미해당", index=work.index, dtype="object")
+    work.loc[overstock_candidate, "과잉·저활성 근거"] = work.loc[overstock_candidate, "과잉후보사유"]
     rows[:] = work.drop(columns=["_stock_risk_required_values_present"], errors="ignore").to_dict("records")
 
     item_identity = _stock_risk_item_identity(work)
@@ -1568,8 +1596,9 @@ def _attach_major_purchase_vendors(
     evaluation_month: str,
     history_month_from: str,
     source_call_count: int,
+    vendor_lookback_days: int,
 ) -> dict[str, Any]:
-    """Assign exactly one completed-month purchase vendor to each product row."""
+    """Aggregate vendor risk using the representative vendor from inbound day facts."""
     started = time.perf_counter()
     recent_from = _add_months(evaluation_month, -6)
     recent_to = _add_months(evaluation_month, -1)
@@ -1645,7 +1674,7 @@ def _attach_major_purchase_vendors(
         grouped = pd.DataFrame(columns=["제품코드", "매입처코드", "매입처명"])
     aggregate_ms = int((time.perf_counter() - aggregate_started) * 1000)
 
-    assignments: dict[str, dict[str, Any]] = {}
+    legacy_assignments: dict[str, dict[str, Any]] = {}
     rank_started = time.perf_counter()
     if not grouped.empty:
         for col in ("최근6완료월순매입금액", "최근6완료월순입고수량", "지원기간순매입금액", "지원기간순입고수량"):
@@ -1701,7 +1730,7 @@ def _attach_major_purchase_vendors(
                 ascending=[True, True, False, False, False, True],
                 kind="stable",
             ).drop_duplicates(subset=["제품코드"], keep="first")
-            assignments = {
+            legacy_assignments = {
                 str(product_code or "").strip(): winner
                 for product_code, winner in winners.set_index("제품코드").to_dict("index").items()
             }
@@ -1709,34 +1738,36 @@ def _attach_major_purchase_vendors(
 
     status_risk_rows: list[dict[str, Any]] = []
     risk_rows: list[dict[str, Any]] = []
+    basis_cutoff_date = ""
     for row in rows:
         product_code = str(row.get("product_code") or "").strip()
-        winner = assignments.get(product_code) if product_code else None
+        vendor_code = str(row.get("recent_inbound_vendor_code") or "").strip()
+        vendor_name_value = str(row.get("recent_inbound_vendor_name") or "").strip()
+        vendor_source = str(row.get("recent_inbound_vendor_source") or "none").strip()
+        basis_cutoff_date = basis_cutoff_date or str(row.get("inbound_data_cutoff_date") or "").strip()
         if not product_code:
             status = "product_code_missing"
             vendor_name = "매입처 미확인"
-        elif not winner:
+        elif vendor_code:
+            status = "assigned"
+            vendor_name = vendor_name_value or vendor_code
+        elif vendor_source == "none":
             status = "recent_purchase_none"
             vendor_name = "최근 매입 없음"
-        elif not str(winner.get("매입처코드") or "").strip():
+        else:
             status = "vendor_unknown"
             vendor_name = "매입처 미확인"
-        else:
-            status = "assigned"
-            vendor_name = str(winner.get("매입처명") or "").strip() or str(winner.get("매입처코드") or "").strip()
+        selection_basis = {
+            "actual_inbound": f"최근 {int(vendor_lookback_days)}일 정상 입고수량",
+            "master_order_vendor": "제품마스터 발주처 fallback",
+        }.get(vendor_source, "")
         row.update(
             {
-                "주요매입처코드": str((winner or {}).get("매입처코드") or "").strip(),
+                "주요매입처코드": vendor_code,
                 "주요매입처명": vendor_name,
                 "주요매입처상태": status,
-                "주요매입처선정기준": str((winner or {}).get("주요매입처선정기준") or ""),
-                "최근6완료월순매입금액": float((winner or {}).get("최근6완료월순매입금액") or 0),
-                "최근6완료월순입고수량": float((winner or {}).get("최근6완료월순입고수량") or 0),
-                "최근6완료월최근매입월": str((winner or {}).get("최근6완료월최근매입월") or ""),
-                "지원기간순매입금액": float((winner or {}).get("지원기간순매입금액") or 0),
-                "지원기간순입고수량": float((winner or {}).get("지원기간순입고수량") or 0),
-                "지원기간최근매입월": str((winner or {}).get("지원기간최근매입월") or ""),
-                "주요매입처자료완전": bool(winner and status == "assigned"),
+                "주요매입처선정기준": selection_basis,
+                "주요매입처자료완전": bool(status == "assigned"),
                 "주요매입처미확인사유": "" if status == "assigned" else status,
             }
         )
@@ -1790,12 +1821,14 @@ def _attach_major_purchase_vendors(
         "total_adjusted_shortage_amount": total_amount, "assigned_adjusted_shortage_amount": assigned_amount, "unassigned_adjusted_shortage_amount": total_amount - assigned_amount,
         "recent_purchase_none_rows": int(sum(r.get("주요매입처상태") == "recent_purchase_none" for r in unassigned)), "recent_purchase_none_amount": float(sum(float(r.get("위험보정부족예상금액") or 0) for r in unassigned if r.get("주요매입처상태") == "recent_purchase_none")),
         "vendor_unknown_rows": int(sum(r.get("주요매입처상태") in {"vendor_unknown", "product_code_missing"} for r in unassigned)), "vendor_unknown_amount": float(sum(float(r.get("위험보정부족예상금액") or 0) for r in unassigned if r.get("주요매입처상태") in {"vendor_unknown", "product_code_missing"})),
-        "basis_completed_month_count": 6, "basis_month_from": recent_from, "basis_month_to": recent_to,
+        "basis_mode": "inbound_daily_facts", "basis_days": int(vendor_lookback_days), "basis_cutoff_date": basis_cutoff_date,
+        "fallback_policy": "master_order_vendor_only_when_no_actual_inbound",
+        "legacy_completed_month_count": 6, "legacy_basis_month_from": recent_from, "legacy_basis_month_to": recent_to,
         "purchase_source_rows": int(len(source)), "purchase_positive_rows": int(purchase_positive_rows), "purchase_nonpositive_rows": int(purchase_nonpositive_rows),
         "purchase_unclassified_rows": int(purchase_unclassified_rows), "missing_product_code_rows": int(missing_product_code_rows),
         "missing_month_rows": int(missing_month_rows), "invalid_numeric_rows": int(invalid_numeric_rows), "other_excluded_rows": int(other_excluded_rows),
     }
-    log.info("[dashboard.vendor_stock_risk] inventory_rows=%s risk_rows=%s assigned_rows=%s unassigned_rows=%s vendor_rows=%s status_risk_rows=%s status_emergency_rows=%s status_warning_rows=%s amount_positive_risk_rows=%s amount_positive_emergency_rows=%s amount_positive_warning_rows=%s amount_zero_risk_rows=%s amount_zero_emergency_rows=%s amount_zero_warning_rows=%s total_adjusted_shortage_amount=%s assigned_adjusted_shortage_amount=%s unassigned_adjusted_shortage_amount=%s recent_purchase_none_rows=%s vendor_unknown_rows=%s top_vendor_count=%s purchase_source_rows=%s purchase_positive_rows=%s purchase_nonpositive_rows=%s purchase_unclassified_rows=%s missing_product_code_rows=%s missing_month_rows=%s invalid_numeric_rows=%s other_excluded_rows=%s major_vendor_aggregate_ms=%s major_vendor_rank_ms=%s vendor_risk_group_ms=%s basis_month_from=%s basis_month_to=%s source_call_count=%s elapsed_ms=%s", summary["inventory_rows"], summary["risk_rows"], summary["assigned_rows"], summary["unassigned_rows"], summary["vendor_count"], summary["status_risk_rows"], summary["status_emergency_rows"], summary["status_warning_rows"], summary["amount_positive_risk_rows"], summary["amount_positive_emergency_rows"], summary["amount_positive_warning_rows"], summary["amount_zero_risk_rows"], summary["amount_zero_emergency_rows"], summary["amount_zero_warning_rows"], summary["total_adjusted_shortage_amount"], summary["assigned_adjusted_shortage_amount"], summary["unassigned_adjusted_shortage_amount"], summary["recent_purchase_none_rows"], summary["vendor_unknown_rows"], summary["top_vendor_count"], summary["purchase_source_rows"], summary["purchase_positive_rows"], summary["purchase_nonpositive_rows"], summary["purchase_unclassified_rows"], summary["missing_product_code_rows"], summary["missing_month_rows"], summary["invalid_numeric_rows"], summary["other_excluded_rows"], aggregate_ms, rank_ms, vendor_risk_group_ms, recent_from, recent_to, int(source_call_count), int((time.perf_counter() - started) * 1000))
+    log.info("[dashboard.vendor_stock_risk] inventory_rows=%s risk_rows=%s assigned_rows=%s unassigned_rows=%s vendor_rows=%s status_risk_rows=%s status_emergency_rows=%s status_warning_rows=%s amount_positive_risk_rows=%s amount_positive_emergency_rows=%s amount_positive_warning_rows=%s amount_zero_risk_rows=%s amount_zero_emergency_rows=%s amount_zero_warning_rows=%s total_adjusted_shortage_amount=%s assigned_adjusted_shortage_amount=%s unassigned_adjusted_shortage_amount=%s recent_purchase_none_rows=%s vendor_unknown_rows=%s top_vendor_count=%s purchase_source_rows=%s purchase_positive_rows=%s purchase_nonpositive_rows=%s purchase_unclassified_rows=%s missing_product_code_rows=%s missing_month_rows=%s invalid_numeric_rows=%s other_excluded_rows=%s major_vendor_aggregate_ms=%s major_vendor_rank_ms=%s vendor_risk_group_ms=%s basis_mode=%s basis_days=%s basis_cutoff_date=%s source_call_count=%s elapsed_ms=%s", summary["inventory_rows"], summary["risk_rows"], summary["assigned_rows"], summary["unassigned_rows"], summary["vendor_count"], summary["status_risk_rows"], summary["status_emergency_rows"], summary["status_warning_rows"], summary["amount_positive_risk_rows"], summary["amount_positive_emergency_rows"], summary["amount_positive_warning_rows"], summary["amount_zero_risk_rows"], summary["amount_zero_emergency_rows"], summary["amount_zero_warning_rows"], summary["total_adjusted_shortage_amount"], summary["assigned_adjusted_shortage_amount"], summary["unassigned_adjusted_shortage_amount"], summary["recent_purchase_none_rows"], summary["vendor_unknown_rows"], summary["top_vendor_count"], summary["purchase_source_rows"], summary["purchase_positive_rows"], summary["purchase_nonpositive_rows"], summary["purchase_unclassified_rows"], summary["missing_product_code_rows"], summary["missing_month_rows"], summary["invalid_numeric_rows"], summary["other_excluded_rows"], aggregate_ms, rank_ms, vendor_risk_group_ms, summary["basis_mode"], summary["basis_days"], summary["basis_cutoff_date"], int(source_call_count), int((time.perf_counter() - started) * 1000))
     return {"summary": summary, "rows": vendor_rows, "top_rows": vendor_rows[:10], "aggregate_ms": aggregate_ms, "rank_ms": rank_ms, "group_ms": vendor_risk_group_ms}
 
 
@@ -1868,21 +1901,12 @@ def _attach_stock_extension_facts(
         "insufficient_data": "자료 부족",
         "closed_horizon": "평가기간 종료",
     }
-    overstock_candidate = work.get("과잉후보여부", pd.Series(False, index=index)).fillna(False).astype(bool)
-    overstock_reason = work.get("과잉후보사유", pd.Series("", index=index, dtype="object")).fillna("").astype(str).str.strip()
-    evidence = pd.Series("기존 과잉후보 기준 미해당", index=index, dtype="object")
-    evidence.loc[overstock_candidate] = overstock_reason.loc[overstock_candidate].where(
-        overstock_reason.loc[overstock_candidate].ne(""),
-        "기존 과잉후보 기준 해당",
-    )
-
     work["stock_cover_days"] = cover_days.astype("object").where(cover_days.notna(), None)
     work["stock_cover_daily_demand_qty"] = daily_demand.astype("object").where(daily_demand.notna(), None)
     work["stock_cover_remaining_days"] = remaining_days
     work["stock_cover_status"] = status
     work["재고커버일"] = work["stock_cover_days"]
     work["재고커버 자료상태"] = status.map(status_labels).fillna("자료 부족")
-    work["과잉·저활성 근거"] = evidence
     work["last_normal_outbound_date"] = ""
     work["outbound_elapsed_days"] = None
     work["outbound_data_status"] = "source_required"
@@ -2021,7 +2045,7 @@ _RISK_DETAIL_COLUMNS = (
     "진행속도기준월말예상출고수량", "위험보정예상출고수량", "위험보정잔여예상수요", "위험보정재고준비율",
     "위험보정부족예상수량", "위험보정부족예상금액", "재고커버일", "재고커버 자료상태", "과잉후보여부", "과잉·저활성 근거",
     "최근 정상 출고일", "출고 경과일", "출고 자료상태", "수요급증여부", "수요급증상위분류", "수요급증세부분류",
-    "수요급증사유", "최근6완료월순매입금액", "최근6완료월순입고수량", "최근6완료월최근매입월",
+    "수요급증사유",
 )
 
 
@@ -2084,9 +2108,6 @@ def _build_dashboard_risk_detail(
             "수요급증상위분류": str(row.get("수요급증상위분류") or ""),
             "수요급증세부분류": str(row.get("수요급증세부분류") or ""),
             "수요급증사유": str(row.get("수요급증사유") or ""),
-            "최근6완료월순매입금액": float(row.get("최근6완료월순매입금액") or 0),
-            "최근6완료월순입고수량": float(row.get("최근6완료월순입고수량") or 0),
-            "최근6완료월최근매입월": str(row.get("최근6완료월최근매입월") or ""),
             "최근 정상 입고일": str(row.get("last_normal_inbound_date") or ""),
             "입고 거래일수": int(row.get("normal_inbound_day_count_365") or 0),
             "평균 입고간격일": row.get("avg_inbound_cycle_days"),
@@ -2204,6 +2225,7 @@ def _attach_dashboard_inbound_facts(
     inbound_facts_df: pd.DataFrame | None,
     *,
     inbound_source_call_count: int = 0,
+    vendor_lookback_days: int = 90,
 ) -> dict[str, Any]:
     """Left-attach read-only inbound facts without changing stock-risk policy."""
     started = time.perf_counter()
@@ -2240,6 +2262,8 @@ def _attach_dashboard_inbound_facts(
             "recent_inbound_vendor_last_date": str(inbound.get("recent_inbound_vendor_last_date") or ""),
             "recent_inbound_vendor_source": str(inbound.get("recent_inbound_vendor_source") or "none"),
             "recent_inbound_vendor_fallback": bool(inbound.get("recent_inbound_vendor_fallback")),
+            "inbound_vendor_days": int(inbound.get("inbound_vendor_days") or vendor_lookback_days),
+            "inbound_data_cutoff_date": str(inbound.get("data_cutoff_date") or ""),
         })
         status_label = {
             "normal": "정상",
@@ -2277,7 +2301,7 @@ def _attach_dashboard_inbound_facts(
         "fallback_products": fallback,
         "no_vendor_products": no_vendor,
         "cycle_days": 365,
-        "vendor_days": 90,
+        "vendor_days": int(vendor_lookback_days),
         "inbound_source_call_count": int(inbound_source_call_count),
         "inbound_io_policy": "fixed_normal_return_whitelist",
         "attach_elapsed_ms": int((time.perf_counter() - started) * 1000),
@@ -2302,6 +2326,8 @@ def _build_inventory_facts(
     inbound_facts_df: pd.DataFrame | None = None,
     source_call_count: int = 0,
     inbound_source_call_count: int = 0,
+    inbound_vendor_days: int = 90,
+    overstock_inactive_days: int = 90,
     stock_mode: str = "real",
     measurement: DashboardQueryMeasurement | None = None,
 ) -> dict[str, Any]:
@@ -2468,7 +2494,7 @@ def _build_inventory_facts(
             else:
                 readiness = min(max(stock, 0.0), remaining) / remaining * 100.0
                 readiness = min(readiness, 100.0)
-                status = "충분" if readiness >= STOCK_READY_THRESHOLD_PCT else "조치 필요"
+                status = "충분" if readiness >= float(readiness_warning_pct) else "조치 필요"
                 has_demand = True
             rows.append(
                 {
@@ -2520,36 +2546,6 @@ def _build_inventory_facts(
         input_rows=len(rows),
         result_rows=len(rows),
     )
-    risk_classification_started = time.perf_counter()
-    stock_risk_summary = _classify_stock_risk_rows(
-        rows,
-        readiness_warning_pct=readiness_warning_pct,
-    )
-    _record_inventory_phase(
-        "inventory_risk_classification",
-        risk_classification_started,
-        input_rows=len(rows),
-        result_rows=len(rows),
-    )
-    inbound_merge_started = time.perf_counter()
-    vendor_stock_risk = _attach_major_purchase_vendors(
-        rows,
-        purchase_vendor_df,
-        evaluation_month=evaluation_month,
-        history_month_from=purchase_history_month_from,
-        source_call_count=source_call_count,
-    )
-    inbound_summary = _attach_dashboard_inbound_facts(
-        rows,
-        inbound_facts_df,
-        inbound_source_call_count=inbound_source_call_count,
-    )
-    _record_inventory_phase(
-        "inventory_inbound_merge",
-        inbound_merge_started,
-        input_rows=len(rows),
-        result_rows=len(rows),
-    )
     stock_merge_started = time.perf_counter()
     stock_extension_summary = _attach_stock_extension_facts(
         rows,
@@ -2558,6 +2554,39 @@ def _build_inventory_facts(
     _record_inventory_phase(
         "inventory_stock_merge",
         stock_merge_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
+    risk_classification_started = time.perf_counter()
+    stock_risk_summary = _classify_stock_risk_rows(
+        rows,
+        readiness_warning_pct=readiness_warning_pct,
+        overstock_inactive_days=overstock_inactive_days,
+    )
+    _record_inventory_phase(
+        "inventory_risk_classification",
+        risk_classification_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
+    inbound_merge_started = time.perf_counter()
+    inbound_summary = _attach_dashboard_inbound_facts(
+        rows,
+        inbound_facts_df,
+        inbound_source_call_count=inbound_source_call_count,
+        vendor_lookback_days=inbound_vendor_days,
+    )
+    vendor_stock_risk = _attach_major_purchase_vendors(
+        rows,
+        purchase_vendor_df,
+        evaluation_month=evaluation_month,
+        history_month_from=purchase_history_month_from,
+        source_call_count=source_call_count,
+        vendor_lookback_days=inbound_vendor_days,
+    )
+    _record_inventory_phase(
+        "inventory_inbound_merge",
+        inbound_merge_started,
         input_rows=len(rows),
         result_rows=len(rows),
     )
@@ -2711,72 +2740,135 @@ def _build_today_actions(sales: dict[str, Any], inventory: dict[str, Any], turno
         risk_status = str(row.get("재고위험상태") or "").strip()
         is_shortage = risk_status in {"긴급 부족", "부족 주의"}
         is_overstock = bool(row.get("과잉후보여부"))
-        if not is_shortage and not is_overstock:
-            continue
         remaining = float(row.get("위험보정잔여예상수요", row.get("remaining_expected_demand_qty")) or 0)
         shortage_qty = float(row.get("위험보정부족예상수량", row.get("shortage_qty")) or 0)
         shortage_amt = float(row.get("위험보정부족예상금액", row.get("shortage_amt")) or 0)
         readiness_pct = float(row.get("위험보정재고준비율", row.get("stock_readiness_pct")) or 0)
-        if is_shortage:
-            demand_surge = bool(row.get("수요급증여부"))
-            adjustment_basis = str(row.get("위험보정기준") or "")
-            evidence = f"잔여수요 {remaining:,.0f}, 부족 {shortage_qty:,.0f}"
-            if demand_surge:
-                evidence = f"수요급증 · {adjustment_basis or '진행속도 보정'} · {evidence}"
-            severity = 0 if risk_status == "긴급 부족" else 1
-            cause_type = "stock_shortage"
-            recommended_action = "발주·재고이동·대체공급 확인"
-            threshold_label = "재고준비율"
-            threshold_value = readiness_pct
-            evidence_label = "위험보정부족예상금액"
-            evidence_value = shortage_amt
-            evidence_unit = "원"
-        else:
-            severity = 3
-            cause_type = "overstock_candidate"
-            evidence = str(row.get("과잉후보사유") or "현재재고가 3개월 필요수량 초과")
-            evidence_label = "과잉후보금액"
-            evidence_value = float(row.get("과잉후보금액") or 0)
-            evidence_unit = "원"
-            threshold_label = "과잉후보 기준"
-            threshold_value = float(row.get("3개월필요수량") or 0)
-            recommended_action = "재고이동·소진계획 확인"
         target_code = product_code
         target_name = product_name or product_code or "제품"
-        candidates.append(
-            {
-                "action_id": f"{cause_type}:product:{target_code or product_name or 'missing'}",
-                "_severity": severity,
-                "_impact": float(evidence_value),
-                "cause_type": cause_type,
-                "status": risk_status or ("과잉 후보" if is_overstock else ""),
-                "target_kind": "product",
-                "target_code": target_code,
-                "target_name": target_name,
-                "evidence_label": evidence_label,
-                "evidence_value": evidence_value,
-                "evidence_unit": evidence_unit,
-                "threshold_label": threshold_label,
-                "threshold_value": threshold_value,
-                "recommended_action": recommended_action,
-                "drilldown_action": "품목별 재고부족현황" if target_code else "",
-                "drilldown_params": {"product_code": target_code} if target_code else {},
-                "source_dashboard_event_id": "",
-                "target": target_name,
-                "product_code": target_code,
-                "product_name": product_name,
-                "manufacturer_name": row.get("manufacturer_name") or "",
-                "current_stock_qty": float(row.get("current_stock_qty") or 0),
-                "remaining_expected_demand_qty": remaining,
-                "shortage_qty": shortage_qty,
-                "shortage_amt": shortage_amt,
-                "stock_readiness_pct": readiness_pct,
-                "evidence": evidence,
-                "stock_cover_days": row.get("stock_cover_days"),
-                "inbound_delayed_candidate": bool(row.get("inbound_delayed_candidate")),
-                "last_normal_inbound_date": str(row.get("last_normal_inbound_date") or ""),
-            }
+        if is_shortage or is_overstock:
+            if is_shortage:
+                demand_surge = bool(row.get("수요급증여부"))
+                adjustment_basis = str(row.get("위험보정기준") or "")
+                evidence = f"잔여수요 {remaining:,.0f}, 부족 {shortage_qty:,.0f}"
+                if demand_surge:
+                    evidence = f"수요급증 · {adjustment_basis or '진행속도 보정'} · {evidence}"
+                severity = 0 if risk_status == "긴급 부족" else 1
+                cause_type = "stock_shortage"
+                recommended_action = "발주·재고이동·대체공급 확인"
+                threshold_label = "재고준비율"
+                threshold_value = readiness_pct
+                evidence_label = "위험보정부족예상금액"
+                evidence_value = shortage_amt
+                evidence_unit = "원"
+            else:
+                severity = 4
+                cause_type = "overstock_candidate"
+                evidence = str(row.get("과잉후보사유") or "현재재고가 3개월 필요수량 초과")
+                evidence_label = "과잉후보금액"
+                evidence_value = float(row.get("과잉후보금액") or 0)
+                evidence_unit = "원"
+                threshold_label = "과잉후보 기준"
+                threshold_value = float(row.get("3개월필요수량") or 0)
+                recommended_action = "재고이동·소진계획 확인"
+            candidates.append(
+                {
+                    "action_id": f"{cause_type}:product:{target_code or product_name or 'missing'}",
+                    "_severity": severity,
+                    "_impact": float(evidence_value),
+                    "cause_type": cause_type,
+                    "status": risk_status or ("과잉 후보" if is_overstock else ""),
+                    "target_kind": "product",
+                    "target_code": target_code,
+                    "target_name": target_name,
+                    "evidence_label": evidence_label,
+                    "evidence_value": evidence_value,
+                    "evidence_unit": evidence_unit,
+                    "threshold_label": threshold_label,
+                    "threshold_value": threshold_value,
+                    "recommended_action": recommended_action,
+                    "drilldown_action": "품목별 재고부족현황" if target_code else "",
+                    "drilldown_params": {"product_code": target_code} if target_code else {},
+                    "source_dashboard_event_id": "",
+                    "target": target_name,
+                    "product_code": target_code,
+                    "product_name": product_name,
+                    "manufacturer_name": row.get("manufacturer_name") or "",
+                    "current_stock_qty": float(row.get("current_stock_qty") or 0),
+                    "remaining_expected_demand_qty": remaining,
+                    "shortage_qty": shortage_qty,
+                    "shortage_amt": shortage_amt,
+                    "stock_readiness_pct": readiness_pct,
+                    "evidence": evidence,
+                    "stock_cover_days": row.get("stock_cover_days"),
+                    "inbound_delayed_candidate": bool(row.get("inbound_delayed_candidate")),
+                    "last_normal_inbound_date": str(row.get("last_normal_inbound_date") or ""),
+                }
+            )
+
+        inbound_day_count = int(row.get("normal_inbound_day_count_365") or 0)
+        inbound_delay_days = row.get("inbound_delay_days")
+        inbound_cycle_days = row.get("avg_inbound_cycle_days")
+        inbound_threshold_days = row.get("inbound_delay_threshold_days")
+        is_inbound_delay = (
+            bool(row.get("inbound_delayed_candidate"))
+            and str(row.get("inbound_data_status") or "") == "delayed_candidate"
+            and inbound_day_count >= 2
+            and inbound_delay_days is not None
+            and inbound_cycle_days is not None
+            and inbound_threshold_days is not None
         )
+        if is_inbound_delay:
+            delay_days = float(inbound_delay_days)
+            cycle_days = float(inbound_cycle_days)
+            threshold_days = float(inbound_threshold_days)
+            current_stock_qty = float(row.get("current_stock_qty") or 0)
+            delay_impact = max(0.0, delay_days - threshold_days)
+            evidence = (
+                f"최근 정상 입고일 {str(row.get('last_normal_inbound_date') or '자료 없음')} · "
+                f"경과 {delay_days:,.0f}일 · 정상 거래주기 {cycle_days:,.1f}일 · "
+                f"현재고 {current_stock_qty:,.0f} · 잔여수요 {remaining:,.0f}"
+            )
+            candidates.append(
+                {
+                    "action_id": f"inbound_delay:product:{target_code or product_name or 'missing'}",
+                    "_severity": 3,
+                    "_impact": delay_impact,
+                    "cause_type": "inbound_delay",
+                    "status": "입고 지연",
+                    "target_kind": "product",
+                    "target_code": target_code,
+                    "target_name": target_name,
+                    "evidence_label": evidence,
+                    "evidence_value": None,
+                    "evidence_unit": "",
+                    "threshold_label": "지연 판정 기준",
+                    "threshold_value": threshold_days,
+                    "threshold_unit": "일",
+                    "recommended_action": "입고 일정·대체공급 확인",
+                    "drilldown_action": "",
+                    "drilldown_params": {},
+                    "source_dashboard_event_id": "",
+                    "target": target_name,
+                    "product_code": target_code,
+                    "product_name": product_name,
+                    "manufacturer_name": row.get("manufacturer_name") or "",
+                    "current_stock_qty": current_stock_qty,
+                    "remaining_expected_demand_qty": remaining,
+                    "shortage_qty": shortage_qty,
+                    "shortage_amt": shortage_amt,
+                    "stock_readiness_pct": readiness_pct,
+                    "evidence": evidence,
+                    "stock_cover_days": row.get("stock_cover_days"),
+                    "inbound_delayed_candidate": True,
+                    "last_normal_inbound_date": str(row.get("last_normal_inbound_date") or ""),
+                    "normal_inbound_day_count_365": inbound_day_count,
+                    "avg_inbound_cycle_days": cycle_days,
+                    "inbound_delay_days": delay_days,
+                    "inbound_delay_threshold_days": threshold_days,
+                    "inbound_data_status": "delayed_candidate",
+                }
+            )
 
     for row in sales.get("decline_targets", []):
         target_name = str(row.get("target") or "").strip()
@@ -2824,10 +2916,11 @@ def _build_today_actions(sales: dict[str, Any], inventory: dict[str, Any], turno
         action.pop("_severity", None)
         action.pop("_impact", None)
     log.info(
-        "[dashboard.actions] total_candidates=%s deduped_candidates=%s displayed_actions=%s shortage_actions=%s decline_actions=%s overstock_actions=%s data_quality_actions=0 elapsed_ms=%s",
+        "[dashboard.actions] total_candidates=%s deduped_candidates=%s displayed_actions=%s shortage_actions=%s decline_actions=%s inbound_delay_actions=%s overstock_actions=%s data_quality_actions=0 elapsed_ms=%s",
         len(candidates), len(deduped), len(actions),
         sum(1 for item in actions if item.get("cause_type") == "stock_shortage"),
         sum(1 for item in actions if item.get("cause_type") == "sales_decline"),
+        sum(1 for item in actions if item.get("cause_type") == "inbound_delay"),
         sum(1 for item in actions if item.get("cause_type") == "overstock_candidate"),
         int((time.perf_counter() - started) * 1000),
     )
@@ -2881,6 +2974,7 @@ def build_dashboard_lite_facts(
         "evaluation_month": service_params.get("evaluation_month"),
         "date_from": service_params.get("date_from"),
         "date_to": service_params.get("date_to"),
+        "judgement_date": service_params.get("policy_date"),
         "trend_support_month_from": source_params.get("dashboard_lite_trend_month_from"),
         "basis": "조회 종료일 기준 당월은 부분월로 표시",
     }
@@ -2944,7 +3038,7 @@ def build_dashboard_lite_facts(
                 dict(service_params),
                 data_cutoff_date=inbound_cutoff_date,
                 cycle_lookback_days=365,
-                vendor_lookback_days=90,
+                vendor_lookback_days=int(service_params["major_purchase_vendor_days"]),
             )
         inbound_source_elapsed_ms = int((time.perf_counter() - inbound_started) * 1000)
         inbound_source_rows = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_source_rows") or 0)
@@ -3167,7 +3261,7 @@ def build_dashboard_lite_facts(
     t_stock = time.perf_counter()
     inventory = _build_inventory_facts(
         stock_shortage_payload,
-        readiness_warning_pct=float(service_params.get("readiness_warning_pct") or STOCK_READY_THRESHOLD_PCT),
+        readiness_warning_pct=float(service_params["readiness_warning_pct"]),
         evaluation_month=str(service_params.get("evaluation_month") or ""),
         policy_date=str(service_params.get("policy_date") or ""),
         demand_surge_history=demand_surge_history,
@@ -3176,6 +3270,8 @@ def build_dashboard_lite_facts(
         inbound_facts_df=inbound_facts_df,
         source_call_count=int(needs_sales_source) + int(needs_stock_source),
         inbound_source_call_count=int(needs_inbound_source),
+        inbound_vendor_days=int(service_params["major_purchase_vendor_days"]),
+        overstock_inactive_days=int(service_params["overstock_inactive_days"]),
         stock_mode=str(service_params.get("stock_mode") or "real"),
         measurement=physical_measurement,
     )
@@ -3359,7 +3455,7 @@ def build_dashboard_lite_facts(
         today_action_count=len(today_actions),
     )
     stock_status_summary = {
-        str(row.get("상태") or ""): int(row.get("품목수") or 0)
+        str(row.get("재고위험상태") or ""): int(row.get("품목수") or 0)
         for row in (inventory.get("stock_risk_summary") or [])
         if isinstance(row, Mapping)
     }
@@ -3430,7 +3526,7 @@ def build_dashboard_lite_facts(
         "inventory": inventory,
         "inbound_summary": dict(inventory.get("inbound_summary") or {}),
         "stock_readiness": {
-            "threshold_pct": float(service_params.get("readiness_warning_pct") or STOCK_READY_THRESHOLD_PCT),
+            "threshold_pct": float(service_params["readiness_warning_pct"]),
             "policy": "제품별 준비가능수량=min(max(현재재고,0), 위험보정 잔여예상수요)",
             "adjustment_policy": "수요급증 품목은 현재 출고속도 기준 진행속도 보정 월말예상을 사용하고, 일반 품목은 기존 당월 예상수요를 사용",
             "sku_readiness_pct": inventory["metrics"]["sku_readiness_pct"],
@@ -3458,7 +3554,7 @@ def build_dashboard_lite_facts(
             "완료월 총매출과 당월 부분월 현재매출의 직접 우열 판단",
             "업체 수 기준 증가/감소를 매출액 전체 증가/감소로 단정",
             "sample_records 또는 화면 일부 행으로 전체 순위/총합 판단",
-            "재고 98% 이상 SKU를 기본 조치 목록에 반복 노출",
+            "재고 준비율 경고기준 이상 SKU를 기본 조치 목록에 반복 노출",
         ],
     }
     facts["base_source_call_count"] = int(needs_sales_source) + int(needs_stock_source)
