@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
 from app.services.ssai_analytics_db import connect_analytics_db
@@ -19,6 +20,22 @@ from app.services.ssai_snapshot_repository import (
 
 
 PayloadValidator = Callable[[Mapping[str, Any], SnapshotKey], SnapshotReadResult]
+
+
+@dataclass(frozen=True)
+class SnapshotGenerationInspection:
+    """Exact-generation, read-only integrity view used before an explicit manual approval."""
+
+    status: str
+    manifest_status: str = ""
+    approval_status: str = ""
+    payload: Mapping[str, Any] | None = None
+    reason: str = ""
+    manifest_id: int | None = None
+    generation_no: int | None = None
+    checksum: str = ""
+    storage_checksum: str = ""
+    payload_size: int = 0
 
 
 def _canonical_payload(payload: Mapping[str, Any]) -> tuple[str, bytes]:
@@ -203,6 +220,43 @@ class SqlServerSnapshotRepository:
         approved_by: str,
         approval_reason: str,
     ) -> SnapshotPublishResult:
+        return self._approve(
+            key,
+            generation_no,
+            approved_by=approved_by,
+            approval_reason=approval_reason,
+            expected_checksum="",
+        )
+
+    def approve_checked(
+        self,
+        key: SnapshotKey,
+        generation_no: int,
+        *,
+        expected_checksum: str,
+        approved_by: str,
+        approval_reason: str,
+    ) -> SnapshotPublishResult:
+        checksum = str(expected_checksum or "").strip().lower()
+        if len(checksum) != 64 or any(ch not in "0123456789abcdef" for ch in checksum):
+            raise ValueError("expected_checksum must be a SHA-256 checksum")
+        return self._approve(
+            key,
+            generation_no,
+            approved_by=approved_by,
+            approval_reason=approval_reason,
+            expected_checksum=checksum,
+        )
+
+    def _approve(
+        self,
+        key: SnapshotKey,
+        generation_no: int,
+        *,
+        approved_by: str,
+        approval_reason: str,
+        expected_checksum: str,
+    ) -> SnapshotPublishResult:
         actor = _validate_actor(approved_by, field="approved_by")
         reason = _validate_actor(approval_reason, field="approval_reason")
         conn = self._writer_connection_factory()
@@ -227,6 +281,8 @@ class SqlServerSnapshotRepository:
                 raise LookupError("snapshot generation not found")
             if str(row[1]) != "draft" or str(row[2]) != "pending":
                 raise ValueError("only a pending draft generation can be approved")
+            if expected_checksum and str(row[3]).lower() != expected_checksum:
+                raise ValueError("expected checksum does not match draft generation")
             payload_json = str(row[4])
             payload_bytes = payload_json.encode("utf-8")
             if len(payload_bytes) != int(row[6]) or _storage_checksum(payload_bytes) != str(row[5]):
@@ -272,6 +328,62 @@ class SqlServerSnapshotRepository:
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def inspect_generation(self, key: SnapshotKey, generation_no: int) -> SnapshotGenerationInspection:
+        """Read exactly one generation and prove storage and contract integrity without changing it."""
+        conn = self._reader_connection_factory()
+        try:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                """
+                /* snapshot.inspect.generation */
+                SELECT m.manifest_id, m.status, m.approval_status, m.checksum,
+                       p.payload_json, p.storage_checksum, p.payload_size
+                FROM snapshot.manifest m
+                INNER JOIN snapshot.payload p ON p.manifest_id=m.manifest_id
+                WHERE m.company_id=? AND m.snapshot_type=? AND m.evaluation_month=?
+                  AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
+                  AND m.generation_no=?
+                """,
+                *_key_values(key),
+                int(generation_no),
+            ).fetchone()
+            if not row:
+                return SnapshotGenerationInspection(status=SNAPSHOT_STATUS_MISSING, generation_no=int(generation_no))
+            payload_json = str(row[4])
+            payload_bytes = payload_json.encode("utf-8")
+            if len(payload_bytes) != int(row[6]) or _storage_checksum(payload_bytes) != str(row[5]):
+                return SnapshotGenerationInspection(
+                    status=SNAPSHOT_STATUS_CORRUPT,
+                    manifest_status=str(row[1]), approval_status=str(row[2]),
+                    manifest_id=int(row[0]), generation_no=int(generation_no), checksum=str(row[3]),
+                    storage_checksum=str(row[5]), payload_size=int(row[6]), reason="storage checksum mismatch",
+                )
+            try:
+                payload = json.loads(payload_json)
+                self._validate_payload(payload, key)
+            except Exception as exc:
+                return SnapshotGenerationInspection(
+                    status=SNAPSHOT_STATUS_CORRUPT,
+                    manifest_status=str(row[1]), approval_status=str(row[2]),
+                    manifest_id=int(row[0]), generation_no=int(generation_no), checksum=str(row[3]),
+                    storage_checksum=str(row[5]), payload_size=int(row[6]), reason=str(exc),
+                )
+            if str(payload.get("checksum") or "") != str(row[3]):
+                return SnapshotGenerationInspection(
+                    status=SNAPSHOT_STATUS_CORRUPT,
+                    manifest_status=str(row[1]), approval_status=str(row[2]),
+                    manifest_id=int(row[0]), generation_no=int(generation_no), checksum=str(row[3]),
+                    storage_checksum=str(row[5]), payload_size=int(row[6]), reason="manifest checksum mismatch",
+                )
+            status = SNAPSHOT_STATUS_READY if str(row[1]) == "published" and str(row[2]) == "approved" else SNAPSHOT_STATUS_UNAPPROVED
+            return SnapshotGenerationInspection(
+                status=status, manifest_status=str(row[1]), approval_status=str(row[2]), payload=payload,
+                manifest_id=int(row[0]), generation_no=int(generation_no), checksum=str(row[3]),
+                storage_checksum=str(row[5]), payload_size=int(row[6]),
+            )
         finally:
             conn.close()
 

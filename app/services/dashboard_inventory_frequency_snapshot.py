@@ -204,6 +204,103 @@ def _source_fingerprint(
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def aggregate_source_fingerprint(
+    monthly_rows: Iterable[Mapping[str, Any]],
+    diagnostics: Mapping[str, Any] | None = None,
+) -> str:
+    canonical = {
+        "monthly_activity": [dict(row) for row in monthly_rows],
+        "diagnostics": dict(diagnostics or {}),
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _assemble_frequency_snapshot_payload(
+    *,
+    company: str,
+    basis: CompletedMonthBasis,
+    universe: Sequence[str],
+    scope_codes: Sequence[str],
+    monthly_rows: Sequence[Mapping[str, Any]],
+    ignored_product_events: int,
+    source_fingerprint: str,
+    fingerprint_mode: str,
+    source_watermark: Any,
+    source_watermark_status: str,
+    source_diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    product_counts: dict[str, int] = defaultdict(int)
+    normalized_monthly_rows: list[dict[str, Any]] = []
+    for row in monthly_rows:
+        normalized = {
+            "month": str(row.get("month") or ""),
+            "product_code": str(row.get("product_code") or ""),
+            "stock_code": str(row.get("stock_code") or ""),
+            "occurrence_count": int(row.get("occurrence_count") or 0),
+            "outbound_quantity": int(row.get("outbound_quantity") or 0),
+            "outbound_day_count": int(row.get("outbound_day_count") or 0),
+        }
+        normalized_monthly_rows.append(normalized)
+        product_counts[normalized["product_code"]] += normalized["occurrence_count"]
+
+    frequency_rows = assign_frequency_grades(product_counts, universe)
+    grade_counts = {grade: 0 for grade in (*FREQUENCY_GRADES, "X")}
+    for row in frequency_rows:
+        grade_counts[row["frequency_grade"]] += 1
+
+    scope_payload = {
+        "mode": "selected" if scope_codes else "all",
+        "stock_codes": list(scope_codes),
+        "fingerprint": scope_fingerprint(scope_codes),
+    }
+    payload: dict[str, Any] = {
+        "snapshot_type": SNAPSHOT_TYPE,
+        "schema_version": SCHEMA_VERSION,
+        "algorithm_version": ALGORITHM_VERSION,
+        "company_id": company,
+        "evaluation_month": basis.evaluation_month,
+        "basis_from": basis.basis_from,
+        "basis_to": basis.basis_to,
+        "basis_months": list(basis.months),
+        "scope": scope_payload,
+        "source_watermark": None if source_watermark is None else str(source_watermark),
+        "source_watermark_status": str(source_watermark_status or "unverified"),
+        "source_fingerprint": source_fingerprint,
+        "source_contract": {
+            "table": "Rddbc120",
+            "io_gu_gcode": "0012",
+            "normal_tcode_from": "500",
+            "normal_tcode_to": "599",
+            "event_key_fields": list(_EVENT_KEY_FIELDS),
+            "positive_quantity_expression": "quantity + oquantity > 0",
+            "return_tcode_from": "600",
+            "return_tcode_to": "699",
+            "returns_are_netted": False,
+            "flag_exclusion_fields": [],
+            "non_exclusion_flag_fields": list(_NON_EXCLUSION_FLAG_FIELDS),
+            # Dashboard filters are applied after this stable, company/scope baseline is graded.
+            "universe_mode": "all_rddbc040_baseline",
+            "dashboard_product_filters": "post_grade",
+            "include_rd04_del_flag_e": True,
+            "fingerprint_contract_version": 2,
+            "fingerprint_mode": fingerprint_mode,
+        },
+        "monthly_activity": normalized_monthly_rows,
+        "product_frequency": frequency_rows,
+        "summary": {
+            "product_count": len(universe),
+            "normal_event_count": sum(item["occurrence_count"] for item in normalized_monthly_rows),
+            "ignored_product_event_count": int(ignored_product_events),
+            "grade_counts": grade_counts,
+        },
+    }
+    if source_diagnostics is not None:
+        payload["source_diagnostics"] = dict(source_diagnostics)
+    payload["checksum"] = calculate_payload_checksum(payload)
+    return payload
+
+
 def build_frequency_snapshot_payload(
     *,
     company_id: Any,
@@ -264,7 +361,6 @@ def build_frequency_snapshot_payload(
         occurrence_days[key].add(event_key[0])
 
     monthly_rows: list[dict[str, Any]] = []
-    product_counts: dict[str, int] = defaultdict(int)
     for (month, product_code, stock_code), values in sorted(monthly.items()):
         day_count = len(occurrence_days[(month, product_code, stock_code)])
         monthly_rows.append(
@@ -277,55 +373,95 @@ def build_frequency_snapshot_payload(
                 "outbound_day_count": day_count,
             }
         )
-        product_counts[product_code] += values["occurrence_count"]
 
-    frequency_rows = assign_frequency_grades(product_counts, universe)
-    grade_counts = {grade: 0 for grade in (*FREQUENCY_GRADES, "X")}
-    for row in frequency_rows:
-        grade_counts[row["frequency_grade"]] += 1
+    return _assemble_frequency_snapshot_payload(
+        company=company,
+        basis=basis,
+        universe=universe,
+        scope_codes=scope_codes,
+        monthly_rows=monthly_rows,
+        ignored_product_events=ignored_product_events,
+        source_fingerprint=_source_fingerprint(events),
+        fingerprint_mode="raw_event_v1",
+        source_watermark=source_watermark,
+        source_watermark_status=source_watermark_status,
+    )
 
-    scope_payload = {
-        "mode": "selected" if scope_codes else "all",
-        "stock_codes": list(scope_codes),
-        "fingerprint": scope_fingerprint(scope_codes),
-    }
-    payload: dict[str, Any] = {
-        "snapshot_type": SNAPSHOT_TYPE,
-        "schema_version": SCHEMA_VERSION,
-        "algorithm_version": ALGORITHM_VERSION,
-        "company_id": company,
-        "evaluation_month": basis.evaluation_month,
-        "basis_from": basis.basis_from,
-        "basis_to": basis.basis_to,
-        "basis_months": list(basis.months),
-        "scope": scope_payload,
-        "source_watermark": None if source_watermark is None else str(source_watermark),
-        "source_watermark_status": str(source_watermark_status or "unverified"),
-        "source_fingerprint": _source_fingerprint(events),
-        "source_contract": {
-            "table": "Rddbc120",
-            "io_gu_gcode": "0012",
-            "normal_tcode_from": "500",
-            "normal_tcode_to": "599",
-            "event_key_fields": list(_EVENT_KEY_FIELDS),
-            "positive_quantity_expression": "quantity + oquantity > 0",
-            "return_tcode_from": "600",
-            "return_tcode_to": "699",
-            "returns_are_netted": False,
-            "flag_exclusion_fields": [],
-            "non_exclusion_flag_fields": list(_NON_EXCLUSION_FLAG_FIELDS),
-        },
-        "monthly_activity": monthly_rows,
-        "product_frequency": frequency_rows,
-        "summary": {
-            "product_count": len(universe),
-            "normal_event_count": sum(item["occurrence_count"] for item in monthly_rows),
-            "ignored_product_event_count": ignored_product_events,
-            "grade_counts": grade_counts,
-        },
-    }
-    payload["checksum"] = calculate_payload_checksum(payload)
-    return payload
+
+def build_frequency_snapshot_payload_from_aggregates(
+    *,
+    company_id: Any,
+    evaluation_month: Any,
+    monthly_rows: Iterable[Mapping[str, Any]],
+    product_codes: Iterable[Any],
+    stock_codes: Iterable[Any] | None = None,
+    source_watermark: Any = None,
+    source_watermark_status: str = "unverified",
+    source_diagnostics: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    company = _normalize_code(company_id, field="company_id")
+    basis = completed_month_basis(evaluation_month)
+    universe = tuple(sorted({_normalize_code(code, field="product_code") for code in product_codes}))
+    universe_set = set(universe)
+    scope_codes = _normalized_scope(stock_codes)
+    scope_set = set(scope_codes)
+    accepted: list[dict[str, Any]] = []
+    ignored_product_events = 0
+    seen: set[tuple[str, str, str]] = set()
+    for index, row in enumerate(monthly_rows):
+        month = str(row.get("month") or "").strip()
+        product_code = _normalize_code(row.get("product_code"), field="product_code")
+        stock_code = _normalize_code(row.get("stock_code"), field="stock_code")
+        key = (month, product_code, stock_code)
+        if key in seen:
+            raise SnapshotContractError(f"duplicate aggregate row: {key!r}")
+        seen.add(key)
+        if month not in basis.months:
+            raise SnapshotContractError(f"aggregate row outside basis months: {key!r}")
+        if scope_set and stock_code not in scope_set:
+            raise SnapshotContractError(f"aggregate row outside stock scope: {key!r}")
+        occurrence_count = _required_nonnegative_int(
+            row.get("occurrence_count"), field=f"monthly_rows[{index}].occurrence_count"
+        )
+        outbound_quantity = _required_nonnegative_int(
+            row.get("outbound_quantity"), field=f"monthly_rows[{index}].outbound_quantity"
+        )
+        outbound_day_count = _required_nonnegative_int(
+            row.get("outbound_day_count"), field=f"monthly_rows[{index}].outbound_day_count"
+        )
+        if occurrence_count <= 0 or outbound_quantity <= 0:
+            raise SnapshotContractError(f"aggregate row must be positive: {key!r}")
+        if outbound_day_count <= 0 or outbound_day_count > occurrence_count:
+            raise SnapshotContractError(f"aggregate day count is inconsistent: {key!r}")
+        if product_code not in universe_set:
+            ignored_product_events += occurrence_count
+            continue
+        accepted.append(
+            {
+                "month": month,
+                "product_code": product_code,
+                "stock_code": stock_code,
+                "occurrence_count": occurrence_count,
+                "outbound_quantity": outbound_quantity,
+                "outbound_day_count": outbound_day_count,
+            }
+        )
+    accepted.sort(key=lambda row: (row["month"], row["product_code"], row["stock_code"]))
+    diagnostics = dict(source_diagnostics or {})
+    fingerprint = aggregate_source_fingerprint(accepted, diagnostics)
+    return _assemble_frequency_snapshot_payload(
+        company=company,
+        basis=basis,
+        universe=universe,
+        scope_codes=scope_codes,
+        monthly_rows=accepted,
+        ignored_product_events=ignored_product_events,
+        source_fingerprint=fingerprint,
+        fingerprint_mode="monthly_aggregate_v1",
+        source_watermark=source_watermark,
+        source_watermark_status=source_watermark_status,
+        source_diagnostics=diagnostics,
+    )
 
 
 def snapshot_key_from_payload(payload: Mapping[str, Any]) -> SnapshotKey:
@@ -378,6 +514,41 @@ def _validate_frequency_payload_structure(
         raise SnapshotContractError("source fingerprint is invalid")
     if payload.get("source_watermark_status") not in {"verified", "unverified"}:
         raise SnapshotContractError("source watermark status is invalid")
+
+    source_contract = payload.get("source_contract")
+    if not isinstance(source_contract, Mapping):
+        raise SnapshotContractError("snapshot source contract is invalid")
+    diagnostic_contract_version = 0
+    source_diagnostics = payload.get("source_diagnostics")
+    if isinstance(source_diagnostics, Mapping):
+        diagnostic_contract_version = int(source_diagnostics.get("diagnostic_contract_version") or 0)
+    if diagnostic_contract_version >= 2:
+        if source_contract.get("fingerprint_contract_version") != 2:
+            raise SnapshotContractError("snapshot fingerprint contract version is invalid")
+        if source_contract.get("fingerprint_mode") not in {"raw_event_v1", "monthly_aggregate_v1"}:
+            raise SnapshotContractError("snapshot fingerprint mode is invalid")
+        partition_fields = (
+            "normal_positive_accepted_row_count",
+            "normal_positive_duplicate_row_count",
+            "normal_positive_conflicting_row_count",
+            "normal_positive_missing_key_row_count",
+            "normal_positive_nonintegral_row_count",
+            "normal_nonpositive_row_count",
+            "return_positive_row_count",
+            "return_nonpositive_row_count",
+            "other_tcode_row_count",
+        )
+        if not isinstance(source_diagnostics, Mapping):
+            raise SnapshotContractError("snapshot diagnostics are invalid")
+        source_count = _required_nonnegative_int(
+            source_diagnostics.get("source_row_count"), field="source_diagnostics.source_row_count"
+        )
+        partition_total = sum(
+            _required_nonnegative_int(source_diagnostics.get(field), field=f"source_diagnostics.{field}")
+            for field in partition_fields
+        )
+        if partition_total != source_count:
+            raise SnapshotContractError("snapshot source diagnostics do not reconcile")
 
     scope = payload.get("scope")
     if not isinstance(scope, Mapping):

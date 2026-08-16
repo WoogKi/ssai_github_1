@@ -119,6 +119,18 @@ class _Cursor:
             self.state.payloads[int(params[0])] = {
                 "payload_json": params[1], "storage_checksum": params[2], "payload_size": int(params[3])
             }
+        elif "snapshot.inspect.generation" in sql:
+            candidates = [
+                m for m in self.state.manifests
+                if self._matches(m, params[:6]) and m["generation_no"] == int(params[6])
+            ]
+            if candidates:
+                item = candidates[0]
+                payload = self.state.payloads[item["manifest_id"]]
+                self.row = (
+                    item["manifest_id"], item["status"], item["approval_status"], item["checksum"],
+                    payload["payload_json"], payload["storage_checksum"], payload["payload_size"],
+                )
         elif "snapshot.approve.load" in sql:
             candidates = [
                 m for m in self.state.manifests
@@ -212,12 +224,35 @@ def test_repository_lifecycle_and_isolation() -> None:
     draft = repository.publish(key, first_payload, created_by="fixture-generator")
     _assert(draft.status == "draft" and draft.generation_no == 1, "publish creates draft generation")
     _assert(repository.read(key).status == SNAPSHOT_STATUS_UNAPPROVED, "draft read must fail closed")
+    inspected = repository.inspect_generation(key, 1)
+    _assert(
+        inspected.status == SNAPSHOT_STATUS_UNAPPROVED and inspected.payload == first_payload,
+        "exact draft inspection must validate without publishing",
+    )
+    try:
+        repository.approve_checked(
+            key, 1, expected_checksum="0" * 64, approved_by="fixture-approver", approval_reason="wrong checksum"
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("approval must bind the expected checksum")
+    _assert(repository.read(key).status == SNAPSHOT_STATUS_UNAPPROVED, "checksum mismatch must not publish draft")
 
-    approved = repository.approve(
-        key, 1, approved_by="fixture-approver", approval_reason="fixture source range reviewed"
+    approved = repository.approve_checked(
+        key, 1, expected_checksum=str(first_payload["checksum"]),
+        approved_by="fixture-approver", approval_reason="fixture source range reviewed"
     )
     ready = repository.read(key)
     _assert(approved.status == SNAPSHOT_STATUS_READY and ready.usable, "approved generation is readable")
+    inspected_ready = repository.inspect_generation(key, 1)
+    _assert(
+        inspected_ready.status == SNAPSHOT_STATUS_READY
+        and inspected_ready.manifest_status == "published"
+        and inspected_ready.approval_status == "approved"
+        and inspected_ready.generation_no == 1,
+        "post-approval exact inspection must report actual published state",
+    )
     _assert(
         ready.approved_by == "fixture-approver" and ready.approval_reason,
         "approval provenance must be retained",

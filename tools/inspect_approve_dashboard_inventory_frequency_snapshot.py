@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Mapping
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
+    ALGORITHM_VERSION,
+    SCHEMA_VERSION,
+    SNAPSHOT_TYPE,
+    scope_fingerprint,
+)
+from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
+from app.services.ssai_snapshot_repository import SnapshotKey  # noqa: E402
+
+
+_GRADE_KEYS = ("A", "B", "C", "D", "E", "X")
+_PARTITION_KEYS = (
+    "normal_positive_accepted_row_count",
+    "normal_positive_duplicate_row_count",
+    "normal_positive_conflicting_row_count",
+    "normal_positive_missing_key_row_count",
+    "normal_positive_nonintegral_row_count",
+    "normal_nonpositive_row_count",
+    "return_positive_row_count",
+    "return_nonpositive_row_count",
+    "other_tcode_row_count",
+)
+
+
+def _parse_grade_counts(value: str) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for item in str(value or "").split(","):
+        key, separator, raw = item.strip().partition("=")
+        if not separator or key not in _GRADE_KEYS:
+            raise ValueError("expected grade counts must be A=..,B=..,C=..,D=..,E=..,X=..")
+        result[key] = int(raw)
+    if tuple(sorted(result)) != tuple(sorted(_GRADE_KEYS)) or any(value < 0 for value in result.values()):
+        raise ValueError("expected grade counts must contain every nonnegative A/B/C/D/E/X count")
+    return result
+
+
+def _key(args: argparse.Namespace) -> SnapshotKey:
+    scope_codes = tuple(sorted({str(code).strip() for code in args.stock_code if str(code).strip()}))
+    return SnapshotKey(
+        company_id=str(args.company_id),
+        snapshot_type=SNAPSHOT_TYPE,
+        evaluation_month=str(args.evaluation_month),
+        scope_fingerprint=scope_fingerprint(scope_codes),
+        schema_version=SCHEMA_VERSION,
+        algorithm_version=ALGORITHM_VERSION,
+    )
+
+
+def _verify_expected(payload: Mapping[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    summary = dict(payload.get("summary") or {})
+    diagnostics = dict(payload.get("source_diagnostics") or {})
+    grade_counts = dict(summary.get("grade_counts") or {})
+    actual_grades = {key: int(grade_counts.get(key) or 0) for key in _GRADE_KEYS}
+    partition_total = sum(int(diagnostics.get(key) or 0) for key in _PARTITION_KEYS)
+    checks = {
+        "product_count": int(summary.get("product_count") or 0) == args.expected_product_count,
+        "normal_event_count": int(summary.get("normal_event_count") or 0) == args.expected_normal_event_count,
+        "grade_counts": actual_grades == args.expected_grade_counts,
+        "grade_count_total": sum(actual_grades.values()) == int(summary.get("product_count") or 0),
+        "source_partition_total": partition_total == args.expected_source_row_count,
+        "source_row_count": int(diagnostics.get("source_row_count") or 0) == args.expected_source_row_count,
+        "accepted_normal": int(diagnostics.get("normal_positive_accepted_row_count") or 0)
+        == int(summary.get("normal_event_count") or 0),
+    }
+    if not all(checks.values()):
+        failed = ", ".join(key for key, value in checks.items() if not value)
+        raise ValueError(f"approval expectation mismatch: {failed}")
+    return {
+        "product_count": summary.get("product_count"),
+        "normal_event_count": summary.get("normal_event_count"),
+        "grade_counts": actual_grades,
+        "source_diagnostics": diagnostics,
+        "checks": checks,
+    }
+
+
+def _output(inspection: Any, verification: Mapping[str, Any] | None) -> dict[str, Any]:
+    return {
+        "integrity_status": inspection.status,
+        "manifest_status": inspection.manifest_status,
+        "approval_status": inspection.approval_status,
+        "manifest_id": inspection.manifest_id,
+        "generation_no": inspection.generation_no,
+        "checksum": inspection.checksum,
+        "storage_checksum_verified": bool(inspection.payload),
+        "contract_checksum_verified": bool(inspection.payload),
+        "payload_size": inspection.payload_size,
+        "verification": verification or {},
+        "reason": inspection.reason,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Inspect and explicitly approve one Dashboard frequency snapshot generation")
+    parser.add_argument("--company-id", required=True, type=int)
+    parser.add_argument("--evaluation-month", required=True)
+    parser.add_argument("--stock-code", action="append", required=True)
+    parser.add_argument("--generation", required=True, type=int)
+    parser.add_argument("--preserve-generation", type=int, default=0)
+    parser.add_argument("--expected-checksum", required=True)
+    parser.add_argument("--expected-product-count", required=True, type=int)
+    parser.add_argument("--expected-normal-event-count", required=True, type=int)
+    parser.add_argument("--expected-source-row-count", required=True, type=int)
+    parser.add_argument("--expected-grade-counts", required=True)
+    parser.add_argument("--approve", action="store_true")
+    parser.add_argument("--approved-by", default="")
+    parser.add_argument("--approval-reason", default="")
+    args = parser.parse_args()
+    try:
+        if args.company_id <= 0 or args.generation <= 0 or args.preserve_generation < 0:
+            raise ValueError("company_id/generation must be positive and preserve_generation cannot be negative")
+        args.expected_grade_counts = _parse_grade_counts(args.expected_grade_counts)
+        if args.approve and (not str(args.approved_by).strip() or not str(args.approval_reason).strip()):
+            raise ValueError("--approved-by and --approval-reason are required with --approve")
+        repository = SqlServerSnapshotRepository()
+        inspection = repository.inspect_generation(_key(args), args.generation)
+        if inspection.status == "corrupt" or not inspection.payload:
+            raise ValueError(f"snapshot inspection failed: {inspection.status}: {inspection.reason}")
+        if inspection.checksum.lower() != str(args.expected_checksum).strip().lower():
+            raise ValueError("expected checksum does not match inspected generation")
+        verification = _verify_expected(inspection.payload, args)
+        output = _output(inspection, verification)
+        preserved = None
+        if args.preserve_generation:
+            preserved = repository.inspect_generation(_key(args), args.preserve_generation)
+            output["preserved_generation"] = {
+                "generation_no": preserved.generation_no,
+                "integrity_status": preserved.status,
+                "manifest_status": preserved.manifest_status,
+                "approval_status": preserved.approval_status,
+                "checksum": preserved.checksum,
+            }
+        if not args.approve:
+            output["mode"] = "inspect"
+            output["approval"] = "not executed"
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+            return 0
+        if inspection.status != "unapproved" or inspection.manifest_status != "draft" or inspection.approval_status != "pending":
+            raise ValueError("only a draft/pending generation can be approved")
+        if preserved is None:
+            raise ValueError("--preserve-generation is required with --approve")
+        if (
+            preserved.status != "unapproved"
+            or preserved.manifest_status != "draft"
+            or preserved.approval_status != "pending"
+        ):
+            raise ValueError("preserved generation must remain draft/pending before approval")
+        repository.approve_checked(
+            _key(args), args.generation, expected_checksum=args.expected_checksum,
+            approved_by=args.approved_by, approval_reason=args.approval_reason,
+        )
+        post = repository.inspect_generation(_key(args), args.generation)
+        if (
+            post.status != "ready"
+            or post.manifest_status != "published"
+            or post.approval_status != "approved"
+            or post.generation_no != args.generation
+            or post.checksum.lower() != str(args.expected_checksum).strip().lower()
+            or not post.payload
+        ):
+            raise ValueError("post-approval inspection did not confirm the published generation")
+        post_verification = _verify_expected(post.payload, args)
+        preserved_after = repository.inspect_generation(_key(args), args.preserve_generation)
+        if (
+            preserved_after.status != "unapproved"
+            or preserved_after.manifest_status != "draft"
+            or preserved_after.approval_status != "pending"
+        ):
+            raise ValueError("preserved generation changed during approval")
+        final_output = _output(post, post_verification)
+        final_output["preserved_generation"] = {
+            "generation_no": preserved_after.generation_no,
+            "integrity_status": preserved_after.status,
+            "manifest_status": preserved_after.manifest_status,
+            "approval_status": preserved_after.approval_status,
+            "checksum": preserved_after.checksum,
+        }
+        final_output.update({"mode": "approve", "approval": "ready", "approved_generation": args.generation})
+        print(json.dumps(final_output, ensure_ascii=False, indent=2))
+        return 0
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error_type": type(exc).__name__, "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
