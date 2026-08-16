@@ -1070,6 +1070,8 @@ def _completed_month_pre_forecasts(
                     "forecast_basis": basis,
                     "forecast_status": "사전예상",
                     "applied_growth_pct": float(applied_rate),
+                    "forecast_helper": "analytics_sales_trend_service._forecast_projection_from_row",
+                    "forecast_source": "completed_month_history",
                 }
             )
         history.append(float(target["value"]))
@@ -1347,6 +1349,7 @@ def _build_sales_facts(
     history_actuals: list[dict[str, Any]] | None = None,
     evaluation_month: Any = None,
     policy_date: Any = None,
+    sales_source_mode: str = "",
     today: date | None = None,
 ) -> dict[str, Any]:
     df = _payload_df(payload)
@@ -1355,22 +1358,46 @@ def _build_sales_facts(
     completed_months = int(max([_num(v, 0) for v in df["완료월수"].tolist()], default=0)) if "완료월수" in df.columns else int(_num(meta.get("completed_month_count")))
     completed_avg = _safe_div(completed_total, completed_months)
     current_sales = _sum_col(df, "당월 현재매출") or _num(meta.get("sum_current_month_sales_amt"))
-    forecast_sales = _sum_col(df, "당월 예상매출") or _num(meta.get("sum_current_month_expected_sales_amt"))
-    progress_pct = _safe_div(current_sales * 100.0, forecast_sales)
-    remaining_sales = _sum_col(df, "당월 잔여예상") or _num(meta.get("sum_current_month_remaining_expected_amt"))
-    if not ("당월 잔여예상" in df.columns or "sum_current_month_remaining_expected_amt" in meta):
-        remaining_sales = max(forecast_sales - current_sales, 0.0)
+    source_forecast_sales = (
+        _sum_col(df, "당월 예상매출")
+        or _num(meta.get("sum_current_month_expected_amt"))
+        or _num(meta.get("sum_current_month_expected_sales_amt"))
+    )
+    evaluation_forecast_sales = _sum_col(df, "평가월 예상매출")
     evaluation_yyyymm = _normalize_yyyymm(evaluation_month) or _normalize_yyyymm(meta.get("evaluation_month") or meta.get("current_month"))
     time_progress = _dashboard_time_progress(evaluation_yyyymm, policy_date=policy_date, today=today)
+    evaluation_completed = str(time_progress.get("status") or "") == "완료월"
+    normalized_source_mode = str(sales_source_mode or "").strip().lower()
+    actual_source_table = "Rddbc210" if normalized_source_mode == "monthly_real" else (
+        "Rddbc220" if normalized_source_mode == "monthly_book" else ""
+    )
+    evaluation_cutoff_date = _last_day_yyyymm(evaluation_yyyymm) if evaluation_yyyymm else ""
     time_progress_pct = time_progress["pct"]
+    forecast_sales = (
+        float(evaluation_forecast_sales)
+        if evaluation_completed and evaluation_forecast_sales > 0
+        else (None if evaluation_completed else float(source_forecast_sales))
+    )
+    progress_pct = (
+        _safe_div(current_sales * 100.0, forecast_sales)
+        if forecast_sales not in (None, 0)
+        else None
+    )
+    source_remaining_sales = _sum_col(df, "당월 잔여예상") or _num(meta.get("sum_current_month_remaining_expected_amt"))
+    if evaluation_completed:
+        remaining_sales = 0.0 if forecast_sales is not None else None
+    elif "당월 잔여예상" in df.columns or "sum_current_month_remaining_expected_amt" in meta:
+        remaining_sales = source_remaining_sales
+    else:
+        remaining_sales = max(float(forecast_sales or 0.0) - current_sales, 0.0)
     expected_to_date_sales = (
         float(forecast_sales) * float(time_progress_pct) / 100.0
-        if time_progress_pct is not None
+        if forecast_sales is not None and time_progress_pct is not None
         else None
     )
     time_adjusted_achievement_pct = (
         float(progress_pct) / float(time_progress_pct) * 100.0
-        if time_progress_pct not in (None, 0)
+        if progress_pct is not None and time_progress_pct not in (None, 0)
         else None
     )
     if time_adjusted_achievement_pct is None:
@@ -1429,7 +1456,7 @@ def _build_sales_facts(
     completed_actuals: list[dict[str, Any]] = []
     for col in _month_sales_columns(df):
         period, period_sort = _chart_period(col.replace(" 매출", ""))
-        if not period_sort:
+        if not period_sort or (evaluation_yyyymm and period_sort > evaluation_yyyymm):
             continue
         completed_actuals.append(
             {
@@ -1444,7 +1471,56 @@ def _build_sales_facts(
         )
     chart_rows.extend(completed_actuals)
     chart_rows.extend(_completed_month_pre_forecasts(completed_actuals, history_actuals=history_actuals))
-    if current_sales or forecast_sales:
+    if evaluation_completed and evaluation_yyyymm:
+        period, period_sort = _chart_period(evaluation_yyyymm)
+        historical_forecast = (
+            {
+                "period": period,
+                "period_sort": period_sort,
+                "value": evaluation_forecast_sales,
+                "kind": "완료월 사전예상",
+                "partial_period": False,
+                "forecast_basis": "평가월 공식 월시점 예상",
+                "forecast_status": "사전예상",
+                "forecast_helper": "analytics_sales_trend_service._forecast_projection_from_row",
+                "forecast_source": "manufacturer_summary.평가월 예상매출",
+            }
+            if evaluation_forecast_sales > 0
+            else None
+        )
+        chart_rows = [
+            row for row in chart_rows
+            if str(row.get("period_sort") or "") != evaluation_yyyymm
+        ]
+        chart_rows.append(
+            {
+                "period": period,
+                "period_sort": period_sort,
+                "value": current_sales,
+                "kind": "완료월 실제",
+                "partial_period": False,
+                "forecast_basis": "",
+                "forecast_status": "확정 실적",
+                "source_table": actual_source_table,
+                "source_mode": normalized_source_mode,
+                "cutoff_date": evaluation_cutoff_date,
+                "aggregation_contract": "공식 월집계 매출 중복제거·반품부호 계약",
+            }
+        )
+        if historical_forecast is not None:
+            historical_forecast.update(
+                {
+                    "period": period,
+                    "period_sort": period_sort,
+                    "kind": "완료월 사전예상",
+                    "partial_period": False,
+                    "forecast_status": "사전예상",
+                    "source_mode": normalized_source_mode,
+                    "cutoff_date": evaluation_cutoff_date,
+                }
+            )
+            chart_rows.append(historical_forecast)
+    elif current_sales or source_forecast_sales:
         period, period_sort = _chart_period(meta.get("evaluation_month") or meta.get("current_month") or "")
         if period_sort:
             chart_rows.append(
@@ -1462,7 +1538,7 @@ def _build_sales_facts(
                 {
                     "period": period,
                     "period_sort": period_sort,
-                    "value": forecast_sales,
+                    "value": source_forecast_sales,
                     "kind": "당월 예상",
                     "partial_period": True,
                     "forecast_basis": "당월 예상",
@@ -1483,46 +1559,46 @@ def _build_sales_facts(
                 source_columns=["완료월총매출", "완료월수"],
             ),
             "current_month_sales": _fact(
-                "당월 현재매출",
+                "평가월 현재매출",
                 current_sales,
                 unit="원",
                 aggregation="sum",
                 grain="제약사",
-                time_basis="당월 부분월 현재값",
+                time_basis="평가월 말일 확정값" if evaluation_completed else "평가월 부분월 현재값",
                 source_columns=["당월 현재매출"],
                 partial_period=True,
                 comparable_with=["당월 예상매출"],
             ),
             "current_month_forecast_sales": _fact(
-                "당월 예상매출",
+                "월말 예상매출",
                 forecast_sales,
                 unit="원",
                 aggregation="sum",
                 grain="제약사",
-                time_basis="당월 월말 예상값",
-                source_columns=["당월 예상매출"],
-                partial_period=True,
+                time_basis="평가월 당시 공식 월말 예상값" if evaluation_completed else "평가월 월말 예상값",
+                source_columns=["평가월 예상매출"] if evaluation_completed else ["당월 예상매출"],
+                partial_period=not evaluation_completed,
                 comparable_with=["당월 현재매출"],
             ),
             "current_month_remaining_forecast_sales": _fact(
-                "당월 잔여예상",
+                "월말 예상 잔여",
                 remaining_sales,
                 unit="원",
                 aggregation="forecast - current when source value is unavailable",
                 grain="제약사",
-                time_basis="당월 잔여 예상 매출",
+                time_basis="평가월 말일 잔여 예상 매출" if evaluation_completed else "평가월 잔여 예상 매출",
                 source_columns=["당월 잔여예상", "당월 예상매출", "당월 현재매출"],
-                partial_period=True,
+                partial_period=not evaluation_completed,
             ),
             "current_month_progress_pct": _fact(
-                "당월 진척률",
+                "예상매출 달성률",
                 progress_pct,
                 unit="%",
                 aggregation="current / forecast",
                 grain="제약사",
-                time_basis="당월 부분월",
-                source_columns=["당월 현재매출", "당월 예상매출"],
-                partial_period=True,
+                time_basis="평가월 말일" if evaluation_completed else "평가월 부분월",
+                source_columns=["당월 현재매출", "평가월 예상매출" if evaluation_completed else "당월 예상매출"],
+                partial_period=not evaluation_completed,
             ),
             "time_progress_pct": _fact(
                 "시간 진척률",
@@ -1578,6 +1654,11 @@ def _build_sales_facts(
             "time_adjusted_status": time_adjusted_status,
             "expected_to_date_sales": expected_to_date_sales,
             "evaluation_month": evaluation_yyyymm,
+            "evaluation_status": time_progress.get("status"),
+            "evaluation_actual_source_table": actual_source_table,
+            "evaluation_actual_source_mode": normalized_source_mode,
+            "evaluation_actual_cutoff_date": evaluation_cutoff_date,
+            "evaluation_forecast_helper": "analytics_sales_trend_service._forecast_projection_from_row",
             "chart_month_count": len({str(row.get("period_sort") or "") for row in chart_rows if row.get("period_sort")}),
             "completed_month_count": completed_months,
         },
@@ -3239,6 +3320,7 @@ def build_dashboard_lite_facts(
         history_actuals=source_monthly_actuals,
         evaluation_month=service_params.get("evaluation_month"),
         policy_date=service_params.get("policy_date"),
+        sales_source_mode=str(source_params.get("source_mode") or ""),
         today=today,
     )
     log.info(

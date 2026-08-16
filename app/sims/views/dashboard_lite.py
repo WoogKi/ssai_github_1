@@ -56,6 +56,7 @@ log = logging.getLogger("ssai.sims.dashboard_lite")
 
 DASHBOARD_LITE_SESSION_KEYS = (
     "__dashboard_lite_result",
+    "__dashboard_lite_applied_params",
     "__dashboard_lite_run_seq",
     "__dashboard_lite_profile_loaded_for",
     "__dashboard_lite_styles_loaded",
@@ -146,7 +147,7 @@ def clear_dashboard_lite_active_result(session_state: Any) -> list[str]:
     removed: list[str] = []
     for key in list(session_state.keys()):
         text = str(key)
-        if text in {"__dashboard_lite_result", "__dashboard_selected_action_detail", "__dashboard_lite_suppress_chat_autoscroll_once"} or text.startswith("__dashboard_lite_risk_detail_"):
+        if text in {"__dashboard_lite_result", "__dashboard_lite_applied_params", "__dashboard_selected_action_detail", "__dashboard_lite_suppress_chat_autoscroll_once"} or text.startswith("__dashboard_lite_risk_detail_"):
             session_state.pop(key, None)
             removed.append(text)
     return removed
@@ -399,18 +400,66 @@ def _fmt_dashboard_amount(value: Any, unit: str) -> str:
         return _fmt_number(value)
 
 
-def _metric_card(label: str, value: Any, suffix: str = "", *, help_text: str = "", digits: int = 0, amount_unit: str = "") -> None:
-    display_value = _fmt_dashboard_amount(value, amount_unit) if amount_unit else _fmt_number(value, digits)
+_DASHBOARD_INLINE_ICON_PATHS = {
+    "bars": '<path d="M5 19V13h3v6zm5 0V9h3v10zm5 0V5h3v14z" fill="currentColor"/>',
+    "trend": '<path d="M4 17l5-5 4 3 7-8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 7h5v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+    "calendar": '<rect x="4" y="5" width="16" height="15" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 3v4m8-4v4M4 9h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><rect x="8" y="12" width="3" height="3" rx=".5" fill="currentColor"/>',
+    "pie": '<path d="M12 3a9 9 0 1 0 9 9h-9z" fill="currentColor" opacity=".92"/><path d="M14 3.2V10h6.8A9 9 0 0 0 14 3.2z" fill="currentColor" opacity=".62"/>',
+    "report": '<path d="M6 3h9l3 3v15H6z" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 11h6M9 15h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="17.5" cy="17.5" r="3.2" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="m16.2 17.5.8.8 1.8-2" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>',
+    "compare": '<path d="M5 12a7 7 0 0 1 12-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M17 4v5h-5M19 12a7 7 0 0 1-12 4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M7 20v-5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>',
+    "target": '<circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/><path d="m12 12 7-7m-3 0h3v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+}
+
+
+def _dashboard_inline_icon(
+    icon_name: str,
+    semantic_class: str,
+    *,
+    variant: str = "circle",
+) -> str:
+    path = _DASHBOARD_INLINE_ICON_PATHS.get(str(icon_name or "").strip())
+    if not path:
+        return ""
+    safe_semantic = re.sub(r"[^a-z0-9_-]", "", str(semantic_class or "neutral").lower()) or "neutral"
+    safe_variant = re.sub(r"[^a-z0-9_-]", "", str(variant or "circle").lower()) or "circle"
+    return (
+        f'<span class="dashboard-lite-icon dashboard-lite-icon-{safe_semantic} dashboard-lite-icon-{safe_variant}" aria-hidden="true">'
+        f'<svg viewBox="0 0 24 24" focusable="false">{path}</svg></span>'
+    )
+
+
+def _metric_card(
+    label: str,
+    value: Any,
+    suffix: str = "",
+    *,
+    help_text: str = "",
+    digits: int = 0,
+    amount_unit: str = "",
+    semantic_class: str = "neutral",
+    display_text: str = "",
+) -> None:
+    display_value = str(display_text or "") or (
+        _fmt_dashboard_amount(value, amount_unit) if amount_unit else _fmt_number(value, digits)
+    )
     if display_value != "자료부족":
         display_value = f"{display_value}{suffix}"
     safe_label = html.escape(str(label or ""))
     safe_value = html.escape(str(display_value or ""))
     safe_help = html.escape(str(help_text or ""))
+    safe_semantic = re.sub(r"[^a-z0-9_-]", "", str(semantic_class or "neutral").lower()) or "neutral"
     help_html = f'<div class="dashboard-lite-kpi-help">{safe_help}</div>' if safe_help else ""
+    icon_name = {
+        "current": "bars",
+        "forecast": "trend",
+        "judgement": "calendar",
+        "remaining": "pie",
+    }.get(safe_semantic)
+    icon_html = _dashboard_inline_icon(icon_name, safe_semantic) if icon_name else ""
     st.markdown(
         f"""
-        <div class="dashboard-lite-kpi-card">
-          <div class="dashboard-lite-kpi-label">{safe_label}</div>
+        <div class="dashboard-lite-kpi-card dashboard-lite-kpi-{safe_semantic}">
+          <div class="dashboard-lite-kpi-head">{icon_html}<div class="dashboard-lite-kpi-label">{safe_label}</div></div>
           <div class="dashboard-lite-kpi-value">{safe_value}</div>
           {help_html}
         </div>
@@ -426,32 +475,109 @@ def _inject_dashboard_lite_styles_once() -> None:
         """
         <style>
         .dashboard-lite-kpi-card {
+            position: relative;
+            display: grid;
+            grid-template-rows: auto 1fr auto;
+            container-type: inline-size;
             border: 1px solid rgba(49, 51, 63, 0.18);
-            border-radius: 8px;
-            padding: 12px 14px;
-            min-height: 104px;
+            border-radius: 11px;
+            padding: 16px 18px 14px;
+            height: 145px;
+            box-sizing: border-box;
+            overflow: hidden;
             background: #ffffff;
+            box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+        }
+        .dashboard-lite-kpi-card::before {
+            content: "";
+            position: absolute;
+            inset: 0 0 auto 0;
+            height: 4px;
+            background: var(--dashboard-kpi-accent, #64748b);
+        }
+        .dashboard-lite-kpi-current { --dashboard-kpi-accent: #2563eb; }
+        .dashboard-lite-kpi-forecast { --dashboard-kpi-accent: #0f9f98; }
+        .dashboard-lite-kpi-judgement { --dashboard-kpi-accent: #f97316; }
+        .dashboard-lite-kpi-remaining { --dashboard-kpi-accent: #64748b; }
+        .dashboard-lite-kpi-current .dashboard-lite-kpi-value { color: #1d4ed8; }
+        .dashboard-lite-kpi-forecast .dashboard-lite-kpi-value { color: #0f9f98; }
+        .dashboard-lite-kpi-judgement .dashboard-lite-kpi-value { color: #c2410c; }
+        .dashboard-lite-kpi-remaining .dashboard-lite-kpi-value { color: #475569; }
+        div[data-testid="stChatMessage"]:has([class*="st-key-dashboard_sales_progress__"]) {
+            padding-left: 12px;
+        }
+        [class*="st-key-dashboard_sales_progress__"] h2 {
+            margin-bottom: 0.4rem;
         }
         .dashboard-lite-kpi-label {
             color: rgba(49, 51, 63, 0.74);
             font-size: 0.9rem;
             line-height: 1.25;
             text-align: left;
-            min-height: 2.4em;
+            min-height: 1.25em;
+            font-weight: 600;
+        }
+        .dashboard-lite-kpi-head {
+            display: flex;
+            align-items: center;
+            gap: 11px;
+            min-width: 0;
+        }
+        .dashboard-lite-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            flex: 0 0 auto;
+            color: #ffffff;
+        }
+        .dashboard-lite-icon svg {
+            display: block;
+            width: 58%;
+            height: 58%;
+        }
+        .dashboard-lite-icon-circle {
+            width: 38px;
+            height: 38px;
+            border: 1px solid rgba(255, 255, 255, 0.78);
+            border-radius: 50%;
+            box-shadow: 0 5px 10px rgba(15, 23, 42, 0.17), inset 0 1px 1px rgba(255, 255, 255, 0.34);
+        }
+        .dashboard-lite-icon-current { background: linear-gradient(145deg, #4f83ff, #2563eb); }
+        .dashboard-lite-icon-forecast { background: linear-gradient(145deg, #2dd4c7, #0fa9a3); }
+        .dashboard-lite-icon-judgement { background: linear-gradient(145deg, #ff9a4d, #f97316); }
+        .dashboard-lite-icon-remaining { background: linear-gradient(145deg, #94a3b8, #64748b); }
+        .dashboard-lite-icon-compact {
+            width: 19px;
+            height: 19px;
+            background: transparent;
+            border: 0;
+            box-shadow: none;
+        }
+        .dashboard-lite-icon-insight {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            box-shadow: 0 3px 8px rgba(15, 23, 42, 0.13), inset 0 1px 1px rgba(255, 255, 255, 0.30);
         }
         .dashboard-lite-kpi-value {
-            margin-top: 10px;
-            text-align: right;
-            font-size: 1.45rem;
+            align-self: center;
+            margin: 4px 0 2px;
+            text-align: center;
+            font-size: 1.6rem;
             font-weight: 700;
             line-height: 1.2;
             font-variant-numeric: tabular-nums;
+            white-space: nowrap;
         }
         .dashboard-lite-kpi-help {
             margin-top: 8px;
             color: rgba(49, 51, 63, 0.55);
             font-size: 0.75rem;
             text-align: left;
+        }
+        @container (max-width: 250px) {
+            .dashboard-lite-kpi-value { font-size: 1.15rem; }
+            .dashboard-lite-kpi-label { font-size: 0.82rem; }
         }
         .dashboard-lite-sales-state {
             margin: 10px 0 14px;
@@ -463,54 +589,186 @@ def _inject_dashboard_lite_styles_once() -> None:
             line-height: 1.55;
         }
         .dashboard-lite-sales-brief {
-            margin: 14px 0 18px;
-            padding: 16px 18px;
-            border: 1px solid rgba(15, 118, 110, 0.22);
-            border-radius: 8px;
-            background: #fbfdfd;
+            margin: 16px 0 8px;
+            padding: 14px 18px 12px;
+            border: 1px solid rgba(37, 99, 235, 0.16);
+            border-radius: 11px;
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            box-shadow: 0 5px 16px rgba(15, 23, 42, 0.06);
+        }
+        .dashboard-lite-sales-brief-row {
+            display: grid;
+            grid-template-columns: max-content minmax(0, 1.25fr) minmax(0, 1fr) minmax(0, 1fr);
+            align-items: center;
+            gap: 0;
         }
         .dashboard-lite-sales-brief-title {
-            margin: 0 0 8px;
-            color: #1f2937;
-            font-size: 1.125rem;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin: 0 18px 0 0;
+            padding: 9px 14px;
+            border-radius: 999px;
+            color: #ffffff;
+            background: #172033;
+            box-shadow: 0 4px 10px rgba(15, 23, 42, 0.16);
+            font-size: 0.96rem;
             font-weight: 700;
-            line-height: 1.35;
+            line-height: 1.2;
+            white-space: nowrap;
+        }
+        .dashboard-lite-sales-brief-title svg {
+            width: 18px;
+            height: 18px;
+            flex: 0 0 auto;
         }
         .dashboard-lite-sales-brief-line {
-            margin: 4px 0;
+            margin: 0;
+            padding: 4px 18px;
+            border-left: 1px solid rgba(148, 163, 184, 0.34);
+            display: flex;
+            align-items: center;
+            gap: 11px;
             color: rgba(31, 41, 55, 0.9);
-            font-size: 1rem;
-            line-height: 1.6;
-        }
-        .dashboard-lite-sales-brief-note {
-            margin: 8px 0 0;
-            color: rgba(49, 51, 63, 0.62);
-            font-size: 0.82rem;
+            font-size: 0.88rem;
             line-height: 1.45;
         }
-        .dashboard-lite-sales-gauge {
-            min-height: 244px;
-            padding: 6px 10px 10px;
+        .dashboard-lite-sales-brief-current strong { color: #1d4ed8; }
+        .dashboard-lite-sales-brief-pace strong { color: #ea580c; }
+        .dashboard-lite-sales-brief-prior strong { color: #0f9f98; }
+        .dashboard-lite-sales-brief-note {
+            margin: 9px 0 0 calc(18px + 9.8rem);
+            color: rgba(49, 51, 63, 0.62);
+            font-size: 0.76rem;
+            line-height: 1.45;
+        }
+        [class*="st-key-dashboard_sales_gauge_card__"],
+        [class*="st-key-dashboard_sales_chart_card__"] {
+            min-height: 440px;
+            box-sizing: border-box;
+            padding: 18px 20px 20px;
             border: 1px solid rgba(49, 51, 63, 0.16);
-            border-radius: 8px;
-            text-align: center;
+            border-radius: 11px;
             background: #ffffff;
+            box-shadow: 0 5px 16px rgba(15, 23, 42, 0.07);
+        }
+        .dashboard-lite-sales-gauge {
+            min-height: 400px;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            text-align: center;
+        }
+        .dashboard-lite-sales-gauge-title {
+            color: #1f2937;
+            font-size: 1.05rem;
+            font-weight: 700;
+            line-height: 1.35;
+            text-align: left;
         }
         .dashboard-lite-sales-gauge svg {
             display: block;
-            width: min(100%, 260px);
-            margin: 0 auto -24px;
+            width: min(100%, 440px);
+            margin: 12px auto -12px;
+            overflow: visible;
+        }
+        .dashboard-lite-gauge-track {
+            filter: drop-shadow(0 3px 4px rgba(15, 23, 42, 0.12));
+        }
+        .dashboard-lite-gauge-progress {
+            filter: drop-shadow(0 5px 6px rgba(29, 78, 216, 0.27));
+        }
+        .dashboard-lite-gauge-needle {
+            filter: drop-shadow(0 2px 2px rgba(30, 64, 175, 0.28));
+        }
+        .dashboard-lite-gauge-hub {
+            filter: drop-shadow(0 4px 4px rgba(30, 64, 175, 0.32));
         }
         .dashboard-lite-gauge-main {
             color: #1f2937;
-            font-size: 1.6rem;
+            font-size: 2.15rem;
             font-weight: 700;
             font-variant-numeric: tabular-nums;
         }
         .dashboard-lite-gauge-label, .dashboard-lite-gauge-sub {
             color: rgba(49, 51, 63, 0.68);
-            font-size: 0.8rem;
-            line-height: 1.45;
+            font-size: 0.92rem;
+            line-height: 1.55;
+        }
+        .dashboard-lite-gauge-label {
+            color: #1e3a8a;
+            font-weight: 650;
+        }
+        .dashboard-lite-gauge-sub {
+            margin: 12px auto 0;
+            padding-top: 11px;
+            width: min(100%, 360px);
+            border-top: 1px solid rgba(148, 163, 184, 0.28);
+            color: #475569;
+        }
+        .dashboard-lite-sales-chart-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 20px;
+            margin: 1px 2px 2px;
+        }
+        .dashboard-lite-sales-chart-title {
+            color: #1f2937;
+            font-size: 1.35rem;
+            font-weight: 700;
+            line-height: 1.3;
+            white-space: nowrap;
+        }
+        .dashboard-lite-sales-chart-legend {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px 20px;
+            color: #334155;
+            font-size: 0.84rem;
+            font-weight: 650;
+        }
+        .dashboard-lite-sales-chart-legend-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            white-space: nowrap;
+        }
+        .dashboard-lite-sales-chart-legend-swatch {
+            width: 13px;
+            height: 13px;
+            border: 1px solid rgba(255, 255, 255, 0.9);
+            border-radius: 3px;
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.18);
+        }
+        .dashboard-lite-sales-chart-legend-actual { background: linear-gradient(180deg, #4f83ff, #2563eb); }
+        .dashboard-lite-sales-chart-legend-forecast { background: linear-gradient(180deg, #2dd4c7, #0fa9a3); }
+        .dashboard-lite-sales-chart-legend-judgement { background: linear-gradient(180deg, #ff9a4d, #f97316); }
+        @media (max-width: 1100px) {
+            .dashboard-lite-sales-brief-row {
+                grid-template-columns: 1fr;
+                gap: 10px;
+            }
+            .dashboard-lite-sales-brief-title {
+                width: fit-content;
+                margin-right: 0;
+            }
+            .dashboard-lite-sales-brief-line {
+                border-left-width: 3px;
+            }
+            .dashboard-lite-sales-brief-note {
+                margin-left: 0;
+            }
+            .dashboard-lite-sales-chart-header {
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 8px;
+            }
+            .dashboard-lite-sales-chart-legend {
+                justify-content: flex-start;
+            }
         }
         </style>
         """,
@@ -540,6 +798,8 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
     forecast = (metrics.get("current_month_forecast_sales") or {}).get("value")
     time_progress = (metrics.get("time_progress_pct") or {}).get("value")
     achievement = (metrics.get("time_adjusted_achievement_pct") or {}).get("value")
+    remaining = (metrics.get("current_month_remaining_forecast_sales") or {}).get("value")
+    chart_rows = sales.get("chart_rows") or []
     try:
         current_number = float(current)
         forecast_number = float(forecast)
@@ -558,6 +818,51 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
     elapsed_days = total_days = None
     evaluation_month = str(visualization.get("evaluation_month") or "")
     time_basis = str((metrics.get("time_progress_pct") or {}).get("time_basis") or "")
+    evaluation_status = next(
+        (status for status in ("완료월", "진행중", "미래월", "자료부족") if status in time_basis),
+        "자료부족",
+    )
+    is_completed_month = evaluation_status == "완료월"
+    historical_forecast_row = next(
+        (
+            row for row in chart_rows
+            if str(row.get("kind") or "") == "완료월 사전예상"
+            and str(row.get("period_sort") or "") == evaluation_month
+        ),
+        None,
+    )
+    historical_actual_row = next(
+        (
+            row for row in chart_rows
+            if str(row.get("kind") or "") == "완료월 실제"
+            and str(row.get("period_sort") or "") == evaluation_month
+        ),
+        None,
+    )
+    historical_forecast = historical_forecast_row.get("value") if historical_forecast_row else None
+    historical_actual = historical_actual_row.get("value") if historical_actual_row else None
+    completed_achievement = None
+    completed_difference = None
+    if is_completed_month:
+        try:
+            historical_actual_number = float(current_number)
+        except (TypeError, ValueError):
+            historical_actual_number = None
+        try:
+            historical_number = float(forecast_number)
+        except (TypeError, ValueError):
+            historical_number = None
+        if historical_actual_number is None or historical_number is None or historical_number <= 0:
+            comparison_label, comparison_amount = "완료월 예상 비교 자료 없음", None
+        else:
+            completed_difference = historical_actual_number - historical_number
+            completed_achievement = historical_actual_number / historical_number * 100.0
+            if completed_difference > 0:
+                comparison_label, comparison_amount = "예상보다 초과", completed_difference
+            elif completed_difference < 0:
+                comparison_label, comparison_amount = "예상보다 미달", abs(completed_difference)
+            else:
+                comparison_label, comparison_amount = "예상과 동일", 0.0
     day_match = re.search(r"(\d+)\s*/\s*(\d+)", time_basis)
     if day_match:
         elapsed_days, total_days = int(day_match.group(1)), int(day_match.group(2))
@@ -568,11 +873,39 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
         except (ValueError, TypeError):
             elapsed_days = total_days = None
 
+    judgement_digits = re.sub(r"\D", "", str((facts.get("period") or {}).get("judgement_date") or ""))[:8]
+    judgement_day = None
+    if len(judgement_digits) == 8 and (not evaluation_month or judgement_digits[:6] == evaluation_month):
+        judgement_day = int(judgement_digits[-2:])
+    elif elapsed_days not in (None, 0):
+        judgement_day = int(elapsed_days)
+    expected_to_date_value = visualization.get("expected_to_date_sales")
+    expected_available = expected_to_date_value is not None
+    try:
+        expected_duplicates_month_end = (
+            expected_available
+            and forecast_number is not None
+            and math.isclose(float(expected_to_date_value), forecast_number, rel_tol=1e-9, abs_tol=0.01)
+        )
+    except (TypeError, ValueError):
+        expected_duplicates_month_end = False
+    expected_chart_visible = (
+        expected_available
+        and time_progress not in (None, 0)
+        and not expected_duplicates_month_end
+    )
+    judgement_basis = f"{judgement_day}일 기준" if judgement_day else "판단 기준일"
+    evaluation_label = f"{int(evaluation_month[4:6])}월" if len(evaluation_month) == 6 else "평가월"
+
     return {
         "current_sales": current,
         "forecast_sales": forecast,
-        "expected_to_date_sales": visualization.get("expected_to_date_sales"),
-        "sales_progress_pct": visualization.get("sales_progress_pct", (metrics.get("current_month_progress_pct") or {}).get("value")),
+        "expected_to_date_sales": expected_to_date_value,
+        "remaining_forecast_sales": remaining if remaining is not None else visualization.get("remaining_forecast"),
+        "sales_progress_pct": (
+            completed_achievement if is_completed_month
+            else visualization.get("sales_progress_pct", (metrics.get("current_month_progress_pct") or {}).get("value"))
+        ),
         "time_progress_pct": time_progress,
         "time_adjusted_achievement_pct": achievement,
         "time_adjusted_status": _sales_time_status_label(achievement),
@@ -580,56 +913,143 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
         "comparison_amount": comparison_amount,
         "elapsed_days": elapsed_days,
         "total_days": total_days,
+        "judgement_day": judgement_day,
+        "judgement_basis": judgement_basis,
+        "expected_to_date_available": expected_available,
+        "expected_to_date_chart_visible": expected_chart_visible,
+        "expected_to_date_duplicates_month_end": expected_duplicates_month_end,
+        "evaluation_label": evaluation_label,
+        "evaluation_status": evaluation_status,
+        "is_completed_month": is_completed_month,
+        "historical_forecast_available": historical_forecast_row is not None,
+        "historical_actual_available": historical_actual_row is not None,
+        "completed_forecast_achievement_pct": completed_achievement,
+        "completed_forecast_difference": completed_difference,
+        "completed_actual_source_table": (historical_actual_row or {}).get("source_table") or visualization.get("evaluation_actual_source_table"),
+        "completed_actual_cutoff_date": (historical_actual_row or {}).get("cutoff_date") or visualization.get("evaluation_actual_cutoff_date"),
+        "completed_forecast_helper": (historical_forecast_row or {}).get("forecast_helper") or visualization.get("evaluation_forecast_helper"),
     }
 
 
 def _sales_gauge_state(facts: dict[str, Any]) -> dict[str, Any]:
     """Return display-only gauge bounds; current-day progress stays calendar based."""
     state = _sales_presentation_state(facts)
+    gauge_available = state.get("sales_progress_pct") is not None
     try:
-        progress = max(0.0, float(state.get("sales_progress_pct") or 0.0))
+        progress = max(0.0, float(state.get("sales_progress_pct"))) if gauge_available else None
     except (TypeError, ValueError):
-        progress = 0.0
+        progress = None
+        gauge_available = False
     try:
         today_progress = max(0.0, float(state.get("time_adjusted_achievement_pct") or 0.0))
     except (TypeError, ValueError):
         today_progress = 0.0
-    maximum = max(120.0, min(max(progress, today_progress, 100.0) + 10.0, 250.0))
-    return {**state, "gauge_max_pct": maximum, "needle_pct": progress, "today_marker_pct": today_progress, "time_basis_label": "판단 기준일"}
+    maximum = max(120.0, min(max(progress or 0.0, today_progress, 100.0) + 10.0, 250.0))
+    return {
+        **state,
+        "gauge_available": gauge_available,
+        "gauge_max_pct": maximum,
+        "needle_pct": progress,
+        "today_marker_pct": today_progress,
+        "time_basis_label": "판단 기준일",
+    }
 
 
-def _render_sales_gauge(facts: dict[str, Any]) -> None:
-    _inject_dashboard_lite_styles_once()
+def _build_sales_gauge_markup(facts: dict[str, Any], *, render_namespace: str = "sales") -> str:
+    """Build one self-contained SVG without Markdown-breaking empty fragments."""
     state = _sales_gauge_state(facts)
-    amount_unit = _facts_amount_display_unit(facts)
-    progress = float(state["needle_pct"])
-    maximum = float(state["gauge_max_pct"])
-    needle_angle = max(-90.0, min(90.0, -90.0 + min(progress, maximum) / maximum * 180.0))
-    today_angle = max(-90.0, min(90.0, -90.0 + min(float(state["today_marker_pct"]), maximum) / maximum * 180.0))
-    comparison = state["comparison_label"]
-    comparison_amount = state.get("comparison_amount")
-    comparison_text = comparison if comparison_amount is None or comparison == "월말 예상 도달" else f"{comparison} {_fmt_dashboard_amount(comparison_amount, amount_unit)}"
-    st.markdown("### 평가월 매출 진행")
+    gauge_available = bool(state["gauge_available"])
+    progress = float(state["needle_pct"] or 0.0)
+    visual_progress = max(0.0, min(progress, 100.0))
+    progress_arc_pct = visual_progress
+    needle_angle = -90.0 + visual_progress * 1.8
+    target_angle = 90.0
+    today_visual_pct = max(0.0, min(float(state["today_marker_pct"]), 100.0))
+    today_angle = -90.0 + today_visual_pct * 1.8
+    today_marker = (
+        f'<path d="M 140 20 L 140 42" stroke="#f97316" stroke-width="5" stroke-linecap="round" '
+        f'transform="rotate({today_angle:.3f} 140 132)"/>'
+        if gauge_available and state["expected_to_date_chart_visible"] else ""
+    )
+    today_achievement = (
+        f"{html.escape(_fmt_number(state['today_marker_pct'], 1))}%"
+        if state["expected_to_date_available"] else "자료부족"
+    )
+    safe_svg_namespace = re.sub(r"[^a-zA-Z0-9_-]", "", str(render_namespace or "sales")) or "sales"
+    track_gradient_id = f"dashboardGaugeTrack-{safe_svg_namespace}"
+    progress_gradient_id = f"dashboardGaugeProgress-{safe_svg_namespace}"
+    needle_gradient_id = f"dashboardGaugeNeedle-{safe_svg_namespace}"
+    hub_gradient_id = f"dashboardGaugeHub-{safe_svg_namespace}"
+    shadow_filter_id = f"dashboardGaugeShadow-{safe_svg_namespace}"
+    needle_filter_id = f"dashboardGaugeNeedleShadow-{safe_svg_namespace}"
+    svg_parts = [
+        f'<svg viewBox="0 0 280 168" role="img" aria-label="{html.escape(state["evaluation_label"])} 매출 진행">',
+        "<defs>",
+        f'<linearGradient id="{track_gradient_id}" gradientUnits="userSpaceOnUse" x1="140" y1="18" x2="140" y2="148"><stop offset="0%" stop-color="#ffffff"/><stop offset="28%" stop-color="#f4f7fb"/><stop offset="62%" stop-color="#e1e7ef"/><stop offset="100%" stop-color="#c8d2df"/></linearGradient>',
+        f'<linearGradient id="{progress_gradient_id}" gradientUnits="userSpaceOnUse" x1="140" y1="18" x2="140" y2="148"><stop offset="0%" stop-color="#b9d4ff"/><stop offset="14%" stop-color="#78a9ff"/><stop offset="34%" stop-color="#4f83f5"/><stop offset="66%" stop-color="#2f6fe5"/><stop offset="88%" stop-color="#2058ca"/><stop offset="100%" stop-color="#173f9f"/></linearGradient>',
+        f'<linearGradient id="{needle_gradient_id}" gradientUnits="userSpaceOnUse" x1="136" y1="43" x2="144" y2="43"><stop offset="0%" stop-color="#173f9c"/><stop offset="42%" stop-color="#6fa2ff"/><stop offset="62%" stop-color="#3b7af0"/><stop offset="100%" stop-color="#12327c"/></linearGradient>',
+        f'<radialGradient id="{hub_gradient_id}" cx="38%" cy="28%" r="75%"><stop offset="0%" stop-color="#dce9ff"/><stop offset="25%" stop-color="#78a8ff"/><stop offset="58%" stop-color="#2f6fed"/><stop offset="100%" stop-color="#102f78"/></radialGradient>',
+        f'<filter id="{shadow_filter_id}" x="-24%" y="-24%" width="148%" height="160%"><feDropShadow dx="0" dy="4" stdDeviation="3.8" flood-color="#123b92" flood-opacity="0.34"/></filter>',
+        f'<filter id="{needle_filter_id}" x="-80%" y="-24%" width="260%" height="160%"><feDropShadow dx="0" dy="3" stdDeviation="2.4" flood-color="#0f255f" flood-opacity="0.38"/></filter>',
+        "</defs>",
+        f'<path class="dashboard-lite-gauge-track" d="M 30 132 A 110 110 0 0 1 250 132" fill="none" stroke="url(#{track_gradient_id})" stroke-width="24" stroke-linecap="round"/>',
+    ]
+    if gauge_available:
+        svg_parts.extend([
+            f'<path class="dashboard-lite-gauge-progress" d="M 30 132 A 110 110 0 0 1 250 132" pathLength="100" fill="none" stroke="url(#{progress_gradient_id})" stroke-width="24" stroke-linecap="round" stroke-dasharray="{progress_arc_pct:.3f} 100" filter="url(#{shadow_filter_id})"/>',
+            f'<path d="M 140 20 L 140 42" stroke="#0f766e" stroke-width="4" stroke-linecap="round" transform="rotate({target_angle:.3f} 140 132)"/>',
+        ])
+        if today_marker:
+            svg_parts.append(today_marker)
+        svg_parts.extend([
+            f'<rect class="dashboard-lite-gauge-needle" x="136.5" y="43" width="7" height="89" rx="3.5" fill="url(#{needle_gradient_id})" stroke="#1e3a8a" stroke-width="0.8" filter="url(#{needle_filter_id})" transform="rotate({needle_angle:.3f} 140 132)"/>',
+            f'<g class="dashboard-lite-gauge-hub" filter="url(#{needle_filter_id})"><circle cx="140" cy="132" r="14" fill="#0f2f7c"/><circle cx="140" cy="132" r="11" fill="#2563eb"/><circle cx="140" cy="132" r="8.6" fill="url(#{hub_gradient_id})"/><circle cx="140" cy="132" r="4.4" fill="#f8fbff" stroke="#dbeafe" stroke-width="0.8"/><circle cx="138.4" cy="130.2" r="1.7" fill="#ffffff" opacity="0.90"/></g>',
+        ])
+    svg_parts.extend([
+        '<text x="28" y="160" text-anchor="middle" fill="#64748b" font-size="12">0%</text>',
+        '<text x="252" y="160" text-anchor="middle" fill="#64748b" font-size="12">100%</text>',
+        "</svg>",
+    ])
+    if not gauge_available:
+        main_text = "자료부족"
+        gauge_label = "비교 자료 없음" if state["is_completed_month"] else "예상매출 달성률 계산 불가"
+        gauge_sub = (
+            "평가월의 공식 예상매출 자료를 확인해 주세요."
+            if state["is_completed_month"] else "평가월의 현재매출·월말 예상 자료를 확인해 주세요."
+        )
+    else:
+        main_text = f"{_fmt_number(progress, 1)}%"
+        gauge_label = "예상매출 대비 달성률" if state["is_completed_month"] else "예상매출 달성률"
+        if state["is_completed_month"]:
+            amount_unit = _facts_amount_display_unit(facts)
+            difference = state.get("completed_forecast_difference")
+            if difference is None:
+                gauge_sub = "비교 자료 없음"
+            elif difference > 0:
+                gauge_sub = f"예상보다 {_fmt_dashboard_amount(abs(difference), amount_unit)} 초과"
+            elif difference < 0:
+                gauge_sub = f"예상보다 {_fmt_dashboard_amount(abs(difference), amount_unit)} 미달"
+            else:
+                gauge_sub = "예상과 동일"
+        else:
+            gauge_sub = f"{state['judgement_basis']} 예상 대비 달성률 {today_achievement}"
+    return "".join([
+        '<div class="dashboard-lite-sales-gauge">',
+        f'<div class="dashboard-lite-sales-gauge-title">{html.escape(state["evaluation_label"])} 매출 진행</div>',
+        "".join(svg_parts),
+        f'<div class="dashboard-lite-gauge-main">{html.escape(main_text)}</div>',
+        f'<div class="dashboard-lite-gauge-label">{html.escape(gauge_label)}</div>',
+        f'<div class="dashboard-lite-gauge-sub">{html.escape(gauge_sub)}</div>',
+        "</div>",
+    ])
+
+
+def _render_sales_gauge(facts: dict[str, Any], *, render_namespace: str = "sales") -> None:
+    _inject_dashboard_lite_styles_once()
     st.markdown(
-        f"""
-        <div class="dashboard-lite-sales-gauge">
-          <svg viewBox="0 0 240 138" role="img" aria-label="평가월 매출 진행">
-            <path d="M 24 116 A 96 96 0 0 1 216 116" fill="none" stroke="#e5e7eb" stroke-width="18" stroke-linecap="round"/>
-            <path d="M 120 20 L 120 39" stroke="#f59e0b" stroke-width="4" transform="rotate(0 120 116)"/>
-            <path d="M 120 23 L 120 43" stroke="#0f766e" stroke-width="4" transform="rotate({today_angle:.3f} 120 116)"/>
-            <path d="M 120 116 L 120 42" stroke="#2563eb" stroke-width="5" stroke-linecap="round" transform="rotate({needle_angle:.3f} 120 116)"/>
-            <circle cx="120" cy="116" r="7" fill="#2563eb"/>
-          </svg>
-          <div class="dashboard-lite-gauge-main">{html.escape(_fmt_number(progress, 1))}%</div>
-          <div class="dashboard-lite-gauge-label">월말 예상 달성률</div>
-          <div class="dashboard-lite-gauge-sub">{html.escape(state['time_basis_label'])} 달성률 {html.escape(_fmt_number(state['today_marker_pct'], 1))}%</div>
-        </div>
-        """,
+        _build_sales_gauge_markup(facts, render_namespace=render_namespace),
         unsafe_allow_html=True,
     )
-    for label, value in (("현재매출", state["current_sales"]), ("월말 예상매출", state["forecast_sales"]), ("판단 기준일 예상매출", state["expected_to_date_sales"])):
-        st.caption(f"{label}: {_fmt_dashboard_amount(value, amount_unit)}")
-    st.caption(comparison_text)
 
 
 def _render_status_cards(facts: dict[str, Any]) -> None:
@@ -637,13 +1057,34 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
     state = _sales_presentation_state(facts)
     amount_unit = _facts_amount_display_unit(facts)
     cards = [
-        ("당월 현재매출", state["current_sales"], "당월 누적 실적", "amount"),
-        ("월말 예상매출", state["forecast_sales"], "당월 월말 예상", "amount"),
-        ("판단 기준일 예상매출", state["expected_to_date_sales"], "월 경과율 반영", "amount"),
-        ("판단 기준일 달성률", state["time_adjusted_achievement_pct"], state["time_adjusted_status"], "pct"),
+        ("현재매출", state["current_sales"], "평가월 말일 확정 실적" if state["is_completed_month"] else "평가월 누적 실적", "amount", "current", ""),
+        (
+            "월말 예상매출",
+            state["forecast_sales"],
+            "완료월 공식 사전예상" if state["is_completed_month"] and state["historical_forecast_available"] else ("비교 자료 없음" if state["is_completed_month"] else "당월 월말 예상"),
+            "amount",
+            "forecast",
+            "비교 자료 없음" if state["is_completed_month"] and not state["historical_forecast_available"] else "",
+        ),
+        (
+            f"{state['judgement_basis']} 예상매출",
+            state["expected_to_date_sales"],
+            "평가월 말일 기준" if state["is_completed_month"] else ("월 경과율 반영" if state["expected_to_date_available"] else "경계월 계산 제외"),
+            "amount",
+            "judgement",
+            "자료부족" if state["expected_to_date_sales"] is None else "",
+        ),
+        (
+            "월말 예상 잔여",
+            state["remaining_forecast_sales"],
+            "공식 잔여예상",
+            "amount",
+            "remaining",
+            "자료부족" if state["remaining_forecast_sales"] is None else "",
+        ),
     ]
     if amount_unit == "auto":
-        amount_values = [value for _label, value, _help, kind in cards if kind == "amount"]
+        amount_values = [value for _label, value, _help, kind, _semantic, _display in cards if kind == "amount"]
         try:
             max_amount = max(abs(float(value)) for value in amount_values if value is not None)
         except ValueError:
@@ -652,7 +1093,7 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
         amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
 
     cols = st.columns(4)
-    for col, (label, value, help_text, kind) in zip(cols, cards):
+    for col, (label, value, help_text, kind, semantic_class, display_text) in zip(cols, cards):
         with col:
             _metric_card(
                 label,
@@ -661,23 +1102,10 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
                 help_text=help_text,
                 digits=1 if kind == "pct" else 0,
                 amount_unit=amount_unit if kind == "amount" else "",
+                semantic_class=semantic_class,
+                display_text=display_text,
             )
 
-    progress_text = "자료부족"
-    if state["elapsed_days"] is not None and state["total_days"] is not None and state["time_progress_pct"] is not None:
-        progress_text = f"{state['elapsed_days']}일 / {state['total_days']}일 · {_fmt_number(state['time_progress_pct'], 1)}%"
-    sales_progress_text = _fmt_number(state["sales_progress_pct"], 1)
-    comparison_text = state["comparison_label"]
-    if state["comparison_amount"] is not None and state["comparison_label"] != "월말 예상 도달":
-        comparison_text = f"{comparison_text} {_fmt_dashboard_amount(state['comparison_amount'], amount_unit)}"
-    st.markdown(
-        "<div class=\"dashboard-lite-sales-state\">"
-        f"<strong>월 경과</strong>: {html.escape(progress_text)} · "
-        f"<strong>월말 예상 달성률</strong>: {html.escape(sales_progress_text)}% · "
-        f"<strong>{html.escape(comparison_text)}</strong>"
-        "</div>",
-        unsafe_allow_html=True,
-    )
 
 
 def _render_sales_brief(facts: dict[str, Any]) -> None:
@@ -688,13 +1116,36 @@ def _render_sales_brief(facts: dict[str, Any]) -> None:
     forecast = metrics.get("current_month_forecast_sales") or {}
     state = _sales_presentation_state(facts)
     amount_unit = _facts_amount_display_unit(facts)
-    current_value = current.get("value")
-    forecast_value = forecast.get("value")
-    if current_value is None or forecast_value is None:
+    current_value = state.get("current_sales", current.get("value"))
+    forecast_value = state.get("forecast_sales", forecast.get("value"))
+    if current_value is None:
         st.caption("당월 현재·예상 매출 자료가 부족합니다.")
         return
 
-    if state["comparison_label"] == "월말 예상 초과":
+    if state["is_completed_month"]:
+        if state["historical_forecast_available"] and forecast_value is not None:
+            difference = state.get("completed_forecast_difference")
+            achievement = state.get("completed_forecast_achievement_pct")
+            if difference is None:
+                difference_line = "예상 대비 차이 자료가 없습니다."
+            elif difference > 0:
+                difference_line = f"공식 예상보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 초과했습니다."
+            elif difference < 0:
+                difference_line = f"공식 예상보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 미달했습니다."
+            else:
+                difference_line = "공식 예상과 동일한 실적입니다."
+            lines = [
+                f"평가월 확정 실제매출은 <strong>{html.escape(_fmt_dashboard_amount(current_value, amount_unit))}</strong>이며, 공식 예상매출은 <strong>{html.escape(_fmt_dashboard_amount(forecast_value, amount_unit))}</strong>입니다.",
+                difference_line,
+                f"예상 대비 달성률은 <strong>{html.escape(_fmt_number(achievement, 1))}%</strong>입니다.",
+            ]
+        else:
+            lines = [
+                f"평가월 확정 실제매출은 <strong>{html.escape(_fmt_dashboard_amount(current_value, amount_unit))}</strong>입니다.",
+                "공식 예상매출 비교 자료가 없습니다.",
+                "기준일 예상매출 비교 자료가 없습니다.",
+            ]
+    elif state["comparison_label"] == "월말 예상 초과":
         lines = [
             f"현재 매출은 <strong>{html.escape(_fmt_dashboard_amount(current_value, amount_unit))}</strong>이며, 월말 예상 <strong>{html.escape(_fmt_dashboard_amount(forecast_value, amount_unit))}</strong>을 <strong>{html.escape(_fmt_dashboard_amount(state['comparison_amount'], amount_unit))}</strong> 초과했습니다.",
         ]
@@ -707,24 +1158,25 @@ def _render_sales_brief(facts: dict[str, Any]) -> None:
             f"현재 매출은 <strong>{html.escape(_fmt_dashboard_amount(current_value, amount_unit))}</strong>이며, 월말 예상은 <strong>{html.escape(_fmt_dashboard_amount(forecast_value, amount_unit))}</strong>입니다. 월말 예상까지 <strong>{html.escape(_fmt_dashboard_amount(state['comparison_amount'], amount_unit))}</strong>이 남았습니다.",
         ]
 
-    expected_to_date = state["expected_to_date_sales"]
-    if expected_to_date is None:
-        lines.append("판단 기준일 예상매출을 계산할 수 있는 평가월 자료가 부족합니다.")
-    else:
-        difference = float(current_value) - float(expected_to_date)
-        if state["time_adjusted_status"] == "현재일 예상과 유사":
-            lines.append("판단 기준일 예상매출과 유사한 수준입니다.")
-        elif difference > 0:
-            lines.append(f"판단 기준일 예상매출보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 앞서 있습니다.")
+    if not state["is_completed_month"]:
+        expected_to_date = state["expected_to_date_sales"]
+        if expected_to_date is None:
+            lines.append("판단 기준일 예상매출을 계산할 수 있는 평가월 자료가 부족합니다.")
         else:
-            lines.append(f"판단 기준일 예상매출보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 뒤처져 있습니다.")
+            difference = float(current_value) - float(expected_to_date)
+            if state["time_adjusted_status"] == "현재일 예상과 유사":
+                lines.append("판단 기준일 예상매출과 유사한 수준입니다.")
+            elif difference > 0:
+                lines.append(f"판단 기준일 예상매출보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 앞서 있습니다.")
+            else:
+                lines.append(f"판단 기준일 예상매출보다 <strong>{html.escape(_fmt_dashboard_amount(abs(difference), amount_unit))}</strong> 뒤처져 있습니다.")
 
     chart_rows = sales.get("chart_rows") or []
     completed = [row for row in chart_rows if row.get("kind") == "완료월 실제"]
     preforecast = [row for row in chart_rows if row.get("kind") == "완료월 사전예상"]
     preforecast_by_month = {str(row.get("period_sort") or ""): row for row in preforecast}
     comparable = [row for row in completed if str(row.get("period_sort") or "") in preforecast_by_month]
-    if comparable:
+    if comparable and not state["is_completed_month"]:
         latest = max(comparable, key=lambda row: str(row.get("period_sort") or ""))
         prior = preforecast_by_month[str(latest.get("period_sort") or "")]
         prior_value = float(prior.get("value") or 0)
@@ -734,20 +1186,35 @@ def _render_sales_brief(facts: dict[str, Any]) -> None:
             lines.append(f"최근 완료월 실적은 당시 사전예상보다 <strong>{html.escape(_fmt_number(abs(delta_pct), 1))}%</strong> {direction}.")
         else:
             lines.append("최근 완료월의 비교 가능한 사전예상 자료가 없습니다.")
-    else:
+    elif not state["is_completed_month"]:
         lines.append("최근 완료월의 비교 가능한 사전예상 자료가 없습니다.")
+    elif len(lines) < 3:
+        lines.append("완료월 실적은 월별 실제매출 차트에 그대로 유지됩니다.")
+    title_icon = _dashboard_inline_icon("report", "remaining", variant="compact")
+    insight_html = "".join(
+        f'<div class="dashboard-lite-sales-brief-line dashboard-lite-sales-brief-{semantic}">'
+        f'{_dashboard_inline_icon(icon_name, icon_semantic, variant="insight")}<span>{line}</span></div>'
+        for semantic, icon_name, icon_semantic, line in zip(
+            ("current", "pace", "prior"),
+            ("trend", "compare", "target"),
+            ("current", "judgement", "forecast"),
+            lines,
+        )
+    )
     st.markdown(
         "<div class=\"dashboard-lite-sales-brief\">"
-        "<div class=\"dashboard-lite-sales-brief-title\">오늘의 매출 요약</div>"
-        + "".join(f"<div class=\"dashboard-lite-sales-brief-line\">{line}</div>" for line in lines)
-        + "<div class=\"dashboard-lite-sales-brief-note\">판단 기준일 예상매출은 평가월의 월 경과율을 반영한 참고값입니다.</div>"
+        "<div class=\"dashboard-lite-sales-brief-row\">"
+        f"<div class=\"dashboard-lite-sales-brief-title\">{title_icon}<span>오늘의 매출 요약</span></div>"
+        + insight_html
+        + "</div>"
+        + "<div class=\"dashboard-lite-sales-brief-note\">기준일 예상매출은 평가월 경과율을 반영하며, 완료월은 말일 기준입니다.</div>"
         + "</div>",
         unsafe_allow_html=True,
     )
 
 
 def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart | None:
-    """Build actual bars with monthly forecast and current-day target markers."""
+    """Build grouped actual, month-end forecast, and eligible current-day bars."""
     rows = (facts.get("sales") or {}).get("chart_rows") or []
     if not rows:
         return None
@@ -782,7 +1249,7 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     actual_df["value_kind"] = actual_df["kind"].map(
         {"완료월 실제": "완료월 실제", "당월 현재(부분월)": "당월 현재매출"}
     ).fillna("실제매출")
-    forecast_df["series"] = "예상매출"
+    forecast_df["series"] = "월말 예상매출"
     forecast_df["value_kind"] = forecast_df["kind"].map(
         {"완료월 사전예상": "완료월 사전예상", "당월 예상": "당월 월말 예상"}
     ).fillna("예상매출")
@@ -807,77 +1274,140 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     forecast_df["month_status"] = forecast_df["kind"].map(
         {"완료월 사전예상": "완료월", "당월 예상": "평가월"}
     ).fillna("예상")
-    series_color = alt.Color(
-        "series:N",
-        title=None,
-        scale=alt.Scale(
-            domain=["실제매출", "예상매출", "판단 기준일"],
-            range=["#2563eb", "#f97316", "#0f766e"],
-        ),
-        legend=alt.Legend(orient="top", direction="horizontal", labelFontSize=12, symbolSize=90),
-    )
-    x_encoding = alt.X("display_period:N", title=None, sort=period_order, axis=alt.Axis(labelAngle=0, labelPadding=8))
-    y_encoding = alt.Y("display_value:Q", title=f"매출 ({unit_label})", stack=None, axis=alt.Axis(grid=True, gridColor="#e5e7eb", gridOpacity=0.8))
-    base = alt.Chart(df).encode(
-        x=x_encoding,
-        y=y_encoding,
-        tooltip=tooltip,
-    )
-    layers = []
-    if not actual_df.empty:
-        layers.append(
-            alt.Chart(actual_df).mark_bar(opacity=0.9, size=32).encode(
-                x=x_encoding,
-                y=y_encoding,
-                color=series_color,
-                tooltip=tooltip,
-            )
-        )
-    if not forecast_df.empty:
-        layers.append(
-            alt.Chart(forecast_df).mark_tick(orient="horizontal", thickness=3, size=34).encode(
-                x=x_encoding,
-                y=y_encoding,
-                color=series_color,
-                tooltip=tooltip,
-            )
-        )
-    chart = (
-        alt.layer(*layers).resolve_scale(y="shared", color="shared").properties(height=380, padding={"left": 4, "right": 8, "top": 8, "bottom": 0})
-        if layers else base.mark_bar().properties(height=380)
-    )
     visualization = (facts.get("sales") or {}).get("visualization") or {}
-    marker_period = str(visualization.get("evaluation_month") or "")
-    marker_value = visualization.get("expected_to_date_sales")
-    if marker_period and marker_value is not None and visualization.get("time_progress_pct") not in (None, 0, 100):
-        marker_period_label = period_display_map.get(f"{marker_period[:4]}-{marker_period[4:6]}") or f"{int(marker_period[4:6])}월"
-        marker_df = pd.DataFrame(
-            [{
-                "display_period": marker_period_label,
-                "display_value": float(marker_value) / divisor,
-                "value": float(marker_value),
-                "series": "판단 기준일",
-                "value_kind": "판단 기준일 예상매출",
-                "amount_display_unit": unit_label,
-                "month_status": "평가월",
-                "time_progress_pct": visualization.get("time_progress_pct"),
-            }]
+    state = _sales_presentation_state(facts)
+    current_day_series = f"{state['judgement_basis']} 예상매출"
+    display_frames = [actual_df, forecast_df]
+    if state["expected_to_date_chart_visible"]:
+        marker_period = str(visualization.get("evaluation_month") or "")
+        marker_period_label = (
+            period_display_map.get(f"{marker_period[:4]}-{marker_period[4:6]}")
+            or state["evaluation_label"]
         )
-        marker = alt.Chart(marker_df).mark_tick(orient="horizontal", thickness=3, size=34).encode(
-            x=x_encoding,
-            y=y_encoding,
-            color=series_color,
-            tooltip=tooltip + [alt.Tooltip("time_progress_pct:Q", title="월 경과율", format=".1f")],
+        display_frames.append(pd.DataFrame([{
+            "display_period": marker_period_label,
+            "display_value": float(state["expected_to_date_sales"]) / divisor,
+            "value": float(state["expected_to_date_sales"]),
+            "series": current_day_series,
+            "value_kind": current_day_series,
+            "amount_display_unit": unit_label,
+            "month_status": "평가월",
+            "time_progress_pct": visualization.get("time_progress_pct"),
+        }]))
+    display_df = pd.concat(display_frames, ignore_index=True, sort=False)
+    cluster_order = ["실제매출", "월말 예상매출", current_day_series]
+    legend_order = ["실제매출", "월말 예상매출", current_day_series]
+    x_encoding = alt.X(
+        "display_period:N",
+        title=None,
+        sort=period_order,
+        scale=alt.Scale(paddingInner=0.42, paddingOuter=0.10),
+        axis=alt.Axis(labelAngle=0, labelPadding=10, labelFontSize=13),
+    )
+    x_offset = alt.XOffset(
+        "series:N",
+        sort=cluster_order,
+        scale=alt.Scale(domain=cluster_order, paddingInner=0.03, paddingOuter=0.02),
+    )
+    y_encoding = alt.Y(
+        "display_value:Q",
+        title=f"매출 ({unit_label})",
+        stack=None,
+        axis=alt.Axis(
+            grid=True,
+            gridColor="#e5e7eb",
+            gridOpacity=0.8,
+            labelFontSize=12,
+            titleFontSize=13,
+            titlePadding=12,
+        ),
+    )
+    gradient_specs = {
+        "실제매출": (["#1d4ed8", "#75a6ff", "#3f7cf4", "#1745b8"], "#1745b8"),
+        "월말 예상매출": (["#0b8f8a", "#63e0d7", "#25c4bb", "#087b77"], "#087b77"),
+        current_day_series: (["#dc5a0c", "#ffb06f", "#ff8738", "#c94b05"], "#c94b05"),
+    }
+    bar_layers: list[alt.Chart] = []
+    for series_name in cluster_order:
+        series_frame = display_df[display_df["series"] == series_name]
+        if series_frame.empty:
+            continue
+        gradient_colors, border_color = gradient_specs[series_name]
+        gradient = alt.Gradient(
+            gradient="linear",
+            x1=0,
+            y1=0,
+            x2=1,
+            y2=0,
+            stops=[
+                alt.GradientStop(offset=0, color=gradient_colors[0]),
+                alt.GradientStop(offset=0.34, color=gradient_colors[1]),
+                alt.GradientStop(offset=0.66, color=gradient_colors[2]),
+                alt.GradientStop(offset=1, color=gradient_colors[3]),
+            ],
         )
-        chart = chart + marker
-    return chart
+        bar_layers.append(
+            alt.Chart(series_frame).mark_bar(
+                color=gradient,
+                opacity=0.96,
+                cornerRadiusTopLeft=5,
+                cornerRadiusTopRight=5,
+                stroke=border_color,
+                strokeWidth=0.8,
+            ).encode(
+                x=x_encoding,
+                xOffset=x_offset,
+                y=y_encoding,
+                tooltip=tooltip,
+            )
+        )
+    bars = alt.layer(*bar_layers)
+    if not state["expected_to_date_chart_visible"]:
+        return bars.properties(
+            height=370,
+            padding={"left": 8, "right": 16, "top": 18, "bottom": 24},
+        )
+    label_df = display_df[display_df["series"] == current_day_series]
+    labels = alt.Chart(label_df).mark_text(
+        dy=-10,
+        align="center",
+        baseline="bottom",
+        color="#9a3412",
+        fontSize=11,
+        fontWeight=600,
+    ).encode(
+        x=x_encoding,
+        xOffset=x_offset,
+        y=y_encoding,
+        text=alt.Text("display_value:Q", format=",.0f"),
+    )
+    return alt.layer(bars, labels).resolve_scale(y="shared").properties(
+        height=370,
+        padding={"left": 8, "right": 16, "top": 18, "bottom": 24},
+    )
 
 
 def _render_sales_chart(facts: dict[str, Any]) -> None:
+    state = _sales_presentation_state(facts)
     chart = _build_sales_bar_chart(facts)
     if chart is None:
         st.info("매출 그래프를 표시할 완료월/당월 facts가 없습니다.")
         return
+    judgement_label = f"{state['judgement_basis']} 예상매출"
+    judgement_legend = (
+        f'<span class="dashboard-lite-sales-chart-legend-item"><span class="dashboard-lite-sales-chart-legend-swatch dashboard-lite-sales-chart-legend-judgement"></span>{html.escape(judgement_label)}</span>'
+        if state["expected_to_date_chart_visible"] else ""
+    )
+    st.markdown(
+        "<div class=\"dashboard-lite-sales-chart-header\">"
+        "<div class=\"dashboard-lite-sales-chart-title\">월별 실제매출·예상매출</div>"
+        "<div class=\"dashboard-lite-sales-chart-legend\">"
+        "<span class=\"dashboard-lite-sales-chart-legend-item\"><span class=\"dashboard-lite-sales-chart-legend-swatch dashboard-lite-sales-chart-legend-actual\"></span>실제매출</span>"
+        "<span class=\"dashboard-lite-sales-chart-legend-item\"><span class=\"dashboard-lite-sales-chart-legend-swatch dashboard-lite-sales-chart-legend-forecast\"></span>월말 예상매출</span>"
+        + judgement_legend
+        + "</div></div>",
+        unsafe_allow_html=True,
+    )
     st.altair_chart(chart, width="stretch")
 
 
@@ -2707,7 +3237,7 @@ def _load_dashboard_scope_options() -> dict[str, Any]:
     }
 
 
-def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
+def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] | None]:
     defaults = default_dashboard_lite_scope()
     _prepare_dashboard_profile_scalar_state()
     option_cache = st.session_state.get(DASHBOARD_LITE_OPTION_CACHE_KEY)
@@ -2775,8 +3305,11 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
             "공급 기준", options=[SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR],
             format_func=lambda value: {SCOPE_MANUFACTURER: "제약사", SCOPE_ORDER_VENDOR: "발주처"}[value],
             key="__dashboard_lite_product_supplier_scope_mode",
-            on_change=_on_dashboard_supplier_scope_mode_change,
         )
+    rendered_scope_mode_key = "__dashboard_lite_supplier_mode_rendered"
+    rendered_scope_mode = str(st.session_state.get(rendered_scope_mode_key) or scope_mode)
+    supplier_mode_changed = rendered_scope_mode != scope_mode
+    st.session_state[rendered_scope_mode_key] = scope_mode
     inactive_scope_cleared = _clear_inactive_dashboard_supplier_state(scope_mode)
     with scope_cols[4]:
         if scope_mode == SCOPE_ORDER_VENDOR:
@@ -2802,48 +3335,50 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
                 options=manager_codes, key=manager_key,
                 format_func=lambda code: f"{manager_names.get(str(code), str(code))} [{code}]",
             )
-    with st.form("dashboard_lite_scope_form", clear_on_submit=False):
-        with st.expander(f"\ucd94\uac00 \ubd84\uc11d\uc870\uac74 \u00b7 {condition_summary}", expanded=False):
-            row1 = st.columns([1, 3, 1])
-            with row1[0]:
-                stock_mode = st.radio("재고기준", options=["real", "book"], horizontal=True, format_func=lambda value: "실재고" if value == "real" else "장부재고", key="__dashboard_lite_stock_mode")
-            with row1[1]:
-                selected_stock_labels = st.multiselect("재고위치", options=stock_codes, key=stock_widget_key, format_func=lambda code: _option_label(code, stock_code_to_name.get(str(code), "")), help="미선택 시 전체 재고위치를 사용합니다.")
-            with row1[2]:
-                amount_display_unit = st.selectbox("금액 표시단위", options=["auto", "won", "thousand", "million"], format_func=lambda value: {"auto": "자동", "won": "원", "thousand": "천원", "million": "백만원"}[value], key="__dashboard_lite_amount_display_unit")
+    with st.expander(f"\ucd94\uac00 \ubd84\uc11d\uc870\uac74 \u00b7 {condition_summary}", expanded=False):
+        row1 = st.columns([1, 3, 1])
+        with row1[0]:
+            stock_mode = st.radio("재고기준", options=["real", "book"], horizontal=True, format_func=lambda value: "실재고" if value == "real" else "장부재고", key="__dashboard_lite_stock_mode")
+        with row1[1]:
+            selected_stock_labels = st.multiselect("재고위치", options=stock_codes, key=stock_widget_key, format_func=lambda code: _option_label(code, stock_code_to_name.get(str(code), "")), help="미선택 시 전체 재고위치를 사용합니다.")
+        with row1[2]:
+            amount_display_unit = st.selectbox("금액 표시단위", options=["auto", "won", "thousand", "million"], format_func=lambda value: {"auto": "자동", "won": "원", "thousand": "천원", "million": "백만원"}[value], key="__dashboard_lite_amount_display_unit")
 
-            row2 = st.columns(2)
-            with row2[0]:
-                vendor_groups = st.multiselect("거래처그룹", options=vendor_group_codes, key="__dashboard_lite_vendor_group_list", format_func=lambda code: _option_label(code, vendor_group_code_to_name.get(str(code), "")))
-            with row2[1]:
-                vendor_kinds = st.multiselect("거래처종류", options=vendor_kind_codes, key="__dashboard_lite_vendor_kind_list", format_func=lambda code: _option_label(code, vendor_kind_code_to_name.get(str(code), "")))
+        row2 = st.columns(2)
+        with row2[0]:
+            vendor_groups = st.multiselect("거래처그룹", options=vendor_group_codes, key="__dashboard_lite_vendor_group_list", format_func=lambda code: _option_label(code, vendor_group_code_to_name.get(str(code), "")))
+        with row2[1]:
+            vendor_kinds = st.multiselect("거래처종류", options=vendor_kind_codes, key="__dashboard_lite_vendor_kind_list", format_func=lambda code: _option_label(code, vendor_kind_code_to_name.get(str(code), "")))
 
-            row3 = st.columns(4)
-            with row3[0]:
-                product_groups = st.multiselect("제품그룹", options=product_group_codes, key="__dashboard_lite_product_group_list", format_func=lambda code: _option_label(code, product_group_code_to_name.get(str(code), "")), help="미선택 시 전체 제품그룹을 포함합니다.")
-            with row3[1]:
-                product_di = st.multiselect("제품구분", options=product_di_codes, key="__dashboard_lite_product_di_list", format_func=lambda code: _option_label(code, product_di_code_to_name.get(str(code), "")), help="미선택 시 전체 제품구분을 포함합니다.")
-            with row3[2]:
-                product_class = st.multiselect("제품분류", options=product_class_codes, key="__dashboard_lite_product_class_list", format_func=lambda code: _option_label(code, product_class_code_to_name.get(str(code), "")), help="미선택 시 전체 제품분류를 포함합니다.")
-            with row3[3]:
-                io_gu = st.multiselect("입출고구분", options=io_gu_codes, key="__dashboard_lite_io_gu_list", format_func=lambda code: _option_label(code, io_gu_code_to_name.get(str(code), "")), help="저장한 Dashboard 공통조건이 Dashboard, KPI, 분석/NLQ의 판매·수요 계산에 적용됩니다.")
+        row3 = st.columns(4)
+        with row3[0]:
+            product_groups = st.multiselect("제품그룹", options=product_group_codes, key="__dashboard_lite_product_group_list", format_func=lambda code: _option_label(code, product_group_code_to_name.get(str(code), "")), help="미선택 시 전체 제품그룹을 포함합니다.")
+        with row3[1]:
+            product_di = st.multiselect("제품구분", options=product_di_codes, key="__dashboard_lite_product_di_list", format_func=lambda code: _option_label(code, product_di_code_to_name.get(str(code), "")), help="미선택 시 전체 제품구분을 포함합니다.")
+        with row3[2]:
+            product_class = st.multiselect("제품분류", options=product_class_codes, key="__dashboard_lite_product_class_list", format_func=lambda code: _option_label(code, product_class_code_to_name.get(str(code), "")), help="미선택 시 전체 제품분류를 포함합니다.")
+        with row3[3]:
+            io_gu = st.multiselect("입출고구분", options=io_gu_codes, key="__dashboard_lite_io_gu_list", format_func=lambda code: _option_label(code, io_gu_code_to_name.get(str(code), "")), help="저장한 Dashboard 공통조건이 Dashboard, KPI, 분석/NLQ의 판매·수요 계산에 적용됩니다.")
 
-            row4 = st.columns(4)
-            with row4[0]:
-                major_purchase_vendor_days = st.number_input("대표 매입처 기준기간(일)", min_value=1, step=1, key="__dashboard_lite_major_purchase_vendor_days")
-            with row4[1]:
-                overstock_inactive_days = st.number_input("과잉·저활성 기준(일)", min_value=1, step=1, key="__dashboard_lite_overstock_inactive_days")
-            with row4[2]:
-                readiness_warning_pct = st.number_input("준비율 경고기준(%)", min_value=0.1, max_value=100.0, step=0.1, key="__dashboard_lite_readiness_warning_pct")
-            with row4[3]:
-                risk_quick_view_count = st.number_input("위험품목 바로보기", min_value=1, step=1, key="__dashboard_lite_risk_quick_view_count")
-        submitted = st.form_submit_button("대시보드 조회", type="primary", width="stretch")
-        try:
-            from app.ui.ssai_login import has_permission
-            save_requested = st.form_submit_button("저장", width="stretch") if has_permission(PROFILE_PERMISSION) else False
-        except Exception:
-            save_requested = False
+        row4 = st.columns(4)
+        with row4[0]:
+            major_purchase_vendor_days = st.number_input("대표 매입처 기준기간(일)", min_value=1, step=1, key="__dashboard_lite_major_purchase_vendor_days")
+        with row4[1]:
+            overstock_inactive_days = st.number_input("과잉·저활성 기준(일)", min_value=1, step=1, key="__dashboard_lite_overstock_inactive_days")
+        with row4[2]:
+            readiness_warning_pct = st.number_input("준비율 경고기준(%)", min_value=0.1, max_value=100.0, step=0.1, key="__dashboard_lite_readiness_warning_pct")
+        with row4[3]:
+            risk_quick_view_count = st.number_input("위험품목 바로보기", min_value=1, step=1, key="__dashboard_lite_risk_quick_view_count")
+    submitted = st.form_submit_button("대시보드 조회", type="primary", width="stretch")
+    try:
+        from app.ui.ssai_login import has_permission
+        save_requested = st.form_submit_button("저장", width="stretch") if has_permission(PROFILE_PERMISSION) else False
+    except Exception:
+        save_requested = False
     supplier_result = {"status": "all", "codes": [], "names": [], "label": "전체"}
+    if (submitted or save_requested) and supplier_mode_changed:
+        st.info("공급 기준이 변경되었습니다. 새 제약사/발주처와 담당자 조건을 확인한 뒤 다시 실행해 주세요.")
+        return False, False, None
     if submitted:
         supplier_result = _resolve_dashboard_supplier(supplier_text, mode=scope_mode)
         if supplier_result.get("status") == "too_short":
@@ -2900,6 +3435,15 @@ def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
         st.warning(str(exc))
         return False, False, None
     return submitted, save_requested, params
+
+
+def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
+    """Render every Dashboard-affecting draft control in one atomic form."""
+    with st.form("dashboard_lite_scope_form",
+        clear_on_submit=False,
+        enter_to_submit=False,
+    ):
+        return _render_dashboard_scope_form_contents()
 
 
 def _dashboard_scope_header(params: dict[str, Any]) -> str:
@@ -3187,6 +3731,31 @@ def _dashboard_layout_preview_key(cache: dict[str, Any]) -> str:
     return "__dashboard_layout_v2_preview"
 
 
+def _dashboard_render_namespace(cache: dict[str, Any] | None, *, render_mode: str) -> str:
+    """Return a stable per-message/per-render-location Streamlit key namespace."""
+    source = cache if isinstance(cache, dict) else {}
+    event_id = str(source.get("dashboard_event_id") or source.get("id") or "").strip()
+    if event_id:
+        identity: Any = {
+            "event_id": event_id,
+            "room_id": str(source.get("room_id") or ""),
+            "company_id": str(source.get("company_id") or ""),
+        }
+    else:
+        identity = {
+            "cache_key": str(source.get("cache_key") or ""),
+            "query_fingerprint": str(source.get("query_fingerprint") or ""),
+            "room_id": str(source.get("room_id") or ""),
+            "company_id": str(source.get("company_id") or ""),
+            "created_at": str(source.get("created_at") or ""),
+            "params": source.get("params") if isinstance(source.get("params"), dict) else {},
+        }
+    identity_text = json.dumps(identity, ensure_ascii=True, sort_keys=True, default=str)
+    digest = hashlib.sha256(identity_text.encode("utf-8")).hexdigest()[:20]
+    safe_mode = re.sub(r"[^a-z0-9_-]", "", str(render_mode or "chat").lower()) or "chat"
+    return f"{safe_mode}_{digest}"
+
+
 def _dashboard_layout_v2_enabled(cache: dict[str, Any] | None) -> bool:
     cache = cache or {}
     key = _dashboard_layout_preview_key(cache)
@@ -3431,9 +4000,10 @@ def _render_dashboard_facts_v2(facts: dict[str, Any], cache: dict[str, Any], *, 
     with action_tab:
         _render_today_actions(facts, cache, render_mode=render_mode)
     with sales_tab:
+        sales_render_namespace = _dashboard_render_namespace(cache, render_mode=f"{render_mode}-v2")
         sales_gauge_col, sales_chart_col = st.columns([35, 65])
         with sales_gauge_col:
-            _render_sales_gauge(facts)
+            _render_sales_gauge(facts, render_namespace=sales_render_namespace)
         with sales_chart_col:
             _render_sales_chart(facts)
         _render_sales_brief(facts)
@@ -3483,15 +4053,17 @@ def _render_dashboard_facts(
     if filter_issues:
         labels = ", ".join(str(item.get("label") or "제품 조건") for item in filter_issues)
         st.warning(f"{labels} 제외 조건에 필요한 코드 컬럼이 없어 이번 결과에는 적용하지 않았습니다.")
-    with st.container(border=True):
+    render_namespace = _dashboard_render_namespace(cache, render_mode=render_mode)
+    with st.container(key=f"dashboard_sales_progress__{render_namespace}"):
         st.markdown("## 매출 진행")
-        sales_gauge_col, sales_chart_col = st.columns([35, 65])
+        _render_status_cards(facts)
+        sales_gauge_col, sales_chart_col = st.columns([3, 7], gap="medium", vertical_alignment="top")
         with sales_gauge_col:
-            _render_sales_gauge(facts)
+            with st.container(key=f"dashboard_sales_gauge_card__{render_namespace}"):
+                _render_sales_gauge(facts, render_namespace=render_namespace)
         with sales_chart_col:
-            st.markdown("### 월별 실제매출·목표")
-            st.caption("파란 막대는 실제매출, 주황 목표선은 월 예상, 청록 목표선은 판단 기준일 예상입니다.")
-            _render_sales_chart(facts)
+            with st.container(key=f"dashboard_sales_chart_card__{render_namespace}"):
+                _render_sales_chart(facts)
         _render_sales_brief(facts)
 
     with st.container(border=True):
@@ -3784,5 +4356,6 @@ def render_dashboard_lite() -> dict[str, Any]:
         }
 
     st.session_state["__dashboard_lite_result"] = result_cache
+    st.session_state["__dashboard_lite_applied_params"] = dict(result_cache.get("params") or params)
     _mark_dashboard_room_title()
     return payload

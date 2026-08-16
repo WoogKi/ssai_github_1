@@ -8159,6 +8159,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "완료월수": 2,
                     "당월 현재매출": 300,
                     "당월 예상매출": 600,
+                    "평가월 예상매출": 600,
                     "최근3개월증감률": -20,
                     "추세판정": "감소",
                     "2026-05 매출": 500,
@@ -8176,6 +8177,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "완료월수": 2,
                     "당월 현재매출": 1000,
                     "당월 예상매출": 1200,
+                    "평가월 예상매출": 1200,
                     "최근3개월증감률": 5,
                     "추세판정": "안정",
                     "2026-05 매출": 1500,
@@ -8193,6 +8195,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "완료월수": 2,
                     "당월 현재매출": 0,
                     "당월 예상매출": 1000,
+                    "평가월 예상매출": 1000,
                     "최근3개월증감률": -35,
                     "추세판정": "감소",
                     "2026-05 매출": 3000,
@@ -8210,6 +8213,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "완료월수": 2,
                     "당월 현재매출": 999999,
                     "당월 예상매출": 999999,
+                    "평가월 예상매출": 999999,
                     "최근3개월증감률": -99,
                     "추세판정": "감소",
                     "2026-05 매출": 999999,
@@ -8368,7 +8372,7 @@ def run_basic_checks() -> list[CheckResult]:
         if "부분월" not in forbidden or "sample_records" not in forbidden:
             fact_errors.append("forbidden_comparisons_missing")
         chart_kinds = {str(r.get("kind")) for r in facts["sales"]["chart_rows"]}
-        if not {"완료월 실제", "당월 현재(부분월)", "당월 예상"}.issubset(chart_kinds):
+        if chart_kinds != {"완료월 실제", "완료월 사전예상"}:
             fact_errors.append(f"chart_kinds={chart_kinds!r}")
         if facts["trend_counts"].get("감소") != 2:
             fact_errors.append("trend_count_wrong")
@@ -10734,6 +10738,8 @@ def run_basic_checks() -> list[CheckResult]:
                 self.column_specs: list[object] = []
                 self.markdowns: list[str] = []
                 self.captions: list[str] = []
+                self.container_keys: list[str] = []
+                self.form_calls: list[dict] = []
                 self.column_config = _FakeNumberColumnFactory()
             def _count(self, name: str) -> None:
                 self.calls[name] = self.calls.get(name, 0) + 1
@@ -10755,10 +10761,18 @@ def run_basic_checks() -> list[CheckResult]:
             def altair_chart(self, *_args, **_kwargs): self._count("altair_chart")
             def metric(self, *_args, **_kwargs): self._count("metric")
             def dataframe(self, *_args, **_kwargs): self._count("dataframe")
-            def container(self, *_args, **_kwargs): return _FakeCtx()
+            def container(self, *_args, **kwargs):
+                key = str(kwargs.get("key") or "")
+                if key:
+                    if key in self.container_keys:
+                        raise AssertionError(f"duplicate_streamlit_container_key={key}")
+                    self.container_keys.append(key)
+                return _FakeCtx()
             def expander(self, *_args, **_kwargs): return _FakeCtx()
             def spinner(self, *_args, **_kwargs): return _FakeCtx()
-            def form(self, *_args, **_kwargs): return _FakeCtx()
+            def form(self, *_args, **kwargs):
+                self.form_calls.append(dict(kwargs))
+                return _FakeCtx()
             def columns(self, n, **_kwargs):
                 self.column_specs.append(n)
                 return [_FakeCtx() for _ in range(len(n) if isinstance(n, (list, tuple)) else int(n))]
@@ -10902,11 +10916,24 @@ def run_basic_checks() -> list[CheckResult]:
             if (stale_stock_rerender.get("meta") or {}).get("status") != "condition_only" or build_calls:
                 render_errors.append("stock_widget_state_rerun_triggered_analysis")
             fake_st.session_state["__dashboard_lite_io_gu_list"] = ["0012:001", "0012:051"]
+            fake_st.session_state["__dashboard_lite_month_from"] = "202601"
+            fake_st.session_state["__dashboard_lite_month_to"] = "202606"
+            fake_st.session_state["__dashboard_lite_evaluation_month"] = "202607"
             fake_st._submit_sequence = [True, False]
             first = view_mod.render_dashboard_lite()
             second = view_mod.render_dashboard_lite()
             if len(build_calls) != 1:
                 render_errors.append(f"submit_rerun_build_calls={len(build_calls)}")
+            if build_calls and tuple(build_calls[0].get(key) for key in ("month_from", "month_to", "evaluation_month")) != ("202601", "202606", "202607"):
+                render_errors.append(f"completed_month_submit_scope={build_calls[0]!r}")
+            applied_params = dict(fake_st.session_state.get("__dashboard_lite_applied_params") or {})
+            if tuple(applied_params.get(key) for key in ("month_from", "month_to", "evaluation_month")) != ("202601", "202606", "202607"):
+                render_errors.append(f"dashboard_applied_params_missing={applied_params!r}")
+            if not fake_st.form_calls or any(
+                call.get("clear_on_submit") is not False or call.get("enter_to_submit") is not False
+                for call in fake_st.form_calls
+            ):
+                render_errors.append(f"dashboard_form_atomic_options={fake_st.form_calls!r}")
             if option_calls != {"stock": 1, "code": 6}:
                 render_errors.append(f"submit_reloaded_option_source={option_calls!r}")
             if build_calls and build_calls[0].get("stock_cd_list") != ["00001"]:
@@ -11033,6 +11060,53 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append("dashboard_chat_snapshot_rendered_detail_toggle")
             if len((((fake_st.session_state.get("__dashboard_lite_result") or {}).get("facts") or {}).get("inventory") or {}).get("risk_detail_rows") or []) != len(primary_detail_rows):
                 render_errors.append("dashboard_chat_push_mutated_primary_detail_rows")
+
+            direct_cache = dict(first["meta"]["dashboard_cache"])
+            nlq_cache = dict(dashboard_cache)
+            direct_cache["dashboard_event_id"] = "dashboard-direct-event"
+            nlq_cache["dashboard_event_id"] = "dashboard-nlq-event"
+            direct_namespace = view_mod._dashboard_render_namespace(direct_cache, render_mode="chat")
+            nlq_namespace = view_mod._dashboard_render_namespace(nlq_cache, render_mode="primary")
+            if (
+                direct_namespace == nlq_namespace
+                or direct_namespace != view_mod._dashboard_render_namespace(direct_cache, render_mode="chat")
+                or nlq_namespace != view_mod._dashboard_render_namespace(nlq_cache, render_mode="primary")
+            ):
+                render_errors.append(
+                    f"dashboard_render_namespace_not_stable_or_distinct={direct_namespace!r}/{nlq_namespace!r}"
+                )
+            build_count_before_history = len(build_calls)
+            fake_st.container_keys.clear()
+            view_mod.reset_dashboard_lite_primary_render_guard()
+            view_mod.render_dashboard_lite_chat_item(direct_cache, render_mode="chat")
+            view_mod.render_dashboard_lite_chat_item(nlq_cache, render_mode="primary")
+            render_container_keys = list(fake_st.container_keys)
+            if len(render_container_keys) != len(set(render_container_keys)):
+                render_errors.append(f"dashboard_multi_message_duplicate_keys={render_container_keys!r}")
+            for prefix in (
+                "dashboard_sales_progress__",
+                "dashboard_sales_gauge_card__",
+                "dashboard_sales_chart_card__",
+            ):
+                matching = [key for key in render_container_keys if key.startswith(prefix)]
+                if len(matching) != 2 or any(
+                    direct_namespace not in key and nlq_namespace not in key for key in matching
+                ):
+                    render_errors.append(f"dashboard_render_namespace_missing={prefix}:{matching!r}")
+            if len(build_calls) != build_count_before_history:
+                render_errors.append("dashboard_history_render_added_source_call")
+            applied_before_invalid = dict(fake_st.session_state.get("__dashboard_lite_applied_params") or {})
+            cache_before_invalid = fake_st.session_state.get("__dashboard_lite_result")
+            fake_st.session_state["__dashboard_lite_evaluation_month"] = "202606"
+            fake_st._submit_sequence = [True, False]
+            invalid_result = view_mod.render_dashboard_lite()
+            if (
+                len(build_calls) != build_count_before_history
+                or fake_st.session_state.get("__dashboard_lite_result") is not cache_before_invalid
+                or fake_st.session_state.get("__dashboard_lite_applied_params") != applied_before_invalid
+                or invalid_result.get("meta", {}).get("facts_kind") != "SIMS_DASHBOARD_FACTS_V01"
+            ):
+                render_errors.append("dashboard_invalid_submit_replaced_applied_result")
             view_mod.clear_dashboard_lite_session_state(fake_st.session_state)
             after_company_change = view_mod.render_dashboard_lite()
             if len(build_calls) != 1:
@@ -11124,23 +11198,54 @@ def run_basic_checks() -> list[CheckResult]:
             def _chart_rows_by_series(spec: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 datasets = spec.get("datasets") or {}
                 rows_by_series: dict[str, list[dict[str, Any]]] = {}
-                for layer in spec.get("layer") or []:
-                    dataset_name = str((layer.get("data") or {}).get("name") or "")
+                def _chart_nodes(node: dict[str, Any]) -> list[dict[str, Any]]:
+                    nodes = [node]
+                    for child in node.get("layer", []) or []:
+                        if isinstance(child, dict):
+                            nodes.extend(_chart_nodes(child))
+                    return nodes
+                data_refs = [(node.get("data") or {}) for node in _chart_nodes(spec)]
+                seen_datasets: set[str] = set()
+                seen_rows: set[str] = set()
+                for data_ref in data_refs:
+                    dataset_name = str(data_ref.get("name") or "")
+                    if not dataset_name or dataset_name in seen_datasets:
+                        continue
+                    seen_datasets.add(dataset_name)
                     for row in datasets.get(dataset_name) or []:
+                        row_signature = json.dumps(
+                            [row.get(field) for field in ("series", "display_period", "value", "value_kind")],
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        if row_signature in seen_rows:
+                            continue
+                        seen_rows.add(row_signature)
                         rows_by_series.setdefault(str(row.get("series") or ""), []).append(row)
                 return rows_by_series
+
+            def _chart_mark_types(spec: dict[str, Any]) -> list[str]:
+                types: list[str] = []
+                for layer in spec.get("layer", []) or []:
+                    if isinstance(layer, dict) and layer.get("layer"):
+                        types.extend(_chart_mark_types(layer))
+                    elif isinstance(layer, dict):
+                        types.append(str((layer.get("mark") or {}).get("type") or ""))
+                if not spec.get("layer"):
+                    types.append(str((spec.get("mark") or {}).get("type") or ""))
+                return types
 
             active_facts = _marker_facts(evaluation_month="202607", policy_date="20260714")
             active_spec = view_mod._build_sales_bar_chart({"sales": active_facts}).to_dict()
             active_rows = _chart_rows_by_series(active_spec)
-            active_marks = [(layer.get("mark") or {}).get("type") for layer in active_spec.get("layer") or []]
+            active_marks = _chart_mark_types(active_spec)
             active_visualization = active_facts.get("visualization") or {}
             expected_to_date = 90 * 14 / 31
-            if active_marks != ["bar", "tick", "tick"]:
-                chart_errors.append(f"active_marker_layers={active_marks!r}")
-            if not all(active_rows.get(series) for series in ("실제매출", "예상매출", "판단 기준일")):
+            if active_marks != ["bar", "bar", "bar", "text"]:
+                chart_errors.append(f"active_grouped_bar_layers={active_marks!r}")
+            if not all(active_rows.get(series) for series in ("실제매출", "월말 예상매출", "14일 기준 예상매출")):
                 chart_errors.append(f"active_marker_series={sorted(active_rows)!r}")
-            judgement_rows = active_rows.get("판단 기준일") or []
+            judgement_rows = active_rows.get("14일 기준 예상매출") or []
             if (
                 len(judgement_rows) != 1
                 or judgement_rows[0].get("month_status") != "평가월"
@@ -11148,7 +11253,7 @@ def run_basic_checks() -> list[CheckResult]:
                 or abs(float(judgement_rows[0].get("value") or 0) - expected_to_date) > 1e-9
             ):
                 chart_errors.append(f"active_judgement_marker={judgement_rows!r}")
-            forecast_rows = active_rows.get("예상매출") or []
+            forecast_rows = active_rows.get("월말 예상매출") or []
             if not any(
                 row.get("value_kind") == "당월 월말 예상"
                 and row.get("month_status") == "평가월"
@@ -11178,24 +11283,74 @@ def run_basic_checks() -> list[CheckResult]:
             for label, boundary_facts, expected_progress in boundary_cases:
                 boundary_spec = view_mod._build_sales_bar_chart({"sales": boundary_facts}).to_dict()
                 boundary_rows = _chart_rows_by_series(boundary_spec)
-                boundary_marks = [(layer.get("mark") or {}).get("type") for layer in boundary_spec.get("layer") or []]
+                boundary_marks = _chart_mark_types(boundary_spec)
                 progress = float((boundary_facts.get("visualization") or {}).get("time_progress_pct") or 0)
                 if progress != expected_progress:
                     chart_errors.append(f"{label}_progress={progress!r}")
-                if boundary_rows.get("판단 기준일") or boundary_marks != ["bar", "tick"]:
+                if any("기준 예상매출" in series for series in boundary_rows) or boundary_marks != ["bar", "bar"]:
                     chart_errors.append(f"{label}_marker_eligibility={boundary_marks!r}/{sorted(boundary_rows)!r}")
-                if not boundary_rows.get("예상매출"):
+                if not boundary_rows.get("월말 예상매출"):
                     chart_errors.append(f"{label}_month_end_marker_missing")
 
             active_chart_json = json.dumps(active_spec, ensure_ascii=False)
-            if not all(token in active_chart_json for token in ("#2563eb", "#f97316", "#0f766e")):
+            if not all(token in active_chart_json for token in ("#1d4ed8", "#75a6ff", "#dc5a0c", "#ffb06f", "#0b8f8a", "#63e0d7")):
                 chart_errors.append("sales_chart_actual_forecast_marker_colors_missing")
+            if '"bottom": 24' not in active_chart_json:
+                chart_errors.append("sales_chart_month_label_bottom_padding_missing")
+
+            dashboard_view_src = (
+                PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py"
+            ).read_text(encoding="utf-8")
+            semantic_tokens = (
+                '"current"',
+                '"forecast"',
+                '"judgement"',
+                '"remaining"',
+            )
+            if not all(token in dashboard_view_src for token in semantic_tokens):
+                chart_errors.append("sales_kpi_semantic_classes_missing")
+            if not all(
+                token in dashboard_view_src
+                for token in (
+                    'st.container(key=f"dashboard_sales_progress__{render_namespace}")',
+                    'st.container(key=f"dashboard_sales_gauge_card__{render_namespace}")',
+                    'st.container(key=f"dashboard_sales_chart_card__{render_namespace}")',
+                    '[class*="st-key-dashboard_sales_gauge_card__"]',
+                    '[class*="st-key-dashboard_sales_chart_card__"]',
+                )
+            ):
+                chart_errors.append("sales_namespaced_layout_or_css_wrappers_missing")
+            render_source = dashboard_view_src.split("def _render_dashboard_facts(", 1)[-1].split(
+                "\ndef ", 1
+            )[0]
+            if render_source.count('st.markdown("## 매출 진행")') != 1:
+                chart_errors.append("sales_progress_title_duplicate")
+            if render_source.count("_render_sales_brief(facts)") != 1:
+                chart_errors.append("sales_summary_duplicate")
+            if not all(
+                token in dashboard_view_src
+                for token in (
+                    'class="dashboard-lite-gauge-progress"',
+                    'stroke-dasharray="{progress_arc_pct:.3f} 100"',
+                    'dashboard-lite-sales-chart-header',
+                    'dashboard-lite-sales-chart-legend-actual',
+                    'dashboard-lite-sales-chart-legend-forecast',
+                    'dashboard-lite-sales-chart-legend-judgement',
+                    'dashboard-lite-sales-brief-row',
+                    'def _dashboard_inline_icon(',
+                    '_DASHBOARD_INLINE_ICON_PATHS',
+                    'dashboard-lite-icon-circle',
+                    'dashboard-lite-icon-insight',
+                    '오늘의 매출 요약</span>',
+                )
+            ):
+                chart_errors.append("sales_visual_fidelity_structure_missing")
         except Exception as exc:
             chart_errors.append(f"sales_chart_build={type(exc).__name__}:{exc}")
         if chart_errors:
             results.append(_fail("Dashboard Lite monthly sales bar chart", "; ".join(chart_errors)))
         else:
-            results.append(_ok("Dashboard Lite monthly sales chart", "actual bars, month-end forecast, and the eligible current-day marker are distinguished; 0/100% boundaries omit only the current-day marker"))
+            results.append(_ok("Dashboard Lite monthly sales chart", "the evaluation month uses three grouped bars; completed and 0/100% boundary months omit only the current-day series"))
 
         preforecast_errors: list[str] = []
         chart_source = pd.DataFrame(
@@ -11262,6 +11417,107 @@ def run_basic_checks() -> list[CheckResult]:
                 preforecast_errors.append(f"remaining_forecast={visualization.get('remaining_forecast')!r}")
             if visualization.get("time_adjusted_status") != "시간 진척보다 앞섬":
                 preforecast_errors.append(f"time_adjusted_status={visualization.get('time_adjusted_status')!r}")
+            completed_source = chart_source.copy(deep=True)
+            completed_source["2026-08 매출"] = 999_999
+            completed_source["당월 예상매출"] = 0
+            progress_aug_source = chart_source.copy(deep=True)
+            progress_aug_source["2026-07 매출"] = 70
+            progress_aug_source["당월 현재매출"] = 30
+            progress_aug_source["당월 예상매출"] = 50
+            progress_aug_sales = dash_mod._build_sales_facts(
+                {"df": progress_aug_source, "meta": {"evaluation_month": "202608"}},
+                history_actuals=chart_history,
+                evaluation_month="202608",
+                policy_date="20260815",
+                sales_source_mode="monthly_real",
+                today=date(2026, 8, 15),
+            )
+            july_progress_forecast = _forecast_value(progress_aug_sales, "2026-07")
+            completed_source["평가월 예상매출"] = july_progress_forecast
+            completed_sales = dash_mod._build_sales_facts(
+                {"df": completed_source, "meta": {"evaluation_month": "202607"}},
+                history_actuals=chart_history,
+                evaluation_month="202607",
+                policy_date="20260815",
+                sales_source_mode="monthly_real",
+                today=date(2026, 8, 15),
+            )
+            completed_book_source = completed_source.copy(deep=True)
+            completed_book_source["당월 현재매출"] = 40
+            completed_book_sales = dash_mod._build_sales_facts(
+                {"df": completed_book_source, "meta": {"evaluation_month": "202607"}},
+                history_actuals=chart_history,
+                evaluation_month="202607",
+                policy_date="20260815",
+                sales_source_mode="monthly_book",
+                today=date(2026, 8, 15),
+            )
+            completed_rows = [
+                row for row in completed_sales.get("chart_rows") or []
+                if str(row.get("period_sort") or "") == "202607"
+            ]
+            completed_by_kind = {str(row.get("kind") or ""): row for row in completed_rows}
+            completed_book_by_kind = {
+                str(row.get("kind") or ""): row
+                for row in completed_book_sales.get("chart_rows") or []
+                if str(row.get("period_sort") or "") == "202607"
+            }
+            completed_visualization = completed_sales.get("visualization") or {}
+            if set(completed_by_kind) != {"완료월 실제", "완료월 사전예상"}:
+                preforecast_errors.append(f"completed_evaluation_rows={completed_rows!r}")
+            elif (
+                float(completed_by_kind["완료월 실제"].get("value") or 0) != 70
+                or float(completed_by_kind["완료월 사전예상"].get("value") or 0) != july_progress_forecast
+                or completed_by_kind["완료월 실제"].get("source_table") != "Rddbc210"
+                or completed_by_kind["완료월 실제"].get("cutoff_date") != "20260731"
+                or "_forecast_projection_from_row" not in str(completed_by_kind["완료월 사전예상"].get("forecast_helper") or "")
+                or completed_by_kind["완료월 사전예상"].get("forecast_source") != "manufacturer_summary.평가월 예상매출"
+            ):
+                preforecast_errors.append(f"completed_evaluation_contract={completed_rows!r}")
+            if (
+                float((completed_book_by_kind.get("완료월 실제") or {}).get("value") or 0) != 40
+                or (completed_book_by_kind.get("완료월 실제") or {}).get("source_table") != "Rddbc220"
+                or float((completed_book_by_kind.get("완료월 사전예상") or {}).get("value") or 0) != july_progress_forecast
+                or float((completed_by_kind.get("완료월 실제") or {}).get("value") or 0) == 110
+            ):
+                preforecast_errors.append(f"completed_source_mode_contract={completed_book_by_kind!r}")
+            missing_history_sales = dash_mod._build_sales_facts(
+                {"df": pd.DataFrame([{
+                    "2026-01 매출": 10, "2026-02 매출": 20, "2026-03 매출": 30,
+                    "2026-04 매출": 40, "2026-05 매출": 50, "2026-06 매출": 60,
+                    "당월 현재매출": 70, "당월 예상매출": 0,
+                }]), "meta": {"evaluation_month": "202607"}},
+                history_actuals=chart_history,
+                evaluation_month="202607",
+                policy_date="20260815",
+                sales_source_mode="monthly_real",
+                today=date(2026, 8, 15),
+            )
+            missing_history_rows = [
+                row for row in missing_history_sales.get("chart_rows") or []
+                if str(row.get("period_sort") or "") == "202607"
+            ]
+            if {str(row.get("kind") or "") for row in missing_history_rows} != {"완료월 실제"}:
+                preforecast_errors.append(f"missing_official_forecast_fabricated={missing_history_rows!r}")
+            if any(str(row.get("period_sort") or "") > "202607" for row in completed_sales.get("chart_rows") or []):
+                preforecast_errors.append("completed_evaluation_included_later_month")
+            if (
+                completed_visualization.get("evaluation_actual_source_table") != "Rddbc210"
+                or completed_visualization.get("evaluation_actual_cutoff_date") != "20260731"
+                or completed_visualization.get("evaluation_status") != "완료월"
+            ):
+                preforecast_errors.append(f"completed_evaluation_metadata={completed_visualization!r}")
+            completed_metrics = completed_sales.get("metrics") or {}
+            expected_completed_pct = 70 / july_progress_forecast * 100
+            if (
+                float((completed_metrics.get("current_month_forecast_sales") or {}).get("value") or 0) != july_progress_forecast
+                or float((completed_metrics.get("current_month_remaining_forecast_sales") or {}).get("value") or 0) != 0
+                or abs(float((completed_metrics.get("current_month_progress_pct") or {}).get("value") or 0) - expected_completed_pct) > 1e-9
+                or float(completed_visualization.get("expected_to_date_sales") or 0) != july_progress_forecast
+                or float(completed_visualization.get("remaining_forecast") or 0) != 0
+                or abs(float(completed_visualization.get("time_adjusted_achievement_pct") or 0) - expected_completed_pct) > 1e-9
+            ):
+                preforecast_errors.append(f"completed_common_cutoff_metrics={completed_metrics!r}/{completed_visualization!r}")
             if dash_mod._dashboard_time_progress("202602", today=date(2026, 7, 28)).get("pct") != 100.0:
                 preforecast_errors.append("past_month_time_progress")
             if dash_mod._dashboard_time_progress("202608", today=date(2026, 7, 28)).get("pct") != 0.0:
@@ -11269,22 +11525,108 @@ def run_basic_checks() -> list[CheckResult]:
             if dash_mod._dashboard_time_progress("202402", today=date(2024, 2, 29)).get("pct") != 100.0:
                 preforecast_errors.append("leap_year_time_progress")
             chart_spec = view_mod._build_sales_bar_chart({"sales": chart_sales}).to_dict()
+            def _flatten_chart_layers(spec: dict[str, Any]) -> list[dict[str, Any]]:
+                flattened: list[dict[str, Any]] = []
+                for layer in spec.get("layer", []) or []:
+                    if isinstance(layer, dict) and layer.get("layer"):
+                        flattened.extend(_flatten_chart_layers(layer))
+                    elif isinstance(layer, dict):
+                        flattened.append(layer)
+                return flattened
+            flat_layers = _flatten_chart_layers(chart_spec)
             expected_display_order = [f"{month}월" for month in range(1, 8)]
-            layer_sorts = [layer.get("encoding", {}).get("x", {}).get("sort") for layer in chart_spec.get("layer", [])]
+            layer_sorts = [layer.get("encoding", {}).get("x", {}).get("sort") for layer in flat_layers]
             if not layer_sorts or any(sort != expected_display_order for sort in layer_sorts):
                 preforecast_errors.append(f"layer_period_sorts={layer_sorts!r}")
-            if any("xOffset" in layer.get("encoding", {}) for layer in chart_spec.get("layer", [])):
-                preforecast_errors.append("x_offset_side_by_side_remains")
+            if not all("xOffset" in layer.get("encoding", {}) for layer in flat_layers):
+                preforecast_errors.append("grouped_bar_x_offset_missing")
             if chart_spec.get("resolve", {}).get("scale", {}).get("y") != "shared":
                 preforecast_errors.append(f"y_scale_resolve={chart_spec.get('resolve')!r}")
-            layer_marks = [layer.get("mark") or {} for layer in chart_spec.get("layer", [])]
-            if layer_marks[0].get("type") != "bar" or layer_marks[0].get("size") != 32:
-                preforecast_errors.append(f"actual_bar_width={layer_marks!r}")
-            if layer_marks[1].get("type") != "tick" or layer_marks[2].get("type") != "tick":
-                preforecast_errors.append(f"forecast_or_current_target_marker={layer_marks!r}")
-            layer_stacks = [layer.get("encoding", {}).get("y", {}).get("stack") for layer in chart_spec.get("layer", [])]
-            if layer_stacks != [None, None, None]:
+            layer_marks = [layer.get("mark") or {} for layer in flat_layers]
+            bar_marks = [mark for mark in layer_marks if mark.get("type") == "bar"]
+            text_marks = [mark for mark in layer_marks if mark.get("type") == "text"]
+            if (
+                len(bar_marks) != 3
+                or any("size" in mark for mark in bar_marks)
+                or any(mark.get("cornerRadiusTopLeft") != 5 or mark.get("cornerRadiusTopRight") != 5 for mark in bar_marks)
+                or any(mark.get("strokeWidth") != 0.8 for mark in bar_marks)
+                or any(not isinstance(mark.get("color"), dict) or mark["color"].get("gradient") != "linear" for mark in bar_marks)
+            ):
+                preforecast_errors.append(f"grouped_bar_style={layer_marks!r}")
+            if (
+                len(text_marks) != 1
+                or "dx" in text_marks[0]
+                or text_marks[0].get("align") != "center"
+                or text_marks[0].get("baseline") != "bottom"
+                or text_marks[0].get("color") != "#9a3412"
+            ):
+                preforecast_errors.append(f"current_day_amount_label={layer_marks!r}")
+            layer_stacks = [layer.get("encoding", {}).get("y", {}).get("stack") for layer in flat_layers]
+            if any(stack is not None for stack in layer_stacks):
                 preforecast_errors.append(f"layer_y_stacks={layer_stacks!r}")
+            bar_layers = [layer for layer in flat_layers if (layer.get("mark") or {}).get("type") == "bar"]
+            text_layers = [layer for layer in flat_layers if (layer.get("mark") or {}).get("type") == "text"]
+            bar_encoding = (bar_layers or [{}])[0].get("encoding") or {}
+            month_scale = (bar_encoding.get("x") or {}).get("scale") or {}
+            offset_encoding = bar_encoding.get("xOffset") or {}
+            offset_scale = offset_encoding.get("scale") or {}
+            expected_cluster_order = ["실제매출", "월말 예상매출", "14일 기준 예상매출"]
+            expected_legend_order = ["실제매출", "월말 예상매출", "14일 기준 예상매출"]
+            if (
+                month_scale.get("paddingInner") != 0.42
+                or month_scale.get("paddingOuter") != 0.10
+                or offset_scale.get("paddingInner") != 0.03
+                or offset_scale.get("paddingOuter") != 0.02
+                or offset_scale.get("domain") != expected_cluster_order
+            ):
+                preforecast_errors.append(
+                    f"grouped_bar_spacing={month_scale!r}/{offset_scale!r}"
+                )
+            if offset_encoding.get("sort") != expected_cluster_order:
+                preforecast_errors.append(f"grouped_bar_series_order={offset_encoding.get('sort')!r}")
+            label_encoding = (text_layers or [{}])[0].get("encoding") or {}
+            label_offset = label_encoding.get("xOffset") or {}
+            if (
+                label_offset.get("sort") != expected_cluster_order
+                or (label_offset.get("scale") or {}).get("domain") != expected_cluster_order
+                or label_encoding.get("x") != bar_encoding.get("x")
+            ):
+                preforecast_errors.append(
+                    f"current_day_label_offset_contract={label_encoding!r}"
+                )
+            gradient_colors = [
+                [stop.get("color") for stop in ((mark.get("color") or {}).get("stops") or [])]
+                for mark in bar_marks
+            ]
+            if gradient_colors != [
+                ["#1d4ed8", "#75a6ff", "#3f7cf4", "#1745b8"],
+                ["#0b8f8a", "#63e0d7", "#25c4bb", "#087b77"],
+                ["#dc5a0c", "#ffb06f", "#ff8738", "#c94b05"],
+            ]:
+                preforecast_errors.append(f"sales_series_gradients={gradient_colors!r}")
+            if any(
+                (mark.get("color") or {}).get("x1") != 0
+                or (mark.get("color") or {}).get("x2") != 1
+                or (mark.get("color") or {}).get("y1") != 0
+                or (mark.get("color") or {}).get("y2") != 0
+                for mark in bar_marks
+            ):
+                preforecast_errors.append(f"sales_series_gradient_direction={bar_marks!r}")
+            grouped_rows = _chart_rows_by_series(chart_spec)
+            july_series = {
+                series
+                for series, rows in grouped_rows.items()
+                if any(row.get("display_period") == "7월" for row in rows)
+            }
+            june_series = {
+                series
+                for series, rows in grouped_rows.items()
+                if any(row.get("display_period") == "6월" for row in rows)
+            }
+            if july_series != {"실제매출", "14일 기준 예상매출", "월말 예상매출"}:
+                preforecast_errors.append(f"evaluation_month_grouped_series={sorted(july_series)!r}")
+            if june_series != {"실제매출", "월말 예상매출"}:
+                preforecast_errors.append(f"completed_month_grouped_series={sorted(june_series)!r}")
             cross_year_rows = list(chart_rows)
             cross_year_rows.append({"period": "2027-01", "period_sort": "202701", "kind": "완료월 실제", "value": 12})
             cross_year_spec = view_mod._build_sales_bar_chart({"sales": {"chart_rows": cross_year_rows, "visualization": visualization}}).to_dict()
@@ -11307,22 +11649,31 @@ def run_basic_checks() -> list[CheckResult]:
         if preforecast_errors:
             results.append(_fail("Dashboard Lite completed-month preforecast bars", "; ".join(preforecast_errors)))
         else:
-            results.append(_ok("Dashboard Lite sales visualization", "actual bars, forecast line gaps, and the current-day marker use the compact facts without mutating raw chart rows"))
+            results.append(_ok("Dashboard Lite sales visualization", "completed months use two grouped bars and the eligible evaluation month uses three, with rounded bordered bars and one current-day amount label"))
 
         presentation_errors: list[str] = []
         try:
-            presentation_base = {"sales": {"metrics": {
+            presentation_base = {"period": {"judgement_date": "20260815"}, "sales": {"metrics": {
                 "current_month_sales": {"value": 110},
                 "current_month_forecast_sales": {"value": 100},
+                "current_month_remaining_forecast_sales": {"value": 23},
                 "current_month_progress_pct": {"value": 110},
-                "time_progress_pct": {"value": 90.3, "time_basis": "202607 28/31일 경과 진행중"},
+                "time_progress_pct": {"value": 48.4, "time_basis": "202608 15/31일 경과 진행중"},
                 "time_adjusted_achievement_pct": {"value": 121.8},
-            }, "visualization": {"expected_to_date_sales": 90.3}}}
+            }, "visualization": {"evaluation_month": "202608", "expected_to_date_sales": 90.3}}}
             over_state = view_mod._sales_presentation_state(presentation_base)
             if over_state.get("comparison_label") != "월말 예상 초과" or over_state.get("comparison_amount") != 10:
                 presentation_errors.append(f"over_state={over_state!r}")
             if over_state.get("time_adjusted_status") != "현재일 예상보다 앞섬":
                 presentation_errors.append(f"ahead_status={over_state!r}")
+            if (
+                over_state.get("evaluation_label") != "8월"
+                or over_state.get("judgement_basis") != "15일 기준"
+                or over_state.get("remaining_forecast_sales") != 23
+                or not over_state.get("expected_to_date_available")
+                or not over_state.get("expected_to_date_chart_visible")
+            ):
+                presentation_errors.append(f"dynamic_sales_labels={over_state!r}")
             under_facts = json.loads(json.dumps(presentation_base))
             under_facts["sales"]["metrics"]["current_month_sales"]["value"] = 80
             under_facts["sales"]["metrics"]["time_adjusted_achievement_pct"]["value"] = 96
@@ -11341,9 +11692,17 @@ def run_basic_checks() -> list[CheckResult]:
             if unchanged_remaining != 20:
                 presentation_errors.append(f"remaining_fact_mutated={unchanged_remaining!r}")
             ui_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
-            for label in ("판단 기준일 예상매출", "판단 기준일 달성률", "월 경과", "월말 예상 초과", "오늘의 매출 요약"):
+            for label in ("예상매출 달성률", "예상 대비 달성률", "월말 예상 잔여", "월말 예상 초과", "오늘의 매출 요약"):
                 if label not in ui_source:
                     presentation_errors.append(f"ui_label_missing={label}")
+            if '"완료월" if completed' in ui_source or '"예상 대비 차이" if completed' in ui_source:
+                presentation_errors.append("completed_month_uses_separate_kpi_labels")
+            if (
+                "완료월 판단 기준일 예상매출은 사용하지 않습니다" in ui_source
+                or "판단 기준일 예상매출은 사용하지 않습니다" in ui_source
+                or "기준일 예상매출은 평가월 경과율을 반영하며, 완료월은 말일 기준입니다." not in ui_source
+            ):
+                presentation_errors.append("sales_cutoff_guidance_not_common")
             if '"시간 진척률"' in ui_source or '"시간 대비 달성률"' in ui_source:
                 presentation_errors.append("legacy_ui_labels_remain")
         except Exception as exc:
@@ -11351,7 +11710,7 @@ def run_basic_checks() -> list[CheckResult]:
         if presentation_errors:
             results.append(_fail("Dashboard Lite sales presentation states", "; ".join(presentation_errors)))
         else:
-            results.append(_ok("Dashboard Lite sales presentation states", "four cards and the status bar distinguish forecast overage, remaining amount, forecast reached, and current-day achievement labels without changing facts"))
+            results.append(_ok("Dashboard Lite sales presentation states", "four KPI cards and dynamic evaluation/judgement-day labels reuse the official sales and remaining facts without changing calculations"))
 
         inventory_visual_errors: list[str] = []
         try:
@@ -11477,16 +11836,144 @@ def run_basic_checks() -> list[CheckResult]:
 
         gauge_errors: list[str] = []
         try:
+            import xml.etree.ElementTree as ET
+
             gauge_facts = {"sales": {"metrics": {
                 "current_month_sales": {"value": 150}, "current_month_forecast_sales": {"value": 100},
                 "current_month_progress_pct": {"value": 150}, "time_progress_pct": {"value": 80, "time_basis": "202607 24/31일 경과 진행중"},
                 "time_adjusted_achievement_pct": {"value": 187.5},
-            }, "visualization": {"expected_to_date_sales": 80}}}
+            }, "visualization": {"expected_to_date_sales": 80, "evaluation_month": "202607"}}}
             gauge_state = view_mod._sales_gauge_state(gauge_facts)
             if gauge_state.get("needle_pct") != 150 or gauge_state.get("today_marker_pct") != 187.5 or float(gauge_state.get("gauge_max_pct") or 0) < 187.5:
                 gauge_errors.append(f"gauge_state={gauge_state!r}")
             if gauge_state.get("comparison_label") != "월말 예상 초과" or gauge_state.get("comparison_amount") != 50:
                 gauge_errors.append(f"gauge_comparison={gauge_state!r}")
+            gauge_source = (
+                PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py"
+            ).read_text(encoding="utf-8")
+            if not all(
+                token in gauge_source
+                for token in (
+                    'pathLength="100"',
+                    'stroke-dasharray="{progress_arc_pct:.3f} 100"',
+                    'needle_angle = -90.0 + visual_progress * 1.8',
+                    'today_angle = -90.0 + today_visual_pct * 1.8',
+                    'class="dashboard-lite-gauge-progress"',
+                    'dashboardGaugeProgress-{safe_svg_namespace}',
+                    'class="dashboard-lite-gauge-needle"',
+                    'class="dashboard-lite-gauge-hub"',
+                    'gradientUnits="userSpaceOnUse"',
+                    'render_namespace=render_namespace',
+                    'def _build_sales_gauge_markup(',
+                    'dashboardGaugeShadow-{safe_svg_namespace}',
+                    'dashboardGaugeNeedleShadow-{safe_svg_namespace}',
+                )
+            ):
+                gauge_errors.append("gauge_progress_arc_or_fixed_visual_domain_missing")
+            gauge_svg_source = gauge_source.split('def _build_sales_gauge_markup(', 1)[-1].split('\ndef ', 1)[0]
+            if gauge_svg_source.count('class="dashboard-lite-gauge-progress"') != 1 or '#93c5fd' in gauge_svg_source:
+                gauge_errors.append("gauge_active_arc_not_single")
+            boundary_facts = []
+            for name, progress_value, time_value, time_basis, expected_value in (
+                ("zero", 0, 0, "202609 0/30일 경과 미래월", None),
+                ("hundred", 100, 100, "202608 31/31일 경과 진행중", None),
+                ("insufficient", None, None, "자료부족", None),
+            ):
+                boundary_facts.append((name, {"sales": {"metrics": {
+                    "current_month_sales": {"value": 100},
+                    "current_month_forecast_sales": {"value": 100},
+                    "current_month_progress_pct": {"value": progress_value},
+                    "time_progress_pct": {"value": time_value, "time_basis": time_basis},
+                    "time_adjusted_achievement_pct": {"value": None},
+                }, "visualization": {"expected_to_date_sales": expected_value, "evaluation_month": "202608"}}}))
+            completed_facts = {"sales": {"metrics": {
+                "current_month_sales": {"value": 280},
+                "current_month_forecast_sales": {"value": 250},
+                "current_month_remaining_forecast_sales": {"value": 0},
+                "current_month_progress_pct": {"value": 112},
+                "time_progress_pct": {"value": 100, "time_basis": "202607 31/31일 경과 완료월"},
+                "time_adjusted_achievement_pct": {"value": 112},
+            }, "visualization": {"expected_to_date_sales": 250, "remaining_forecast": 0, "evaluation_month": "202607"}, "chart_rows": [
+                {"period": "2026-07", "period_sort": "202607", "kind": "완료월 실제", "value": 280, "source_table": "Rddbc210", "cutoff_date": "20260731"},
+                {"period": "2026-07", "period_sort": "202607", "kind": "완료월 사전예상", "value": 250, "forecast_helper": "analytics_sales_trend_service._forecast_projection_from_row"},
+            ]}}
+            completed_missing_forecast = json.loads(json.dumps(completed_facts))
+            completed_missing_forecast["sales"]["chart_rows"] = completed_missing_forecast["sales"]["chart_rows"][:1]
+            completed_missing_forecast["sales"]["metrics"]["current_month_forecast_sales"]["value"] = None
+            completed_missing_forecast["sales"]["metrics"]["current_month_remaining_forecast_sales"]["value"] = None
+            completed_missing_forecast["sales"]["metrics"]["current_month_progress_pct"]["value"] = None
+            completed_missing_forecast["sales"]["metrics"]["time_adjusted_achievement_pct"]["value"] = None
+            completed_missing_forecast["sales"]["visualization"]["expected_to_date_sales"] = None
+            completed_missing_forecast["sales"]["visualization"]["remaining_forecast"] = None
+            markup_cases = [("normal", gauge_facts), *boundary_facts, ("completed", completed_facts), ("completed-missing", completed_missing_forecast)]
+            resource_ids: dict[str, set[str]] = {}
+            for name, case_facts in markup_cases:
+                markup = view_mod._build_sales_gauge_markup(case_facts, render_namespace=f"gauge-{name}")
+                svg = markup[markup.index("<svg"):markup.index("</svg>") + len("</svg>")]
+                root = ET.fromstring(svg)
+                resource_ids[name] = {str(node.attrib.get("id")) for node in root.iter() if node.attrib.get("id")}
+                if "\n\n" in markup or markup.count("<svg") != 1 or markup.count("</svg>") != 1:
+                    gauge_errors.append(f"gauge_markup_boundary={name}")
+            if any(resource_ids[left] & resource_ids[right] for left in resource_ids for right in resource_ids if left < right):
+                gauge_errors.append(f"gauge_resource_ids_not_namespaced={resource_ids!r}")
+            completed_markup = view_mod._build_sales_gauge_markup(completed_facts, render_namespace="completed")
+            completed_svg = completed_markup[
+                completed_markup.index("<svg"):completed_markup.index("</svg>") + len("</svg>")
+            ]
+            completed_root = ET.fromstring(completed_svg)
+            linear_gradients = [
+                node for node in completed_root.iter()
+                if str(node.tag).endswith("linearGradient")
+            ]
+            radial_gradients = [
+                node for node in completed_root.iter()
+                if str(node.tag).endswith("radialGradient")
+            ]
+            hub_nodes = [
+                node for node in completed_root.iter()
+                if str(node.attrib.get("class") or "") == "dashboard-lite-gauge-hub"
+            ]
+            if (
+                len(linear_gradients) != 3
+                or any(len(list(node)) < 4 for node in linear_gradients)
+                or len(radial_gradients) != 1
+                or len(list(radial_gradients[0])) < 4
+                or len(hub_nodes) != 1
+                or sum(1 for node in hub_nodes[0].iter() if str(node.tag).endswith("circle")) < 5
+                or completed_svg.count("feDropShadow") < 2
+            ):
+                gauge_errors.append("gauge_bevel_gradient_or_hub_depth_missing")
+            if (
+                "112.0%" not in completed_markup
+                or "예상매출 대비 달성률" not in completed_markup
+                or 'class="dashboard-lite-gauge-needle"' not in completed_markup
+                or 'class="dashboard-lite-gauge-progress"' not in completed_markup
+                or 'stroke-dasharray="100.000 100"' not in completed_markup
+                or "예상보다 30 원 초과" not in completed_markup
+            ):
+                gauge_errors.append(f"completed_gauge_contract={completed_markup!r}")
+            completed_state = view_mod._sales_presentation_state(completed_facts)
+            if (
+                not completed_state.get("expected_to_date_available")
+                or completed_state.get("expected_to_date_chart_visible")
+                or not completed_state.get("expected_to_date_duplicates_month_end")
+                or not completed_state.get("is_completed_month")
+                or abs(float(completed_state.get("completed_forecast_achievement_pct") or 0) - 112.0) > 1e-9
+                or completed_state.get("completed_forecast_difference") != 30.0
+                or completed_state.get("completed_actual_source_table") != "Rddbc210"
+                or completed_state.get("completed_actual_cutoff_date") != "20260731"
+                or completed_state.get("judgement_basis") != "31일 기준"
+                or completed_state.get("expected_to_date_sales") != 250
+                or completed_state.get("remaining_forecast_sales") != 0
+            ):
+                gauge_errors.append(f"completed_presentation_state={completed_state!r}")
+            missing_markup = view_mod._build_sales_gauge_markup(completed_missing_forecast, render_namespace="completed-missing")
+            if (
+                "비교 자료 없음" not in missing_markup
+                or 'class="dashboard-lite-gauge-needle"' in missing_markup
+                or 'class="dashboard-lite-gauge-progress"' in missing_markup
+            ):
+                gauge_errors.append(f"completed_missing_forecast_contract={missing_markup!r}")
         except Exception as exc:
             gauge_errors.append(f"gauge_runtime={type(exc).__name__}:{exc}")
         if gauge_errors:
@@ -13258,11 +13745,16 @@ def run_basic_checks() -> list[CheckResult]:
             scope_start = view_source.index('"공급 기준"', scope_row_start)
             if (
                 not (scope_row_start < scope_start < form_start)
+                or "return _render_dashboard_scope_form_contents()" not in view_source[form_start:view_source.index("def _dashboard_scope_header")]
                 or "options=[SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR]" not in view_source
                 or "담당자 목록을 불러오지 못했습니다." not in view_source
-                or "on_change=_on_dashboard_supplier_scope_mode_change" not in view_source
+                or "enter_to_submit=False" not in view_source
+                or "on_change=_on_dashboard_supplier_scope_mode_change" in view_source[
+                    view_source.index("def _render_dashboard_scope_form_contents"):
+                    view_source.index("def _dashboard_scope_header")
+                ]
             ):
-                supplier_scope_errors.append("supplier_scope_form_callback_contract")
+                supplier_scope_errors.append("supplier_scope_atomic_form_contract")
             header = view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "product_supplier_scope_mode": "manufacturer", "supplier_scope_label": "제약사A [00015]", "supplier_manager_label": "담당자A [00021]"})
             if "제약사 담당자: 담당자A [00021]" not in header:
                 supplier_scope_errors.append("supplier_manager_header_contract")
