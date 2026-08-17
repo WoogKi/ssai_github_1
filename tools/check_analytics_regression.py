@@ -8410,25 +8410,8 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append(f"shortage_formula_wrong={risk!r}")
         if any(str(r.get("product_code")) == "P004" for r in facts["inventory"]["risk_targets"]):
             fact_errors.append("excluded_product_in_risk_targets")
-        if not facts.get("today_actions"):
-            fact_errors.append("today_actions_empty")
-        action_ids = [str(action.get("action_id") or "") for action in facts.get("today_actions") or []]
-        required_action_fields = {
-            "action_id", "priority", "status", "cause_type", "target_kind", "target_code",
-            "target_name", "evidence_label", "evidence_value", "evidence_unit",
-            "threshold_label", "threshold_value", "recommended_action", "drilldown_action",
-            "drilldown_params", "source_dashboard_event_id",
-        }
-        if any(required_action_fields - set(action) for action in facts.get("today_actions") or []):
-            fact_errors.append("today_actions_schema_missing")
-        if len(action_ids) != len(set(action_ids)) or any(not action_id for action_id in action_ids):
-            fact_errors.append("today_actions_duplicate_or_empty_action_id")
-        action_priorities = [int(action.get("priority") or 0) for action in facts.get("today_actions") or []]
-        if action_priorities != sorted(action_priorities) or len(action_priorities) > 10:
-            fact_errors.append("today_actions_order_or_limit")
-        facts_threshold = float((facts.get("stock_readiness") or {}).get("threshold_pct") or 0)
-        if any(action.get("cause_type") == "stock_shortage" and float(action.get("stock_readiness_pct") or 0) >= facts_threshold for action in facts.get("today_actions") or []):
-            fact_errors.append("today_actions_contains_ready_shortage")
+        if facts.get("today_actions") != []:
+            fact_errors.append("today_actions_should_not_be_assembled")
         filter_facts = facts.get("filters") or {}
         if [x.get("code") for x in filter_facts.get("included_stock_locations") or []] != ["00002", "00001"]:
             fact_errors.append(f"filter_stock_locations={filter_facts!r}")
@@ -8442,75 +8425,9 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append(f"filter_class_code={filter_facts!r}")
         if not facts.get("additional_notes") or "sales_decline_targets" not in facts.get("additional_notes"):
             fact_errors.append("additional_notes_missing")
-        if (
-            facts["turnover_days"].get("status") != "no_data"
-            or facts.get("transaction_cycle", {}).get("sales_data_status") != "no_data"
-            or facts.get("transaction_cycle", {}).get("period_days") != 90
-        ):
-            fact_errors.append("turnover_status_wrong")
-        cycle_source = pd.DataFrame(
-            [
-                {"trade_date": "20260409", "io_code": "501"},
-                {"trade_date": "20260701", "io_code": "501"},
-                {"trade_date": "20260703", "io_code": "601"},
-                {"trade_date": "20260703", "io_code": "501"},
-                {"trade_date": "20260708", "io_code": "501"},
-                {"trade_date": "20260709", "io_code": "501"},
-            ]
-        )
-        cycle_facts = dash_mod.build_dashboard_lite_facts(
-            {"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "policy_date": "20260708"},
-            manufacturer_summary_payload={"df": sales_df.copy(deep=True), "meta": {"evaluation_month": "2026-07"}},
-            stock_shortage_payload={"df": stock_df.copy(deep=True), "meta": {}},
-            inbound_facts_df=pd.DataFrame(),
-            sales_transaction_cycle_df=cycle_source,
-            today=date(2026, 7, 8),
-        )
-        cycle_meta = (cycle_facts.get("transaction_cycle") or {}).get("sales_transaction_cycle") or {}
-        if (
-            cycle_meta.get("result_status") != "success"
-            or cycle_meta.get("unique_trade_days") != 3
-            or cycle_meta.get("latest_normal_trade_date") != "20260708"
-            or cycle_meta.get("average_interval_days") != 3.5
-            or cycle_facts.get("performance", {}).get("sales_transaction_cycle_physical_query_count") != 0
-        ):
-            fact_errors.append(f"sales_transaction_cycle_contract={cycle_meta!r}")
-        cycle_timing = dash_mod.transaction_cycle_phase_timing(
-            source_started_at=0.0,
-            source_finished_at=0.120,
-            calculation_started_at=0.120,
-            calculation_finished_at=0.128,
-        )
-        if cycle_timing != {
-            "source_elapsed_ms": 120,
-            "calculation_elapsed_ms": 8,
-            "total_elapsed_ms": 128,
-        }:
-            fact_errors.append(f"sales_transaction_cycle_exclusive_timing={cycle_timing!r}")
-        expected_cycle_statuses = {
-            ("success", "success"): "ready",
-            ("single_trade_day", "success"): "ready",
-            ("success", "no_data"): "partial",
-            ("no_data", "no_data"): "no_data",
-            ("error", "success"): "degraded",
-            ("error", "error"): "error",
-        }
-        resolved_cycle_statuses = {
-            pair: dash_mod.resolve_transaction_cycle_status(*pair)
-            for pair in expected_cycle_statuses
-        }
-        if resolved_cycle_statuses != expected_cycle_statuses:
-            fact_errors.append(f"sales_transaction_cycle_overall_status={resolved_cycle_statuses!r}")
-        cycle_phases = cycle_facts.get("performance", {}).get("phase_metrics") or []
-        if any(
-            item.get("phase") == "sales_transaction_cycle_calculation"
-            and item.get("source_name") != "sales"
-            for item in cycle_phases
-        ):
-            fact_errors.append(f"sales_transaction_cycle_phase_source={cycle_phases!r}")
         facts_source = Path("app/services/dashboard_lite_facts.py").read_text(encoding="utf-8")
-        if 'source="sales_transaction_cycle"' in facts_source or 'source="sales",\n                phase="sales_transaction_cycle_source"' not in facts_source:
-            fact_errors.append("sales_transaction_cycle_physical_source_contract")
+        if 'phase="sales_transaction_cycle_source"' in facts_source or "_build_today_actions(sales, inventory, turnover)" in facts_source:
+            fact_errors.append("dashboard_removed_panel_source_still_invoked")
         stock_risk_rows = [
             {"product_code": "MISSING", "current_stock_qty": 0, "current_stock_amt": 0, "remaining_expected_demand_qty": 10, "shortage_qty": 10, "shortage_amt": 100, "stock_readiness_pct": 0, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": False},
             {"product_code": "NO_DEMAND", "current_stock_qty": 100, "current_stock_amt": 1000, "remaining_expected_demand_qty": 0, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
@@ -10729,6 +10646,8 @@ def run_basic_checks() -> list[CheckResult]:
         class _FakeNumberColumnFactory:
             def NumberColumn(self, label=None, **kwargs):
                 return {"label": label, **kwargs}
+            def TextColumn(self, label=None, **kwargs):
+                return {"label": label, **kwargs}
 
         class _FakeStreamlit:
             def __init__(self, *, submit_sequence: list[bool]):
@@ -11054,8 +10973,8 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append("rerun_cache_not_rendered")
             if primary_target.container_calls != 0:
                 render_errors.append(f"dashboard_primary_render_escaped_message_position={primary_target.container_calls}")
-            if primary_detail_rows and primary_toggle_before_chat < 1:
-                render_errors.append("dashboard_primary_detail_toggle_missing")
+            if primary_toggle_before_chat != 0:
+                render_errors.append("dashboard_removed_risk_detail_toggle_rendered")
             if fake_st.calls.get("toggle", 0) != primary_toggle_before_chat:
                 render_errors.append("dashboard_chat_snapshot_rendered_detail_toggle")
             if len((((fake_st.session_state.get("__dashboard_lite_result") or {}).get("facts") or {}).get("inventory") or {}).get("risk_detail_rows") or []) != len(primary_detail_rows):
@@ -12500,8 +12419,8 @@ def run_basic_checks() -> list[CheckResult]:
             for legacy_name in legacy_names:
                 if legacy_name in source_text:
                     drilldown_errors.append(f"legacy_reference={source_name}:{legacy_name}")
-        if view_src.count('st.markdown("## 오늘의 조치")') != 1 or 'st.markdown("#### 오늘의 조치")' in action_view_source:
-            drilldown_errors.append("today_actions_heading_duplicate")
+        if 'st.markdown("## 오늘의 조치")' in view_src or 'st.markdown("#### 오늘의 조치")' in action_view_source:
+            drilldown_errors.append("today_actions_heading_remains")
         if "uuid.uuid4" in action_view_source:
             drilldown_errors.append("action_widget_uuid")
         for required_text in (
@@ -13227,8 +13146,6 @@ def run_basic_checks() -> list[CheckResult]:
                 "_DASHBOARD_V2_PREVIEW_AVAILABLE = False",
                 "if not _DASHBOARD_V2_PREVIEW_AVAILABLE:",
                 "_render_dashboard_layout_preview_toggle(cache, render_mode=\"primary\")",
-                "_render_today_actions(facts, cache, render_mode=render_mode)",
-                "_render_risk_detail(facts, cache, render_mode=render_mode)",
                 "[dashboard.layout_preview]",
                 "[dashboard.layout_section]",
                 "[dashboard.analysis_detail]",
@@ -17555,6 +17472,590 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
     return results
 
 
+def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
+    """Keep the redesigned inventory view tied to approved snapshot facts only."""
+    results: list[CheckResult] = []
+    try:
+        dash_mod = importlib.import_module("app.services.dashboard_lite_facts")
+        snapshot_mod = importlib.import_module("app.services.ssai_snapshot_repository")
+        snapshot_service = importlib.import_module("app.services.dashboard_inventory_frequency_snapshot_service")
+
+        frequency_rows = [
+            {"product_code": f"P{index}", "frequency_grade": grade, "occurrence_count_3m": index, "data_status": "ready"}
+            for index, grade in enumerate(("A", "B", "C", "D", "E", "X"), start=1)
+        ]
+        approved = snapshot_mod.SnapshotReadResult(
+            status=snapshot_mod.SNAPSHOT_STATUS_READY,
+            payload={"product_frequency": frequency_rows},
+            generation_no=2,
+            checksum="fixture-approved",
+        )
+        stock_df = pd.DataFrame([
+            {"제품코드": "P1", "제품명": "긴급", "현재재고수량": -29.9, "당월 잔여예상출고수량": 70, "당월 예상출고수량": 100, "부족예상수량": 40, "부족예상금액": 400},
+            {"제품코드": "P2", "제품명": "경고", "현재재고수량": 30, "당월 잔여예상출고수량": 70, "당월 예상출고수량": 100, "부족예상수량": 40, "부족예상금액": 400},
+            {"제품코드": "P3", "제품명": "적정", "현재재고수량": 50, "당월 잔여예상출고수량": 70, "당월 예상출고수량": 100, "부족예상수량": 20, "부족예상금액": 200},
+            {"제품코드": "P4", "제품명": "과다", "현재재고수량": 150, "당월 잔여예상출고수량": 70, "당월 예상출고수량": 100, "부족예상수량": 0, "부족예상금액": 0},
+            {"제품코드": "P5", "제품명": "무수요", "현재재고수량": 20, "당월 잔여예상출고수량": 0, "당월 예상출고수량": 0, "부족예상수량": 0, "부족예상금액": 0},
+            {"제품코드": "P6", "제품명": "자료부족", "현재재고수량": 20, "당월 잔여예상출고수량": 0, "부족예상수량": 0, "부족예상금액": 0},
+        ])
+        inventory = dash_mod._build_inventory_facts(
+            {"df": stock_df, "meta": {}},
+            evaluation_month="202608",
+            policy_date="20260816",
+            inbound_facts_df=pd.DataFrame(),
+            frequency_snapshot=approved,
+        )
+        summary = inventory.get("inventory_status_summary") or {}
+        counts = summary.get("status_counts") or {}
+        expected_counts = {"긴급 부족": 1, "재고 경고": 1, "적정 재고": 1, "과다 재고": 1, "예상수요 없음": 1, "자료 부족": 1}
+        errors: list[str] = []
+        if counts != expected_counts:
+            errors.append(f"unbounded_status_boundaries={counts!r}")
+        if int(summary.get("expected_demand_product_count") or 0) != 4:
+            errors.append(f"expected_demand_count={summary!r}")
+        detail = {row.get("제품코드"): row for row in inventory.get("inventory_status_detail_rows") or []}
+        if detail.get("P4", {}).get("재고수요비율") != 150.0:
+            errors.append(f"overstock_ratio_capped={detail.get('P4')!r}")
+        if detail.get("P1", {}).get("재고수요비율") != -29.9:
+            errors.append(f"negative_stock_ratio_not_raw={detail.get('P1')!r}")
+        if detail.get("P1", {}).get("출고빈도등급") != "A" or detail.get("P6", {}).get("출고빈도등급") != "X":
+            errors.append(f"approved_frequency_join={detail!r}")
+        missing = dash_mod._build_inventory_facts(
+            {"df": stock_df, "meta": {}},
+            evaluation_month="202608",
+            policy_date="20260816",
+            inbound_facts_df=pd.DataFrame(),
+            frequency_snapshot=snapshot_mod.SnapshotReadResult(status=snapshot_mod.SNAPSHOT_STATUS_UNAPPROVED),
+        )
+        missing_grades = {row.get("출고빈도등급") for row in missing.get("inventory_status_detail_rows") or []}
+        if missing_grades != {"빈도자료 부족"}:
+            errors.append(f"unapproved_frequency_not_fail_closed={missing_grades!r}")
+
+        view_mod = importlib.import_module("app.sims.views.dashboard_lite")
+        view_facts = {"inventory": inventory}
+        status_chart = view_mod._build_inventory_status_summary_chart(view_facts)
+        frequency_chart = view_mod._build_outbound_frequency_distribution_chart(view_facts)
+        surge_state = {
+            "total": 1334,
+            "top_partition_valid": True,
+            "top_rows": [
+                {"label": "기존 예상 초과", "count": 1272},
+                {"label": "예상외 출고 발생", "count": 62},
+            ],
+        }
+        demand_donut = view_mod._build_demand_surge_summary_donut(surge_state)
+        demand_type_chart = view_mod._build_demand_surge_summary_type_chart([
+            {"label": "신규 출고 후보", "count": 34},
+            {"label": "계절성 재발생 후보", "count": 20},
+            {"label": "3개월 이상 재출고", "count": 8},
+        ])
+        vendor_chart = view_mod._build_vendor_stock_risk_summary_chart(
+            pd.DataFrame([
+                {"표시매입처": "매입처 A", "주요매입처명": "전체 매입처 A", "표시금액": 120.0, "금액비율": "120 백만 · 12.0%", "긴급부족금액": 120_000_000, "부족주의금액": 0.0, "비율": 12.0},
+                {"표시매입처": "매입처 B", "주요매입처명": "전체 매입처 B", "표시금액": 80.0, "금액비율": "80 백만 · 8.0%", "긴급부족금액": 80_000_000, "부족주의금액": 0.0, "비율": 8.0},
+            ]),
+            unit_label="백만",
+        )
+        charts = {
+            "status": status_chart,
+            "frequency": frequency_chart,
+            "demand_donut": demand_donut,
+            "demand_type": demand_type_chart,
+            "vendor": vendor_chart,
+        }
+        if any(chart is None for chart in charts.values()):
+            errors.append("inventory_summary_visual_fixture_missing_chart")
+        for chart_name, chart in charts.items():
+            if chart is not None:
+                try:
+                    chart.to_dict(validate=True)
+                except Exception as exc:
+                    errors.append(f"inventory_summary_chart_schema={chart_name}:{type(exc).__name__}")
+        frequency_spec = json.dumps(frequency_chart.to_dict(), ensure_ascii=False) if frequency_chart is not None else ""
+        if any(f'"{grade}"' not in frequency_spec for grade in ("A", "B", "C", "D", "E", "X")):
+            errors.append("frequency_visual_order_or_grade_missing")
+        view_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
+        if "visible_labels" in view_mod._build_labeled_summary_donut.__code__.co_names:
+            errors.append("donut_label_layer_filters_theta_rows")
+        labeled_donut = view_mod._build_labeled_summary_donut(
+            [
+                {"label": "긴급 부족", "count": 2250, "color": "#dc2626", "text_color": "#ffffff"},
+                {"label": "재고 경고", "count": 1050, "color": "#f59e0b", "text_color": "#ffffff"},
+                {"label": "적정 재고", "count": 4070, "color": "#16a34a", "text_color": "#ffffff"},
+                {"label": "과다 재고", "count": 2560, "color": "#7c3aed", "text_color": "#ffffff"},
+                {"label": "예상수요 없음", "count": 70, "color": "#94a3b8", "text_color": "#1f2937"},
+                {"label": "자료 부족", "count": 0, "color": "#64748b", "text_color": "#ffffff"},
+            ],
+            total_label="전체 관리 품목",
+            total=10000,
+        )
+        labeled_spec = labeled_donut.to_dict(validate=True) if labeled_donut is not None else {}
+        donut_rows = next(
+            (rows for rows in (labeled_spec.get("datasets") or {}).values() if rows and "start_angle" in rows[0]),
+            [],
+        )
+        expected_donut_labels = {
+            "긴급 부족": "22.5%", "재고 경고": "10.5%", "적정 재고": "40.7%", "과다 재고": "25.6%", "예상수요 없음": "0.7%",
+        }
+        donut_by_label = {str(row.get("label")): row for row in donut_rows}
+        if set(donut_by_label) != set(expected_donut_labels):
+            errors.append(f"donut_geometry_rows={donut_rows!r}")
+        else:
+            previous_end = 0.0
+            for label, expected_label in expected_donut_labels.items():
+                row = donut_by_label[label]
+                if (
+                    row.get("pct_label") != expected_label
+                    or abs(float(row.get("start_angle") or 0.0) - previous_end) > 1e-9
+                    or not (float(row.get("start_angle") or 0.0) < float(row.get("mid_angle") or 0.0) < float(row.get("end_angle") or 0.0))
+                ):
+                    errors.append(f"donut_original_geometry={label}:{row!r}")
+                    break
+                previous_end = float(row.get("end_angle") or 0.0)
+            if donut_by_label["예상수요 없음"].get("outside_label") != "0.7%" or "자료 부족" in donut_by_label:
+                errors.append(f"donut_small_zero_contract={donut_by_label!r}")
+        flow_markup = view_mod._demand_surge_flow_markup(62)
+        if not all(token in flow_markup for token in ("예상외 출고 62개", "dashboard-demand-flow", "dashboard-lite-demand-surge-flow-arrow")):
+            errors.append(f"demand_surge_flow_contract={flow_markup!r}")
+        detail_total = sum(int(row.get("count") or 0) for row in [
+            {"label": "신규 출고 후보", "count": 34},
+            {"label": "계절성 재발생 후보", "count": 20},
+            {"label": "3개월 이상 재출고", "count": 8},
+        ])
+        if detail_total != 62:
+            errors.append(f"demand_surge_detail_partition={detail_total}")
+        vendor_spec = json.dumps(vendor_chart.to_dict(), ensure_ascii=False) if vendor_chart is not None else ""
+        if not all(token in vendor_spec for token in ("전체 매입처명", "부족예상금액", "전체 부족금액 대비")):
+            errors.append("vendor_tooltip_full_name_amount_pct_missing")
+        if (
+            'size": 26' not in frequency_spec
+            or '"field": "relative_top_pct"' not in frequency_spec
+            or '"track": 102.0' not in frequency_spec
+            or '"domain": [0, 116]' not in frequency_spec
+        ):
+            errors.append("frequency_density_contract_missing")
+        status_spec = json.dumps(status_chart.to_dict(), ensure_ascii=False) if status_chart is not None else ""
+        demand_donut_spec = json.dumps(demand_donut.to_dict(), ensure_ascii=False) if demand_donut is not None else ""
+        demand_type_spec = json.dumps(demand_type_chart.to_dict(), ensure_ascii=False) if demand_type_chart is not None else ""
+        if not all(token in status_spec for token in ('"height": 270', '"innerRadius": 76', '"outerRadius": 116', '"background": "transparent"')):
+            errors.append("status_donut_density_contract_missing")
+        if not all(token in demand_donut_spec for token in ('"height": 226', '"innerRadius": 64', '"outerRadius": 103', '"background": "transparent"')):
+            errors.append("demand_donut_density_contract_missing")
+        if not all(token in demand_type_spec for token in ('"height": 164', '"size": 18', '"background": "transparent"')):
+            errors.append("demand_type_density_contract_missing")
+        if not all(token in vendor_spec for token in ('"size": 19', '"track": 102.0', '"domain": [0, 116]', '"background": "transparent"')):
+            errors.append("vendor_density_contract_missing")
+        if (
+            "height: 100%;" not in view_source
+            or "height: auto;" not in view_source
+            or "@media (max-width: 760px)" not in view_source
+            or "grid-template-columns: 10px max-content max-content;" not in view_source
+            or "background: transparent !important;" not in view_source
+            or "dashboard_inventory_card_body__" not in view_source
+        ):
+            errors.append("inventory_card_desktop_equal_mobile_release_missing")
+        if "fontWeight=650" in view_source:
+            errors.append("invalid_altair_font_weight_650_remains")
+
+        class _Repository:
+            def __init__(self) -> None:
+                self.keys: list[Any] = []
+
+            def read(self, key: Any) -> Any:
+                self.keys.append(key)
+                return approved
+
+        repository = _Repository()
+        read = snapshot_service.read_approved_frequency_snapshot(
+            company_id=4,
+            evaluation_month="202608",
+            stock_codes=["00901", "00001", "00247"],
+            repository=repository,
+        )
+        key = repository.keys[0] if repository.keys else None
+        expected_scope = importlib.import_module("app.services.dashboard_inventory_frequency_snapshot").scope_fingerprint(
+            ["00001", "00247", "00901"]
+        )
+        if (
+            read is not approved
+            or key is None
+            or key.company_id != "4"
+            or key.evaluation_month != "202608"
+            or key.scope_fingerprint != expected_scope
+        ):
+            errors.append(f"snapshot_key_contract={key!r}/{read!r}")
+
+        class _CachedRepository:
+            def __init__(self, result: Any) -> None:
+                self.result = result
+                self.read_count = 0
+
+            def read(self, _key: Any) -> Any:
+                self.read_count += 1
+                return self.result
+
+        original_repository = snapshot_service.SqlServerSnapshotRepository
+        ready_repository = _CachedRepository(approved)
+        try:
+            snapshot_service.clear_frequency_snapshot_read_cache()
+            snapshot_service.SqlServerSnapshotRepository = lambda **_kwargs: ready_repository
+            snapshot_service.read_approved_frequency_snapshot(
+                company_id=4,
+                evaluation_month="202608",
+                stock_codes=["00001", "00247", "00901"],
+            )
+            snapshot_service.read_approved_frequency_snapshot(
+                company_id=4,
+                evaluation_month="202608",
+                stock_codes=["00001", "00247", "00901"],
+            )
+            if ready_repository.read_count != 1:
+                errors.append(f"ready_snapshot_cache_calls={ready_repository.read_count}")
+
+            stale_repository = _CachedRepository(
+                snapshot_mod.SnapshotReadResult(status=snapshot_mod.SNAPSHOT_STATUS_STALE, reason="fixture")
+            )
+            snapshot_service.clear_frequency_snapshot_read_cache()
+            snapshot_service.SqlServerSnapshotRepository = lambda **_kwargs: stale_repository
+            snapshot_service.read_approved_frequency_snapshot(
+                company_id=4,
+                evaluation_month="202608",
+                stock_codes=["00001", "00247", "00901"],
+            )
+            snapshot_service.read_approved_frequency_snapshot(
+                company_id=4,
+                evaluation_month="202608",
+                stock_codes=["00001", "00247", "00901"],
+            )
+            if stale_repository.read_count != 2:
+                errors.append(f"stale_snapshot_cache_calls={stale_repository.read_count}")
+        finally:
+            snapshot_service.SqlServerSnapshotRepository = original_repository
+            snapshot_service.clear_frequency_snapshot_read_cache()
+
+        integrated_inventory = {
+            "inventory_status_detail_rows": [
+                {"재고상태": "긴급 부족", "재고수요비율": 20.0, "제품코드": "P1", "제품명": "위험품목", "제조사명": "제조사A", "출고빈도등급": "A", "3개월 출고발생수": 5, "현재재고수량": 2, "평가월 예상수요": 10, "수요급증여부": True, "수요급증상위분류": "기존 예상 초과", "수요급증세부분류": "기존 예상 초과"},
+                {"재고상태": "적정 재고", "재고수요비율": 100.0, "제품코드": "P2", "제품명": "일반품목", "제조사명": "제조사B", "출고빈도등급": "X", "3개월 출고발생수": 0, "현재재고수량": 10, "평가월 예상수요": 10, "수요급증여부": True, "수요급증상위분류": "예상외 출고 발생", "수요급증세부분류": "신규 출고 후보"},
+                {"재고상태": "적정 재고", "재고수요비율": 100.0, "제품코드": "P3", "제품명": "일반품목2", "제조사명": "제조사B", "출고빈도등급": "X", "3개월 출고발생수": 0, "현재재고수량": 10, "평가월 예상수요": 10, "수요급증여부": False, "수요급증상위분류": "", "수요급증세부분류": ""},
+            ],
+            "risk_detail_rows": [
+                {"제품코드": "P1", "제품명": "위험품목", "위험상태": "긴급 부족", "위험사유": "잔여수요 대비 부족", "주요매입처명": "매입처A", "주요매입처코드": "V1", "주요매입처상태": "assigned", "위험보정부족예상금액": 100.0, "재고커버일": 2.0, "수요급증여부": True, "수요급증상위분류": "기존 예상 초과", "수요급증세부분류": "기존 예상 초과", "최근 정상 입고일": "", "입고 경과일": None, "정상 입고 거래일수": 0, "평균 입고간격일": None, "_주요매입처필터키": "assigned:V1"},
+            ],
+        }
+        integrated_frame = view_mod._build_integrated_inventory_detail_frame(integrated_inventory)
+        risk_filtered = view_mod._filter_integrated_inventory_detail_rows(
+            integrated_frame, inventory_status="전체", frequency_grade="전체", risk_filter="위험 품목", vendor_key="assigned:V1", search_text=""
+        )
+        surge_all = view_mod._filter_integrated_inventory_detail_rows(
+            integrated_frame, inventory_status="전체", frequency_grade="전체", risk_filter="전체", vendor_key="전체", search_text="", demand_surge_filter="수요급증 전체"
+        )
+        surge_top = view_mod._filter_integrated_inventory_detail_rows(
+            integrated_frame, inventory_status="전체", frequency_grade="전체", risk_filter="전체", vendor_key="전체", search_text="", demand_surge_filter="기존 예상 초과"
+        )
+        surge_detail = view_mod._filter_integrated_inventory_detail_rows(
+            integrated_frame, inventory_status="전체", frequency_grade="전체", risk_filter="전체", vendor_key="전체", search_text="", demand_surge_filter="신규 출고 후보"
+        )
+        if (
+            len(integrated_frame) != 3 or len(risk_filtered) != 1 or risk_filtered.iloc[0].get("위험 유형") != "긴급 부족"
+            or risk_filtered.iloc[0].get("주요매입처명") != "매입처A" or set(surge_all["제품코드"]) != {"P1", "P2"}
+            or list(surge_top["제품코드"]) != ["P1"] or list(surge_detail["제품코드"]) != ["P2"]
+        ):
+            errors.append(f"integrated_inventory_detail_filter_contract={risk_filtered.to_dict('records')!r}")
+        duplicate_inventory = dict(integrated_inventory)
+        duplicate_inventory["risk_detail_rows"] = integrated_inventory["risk_detail_rows"] * 2
+        try:
+            view_mod._build_integrated_inventory_detail_frame(duplicate_inventory)
+            errors.append("integrated_inventory_duplicate_risk_product_not_fail_closed")
+        except ValueError:
+            pass
+        mismatch_inventory = dict(integrated_inventory)
+        mismatch_inventory["risk_detail_rows"] = [dict(integrated_inventory["risk_detail_rows"][0], 수요급증세부분류="신규 출고 후보")]
+        try:
+            view_mod._build_integrated_inventory_detail_frame(mismatch_inventory)
+            errors.append("integrated_inventory_surge_fact_mismatch_not_fail_closed")
+        except ValueError:
+            pass
+        forwarded = dash_mod._attach_inventory_status_and_frequency(
+            [{
+                "product_code": "PS", "product_name": "수요급증전달", "manufacturer_name": "제조사S",
+                "inventory_current_stock_present": True, "evaluation_expected_demand_present": True,
+                "current_stock_qty": 20.0, "evaluation_expected_demand_qty": 100.0,
+                "수요급증여부": True, "수요급증상위분류": "예상외 출고 발생",
+                "수요급증세부분류": "계절성 재발생 후보", "수요급증세부분류사유": "fixture exact fact",
+            }],
+            frequency_snapshot=snapshot_mod.SnapshotReadResult(status=snapshot_mod.SNAPSHOT_STATUS_UNAPPROVED),
+        )
+        forwarded_row = (forwarded.get("detail_rows") or [{}])[0]
+        if (
+            not bool(forwarded_row.get("수요급증여부"))
+            or forwarded_row.get("수요급증상위분류") != "예상외 출고 발생"
+            or forwarded_row.get("수요급증세부분류") != "계절성 재발생 후보"
+        ):
+            errors.append(f"inventory_detail_demand_surge_fact_forwarding={forwarded_row!r}")
+        from app.services.dashboard_risk_detail_export import build_dashboard_inventory_detail_excel_bytes
+        from io import BytesIO
+        from openpyxl import load_workbook
+        integrated_excel, integrated_excel_info = build_dashboard_inventory_detail_excel_bytes(
+            risk_filtered,
+            [{"조건명": "위험 품목", "값": "위험 품목"}],
+        )
+        integrated_workbook = load_workbook(BytesIO(integrated_excel), read_only=True)
+        integrated_sheet = integrated_workbook["재고현황상세"]
+        if int(integrated_excel_info.get("export_rows") or 0) != len(risk_filtered) or integrated_sheet.max_row - 1 != len(risk_filtered) or any(str(cell.value or "").startswith("_") for cell in integrated_sheet[1]):
+            errors.append(f"integrated_inventory_detail_excel_contract={integrated_excel_info!r}")
+
+        display_fixture = pd.DataFrame([
+            {
+                "제품코드": "P-display", "제품명": "표시정리", "재고상태": "적정 재고", "출고빈도등급": "X",
+                "3개월 출고발생수": 0, "현재재고수량": 0.0, "평가월 예상수요": float("nan"),
+                "수요급증여부": False, "수요급증상위분류": "None", "수요급증세부분류": "nan",
+                "수요급증세부분류사유": pd.NaT, "최근 정상 입고일": None, "입고 경과일": float("nan"),
+                "정상 입고 거래일수": 0, "평균 입고간격일": pd.NaT, "입고 자료상태": "None",
+                "위험보정부족예상금액": 0.0,
+            },
+            {
+                "제품코드": "P-inbound", "제품명": "입고표시", "재고상태": "적정 재고", "출고빈도등급": "A",
+                "3개월 출고발생수": 1, "현재재고수량": 1.0, "평가월 예상수요": 1.0,
+                "수요급증여부": False, "최근 정상 입고일": "20251015", "입고 경과일": 0,
+                "정상 입고 거래일수": 0, "평균 입고간격일": 12.5, "입고 자료상태": "정상",
+                "위험보정부족예상금액": 0.0,
+            },
+        ])
+        display_fixture_source = view_mod._integrated_inventory_detail_display_frame(display_fixture, 300)
+        from app.ui.sims_table_display import build_sims_table_display_config
+        display_fixture_result, _display_fixture_config, _display_fixture_width, _display_fixture_height = build_sims_table_display_config(
+            display_fixture_source,
+            action_name="Dashboard 재고 현황 상세",
+            add_row_no=False,
+            enable_pinning=False,
+        )
+        if (
+            display_fixture_result.iloc[0].get("3개월 출고발생수") != 0
+            or display_fixture_result.iloc[0].get("현재재고수량") != 0.0
+            or display_fixture_result.iloc[0].get("위험보정부족예상금액") != 0.0
+            or any(str(display_fixture_result.iloc[0].get(column) or "") for column in (
+                "평가월 예상수요", "수요급증상위분류", "수요급증세부분류", "수요급증세부분류사유",
+                "최근 정상 입고일", "입고 경과일", "정상 입고 거래일수", "평균 입고간격일", "입고 자료상태",
+            ))
+            or str(display_fixture_result.iloc[1].get("최근 정상 입고일") or "") != "2025-10-15"
+            or str(display_fixture_result.iloc[1].get("입고 경과일") or "") != "0"
+            or str(display_fixture_result.iloc[1].get("정상 입고 거래일수") or "") != "0"
+            or str(display_fixture_result.iloc[1].get("평균 입고간격일") or "") != "12.50"
+        ):
+            errors.append(f"inventory_detail_display_missing_zero_contract={display_fixture_result.to_dict('records')!r}")
+
+        class _FakeInventoryDetailContext:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+
+        class _FakeInventoryDetailSt:
+            def __init__(self):
+                self.session_state: dict[str, Any] = {}
+                self.submit_sequence: list[bool] = []
+                self.dataframes: list[pd.DataFrame] = []
+                self.dataframe_calls: list[dict[str, Any]] = []
+                self.info_messages: list[str] = []
+                self.captions: list[str] = []
+                self.form_keys: list[str] = []
+                self.column_specs: list[object] = []
+                self.button_calls = 0
+                self.button_sequence: list[bool] = []
+                self.download_calls = 0
+                self.rerun_calls = 0
+                class _ColumnConfig:
+                    @staticmethod
+                    def NumberColumn(label=None, **kwargs): return {"label": label, **kwargs}
+                    @staticmethod
+                    def TextColumn(label=None, **kwargs): return {"label": label, **kwargs}
+                self.column_config = _ColumnConfig()
+            def markdown(self, *_args, **_kwargs): pass
+            def caption(self, text, *_args, **_kwargs): self.captions.append(str(text))
+            def info(self, text, *_args, **_kwargs): self.info_messages.append(str(text))
+            def warning(self, *_args, **_kwargs): pass
+            def form(self, key, **_kwargs):
+                self.form_keys.append(str(key))
+                return _FakeInventoryDetailContext()
+            def columns(self, values, **_kwargs):
+                self.column_specs.append(values)
+                return [_FakeInventoryDetailContext() for _ in range(len(values) if isinstance(values, (list, tuple)) else int(values))]
+            def selectbox(self, _label, options, **kwargs):
+                key = str(kwargs.get("key") or "")
+                self.session_state.setdefault(key, list(options)[0])
+                return self.session_state[key]
+            def text_input(self, _label, value="", **kwargs):
+                key = str(kwargs.get("key") or "")
+                self.session_state.setdefault(key, value)
+                return self.session_state[key]
+            def form_submit_button(self, *_args, **_kwargs):
+                return self.submit_sequence.pop(0) if self.submit_sequence else False
+            def dataframe(self, frame, *_args, **kwargs):
+                self.dataframes.append(frame.copy())
+                self.dataframe_calls.append({
+                    "frame": frame.copy(),
+                    "column_config": dict(kwargs.get("column_config") or {}),
+                })
+            def button(self, *_args, **_kwargs):
+                self.button_calls += 1
+                return self.button_sequence.pop(0) if self.button_sequence else False
+            def download_button(self, *_args, **_kwargs): self.download_calls += 1
+            def rerun(self, *_args, **_kwargs): self.rerun_calls += 1
+
+        old_detail_st = view_mod.st
+        old_detail_namespace = view_mod._dashboard_render_namespace
+        old_detail_permission = view_mod.require_permission
+        old_detail_export = view_mod.build_dashboard_inventory_detail_excel_bytes
+        detail_st = _FakeInventoryDetailSt()
+        detail_exports: list[tuple[pd.DataFrame, list[dict[str, Any]]]] = []
+        try:
+            view_mod.st = detail_st
+            view_mod._dashboard_render_namespace = lambda *_args, **_kwargs: "detail-fixture"
+            view_mod.require_permission = lambda *_args, **_kwargs: True
+            view_mod.build_dashboard_inventory_detail_excel_bytes = lambda rows, conditions: (
+                detail_exports.append((rows.copy(), [dict(condition) for condition in conditions])) or (b"fixture", {"export_rows": len(rows)})
+            )
+            detail_facts = {"inventory": {**integrated_inventory, "inventory_status_summary": {"total_product_count": 3, "expected_demand_product_count": 3}}}
+            view_mod._render_inventory_status_detail(detail_facts, {"event_id": "detail-fixture"}, render_mode="primary")
+            if detail_st.dataframes or "조건을 선택한 후 [재고 상세 조회]를 눌러주세요." not in detail_st.info_messages:
+                errors.append(f"inventory_detail_initial_submit_contract={detail_st.info_messages!r}|frames={len(detail_st.dataframes)}")
+
+            search_key = "dashboard_inventory_detail::detail-fixture::search"
+            detail_st.session_state[search_key] = "위험"
+            detail_st.submit_sequence = [True]
+            view_mod._render_inventory_status_detail(detail_facts, {"event_id": "detail-fixture"}, render_mode="primary")
+            applied_frames = len(detail_st.dataframes)
+            if applied_frames != 1 or list(detail_st.dataframes[-1]["제품코드"]) != ["P1"]:
+                errors.append(f"inventory_detail_submit_filter_contract={detail_st.dataframes!r}")
+            elif not detail_st.dataframe_calls:
+                errors.append("inventory_detail_dataframe_call_missing")
+            else:
+                final_call = detail_st.dataframe_calls[-1]
+                final_frame = final_call["frame"]
+                final_config = final_call["column_config"]
+                inbound_columns = ("입고 경과일", "정상 입고 거래일수", "평균 입고간격일")
+                leaked_nulls = [
+                    column
+                    for column in inbound_columns
+                    if str(final_frame.iloc[0].get(column) or "").strip().casefold()
+                    in {"none", "nan", "nat", "<na>"}
+                ]
+                non_text_configs = [
+                    column
+                    for column in inbound_columns
+                    if str(((final_config.get(column) or {}).get("type_config") or {}).get("type") or "") != "text"
+                ]
+                if leaked_nulls or non_text_configs:
+                    errors.append(
+                        "inventory_detail_dataframe_null_boundary="
+                        f"leaks={leaked_nulls!r}|non_text_configs={non_text_configs!r}"
+                    )
+
+            detail_st.session_state[search_key] = "일반"
+            detail_st.submit_sequence = [False]
+            view_mod._render_inventory_status_detail(detail_facts, {"event_id": "detail-fixture"}, render_mode="primary")
+            if len(detail_st.dataframes) != applied_frames + 1 or list(detail_st.dataframes[-1]["제품코드"]) != ["P1"]:
+                errors.append(f"inventory_detail_unsaved_widget_contract={detail_st.dataframes!r}")
+            detail_st.button_sequence = [True]
+            view_mod._render_inventory_status_detail(detail_facts, {"event_id": "detail-fixture"}, render_mode="primary")
+            exported_conditions = {str(row.get("조건명") or ""): str(row.get("값") or "") for row in (detail_exports[-1][1] if detail_exports else [])}
+            if (
+                not detail_exports
+                or list(detail_exports[-1][0]["제품코드"]) != ["P1"]
+                or exported_conditions.get("제품 검색") != "위험"
+                or detail_st.rerun_calls != 1
+            ):
+                errors.append(f"inventory_detail_excel_applied_contract={detail_exports!r}|conditions={exported_conditions!r}|reruns={detail_st.rerun_calls}")
+
+            detail_st.session_state[search_key] = "존재하지않음"
+            detail_st.submit_sequence = [True]
+            dataframe_count_before_empty = len(detail_st.dataframes)
+            button_calls_before_empty = detail_st.button_calls
+            download_calls_before_empty = detail_st.download_calls
+            view_mod._render_inventory_status_detail(detail_facts, {"event_id": "detail-fixture"}, render_mode="primary")
+            if len(detail_st.dataframes) != dataframe_count_before_empty or "선택한 조건에 해당하는 품목이 없습니다." not in detail_st.info_messages or detail_st.button_calls != button_calls_before_empty or detail_st.download_calls != download_calls_before_empty:
+                errors.append(f"inventory_detail_empty_contract={detail_st.info_messages!r}|frames={len(detail_st.dataframes)}|buttons={detail_st.button_calls}|downloads={detail_st.download_calls}")
+            if len(set(detail_st.form_keys)) != 1 or not detail_st.form_keys[0].endswith("detail-fixture"):
+                errors.append(f"inventory_detail_form_namespace_contract={detail_st.form_keys!r}")
+            if (10, 9, 2.5) not in detail_st.column_specs:
+                errors.append(f"inventory_detail_submit_inline_layout={detail_st.column_specs!r}")
+        finally:
+            view_mod.st = old_detail_st
+            view_mod._dashboard_render_namespace = old_detail_namespace
+            view_mod.require_permission = old_detail_permission
+            view_mod.build_dashboard_inventory_detail_excel_bytes = old_detail_export
+
+        view_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
+        required_view_tokens = (
+            "## 재고 현황",
+            "재고 핵심상태",
+            "출고빈도 분포",
+            "수요급증 세부",
+            "매입처별 부족예상 TOP 10",
+            "_render_inventory_status_detail",
+            "dashboard_inventory_detail::{namespace}::surge",
+            "dashboard_inventory_detail_form::{namespace}",
+            "__dashboard_lite_inventory_detail_applied::{namespace}",
+            "재고 상세 조회",
+            "ERP 실시간 재계산은 수행하지 않습니다.",
+        )
+        if any(token not in view_source for token in required_view_tokens):
+            errors.append("inventory_status_view_contract_missing")
+        render_source = view_source.split("def _render_dashboard_facts(", 1)[-1].split("\ndef ", 1)[0]
+        if render_source.count("_render_risk_detail(") != 0:
+            errors.append(f"primary_risk_detail_call_count={render_source.count('_render_risk_detail(')}")
+        if render_source.count("_render_inventory_status_detail(") != 1:
+            errors.append(f"integrated_inventory_detail_call_count={render_source.count('_render_inventory_status_detail(')}")
+        for removed_call in ("_render_turnover(facts)", "_render_today_actions(facts", "위험 품목 상세 및 Excel"):
+            if removed_call in render_source:
+                errors.append(f"removed_dashboard_panel_remains={removed_call}")
+        summary_calls = {
+            "status": render_source.count("_build_inventory_status_summary_chart(facts)"),
+            "frequency": render_source.count("_build_outbound_frequency_distribution_chart(facts)"),
+            "surge": render_source.count("_render_demand_surge_summary_card(facts,"),
+            "vendor": render_source.count("_render_vendor_stock_risk_summary_card(facts,"),
+        }
+        if summary_calls != {"status": 1, "frequency": 1, "surge": 1, "vendor": 1}:
+            errors.append(f"inventory_summary_card_calls={summary_calls!r}")
+        removed_summary_calls = (
+            "_render_inventory_cover_days(facts)",
+            "_render_vendor_stock_risk(facts)",
+            "with st.expander(\"수요급증 세부 분류\"",
+        )
+        if any(call in render_source for call in removed_summary_calls):
+            errors.append("inventory_summary_duplicate_visuals_present")
+        required_summary_keys = (
+            "dashboard_inventory_card__status__",
+            "dashboard_inventory_card__frequency__",
+            "dashboard_inventory_card__surge__",
+            "dashboard_inventory_card__vendor__",
+        )
+        if any(key not in render_source for key in required_summary_keys):
+            errors.append("inventory_summary_render_namespace_missing")
+        reader_source = (PROJECT_ROOT / "app" / "services" / "dashboard_inventory_frequency_snapshot_service.py").read_text(encoding="utf-8")
+        repository_source = (PROJECT_ROOT / "app" / "services" / "sql_server_snapshot_repository.py").read_text(encoding="utf-8")
+        required_snapshot_log_stages = (
+            "stage=key_cache_lookup",
+            "stage=reader_total",
+            "\"db_connection\"",
+            "\"published_sql_execute\"",
+            "\"published_sql_fetch\"",
+            "\"payload_byte_conversion\"",
+            "\"storage_checksum\"",
+            "\"json_decode\"",
+            "\"contract_checksum_validation\"",
+            "\"repository_total\"",
+        )
+        if any(stage not in (reader_source + repository_source) for stage in required_snapshot_log_stages):
+            errors.append("snapshot_stage_logging_contract_missing")
+        if errors:
+            results.append(_fail("Dashboard inventory status and approved frequency snapshot", "; ".join(errors)))
+        else:
+            results.append(_ok("Dashboard inventory status and approved frequency snapshot", "30/50/150 status is uncapped; unapproved snapshots fail closed; scope key is company/evaluation/stock exact"))
+    except Exception as exc:
+        results.append(_fail("Dashboard inventory status and approved frequency snapshot", f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}"))
+    return results
+
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
@@ -17581,6 +18082,9 @@ def main() -> int:
 
     dashboard_nlq_results = run_dashboard_nlq_contract_checks()
     failed += _print_results("DASHBOARD NLQ CONTRACT CHECKS", dashboard_nlq_results)
+
+    dashboard_inventory_results = run_dashboard_inventory_status_contract_checks()
+    failed += _print_results("DASHBOARD INVENTORY STATUS CONTRACT CHECKS", dashboard_inventory_results)
 
     general_rule_results = run_general_current_table_rule_checks()
     failed += _print_results("GENERAL CURRENT-TABLE RULE CHECKS", general_rule_results)

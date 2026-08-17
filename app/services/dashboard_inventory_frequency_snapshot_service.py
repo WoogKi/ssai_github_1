@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import time
+import logging
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -10,17 +12,28 @@ from sqlalchemy import text
 
 from app.db.mssql_client import get_current_company_id, get_engine, set_current_company_id
 from app.services.dashboard_inventory_frequency_snapshot import (
+    ALGORITHM_VERSION,
+    SCHEMA_VERSION,
+    SNAPSHOT_TYPE,
     SnapshotContractError,
     build_frequency_snapshot_payload_from_aggregates,
     completed_month_basis,
+    scope_fingerprint,
     snapshot_key_from_payload,
     validate_frequency_snapshot_payload,
+)
+from app.services.ssai_snapshot_repository import (
+    SNAPSHOT_STATUS_MISSING,
+    SNAPSHOT_STATUS_STALE,
+    SnapshotKey,
+    SnapshotReadResult,
 )
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository
 
 
 QueryExecutor = Callable[[int, str, Mapping[str, Any], int], pd.DataFrame]
 ProgressReporter = Callable[[str], None]
+log = logging.getLogger("ssai.sims.dashboard_snapshot")
 ROW_PARTITION_FIELDS = (
     "normal_positive_accepted_row_count",
     "normal_positive_duplicate_row_count",
@@ -53,8 +66,76 @@ class FrequencySnapshotPlan:
     analytics_write_plan: str = "draft manifest 1 + immutable payload 1; approval/publish 0"
 
 
+@dataclass(frozen=True)
+class DashboardProfileStockScope:
+    """Exact stored Dashboard stock scope accepted for a snapshot operation."""
+
+    company_id: int
+    stock_codes: tuple[str, ...]
+    profile_status: str
+    scope_source: str
+
+
 def normalize_stock_scope(stock_codes: Sequence[Any] | None) -> tuple[str, ...]:
     return tuple(sorted({str(code).strip() for code in stock_codes or () if str(code).strip()}))
+
+
+def resolve_dashboard_profile_stock_scope(
+    *,
+    company_id: Any,
+    manual_stock_codes: Sequence[Any] | None = None,
+    profile_loader: Callable[[int], Any] | None = None,
+) -> DashboardProfileStockScope:
+    """Resolve the same saved Dashboard stock scope for CLI snapshot operations.
+
+    ``None`` means use the stored scope.  An explicit sequence is an operator
+    override and is accepted only when it exactly equals that stored scope.
+    """
+    try:
+        normalized_company = int(company_id)
+    except (TypeError, ValueError) as exc:
+        raise SnapshotContractError("dashboard_profile_company_invalid") from exc
+    if normalized_company <= 0:
+        raise SnapshotContractError("dashboard_profile_company_invalid")
+
+    if profile_loader is None:
+        from app.services.ssai_analysis_profile_service import load_dashboard_profile_checked
+
+        profile_loader = lambda value: load_dashboard_profile_checked(company_id=value)
+    result = profile_loader(normalized_company)
+    status = str(getattr(result, "status", "unavailable") or "unavailable")
+    profile = getattr(result, "profile", None)
+    reason_code = str(getattr(result, "reason_code", "") or "")
+    result_company_id = getattr(result, "company_id", normalized_company)
+    if result_company_id is not None:
+        try:
+            if int(result_company_id) != normalized_company:
+                raise SnapshotContractError("dashboard_profile_company_mismatch")
+        except (TypeError, ValueError) as exc:
+            raise SnapshotContractError("dashboard_profile_company_mismatch") from exc
+    if status != "ready" or not isinstance(profile, Mapping):
+        raise SnapshotContractError(f"dashboard_profile_{status}:{reason_code or 'profile_unavailable'}")
+
+    from app.services.ssai_analysis_profile_service import normalize_company_default_conditions
+
+    stored_scope = normalize_stock_scope(
+        normalize_company_default_conditions(profile).get("stock_cd_list")
+    )
+    if not stored_scope:
+        raise SnapshotContractError("dashboard_profile_stock_scope_empty")
+    if manual_stock_codes is not None:
+        manual_scope = normalize_stock_scope(manual_stock_codes)
+        if manual_scope != stored_scope:
+            raise SnapshotContractError("dashboard_profile_stock_scope_mismatch")
+        source = "manual_verified"
+    else:
+        source = "dashboard_profile"
+    return DashboardProfileStockScope(
+        company_id=normalized_company,
+        stock_codes=stored_scope,
+        profile_status=status,
+        scope_source=source,
+    )
 
 
 def build_frequency_snapshot_plan(*, company_id: Any, evaluation_month: Any, stock_codes: Sequence[Any] | None) -> FrequencySnapshotPlan:
@@ -73,6 +154,118 @@ def build_frequency_snapshot_plan(*, company_id: Any, evaluation_month: Any, sto
         basis_months=basis.months,
         stock_codes=normalize_stock_scope(stock_codes),
     )
+
+
+def frequency_snapshot_key(plan: FrequencySnapshotPlan) -> SnapshotKey:
+    """Return the immutable repository key for one Dashboard frequency scope."""
+    return SnapshotKey(
+        company_id=str(plan.company_id),
+        snapshot_type=SNAPSHOT_TYPE,
+        evaluation_month=plan.evaluation_month,
+        scope_fingerprint=scope_fingerprint(plan.stock_codes),
+        schema_version=SCHEMA_VERSION,
+        algorithm_version=ALGORITHM_VERSION,
+    )
+
+
+_FREQUENCY_READ_CACHE_TTL_SECONDS = 300.0
+_frequency_read_cache: dict[SnapshotKey, tuple[float, SnapshotReadResult]] = {}
+
+
+def _snapshot_exception_code(exc: Exception) -> str:
+    """Return only an exception class and optional SQLSTATE, never its text."""
+    sqlstate = ""
+    args = getattr(exc, "args", ()) or ()
+    if args and isinstance(args[0], str):
+        candidate = args[0].strip().upper()
+        if len(candidate) == 5 and candidate.isalnum():
+            sqlstate = candidate
+    return f"{type(exc).__name__}{':' + sqlstate if sqlstate else ''}"
+
+
+def read_approved_frequency_snapshot(
+    *,
+    company_id: Any,
+    evaluation_month: Any,
+    stock_codes: Sequence[Any] | None,
+    repository: Any | None = None,
+) -> SnapshotReadResult:
+    """Read only the approved snapshot, with a short process-local cache.
+
+    This boundary is deliberately separate from ERP reads.  A missing or
+    unavailable shared snapshot stays fail-closed so Dashboard facts can show
+    frequency data as insufficient without attempting a live Rddbc120 rebuild.
+    """
+    try:
+        plan = build_frequency_snapshot_plan(
+            company_id=company_id,
+            evaluation_month=evaluation_month,
+            stock_codes=stock_codes,
+        )
+    except SnapshotContractError as exc:
+        return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
+    key = frequency_snapshot_key(plan)
+    now = time.monotonic()
+    cached = _frequency_read_cache.get(key)
+    cache_age_ms = int((now - cached[0]) * 1000) if cached else 0
+    log.info(
+        "[dashboard.snapshot.reader] stage=key_cache_lookup company_id=%s evaluation_month=%s stock_code_count=%s scope_fingerprint=%s schema_version=%s algorithm_version=%s cache_hit=%s cache_age_ms=%s cached_status=%s",
+        key.company_id,
+        key.evaluation_month,
+        len(plan.stock_codes),
+        key.scope_fingerprint[:12],
+        key.schema_version,
+        key.algorithm_version,
+        bool(repository is None and cached and cached[1].status == "ready" and now - cached[0] < _FREQUENCY_READ_CACHE_TTL_SECONDS),
+        cache_age_ms,
+        str(cached[1].status) if cached else "",
+    )
+    if repository is None and cached and cached[1].status == "ready" and now - cached[0] < _FREQUENCY_READ_CACHE_TTL_SECONDS:
+        return cached[1]
+    started = time.perf_counter()
+    try:
+        repo = repository or SqlServerSnapshotRepository(
+            payload_validator=lambda candidate, expected_key: validate_frequency_snapshot_payload(
+                candidate,
+                expected_key=expected_key,
+            )
+        )
+        result = repo.read(key)
+    except Exception as exc:
+        reason_code = _snapshot_exception_code(exc)
+        result = SnapshotReadResult(status=SNAPSHOT_STATUS_STALE, reason=f"snapshot read unavailable: {reason_code}")
+        log.warning(
+            "[dashboard.snapshot.reader] stage=repository_error company_id=%s evaluation_month=%s stock_code_count=%s scope_fingerprint=%s status=%s reason_code=%s elapsed_ms=%s",
+            key.company_id,
+            key.evaluation_month,
+            len(plan.stock_codes),
+            key.scope_fingerprint[:12],
+            SNAPSHOT_STATUS_STALE,
+            reason_code,
+            int((time.perf_counter() - started) * 1000),
+        )
+    if repository is None and result.status == "ready":
+        _frequency_read_cache[key] = (now, result)
+    elif repository is None:
+        _frequency_read_cache.pop(key, None)
+    log.info(
+        "[dashboard.snapshot.reader] stage=reader_total company_id=%s evaluation_month=%s stock_code_count=%s scope_fingerprint=%s status=%s generation_no=%s payload_bytes=%s reason_code=%s elapsed_ms=%s",
+        key.company_id,
+        key.evaluation_month,
+        len(plan.stock_codes),
+        key.scope_fingerprint[:12],
+        result.status,
+        result.generation_no if result.generation_no is not None else "",
+        0,
+        "none" if result.status == "ready" else str(result.status),
+        int((time.perf_counter() - started) * 1000),
+    )
+    return result
+
+
+def clear_frequency_snapshot_read_cache() -> None:
+    """Clear process-local reads after an operator publishes a new snapshot."""
+    _frequency_read_cache.clear()
 
 
 def product_universe_sql() -> tuple[str, dict[str, Any]]:

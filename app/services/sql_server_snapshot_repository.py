@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping
 
@@ -20,6 +23,7 @@ from app.services.ssai_snapshot_repository import (
 
 
 PayloadValidator = Callable[[Mapping[str, Any], SnapshotKey], SnapshotReadResult]
+log = logging.getLogger("ssai.sims.dashboard_snapshot")
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,18 @@ def _storage_checksum(payload_bytes: bytes) -> str:
     return hashlib.sha256(payload_bytes).hexdigest()
 
 
+def _decode_compressed_payload(value: Any) -> str:
+    """Decode SQL Server COMPRESS(VARBINARY(NVARCHAR)) without changing payload bytes."""
+    if isinstance(value, str):
+        # In-memory repository fixtures model the logical value, not SQL transport bytes.
+        return value
+    try:
+        utf16_bytes = gzip.decompress(bytes(value))
+        return utf16_bytes.decode("utf-16le")
+    except (OSError, TypeError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("compressed snapshot payload cannot be decoded") from exc
+
+
 def _key_values(key: SnapshotKey) -> tuple[str, str, str, str, str, str]:
     return (
         key.company_id,
@@ -55,6 +71,43 @@ def _key_values(key: SnapshotKey) -> tuple[str, str, str, str, str, str]:
         key.scope_fingerprint,
         key.schema_version,
         key.algorithm_version,
+    )
+
+
+def _snapshot_exception_code(exc: Exception) -> str:
+    """Expose only an exception class and optional SQLSTATE in runtime logs."""
+    sqlstate = ""
+    args = getattr(exc, "args", ()) or ()
+    if args and isinstance(args[0], str):
+        candidate = args[0].strip().upper()
+        if len(candidate) == 5 and candidate.isalnum():
+            sqlstate = candidate
+    return f"{type(exc).__name__}{':' + sqlstate if sqlstate else ''}"
+
+
+def _log_read_stage(
+    key: SnapshotKey,
+    stage: str,
+    *,
+    elapsed_ms: int,
+    status: str = "",
+    generation_no: int | None = None,
+    payload_bytes: int = 0,
+    reason_code: str = "",
+) -> None:
+    log.info(
+        "[dashboard.snapshot.repository] stage=%s company_id=%s evaluation_month=%s scope_fingerprint=%s schema_version=%s algorithm_version=%s status=%s generation_no=%s payload_bytes=%s reason_code=%s elapsed_ms=%s",
+        stage,
+        key.company_id,
+        key.evaluation_month,
+        key.scope_fingerprint[:12],
+        key.schema_version,
+        key.algorithm_version,
+        status,
+        generation_no if generation_no is not None else "",
+        payload_bytes,
+        reason_code,
+        elapsed_ms,
     )
 
 
@@ -388,15 +441,36 @@ class SqlServerSnapshotRepository:
             conn.close()
 
     def read(self, key: SnapshotKey) -> SnapshotReadResult:
-        conn = self._reader_connection_factory()
+        total_started = time.perf_counter()
+        conn = None
+        payload_size = 0
+        generation_no: int | None = None
+
+        def _finish(result: SnapshotReadResult) -> SnapshotReadResult:
+            _log_read_stage(
+                key,
+                "repository_total",
+                elapsed_ms=int((time.perf_counter() - total_started) * 1000),
+                status=result.status,
+                generation_no=result.generation_no,
+                payload_bytes=payload_size,
+                reason_code="none" if result.status == SNAPSHOT_STATUS_READY else str(result.status),
+            )
+            return result
+
         try:
+            started = time.perf_counter()
+            conn = self._reader_connection_factory()
+            _log_read_stage(key, "db_connection", elapsed_ms=int((time.perf_counter() - started) * 1000))
             cursor = conn.cursor()
-            row = cursor.execute(
+            started = time.perf_counter()
+            statement = cursor.execute(
                 """
                 /* snapshot.read.published */
                 SELECT TOP 1 m.manifest_id, m.generation_no, m.checksum,
                        m.approval_status, m.approved_at, m.approved_by, m.approval_reason,
-                       p.payload_json, p.storage_checksum, p.payload_size
+                       COMPRESS(CONVERT(VARBINARY(MAX), p.payload_json)) AS payload_compressed,
+                       p.storage_checksum, p.payload_size
                 FROM snapshot.manifest m
                 INNER JOIN snapshot.payload p ON p.manifest_id=m.manifest_id
                 WHERE m.company_id=? AND m.snapshot_type=? AND m.evaluation_month=?
@@ -405,21 +479,44 @@ class SqlServerSnapshotRepository:
                 ORDER BY m.generation_no DESC
                 """,
                 *_key_values(key),
-            ).fetchone()
+            )
+            _log_read_stage(key, "published_sql_execute", elapsed_ms=int((time.perf_counter() - started) * 1000))
+            started = time.perf_counter()
+            row = statement.fetchone()
+            transport_payload_size = len(bytes(row[7])) if row and not isinstance(row[7], str) else 0
+            _log_read_stage(
+                key,
+                "published_sql_fetch",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                generation_no=int(row[1]) if row else None,
+                payload_bytes=transport_payload_size,
+            )
             if not row:
-                return self._unavailable_status(cursor, key)
-            payload_json = str(row[7])
+                return _finish(self._unavailable_status(cursor, key))
+            generation_no = int(row[1])
+            started = time.perf_counter()
+            payload_json = _decode_compressed_payload(row[7])
             payload_bytes = payload_json.encode("utf-8")
-            if len(payload_bytes) != int(row[9]) or _storage_checksum(payload_bytes) != str(row[8]):
-                return SnapshotReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="storage checksum mismatch")
+            payload_size = len(payload_bytes)
+            _log_read_stage(key, "payload_byte_conversion", elapsed_ms=int((time.perf_counter() - started) * 1000), generation_no=generation_no, payload_bytes=payload_size)
+            started = time.perf_counter()
+            storage_valid = payload_size == int(row[9]) and _storage_checksum(payload_bytes) == str(row[8])
+            _log_read_stage(key, "storage_checksum", elapsed_ms=int((time.perf_counter() - started) * 1000), generation_no=generation_no, payload_bytes=payload_size, status="valid" if storage_valid else "corrupt")
+            if not storage_valid:
+                return _finish(SnapshotReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="storage checksum mismatch"))
             try:
+                started = time.perf_counter()
                 payload = json.loads(payload_json)
+                _log_read_stage(key, "json_decode", elapsed_ms=int((time.perf_counter() - started) * 1000), generation_no=generation_no, payload_bytes=payload_size)
+                started = time.perf_counter()
+                if str(payload.get("checksum") or "") != str(row[2]):
+                    return _finish(SnapshotReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="manifest checksum mismatch"))
                 self._validate_payload(payload, key)
+                _log_read_stage(key, "contract_checksum_validation", elapsed_ms=int((time.perf_counter() - started) * 1000), generation_no=generation_no, payload_bytes=payload_size, status="valid")
             except Exception as exc:
-                return SnapshotReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason=str(exc))
-            if str(payload.get("checksum") or "") != str(row[2]):
-                return SnapshotReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="manifest checksum mismatch")
-            return SnapshotReadResult(
+                _log_read_stage(key, "contract_checksum_validation", elapsed_ms=int((time.perf_counter() - started) * 1000), generation_no=generation_no, payload_bytes=payload_size, status="corrupt", reason_code=_snapshot_exception_code(exc))
+                return _finish(SnapshotReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason=str(exc)))
+            return _finish(SnapshotReadResult(
                 status=SNAPSHOT_STATUS_READY,
                 payload=payload,
                 manifest_id=int(row[0]),
@@ -429,9 +526,21 @@ class SqlServerSnapshotRepository:
                 approved_at=str(row[4] or ""),
                 approved_by=str(row[5] or ""),
                 approval_reason=str(row[6] or ""),
+            ))
+        except Exception as exc:
+            _log_read_stage(
+                key,
+                "repository_error",
+                elapsed_ms=int((time.perf_counter() - total_started) * 1000),
+                status="error",
+                generation_no=generation_no,
+                payload_bytes=payload_size,
+                reason_code=_snapshot_exception_code(exc),
             )
+            raise
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     @staticmethod
     def _unavailable_status(cursor: Any, key: SnapshotKey) -> SnapshotReadResult:

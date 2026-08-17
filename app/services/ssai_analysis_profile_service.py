@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from typing import Any, Mapping, MutableMapping
 
 from app.services.ssai_auth_service import connect_ssai_db
@@ -34,6 +35,16 @@ _CODE_LIST_KEYS = {
     "product_class_list",
     "io_gu_list",
 }
+
+
+@dataclass(frozen=True)
+class DashboardProfileLoadResult:
+    """One non-sensitive, company-scoped profile read outcome."""
+
+    status: str
+    profile: dict[str, Any] | None = None
+    reason_code: str = ""
+    company_id: int | None = None
 
 
 def normalize_business_code(value: Any) -> str:
@@ -227,7 +238,8 @@ def _profile_log_summary(profile: Mapping[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def load_dashboard_profile(*, company_id: int) -> dict[str, Any] | None:
+def load_dashboard_profile_checked(*, company_id: int) -> DashboardProfileLoadResult:
+    """Read one company profile without turning an unavailable DB into missing data."""
     try:
         with connect_ssai_db() as conn:
             row = conn.cursor().execute(
@@ -239,23 +251,50 @@ def load_dashboard_profile(*, company_id: int) -> dict[str, Any] | None:
                 int(company_id),
             ).fetchone()
     except Exception as exc:
-        log.warning("[analysis_profile.load] company_id=%s loaded=False error_type=%s", company_id, type(exc).__name__)
-        return None
+        reason_code = f"profile_db_unavailable:{type(exc).__name__}"
+        log.warning(
+            "[analysis_profile.load] company_id=%s status=unavailable reason_code=%s",
+            company_id,
+            reason_code,
+        )
+        return DashboardProfileLoadResult(
+            status="unavailable",
+            reason_code=reason_code,
+            company_id=int(company_id),
+        )
     if not row:
         log.info("[analysis_profile.load] company_id=%s profile_found=False", company_id)
-        return None
+        return DashboardProfileLoadResult(
+            status="missing",
+            reason_code="profile_missing",
+            company_id=int(company_id),
+        )
     try:
         value = json.loads(str(row[0] or "{}"))
     except (TypeError, ValueError, json.JSONDecodeError):
-        return None
+        return DashboardProfileLoadResult(
+            status="corrupt",
+            reason_code="profile_json_invalid",
+            company_id=int(company_id),
+        )
     if not isinstance(value, dict):
-        return None
+        return DashboardProfileLoadResult(
+            status="corrupt",
+            reason_code="profile_json_not_object",
+            company_id=int(company_id),
+        )
     summary = _profile_log_summary(value)
     log.info(
         "[analysis_profile.load] company_id=%s profile_found=True condition_keys=%s io_gu_count=%s io_gu_sample=%s",
         company_id, summary["condition_keys"], summary["io_gu_count"], summary["io_gu_sample"],
     )
-    return value
+    return DashboardProfileLoadResult(status="ready", profile=value, company_id=int(company_id))
+
+
+def load_dashboard_profile(*, company_id: int) -> dict[str, Any] | None:
+    """Compatibility wrapper used by Dashboard, KPI, and deterministic NLQ."""
+    result = load_dashboard_profile_checked(company_id=company_id)
+    return dict(result.profile or {}) if result.status == "ready" else None
 
 
 def save_dashboard_profile(

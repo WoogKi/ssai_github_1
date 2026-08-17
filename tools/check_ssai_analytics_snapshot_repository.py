@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gzip
 import os
 import sys
 from pathlib import Path
@@ -32,6 +33,7 @@ from app.services.ssai_snapshot_repository import (  # noqa: E402
     SNAPSHOT_STATUS_UNAPPROVED,
     SNAPSHOT_STATUS_VERSION_MISMATCH,
     SnapshotKey,
+    SnapshotReadResult,
 )
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
 
@@ -165,7 +167,8 @@ class _Cursor:
                 self.row = (
                     item["manifest_id"], item["generation_no"], item["checksum"], item["approval_status"],
                     item["approved_at"], item["approved_by"], item["approval_reason"],
-                    payload["payload_json"], payload["storage_checksum"], payload["payload_size"],
+                    gzip.compress(str(payload["payload_json"]).encode("utf-16le")),
+                    payload["storage_checksum"], payload["payload_size"],
                 )
         elif "snapshot.read.exact" in sql:
             rows = [m for m in self.state.manifests if self._matches(m, params)]
@@ -245,6 +248,10 @@ def test_repository_lifecycle_and_isolation() -> None:
     )
     ready = repository.read(key)
     _assert(approved.status == SNAPSHOT_STATUS_READY and ready.usable, "approved generation is readable")
+    _assert(
+        ready.payload == first_payload,
+        "compressed published transport must restore the exact canonical payload before validation",
+    )
     inspected_ready = repository.inspect_generation(key, 1)
     _assert(
         inspected_ready.status == SNAPSHOT_STATUS_READY
@@ -305,6 +312,19 @@ def test_repository_lifecycle_and_isolation() -> None:
     _assert(repository.read(month_key).status == SNAPSHOT_STATUS_MISSING, "month isolation")
     _assert(repository.read(scope_key).status == SNAPSHOT_STATUS_MISSING, "scope isolation")
     _assert(repository.read(version_key).status == SNAPSHOT_STATUS_VERSION_MISMATCH, "version isolation")
+
+    invalid_repository = SqlServerSnapshotRepository(
+        reader_connection_factory=factory,
+        writer_connection_factory=factory,
+        payload_validator=lambda _payload, _key: SnapshotReadResult(
+            status=SNAPSHOT_STATUS_CORRUPT,
+            reason="fixture validator rejection",
+        ),
+    )
+    _assert(
+        invalid_repository.read(key).status == SNAPSHOT_STATUS_CORRUPT,
+        "validator result status must fail closed instead of returning ready",
+    )
 
     active_manifest_id = int(repository.read(key).manifest_id or 0)
     original_storage_checksum = state.payloads[active_manifest_id]["storage_checksum"]

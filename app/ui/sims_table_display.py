@@ -439,8 +439,27 @@ def normalize_display_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
         if col_name == "기준월":
             out[col] = sr.map(_format_display_yyyymm)
             continue
-        if "일자" in col_name or "날짜" in col_name:
+        # Date facts do not always use the generic '일자'/'날짜' suffix.
+        # Keep the explicit set narrow: period and count fields such as
+        # '입고 경과일' and '정상 입고 거래일수' must remain numeric cells.
+        if (
+            "일자" in col_name
+            or "날짜" in col_name
+            or col_name in {
+                "최근 정상 입고일",
+                "최근 정상 출고일",
+                "최근 입고일",
+                "최근 출고일",
+            }
+        ):
             out[col] = sr.map(_format_display_yyyymmdd)
+            continue
+
+        if pd.api.types.is_datetime64_any_dtype(sr):
+            # A fully missing datetime column can have no date-like name (for
+            # example an optional detail reason).  Keep real values intact,
+            # but make NaT a visual blank like every other display null.
+            out[col] = sr.map(lambda value: "" if _is_display_missing_token(value) else value)
             continue
 
         if _is_numeric_display_col(out, col):
@@ -580,6 +599,13 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         "당월 출고진척률",
         "당월 재고충족률",
         "부족예상금액",
+        # Dashboard inbound facts: these names remain numeric even after the
+        # blank-safe display copy has changed a nullable column to strings.
+        # Without this, a later legacy NumberColumn override can turn visual
+        # blanks back into Streamlit's literal None.
+        "입고 경과일",
+        "정상 입고 거래일수",
+        "평균 입고간격일",
     }
     if s in explicit_numeric_cols:
         return True

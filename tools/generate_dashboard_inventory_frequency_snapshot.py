@@ -15,10 +15,12 @@ if str(ROOT) not in sys.path:
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
     build_frequency_snapshot_plan,
     generate_frequency_snapshot_draft,
+    resolve_dashboard_profile_stock_scope,
 )
+from app.services.dashboard_inventory_frequency_snapshot import SnapshotContractError  # noqa: E402
 
 
-def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool) -> dict[str, Any]:
+def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, scope_source: str) -> dict[str, Any]:
     return {
         "mode": "apply" if apply else "dry-run",
         "company_id": plan.company_id,
@@ -30,6 +32,7 @@ def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool) -> 
             "mode": "selected" if plan.stock_codes else "all",
             "count": len(plan.stock_codes),
             "stock_codes": list(plan.stock_codes),
+            "source": scope_source,
         },
         "erp_read_plan": {
             "sql_call_count": plan.erp_sql_call_count,
@@ -50,6 +53,7 @@ def main() -> int:
     parser.add_argument("--company-id", required=True, type=int)
     parser.add_argument("--evaluation-month", required=True)
     scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--dashboard-profile", action="store_true")
     scope.add_argument("--stock-code", action="append", default=[])
     scope.add_argument("--all-stock-locations", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=120)
@@ -58,16 +62,37 @@ def main() -> int:
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    plan = build_frequency_snapshot_plan(
-        company_id=args.company_id,
-        evaluation_month=args.evaluation_month,
-        stock_codes=[] if args.all_stock_locations else args.stock_code,
-    )
+    manual_scope = None if args.dashboard_profile else ([] if args.all_stock_locations else args.stock_code)
+    try:
+        resolved_scope = resolve_dashboard_profile_stock_scope(
+            company_id=args.company_id,
+            manual_stock_codes=manual_scope,
+        )
+        plan = build_frequency_snapshot_plan(
+            company_id=args.company_id,
+            evaluation_month=args.evaluation_month,
+            stock_codes=resolved_scope.stock_codes,
+        )
+    except SnapshotContractError as exc:
+        print(json.dumps({
+            "ok": False,
+            "stage": "dashboard_profile_scope",
+            "error_code": str(exc),
+        }, ensure_ascii=False, indent=2))
+        return 1
+    except Exception as exc:
+        print(json.dumps({
+            "ok": False,
+            "stage": "dashboard_profile_scope",
+            "error_code": f"dashboard_profile_scope_unexpected:{type(exc).__name__}",
+        }, ensure_ascii=False, indent=2))
+        return 1
     output = _plan_json(
         plan,
         apply=bool(args.apply),
         timeout_seconds=max(1, int(args.timeout_seconds)),
         force=bool(args.force),
+        scope_source=resolved_scope.scope_source,
     )
     if not args.apply:
         print(json.dumps(output, ensure_ascii=False, indent=2))

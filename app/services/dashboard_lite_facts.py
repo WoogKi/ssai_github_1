@@ -15,7 +15,7 @@ from datetime import date, datetime
 import logging
 import re
 import time
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import pandas as pd
 
@@ -26,6 +26,7 @@ from app.db.mssql_client import (
     get_active_dashboard_query_measurement,
 )
 from app.services.product_supplier_scope_service import apply_product_supplier_scope, supplier_scope_filter_active
+from app.services.ssai_snapshot_repository import SnapshotReadResult
 
 
 FACTS_KIND = "SIMS_DASHBOARD_FACTS_V01"
@@ -41,6 +42,7 @@ DASHBOARD_LITE_SETTING_DEFAULTS = {
 # Compatibility name for callers that use the service-level fallback directly.
 STOCK_READY_THRESHOLD_PCT = float(DASHBOARD_LITE_SETTING_DEFAULTS["readiness_warning_pct"])
 MAX_DASHBOARD_MONTHS = 13
+INVENTORY_STATUS_ORDER = ("긴급 부족", "재고 경고", "적정 재고", "과다 재고", "예상수요 없음", "자료 부족")
 
 log = logging.getLogger("ssai.sims.dashboard_lite")
 
@@ -1343,6 +1345,117 @@ def _classify_stock_risk_rows(
     return summary
 
 
+def _attach_inventory_status_and_frequency(
+    rows: list[dict[str, Any]],
+    *,
+    frequency_snapshot: SnapshotReadResult,
+) -> dict[str, Any]:
+    """Attach display-only inventory state and approved outbound frequency facts.
+
+    Existing risk actions remain based on the risk-adjusted residual demand.
+    This separate presentation model uses the uncapped evaluation-month forecast
+    required by the inventory-status screen.
+    """
+    snapshot_status = str(frequency_snapshot.status or "missing")
+    frequency_by_product: dict[str, Mapping[str, Any]] = {}
+    if frequency_snapshot.usable and isinstance(frequency_snapshot.payload, Mapping):
+        frequency_by_product = {
+            str(item.get("product_code") or "").strip(): item
+            for item in (frequency_snapshot.payload.get("product_frequency") or [])
+            if isinstance(item, Mapping) and str(item.get("product_code") or "").strip()
+        }
+
+    summary_counts = {label: 0 for label in INVENTORY_STATUS_ORDER}
+    expected_demand_count = 0
+    frequency_counts = {grade: 0 for grade in ("A", "B", "C", "D", "E", "X", "빈도자료 부족")}
+    missing_frequency_product_count = 0
+    detail_rows: list[dict[str, Any]] = []
+    for row in rows:
+        product_code = str(row.get("product_code") or "").strip()
+        stock_present = bool(row.get("inventory_current_stock_present"))
+        demand_present = bool(row.get("evaluation_expected_demand_present"))
+        stock = _num(row.get("current_stock_qty"))
+        demand = _num(row.get("evaluation_expected_demand_qty"))
+        ratio: float | None = None
+        if not stock_present or not demand_present:
+            status = "자료 부족"
+        elif demand <= 0:
+            status = "예상수요 없음"
+        else:
+            expected_demand_count += 1
+            # 재고상태는 실제 재고 원값을 평가월 예상수요와 비교한다.
+            # 음수 재고도 부족 정도를 그대로 드러내야 한다.
+            ratio = stock / demand * 100.0
+            if ratio < 30.0:
+                status = "긴급 부족"
+            elif ratio < 50.0:
+                status = "재고 경고"
+            elif ratio < 150.0:
+                status = "적정 재고"
+            else:
+                status = "과다 재고"
+        summary_counts[status] += 1
+
+        frequency = frequency_by_product.get(product_code)
+        if frequency is None:
+            grade = "빈도자료 부족"
+            occurrence_count: int | None = None
+            row_frequency_status = snapshot_status if snapshot_status != "ready" else "stale"
+            missing_frequency_product_count += int(snapshot_status == "ready")
+        else:
+            grade = str(frequency.get("frequency_grade") or "빈도자료 부족")
+            occurrence_count = frequency.get("occurrence_count_3m")
+            row_frequency_status = str(frequency.get("data_status") or "ready")
+        if grade not in frequency_counts:
+            grade = "빈도자료 부족"
+        frequency_counts[grade] += 1
+
+        row["inventory_status"] = status
+        row["inventory_status_ratio_pct"] = ratio
+        row["outbound_frequency_grade"] = grade
+        row["outbound_occurrence_count_3m"] = occurrence_count
+        row["outbound_frequency_data_status"] = row_frequency_status
+        detail_rows.append(
+            {
+                "재고상태": status,
+                "재고수요비율": ratio,
+                "제품코드": product_code,
+                "제품명": str(row.get("product_name") or ""),
+                "제조사명": str(row.get("manufacturer_name") or ""),
+                "제품그룹명": str(row.get("제품그룹명") or ""),
+                "제품구분명": str(row.get("제품구분명") or ""),
+                "제품분류명": str(row.get("제품분류명") or ""),
+                "현재재고수량": stock,
+                "평가월 예상수요": demand if demand_present else None,
+                "재고 커버일": row.get("stock_cover_days"),
+                "출고빈도등급": grade,
+                "3개월 출고발생수": occurrence_count,
+                "출고빈도 자료상태": row_frequency_status,
+                "주요매입처명": str(row.get("주요매입처명") or ""),
+                # Detail filtering consumes the exact, already-classified values.
+                # Do not derive demand-surge labels again in the view layer.
+                "수요급증여부": bool(row.get("수요급증여부")),
+                "수요급증상위분류": str(row.get("수요급증상위분류") or ""),
+                "수요급증세부분류": str(row.get("수요급증세부분류") or ""),
+                "수요급증세부분류사유": str(row.get("수요급증세부분류사유") or ""),
+            }
+        )
+    return {
+        "summary": {
+            "total_product_count": len(rows),
+            "expected_demand_product_count": expected_demand_count,
+            "status_counts": summary_counts,
+            "frequency_counts": frequency_counts,
+            "snapshot_status": snapshot_status,
+            "snapshot_generation_no": frequency_snapshot.generation_no,
+            "snapshot_checksum": frequency_snapshot.checksum,
+            "snapshot_reason": str(frequency_snapshot.reason or ""),
+            "missing_frequency_product_count": missing_frequency_product_count,
+        },
+        "detail_rows": detail_rows,
+    }
+
+
 def _build_sales_facts(
     payload: Mapping[str, Any] | None,
     *,
@@ -2410,6 +2523,7 @@ def _build_inventory_facts(
     inbound_vendor_days: int = 90,
     overstock_inactive_days: int = 90,
     stock_mode: str = "real",
+    frequency_snapshot: SnapshotReadResult | None = None,
     measurement: DashboardQueryMeasurement | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -2456,6 +2570,7 @@ def _build_inventory_facts(
             product_code = str(row.get(code_col) or "").strip()
             stock = _num(row.get("현재재고수량"))
             remaining = _num(row.get("당월 잔여예상출고수량"))
+            evaluation_expected = _num(row.get("당월 예상출고수량"))
             source_shortage_qty = _num(row.get("부족예상수량"), max(remaining - stock, 0))
             source_shortage_amt = _num(row.get("부족예상금액"))
             unit_price = _safe_div(source_shortage_amt, source_shortage_qty, 0.0) if source_shortage_qty > 0 else 0.0
@@ -2479,9 +2594,12 @@ def _build_inventory_facts(
                     "product_class_name": str(row.get("제품분류명") or "").strip(),
                     "current_stock_qty": stock,
                     "current_stock_amt": _num(row.get("현재재고금액")),
+                    "inventory_current_stock_present": row.get("현재재고수량") is not None and pd.notna(row.get("현재재고수량")) and str(row.get("현재재고수량")).strip() != "",
                     "remaining_expected_demand_qty": remaining,
                     "당월현재출고수량": _num(row.get("당월 현재출고수량")),
-                    "당월기준예상출고수량": _num(row.get("당월 예상출고수량")),
+                    "당월기준예상출고수량": evaluation_expected,
+                    "evaluation_expected_demand_qty": evaluation_expected,
+                    "evaluation_expected_demand_present": row.get("당월 예상출고수량") is not None and pd.notna(row.get("당월 예상출고수량")) and str(row.get("당월 예상출고수량")).strip() != "",
                     "3개월필요수량": _num(row.get("3개월필요수량")),
                     "_source_shortage_qty": source_shortage_qty,
                     "_source_shortage_amt": source_shortage_amt,
@@ -2518,9 +2636,12 @@ def _build_inventory_facts(
                     "product_class_name": item["product_class_name"],
                     "current_stock_qty": 0.0,
                     "current_stock_amt": 0.0,
+                    "inventory_current_stock_present": True,
                     "remaining_expected_demand_qty": 0.0,
                     "당월현재출고수량": 0.0,
                     "당월기준예상출고수량": 0.0,
+                    "evaluation_expected_demand_qty": 0.0,
+                    "evaluation_expected_demand_present": True,
                     "3개월필요수량": 0.0,
                     "_source_shortage_qty": 0.0,
                     "_source_shortage_amt": 0.0,
@@ -2537,9 +2658,11 @@ def _build_inventory_facts(
                     acc[field] = str(item[field])
             acc["current_stock_qty"] += float(item.get("current_stock_qty") or 0)
             acc["current_stock_amt"] += float(item.get("current_stock_amt") or 0)
+            acc["inventory_current_stock_present"] = bool(acc["inventory_current_stock_present"]) and bool(item.get("inventory_current_stock_present"))
             acc["remaining_expected_demand_qty"] += float(item.get("remaining_expected_demand_qty") or 0)
             acc["당월현재출고수량"] += float(item.get("당월현재출고수량") or 0)
             acc["당월기준예상출고수량"] += float(item.get("당월기준예상출고수량") or 0)
+            acc["evaluation_expected_demand_qty"] += float(item.get("evaluation_expected_demand_qty") or 0)
             acc["3개월필요수량"] += float(item.get("3개월필요수량") or 0)
             acc["_source_shortage_qty"] += float(item.get("_source_shortage_qty") or 0)
             acc["_source_shortage_amt"] += float(item.get("_source_shortage_amt") or 0)
@@ -2548,6 +2671,7 @@ def _build_inventory_facts(
             acc["_stock_risk_required_values_present"] = bool(acc["_stock_risk_required_values_present"]) and bool(item.get("_stock_risk_required_values_present"))
             acc["_stock_cover_stock_present"] = bool(acc["_stock_cover_stock_present"]) and bool(item.get("_stock_cover_stock_present"))
             acc["_stock_cover_demand_present"] = bool(acc["_stock_cover_demand_present"]) and bool(item.get("_stock_cover_demand_present"))
+            acc["evaluation_expected_demand_present"] = bool(acc["evaluation_expected_demand_present"]) and bool(item.get("evaluation_expected_demand_present"))
         _record_inventory_phase(
             "inventory_groupby",
             groupby_started,
@@ -2588,9 +2712,12 @@ def _build_inventory_facts(
                     "제품분류명": str(row.get("product_class_name") or "").strip(),
                     "current_stock_qty": stock,
                     "current_stock_amt": float(row.get("current_stock_amt") or 0),
+                    "inventory_current_stock_present": bool(row.get("inventory_current_stock_present")),
                     "remaining_expected_demand_qty": remaining,
                     "당월현재출고수량": float(row.get("당월현재출고수량") or 0),
                     "당월기준예상출고수량": float(row.get("당월기준예상출고수량") or 0),
+                    "evaluation_expected_demand_qty": float(row.get("evaluation_expected_demand_qty") or 0),
+                    "evaluation_expected_demand_present": bool(row.get("evaluation_expected_demand_present")),
                     "3개월필요수량": float(row.get("3개월필요수량") or 0),
                     "stock_readiness_pct": readiness,
                     "shortage_qty": shortage_qty,
@@ -2670,6 +2797,25 @@ def _build_inventory_facts(
         inbound_merge_started,
         input_rows=len(rows),
         result_rows=len(rows),
+    )
+    inventory_status_started = time.perf_counter()
+    inventory_status = _attach_inventory_status_and_frequency(
+        rows,
+        frequency_snapshot=frequency_snapshot or SnapshotReadResult(status="missing", reason="frequency snapshot was not requested"),
+    )
+    _record_inventory_phase(
+        "inventory_status_frequency_attach",
+        inventory_status_started,
+        input_rows=len(rows),
+        result_rows=len(inventory_status["detail_rows"]),
+    )
+    log.info(
+        "[dashboard.inventory_status_frequency] inventory_rows=%s snapshot_status=%s generation_no=%s frequency_missing_rows=%s elapsed_ms=%s",
+        len(rows),
+        inventory_status["summary"].get("snapshot_status") or "",
+        inventory_status["summary"].get("snapshot_generation_no") or "",
+        inventory_status["summary"].get("missing_frequency_product_count") or 0,
+        int((time.perf_counter() - inventory_status_started) * 1000),
     )
     risk_detail_started = time.perf_counter()
     risk_detail_rows, risk_detail_summary = _build_dashboard_risk_detail(rows, stock_mode=stock_mode)
@@ -2807,6 +2953,8 @@ def _build_inventory_facts(
         "stock_extension_summary": stock_extension_summary,
         "risk_detail_summary": risk_detail_summary,
         "risk_detail_rows": risk_detail_rows,
+        "inventory_status_summary": inventory_status["summary"],
+        "inventory_status_detail_rows": inventory_status["detail_rows"],
         "data_quality": [] if rows else ["재고준비율 산정 자료 없음"],
     }
 
@@ -3015,6 +3163,7 @@ def build_dashboard_lite_facts(
     stock_shortage_payload: Mapping[str, Any] | None = None,
     inbound_facts_df: pd.DataFrame | None = None,
     sales_transaction_cycle_df: pd.DataFrame | None = None,
+    frequency_snapshot_reader: Callable[[Any, Any, list[str]], SnapshotReadResult] | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
     """Build Dashboard Lite v0.1 facts from existing analytics payloads."""
@@ -3341,6 +3490,21 @@ def build_dashboard_lite_facts(
         elapsed_ms=int((time.perf_counter() - t_sales) * 1000),
     )
     t_stock = time.perf_counter()
+    stock_codes = list(service_params.get("stock_cd_list") or [])
+    if frequency_snapshot_reader is None:
+        from app.services.dashboard_inventory_frequency_snapshot_service import read_approved_frequency_snapshot
+
+        frequency_snapshot = read_approved_frequency_snapshot(
+            company_id=service_params.get("company_id"),
+            evaluation_month=service_params.get("evaluation_month"),
+            stock_codes=stock_codes,
+        )
+    else:
+        frequency_snapshot = frequency_snapshot_reader(
+            service_params.get("company_id"),
+            service_params.get("evaluation_month"),
+            stock_codes,
+        )
     inventory = _build_inventory_facts(
         stock_shortage_payload,
         readiness_warning_pct=float(service_params["readiness_warning_pct"]),
@@ -3355,6 +3519,7 @@ def build_dashboard_lite_facts(
         inbound_vendor_days=int(service_params["major_purchase_vendor_days"]),
         overstock_inactive_days=int(service_params["overstock_inactive_days"]),
         stock_mode=str(service_params.get("stock_mode") or "real"),
+        frequency_snapshot=frequency_snapshot,
         measurement=physical_measurement,
     )
     def _product_codes(frame: Any, *columns: str) -> set[str]:
@@ -3399,129 +3564,16 @@ def build_dashboard_lite_facts(
         len(inventory.get("readiness_rows") or []),
         int((time.perf_counter() - t_stock) * 1000),
     )
-    purchase_cycle = {}
-    if isinstance(inbound_facts_df, pd.DataFrame):
-        purchase_cycle = dict(inbound_facts_df.attrs.get("purchase_transaction_cycle") or {})
-    from app.services.dashboard_inbound_facts_service import summarize_transaction_cycle_dates
-
-    sales_cycle_cutoff_date = _dashboard_inbound_cutoff_date(service_params, today=today)
-    sales_cycle_source_started = time.perf_counter()
-    if sales_transaction_cycle_df is None:
-        from app.services.analytics_sales_trend_service import get_dashboard_sales_transaction_dates
-
-        sales_cycle_source_mode = "rddbc120_minimal"
-        try:
-            with dashboard_query_measurement(
-                physical_measurement,
-                source="sales",
-                phase="sales_transaction_cycle_source",
-                source_mode=sales_cycle_source_mode,
-            ):
-                sales_transaction_cycle_df = get_dashboard_sales_transaction_dates(
-                    dict(source_params),
-                    date_from=(pd.Timestamp(sales_cycle_cutoff_date) - pd.Timedelta(days=89)).strftime("%Y%m%d"),
-                    date_to=sales_cycle_cutoff_date,
-                )
-            sales_cycle_physical_query_count = 1
-        except Exception as exc:
-            sales_transaction_cycle_df = pd.DataFrame(columns=["trade_date", "io_code"])
-            sales_cycle_source_mode = "error"
-            log.warning(
-                "[dashboard.sales_transaction_cycle] status=error error_type=%s elapsed_ms=%s",
-                type(exc).__name__,
-                int((time.perf_counter() - sales_cycle_source_started) * 1000),
-            )
-    elif isinstance(sales_transaction_cycle_df, pd.DataFrame):
-        sales_cycle_source_mode = str(sales_transaction_cycle_df.attrs.get("source_mode") or sales_cycle_source_mode)
-        sales_cycle_physical_query_count = int(sales_transaction_cycle_df.attrs.get("physical_query_count") or 0)
-
-    sales_cycle_source_finished = time.perf_counter()
-    sales_cycle_calculation_started = sales_cycle_source_finished
-    cycle_source = sales_transaction_cycle_df if isinstance(sales_transaction_cycle_df, pd.DataFrame) else pd.DataFrame()
-    sales_cycle_source_rows = int(len(cycle_source))
-    normal_sale_dates = pd.Series(dtype="object")
-    if not cycle_source.empty and {"trade_date", "io_code"}.issubset(cycle_source.columns):
-        # Existing sales facts use 5xx for sales and 6xx for returns.  A return
-        # on a normal-sale date therefore cannot erase that date.
-        normal_sale_dates = cycle_source.loc[
-            cycle_source["io_code"].fillna("").astype(str).str.strip().str.startswith("5"),
-            "trade_date",
-        ]
-    sales_cycle = summarize_transaction_cycle_dates(
-        normal_sale_dates,
-        cutoff_date=sales_cycle_cutoff_date,
-        period_days=90,
-    )
-    if sales_cycle_source_mode == "error":
-        sales_cycle["result_status"] = "error"
-    sales_cycle_calculation_finished = time.perf_counter()
-    sales_cycle_timing = transaction_cycle_phase_timing(
-        source_started_at=sales_cycle_source_started,
-        source_finished_at=sales_cycle_source_finished,
-        calculation_started_at=sales_cycle_calculation_started,
-        calculation_finished_at=sales_cycle_calculation_finished,
-    )
-    sales_cycle_source_elapsed_ms = sales_cycle_timing["source_elapsed_ms"]
-    sales_cycle_calculation_elapsed_ms = sales_cycle_timing["calculation_elapsed_ms"]
-    sales_cycle_total_elapsed_ms = sales_cycle_timing["total_elapsed_ms"]
-    sales_cycle.update(
-        {
-            "window_days": sales_cycle["period_days"],
-            "latest_normal_trade_date": sales_cycle["latest_date"] or None,
-            "source_mode": sales_cycle_source_mode,
-            "physical_query_count": sales_cycle_physical_query_count,
-            "source_rows": sales_cycle_source_rows,
-            "source_elapsed_ms": sales_cycle_source_elapsed_ms,
-            "calculation_elapsed_ms": sales_cycle_calculation_elapsed_ms,
-            "total_elapsed_ms": sales_cycle_total_elapsed_ms,
-            "elapsed_ms": sales_cycle_total_elapsed_ms,
-        }
-    )
-    physical_measurement.add_phase(
-        phase="sales_transaction_cycle_calculation",
-        source_name="sales",
-        input_rows=sales_cycle_source_rows,
-        result_rows=int(sales_cycle.get("unique_trade_days") or 0),
-        elapsed_ms=sales_cycle_calculation_elapsed_ms,
-    )
-    log.info(
-        "[dashboard.sales_transaction_cycle] status=%s source_mode=%s window_start=%s window_end=%s source_rows=%s unique_trade_days=%s physical_query_count=%s source_elapsed_ms=%s calculation_elapsed_ms=%s total_elapsed_ms=%s",
-        sales_cycle["result_status"], sales_cycle_source_mode, sales_cycle["window_start"], sales_cycle["window_end"],
-        sales_cycle_source_rows, sales_cycle["unique_trade_days"], sales_cycle_physical_query_count,
-        sales_cycle_source_elapsed_ms, sales_cycle_calculation_elapsed_ms, sales_cycle_total_elapsed_ms,
-    )
-    purchase_cycle_status = purchase_cycle.get("result_status") or purchase_cycle.get("data_status")
-    sales_cycle_status = sales_cycle.get("result_status")
-    turnover = {
-        "status": resolve_transaction_cycle_status(purchase_cycle_status, sales_cycle_status),
-        "period_days": int(purchase_cycle.get("period_days") or 90),
-        "cutoff_date": str(purchase_cycle.get("cutoff_date") or ""),
-        "purchase_latest_date": str(purchase_cycle.get("latest_date") or ""),
-        "purchase_elapsed_days": purchase_cycle.get("elapsed_days"),
-        "purchase_unique_trade_days": purchase_cycle.get("unique_trade_days"),
-        "purchase_average_interval_days": purchase_cycle.get("average_interval_days"),
-        "purchase_data_status": str(purchase_cycle.get("data_status") or "missing"),
-        "sales_latest_date": str(sales_cycle.get("latest_date") or ""),
-        "sales_elapsed_days": sales_cycle.get("elapsed_days"),
-        "sales_unique_trade_days": sales_cycle.get("unique_trade_days"),
-        "sales_average_interval_days": sales_cycle.get("average_interval_days"),
-        "sales_data_status": str(sales_cycle_status or "no_data"),
-        "sales_transaction_cycle": sales_cycle,
-        "purchase_turnover_days": purchase_cycle.get("average_interval_days"),
-        "sales_turnover_days": sales_cycle.get("average_interval_days"),
-        "definition": "최근 90일 정상 매입·매출 고유 거래일 사이 평균 일수",
-        "data_quality": [],
-    }
-    t_actions = time.perf_counter()
-    today_actions = _build_today_actions(sales, inventory, turnover)
-    actions_elapsed_ms = int((time.perf_counter() - t_actions) * 1000)
-    physical_measurement.add_phase(
-        phase="today_actions",
-        source_name="facts",
-        input_rows=len(inventory.get("readiness_rows") or []),
-        result_rows=len(today_actions),
-        elapsed_ms=actions_elapsed_ms,
-    )
+    # The Dashboard no longer presents transaction-cycle or today-action panels.
+    # Preserve the facts shape for compact snapshots while avoiding their dedicated
+    # Rddbc120 query and action-candidate assembly.
+    turnover = {"status": "not_rendered", "data_quality": []}
+    today_actions: list[dict[str, Any]] = []
+    sales_cycle_source_elapsed_ms = 0
+    sales_cycle_calculation_elapsed_ms = 0
+    sales_cycle_total_elapsed_ms = 0
+    sales_cycle_source_rows = 0
+    sales_cycle_physical_query_count = 0
     t_visual_phase2 = time.perf_counter()
     visual_phase2_summary, purchase_trend_rows = _build_visual_phase2_summary(
         list(inventory.get("readiness_rows") or []),
@@ -3534,7 +3586,7 @@ def build_dashboard_lite_facts(
             ),
             0,
         ),
-        today_action_count=len(today_actions),
+        today_action_count=0,
     )
     stock_status_summary = {
         str(row.get("재고위험상태") or ""): int(row.get("품목수") or 0)
@@ -3556,22 +3608,12 @@ def build_dashboard_lite_facts(
     )
     additional_notes = {
         "sales_decline_targets": sales.get("decline_targets", []),
-        "turnover_status": turnover.get("status") or "",
-        "data_quality": sales.get("data_quality", []) + inventory.get("data_quality", []) + turnover.get("data_quality", []) + filter_diagnostics,
+        "data_quality": sales.get("data_quality", []) + inventory.get("data_quality", []) + filter_diagnostics,
         "performance": stock_timing,
         "comparison_notes": [
-            "제약사별 매출 감소, 거래 회전일 자료부족, 일반 데이터 품질 안내는 제품 조치 표와 분리",
+            "제약사별 매출 감소와 일반 데이터 품질 안내는 재고 현황과 분리",
         ],
     }
-    log.info(
-        "[dashboard.actions] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",
-        service_params.get("company_id") or "",
-        service_params.get("month_from"),
-        service_params.get("month_to"),
-        service_params.get("evaluation_month"),
-        len(today_actions),
-        actions_elapsed_ms,
-    )
     physical_measurement.add_phase(
         phase="visual_phase2",
         source_name="facts",

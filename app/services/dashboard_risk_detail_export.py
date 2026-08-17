@@ -21,6 +21,7 @@ log = logging.getLogger("ssai.sims.dashboard_risk_detail_export")
 DETAIL_SHEET_NAME = "위험품목상세"
 VENDOR_SHEET_NAME = "매입처별위험요약"
 SCOPE_SHEET_NAME = "조회조건"
+INVENTORY_DETAIL_SHEET_NAME = "재고현황상세"
 
 _AMOUNT_COLUMNS = {"현재재고금액", "재고평가단가", "위험보정부족예상금액", "긴급부족금액", "부족주의금액", "전체위험보정부족금액"}
 _QTY_COLUMNS = {"현재재고수량", "당월현재출고수량", "당월기준예상출고수량", "진행속도기준월말예상출고수량", "위험보정예상출고수량", "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족수량"}
@@ -111,5 +112,38 @@ def build_dashboard_risk_detail_excel_bytes(
     log.info(
         "[dashboard.risk_detail_export] export_rows=%s vendor_summary_rows=%s sheet_count=%s bytes_size=%s permission_allowed=True elapsed_ms=%s success=True",
         info["export_rows"], info["vendor_summary_rows"], info["sheet_count"], info["bytes_size"], info["elapsed_ms"],
+    )
+    return payload, info
+
+
+def build_dashboard_inventory_detail_excel_bytes(
+    detail_rows: Sequence[Mapping[str, Any]] | pd.DataFrame,
+    query_conditions: Sequence[Mapping[str, Any]] | pd.DataFrame,
+) -> tuple[bytes, dict[str, int]]:
+    """Export the already-filtered unified inventory detail without any reload."""
+    started = time.perf_counter()
+    detail_df = _sanitize_dataframe_for_excel(_as_frame(detail_rows))
+    private_columns = [column for column in detail_df.columns if str(column).startswith("_")]
+    if private_columns:
+        detail_df = detail_df.drop(columns=private_columns)
+    scope_df = _sanitize_dataframe_for_excel(_as_frame(query_conditions))
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        detail_df.to_excel(writer, index=False, sheet_name=INVENTORY_DETAIL_SHEET_NAME)
+        scope_df.to_excel(writer, index=False, sheet_name=SCOPE_SHEET_NAME)
+        _apply_dashboard_risk_formats(writer, detail_df, INVENTORY_DETAIL_SHEET_NAME)
+        _apply_dashboard_risk_formats(writer, scope_df, SCOPE_SHEET_NAME)
+
+    payload = output.getvalue()
+    info = {
+        "export_rows": int(len(detail_df)),
+        "sheet_count": 2,
+        "bytes_size": int(len(payload)),
+        "elapsed_ms": int((time.perf_counter() - started) * 1000),
+    }
+    log.info(
+        "[dashboard.inventory_detail_export] export_rows=%s sheet_count=%s bytes_size=%s permission_allowed=True elapsed_ms=%s success=True",
+        info["export_rows"], info["sheet_count"], info["bytes_size"], info["elapsed_ms"],
     )
     return payload, info

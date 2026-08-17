@@ -38,6 +38,10 @@ from app.services.ssai_snapshot_repository import (  # noqa: E402
     SnapshotReadResult,
     SnapshotRepository,
 )
+from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
+    resolve_dashboard_profile_stock_scope,
+)
+from app.services.ssai_analysis_profile_service import DashboardProfileLoadResult  # noqa: E402
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -275,6 +279,37 @@ def test_repository_boundary() -> None:
     _assert(SNAPSHOT_TYPE and SCHEMA_VERSION and ALGORITHM_VERSION, "version contract is required")
 
 
+def test_dashboard_profile_stock_scope_contract() -> None:
+    profiles = {
+        6: DashboardProfileLoadResult(status="ready", profile={"stock_cd_list": ["00001"]}, company_id=6),
+        4: DashboardProfileLoadResult(status="ready", profile={"stock_cd_list": ["00901", "00001", "00247"]}, company_id=4),
+        7: DashboardProfileLoadResult(status="missing", reason_code="profile_missing"),
+        8: DashboardProfileLoadResult(status="ready", profile={"stock_cd_list": []}),
+        9: DashboardProfileLoadResult(status="unavailable", reason_code="profile_db_unavailable:OperationalError"),
+        10: DashboardProfileLoadResult(status="ready", profile={"stock_cd_list": ["00001"]}, company_id=4),
+    }
+    loader = lambda company_id: profiles[company_id]
+    company6 = resolve_dashboard_profile_stock_scope(company_id=6, profile_loader=loader)
+    company4 = resolve_dashboard_profile_stock_scope(company_id=4, profile_loader=loader)
+    _assert(company6.stock_codes == ("00001",), "company 6 must keep its own saved stock scope")
+    _assert(company4.stock_codes == ("00001", "00247", "00901"), "company 4 scope must remain deterministic")
+    verified_manual = resolve_dashboard_profile_stock_scope(
+        company_id=6, manual_stock_codes=["00001"], profile_loader=loader,
+    )
+    _assert(verified_manual.scope_source == "manual_verified", "matching manual scope may remain an override")
+    for company_id, expected_code in ((6, "dashboard_profile_stock_scope_mismatch"), (7, "dashboard_profile_missing"), (8, "dashboard_profile_stock_scope_empty"), (9, "dashboard_profile_unavailable"), (10, "dashboard_profile_company_mismatch")):
+        try:
+            resolve_dashboard_profile_stock_scope(
+                company_id=company_id,
+                manual_stock_codes=["99999"] if company_id == 6 else None,
+                profile_loader=loader,
+            )
+        except SnapshotContractError as exc:
+            _assert(expected_code in str(exc), f"{company_id} expected {expected_code}, got {exc}")
+        else:
+            raise AssertionError(f"{company_id} must fail closed")
+
+
 def main() -> int:
     tests = (
         test_tcode_and_event_contract,
@@ -283,6 +318,7 @@ def main() -> int:
         test_payload_determinism_and_fail_closed,
         test_payload_internal_corruption,
         test_repository_boundary,
+        test_dashboard_profile_stock_scope_contract,
     )
     for test in tests:
         test()
