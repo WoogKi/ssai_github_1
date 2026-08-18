@@ -358,6 +358,40 @@ def _parser_cases() -> list[ParserCase]:
                 "month_to": "202605",
             },
         ),
+        ParserCase(
+            query="제품재고장 출고빈도 A 조회",
+            expected_action="제품재고현황 조회",
+            expected_params={"frequency_grade": "A"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
+            query="제품재고장 출고빈도등급 E 조회",
+            expected_action="제품재고현황 조회",
+            expected_params={"frequency_grade": "E"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
+            query="제품재고현황 출고빈도 구분 X 조회",
+            expected_action="제품재고현황 조회",
+            expected_params={"frequency_grade": "X"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
+            query="제품재고장 출고빈도 자료부족 조회",
+            expected_action="제품재고현황 조회",
+            expected_params={"frequency_grade": "빈도자료 부족"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
+            query="제품재고장 202608 제조사 한미 출고빈도 E 조회",
+            expected_action="제품재고현황 조회",
+            expected_params={
+                "frequency_grade": "E",
+                "date_from": "20260801",
+                "date_to": "20260831",
+                "maker_nm": "한미",
+            },
+        ),
     ]
 
 
@@ -4464,12 +4498,45 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
     required_perf_stages = (
         '"month_carry"', '"period_in"', '"period_out"', '"last_cost"',
         "filter_prepare_ms", "group_aggregate_ms", "unit_calc_ms",
-        "amount_calc_ms", "dc_calc_ms", "final_display_frame_ms", "final_total_ms",
+        "amount_calc_ms", "dc_calc_ms", "frequency_attach_ms", "frequency_filter_ms",
+        "final_display_frame_ms", "final_total_ms",
     )
     results.append(
         _ok("product inventory performance stages are independently logged", "sql/group/calc/display")
         if all(marker in perf_source for marker in required_perf_stages)
         else _fail("product inventory performance stages are independently logged", "missing performance marker")
+    )
+
+    avg_query_stages: list[str] = []
+
+    def _avg_query(sql, _params):
+        avg_query_stages.append("last_cost" if "last_unit_cost" in str(sql) else "source")
+        return pd.DataFrame({"physic_cd": ["P1"]})
+
+    avg_params = {"date_from": "20260801", "date_to": "20260831"}
+    avg_cfg = inventory_service._settings({"stock_mode": "real", "price_mode": "총평균단가"})
+    with patch.object(inventory_service, "query_to_df", side_effect=_avg_query):
+        _avg_source, avg_last = inventory_service._collect_source_df(avg_params, avg_cfg)
+    avg_last_meta = dict(avg_params.get("_product_inventory_last_cost_scope") or {})
+    avg_last_cost_skip_ok = (
+        len(avg_query_stages) == 3
+        and "last_cost" not in avg_query_stages
+        and avg_last.empty
+        and avg_last_meta.get("fallback_reason") == "price_mode_not_last"
+        and (avg_params.get("_product_inventory_query_perf") or {}).get("last_cost", {}).get("skipped") is True
+    )
+    results.append(
+        _ok("product inventory average price skips last-cost SQL", repr(avg_last_meta))
+        if avg_last_cost_skip_ok
+        else _fail("product inventory average price skips last-cost SQL", repr({"stages": avg_query_stages, "meta": avg_last_meta}))
+    )
+
+    inventory_view = importlib.import_module("app.sims.views.rddbc_io_inventory_views")
+    inventory_view_source = inspect.getsource(inventory_view.view_product_inventory)
+    results.append(
+        _ok("product inventory no-data uses panel single renderer", "view has no direct text payload render")
+        if "_show_text_payload" not in inventory_view_source
+        else _fail("product inventory no-data uses panel single renderer", "duplicate view renderer remains")
     )
 
     last_cost_base_params = {

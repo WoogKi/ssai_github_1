@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import logging
 import os
@@ -13,6 +13,17 @@ import time
 
 import pandas as pd
 
+from app.db.mssql_client import get_current_company_id
+from app.services.dashboard_inventory_frequency_snapshot import (
+    FREQUENCY_INSUFFICIENT_GRADE,
+    frequency_rows_for_product_subset,
+    scope_fingerprint,
+)
+from app.services.dashboard_inventory_frequency_snapshot_service import (
+    read_approved_frequency_snapshot,
+    resolve_dashboard_profile_stock_scope,
+)
+from app.services.ssai_snapshot_repository import SnapshotReadResult
 from app.services.rddbc_io_common import (
     clean_text,
     add_unlabeled_name_like_filter,
@@ -288,6 +299,10 @@ def _build_inventory_query_summary(
     if stock_text:
         bits.append(f"재고위치 {stock_text}")
 
+    frequency_grade = _normalize_product_inventory_frequency_filter(params.get("frequency_grade"))
+    if frequency_grade:
+        bits.append(f"출고빈도 {frequency_grade}")
+
 
     return " / ".join(bits)
 
@@ -450,8 +465,161 @@ _DISPLAY_NUMERIC_COLS_260 = {
     "입고수량", "입고단가", "입고DC율", "입고금액",
     "출고수량", "출고단가", "출고DC율", "출고금액",
     "재고수량", "재고단가", "재고DC율", "재고금액",
-    "현보험약가", "보험금액",
+    "현보험약가", "보험금액", "3개월 출고발생수",
 }
+
+_FREQUENCY_GRADE_COLUMN = "출고빈도등급"
+_FREQUENCY_COUNT_COLUMN = "3개월 출고발생수"
+_FREQUENCY_FILTER_ALL = "전체"
+_FREQUENCY_FILTER_VALUES = ("A", "B", "C", "D", "E", "X", FREQUENCY_INSUFFICIENT_GRADE)
+
+
+def _place_frequency_columns(df: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        column
+        for column in df.columns
+        if column not in {_FREQUENCY_GRADE_COLUMN, _FREQUENCY_COUNT_COLUMN}
+    ]
+    product_code_index = columns.index("제품코드") + 1
+    columns[product_code_index:product_code_index] = [
+        _FREQUENCY_GRADE_COLUMN,
+        _FREQUENCY_COUNT_COLUMN,
+    ]
+    return df.loc[:, columns]
+
+
+def _normalize_product_inventory_frequency_filter(value: Any) -> str:
+    """Return the one canonical product-inventory frequency filter value."""
+    normalized = clean_text(value)
+    if normalized in {"", _FREQUENCY_FILTER_ALL}:
+        return ""
+    if normalized in _FREQUENCY_FILTER_VALUES:
+        return normalized
+    return ""
+
+
+def filter_product_inventory_frequency_rows(df: pd.DataFrame, frequency_grade: Any) -> pd.DataFrame:
+    """Filter already attached frequency values without recalculating a subset."""
+    selected = _normalize_product_inventory_frequency_filter(frequency_grade)
+    if not selected or _FREQUENCY_GRADE_COLUMN not in df.columns:
+        return df
+    return df.loc[df[_FREQUENCY_GRADE_COLUMN].fillna("").astype(str) == selected].copy()
+
+
+def _inventory_frequency_context(params: Dict[str, Any], date_to: str) -> tuple[int | None, str, str]:
+    """Return the company/evaluation key without letting request params cross companies."""
+    context_company = get_current_company_id()
+    requested_company = clean_text(params.get("company_id"))
+    try:
+        requested_id = int(requested_company) if requested_company else None
+    except (TypeError, ValueError):
+        return None, "", "company_id_invalid"
+    if context_company is not None and requested_id is not None and int(context_company) != requested_id:
+        return None, "", "company_context_mismatch"
+    company_id = int(context_company) if context_company is not None else requested_id
+    explicit_month = "".join(ch for ch in clean_text(params.get("evaluation_month")) if ch.isdigit())[:6]
+    evaluation_month = explicit_month if len(explicit_month) == 6 else str(date_to or "")[:6]
+    if company_id is None:
+        return None, evaluation_month, "company_context_missing"
+    if len(evaluation_month) != 6:
+        return company_id, "", "evaluation_month_missing"
+    return company_id, evaluation_month, ""
+
+
+def attach_dashboard_frequency_snapshot(
+    df: pd.DataFrame,
+    *,
+    params: Dict[str, Any],
+    date_to: str,
+    profile_scope_resolver: Callable[..., Any] = resolve_dashboard_profile_stock_scope,
+    snapshot_reader: Callable[..., SnapshotReadResult] = read_approved_frequency_snapshot,
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Attach the Dashboard's approved frequency snapshot to inventory output only.
+
+    The inventory query's selected stock filters remain untouched. The snapshot
+    key always uses the company-saved Dashboard stock scope, so a subset view
+    never re-ranks products or falls back to ERP activity rows.
+    """
+    out = df.copy()
+    if "제품코드" not in out.columns:
+        return out, {
+            "frequency_snapshot_status": "missing",
+            "frequency_snapshot_reason": "product_code_column_missing",
+            "frequency_missing_product_count": 0,
+            "frequency_additional_erp_source_call_count": 0,
+        }
+
+    product_codes = out["제품코드"].fillna("").astype(str).str.strip()
+    detail_mask = product_codes.ne("")
+    detail_product_codes = set(product_codes.loc[detail_mask])
+    out[_FREQUENCY_GRADE_COLUMN] = ""
+    out[_FREQUENCY_COUNT_COLUMN] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    company_id, evaluation_month, context_reason = _inventory_frequency_context(params, date_to)
+    base_meta: Dict[str, Any] = {
+        "frequency_snapshot_company_id": company_id,
+        "frequency_snapshot_evaluation_month": evaluation_month,
+        "frequency_snapshot_status": "missing",
+        "frequency_snapshot_reason": context_reason,
+        "frequency_snapshot_scope_fingerprint": "",
+        "frequency_snapshot_generation_no": None,
+        "frequency_snapshot_checksum": "",
+        "frequency_missing_product_count": len(detail_product_codes),
+        "frequency_additional_erp_source_call_count": 0,
+    }
+    if not detail_mask.any() or context_reason:
+        if detail_mask.any():
+            out.loc[detail_mask, _FREQUENCY_GRADE_COLUMN] = FREQUENCY_INSUFFICIENT_GRADE
+        return _place_frequency_columns(out), base_meta
+
+    try:
+        scope = profile_scope_resolver(company_id=company_id)
+        snapshot = snapshot_reader(
+            company_id=company_id,
+            evaluation_month=evaluation_month,
+            stock_codes=list(scope.stock_codes),
+        )
+    except Exception as exc:
+        base_meta["frequency_snapshot_reason"] = f"frequency_snapshot_unavailable:{type(exc).__name__}"
+        out.loc[detail_mask, _FREQUENCY_GRADE_COLUMN] = FREQUENCY_INSUFFICIENT_GRADE
+        return _place_frequency_columns(out), base_meta
+
+    base_meta.update(
+        {
+            "frequency_snapshot_status": str(snapshot.status or "missing"),
+            "frequency_snapshot_reason": str(snapshot.reason or ""),
+            "frequency_snapshot_scope": list(scope.stock_codes),
+            "frequency_snapshot_scope_fingerprint": scope_fingerprint(scope.stock_codes),
+            "frequency_snapshot_generation_no": snapshot.generation_no,
+            "frequency_snapshot_checksum": str(snapshot.checksum or ""),
+        }
+    )
+    frequency_rows = frequency_rows_for_product_subset(
+        snapshot,
+        product_codes.loc[detail_mask].drop_duplicates().tolist(),
+    )
+    frequency_frame = pd.DataFrame(frequency_rows)
+    if frequency_frame.empty:
+        grade_by_product = pd.Series(dtype="object")
+        occurrence_by_product = pd.Series(dtype="float64")
+    else:
+        frequency_frame["product_code"] = frequency_frame["product_code"].fillna("").astype(str).str.strip()
+        frequency_frame = frequency_frame.loc[frequency_frame["product_code"].ne("")]
+        frequency_frame = frequency_frame.drop_duplicates(subset=["product_code"], keep="last")
+        grade_by_product = frequency_frame.set_index("product_code")["frequency_grade"]
+        occurrence_by_product = frequency_frame.set_index("product_code")["occurrence_count_3m"]
+
+    attached_grades = product_codes.map(grade_by_product).fillna(FREQUENCY_INSUFFICIENT_GRADE).astype(str)
+    attached_occurrences = pd.to_numeric(product_codes.map(occurrence_by_product), errors="coerce")
+    attached_valid = (
+        detail_mask
+        & attached_grades.ne(FREQUENCY_INSUFFICIENT_GRADE)
+        & attached_occurrences.notna()
+    )
+    out.loc[detail_mask, _FREQUENCY_GRADE_COLUMN] = attached_grades.loc[detail_mask]
+    out.loc[attached_valid, _FREQUENCY_COUNT_COLUMN] = attached_occurrences.loc[attached_valid].astype("Int64")
+    missing_mask = detail_mask & ~attached_valid
+    base_meta["frequency_missing_product_count"] = int(product_codes.loc[missing_mask].nunique())
+    return _place_frequency_columns(out), base_meta
 
 def _finalize_display_df_260(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -1640,6 +1808,28 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
         params["_current_stock_query_perf"] = query_perf
         return all_df, pd.DataFrame()
 
+    if cfg.get("price_mode") != "last":
+        scope_meta = {
+            "applied": False,
+            "product_code_count": 0,
+            "safe_limit": 0,
+            "fixed_parameter_count": 0,
+            "fallback_reason": "price_mode_not_last",
+        }
+        params["_product_inventory_last_cost_scope"] = scope_meta
+        query_perf["last_cost"] = {
+            "rows": 0,
+            "sql_fetch_ms": 0.0,
+            "predicate_mode": predicate_mode,
+            "skipped": True,
+            "skip_reason": "price_mode_not_last",
+        }
+        log.info(
+            "[product_inventory.perf] stage=last_cost skipped=True reason=price_mode_not_last price_mode=%s",
+            cfg.get("price_mode"),
+        )
+        return all_df, pd.DataFrame()
+
     base_last_sql, _ = _build_last_cost_sql(sql_params, cfg)
     product_scope, scope_meta = _last_cost_product_scope_plan(
         sql_params,
@@ -1921,6 +2111,8 @@ def _final_display_df(
     grp: pd.DataFrame,
     cfg: Dict[str, Any],
     perf: Optional[Dict[str, Any]] = None,
+    frequency_params: Optional[Dict[str, Any]] = None,
+    frequency_date_to: str = "",
 ) -> tuple[pd.DataFrame, Dict[str, Any]]:
     if bool(cfg.get("current_stock_query")):
         return _final_current_stock_display_df(grp, cfg)
@@ -2048,7 +2240,39 @@ def _final_display_df(
 
     ]
     out = work[cols].copy()
+    frequency_meta: Dict[str, Any] = {}
+    if frequency_params is not None:
+        frequency_attach_started = time.perf_counter()
+        out, frequency_meta = attach_dashboard_frequency_snapshot(
+            out,
+            params=frequency_params,
+            date_to=frequency_date_to,
+        )
+        perf["frequency_attach_ms"] = round((time.perf_counter() - frequency_attach_started) * 1000, 1)
+        perf["frequency_rows_before_filter"] = int(len(out))
+        frequency_filter_started = time.perf_counter()
+        out = filter_product_inventory_frequency_rows(
+            out,
+            frequency_params.get("frequency_grade"),
+        )
+        perf["frequency_filter_ms"] = round((time.perf_counter() - frequency_filter_started) * 1000, 1)
+        perf["frequency_rows_after_filter"] = int(len(out))
     perf["final_display_frame_ms"] = round((time.perf_counter() - display_started) * 1000, 1)
+
+    if out.empty:
+        return out, {
+            "row_count": 0,
+            "detail_count": 0,
+            "sum_carry_qty": 0.0,
+            "sum_in_qty": 0.0,
+            "sum_out_qty": 0.0,
+            "sum_stock_qty": 0.0,
+            "sum_stock_amt": 0.0,
+            "sum_insu_amt": 0.0,
+            "group_label": group_label,
+            "product_info": {},
+            **frequency_meta,
+        }
 
     # 합계는 상세행 기준으로 먼저 계산
     total_started = time.perf_counter()
@@ -2083,6 +2307,10 @@ def _final_display_df(
     total_frame.index = [0]
     for column, value in total_row.items():
         total_frame.at[0, column] = float("nan") if value is None else value
+    if _FREQUENCY_GRADE_COLUMN in total_frame.columns:
+        total_frame.at[0, _FREQUENCY_GRADE_COLUMN] = ""
+    if _FREQUENCY_COUNT_COLUMN in total_frame.columns:
+        total_frame.at[0, _FREQUENCY_COUNT_COLUMN] = pd.NA
     out = pd.concat([out, total_frame], ignore_index=True)
     out = _finalize_display_df_260(out)
     perf["final_total_ms"] = round((time.perf_counter() - total_started) * 1000, 1)
@@ -2099,6 +2327,7 @@ def _final_display_df(
         "sum_insu_amt": sum_insu_amt,
         "group_label": group_label,
         "product_info": product_info,        
+        **frequency_meta,
     }
     return out, meta
 
@@ -2432,7 +2661,13 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             )
         else:
             display_perf: Dict[str, Any] = {}
-            df_display, meta = _final_display_df(grp, cfg, perf=display_perf)
+            df_display, meta = _final_display_df(
+                grp,
+                cfg,
+                perf=display_perf,
+                frequency_params=params,
+                frequency_date_to=date_to,
+            )
             df_full = df_display
             service_total_ms = round((time.perf_counter() - request_started) * 1000, 1)
             query_perf = dict(work_params.get("_product_inventory_query_perf") or {})
@@ -2453,7 +2688,8 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 "filter_prepare_ms=%s source_elapsed_ms=%s normalize_ms=%s "
                 "group_aggregate_ms=%s master_merge_ms=%s last_cost_merge_ms=%s "
                 "unit_calc_ms=%s amount_calc_ms=%s dc_calc_ms=%s group_finalize_ms=%s "
-                "final_display_frame_ms=%s subtotal_ms=%s subtotal_rows=%s final_total_ms=%s "
+                "frequency_attach_ms=%s frequency_filter_ms=%s frequency_rows_before_filter=%s "
+                "frequency_rows_after_filter=%s final_display_frame_ms=%s subtotal_ms=%s subtotal_rows=%s final_total_ms=%s "
                 "service_total_ms=%s source_rows=%s result_rows=%s",
                 perf_meta["predicate_mode"],
                 filter_prepare_ms,
@@ -2466,6 +2702,10 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 group_perf.get("amount_calc_ms", 0),
                 group_perf.get("dc_calc_ms", 0),
                 group_perf.get("group_finalize_ms", 0),
+                display_perf.get("frequency_attach_ms", 0),
+                display_perf.get("frequency_filter_ms", 0),
+                display_perf.get("frequency_rows_before_filter", 0),
+                display_perf.get("frequency_rows_after_filter", 0),
                 display_perf.get("final_display_frame_ms", 0),
                 display_perf.get("subtotal_ms", 0),
                 display_perf.get("subtotal_rows", 0),

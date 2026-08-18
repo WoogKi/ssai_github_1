@@ -80,33 +80,6 @@ def _ensure_select_value(key: str, options: list[str], default: str = "") -> Non
     if current not in options:
         st.session_state[key] = default if default in options else (options[0] if options else "")
 
-def _show_text_payload(payload: Dict[str, Any]) -> None:
-    if not isinstance(payload, dict):
-        return
-
-    msg = str(payload.get("message") or payload.get("data") or "").strip()
-    if not msg:
-        return
-
-    df_display = payload.get("df_display")
-    if isinstance(df_display, pd.DataFrame) and not df_display.empty:
-        return
-
-    df = payload.get("df")
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        return
-
-    records = payload.get("records")
-    if isinstance(records, list) and len(records) > 0:
-        return
-
-    if "후보를 목록에서 선택" in msg:
-        st.warning(msg)
-    elif "없습니다" in msg or "없읍니다" in msg or "0건" in msg:
-        st.info(msg)
-    else:
-        st.info(msg)
-
 # 재고 위치 옵션 로드
 # C01의 list_by_group이 있으면 그걸 쓰고, 없으면 search_rows로 대체. 실패하면 전체 하나만.
 def _load_stock_options() -> list[tuple[str, str]]:
@@ -317,7 +290,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         st.caption("조회조건 · 제품재고현황")
 
         # 1라인
-        c1, c2, c3, c4, c5, c6, c7 = st.columns([0.9, 1.0, 1.0, 1.15, 1.15, 2.2, 0.8])
+        c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([0.9, 1.0, 1.0, 1.15, 1.15, 2.0, 1.25, 0.7])
 
         with c1:
             stock_mode = st.selectbox(
@@ -367,6 +340,17 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
             )
 
         with c7:
+            frequency_grade = st.selectbox(
+                "출고빈도 구분",
+                options=["전체", "A", "B", "C", "D", "E", "X", "빈도자료 부족"],
+                index=_pick_index(
+                    ["전체", "A", "B", "C", "D", "E", "X", "빈도자료 부족"],
+                    st.session_state.get(f"{prefix}_frequency_grade", defaults.get("frequency_grade", "전체")),
+                ),
+                key=f"{prefix}_frequency_grade",
+            )
+
+        with c8:
             top = _top_value(f"{prefix}_top", int(defaults.get("top", 1000)))
 
         # 2라인
@@ -553,6 +537,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
             "product_class_nm": "" if _clean_text(product_class_nm) == "전체" else _clean_text(product_class_nm),
             "stock_cds": stock_cds,
             "stock_names": [] if picked_all else selected_stock_labels,
+            "frequency_grade": "" if _clean_text(frequency_grade) == "전체" else _clean_text(frequency_grade),
             "top": int(top),
         }
 
@@ -660,10 +645,6 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         payload = get_product_inventory_result(final_params)
         st.session_state[payload_key] = payload
 
-        msg = str(payload.get("message") or payload.get("data") or "").strip()
-        if msg and ("없습니다" in msg or "없읍니다" in msg or "0건" in msg):
-            _show_text_payload(payload)
-
         if final_physic_cd != raw_physic_cd or final_physic_nm != raw_physic_nm:
             _queue_product_input_sync(prefix, final_physic_cd, final_physic_nm)
 
@@ -700,9 +681,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
             "final": False,
         }
 
-    payload = st.session_state[payload_key]
-    _show_text_payload(payload)
-    return payload
+    return st.session_state[payload_key]
 
 
 view_rddbc260 = view_product_inventory

@@ -12887,7 +12887,7 @@ def run_basic_checks() -> list[CheckResult]:
                         },
                         "chart_rows": [{"period": "2026-01", "value": 1}],
                     },
-                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "visual_phase2_summary": {"inventory_count": 1, "cover_partition_valid": True, "briefing_lines": ["브리핑 1", "브리핑 2", "브리핑 3"], "additional_source_call_count": 0}, "purchase_trend_rows": [{"month": "202601", "amount": 10}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
+                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "inventory_status_summary": {"total_product_count": 10, "expected_demand_product_count": 8, "status_counts": {"긴급 부족": 2, "재고 경고": 1, "적정 재고": 4, "과다 재고": 1, "예상수요 없음": 2, "자료 부족": 0}, "frequency_counts": {"A": 1, "B": 1, "C": 1, "D": 1, "E": 1, "X": 5, "빈도자료 부족": 0}, "snapshot_status": "ready", "snapshot_generation_no": 2, "snapshot_checksum": "fixture"}, "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "visual_phase2_summary": {"inventory_count": 1, "cover_partition_valid": True, "briefing_lines": ["브리핑 1", "브리핑 2", "브리핑 3"], "additional_source_call_count": 0}, "purchase_trend_rows": [{"month": "202601", "amount": 10}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
                     "today_actions": [{"priority": 1}],
                     "transaction_cycle": {
                         "period_days": 90,
@@ -12970,6 +12970,25 @@ def run_basic_checks() -> list[CheckResult]:
                 dashboard_roundtrip_errors.append(f"dashboard_snapshot_visualization_lost={compact_visualization!r}")
             if "stock_risk_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
                 dashboard_roundtrip_errors.append("dashboard_stock_risk_summary_missing")
+            compact_inventory_status = compact_cache.get("facts", {}).get("inventory", {}).get("inventory_status_summary") or {}
+            if (
+                compact_inventory_status.get("total_product_count") != 10
+                or compact_inventory_status.get("status_counts", {}).get("적정 재고") != 4
+                or compact_inventory_status.get("snapshot_status") != "ready"
+            ):
+                dashboard_roundtrip_errors.append(f"dashboard_inventory_status_summary_missing={compact_inventory_status!r}")
+            compact_status_chart = view_mod._build_inventory_status_summary_chart(
+                {"inventory": compact_cache.get("facts", {}).get("inventory", {})}
+            )
+            if compact_status_chart is None:
+                dashboard_roundtrip_errors.append("dashboard_compact_inventory_status_chart_missing")
+            else:
+                try:
+                    compact_status_chart.to_dict(validate=True)
+                except Exception as exc:
+                    dashboard_roundtrip_errors.append(
+                        f"dashboard_compact_inventory_status_chart_schema={type(exc).__name__}"
+                    )
             if "stock_overstock_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
                 dashboard_roundtrip_errors.append("dashboard_stock_overstock_summary_missing")
             if "stock_demand_surge_summary" not in compact_cache.get("facts", {}).get("inventory", {}):
@@ -17544,6 +17563,14 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
             ],
         }
         demand_donut = view_mod._build_demand_surge_summary_donut(surge_state)
+        demand_single_donut = view_mod._build_demand_surge_summary_donut({
+            "total": 42,
+            "top_partition_valid": True,
+            "top_rows": [
+                {"label": "기존 예상 초과", "count": 42},
+                {"label": "예상외 출고 발생", "count": 0},
+            ],
+        })
         demand_type_chart = view_mod._build_demand_surge_summary_type_chart([
             {"label": "신규 출고 후보", "count": 34},
             {"label": "계절성 재발생 후보", "count": 20},
@@ -17560,6 +17587,7 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
             "status": status_chart,
             "frequency": frequency_chart,
             "demand_donut": demand_donut,
+            "demand_single_donut": demand_single_donut,
             "demand_type": demand_type_chart,
             "vendor": vendor_chart,
         }
@@ -17637,13 +17665,16 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
         status_spec = json.dumps(status_chart.to_dict(), ensure_ascii=False) if status_chart is not None else ""
         demand_donut_spec = json.dumps(demand_donut.to_dict(), ensure_ascii=False) if demand_donut is not None else ""
         demand_type_spec = json.dumps(demand_type_chart.to_dict(), ensure_ascii=False) if demand_type_chart is not None else ""
-        if not all(token in status_spec for token in ('"height": 270', '"innerRadius": 76', '"outerRadius": 116', '"background": "transparent"')):
+        if not all(token in status_spec for token in ('"height": 270', '"padding": {"top": 12, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 76', '"outerRadius": 116', '"background": "transparent"')):
             errors.append("status_donut_density_contract_missing")
-        if not all(token in demand_donut_spec for token in ('"height": 226', '"innerRadius": 64', '"outerRadius": 103', '"background": "transparent"')):
+        if not all(token in demand_donut_spec for token in ('"height": 226', '"padding": {"top": 18, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 55', '"outerRadius": 94', '"background": "transparent"')):
             errors.append("demand_donut_density_contract_missing")
+        demand_single_spec = json.dumps(demand_single_donut.to_dict(), ensure_ascii=False) if demand_single_donut is not None else ""
+        if not all(token in demand_single_spec for token in ('"height": 226', '"padding": {"top": 18, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 55', '"outerRadius": 94')):
+            errors.append("demand_single_donut_headroom_contract_missing")
         if not all(token in demand_type_spec for token in ('"height": 164', '"size": 18', '"background": "transparent"')):
             errors.append("demand_type_density_contract_missing")
-        if not all(token in vendor_spec for token in ('"size": 19', '"track": 102.0', '"domain": [0, 116]', '"background": "transparent"')):
+        if not all(token in vendor_spec for token in ('"size": 19', '"track": 104.0', '"label_position": 118.0', '"domain": [0, 122]', '"background": "transparent"')):
             errors.append("vendor_density_contract_missing")
         if (
             "height: 100%;" not in view_source

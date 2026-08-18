@@ -1718,6 +1718,7 @@ def _build_labeled_summary_donut(
     height: int = 212,
     inner_radius: int = 58,
     outer_radius: int = 92,
+    top_padding: int = 12,
 ) -> alt.Chart | None:
     """Render persisted counts with labels tied to the original pie geometry."""
     frame = pd.DataFrame([dict(row) for row in rows if int(row.get("count") or 0) > 0])
@@ -1789,7 +1790,13 @@ def _build_labeled_summary_donut(
         alt.Chart(center).mark_text(fontSize=23 if outer_radius >= 100 else 21, fontWeight=700, dy=-8, color="#1f2937").encode(text="total:N"),
         alt.Chart(center).mark_text(fontSize=12 if outer_radius >= 100 else 11, dy=15, color="#64748b").encode(text="label:N"),
     ])
-    return alt.layer(*layers).properties(height=height).configure(background="transparent").configure_view(stroke=None)
+    # Keep the ring geometry unchanged while reserving a small top inset for
+    # outer percentage labels. Both inventory-status and demand-surge donuts
+    # use this component, so their visual center stays aligned.
+    return alt.layer(*layers).properties(
+        height=height,
+        padding={"top": max(0, int(top_padding)), "bottom": 0, "left": 0, "right": 0},
+    ).configure(background="transparent").configure_view(stroke=None)
 
 
 def _render_summary_card_heading(icon: str, semantic: str, title: str, subtitle: str) -> None:
@@ -2361,8 +2368,12 @@ def _build_demand_surge_summary_donut(state: Mapping[str, Any]) -> alt.Chart | N
         total_label="수요급증 품목",
         total=total,
         height=226,
-        inner_radius=64,
-        outer_radius=103,
+        # This card has its legend below the chart. Keep the status donut's
+        # larger shared geometry intact, but reserve vertical label headroom
+        # here for both a 100% arc and a small top slice.
+        inner_radius=55,
+        outer_radius=94,
+        top_padding=18,
     )
 
 
@@ -2691,18 +2702,18 @@ def _build_vendor_stock_risk_summary_chart(frame: pd.DataFrame, *, unit_label: s
     max_amount = float(chart_frame["표시금액"].max() or 0.0)
     # Use the same visual headroom contract as the frequency chart.  Amounts
     # and rank remain untouched; only the drawing scale reserves the tail.
-    chart_frame["track"] = 102.0
+    chart_frame["track"] = 104.0
     chart_frame["relative_top_pct"] = chart_frame["표시금액"].map(
         lambda value: (float(value) / max_amount * 100.0) if max_amount else 0.0
     )
-    chart_frame["label_position"] = 113.0
+    chart_frame["label_position"] = 118.0
     order = chart_frame["표시매입처"].tolist()
     y = alt.Y("표시매입처:N", sort=order, title=None, axis=alt.Axis(labelLimit=145, labelColor="#475569"))
     background = alt.Chart(chart_frame).mark_bar(cornerRadiusEnd=5, color="#e8edf4", size=19).encode(
-        x=alt.X("track:Q", scale=alt.Scale(domain=[0, 116]), axis=None), y=y
+        x=alt.X("track:Q", scale=alt.Scale(domain=[0, 122]), axis=None), y=y
     )
     bars = alt.Chart(chart_frame).mark_bar(cornerRadiusEnd=5, color="#dc2626", size=19).encode(
-        x=alt.X("relative_top_pct:Q", scale=alt.Scale(domain=[0, 116]), axis=None),
+        x=alt.X("relative_top_pct:Q", scale=alt.Scale(domain=[0, 122]), axis=None),
         y=y,
         tooltip=[
             alt.Tooltip("표시매입처:N", title="주요 매입처"),
@@ -2714,7 +2725,7 @@ def _build_vendor_stock_risk_summary_chart(frame: pd.DataFrame, *, unit_label: s
         ],
     )
     labels = alt.Chart(chart_frame).mark_text(align="right", color="#334155", fontSize=10, fontWeight=600).encode(
-        x=alt.X("label_position:Q", scale=alt.Scale(domain=[0, 116]), axis=None), y=y, text="금액비율:N"
+        x=alt.X("label_position:Q", scale=alt.Scale(domain=[0, 122]), axis=None), y=y, text="금액비율:N"
     )
     return (background + bars + labels).properties(height=max(236, min(266, len(order) * 25))).configure(background="transparent").configure_view(stroke=None)
 
@@ -4505,6 +4516,14 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
                 limit=row_limit,
             ),
             "stock_risk_summary": list(inventory.get("stock_risk_summary") or []),
+            "inventory_status_summary": {
+                key: (inventory.get("inventory_status_summary") or {}).get(key)
+                for key in (
+                    "total_product_count", "expected_demand_product_count", "status_counts",
+                    "frequency_counts", "snapshot_status", "snapshot_generation_no",
+                    "snapshot_checksum", "snapshot_reason", "missing_frequency_product_count",
+                )
+            },
             "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
             "stock_demand_surge_summary": dict(inventory.get("stock_demand_surge_summary") or {}),
             "vendor_stock_risk_summary": dict(inventory.get("vendor_stock_risk_summary") or {}),

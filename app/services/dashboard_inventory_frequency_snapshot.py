@@ -712,3 +712,43 @@ def frequency_rows_for_universe(
         }
         for code in universe
     ]
+
+
+def frequency_rows_for_product_subset(
+    result: SnapshotReadResult,
+    product_codes: Sequence[Any],
+) -> list[dict[str, Any]]:
+    """Return approved snapshot frequencies for a displayed product subset.
+
+    The repository has already validated the immutable full-universe payload.
+    Consumers that merely filter that universe must not re-grade their subset.
+    """
+    requested = tuple(sorted({_normalize_code(code, field="product_code") for code in product_codes}))
+    if result.usable:
+        payload_rows = result.payload.get("product_frequency", []) if result.payload else []
+        by_product = {
+            str(row.get("product_code")): dict(row)
+            for row in payload_rows
+            if isinstance(row, Mapping) and row.get("product_code")
+        }
+        return [
+            by_product.get(
+                code,
+                {
+                    "product_code": code,
+                    "occurrence_count_3m": None,
+                    "frequency_grade": FREQUENCY_INSUFFICIENT_GRADE,
+                    "data_status": SNAPSHOT_STATUS_STALE,
+                },
+            )
+            for code in requested
+        ]
+    return [
+        {
+            "product_code": code,
+            "occurrence_count_3m": None,
+            "frequency_grade": FREQUENCY_INSUFFICIENT_GRADE,
+            "data_status": result.status,
+        }
+        for code in requested
+    ]

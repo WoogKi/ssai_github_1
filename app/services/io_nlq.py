@@ -501,6 +501,7 @@ _NLQ_EXPLICIT_CONDITION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "order_cd", "order_nm", "real_ven_cd", "real_ven_nm",
     )),
     ("stock", ("stock_cd", "stock_cds", "stock_cd_list", "stock_nm")),
+    ("outbound_frequency", ("frequency_grade",)),
     ("salesperson", ("sales_man", "sales_man_nm", "salesperson_cd", "salesperson_nm")),
     ("region", ("region_cd", "region_nm")),
     ("io_type", ("io_gu", "io_gu_list", "io_gu_prefix")),
@@ -961,6 +962,33 @@ def _extract_code_flex(text: str, label: str, min_digits: int = 1, max_digits: i
     return None
 
 
+def _extract_product_inventory_frequency_grade(text: str) -> str:
+    """Extract only an explicitly labelled product-inventory frequency filter."""
+    compact = re.sub(r"\s+", "", _norm(text))
+    if not compact:
+        return ""
+    match = re.search(
+        r"출고빈도(?:등급|구분)?(?:[:=])?(전체|[A-EX]|빈도자료부족|자료부족)",
+        compact,
+    )
+    if not match:
+        return ""
+    value = match.group(1)
+    return "빈도자료 부족" if value in {"빈도자료부족", "자료부족"} else value
+
+
+def _remove_product_inventory_frequency_phrase(params: Dict[str, Any], frequency_grade: str) -> Dict[str, Any]:
+    """Keep an explicit frequency phrase from becoming a product-name condition."""
+    if not frequency_grade:
+        return params
+    out = dict(params or {})
+    product_name = clean_text(out.get("physic_nm"))
+    compact = re.sub(r"\s+", "", product_name)
+    if re.fullmatch(r"출고빈도(?:등급|구분)?(?:[:=])?(전체|[A-EX]|빈도자료부족|자료부족)(?:조회)?", compact):
+        out.pop("physic_nm", None)
+    return out
+
+
 def _normalize_stock_code_token(value: str) -> str:
     digits = re.sub(r"[^0-9]", "", str(value or ""))
     if not digits:
@@ -1343,7 +1371,7 @@ def _trim_io_named_value_at_next_label(value: Optional[str]) -> str:
         return ""
     next_label = re.compile(
         r"\s+(?=(?:제품명|제품코드|제품|제조사명|제조사|제약사명|제약사|발주처명|발주처|"
-        r"매입처명|매입처|재고위치명|재고위치)\s*(?:[:=]|\s))"
+        r"매입처명|매입처|재고위치명|재고위치|출고빈도등급|출고빈도구분|출고빈도)\s*(?:[:=]|\s))"
     )
     return clean_text(next_label.split(raw, maxsplit=1)[0])
 
@@ -1369,7 +1397,9 @@ def _extract_io_compound_named_values(text: str) -> dict[str, str]:
             return r"제품(?!그룹명|그룹|구분명|구분|분류명|분류|코드|명)"
         return re.escape(label)
 
-    all_labels = tuple(label for _, labels in label_specs for label in labels)
+    all_labels = tuple(label for _, labels in label_specs for label in labels) + (
+        "출고빈도등급", "출고빈도구분", "출고빈도",
+    )
     all_labels_pat = "|".join(label_pattern(label) for label in sorted(all_labels, key=len, reverse=True))
     values: dict[str, str] = {}
     for key, labels in label_specs:
@@ -2624,6 +2654,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
         return None
 
     params = extract_params(raw, today=today)
+    frequency_grade = _extract_product_inventory_frequency_grade(raw)
 
     def _result(action: str, params_in: Dict[str, Any]) -> Dict[str, Any]:
         fixed_params = _normalize_io_detail_vendor_params(
@@ -2732,6 +2763,9 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
 
     if _has_any(raw, _PRODUCT_INVENTORY_WORDS):
         params = _apply_date_params_for_product_inventory(params, raw)
+        if frequency_grade:
+            params["frequency_grade"] = frequency_grade
+            params = _remove_product_inventory_frequency_phrase(params, frequency_grade)
         return _result("제품재고현황 조회", params)
 
     # 명시적으로 입고명세 / 출고명세를 말한 경우에는

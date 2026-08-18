@@ -5753,6 +5753,8 @@ def _try_handle_io_nlq(
         key in params for key in ("stock_cd", "stock_cds", "stock_cd_list")
     ):
         condition_sources.setdefault("stock_codes", "explicit")
+    if action == "제품재고현황 조회" and params.get("frequency_grade") not in (None, ""):
+        condition_sources.setdefault("frequency_grade", "explicit")
     if resolved_kind == "unlabeled_like" and str(params.get("nlq_unlabeled_name") or "").strip():
         condition_sources.setdefault("unlabeled_name", "explicit")
 
