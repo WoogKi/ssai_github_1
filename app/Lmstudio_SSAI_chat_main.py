@@ -265,6 +265,11 @@ from app.services.ssai_permission_policy import (
     describe_permission,
     get_required_permission,
 )
+from app.services.chat_company_scope_policy import (
+    normalize_company_id as _normalize_chat_company_id,
+    room_matches_company as _room_matches_company,
+    rooms_for_company as _rooms_for_company,
+)
 
 from app.ui.ssai_login import (
     require_login,
@@ -483,7 +488,10 @@ def _sig_of_uploads(files):
 
 def _get_room_by_id(rid: str):
     for r in st.session_state.get("chat_rooms", []):
-        if r.get("id") == rid:
+        if r.get("id") == rid and _room_matches_company(
+            r,
+            _normalize_chat_company_id((get_selected_company() or {}).get("company_id")),
+        ):
             return r
     return None
 
@@ -1298,6 +1306,9 @@ def _restore_current_table_source_for_room(room_id: str) -> None:
             (r for r in ss.get("chat_rooms", []) if str(r.get("id") or "") == str(room_id or "")),
             None,
         )
+        if not _room_matches_company(room, _selected_chat_company_id()):
+            reason = "cross_company_or_unscoped"
+            room = None
         table_key, action = _find_latest_source_table_in_room(room or {})
         if table_key:
             has_payload = False
@@ -2212,6 +2223,13 @@ def _render_login_greeting_banner() -> None:
         ]
     )
 
+    # 회사 전환 안내는 이미 deterministic하게 제공된다. 이 rerun에서 회사별
+    # greeting을 다시 LLM으로 만들면 전환 자체가 LM Studio timeout에 묶인다.
+    if isinstance(st.session_state.get("__ssai_company_change_notice"), dict):
+        st.session_state["__ssai_login_greeting"] = _fallback_login_greeting(profile)
+        st.session_state["__ssai_login_greeting_sig"] = sig
+        log.info("[company.greeting] mode=deterministic reason=company_change llm_call_count=0")
+
     if st.session_state.get("__ssai_login_greeting_sig") != sig:
         st.session_state["__ssai_login_greeting"] = _generate_login_greeting(profile)
         st.session_state["__ssai_login_greeting_sig"] = sig
@@ -2639,7 +2657,11 @@ def _build_current_room_compact_context(limit_chars: int = 5000) -> str:
         rid = str(st.session_state.get("current_room") or "")
         rooms = st.session_state.get("chat_rooms") or []
         room = next((r for r in rooms if isinstance(r, dict) and str(r.get("id") or "") == rid), None)
-        if not isinstance(room, dict):
+        if not _room_matches_company(
+            room,
+            _normalize_chat_company_id((get_selected_company() or {}).get("company_id")),
+        ):
+            log.warning("[chat.room.compact_context] blocked reason=cross_company_or_unscoped room_id=%s", rid)
             return ""
         lines: list[str] = []
         for msg in _build_room_render_messages(room)[-18:]:
@@ -6395,6 +6417,78 @@ def _current_chat_meta() -> dict[str, Any]:
     return meta
 
 
+def _selected_chat_company_id() -> str:
+    return _normalize_chat_company_id((get_selected_company() or {}).get("company_id"))
+
+
+def _current_company_chat_rooms(rooms: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    return _rooms_for_company(
+        rooms if rooms is not None else st.session_state.get("chat_rooms") or [],
+        _selected_chat_company_id(),
+    )
+
+
+def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_company_id: str) -> None:
+    """Clear volatile chat state while retaining persisted user/company rooms."""
+    ss = st.session_state
+    for key in (
+        "current_room",
+        "__queue_ai",
+        "__an_busy",
+        "__an_job",
+        "__an_cancel",
+        "__deferred_current_table_followup",
+        "__sims_auto_user_input",
+        "__chat_room_nav_request",
+        "__chat_room_pending_to_persisted_room_id",
+        "__chat_room_select_render_ready",
+        "__room_delete_ask",
+        "__room_prev_selected",
+        "__room_prev_name",
+        "__room_rename_buf",
+        "__room_page_initialized",
+    ):
+        ss.pop(key, None)
+    ss["__room_filter"] = ""
+    ss["__room_filter_prev"] = ""
+    ss["__room_page"] = 0
+    _clear_chat_room_selector_request_state(ss)
+    log.info(
+        "[company.chat_scope] action=clear previous_company_id=%s selected_company_id=%s rooms_retained=%s",
+        previous_company_id,
+        selected_company_id,
+        len(ss.get("chat_rooms") or []),
+    )
+
+
+def _ensure_current_company_chat_scope() -> bool:
+    """Make the active chat room/context follow the selected company exactly."""
+    selected_company_id = _selected_chat_company_id()
+    previous_company_id = str(st.session_state.get("__chat_selected_company_id") or "")
+    if not selected_company_id:
+        st.session_state.pop("current_room", None)
+        return False
+    if previous_company_id == selected_company_id:
+        return False
+
+    started = time.perf_counter()
+    _clear_company_scoped_chat_runtime(
+        previous_company_id=previous_company_id,
+        selected_company_id=selected_company_id,
+    )
+    st.session_state["__chat_selected_company_id"] = selected_company_id
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    st.session_state["__company_chat_scope_switch_ms"] = elapsed_ms
+    log.info(
+        "[company.chat_scope] action=switch previous_company_id=%s selected_company_id=%s scoped_rooms=%s elapsed_ms=%s",
+        previous_company_id,
+        selected_company_id,
+        len(_current_company_chat_rooms()),
+        elapsed_ms,
+    )
+    return True
+
+
 def _default_room_name() -> str:
     now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -6598,7 +6692,7 @@ def _select_pending_new_room(*, close_sims_state: bool = False) -> dict[str, Any
     ss.setdefault("chat_rooms", [])
 
     # 이미 만들어 둔 빈 임시방이 있으면 재사용한다.
-    for room in ss.chat_rooms:
+    for room in _current_company_chat_rooms(ss.chat_rooms):
         if _is_empty_auto_room(room):
             ss.current_room = room.get("id")
             if close_sims_state:
@@ -6627,10 +6721,16 @@ def _get_current_room_or_pending() -> dict[str, Any]:
     current_id = str(ss.get("current_room") or "").strip()
     if current_id:
         for room in ss.chat_rooms:
-            if str(room.get("id") or "") == current_id:
+            if (
+                str(room.get("id") or "") == current_id
+                and _room_matches_company(room, _selected_chat_company_id())
+            ):
                 if room.get("__messages_loaded") is False:
                     _ensure_partitioned_room_loaded(current_id)
                 return room
+
+        ss.pop("current_room", None)
+        log.warning("[chat.room] blocked reason=cross_company_or_unscoped current_room_id=%s", current_id)
 
     return _select_pending_new_room()
 
@@ -6691,7 +6791,7 @@ def _compute_room_sidebar_state(
 ) -> dict[str, Any]:
     """Return the persisted sidebar room slice without mutating room data."""
 
-    room_list = [room for room in rooms or [] if isinstance(room, dict)]
+    room_list = _current_company_chat_rooms(rooms)
     pending_rooms = [room for room in room_list if _is_empty_auto_room(room)]
     persisted_rooms = [room for room in room_list if not _is_empty_auto_room(room)]
     persisted_ids = {str(room.get("id") or "") for room in persisted_rooms if str(room.get("id") or "")}
@@ -7236,6 +7336,7 @@ def _consume_company_change_notice(room: dict[str, Any]) -> None:
     """
     ssai_login.py에서 큐잉한 회사 변경 안내를 현재 채팅방에 표시/저장한다.
     """
+    started = time.perf_counter()
     notice = st.session_state.pop("__ssai_company_change_notice", None)
 
     if not isinstance(notice, dict):
@@ -7289,9 +7390,19 @@ def _consume_company_change_notice(room: dict[str, Any]) -> None:
     save_chat_rooms()
 
     log.info(
-        "[company.change.notice] saved %s company_changed=%s",
+        "[company.change.notice] saved %s company_changed=%s company_notice_ms=%s llm_call_count=0",
         _chat_log_kv(room),
         bool(old_name != new_name),
+        int((time.perf_counter() - started) * 1000),
+    )
+    log.info(
+        "[company.switch.perf] company_permission_refresh_ms=%s company_chat_scope_switch_ms=%s company_notice_ms=%s company_switch_total_ms=%s llm_call_count=0",
+        int(st.session_state.get("__company_permission_refresh_ms") or 0),
+        int(st.session_state.get("__company_chat_scope_switch_ms") or 0),
+        int((time.perf_counter() - started) * 1000),
+        int(st.session_state.get("__company_permission_refresh_ms") or 0)
+        + int(st.session_state.get("__company_chat_scope_switch_ms") or 0)
+        + int((time.perf_counter() - started) * 1000),
     )
 
 
@@ -7303,6 +7414,11 @@ def migrate_rooms(data: Union[dict, list, None]) -> List[Dict[str, Any]]:
         return []
 
     current_meta = _current_chat_meta()
+    user_meta = {
+        key: value
+        for key, value in current_meta.items()
+        if key not in {"company_id", "company_name", "db_name"}
+    }
 
     def _normalize_room(room: dict, fallback_id: str | None = None, fallback_name: str | None = None) -> dict:
         rid = room.get("id") or fallback_id or str(uuid.uuid4())
@@ -7323,8 +7439,9 @@ def migrate_rooms(data: Union[dict, list, None]) -> List[Dict[str, Any]]:
         else:
             out["sims_messages"] = []
 
-        # user_id 기준 파일로 분리되므로, 없는 메타는 현재 로그인 사용자 기준으로 보강
-        for k, v in current_meta.items():
+        # 사용자별 파일이므로 사용자 메타만 보강한다. 회사 ownership이 없는
+        # legacy 방을 현재 선택 회사로 귀속시키면 cross-company 노출이 생긴다.
+        for k, v in user_meta.items():
             out.setdefault(k, v)
 
         out.setdefault("created_at", room.get("created_at") or make_ts())
@@ -8101,6 +8218,12 @@ def _ensure_partitioned_room_loaded(room_id: str) -> None:
     rooms = st.session_state.get("chat_rooms") or []
     for room in rooms:
         if isinstance(room, dict) and str(room.get("id") or "") == str(room_id or ""):
+            if not _room_matches_company(room, _selected_chat_company_id()):
+                log.warning(
+                    "[chat.storage.room_load] blocked reason=cross_company_or_unscoped room_id=%s",
+                    str(room_id or ""),
+                )
+                return
             if room.get("__messages_loaded") is True:
                 return
             t0 = time.perf_counter()
@@ -8141,7 +8264,11 @@ def _load_partitioned_chat_rooms(chat_file: str) -> list[dict[str, Any]] | None:
 
         rooms: list[dict[str, Any]] = []
         for meta in room_metas:
-            if isinstance(meta, dict) and str(meta.get("id") or "") == selected_room_id:
+            if (
+                isinstance(meta, dict)
+                and str(meta.get("id") or "") == selected_room_id
+                and _room_matches_company(meta, _selected_chat_company_id())
+            ):
                 break
         else:
             selected_room_id = ""
@@ -8305,7 +8432,12 @@ def _try_migrate_legacy_to_partitioned(rooms: list[dict[str, Any]], chat_file: s
 
 def _valid_current_room_id_for_rooms(rooms: list[dict[str, Any]]) -> str:
     current_room_id = str(st.session_state.get("current_room") or "").strip()
-    if current_room_id and any(str((room or {}).get("id") or "") == current_room_id for room in rooms or [] if isinstance(room, dict)):
+    if current_room_id and any(
+        str((room or {}).get("id") or "") == current_room_id
+        and _room_matches_company(room, _selected_chat_company_id())
+        for room in rooms or []
+        if isinstance(room, dict)
+    ):
         return current_room_id
     return ""
 
@@ -9548,7 +9680,7 @@ if "chat_rooms" not in st.session_state:
 
     # ✅ 기존 저장 방 보정
     # - 메시지가 이미 있는 방은 더 이상 임시방이 아니므로 auto_created=False
-    # - 방 최상위 company_id/db_name이 예전 회사로 남아 있으면 마지막 메시지 기준으로 보정
+    # - 방 최상위 회사 metadata는 ownership이므로 마지막 메시지로 덮어쓰지 않는다.
     try:
         touched = False
 
@@ -9565,6 +9697,8 @@ if "chat_rooms" not in st.session_state:
 
                 last_meta = _room_meta_from_last_message(r)
                 for k, v in last_meta.items():
+                    if k in {"company_id", "company_name", "db_name"}:
+                        continue
                     if r.get(k) != v:
                         r[k] = v
                         touched = True
@@ -9576,7 +9710,7 @@ if "chat_rooms" not in st.session_state:
 
         if touched:
             save_chat_rooms()
-            log.info("[chat.migrate] materialized rooms and synced room meta from last message %s", _chat_log_kv())
+            log.info("[chat.migrate] materialized rooms and synced non-ownership meta from last message %s", _chat_log_kv())
 
     except Exception:
         log.exception("[chat.migrate] failed to materialize room meta")
@@ -9620,6 +9754,7 @@ if "chat_rooms" not in st.session_state:
 # 로그인 직후 기본 입력 대상은 기존 방이 아니라 "새 대화 대기방"이다.
 # 기존 방은 목록에만 표시하고, 사용자가 직접 선택해야 해당 방에 이어 쓴다.
 st.session_state.setdefault("chat_rooms", [])
+_ensure_current_company_chat_scope()
 if "current_room" not in st.session_state or not st.session_state.current_room:
     _select_pending_new_room()
 
@@ -9852,7 +9987,8 @@ with st.sidebar:
     # 첫 채팅 / SIMS 결과 / 회사 변경 안내가 들어갈 때 save_chat_rooms()로 실제 저장된다.
     ss.setdefault("chat_rooms", [])
 
-    existing_room_ids = {str((room or {}).get("id") or "") for room in ss.chat_rooms if isinstance(room, dict)}
+    scoped_rooms = _current_company_chat_rooms(ss.chat_rooms)
+    existing_room_ids = {str((room or {}).get("id") or "") for room in scoped_rooms}
     stale_current_room_id = ""
     if ss.get("current_room") and str(ss.get("current_room") or "") not in existing_room_ids:
         stale_current_room_id = str(ss.get("current_room") or "")
@@ -9957,7 +10093,7 @@ with st.sidebar:
     # 최조 대화 등록 하기 전
     id_to_name = {}
 
-    for r in ss.chat_rooms:
+    for r in scoped_rooms:
         rid = r.get("id")
         if not rid:
             continue
@@ -9998,7 +10134,7 @@ with st.sidebar:
     ]
     all_room_ids = [
         str(room.get("id") or "")
-        for room in ss.chat_rooms
+        for room in scoped_rooms
         if isinstance(room, dict) and _is_chat_room_id(room.get("id"))
     ]
     ss[_CHAT_ROOM_SELECTOR_VALID_IDS_KEY] = all_room_ids
@@ -10256,7 +10392,7 @@ with st.sidebar:
     def _apply_rename():
         new_name = (ss.__room_rename_buf or "").strip()
         if new_name:
-            for r in ss.chat_rooms:
+            for r in scoped_rooms:
                 if r["id"] == ss.current_room:
                     r["name"] = new_name
                     r["name_auto"] = False
@@ -10341,9 +10477,11 @@ with st.sidebar:
             def _do_delete():
                 target = ss.current_room
                 ss.chat_rooms = [r for r in ss.chat_rooms if r["id"] != target]
-                if not ss.chat_rooms:
-                    ss.chat_rooms.append(_make_chat_room(auto_created=True))                    
-                ss.current_room = ss.chat_rooms[0]["id"]
+                replacement_rooms = _current_company_chat_rooms(ss.chat_rooms)
+                if not replacement_rooms:
+                    replacement_rooms.append(_make_chat_room(auto_created=True))
+                    ss.chat_rooms.extend(replacement_rooms)
+                ss.current_room = replacement_rooms[0]["id"]
                 ss["__room_delete_ask"] = False
                 save_chat_rooms()
 
@@ -10362,7 +10500,7 @@ with st.sidebar:
         buf_zip = io.BytesIO()
         with zipfile.ZipFile(buf_zip, "w", zipfile.ZIP_DEFLATED) as zipf:
             used_entry_names: set[str] = set()
-            for room in ss.chat_rooms:
+            for room in _current_company_chat_rooms(ss.chat_rooms):
                 entry_name = _make_unique_chat_zip_entry_name(room.get("name", ""), used_entry_names)
                 zipf.writestr(entry_name, json.dumps(_json_sanitize(room), ensure_ascii=False, indent=2))
         buf_zip.seek(0)
@@ -10370,7 +10508,11 @@ with st.sidebar:
                         mime="application/zip", width="stretch", key="__dl_all_rooms_zip")
 
         # 현재 JSON
-        cur_room = next((r for r in ss.chat_rooms if r["id"] == ss.current_room), ss.chat_rooms[0])
+        current_scope_rooms = _current_company_chat_rooms(ss.chat_rooms)
+        cur_room = next(
+            (r for r in current_scope_rooms if r["id"] == ss.current_room),
+            current_scope_rooms[0],
+        )
         cur_json = json.dumps(
             _room_persistence_projection(cur_room),
             ensure_ascii=False,

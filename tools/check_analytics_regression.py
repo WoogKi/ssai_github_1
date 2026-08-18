@@ -7202,7 +7202,16 @@ def run_basic_checks() -> list[CheckResult]:
             start = main_src.index("def _compute_room_sidebar_state")
             end = main_src.index("\ndef _ensure_sims_panel_room_title", start)
             sidebar_src = main_src[helper_start:end]
-            ns: dict[str, Any] = {"Any": Any, "Iterable": Iterable}
+            # Pagination is independent from company ownership.  The main
+            # renderer supplies the exact-company subset before this helper
+            # calculates page state.
+            ns: dict[str, Any] = {
+                "Any": Any,
+                "Iterable": Iterable,
+                "_current_company_chat_rooms": lambda rooms: [
+                    room for room in (rooms or []) if isinstance(room, dict)
+                ],
+            }
             exec(sidebar_src, ns)
             compute = ns["_compute_room_sidebar_state"]
             resolve_pick = ns["_resolve_room_pick"]

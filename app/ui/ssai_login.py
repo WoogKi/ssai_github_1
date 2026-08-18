@@ -16,6 +16,8 @@ from app.services.ssai_auth_service import (
     authenticate_ssai_password,
     authenticate_wholesale_sims_password,
     get_active_companies_for_user,
+    get_user_permissions,
+    connect_ssai_db,
     get_sims_user_for_login,
     verify_sims_plain_password,
 )
@@ -434,6 +436,45 @@ def _company_selector_label(company: dict) -> str:
     return middle
 
 
+def _refresh_selected_company_permissions(
+    user: AuthUser | None,
+    company: dict | None,
+) -> bool:
+    """Refresh the single session permission source for the selected company.
+
+    A failed refresh must never retain permissions computed for the previous
+    company.  This applies to every permission consumer, not only RAG.
+    """
+    company_id_text = _company_id_of(company)
+    try:
+        company_id = int(company_id_text)
+    except (TypeError, ValueError):
+        company_id = 0
+    if user is None or company_id <= 0:
+        st.session_state[SESSION_AUTH_PERMISSIONS] = []
+        return False
+
+    try:
+        with connect_ssai_db() as conn:
+            permissions = get_user_permissions(
+                conn,
+                user_id=user.user_id,
+                company_id=company_id,
+            )
+    except Exception as exc:
+        st.session_state[SESSION_AUTH_PERMISSIONS] = []
+        log.warning(
+            "[auth.permission] refresh failed user_id=%s company_id=%s error_type=%s",
+            user.user_id,
+            company_id,
+            type(exc).__name__,
+        )
+        return False
+
+    st.session_state[SESSION_AUTH_PERMISSIONS] = list(permissions or [])
+    return True
+
+
 def _after_company_selected(
     company: dict,
     *,
@@ -449,9 +490,14 @@ def _after_company_selected(
     - 로그인 인사말 재생성 플래그 초기화
     - 수동 회사 변경이면 안내 메시지 큐 등록
     """
+    started = time.perf_counter()
     user = get_current_user()
 
     st.session_state[SESSION_COMPANY] = company
+    permission_started = time.perf_counter()
+    permissions_refreshed = _refresh_selected_company_permissions(user, company)
+    permission_refresh_ms = int((time.perf_counter() - permission_started) * 1000)
+    st.session_state["__company_permission_refresh_ms"] = permission_refresh_ms
 
     if user:
         company_id = company.get("company_id")
@@ -504,10 +550,14 @@ def _after_company_selected(
         }
 
     log.info(
-        "[auth.company] selected %s manual_change=%s previous_company_id=%s",
+        "[auth.company] selected %s manual_change=%s previous_company_id=%s permission_refresh=%s permission_count=%s company_permission_refresh_ms=%s company_switch_total_ms=%s",
         _login_log_kv(user=user, company=company),
         bool(manual_change),
         _company_id_of(previous_company),
+        permissions_refreshed,
+        len(get_current_permissions()),
+        permission_refresh_ms,
+        int((time.perf_counter() - started) * 1000),
     )
 
 def _find_default_company(user: AuthUser, companies: list[dict]) -> dict | None:
