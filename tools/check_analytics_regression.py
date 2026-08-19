@@ -13686,11 +13686,14 @@ def run_basic_checks() -> list[CheckResult]:
                 supplier_scope_errors.append("inbound_order_vendor_alias_correlation")
             view_source = Path(view_mod.__file__).read_text(encoding="utf-8")
             form_start = view_source.index('with st.form("dashboard_lite_scope_form"')
+            scope_form_end = view_source.index("def _dashboard_scope_header")
+            scope_form_source = view_source[form_start:scope_form_end]
             scope_row_start = view_source.index("scope_cols = st.columns([1, 1, 1, 1.1, 2.1, 2.1], gap=\"small\")")
             scope_start = view_source.index('"공급 기준"', scope_row_start)
             if (
                 not (scope_row_start < scope_start < form_start)
-                or "return _render_dashboard_scope_form_contents()" not in view_source[form_start:view_source.index("def _dashboard_scope_header")]
+                or "result = _render_dashboard_scope_form_contents()" not in scope_form_source
+                or "return result" not in scope_form_source
                 or "options=[SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR]" not in view_source
                 or "담당자 목록을 불러오지 못했습니다." not in view_source
                 or "enter_to_submit=False" not in view_source

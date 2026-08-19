@@ -4307,6 +4307,7 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
         with row4[3]:
             risk_quick_view_count = st.number_input("위험품목 바로보기", min_value=1, step=1, key="__dashboard_lite_risk_quick_view_count")
     submitted = st.form_submit_button("대시보드 조회", type="primary", width="stretch")
+    log.info("[dashboard.form.lifecycle] form_key=dashboard_lite_scope_form phase=submit_registered")
     try:
         from app.ui.ssai_login import has_permission
         save_requested = st.form_submit_button("저장", width="stretch") if has_permission(PROFILE_PERMISSION) else False
@@ -4376,11 +4377,14 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
 
 def _render_dashboard_scope_form() -> tuple[bool, bool, dict[str, Any] | None]:
     """Render every Dashboard-affecting draft control in one atomic form."""
+    log.info("[dashboard.form.lifecycle] form_key=dashboard_lite_scope_form phase=form_enter")
     with st.form("dashboard_lite_scope_form",
         clear_on_submit=False,
         enter_to_submit=False,
     ):
-        return _render_dashboard_scope_form_contents()
+        result = _render_dashboard_scope_form_contents()
+    log.info("[dashboard.form.lifecycle] form_key=dashboard_lite_scope_form phase=form_exit")
+    return result
 
 
 def _dashboard_scope_header(params: dict[str, Any]) -> str:

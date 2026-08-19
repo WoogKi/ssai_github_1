@@ -123,6 +123,21 @@ def _login_log_kv(
     )
 
 
+def _log_form_lifecycle(
+    form_key: str,
+    phase: str,
+    *,
+    company: dict | None = None,
+) -> None:
+    """Record form progress without logging login or input values."""
+    log.info(
+        "[auth.form.lifecycle] form_key=%s phase=%s %s",
+        form_key,
+        phase,
+        _login_log_kv(company=company),
+    )
+
+
 def _clear_company_dependent_state() -> None:
     """
     회사 변경 시 이전 회사 기준 캐시/현재표/SIMS 결과를 정리한다.
@@ -796,6 +811,7 @@ def render_company_selector() -> bool:
     st.caption(f"확인할 SIMS 사용자 ID: `{sims_user_id_for_change}`")
 
     # 모든 사용자가 Password 입력 후 Enter 또는 버튼으로 제출
+    _log_form_lifecycle("__ssai_company_change_form", "form_enter", company=selected_company)
     with st.form(
         "__ssai_company_change_form",
         clear_on_submit=False,
@@ -815,6 +831,7 @@ def render_company_selector() -> bool:
                 type="primary",
                 width="stretch",
             )
+            _log_form_lifecycle("__ssai_company_change_form", "submit_registered", company=selected_company)
 
         with col2:
             if current_company is not None:
@@ -822,6 +839,7 @@ def render_company_selector() -> bool:
                     "취소",
                     width="stretch",
                 )
+    _log_form_lifecycle("__ssai_company_change_form", "form_exit", company=selected_company)
 
 
     if company_change_cancelled:
@@ -934,6 +952,7 @@ def render_signup_request_box() -> None:
             "SIMS 비밀번호는 가입 신청 단계에서 입력하지 않습니다."
         )
 
+        _log_form_lifecycle("ssai_signup_form", "form_enter")
         with st.form("ssai_signup_form", clear_on_submit=False):
             signup_login_id = st.text_input(
                 "로그인 ID",
@@ -991,6 +1010,8 @@ def render_signup_request_box() -> None:
                 type="primary",
                 width="stretch",
             )
+            _log_form_lifecycle("ssai_signup_form", "submit_registered")
+        _log_form_lifecycle("ssai_signup_form", "form_exit")
 
         if not submitted:
             return
@@ -1050,6 +1071,7 @@ def render_login_form() -> bool:
             st.write(f"사용자: **{pending_auth.get('display_name') or pending_auth.get('login_id')}**")
             st.caption("회원사 ERP에 등록된 SIMS 비밀번호를 입력하세요.")
 
+            _log_form_lifecycle("ssai_sims_password_form", "form_enter")
             with st.form("ssai_sims_password_form", clear_on_submit=False):
                 sims_password = st.text_input(
                     "SIMS Password",
@@ -1071,6 +1093,8 @@ def render_login_form() -> bool:
                         "처음으로",
                         width="stretch",
                     )
+                _log_form_lifecycle("ssai_sims_password_form", "submit_registered")
+            _log_form_lifecycle("ssai_sims_password_form", "form_exit")
 
         if cancel_submitted:
             log.info(
@@ -1110,10 +1134,13 @@ def render_login_form() -> bool:
 
     st.caption("1단계: SS AI 로그인 ID와 SS AI Password를 입력하세요.")
 
+    _log_form_lifecycle("ssai_login_form", "form_enter")
     with st.form("ssai_login_form", clear_on_submit=False):
         login_id = st.text_input("로그인 ID", value="", placeholder="아이디를 입력하세요")
         password = st.text_input("SS AI Password", type="password")
         submitted = st.form_submit_button("다음", width="stretch")
+        _log_form_lifecycle("ssai_login_form", "submit_registered")
+    _log_form_lifecycle("ssai_login_form", "form_exit")
 
     # 로그인 버튼을 누르지 않아도 가입 신청 UI는 항상 보여야 한다.
     st.divider()
