@@ -1081,6 +1081,7 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
         month_in_qty_expr = "ISNULL(M.Rd21_In_Quantity, 0) + ISNULL(M.Rd21_In_Oquantity, 0)"
         month_out_qty_expr = "ISNULL(M.Rd21_Out_Quantity, 0) + ISNULL(M.Rd21_Out_Oquantity, 0)"
         month_in_amt_expr = "ISNULL(M.Rd21_In_Supply_Price, 0) + ISNULL(M.Rd21_In_Tax_Price, 0)"
+        month_out_amt_expr = "ISNULL(M.Rd21_Out_Supply_Price, 0) + ISNULL(M.Rd21_Out_Tax_Price, 0)"
     else:
         month_table = "dbo.Rddbc220"
         month_alias = "Rd22"
@@ -1093,6 +1094,7 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
         month_in_qty_expr = "ISNULL(M.Rd22_In_Quantity, 0)"
         month_out_qty_expr = "ISNULL(M.Rd22_Out_Quantity, 0)"
         month_in_amt_expr = "ISNULL(M.Rd22_In_Supply_Price, 0) + ISNULL(M.Rd22_In_Tax_Price, 0)"
+        month_out_amt_expr = "ISNULL(M.Rd22_Out_Supply_Price, 0) + ISNULL(M.Rd22_Out_Tax_Price, 0)"
 
     return {
         "stock_mode": stock_mode,
@@ -1107,6 +1109,7 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
         "month_in_qty_expr": month_in_qty_expr,
         "month_out_qty_expr": month_out_qty_expr,
         "month_in_amt_expr": month_in_amt_expr,
+        "month_out_amt_expr": month_out_amt_expr,
         "in_exclude_prefix": in_exclude_prefix,
         "out_exclude_prefix": out_exclude_prefix,
         "current_stock_query": bool(params.get("current_stock_query")),
@@ -1116,6 +1119,31 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
             if clean_text(code) and clean_text(name)
         },
     }
+
+
+def _month_last(yyyymmdd: str) -> str:
+    year = int(yyyymmdd[:4])
+    month = int(yyyymmdd[4:6])
+    next_month = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+    return (next_month - timedelta(days=1)).strftime("%Y%m%d")
+
+
+def resolve_product_inventory_source_path(params: Optional[Dict[str, Any]] = None) -> str:
+    """Choose the monthly ledger or explicitly dated detail source path."""
+    source_params = dict(params or {})
+    if bool(source_params.get("current_stock_query")):
+        return "date_exact"
+    raw = clean_text(source_params.get("source_path") or source_params.get("inventory_source_path")).lower()
+    if raw in {"monthly", "date_exact"}:
+        return raw
+
+    if not clean_text(source_params.get("date_from")) and not clean_text(source_params.get("date_to")) and not clean_text(source_params.get("month_from")) and not clean_text(source_params.get("month_to")):
+        return "monthly"
+
+    date_from, date_to = _resolve_inventory_dates(source_params)
+    if date_from[:6] == date_to[:6] and date_from.endswith("01") and date_to == _month_last(date_from):
+        return "monthly"
+    return "date_exact"
 
 
 def _inventory_predicate_mode(params: Dict[str, Any]) -> str:
@@ -1308,7 +1336,7 @@ def _apply_master_filters(
 # -----------------------------------------------------------------------------
 # SQL: 월집계 이월
 # -----------------------------------------------------------------------------
-def _build_month_carry_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+def _build_month_carry_baseline_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     sql_params = dict(params)
     stock_codes = _normalize_stock_codes(params)
 
@@ -1401,6 +1429,205 @@ HAVING
     SUM({cfg['month_in_qty_expr']}) <> 0
     OR SUM({cfg['month_in_amt_expr']}) <> 0
     OR SUM({cfg['month_out_qty_expr']}) <> 0
+"""
+    return sql, sql_params
+
+
+def _month_carry_has_master_filter(params: Dict[str, Any]) -> bool:
+    """Keep the established master-filter SQL when its aliases are required."""
+    text_filters = (
+        "physic_cd", "physic_nm", "ven_nm", "maker_cd", "maker_nm",
+        "order_cd", "order_nm", "buy_cd", "buy_nm", "product_group_nm",
+        "product_di_nm", "product_class_nm", "nlq_unlabeled_name",
+        "current_stock_entity_scope", "current_stock_entity_phrase",
+    )
+    if any(clean_text(params.get(key)) not in {"", "전체"} for key in text_filters):
+        return True
+    if bool(params.get("_product_inventory_explicit_product_scope_applied")):
+        return True
+    return bool(
+        params.get("current_stock_manufacturer_codes")
+        or params.get("current_stock_product_codes")
+    )
+
+
+def _build_month_carry_monthagg_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    """Aggregate monthly movements before expanding display-only master rows."""
+    sql_params = dict(params)
+    stock_codes = _normalize_stock_codes(params)
+    month_table = cfg["month_table"]
+    month_alias = cfg["month_alias"]
+    stock_field = f"M.{month_alias}_Stock_Cd"
+    group_cd_expr, group_nm_expr = _vendor_group_expr(
+        cfg["group_basis"], "A.month_ven_cd", "A.month_stock_cd"
+    )
+    where = [
+        f"M.{month_alias}_Stock_YyMm < %(base_month)s",
+        f"NULLIF(LTRIM(RTRIM(M.{month_alias}_Stock_YyMm)), '') IS NOT NULL",
+        "ISNULL(PFilter.Rd04_Del_Flag, '') <> 'E'",
+    ]
+    _append_in_clause(where, sql_params, stock_field, stock_codes, "carry_stock")
+
+    sql = f"""
+WITH MonthAgg AS (
+    SELECT
+        M.{month_alias}_Physic_Cd AS month_physic_cd,
+        M.{month_alias}_Stock_Cd AS month_stock_cd,
+        M.{month_alias}_Ven_Cd AS month_ven_cd,
+        SUM({cfg['month_in_qty_expr']}) AS old_in_qty,
+        SUM({cfg['month_in_amt_expr']}) AS old_in_amt,
+        SUM({cfg['month_out_qty_expr']}) AS old_out_qty
+    FROM {month_table} AS M
+    LEFT JOIN dbo.Rddbc040 AS PFilter
+           ON M.{month_alias}_Physic_Cd = PFilter.Rd04_Physic_Cd
+    WHERE {' AND '.join(where)}
+    GROUP BY
+        M.{month_alias}_Physic_Cd,
+        M.{month_alias}_Stock_Cd,
+        M.{month_alias}_Ven_Cd
+    HAVING
+        SUM({cfg['month_in_qty_expr']}) <> 0
+        OR SUM({cfg['month_in_amt_expr']}) <> 0
+        OR SUM({cfg['month_out_qty_expr']}) <> 0
+)
+SELECT
+    {_common_descriptor_sql(group_cd_expr, group_nm_expr)},
+    CAST(SUM(A.old_in_qty) AS decimal(18, 4)) AS old_in_qty,
+    CAST(SUM(A.old_in_amt) AS decimal(18, 4)) AS old_in_amt,
+    CAST(SUM(A.old_out_qty) AS decimal(18, 4)) AS old_out_qty,
+    CAST(0 AS decimal(18, 4)) AS now_in_qty,
+    CAST(0 AS decimal(18, 4)) AS now_in_amt,
+    CAST(0 AS decimal(18, 4)) AS now_out_qty,
+    CAST(0 AS decimal(18, 4)) AS now_out_amt
+FROM MonthAgg AS A
+LEFT JOIN dbo.Rddbc040 AS P
+       ON A.month_physic_cd = P.Rd04_Physic_Cd
+LEFT JOIN dbo.Rddbc010 AS PG
+       ON P.Rd04_Physic_Group_Gcode = PG.Rd01_Gcode
+      AND P.Rd04_Physic_Group = PG.Rd01_Tcode
+LEFT JOIN dbo.Rddbc010 AS PD
+       ON P.Rd04_Physic_Di_Gcode = PD.Rd01_Gcode
+      AND P.Rd04_Physic_Di = PD.Rd01_Tcode
+LEFT JOIN dbo.Rddbc010 AS PF
+       ON P.Rd04_Physic_Flag_Gcode = PF.Rd01_Gcode
+      AND P.Rd04_Physic_Flag = PF.Rd01_Tcode
+LEFT JOIN dbo.Rddbc010 AS PhysicGu
+       ON P.Rd04_Physic_Gu_Gcode = PhysicGu.Rd01_Gcode
+      AND P.Rd04_Physic_Gu = PhysicGu.Rd01_Tcode
+LEFT JOIN dbo.Rddbc046 AS StdCd
+       ON P.Rd04_Physic_Cd = StdCd.Rd046_Physic_Cd
+LEFT JOIN dbo.Rddbc030 AS BuyVen
+       ON A.month_ven_cd = BuyVen.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS MakerVen
+       ON P.Rd04_Ven_Cd = MakerVen.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS OrderVen
+       ON P.Rd04_OrVen_Cd = OrderVen.Rd03_Ven_Cd
+GROUP BY
+    {group_cd_expr},
+    {group_nm_expr},
+    BuyVen.Rd03_Ven_Cd, BuyVen.Rd03_Ven_Nm,
+    OrderVen.Rd03_Ven_Cd, OrderVen.Rd03_Ven_Nm,
+    MakerVen.Rd03_Ven_Cd, MakerVen.Rd03_Ven_Nm,
+    P.Rd04_Physic_Cd, P.Rd04_Physic_Nm, P.Rd04_Standard,
+    P.Rd04_Insu_Cd, P.Rd04_Old_Insu_Cd, StdCd.Rd046_Standard_Cd,
+    P.Rd04_Pack_Unit, P.Rd04_In_Unit_Cost,
+    P.Rd04_Insu_Date, P.Rd04_Before_Insu_Date, P.Rd04_Insu_Price,
+    P.Rd04_Before_Insu_Price, P.Rd04_Acc_Unit, P.Rd04_Physic_Tax,
+    PG.Rd01_Hnm, PD.Rd01_Hnm, PF.Rd01_Hnm, PhysicGu.Rd01_Hnm
+HAVING
+    SUM(A.old_in_qty) <> 0
+    OR SUM(A.old_in_amt) <> 0
+    OR SUM(A.old_out_qty) <> 0
+"""
+    return sql, sql_params
+
+
+def _build_month_carry_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    """Build month carry without changing established master-filter semantics."""
+    if _month_carry_has_master_filter(params):
+        return _build_month_carry_baseline_sql(params, cfg)
+    return _build_month_carry_monthagg_sql(params, cfg)
+
+
+def _build_month_period_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+    """Build the selected whole-month ledger branch without detail tables."""
+    sql_params = dict(params)
+    stock_codes = _normalize_stock_codes(params)
+    month_table = cfg["month_table"]
+    month_alias = cfg["month_alias"]
+    stock_field = f"M.{month_alias}_Stock_Cd"
+    group_cd_expr, group_nm_expr = _vendor_group_expr(
+        cfg["group_basis"], f"M.{month_alias}_Ven_Cd", stock_field
+    )
+    month_from = clean_text(params.get("month_from") or params.get("date_from"))[:6]
+    month_to = clean_text(params.get("month_to") or params.get("date_to"))[:6]
+    if not month_from or not month_to:
+        raise ValueError("월집계 조회의 기준월이 없습니다.")
+    sql_params["month_from"] = month_from
+    sql_params["month_to"] = month_to
+
+    where = [
+        "1 = 1",
+        f"LEFT(M.{month_alias}_Stock_YyMm, 6) >= %(month_from)s",
+        f"LEFT(M.{month_alias}_Stock_YyMm, 6) <= %(month_to)s",
+        f"NULLIF(LTRIM(RTRIM(M.{month_alias}_Stock_YyMm)), '') IS NOT NULL",
+        "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
+    ]
+    _append_in_clause(where, sql_params, stock_field, stock_codes, "period_stock")
+    _apply_master_filters(where, sql_params, params, f"M.{month_alias}_Ven_Cd")
+
+    sql = f"""
+SELECT
+    {_common_descriptor_sql(group_cd_expr, group_nm_expr)},
+    CAST(0 AS decimal(18, 4)) AS old_in_qty,
+    CAST(0 AS decimal(18, 4)) AS old_in_amt,
+    CAST(0 AS decimal(18, 4)) AS old_out_qty,
+    CAST(SUM({cfg['month_in_qty_expr']}) AS decimal(18, 4)) AS now_in_qty,
+    CAST(SUM({cfg['month_in_amt_expr']}) AS decimal(18, 4)) AS now_in_amt,
+    CAST(SUM({cfg['month_out_qty_expr']}) AS decimal(18, 4)) AS now_out_qty,
+    CAST(SUM({cfg['month_out_amt_expr']}) AS decimal(18, 4)) AS now_out_amt
+FROM {month_table} AS M
+LEFT JOIN dbo.Rddbc040 AS P
+       ON M.{month_alias}_Physic_Cd = P.Rd04_Physic_Cd
+
+LEFT JOIN dbo.Rddbc010 AS PG
+       ON P.Rd04_Physic_Group_Gcode = PG.Rd01_Gcode
+      AND P.Rd04_Physic_Group = PG.Rd01_Tcode
+LEFT JOIN dbo.Rddbc010 AS PD
+       ON P.Rd04_Physic_Di_Gcode = PD.Rd01_Gcode
+      AND P.Rd04_Physic_Di = PD.Rd01_Tcode
+LEFT JOIN dbo.Rddbc010 AS PF
+       ON P.Rd04_Physic_Flag_Gcode = PF.Rd01_Gcode
+      AND P.Rd04_Physic_Flag = PF.Rd01_Tcode
+LEFT JOIN dbo.Rddbc010 AS PhysicGu
+       ON P.Rd04_Physic_Gu_Gcode = PhysicGu.Rd01_Gcode
+      AND P.Rd04_Physic_Gu = PhysicGu.Rd01_Tcode
+LEFT JOIN dbo.Rddbc046 AS StdCd
+       ON P.Rd04_Physic_Cd = StdCd.Rd046_Physic_Cd
+LEFT JOIN dbo.Rddbc030 AS BuyVen
+       ON M.{month_alias}_Ven_Cd = BuyVen.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS MakerVen
+       ON P.Rd04_Ven_Cd = MakerVen.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS OrderVen
+       ON P.Rd04_OrVen_Cd = OrderVen.Rd03_Ven_Cd
+WHERE {" AND ".join(where)}
+GROUP BY
+    {group_cd_expr},
+    {group_nm_expr},
+    BuyVen.Rd03_Ven_Cd, BuyVen.Rd03_Ven_Nm,
+    OrderVen.Rd03_Ven_Cd, OrderVen.Rd03_Ven_Nm,
+    MakerVen.Rd03_Ven_Cd, MakerVen.Rd03_Ven_Nm,
+    P.Rd04_Physic_Cd, P.Rd04_Physic_Nm, P.Rd04_Standard,
+    P.Rd04_Insu_Cd, P.Rd04_Old_Insu_Cd, StdCd.Rd046_Standard_Cd,
+    P.Rd04_Pack_Unit, P.Rd04_In_Unit_Cost,
+    P.Rd04_Insu_Date, P.Rd04_Before_Insu_Date, P.Rd04_Insu_Price,
+    P.Rd04_Before_Insu_Price, P.Rd04_Acc_Unit, P.Rd04_Physic_Tax,
+    PG.Rd01_Hnm, PD.Rd01_Hnm, PF.Rd01_Hnm, PhysicGu.Rd01_Hnm
+HAVING
+    SUM({cfg['month_in_qty_expr']}) <> 0
+    OR SUM({cfg['month_in_amt_expr']}) <> 0
+    OR SUM({cfg['month_out_qty_expr']}) <> 0
+    OR SUM({cfg['month_out_amt_expr']}) <> 0
 """
     return sql, sql_params
 
@@ -1739,6 +1966,8 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
     frames: list[pd.DataFrame] = []
     current_stock_query = bool(cfg.get("current_stock_query"))
     query_perf: dict[str, dict[str, Any]] = {}
+    source_path = resolve_product_inventory_source_path(params)
+    params["source_path"] = source_path
     predicate_mode = (
         clean_text(params.get("current_stock_predicate_mode"))
         if current_stock_query
@@ -1781,8 +2010,38 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
             )
         return df
 
+    if source_path == "monthly" and cfg.get("price_mode") == "last":
+        raise ValueError("월집계 조회에서는 최종매입가 기준을 사용할 수 없습니다. 일자 범위를 지정해 조회해 주세요.")
+
     month_sql, month_params = _build_month_carry_sql(sql_params, cfg)
     frames.append(_fetch("month_carry", month_sql, month_params))
+
+    if source_path == "monthly":
+        period_sql, period_params = _build_month_period_sql(sql_params, cfg)
+        frames.append(_fetch("month_period", period_sql, period_params))
+        frames = [df for df in frames if isinstance(df, pd.DataFrame) and not df.empty]
+        params["_product_inventory_last_cost_scope"] = {
+            "applied": False,
+            "product_code_count": 0,
+            "safe_limit": 0,
+            "fixed_parameter_count": 0,
+            "fallback_reason": "price_mode_not_last",
+        }
+        query_perf["last_cost"] = {
+            "rows": 0,
+            "sql_fetch_ms": 0.0,
+            "predicate_mode": predicate_mode,
+            "skipped": True,
+            "skip_reason": "price_mode_not_last",
+        }
+        params["_product_inventory_query_perf"] = query_perf
+        log.info(
+            "[product_inventory.source] source_path=monthly month_table=%s detail_query_count=0",
+            cfg["month_table"],
+        )
+        if not frames:
+            return pd.DataFrame(), pd.DataFrame()
+        return pd.concat(frames, ignore_index=True, sort=False), pd.DataFrame()
 
     first_day = _month_first(date_from)
     prev_day = _prev_day(date_from)
@@ -1796,6 +2055,11 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
     out_sql, out_params = _build_detail_sql("out", sql_params, cfg, date_from, date_to, "period")
     frames.append(_fetch("period_in", in_sql, in_params))
     frames.append(_fetch("period_out", out_sql, out_params))
+    log.info(
+        "[product_inventory.source] source_path=date_exact month_table=%s detail_query_count=%s",
+        cfg["month_table"],
+        4 if first_day <= prev_day else 2,
+    )
 
     frames = [df for df in frames if isinstance(df, pd.DataFrame) and not df.empty]
     if not frames:
@@ -2474,6 +2738,27 @@ def _final_current_stock_display_df(
     display_df, _source_df, meta = _build_current_stock_table_frames(grp, cfg)
     return display_df, meta
 
+
+def _filter_current_stock_frequency_rows(
+    grp: pd.DataFrame,
+    *,
+    params: Dict[str, Any],
+    date_to: str,
+) -> tuple[pd.DataFrame, Dict[str, Any]]:
+    """Filter current-stock facts with the same approved snapshot boundary."""
+    selected = _normalize_product_inventory_frequency_filter(params.get("frequency_grade"))
+    if not selected or grp is None or grp.empty:
+        return grp, {}
+
+    frequency_frame = pd.DataFrame({"제품코드": grp["physic_cd"]}, index=grp.index)
+    attached, meta = attach_dashboard_frequency_snapshot(
+        frequency_frame,
+        params=params,
+        date_to=date_to,
+    )
+    attached = filter_product_inventory_frequency_rows(attached, selected)
+    return grp.loc[attached.index].copy(), meta
+
 # -----------------------------------------------------------------------------
 # 외부 공개 함수
 # -----------------------------------------------------------------------------
@@ -2486,6 +2771,15 @@ def get_product_inventory_df(params: Optional[Dict[str, Any]] = None) -> pd.Data
     work_params = dict(params)
     work_params["date_from"] = date_from
     work_params["date_to"] = date_to
+    source_path = resolve_product_inventory_source_path(params)
+    work_params["source_path"] = source_path
+    if source_path == "monthly":
+        month_from = clean_text(work_params.get("month_from") or date_from)[:6]
+        month_to = clean_text(work_params.get("month_to") or date_to)[:6]
+        work_params["month_from"] = month_from
+        work_params["month_to"] = month_to
+        work_params["date_from"] = f"{month_from}01"
+        work_params["date_to"] = _month_last(f"{month_to}01")
 
     stock_codes_before = _normalize_stock_codes(work_params)
 
@@ -2525,6 +2819,16 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
         work_params = dict(params)
         work_params["date_from"] = date_from
         work_params["date_to"] = date_to
+        source_path = resolve_product_inventory_source_path(params)
+        work_params["source_path"] = source_path
+        if source_path == "monthly":
+            month_from = clean_text(work_params.get("month_from") or date_from)[:6]
+            month_to = clean_text(work_params.get("month_to") or date_to)[:6]
+            work_params["month_from"] = month_from
+            work_params["month_to"] = month_to
+            work_params["date_from"] = f"{month_from}01"
+            work_params["date_to"] = _month_last(f"{month_to}01")
+            date_from, date_to = work_params["date_from"], work_params["date_to"]
 
         stock_name = _stock_name_condition(work_params)
         stock_codes_before = _normalize_stock_codes(work_params)
@@ -2642,18 +2946,28 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
         grp = _prepare_grouped_df(src_df, last_df, cfg, work_params, perf=group_perf)
         group_elapsed_ms = round((time.perf_counter() - group_started) * 1000, 1)
         if bool(cfg.get("current_stock_query")):
+            frequency_filter_started = time.perf_counter()
+            grp, frequency_meta = _filter_current_stock_frequency_rows(
+                grp,
+                params=work_params,
+                date_to=date_to,
+            )
+            frequency_filter_ms = round((time.perf_counter() - frequency_filter_started) * 1000, 1)
             frame_started = time.perf_counter()
             df_display, df_full, meta = _build_current_stock_table_frames(grp, cfg)
             frame_elapsed_ms = round((time.perf_counter() - frame_started) * 1000, 1)
+            meta.update(frequency_meta)
+            meta["frequency_filter_ms"] = frequency_filter_ms
             meta["current_stock_query_perf"] = dict(work_params.get("_current_stock_query_perf") or {})
             meta["current_stock_source_elapsed_ms"] = source_elapsed_ms
             meta["current_stock_group_elapsed_ms"] = group_elapsed_ms
             meta["current_stock_frame_elapsed_ms"] = frame_elapsed_ms
             meta["current_stock_service_elapsed_ms"] = round((time.perf_counter() - service_started) * 1000, 1)
             log.info(
-                "[current_stock.perf] stage=service_complete source_elapsed_ms=%s group_elapsed_ms=%s frame_elapsed_ms=%s total_elapsed_ms=%s detail_rows=%s predicate_mode=%s",
+                "[current_stock.perf] stage=service_complete source_elapsed_ms=%s group_elapsed_ms=%s frequency_filter_ms=%s frame_elapsed_ms=%s total_elapsed_ms=%s detail_rows=%s predicate_mode=%s",
                 source_elapsed_ms,
                 group_elapsed_ms,
+                frequency_filter_ms,
                 frame_elapsed_ms,
                 meta["current_stock_service_elapsed_ms"],
                 int(meta.get("detail_count", 0) or 0),
@@ -2672,6 +2986,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             service_total_ms = round((time.perf_counter() - request_started) * 1000, 1)
             query_perf = dict(work_params.get("_product_inventory_query_perf") or {})
             perf_meta = {
+                "source_path": source_path,
                 "predicate_mode": _inventory_predicate_mode(work_params),
                 "filter_prepare_ms": filter_prepare_ms,
                 "source_elapsed_ms": source_elapsed_ms,
@@ -2684,13 +2999,14 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             }
             meta["product_inventory_perf"] = perf_meta
             log.info(
-                "[product_inventory.perf] stage=service_complete predicate_mode=%s "
+                "[product_inventory.perf] stage=service_complete source_path=%s predicate_mode=%s "
                 "filter_prepare_ms=%s source_elapsed_ms=%s normalize_ms=%s "
                 "group_aggregate_ms=%s master_merge_ms=%s last_cost_merge_ms=%s "
                 "unit_calc_ms=%s amount_calc_ms=%s dc_calc_ms=%s group_finalize_ms=%s "
                 "frequency_attach_ms=%s frequency_filter_ms=%s frequency_rows_before_filter=%s "
                 "frequency_rows_after_filter=%s final_display_frame_ms=%s subtotal_ms=%s subtotal_rows=%s final_total_ms=%s "
                 "service_total_ms=%s source_rows=%s result_rows=%s",
+                source_path,
                 perf_meta["predicate_mode"],
                 filter_prepare_ms,
                 source_elapsed_ms,

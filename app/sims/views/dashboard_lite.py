@@ -848,9 +848,11 @@ def _inject_dashboard_lite_styles_once() -> None:
             border-radius: 11px;
             background: #ffffff;
             box-shadow: 0 5px 16px rgba(15, 23, 42, 0.07);
+            transform: translateY(9px);
         }
         .dashboard-lite-sales-gauge {
-            min-height: 400px;
+            min-height: 393px;
+            padding-top: 7px;
             display: flex;
             flex-direction: column;
             justify-content: flex-start;
@@ -1129,7 +1131,7 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
 
 
 def _sales_gauge_state(facts: dict[str, Any]) -> dict[str, Any]:
-    """Return display-only gauge bounds; current-day progress stays calendar based."""
+    """Return the actual-sales gauge and its cumulative-target marker."""
     state = _sales_presentation_state(facts)
     gauge_available = state.get("sales_progress_pct") is not None
     try:
@@ -1137,18 +1139,21 @@ def _sales_gauge_state(facts: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         progress = None
         gauge_available = False
+    today_progress = None
     try:
-        today_progress = max(0.0, float(state.get("time_adjusted_achievement_pct") or 0.0))
+        expected_to_date = float(state.get("expected_to_date_sales"))
+        monthly_target = float(state.get("forecast_sales"))
+        if monthly_target > 0:
+            today_progress = max(0.0, expected_to_date / monthly_target * 100.0)
     except (TypeError, ValueError):
-        today_progress = 0.0
-    maximum = max(120.0, min(max(progress or 0.0, today_progress, 100.0) + 10.0, 250.0))
+        pass
     return {
         **state,
         "gauge_available": gauge_available,
-        "gauge_max_pct": maximum,
+        "gauge_max_pct": 100.0,
         "needle_pct": progress,
         "today_marker_pct": today_progress,
-        "time_basis_label": "판단 기준일",
+        "time_basis_label": "오늘까지 누적 목표",
     }
 
 
@@ -1160,17 +1165,16 @@ def _build_sales_gauge_markup(facts: dict[str, Any], *, render_namespace: str = 
     visual_progress = max(0.0, min(progress, 100.0))
     progress_arc_pct = visual_progress
     needle_angle = -90.0 + visual_progress * 1.8
-    target_angle = 90.0
-    today_visual_pct = max(0.0, min(float(state["today_marker_pct"]), 100.0))
+    today_visual_pct = max(0.0, min(float(state.get("today_marker_pct") or 0.0), 100.0))
     today_angle = -90.0 + today_visual_pct * 1.8
     today_marker = (
         f'<path d="M 140 20 L 140 42" stroke="#f97316" stroke-width="5" stroke-linecap="round" '
         f'transform="rotate({today_angle:.3f} 140 132)"/>'
-        if gauge_available and state["expected_to_date_chart_visible"] else ""
+        if gauge_available and state.get("today_marker_pct") is not None else ""
     )
     today_achievement = (
-        f"{html.escape(_fmt_number(state['today_marker_pct'], 1))}%"
-        if state["expected_to_date_available"] else "자료부족"
+        f"{html.escape(_fmt_number(state['time_adjusted_achievement_pct'], 1))}%"
+        if state.get("time_adjusted_achievement_pct") is not None else "자료부족"
     )
     safe_svg_namespace = re.sub(r"[^a-zA-Z0-9_-]", "", str(render_namespace or "sales")) or "sales"
     track_gradient_id = f"dashboardGaugeTrack-{safe_svg_namespace}"
@@ -1194,7 +1198,6 @@ def _build_sales_gauge_markup(facts: dict[str, Any], *, render_namespace: str = 
     if gauge_available:
         svg_parts.extend([
             f'<path class="dashboard-lite-gauge-progress" d="M 30 132 A 110 110 0 0 1 250 132" pathLength="100" fill="none" stroke="url(#{progress_gradient_id})" stroke-width="24" stroke-linecap="round" stroke-dasharray="{progress_arc_pct:.3f} 100" filter="url(#{shadow_filter_id})"/>',
-            f'<path d="M 140 20 L 140 42" stroke="#0f766e" stroke-width="4" stroke-linecap="round" transform="rotate({target_angle:.3f} 140 132)"/>',
         ])
         if today_marker:
             svg_parts.append(today_marker)
@@ -1209,14 +1212,14 @@ def _build_sales_gauge_markup(facts: dict[str, Any], *, render_namespace: str = 
     ])
     if not gauge_available:
         main_text = "자료부족"
-        gauge_label = "비교 자료 없음" if state["is_completed_month"] else "예상매출 달성률 계산 불가"
+        gauge_label = "비교 자료 없음" if state["is_completed_month"] else "월 목표 대비 실제 진행률 계산 불가"
         gauge_sub = (
             "평가월의 공식 예상매출 자료를 확인해 주세요."
             if state["is_completed_month"] else "평가월의 현재매출·월말 예상 자료를 확인해 주세요."
         )
     else:
         main_text = f"{_fmt_number(progress, 1)}%"
-        gauge_label = "예상매출 대비 달성률" if state["is_completed_month"] else "예상매출 달성률"
+        gauge_label = "월 목표 대비 실제 진행률"
         if state["is_completed_month"]:
             amount_unit = _facts_amount_display_unit(facts)
             difference = state.get("completed_forecast_difference")
@@ -1719,6 +1722,8 @@ def _build_labeled_summary_donut(
     inner_radius: int = 58,
     outer_radius: int = 92,
     top_padding: int = 12,
+    show_segment_details: bool = False,
+    segment_detail_outside_offset: int = 21,
 ) -> alt.Chart | None:
     """Render persisted counts with labels tied to the original pie geometry."""
     frame = pd.DataFrame([dict(row) for row in rows if int(row.get("count") or 0) > 0])
@@ -1740,12 +1745,26 @@ def _build_labeled_summary_donut(
         cursor = end_angle
     geometry = pd.DataFrame(geometries, index=frame.index)
     frame = pd.concat([frame, geometry], axis=1)
-    frame["inside_label"] = frame.apply(
-        lambda row: row["pct_label"] if float(row["pct"]) >= 7.0 else "", axis=1
-    )
-    frame["outside_label"] = frame.apply(
-        lambda row: row["pct_label"] if 0.0 < float(row["pct"]) < 7.0 else "", axis=1
-    )
+    if show_segment_details:
+        frame["inside_title"] = frame.apply(
+            lambda row: str(row["label"]) if float(row["pct"]) >= 7.0 else "", axis=1
+        )
+        frame["inside_detail"] = frame.apply(
+            lambda row: f"{int(row['count']):,}개 · {float(row['pct']):.1f}%" if float(row["pct"]) >= 7.0 else "", axis=1
+        )
+        frame["outside_title"] = frame.apply(
+            lambda row: str(row["label"]) if 0.0 < float(row["pct"]) < 7.0 else "", axis=1
+        )
+        frame["outside_detail"] = frame.apply(
+            lambda row: f"{int(row['count']):,}개 · {float(row['pct']):.1f}%" if 0.0 < float(row["pct"]) < 7.0 else "", axis=1
+        )
+    else:
+        frame["inside_label"] = frame.apply(
+            lambda row: row["pct_label"] if float(row["pct"]) >= 7.0 else "", axis=1
+        )
+        frame["outside_label"] = frame.apply(
+            lambda row: row["pct_label"] if 0.0 < float(row["pct"]) < 7.0 else "", axis=1
+        )
     color_domain = [str(row["label"]) for row in rows]
     color_range = [str(row["color"]) for row in rows]
     angle_encoding = {
@@ -1771,20 +1790,30 @@ def _build_labeled_summary_donut(
         **angle_encoding,
     )
     layers: list[alt.Chart] = [shadow, arc, outer_rim, inner_rim]
-    layers.append(
-        alt.Chart(frame).mark_text(radius=(inner_radius + outer_radius) // 2, fontSize=11, fontWeight=700).encode(
-            theta=alt.Theta("mid_angle:Q", stack=None),
-            text="inside_label:N",
-            color=alt.Color("text_color:N", scale=None),
-        )
-    )
-    layers.append(
-        alt.Chart(frame).mark_text(radius=outer_radius + 16, fontSize=10, fontWeight=600).encode(
-            theta=alt.Theta("mid_angle:Q", stack=None),
-            text="outside_label:N",
-            color=alt.Color("color:N", scale=None),
-        )
-    )
+    if show_segment_details:
+        layers.extend([
+            alt.Chart(frame).mark_text(radius=(inner_radius + outer_radius) // 2, dy=-7, fontSize=10, fontWeight=700).encode(
+                theta=alt.Theta("mid_angle:Q", stack=None), text="inside_title:N", color=alt.Color("text_color:N", scale=None),
+            ),
+            alt.Chart(frame).mark_text(radius=(inner_radius + outer_radius) // 2, dy=8, fontSize=10, fontWeight=600).encode(
+                theta=alt.Theta("mid_angle:Q", stack=None), text="inside_detail:N", color=alt.Color("text_color:N", scale=None),
+            ),
+            alt.Chart(frame).mark_text(radius=outer_radius + segment_detail_outside_offset, dy=-6, fontSize=10, fontWeight=700).encode(
+                theta=alt.Theta("mid_angle:Q", stack=None), text="outside_title:N", color=alt.Color("color:N", scale=None),
+            ),
+            alt.Chart(frame).mark_text(radius=outer_radius + segment_detail_outside_offset, dy=7, fontSize=10, fontWeight=600).encode(
+                theta=alt.Theta("mid_angle:Q", stack=None), text="outside_detail:N", color=alt.Color("color:N", scale=None),
+            ),
+        ])
+    else:
+        layers.extend([
+            alt.Chart(frame).mark_text(radius=(inner_radius + outer_radius) // 2, fontSize=11, fontWeight=700).encode(
+                theta=alt.Theta("mid_angle:Q", stack=None), text="inside_label:N", color=alt.Color("text_color:N", scale=None),
+            ),
+            alt.Chart(frame).mark_text(radius=outer_radius + 16, fontSize=10, fontWeight=600).encode(
+                theta=alt.Theta("mid_angle:Q", stack=None), text="outside_label:N", color=alt.Color("color:N", scale=None),
+            ),
+        ])
     center = pd.DataFrame([{"total": f"{int(total):,}개", "label": total_label}])
     layers.extend([
         alt.Chart(center).mark_text(fontSize=23 if outer_radius >= 100 else 21, fontWeight=700, dy=-8, color="#1f2937").encode(text="total:N"),
@@ -2367,13 +2396,12 @@ def _build_demand_surge_summary_donut(state: Mapping[str, Any]) -> alt.Chart | N
         rows,
         total_label="수요급증 품목",
         total=total,
-        height=226,
-        # This card has its legend below the chart. Keep the status donut's
-        # larger shared geometry intact, but reserve vertical label headroom
-        # here for both a 100% arc and a small top slice.
-        inner_radius=55,
-        outer_radius=94,
-        top_padding=18,
+        height=270,
+        inner_radius=74,
+        outer_radius=112,
+        top_padding=24,
+        show_segment_details=True,
+        segment_detail_outside_offset=12,
     )
 
 
@@ -2404,15 +2432,10 @@ def _render_demand_surge_summary_card(facts: dict[str, Any], *, render_namespace
         composition_col, type_col = st.columns([42, 58], gap="small", vertical_alignment="center")
         with composition_col:
             if state["top_partition_valid"]:
-                rows = [
-                    {"label": row["label"], "count": int(row["count"]), "color": color, "text_color": "#ffffff"}
-                    for row, color in zip(state["top_rows"], ("#f97316", "#7c3aed"))
-                ]
                 with st.container():
                     chart = _build_demand_surge_summary_donut(state)
                     if chart is not None:
                         st.altair_chart(chart, width="stretch")
-                    _render_inventory_summary_legend(rows, total=total)
             else:
                 st.caption("상위 분류 합계가 전체 수요급증과 일치하지 않아 독립 지표로 표시합니다.")
         with type_col:
@@ -2427,9 +2450,6 @@ def _render_demand_surge_summary_card(facts: dict[str, Any], *, render_namespace
                         st.caption("예상외 출고 발생 품목이 없습니다.")
             else:
                 st.caption("하위 유형 합계가 예상외 출고 발생과 일치하지 않아 독립 지표로 표시합니다.")
-    st.markdown('<div class="dashboard-lite-inventory-card-footer">세부 유형은 기존 수요급증 분류 계약을 사용합니다.</div>', unsafe_allow_html=True)
-
-
 def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
     summary = _stock_risk_display_summary(facts)
     amount_unit = _facts_amount_display_unit(facts)

@@ -688,7 +688,18 @@ def _apply_date_params_for_product_inventory(params: Dict[str, Any], text: str) 
     제품재고현황/제품재고장은 실제 조회에 date_from/date_to가 필요하다.
     제품수불현황과 동일하게 2023~2026, 202605 같은 기간 표현을 date range로 보정한다.
     """
-    out = _apply_date_params_for_product_flow(params, text)
+    out = dict(params or {})
+    raw_date_from = clean_text(out.get("date_from"))
+    raw_date_to = clean_text(out.get("date_to"))
+    raw_month_from = clean_text(out.get("month_from"))
+    raw_month_to = clean_text(out.get("month_to"))
+    if raw_date_from or raw_date_to:
+        out["source_path"] = "date_exact"
+    elif raw_month_from or raw_month_to or clean_text(out.get(_NLQ_PERIOD_KIND_KEY)) == "calendar_month":
+        out["source_path"] = "monthly"
+    else:
+        out["source_path"] = "monthly"
+    out = _apply_date_params_for_product_flow(out, text)
     date_from = clean_text(out.get("date_from"))
     date_to = clean_text(out.get("date_to"))
 
@@ -700,8 +711,20 @@ def _apply_date_params_for_product_inventory(params: Dict[str, Any], text: str) 
     if date_from and date_from == date_to and not has_explicit_range:
         out["date_from"] = f"{date_to[:6]}01"
         out["month_from"] = date_to[:6]
-    return out
 
+    # 명시 일자 범위의 잔여 문구가 제품명으로 잘못 남는 경우 제거한다.
+    # 예: "2026년 8월 1일부터 8월 19일까지 제품재고장"
+    #     -> physic_nm="1일부터 19일까지" 제거
+    if clean_text(out.get("source_path")) == "date_exact":
+        product_name = clean_text(out.get("physic_nm"))
+        if (
+            product_name
+            and re.search(r"(?:년|월|일|부터|까지|에서|~|/|-|\.)", product_name)
+            and re.fullmatch(r"[0-9\s년월일부터까지에서./~\-]+", product_name)
+        ):
+            out.pop("physic_nm", None)
+
+    return out
 
 _NAMED_CONDITION_VALUE_KEYS = (
     "physic_nm", "maker_nm", "product_ven_nm", "ven_nm", "buy_nm",
@@ -970,11 +993,12 @@ def _extract_product_inventory_frequency_grade(text: str) -> str:
     match = re.search(
         r"출고빈도(?:등급|구분)?(?:[:=])?(전체|[A-EX]|빈도자료부족|자료부족)",
         compact,
+        flags=re.IGNORECASE,
     )
     if not match:
         return ""
     value = match.group(1)
-    return "빈도자료 부족" if value in {"빈도자료부족", "자료부족"} else value
+    return "빈도자료 부족" if value in {"빈도자료부족", "자료부족"} else value.upper()
 
 
 def _remove_product_inventory_frequency_phrase(params: Dict[str, Any], frequency_grade: str) -> Dict[str, Any]:
@@ -987,6 +1011,16 @@ def _remove_product_inventory_frequency_phrase(params: Dict[str, Any], frequency
     if re.fullmatch(r"출고빈도(?:등급|구분)?(?:[:=])?(전체|[A-EX]|빈도자료부족|자료부족)(?:조회)?", compact):
         out.pop("physic_nm", None)
     return out
+
+
+def remove_outbound_frequency_phrase(text: str) -> str:
+    """Keep a labelled outbound-frequency condition out of entity resolution."""
+    return re.sub(
+        r"출고빈도(?:등급|구분)?\s*(?:[:=])?\s*(?:전체|[A-EXa-ex]|빈도\s*자료\s*부족|자료\s*부족)",
+        " ",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    )
 
 
 def _normalize_stock_code_token(value: str) -> str:
@@ -2684,6 +2718,9 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
 
     if _has_any(raw, _CURRENT_STOCK_WORDS):
         params = _apply_date_params_for_product_inventory(params, raw)
+        if frequency_grade:
+            params["frequency_grade"] = frequency_grade
+            params = _remove_product_inventory_frequency_phrase(params, frequency_grade)
         return _result("현재고 조회", params)
 
     if _has_any(raw, _PRODUCT_FLOW_WORDS):

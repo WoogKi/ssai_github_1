@@ -365,6 +365,24 @@ def _parser_cases() -> list[ParserCase]:
             forbidden_params=("physic_nm",),
         ),
         ParserCase(
+            query="현재고 출고빈도 A",
+            expected_action="현재고 조회",
+            expected_params={"frequency_grade": "A"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
+            query="출고빈도 A 현재고",
+            expected_action="현재고 조회",
+            expected_params={"frequency_grade": "A"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
+            query="현재고 출고빈도 b",
+            expected_action="현재고 조회",
+            expected_params={"frequency_grade": "B"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
             query="제품재고장 출고빈도등급 E 조회",
             expected_action="제품재고현황 조회",
             expected_params={"frequency_grade": "E"},
@@ -4519,7 +4537,7 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         _avg_source, avg_last = inventory_service._collect_source_df(avg_params, avg_cfg)
     avg_last_meta = dict(avg_params.get("_product_inventory_last_cost_scope") or {})
     avg_last_cost_skip_ok = (
-        len(avg_query_stages) == 3
+        len(avg_query_stages) == 2
         and "last_cost" not in avg_query_stages
         and avg_last.empty
         and avg_last_meta.get("fallback_reason") == "price_mode_not_last"
@@ -6202,6 +6220,98 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
     return results
 
 
+def run_product_inventory_source_path_checks() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    io_nlq = importlib.import_module("app.services.io_nlq")
+    inventory_service = importlib.import_module("app.services.product_inventory_service")
+
+    monthly_nlq = io_nlq.resolve_io_nlq("2026년 8월 제품재고장") or {}
+    default_nlq = io_nlq.resolve_io_nlq("제품재고장 출고빈도 A") or {}
+    date_nlq = io_nlq.resolve_io_nlq("2026년 8월 1일부터 2026년 8월 19일까지 제품재고장") or {}
+    monthly_params = dict(monthly_nlq.get("params") or {})
+    default_params = dict(default_nlq.get("params") or {})
+    date_params = dict(date_nlq.get("params") or {})
+    results.append(
+        _ok("product inventory month NLQ selects monthly source", repr(monthly_params))
+        if monthly_params.get("source_path") == "monthly"
+        else _fail("product inventory month NLQ selects monthly source", repr(monthly_params))
+    )
+    results.append(
+        _ok("product inventory default NLQ selects monthly source", repr(default_params))
+        if default_params.get("source_path") == "monthly"
+        else _fail("product inventory default NLQ selects monthly source", repr(default_params))
+    )
+    results.append(
+        _ok("product inventory service default selects monthly source", "empty params")
+        if inventory_service.resolve_product_inventory_source_path({}) == "monthly"
+        else _fail("product inventory service default selects monthly source", "empty params")
+    )
+    results.append(
+        _ok("product inventory explicit date NLQ selects detail source", repr(date_params))
+        if date_params.get("source_path") == "date_exact"
+        else _fail("product inventory explicit date NLQ selects detail source", repr(date_params))
+    )
+    results.append(
+        _ok("current stock keeps its existing detail source", "current_stock_query")
+        if inventory_service.resolve_product_inventory_source_path({"current_stock_query": True}) == "date_exact"
+        else _fail("current stock keeps its existing detail source", "current_stock_query")
+    )
+
+    cfg = inventory_service._settings({"stock_mode": "real", "price_mode": "avg"})
+    original_query = inventory_service._query_df_safe
+    captured_sql: list[str] = []
+    try:
+        inventory_service._query_df_safe = lambda sql, _params: (captured_sql.append(sql) or pd.DataFrame())
+        inventory_service._collect_source_df(
+            {
+                "source_path": "monthly",
+                "date_from": "20260801",
+                "date_to": "20260831",
+                "month_from": "202608",
+                "month_to": "202608",
+                "stock_mode": "real",
+                "price_mode": "avg",
+                "stock_cds": ["00001"],
+            },
+            cfg,
+        )
+        monthly_sql = "\n".join(captured_sql)
+        monthly_ok = (
+            len(captured_sql) == 2
+            and "dbo.Rddbc210" in monthly_sql
+            and "dbo.Rddbc110" not in monthly_sql
+            and "dbo.Rddbc120" not in monthly_sql
+        )
+        results.append(
+            _ok("product inventory monthly path has zero detail queries", f"calls={len(captured_sql)}")
+            if monthly_ok
+            else _fail("product inventory monthly path has zero detail queries", f"calls={len(captured_sql)}")
+        )
+
+        captured_sql.clear()
+        inventory_service._collect_source_df(
+            {
+                "source_path": "date_exact",
+                "date_from": "20260801",
+                "date_to": "20260819",
+                "stock_mode": "real",
+                "price_mode": "avg",
+                "stock_cds": ["00001"],
+            },
+            cfg,
+        )
+        detail_sql = "\n".join(captured_sql)
+        detail_ok = len(captured_sql) == 3 and "dbo.Rddbc110" in detail_sql and "dbo.Rddbc120" in detail_sql
+        results.append(
+            _ok("product inventory explicit-date path keeps detail queries", f"calls={len(captured_sql)}")
+            if detail_ok
+            else _fail("product inventory explicit-date path keeps detail queries", f"calls={len(captured_sql)}")
+        )
+    finally:
+        inventory_service._query_df_safe = original_query
+    return results
+
+
 def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
     io_nlq = importlib.import_module("app.services.io_nlq")
@@ -6695,6 +6805,64 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
             and effective.get("group_basis") == "stock"
         )
         results.append(_ok("current stock saved stock / all io", repr(effective)) if defaults_ok else _fail("current stock saved stock / all io", repr(effective)))
+
+        frequency_fixture = pd.DataFrame(
+            {
+                "physic_cd": ["00001", "00001", "00002"],
+                "stock_cd": ["00001", "00002", "00001"],
+                "current_qty": [10, 20, 30],
+            }
+        )
+        original_attach_frequency = inventory_service.attach_dashboard_frequency_snapshot
+        try:
+            def _ready_frequency(frame, **_kwargs):
+                out = frame.copy()
+                out["출고빈도등급"] = ["A", "A", "B"]
+                out["3개월 출고발생수"] = pd.Series([4, 4, 2], index=out.index, dtype="Int64")
+                return out, {"frequency_snapshot_status": "ready", "frequency_additional_erp_source_call_count": 0}
+
+            inventory_service.attach_dashboard_frequency_snapshot = _ready_frequency
+            filtered_frequency, frequency_meta = inventory_service._filter_current_stock_frequency_rows(
+                frequency_fixture,
+                params={"frequency_grade": "A"},
+                date_to="20260831",
+            )
+            ready_frequency_ok = (
+                list(filtered_frequency.index) == [0, 1]
+                and filtered_frequency["physic_cd"].tolist() == ["00001", "00001"]
+                and frequency_meta.get("frequency_snapshot_status") == "ready"
+                and frequency_meta.get("frequency_additional_erp_source_call_count") == 0
+            )
+            results.append(
+                _ok("current stock frequency filter reuses attached product grade", "A keeps duplicate product rows")
+                if ready_frequency_ok
+                else _fail("current stock frequency filter reuses attached product grade", repr({"rows": filtered_frequency.to_dict("records"), "meta": frequency_meta}))
+            )
+
+            def _missing_frequency(frame, **_kwargs):
+                out = frame.copy()
+                out["출고빈도등급"] = "빈도자료 부족"
+                out["3개월 출고발생수"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+                return out, {"frequency_snapshot_status": "missing", "frequency_additional_erp_source_call_count": 0}
+
+            inventory_service.attach_dashboard_frequency_snapshot = _missing_frequency
+            missing_frequency, missing_meta = inventory_service._filter_current_stock_frequency_rows(
+                frequency_fixture,
+                params={"frequency_grade": "A"},
+                date_to="20260831",
+            )
+            missing_frequency_ok = (
+                missing_frequency.empty
+                and missing_meta.get("frequency_snapshot_status") == "missing"
+                and missing_meta.get("frequency_additional_erp_source_call_count") == 0
+            )
+            results.append(
+                _ok("current stock frequency filter fails closed for unavailable snapshot", "A returns no rows")
+                if missing_frequency_ok
+                else _fail("current stock frequency filter fails closed for unavailable snapshot", repr({"rows": missing_frequency.to_dict("records"), "meta": missing_meta}))
+            )
+        finally:
+            inventory_service.attach_dashboard_frequency_snapshot = original_attach_frequency
     finally:
         supplier.resolve_common_vendor_candidates = originals["vendor"]
         goods_service.search_goods_full = originals["goods"]
@@ -6773,6 +6941,12 @@ def main() -> int:
     failed += _print_results(
         "PRODUCT INVENTORY COMPANY DEFAULT SCOPE CHECKS",
         product_inventory_default_results,
+    )
+
+    product_inventory_source_results = run_product_inventory_source_path_checks()
+    failed += _print_results(
+        "PRODUCT INVENTORY MONTHLY / DATE-EXACT SOURCE PATH CHECKS",
+        product_inventory_source_results,
     )
 
     current_stock_results = run_current_stock_nlq_contract_checks()

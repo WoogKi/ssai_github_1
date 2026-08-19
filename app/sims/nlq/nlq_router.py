@@ -5467,6 +5467,7 @@ def _try_handle_io_nlq(
 
     try:
         from app.services.io_nlq import (
+            remove_outbound_frequency_phrase,
             resolve_io_nlq,
             resolve_current_stock_entity_condition,
             resolve_unlabeled_io_entity_condition,
@@ -5594,11 +5595,29 @@ def _try_handle_io_nlq(
     # Label-free proper nouns are never assigned to a condition by wording
     # alone.  The IO master relationships must identify exactly one semantic
     # target; otherwise retain the existing candidate-table result contract.
-    entity_resolution = (
-        resolve_current_stock_entity_condition(txt_for_io, params=params)
-        if action == "현재고 조회"
-        else resolve_unlabeled_io_entity_condition(txt_for_io, action=action, params=params)
+    current_stock_frequency_only = (
+        action == "현재고 조회"
+        and bool(str(params.get("frequency_grade") or "").strip())
+        and not any(
+            str(params.get(key) or "").strip()
+            for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm")
+        )
     )
+    if current_stock_frequency_only:
+        # An explicitly labelled grade is already a complete local filter.
+        # Do not reinterpret its grade token as a product/manufacturer name.
+        entity_resolution = {"status": "resolved", "params": params, "resolved_kind": "frequency_only"}
+    else:
+        entity_text = (
+            remove_outbound_frequency_phrase(txt_for_io)
+            if action == "현재고 조회" and params.get("frequency_grade")
+            else txt_for_io
+        )
+        entity_resolution = (
+            resolve_current_stock_entity_condition(entity_text, params=params)
+            if action == "현재고 조회"
+            else resolve_unlabeled_io_entity_condition(entity_text, action=action, params=params)
+        )
     entity_status = str(entity_resolution.get("status") or "")
     if entity_status in {"input_required", "candidate_required", "not_found", "resolution_unavailable"}:
         candidates = list(entity_resolution.get("candidates") or [])
@@ -5753,7 +5772,7 @@ def _try_handle_io_nlq(
         key in params for key in ("stock_cd", "stock_cds", "stock_cd_list")
     ):
         condition_sources.setdefault("stock_codes", "explicit")
-    if action == "제품재고현황 조회" and params.get("frequency_grade") not in (None, ""):
+    if action in {"제품재고현황 조회", "현재고 조회"} and params.get("frequency_grade") not in (None, ""):
         condition_sources.setdefault("frequency_grade", "explicit")
     if resolved_kind == "unlabeled_like" and str(params.get("nlq_unlabeled_name") or "").strip():
         condition_sources.setdefault("unlabeled_name", "explicit")
@@ -5770,6 +5789,8 @@ def _try_handle_io_nlq(
             session_state=session_state,
             source_out=condition_sources,
         )
+        if not str(params.get("source_path") or "").strip():
+            params["source_path"] = "date_exact" if bool(period_policy.get("explicit_period_present")) else "monthly"
     period_source = "explicit" if bool(period_policy.get("explicit_period_present")) else "action_default"
     for key in ("date_from", "date_to", "month_from", "month_to"):
         if params.get(key) not in (None, ""):

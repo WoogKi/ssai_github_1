@@ -11645,7 +11645,7 @@ def run_basic_checks() -> list[CheckResult]:
             if unchanged_remaining != 20:
                 presentation_errors.append(f"remaining_fact_mutated={unchanged_remaining!r}")
             ui_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
-            for label in ("예상매출 달성률", "예상 대비 달성률", "월말 예상 잔여", "월말 예상 초과", "오늘의 매출 요약"):
+            for label in ("월 목표 대비 실제 진행률", "예상 대비 달성률", "월말 예상 잔여", "월말 예상 초과", "오늘의 매출 요약"):
                 if label not in ui_source:
                     presentation_errors.append(f"ui_label_missing={label}")
             if '"완료월" if completed' in ui_source or '"예상 대비 차이" if completed' in ui_source:
@@ -11793,11 +11793,11 @@ def run_basic_checks() -> list[CheckResult]:
 
             gauge_facts = {"sales": {"metrics": {
                 "current_month_sales": {"value": 150}, "current_month_forecast_sales": {"value": 100},
-                "current_month_progress_pct": {"value": 150}, "time_progress_pct": {"value": 80, "time_basis": "202607 24/31일 경과 진행중"},
+                "current_month_progress_pct": {"value": 150}, "time_progress_pct": {"value": 70, "time_basis": "202607 24/31일 경과 진행중"},
                 "time_adjusted_achievement_pct": {"value": 187.5},
             }, "visualization": {"expected_to_date_sales": 80, "evaluation_month": "202607"}}}
             gauge_state = view_mod._sales_gauge_state(gauge_facts)
-            if gauge_state.get("needle_pct") != 150 or gauge_state.get("today_marker_pct") != 187.5 or float(gauge_state.get("gauge_max_pct") or 0) < 187.5:
+            if gauge_state.get("needle_pct") != 150 or gauge_state.get("today_marker_pct") != 80 or gauge_state.get("gauge_max_pct") != 100.0:
                 gauge_errors.append(f"gauge_state={gauge_state!r}")
             if gauge_state.get("comparison_label") != "월말 예상 초과" or gauge_state.get("comparison_amount") != 50:
                 gauge_errors.append(f"gauge_comparison={gauge_state!r}")
@@ -11820,11 +11820,18 @@ def run_basic_checks() -> list[CheckResult]:
                     'def _build_sales_gauge_markup(',
                     'dashboardGaugeShadow-{safe_svg_namespace}',
                     'dashboardGaugeNeedleShadow-{safe_svg_namespace}',
+                    'expected_to_date / monthly_target * 100.0',
+                    "time_adjusted_achievement_pct",
                 )
             ):
                 gauge_errors.append("gauge_progress_arc_or_fixed_visual_domain_missing")
             gauge_svg_source = gauge_source.split('def _build_sales_gauge_markup(', 1)[-1].split('\ndef ', 1)[0]
-            if gauge_svg_source.count('class="dashboard-lite-gauge-progress"') != 1 or '#93c5fd' in gauge_svg_source:
+            if (
+                gauge_svg_source.count('class="dashboard-lite-gauge-progress"') != 1
+                or '#93c5fd' in gauge_svg_source
+                or 'stroke="#0f766e"' in gauge_svg_source
+                or 'today_progress = max(0.0, float(state.get("time_progress_pct")' in gauge_source.split('def _sales_gauge_state', 1)[-1].split('\ndef ', 1)[0]
+            ):
                 gauge_errors.append("gauge_active_arc_not_single")
             boundary_facts = []
             for name, progress_value, time_value, time_basis, expected_value in (
@@ -11869,6 +11876,12 @@ def run_basic_checks() -> list[CheckResult]:
                     gauge_errors.append(f"gauge_markup_boundary={name}")
             if any(resource_ids[left] & resource_ids[right] for left in resource_ids for right in resource_ids if left < right):
                 gauge_errors.append(f"gauge_resource_ids_not_namespaced={resource_ids!r}")
+            normal_markup = view_mod._build_sales_gauge_markup(gauge_facts, render_namespace="normal")
+            if (
+                "24일 기준 예상 대비 달성률 187.5%" not in normal_markup
+                or 'transform="rotate(54.000 140 132)"' not in normal_markup
+            ):
+                gauge_errors.append(f"gauge_reference_or_marker_contract={normal_markup!r}")
             completed_markup = view_mod._build_sales_gauge_markup(completed_facts, render_namespace="completed")
             completed_svg = completed_markup[
                 completed_markup.index("<svg"):completed_markup.index("</svg>") + len("</svg>")
@@ -11898,7 +11911,7 @@ def run_basic_checks() -> list[CheckResult]:
                 gauge_errors.append("gauge_bevel_gradient_or_hub_depth_missing")
             if (
                 "112.0%" not in completed_markup
-                or "예상매출 대비 달성률" not in completed_markup
+                or "월 목표 대비 실제 진행률" not in completed_markup
                 or 'class="dashboard-lite-gauge-needle"' not in completed_markup
                 or 'class="dashboard-lite-gauge-progress"' not in completed_markup
                 or 'stroke-dasharray="100.000 100"' not in completed_markup
@@ -11932,7 +11945,7 @@ def run_basic_checks() -> list[CheckResult]:
         if gauge_errors:
             results.append(_fail("Dashboard Lite sales gauge", "; ".join(gauge_errors)))
         else:
-            results.append(_ok("Dashboard Lite sales gauge", "month-end achievement drives the needle and main value; current-day achievement remains a separate marker with safe over-120 scaling"))
+            results.append(_ok("Dashboard Lite sales gauge", "actual sales versus the monthly target drives the needle and blue arc; the calendar cumulative target is the only separate marker"))
 
         demand_surge_visual_errors: list[str] = []
         try:
@@ -17704,11 +17717,23 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
         demand_type_spec = json.dumps(demand_type_chart.to_dict(), ensure_ascii=False) if demand_type_chart is not None else ""
         if not all(token in status_spec for token in ('"height": 270', '"padding": {"top": 12, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 76', '"outerRadius": 116', '"background": "transparent"')):
             errors.append("status_donut_density_contract_missing")
-        if not all(token in demand_donut_spec for token in ('"height": 226', '"padding": {"top": 18, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 55', '"outerRadius": 94', '"background": "transparent"')):
+        if not all(token in demand_donut_spec for token in ('"height": 270', '"padding": {"top": 24, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 74', '"outerRadius": 112', '"radius": 124', '"inside_title"', '"inside_detail"', '"outside_title"', '"outside_detail"', '"background": "transparent"')):
             errors.append("demand_donut_density_contract_missing")
         demand_single_spec = json.dumps(demand_single_donut.to_dict(), ensure_ascii=False) if demand_single_donut is not None else ""
-        if not all(token in demand_single_spec for token in ('"height": 226', '"padding": {"top": 18, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 55', '"outerRadius": 94')):
+        if not all(token in demand_single_spec for token in ('"height": 270', '"padding": {"top": 24, "bottom": 0, "left": 0, "right": 0}', '"innerRadius": 74', '"outerRadius": 112', '"radius": 124', '"inside_title"')):
             errors.append("demand_single_donut_headroom_contract_missing")
+        demand_card_source = view_source.split('def _render_demand_surge_summary_card', 1)[-1].split('\ndef ', 1)[0]
+        if (
+            '_render_inventory_summary_legend(' in demand_card_source
+            or "세부 유형은 기존 수요급증 분류 계약을 사용합니다." in demand_card_source
+        ):
+            errors.append("demand_surge_external_legend_remains")
+        if (
+            "min-height: 393px;" not in view_source
+            or "padding-top: 7px;" not in view_source
+            or "transform: translateY(9px);" not in view_source
+        ):
+            errors.append("sales_gauge_vertical_balance_missing")
         if not all(token in demand_type_spec for token in ('"height": 164', '"size": 18', '"background": "transparent"')):
             errors.append("demand_type_density_contract_missing")
         if not all(token in vendor_spec for token in ('"size": 19', '"track": 104.0', '"label_position": 118.0', '"domain": [0, 122]', '"background": "transparent"')):

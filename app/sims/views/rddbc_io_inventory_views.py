@@ -10,7 +10,10 @@ import pandas as pd
 import streamlit as st
 
 from app.services import rddbc010_service as C01
-from app.services.product_inventory_service import get_product_inventory_result
+from app.services.product_inventory_service import (
+    get_product_inventory_result,
+    resolve_product_inventory_source_path,
+)
 from app.sims.views.rddbc_io_shared import (
     _apply_product_input_sync_if_pending,
     _apply_product_pick,
@@ -225,8 +228,11 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         if c in stock_code_to_label
     ]
 
-    date_from_default = _as_date(defaults.get("date_from"), dt.date.today() - dt.timedelta(days=30))
-    date_to_default = _as_date(defaults.get("date_to"), dt.date.today())
+    today = dt.date.today()
+    month_first = today.replace(day=1)
+    month_last = (month_first.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)
+    date_from_default = _as_date(defaults.get("date_from"), month_first)
+    date_to_default = _as_date(defaults.get("date_to"), month_last)
 
     stock_mode_default = _clean_text(defaults.get("stock_mode") or "실재고")
     group_basis_default = _clean_text(defaults.get("group_basis") or "제조사")
@@ -540,6 +546,7 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
             "frequency_grade": "" if _clean_text(frequency_grade) == "전체" else _clean_text(frequency_grade),
             "top": int(top),
         }
+        base_p["source_path"] = resolve_product_inventory_source_path(base_p)
 
         maker_p = {
             "ven_cd": _clean_text(st.session_state.get(f"{maker_prefix}_ven_cd", defaults.get("maker_cd", ""))),
