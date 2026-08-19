@@ -967,6 +967,9 @@ def run_basic_checks() -> list[CheckResult]:
         get_models_start = main_src.find("def _get_models_cached()")
         get_models_end = main_src.find("# =========================", get_models_start + 1)
         get_models_block = main_src[get_models_start:get_models_end]
+        greeting_start = main_src.find("def _generate_login_greeting")
+        greeting_end = main_src.find("def _render_login_greeting_banner", greeting_start)
+        greeting_block = main_src[greeting_start:greeting_end]
         source_guards = {
             "top_health_lazy": "LLM_STATUS = {\"ok\": None" in top_src and "LLM_STATUS = check_llm(" not in top_src,
             "model_cache_ttl_short": "@st.cache_data(ttl=5)" in main_src and "def _get_models_cached" in main_src,
@@ -980,6 +983,24 @@ def run_basic_checks() -> list[CheckResult]:
             "stream_no_retry_after_tokens": "if collected:\n                    final_text = \"\".join(collected).strip()" in main_src,
             "reasoning_delta_guard": "reasoning_content" in main_src and "reasoning_seen" in main_src,
             "login_fallback_ready_check": "ready, _ready_message = _llm_request_config_ready(EXPECTED_LM_MODEL)" in main_src,
+            "login_greeting_timing_contract": all(
+                marker in main_src
+                for marker in (
+                    "[auth.greeting] phase=before_llm",
+                    "[auth.greeting] phase=complete",
+                    "[auth.greeting] phase=failed",
+                    "__auth_greeting_llm_elapsed",
+                    "message_count=1 prompt_chars=%s stream=False timeout_s=10 max_tokens=96",
+                )
+            ),
+            "login_greeting_compact_prompt_contract": (
+                "기준 문장:" in greeting_block
+                and "회사명:" not in greeting_block
+                and "사용자명:" not in greeting_block
+                and "반드시 유지할 의미:" not in greeting_block
+                and "max_tokens=96" in greeting_block
+                and "company_display_name" in greeting_block
+            ),
             "wait_placeholder": "wait_slot = st.empty()" in main_src and "_clear_wait_notice()" in main_src,
             "no_local_model_runtime_fallback": 'or "local-model"' not in main_src.replace('#                model=model or st.session_state.get("selected_model") or "local-model"', ""),
         }
@@ -1110,11 +1131,12 @@ def run_basic_checks() -> list[CheckResult]:
         from app.services.llm_health import classify_llm_exception as _classify_llm_exception
         retry_start = main_src.index("def call_chat_with_retry")
         retry_end = main_src.index("# =========================================================", retry_start + 1)
-        completion_calls = {"create": 0, "with_options": []}
+        completion_calls = {"create": 0, "with_options": [], "request_kwargs": []}
 
         class _FakeCompletions:
-            def create(self, **_kwargs):
+            def create(self, **kwargs):
                 completion_calls["create"] += 1
+                completion_calls["request_kwargs"].append(dict(kwargs))
                 raise type("APIConnectFixture", (Exception,), {})("raw secret-token http://127.0.0.1/body")
 
         class _FakeClient:
@@ -1147,6 +1169,7 @@ def run_basic_checks() -> list[CheckResult]:
                 stream=False,
                 timeout_s=1,
                 max_retry=0,
+                max_tokens=96,
             )
             sidebar_errors.append("completion failure did not raise safe RuntimeError")
         except RuntimeError as exc:
@@ -1154,6 +1177,8 @@ def run_basic_checks() -> list[CheckResult]:
                 sidebar_errors.append("completion failure exposed raw exception text")
         if completion_calls["create"] != 1:
             sidebar_errors.append(f"completion failure call count unexpected={completion_calls['create']}")
+        elif completion_calls["request_kwargs"][0].get("max_tokens") != 96:
+            sidebar_errors.append(f"completion max_tokens was not forwarded={completion_calls['request_kwargs']}")
 
         for required in (
             "sidebar_model_admin_allowed",

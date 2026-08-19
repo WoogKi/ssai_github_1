@@ -1725,6 +1725,7 @@ def call_chat_with_retry(
     timeout_s: int | None = None,         # per-call 타임아웃(선택)
     max_retry: int | None = None,         # per-call 재시도 횟수(선택, 성공 포함 X)
     backoff_seq: list[float] | None = None,  # per-call 백오프 시퀀스(선택)
+    max_tokens: int | None = None,         # completion 상한(필요한 단일 호출만 사용)
 ):
     """
     - stream=True  -> 스트리밍 generator 반환 (create 호출 성공 시에만 반환)
@@ -1741,6 +1742,14 @@ def call_chat_with_retry(
     eff_timeout = int(timeout_s if timeout_s is not None else LLM_TIMEOUT_S)
     eff_retry   = bounded_retry_count(max_retry if max_retry is not None else LLM_MAX_RETRY)
     eff_backoff = list(backoff_seq) if backoff_seq is not None else list(LLM_BACKOFF_SEQ or [0.6, 1.2, 2.0])
+    eff_max_tokens = None
+    if max_tokens is not None:
+        try:
+            eff_max_tokens = int(max_tokens)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_tokens must be a positive integer") from exc
+        if eff_max_tokens <= 0:
+            raise ValueError("max_tokens must be a positive integer")
 
     # per-call 타임아웃 부여 (드라이버가 지원하면 with_options 사용)
     cli = getattr(CLIENT, "with_options", lambda **kw: CLIENT)(timeout=eff_timeout, max_retries=0)
@@ -1753,11 +1762,12 @@ def call_chat_with_retry(
         prompt_chars = 0
 
     log.info(
-        "[llm.request] start model=%s stream=%s timeout_s=%s max_retry=%s messages=%s prompt_chars=%s",
+        "[llm.request] start model=%s stream=%s timeout_s=%s max_retry=%s max_tokens=%s messages=%s prompt_chars=%s",
         model_id,
         stream,
         eff_timeout,
         eff_retry,
+        eff_max_tokens,
         len(fixed_messages or []),
         prompt_chars,
     )
@@ -1769,11 +1779,16 @@ def call_chat_with_retry(
     for attempt in range(total_tries):
         attempt_t0 = time.perf_counter()
         try:
+            request_kwargs = {
+                "model": model_id,
+                "messages": fixed_messages,
+                "temperature": temperature,
+                "stream": stream,
+            }
+            if eff_max_tokens is not None:
+                request_kwargs["max_tokens"] = eff_max_tokens
             resp = cli.chat.completions.create(
-                model=model_id,
-                messages=fixed_messages,
-                temperature=temperature,
-                stream=stream,
+                **request_kwargs,
                 # 주의: LM Studio 계열은 request_timeout 전달 비권장. with_options(timeout=...)만 사용.
             )
 
@@ -2132,15 +2147,33 @@ def _clean_generated_greeting(text: str, fallback: str) -> str:
 
 def _generate_login_greeting(profile: dict[str, Any]) -> str:
     fallback = _fallback_login_greeting(profile)
+    total_started = time.perf_counter()
+    ready_check_ms = 0
+    prompt_build_ms = 0
+    llm_call_ms = 0
+    llm_started: float | None = None
 
     try:
+        ready_started = time.perf_counter()
         ready, _ready_message = _llm_request_config_ready(EXPECTED_LM_MODEL)
+        ready_check_ms = int((time.perf_counter() - ready_started) * 1000)
         if not ready:
+            log.info(
+                "[auth.greeting] phase=config_not_ready ready_check_ms=%s total_ms=%s",
+                ready_check_ms,
+                int((time.perf_counter() - total_started) * 1000),
+            )
             return fallback
 
+        prompt_started = time.perf_counter()
         company_name = str(profile.get("company_name") or "").strip()
+        company_display_name = re.sub(
+            r"\s*(?:ERP\s*DB|ERP\s*DATABASE)\s*$",
+            "",
+            company_name,
+            flags=re.IGNORECASE,
+        ).strip()
         duty_name = str(profile.get("duty_name") or "").strip()
-        sims_user_name = str(profile.get("sims_user_name") or "").strip()
         user_type = str(profile.get("user_type") or "").strip()
 
         role_text = "관리자" if user_type.startswith("SSART") else (duty_name or "담당자")
@@ -2152,31 +2185,27 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
             )
         else:
             meaning = (
-                f"안녕하세요. {company_name} {role_text}님, "
-                f"저는 유통분야 전문 AI가 되려는 {company_name}의 SSAI입니다."
+                f"안녕하세요. {company_display_name} {role_text}님, "
+                f"저는 유통분야 전문 AI가 되려는 {company_display_name}의 SSAI입니다."
             )
 
         prompt = f"""
-한국어 업무용 로그인 인사말을 작성하세요.
+아래 기준 문장을 화면용 한국어 로그인 인사말 한 문장으로만 출력하세요.
+기준 문장의 핵심 의미와 호칭을 유지하세요.
+설명, 검토, 제목, 목록, 따옴표, 권한명, DB 관련 표현은 출력하지 마세요.
 
-출력 규칙:
-- 인사말 본문 1개만 출력
-- 예시, 옵션, 번호, 제목, 설명문 출력 금지
-- 따옴표 출력 금지
-- 1~2문장
-- 친절하고 전문적인 말투
-- 비밀번호, ID, DB명, 사용자 유형 코드는 절대 언급하지 말 것
-- SSART_ADMIN 같은 내부 권한명은 절대 언급하지 말 것
-
-화면 표시용 정보:
-회사명: {company_name}
-직책/역할: {role_text}
-사용자명: {sims_user_name}
-
-반드시 유지할 의미:
-{meaning}
+기준 문장: {meaning}
 """.strip()
+        prompt_build_ms = int((time.perf_counter() - prompt_started) * 1000)
+        prompt_chars = len(prompt)
 
+        log.info(
+            "[auth.greeting] phase=before_llm ready_check_ms=%s prompt_build_ms=%s message_count=1 prompt_chars=%s stream=False timeout_s=10 max_tokens=96",
+            ready_check_ms,
+            prompt_build_ms,
+            prompt_chars,
+        )
+        llm_started = time.perf_counter()
         resp = call_chat_with_retry(
             messages=[{"role": "user", "content": prompt}],
             model=EXPECTED_LM_MODEL or st.session_state.get("selected_model") or "",
@@ -2184,10 +2213,25 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
             stream=False,
             timeout_s=10,
             max_retry=0,
+            max_tokens=96,
         )
+        llm_call_ms = int((time.perf_counter() - llm_started) * 1000)
 
+        extract_started = time.perf_counter()
         extracted = extract_chat_completion_text(resp)
         text = str(extracted.get("content") or "").strip()
+        extract_ms = int((time.perf_counter() - extract_started) * 1000)
+        st.session_state["__auth_greeting_llm_elapsed"] = llm_call_ms / 1000.0
+        log.info(
+            "[auth.greeting] phase=complete ready_check_ms=%s prompt_build_ms=%s llm_call_ms=%s extract_ms=%s total_ms=%s finish_reason=%s content_present=%s",
+            ready_check_ms,
+            prompt_build_ms,
+            llm_call_ms,
+            extract_ms,
+            int((time.perf_counter() - total_started) * 1000),
+            str(extracted.get("finish_reason") or ""),
+            bool(text),
+        )
         if not text:
             return fallback
         if extracted.get("finish_reason") == "length":
@@ -2203,7 +2247,20 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
 
         return _clean_generated_greeting(text, fallback)
 
-    except Exception:
+    except Exception as exc:
+        if llm_started is not None:
+            llm_call_ms = int((time.perf_counter() - llm_started) * 1000)
+        st.session_state["__auth_greeting_llm_elapsed"] = llm_call_ms / 1000.0
+        log.warning(
+            "[auth.greeting] phase=failed ready_check_ms=%s prompt_build_ms=%s llm_call_ms=%s total_ms=%s error_code=%s status=%s exception=%s",
+            ready_check_ms,
+            prompt_build_ms,
+            llm_call_ms,
+            int((time.perf_counter() - total_started) * 1000),
+            getattr(exc, "llm_error_code", "unknown_error"),
+            getattr(exc, "llm_status", ""),
+            getattr(exc, "llm_exception_type", type(exc).__name__),
+        )
         return fallback
 
 
