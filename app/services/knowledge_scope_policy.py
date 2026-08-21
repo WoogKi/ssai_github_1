@@ -28,8 +28,18 @@ class KnowledgeDocumentStatus(StrEnum):
     DISABLED = "DISABLED"
 
 
+class KnowledgeClassification(StrEnum):
+    GENERAL = "GENERAL"
+    ERP_DB_INTERNAL = "ERP_DB_INTERNAL"
+
+
 KNOWLEDGE_GLOBAL_MANAGE = "KNOWLEDGE_GLOBAL_MANAGE"
 KNOWLEDGE_COMPANY_MANAGE = "KNOWLEDGE_COMPANY_MANAGE"
+KNOWLEDGE_ERP_DB_READ = "KNOWLEDGE_ERP_DB_READ"
+KNOWLEDGE_PROJECT_SOURCE_READ = "KNOWLEDGE_PROJECT_SOURCE_READ"
+
+_SOURCE_KIND_DOCUMENT = "DOCUMENT"
+_SOURCE_KIND_PROJECT_SOURCE = "PROJECT_SOURCE"
 
 
 @dataclass(frozen=True)
@@ -99,14 +109,56 @@ def validate_document_scope(document: Mapping[str, Any]) -> KnowledgeAccessDecis
     return KnowledgeAccessDecision(True, "valid")
 
 
+def validate_document_classification(document: Mapping[str, Any]) -> KnowledgeAccessDecision:
+    """Validate the security classification without broadening malformed values.
+
+    Missing metadata means GENERAL only for manifests created before this field
+    existed. New registration calls always supply the field explicitly.
+    """
+    if "knowledge_classification" not in document:
+        return KnowledgeAccessDecision(True, "general_classification")
+    raw = _document_value(document, "knowledge_classification")
+    if not isinstance(raw, str):
+        return KnowledgeAccessDecision(False, "invalid_knowledge_classification")
+    try:
+        classification = KnowledgeClassification(raw.strip().upper())
+    except ValueError:
+        return KnowledgeAccessDecision(False, "invalid_knowledge_classification")
+    return KnowledgeAccessDecision(
+        True,
+        "erp_db_internal_classification"
+        if classification is KnowledgeClassification.ERP_DB_INTERNAL
+        else "general_classification",
+    )
+
+
+def _source_kind(document: Mapping[str, Any]) -> tuple[str | None, KnowledgeAccessDecision | None]:
+    """Return the manifest source kind without broadening malformed metadata.
+
+    Missing source_kind is retained as DOCUMENT for pre-Project-Source manifests.
+    New manifests always persist a concrete value through DocumentSource.
+    """
+    raw = _document_value(document, "source_kind")
+    if raw is None:
+        return _SOURCE_KIND_DOCUMENT, None
+    if not isinstance(raw, str):
+        return None, KnowledgeAccessDecision(False, "invalid_source_kind")
+    normalized = raw.strip().upper()
+    if normalized not in {_SOURCE_KIND_DOCUMENT, _SOURCE_KIND_PROJECT_SOURCE}:
+        return None, KnowledgeAccessDecision(False, "invalid_source_kind")
+    return normalized, None
+
 def can_read_document(
     *,
     document: Mapping[str, Any],
     current_user_id: int | None,
     current_company_id: int | None,
     permission_codes: Iterable[str] | None,
+    technical_detail_mode: bool = False,
 ) -> KnowledgeAccessDecision:
     """Return a fail-closed decision for a future RAG retrieval candidate."""
+    if not isinstance(technical_detail_mode, bool):
+        return KnowledgeAccessDecision(False, "invalid_technical_detail_mode")
     if get_required_permission(special="rag") not in _permissions(permission_codes):
         return KnowledgeAccessDecision(False, "missing_rag_use")
 
@@ -118,21 +170,41 @@ def can_read_document(
         return valid
 
     scope = KnowledgeScope(str(_document_value(document, "scope")).strip().upper())
-    if scope is KnowledgeScope.GLOBAL:
-        return KnowledgeAccessDecision(True, "global_active")
+    allowed_reason = "global_active"
+    if scope is not KnowledgeScope.GLOBAL:
+        company_id, _ = _optional_positive_id(_document_value(document, "company_id"))
+        selected_company_id, selected_company_valid = _optional_positive_id(current_company_id)
+        if not selected_company_valid or company_id != selected_company_id:
+            return KnowledgeAccessDecision(False, "company_mismatch")
+        allowed_reason = "company_match"
+        if scope is KnowledgeScope.USER:
+            document_user_id, _ = _optional_positive_id(_document_value(document, "user_id"))
+            selected_user_id, selected_user_valid = _optional_positive_id(current_user_id)
+            if not selected_user_valid or document_user_id != selected_user_id:
+                return KnowledgeAccessDecision(False, "user_mismatch")
+            allowed_reason = "user_match"
 
-    company_id, _ = _optional_positive_id(_document_value(document, "company_id"))
-    selected_company_id, selected_company_valid = _optional_positive_id(current_company_id)
-    if not selected_company_valid or company_id != selected_company_id:
-        return KnowledgeAccessDecision(False, "company_mismatch")
-    if scope is KnowledgeScope.COMPANY:
-        return KnowledgeAccessDecision(True, "company_match")
-
-    document_user_id, _ = _optional_positive_id(_document_value(document, "user_id"))
-    selected_user_id, selected_user_valid = _optional_positive_id(current_user_id)
-    if not selected_user_valid or document_user_id != selected_user_id:
-        return KnowledgeAccessDecision(False, "user_mismatch")
-    return KnowledgeAccessDecision(True, "user_match")
+    classification = validate_document_classification(document)
+    if not classification.allowed:
+        return classification
+    source_kind, source_kind_error = _source_kind(document)
+    if source_kind_error is not None:
+        return source_kind_error
+    permissions = _permissions(permission_codes)
+    requires_technical_detail = (
+        source_kind == _SOURCE_KIND_PROJECT_SOURCE
+        or classification.reason_code == "erp_db_internal_classification"
+    )
+    if requires_technical_detail and not technical_detail_mode:
+        return KnowledgeAccessDecision(False, "technical_detail_mode_required")
+    if requires_technical_detail and KNOWLEDGE_PROJECT_SOURCE_READ not in permissions:
+        return KnowledgeAccessDecision(False, "missing_project_source_read")
+    if (
+        classification.reason_code == "erp_db_internal_classification"
+        and KNOWLEDGE_ERP_DB_READ not in permissions
+    ):
+        return KnowledgeAccessDecision(False, "missing_erp_db_read")
+    return KnowledgeAccessDecision(True, allowed_reason)
 
 
 def can_manage_document(
@@ -150,6 +222,9 @@ def can_manage_document(
     valid = validate_document_scope(document)
     if not valid.allowed:
         return valid
+    classification = validate_document_classification(document)
+    if not classification.allowed:
+        return classification
 
     permissions = _permissions(permission_codes)
     scope = KnowledgeScope(str(_document_value(document, "scope")).strip().upper())

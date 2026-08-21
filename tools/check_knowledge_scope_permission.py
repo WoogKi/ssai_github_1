@@ -10,14 +10,31 @@ sys.path.insert(0, str(ROOT))
 
 from app.services.knowledge_scope_policy import (  # noqa: E402
     KNOWLEDGE_COMPANY_MANAGE,
+    KNOWLEDGE_ERP_DB_READ,
     KNOWLEDGE_GLOBAL_MANAGE,
+    KNOWLEDGE_PROJECT_SOURCE_READ,
     can_manage_document,
     can_read_document,
 )
 
 
-def _document(scope: str, *, company_id: int | None = None, user_id: int | None = None, status: str = "ACTIVE") -> dict:
-    return {"scope": scope, "company_id": company_id, "user_id": user_id, "status": status}
+def _document(
+    scope: str,
+    *,
+    company_id: int | None = None,
+    user_id: int | None = None,
+    status: str = "ACTIVE",
+    classification: object = "GENERAL",
+    source_kind: object = "DOCUMENT",
+) -> dict:
+    return {
+        "scope": scope,
+        "company_id": company_id,
+        "user_id": user_id,
+        "status": status,
+        "knowledge_classification": classification,
+        "source_kind": source_kind,
+    }
 
 
 def _assert(decision, allowed: bool, reason: str) -> None:
@@ -48,12 +65,42 @@ def main() -> None:
     _assert(can_read_document(document=_document("COMPANY", company_id=0), current_user_id=11, current_company_id=4, permission_codes=rag), False, "company_scope_invalid_company")
     _assert(can_read_document(document=_document("USER", company_id=4, user_id=-1), current_user_id=11, current_company_id=4, permission_codes=rag), False, "user_scope_invalid_owner")
 
+    project_source = _document("GLOBAL", source_kind="PROJECT_SOURCE")
+    _assert(can_read_document(document=project_source, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ]), False, "technical_detail_mode_required")
+    _assert(can_read_document(document=project_source, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE"], technical_detail_mode=True), False, "missing_project_source_read")
+    _assert(can_read_document(document=project_source, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ], technical_detail_mode=True), True, "global_active")
+    _assert(can_read_document(document=_document("GLOBAL", source_kind="SOURCE"), current_user_id=11, current_company_id=4, permission_codes=rag), False, "invalid_source_kind")
+    _assert(can_read_document(document=_document("GLOBAL"), current_user_id=11, current_company_id=4, permission_codes=rag, technical_detail_mode="true"), False, "invalid_technical_detail_mode")
+
+    erp_document = _document("GLOBAL", classification="ERP_DB_INTERNAL")
+    role_permissions = {
+        "SYSTEM_ADMIN": ["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ, KNOWLEDGE_ERP_DB_READ],
+        "SSART_MANAGER": ["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ, KNOWLEDGE_ERP_DB_READ],
+        "SSART_STAFF": ["RAG_USE"],
+        "WHOLESALE_MANAGER": ["RAG_USE"],
+        "WHOLESALE_STAFF": ["RAG_USE"],
+        "WHOLESALE_READONLY": [],
+    }
+    for role_code in ("SYSTEM_ADMIN", "SSART_MANAGER"):
+        _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code]), False, "technical_detail_mode_required")
+        _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code], technical_detail_mode=True), True, "global_active")
+    for role_code in ("SSART_STAFF", "WHOLESALE_MANAGER", "WHOLESALE_STAFF"):
+        _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code], technical_detail_mode=True), False, "missing_project_source_read")
+    _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions["WHOLESALE_READONLY"]), False, "missing_rag_use")
+    company_erp = _document("COMPANY", company_id=4, classification="ERP_DB_INTERNAL")
+    _assert(can_read_document(document=company_erp, current_user_id=11, current_company_id=4, permission_codes=role_permissions["SYSTEM_ADMIN"], technical_detail_mode=True), True, "company_match")
+    _assert(can_read_document(document=company_erp, current_user_id=11, current_company_id=6, permission_codes=role_permissions["SYSTEM_ADMIN"], technical_detail_mode=True), False, "company_mismatch")
+    for malformed in (None, "", "SECRET", 1, True):
+        _assert(can_read_document(document=_document("GLOBAL", classification=malformed), current_user_id=11, current_company_id=4, permission_codes=role_permissions["SYSTEM_ADMIN"], technical_detail_mode=True), False, "invalid_knowledge_classification")
+
     _assert(can_manage_document(document=_document("GLOBAL"), current_company_id=4, permission_codes=[KNOWLEDGE_GLOBAL_MANAGE]), True, "global_manage_allowed")
     _assert(can_manage_document(document=_document("GLOBAL"), current_company_id=4, permission_codes=["USER_MANAGE_ALL"]), False, "missing_global_manage")
     _assert(can_manage_document(document=_document("COMPANY", company_id=4), current_company_id=4, permission_codes=[KNOWLEDGE_COMPANY_MANAGE]), True, "company_manage_allowed")
     _assert(can_manage_document(document=_document("COMPANY", company_id=4), current_company_id=6, permission_codes=[KNOWLEDGE_COMPANY_MANAGE]), False, "company_mismatch")
     _assert(can_manage_document(document=_document("USER", company_id=4, user_id=11), current_company_id=4, permission_codes=["UPLOAD_FILE"]), False, "user_scope_management_not_defined")
-    print("RESULT OK tests=25")
+    _assert(can_manage_document(document=_document("GLOBAL", classification="ERP_DB_INTERNAL"), current_company_id=4, permission_codes=[KNOWLEDGE_GLOBAL_MANAGE]), True, "global_manage_allowed")
+    _assert(can_manage_document(document=_document("GLOBAL", classification="INVALID"), current_company_id=4, permission_codes=[KNOWLEDGE_GLOBAL_MANAGE]), False, "invalid_knowledge_classification")
+    print("RESULT OK tests=49")
 
 
 if __name__ == "__main__":
