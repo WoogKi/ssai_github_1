@@ -34,6 +34,7 @@ APPROVAL_APPROVED = "APPROVED"
 APPROVAL_PENDING = "PENDING"
 DOCUMENT_ACTIVE = "ACTIVE"
 DOCUMENT_SUPERSEDED = "SUPERSEDED"
+DOCUMENT_RETIRED = "RETIRED"
 SOURCE_KIND_DOCUMENT = "DOCUMENT"
 SOURCE_KIND_PROJECT_SOURCE = "PROJECT_SOURCE"
 _SOURCE_KINDS = {SOURCE_KIND_DOCUMENT, SOURCE_KIND_PROJECT_SOURCE}
@@ -710,6 +711,37 @@ class KnowledgeDocumentRepository:
             raise KnowledgeManagementDenied(decision.reason_code)
         return self._approve_target(documents, target)
 
+    def retire_checked(
+        self,
+        *,
+        document_id: str,
+        version: int,
+        current_company_id: int | None,
+        permission_codes: Iterable[str] | None,
+    ) -> tuple[DocumentSource, bool]:
+        """Retire one exact active document after the same management check."""
+        documents = self._read_manifest()
+        target = self._find_document(documents, document_id)
+        if int(version) != target.version:
+            raise ValueError("Knowledge document version does not match retire request")
+        decision = can_manage_document(
+            document=target.policy_document(),
+            current_company_id=current_company_id,
+            permission_codes=permission_codes,
+        )
+        if not decision.allowed:
+            raise KnowledgeManagementDenied(decision.reason_code)
+        if target.status == DOCUMENT_RETIRED:
+            return target, False
+        if target.status != DOCUMENT_ACTIVE:
+            raise ValueError("Only an active Knowledge document can be retired")
+        retired = DocumentSource(**{**asdict(target), "status": DOCUMENT_RETIRED})
+        self._write_manifest([
+            retired if source.document_id == retired.document_id else source
+            for source in documents
+        ])
+        return retired, True
+
     def _approve_trusted(self, *, document_id: str) -> DocumentSource:
         """Internal/fixture boundary after authorization has already succeeded."""
         documents = self._read_manifest()
@@ -934,6 +966,14 @@ class KnowledgeDocumentRepository:
                 technical_detail_mode=technical_detail_mode,
             )
             if not decision.allowed:
+                continue
+            # Operating Chat supplies source_repo_root. Never read a stale
+            # PROJECT_SOURCE artifact into that request's LLM context.
+            if (
+                source.source_kind == SOURCE_KIND_PROJECT_SOURCE
+                and self._source_repo_root is not None
+                and not self._project_source_is_current(source)
+            ):
                 continue
             artifact = self._read_artifact(source.content_hash)
             for section in artifact.sections:

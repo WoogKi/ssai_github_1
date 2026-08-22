@@ -275,7 +275,21 @@ from app.ui.ssai_login import (
     require_login,
     require_permission,
     get_current_user,
+    get_current_permissions,
     get_selected_company,
+)
+from app.services.knowledge_document_service import (
+    KnowledgeDocumentRepository,
+    build_knowledge_chat_request_context,
+)
+from app.ui.knowledge_chat_adapter import (
+    build_knowledge_prompt,
+    parse_explicit_knowledge_request,
+)
+from app.ui.knowledge_chat_evidence import (
+    KNOWLEDGE_ANSWER_MESSAGE_TYPE,
+    build_knowledge_answer_display,
+    build_knowledge_answer_message,
 )
 
 from app.services.ssai_storage_service import (
@@ -1576,6 +1590,10 @@ def search_messages_in_room(room: dict, pattern: re.Pattern, roles: set[str]):
     """room['messages']에서 role 필터와 정규식 패턴으로 검색 결과 리스트 생성"""
     results = []
     for i, m in enumerate(room.get("messages", [])):
+        # Knowledge evidence is re-authorized only by its dedicated renderer.
+        # Do not expose it through the generic raw-message search surface.
+        if str(m.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE:
+            continue
         role = m.get("role", "assistant")
         if role not in roles:
             continue
@@ -2174,9 +2192,11 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
             flags=re.IGNORECASE,
         ).strip()
         duty_name = str(profile.get("duty_name") or "").strip()
+        sims_user_name = str(profile.get("sims_user_name") or "").strip()
         user_type = str(profile.get("user_type") or "").strip()
 
         role_text = "관리자" if user_type.startswith("SSART") else (duty_name or "담당자")
+        name_part = f" {sims_user_name}" if sims_user_name else ""
 
         if user_type.startswith("SSART"):
             meaning = (
@@ -2185,7 +2205,7 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
             )
         else:
             meaning = (
-                f"안녕하세요. {company_display_name} {role_text}님, "
+                f"안녕하세요. {company_display_name} {role_text}{name_part}님, "
                 f"저는 유통분야 전문 AI가 되려는 {company_display_name}의 SSAI입니다."
             )
 
@@ -2245,7 +2265,13 @@ def _generate_login_greeting(profile: dict[str, Any]) -> str:
         if len(text) > 220:
             text = text[:220].rstrip() + "..."
 
-        return _clean_generated_greeting(text, fallback)
+        cleaned = _clean_generated_greeting(text, fallback)
+        if not user_type.startswith("SSART"):
+            required_identity = (company_display_name, role_text, sims_user_name)
+            if any(term and term not in cleaned for term in required_identity):
+                log.info("[auth.greeting] phase=identity_fallback generated_identity_complete=False")
+                return fallback
+        return cleaned
 
     except Exception as exc:
         if llm_started is not None:
@@ -2387,8 +2413,23 @@ def _truncate(s: str, limit: int = MAX_PREVIEW_CHARS) -> str:
     s = s or ""
     return (s[:limit] + f"\n\n... (미리보기 {limit}자 제한으로 이후 생략)") if len(s) > limit else s
 
+MAX_ATTACHMENT_ANALYSIS_CHARS = 20_000
+
+
 def _out(text: str, preview: bool = True) -> str:
-    return _truncate(text) if preview else (text or "")
+    if preview:
+        return _truncate(text)
+    text = text or ""
+    if len(text) > MAX_ATTACHMENT_ANALYSIS_CHARS:
+        return text[:MAX_ATTACHMENT_ANALYSIS_CHARS].rstrip() + "\n\n... (분석 추출 20000자 제한으로 이후 생략)"
+    return text
+
+
+def _tabular_text_for_attachment(df: pd.DataFrame, *, preview: bool) -> str:
+    """Render bounded table extraction without exposing missing values as NaN."""
+    rows = 20 if preview else 200
+    frame = df.head(rows).copy().astype("object")
+    return frame.where(pd.notna(frame), "").to_string()
 
 def _bytes_len(uploaded_file) -> int:
     pos = uploaded_file.tell()
@@ -2723,6 +2764,11 @@ def _build_current_room_compact_context(limit_chars: int = 5000) -> str:
         lines: list[str] = []
         for msg in _build_room_render_messages(room)[-18:]:
             if not isinstance(msg, dict):
+                continue
+            # A Knowledge answer is not ordinary-chat history. Its evidence is
+            # rendered only after a current authorization check, and must never
+            # be fed to a later general LLM request through room compaction.
+            if str(msg.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE:
                 continue
             meta = msg.get("meta") if isinstance(msg.get("meta"), dict) else {}
             role = str(msg.get("role") or meta.get("role") or "")
@@ -7389,6 +7435,91 @@ def _message_meta(message_type: str = "chat") -> dict[str, Any]:
     return meta
 
 
+def _knowledge_request_context_for_room(room: dict[str, Any], *, technical_detail_mode: bool):
+    """Capture selected-company identity once for one explicit Knowledge request."""
+    user = get_current_user()
+    company = get_selected_company() or {}
+    return build_knowledge_chat_request_context(
+        user_id=getattr(user, "user_id", None),
+        company_id=company.get("company_id") if isinstance(company, dict) else None,
+        permission_codes=get_current_permissions(),
+        room_owner_user_id=room.get("user_id") if isinstance(room, dict) else None,
+        room_company_id=room.get("company_id") if isinstance(room, dict) else None,
+        technical_detail_mode=technical_detail_mode,
+    )
+
+
+def _knowledge_repository_for_chat() -> KnowledgeDocumentRepository:
+    return KnowledgeDocumentRepository(source_repo_root=_ROOT)
+
+
+def _render_knowledge_answer_message(message: dict[str, Any], *, room: dict[str, Any]) -> bool:
+    """Use the same re-authorization/display boundary for live and history."""
+    payload = message.get("knowledge_evidence") if isinstance(message, dict) else None
+    technical_detail_mode = bool(payload.get("technical_detail_mode")) if isinstance(payload, dict) else False
+    display = build_knowledge_answer_display(
+        repository=_knowledge_repository_for_chat(),
+        message=message,
+        request_context=_knowledge_request_context_for_room(
+            room,
+            technical_detail_mode=technical_detail_mode,
+        ),
+    )
+    if not display.visible:
+        log.info("[knowledge.chat.display] hidden reason=%s", display.reason_code)
+        return True
+    with st.chat_message("assistant"):
+        st.markdown(display.content)
+        st.caption("근거: " + " · ".join(citation.label for citation in display.citations))
+        for notice in display.conflict_notices:
+            st.info(notice.message)
+    return True
+
+
+def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
+    """Handle one explicit /knowledge request without changing ordinary chat routing."""
+    request_context = _knowledge_request_context_for_room(
+        room,
+        technical_detail_mode=route.technical_detail_mode,
+    )
+    repository = _knowledge_repository_for_chat()
+    packet = repository.retrieve_for_chat(query=route.query, request_context=request_context)
+    if packet.reason_code != "ready" or not packet.text or not packet.citations:
+        _sync_room_meta(room, materialize=True)
+        save_chat_rooms()
+        st.info("승인된 Knowledge에서 답변 근거를 찾지 못했습니다.")
+        log.info("[knowledge.chat] result=no_match reason=%s", packet.reason_code)
+        return True
+    try:
+        response = call_chat_protected(
+            messages=build_knowledge_prompt(query=route.query, packet=packet),
+            model=EXPECTED_LM_MODEL or st.session_state.get("selected_model") or "",
+            temperature=0.2,
+            stream=False,
+            max_retry=0,
+        )
+        answer = str(extract_chat_completion_text(response).get("content") or "").strip()
+        message = build_knowledge_answer_message(
+            repository=repository,
+            answer=answer,
+            packet=packet,
+            request_context=request_context,
+            message_id=str(uuid.uuid4()),
+            timestamp=make_ts(),
+        )
+    except Exception as exc:
+        log.warning("[knowledge.chat] answer_not_saved error_type=%s", type(exc).__name__)
+        st.error("Knowledge 답변을 안전하게 생성하지 못했습니다.")
+        return True
+    message["seq"] = _next_seq()
+    room.setdefault("messages", []).append(message)
+    _sync_room_meta(room, materialize=True)
+    save_chat_rooms()
+    _render_knowledge_answer_message(message, room=room)
+    log.info("[knowledge.chat] result=stored citations=%s technical_detail=%s", len(packet.citations), route.technical_detail_mode)
+    return True
+
+
 def _consume_company_change_notice(room: dict[str, Any]) -> None:
     """
     ssai_login.py에서 큐잉한 회사 변경 안내를 현재 채팅방에 표시/저장한다.
@@ -7803,6 +7934,7 @@ _CHAT_PARTITION_MESSAGE_ALLOW_KEYS = {
     "payload_id",
     "source_key",
     "source_action",
+    "knowledge_evidence",
     "meta",
 }
 
@@ -9340,8 +9472,9 @@ def process_file(file, preview: bool = True) -> str:
                     df = pd.read_csv(io.BytesIO(raw), encoding=enc, low_memory=False, sep=sep, nrows=200, on_bad_lines="skip")
             else:
                 df = pd.read_csv(file, low_memory=False, nrows=200, on_bad_lines="skip")
-            preview_txt = df.head(20).to_string()
-            return _cache_and_return("데이터 미리보기(상위 20행):\n" + (_truncate(preview_txt) if preview else preview_txt))
+            extracted_txt = _tabular_text_for_attachment(df, preview=preview)
+            label = "데이터 미리보기(상위 20행):" if preview else "분석 추출(상위 200행):"
+            return _cache_and_return(_out(label + "\n" + extracted_txt, preview))
         except Exception as e:
             return _cache_and_return(f"[CSV 읽기 오류] {e}")
 
@@ -9358,8 +9491,9 @@ def process_file(file, preview: bool = True) -> str:
             first_name = xl.sheet_names[0]
             first_df = xl.parse(first_name, nrows=200)
             header = f"[시트 {len(xl.sheet_names)}개 중 첫 시트: {first_name}]\n"
-            preview_txt = first_df.head(20).to_string()
-            return _cache_and_return(header + "데이터 미리보기(상위 20행):\n" + (_truncate(preview_txt) if preview else preview_txt))
+            extracted_txt = _tabular_text_for_attachment(first_df, preview=preview)
+            label = "데이터 미리보기(상위 20행):" if preview else "분석 추출(상위 200행):"
+            return _cache_and_return(_out(header + label + "\n" + extracted_txt, preview))
         except ImportError:
             return _cache_and_return("`.xlsx`를 읽으려면 `openpyxl`이 필요합니다. 설치: `pip install openpyxl`")
         except Exception as e:
@@ -9370,8 +9504,9 @@ def process_file(file, preview: bool = True) -> str:
         try:
             file.seek(0)
             df = pd.read_excel(file, engine="xlrd")
-            preview_txt = df.head(20).to_string()
-            return _cache_and_return("데이터 미리보기(상위 20행):\n" + (_truncate(preview_txt) if preview else preview_txt))
+            extracted_txt = _tabular_text_for_attachment(df, preview=preview)
+            label = "데이터 미리보기(상위 20행):" if preview else "분석 추출(상위 200행):"
+            return _cache_and_return(_out(label + "\n" + extracted_txt, preview))
         except ImportError:
             return _cache_and_return("`.xls`는 `xlrd==1.2.0`이 필요합니다. 설치: `pip install xlrd==1.2.0`")
         except Exception as e:
@@ -11082,15 +11217,20 @@ if user_input and user_input.strip():
     user_input = user_input.strip()
 
     st.session_state.pop("__sims_flash", None)
-    # ✅ 키보드 보정(입력 버블에도 반영)
-    try:
-        from app.sims.nlq.nlq_router import keyboard_fix
-        fixed = keyboard_fix(user_input)
-        if fixed and fixed != user_input:
-            log.debug("[chat] keyboard-fix(user_input): %r -> %r", user_input[:60], fixed[:60])
-            user_input = fixed
-    except Exception:
-        pass
+    # Explicit Knowledge commands own their command/query bytes. The normal
+    # Korean/English keyboard correction stays on every ordinary Chat path.
+    raw_knowledge_route = parse_explicit_knowledge_request(user_input)
+    if raw_knowledge_route is None:
+        try:
+            from app.sims.nlq.nlq_router import keyboard_fix
+            fixed = keyboard_fix(user_input)
+            if fixed and fixed != user_input:
+                log.debug("[chat] keyboard-fix(user_input): %r -> %r", user_input[:60], fixed[:60])
+                user_input = fixed
+        except Exception:
+            pass
+    else:
+        log.debug("[knowledge.chat] preserve_explicit_command technical_detail=%s", raw_knowledge_route.technical_detail_mode)
 
     st.session_state["__did_user_input"] = True
 
@@ -11153,6 +11293,15 @@ if user_input and user_input.strip():
         **_message_meta("chat"),
     })
 
+    # A valid slash command is already persisted in its room. Queue its
+    # dedicated adapter now, before any current-table, SIMS, NLQ, or ERP
+    # router can inspect query payload words.
+    if raw_knowledge_route is not None:
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        st.session_state["__queue_ai"] = True
+        log.info("[knowledge.chat] explicit_command_queued technical_detail=%s", raw_knowledge_route.technical_detail_mode)
+        st.rerun()
 #   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
     # ✅ (D) 컨텍스트 메타 질문은 NLQ/LLM 전에 즉답 처리 (삽입 위치 고정)
 #    if _try_answer_ctx_meta_question(
@@ -11621,6 +11770,9 @@ with st.container():
 
     def _render_message(m: dict) -> bool:
         meta = (m.get("meta") or {})
+
+        if str(m.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE:
+            return _render_knowledge_answer_message(m, room=current_room)
 
         if str(m.get("type") or "").strip().lower() == "dashboard_lite":
             dashboard_item = dict(m)
@@ -12701,15 +12853,19 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
             if not msgs:
                 msgs = [{"role": "user", "content": "You are a helpful assistant."}]
 
-        # ✅ 스트리밍 + 저장까지 내부에서 처리
+        # Explicit Knowledge commands are isolated from ordinary Chat/NLQ routing.
+        knowledge_route = parse_explicit_knowledge_request(last_user_text)
         with pending_area:
-            stream_and_append_assistant(
-                messages_for_ai=msgs,
-                room=current_room,
-                temperature=0.2,
-                history_channel=("sims_messages" if use_sims_hist else "gen_messages"),
-            )
-            log.debug("[chat] stream_and_append_assistant finished")
+            if knowledge_route is not None:
+                _run_explicit_knowledge_chat(knowledge_route, room=current_room)
+            else:
+                stream_and_append_assistant(
+                    messages_for_ai=msgs,
+                    room=current_room,
+                    temperature=0.2,
+                    history_channel=("sims_messages" if use_sims_hist else "gen_messages"),
+                )
+                log.debug("[chat] stream_and_append_assistant finished")
 # =========================
 
 st.write("")  # 시각적 여백
@@ -12810,12 +12966,12 @@ if uploaded_files:
             attached_saved_names.append(save_path.name)
             cleanup_uploads(upload_dir=save_path.parent)
             
-            # 텍스트 추출(미리보기 길이 보호)
+            # 텍스트 추출(분석용 bounded extraction)
             try:
                 uf.seek(0)
             except Exception:
                 pass
-            extracted = process_file(uf, preview=True)
+            extracted = process_file(uf, preview=False)
             attached_texts.append(f"### {uf.name}\n{extracted}")
 
             progress.progress(idx/total, text=f"분석 중... ({idx}/{total})")
