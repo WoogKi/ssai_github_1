@@ -1976,7 +1976,11 @@ def _patch_push_function(capture: PayloadCapture) -> None:
 def run_default_period_policy_checks() -> list[CheckResult]:
     """Exercise canonical period policy without a service or database call."""
     from app.services.io_nlq import apply_nlq_default_period_policy
-    from app.sims.nlq.nlq_router import _build_io_query_summary
+    from app.sims.nlq.nlq_router import (
+        _apply_analytics_period_defaults,
+        _build_io_query_summary,
+        _resolve_analytics_action,
+    )
 
     results: list[CheckResult] = []
     reference_day = date(2026, 8, 11)
@@ -2180,10 +2184,13 @@ def run_default_period_policy_checks() -> list[CheckResult]:
         )
     )
 
-    from app.services.io_nlq import resolve_io_nlq
+    from app.services.io_nlq import extract_params, resolve_io_nlq
 
     natural_period_cases = (
         ("오늘 입고현황", "20260811", "20260811", "today"),
+        ("어제 입고현황", "20260810", "20260810", "yesterday"),
+        ("오늘 출고현황", "20260811", "20260811", "today"),
+        ("어제 출고현황", "20260810", "20260810", "yesterday"),
         ("당일 입고현황", "20260811", "20260811", "today"),
         ("하루 입고현황", "20260811", "20260811", "today"),
         ("최근 1일 입고현황", "20260811", "20260811", "today"),
@@ -2193,6 +2200,11 @@ def run_default_period_policy_checks() -> list[CheckResult]:
         ("8월 입고현황", "20260801", "20260831", "calendar_month"),
         ("이번달 입고현황", "20260801", "20260831", "calendar_month"),
         ("이번 월 입고현황", "20260801", "20260831", "calendar_month"),
+        ("지난달 입고현황", "20260701", "20260731", "calendar_month"),
+        ("지난 달 입고현황", "20260701", "20260731", "calendar_month"),
+        ("지난달 출고현황", "20260701", "20260731", "calendar_month"),
+        ("이번 달 출고현황", "20260801", "20260831", "calendar_month"),
+        ("이번 달 매출 추이", "20260801", "20260831", "calendar_month"),
         ("2026년 8월 입고현황", "20260801", "20260831", "calendar_month"),
         ("입고현황 202608", "20260801", "20260831", "calendar_month"),
     )
@@ -2215,6 +2227,53 @@ def run_default_period_policy_checks() -> list[CheckResult]:
             )
         )
 
+    for query, expected_from, expected_to in (
+        ("지난달 매출 추이", "20260701", "20260731"),
+        ("지난 달 매출 추이", "20260701", "20260731"),
+        ("이번 달 매출 추이", "20260801", "20260831"),
+    ):
+        analytics_action = _resolve_analytics_action(query)
+        analytics_params = _apply_analytics_period_defaults(
+            extract_params(query, today=reference_day),
+            query,
+        )
+        results.append(
+            CheckResult(
+                f"relative-month sales trend keeps analytics action and period: {query}",
+                analytics_action == "품목별 매출 추세 분석"
+                and analytics_params.get("date_from") == expected_from
+                and analytics_params.get("date_to") == expected_to
+                and analytics_params.get("month_from") == expected_from[:6]
+                and analytics_params.get("month_to") == expected_to[:6],
+                f"action={analytics_action!r}, params={analytics_params!r}",
+            )
+        )
+    for default_action in ("입고명세 조회", "출고명세 조회"):
+        default_params, default_policy = apply_nlq_default_period_policy(
+            {},
+            default_action,
+            today=reference_day,
+        )
+        results.append(
+            CheckResult(
+                f"relative-day absent {default_action} keeps default period",
+                default_policy.get("final_date_from") == "20260811"
+                and default_policy.get("final_date_to") == "20260811"
+                and default_policy.get("default_policy") == "today"
+                and default_policy.get("explicit_period_present") is False
+                and default_policy.get("auto_applied") is True,
+                str(default_policy),
+            )
+        )
+    io_source = (Path(__file__).resolve().parents[1] / "app" / "services" / "io_nlq.py").read_text(encoding="utf-8")
+    results.append(
+        CheckResult(
+            "relative day parser uses shared operating KST clock",
+            "from app.services.datetime_tool import operating_now" in io_source
+            and "current_day = operating_now().date()" in io_source,
+            "Date/Time Tool operating_now contract",
+        )
+    )
     boundary_cases = (
         ("최근 한달 입고현황", date(2027, 1, 1), "20261202", "20270101"),
         ("최근 한달 입고현황", date(2024, 3, 1), "20240131", "20240301"),

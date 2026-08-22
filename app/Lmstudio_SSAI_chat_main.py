@@ -282,6 +282,14 @@ from app.services.knowledge_document_service import (
     KnowledgeDocumentRepository,
     build_knowledge_chat_request_context,
 )
+from app.services.datetime_tool import resolve_datetime_question
+from app.services.web_search_service import (
+    build_web_search_prompt,
+    parse_web_search_request,
+    render_web_search_answer,
+    search_web,
+)
+
 from app.ui.knowledge_chat_adapter import (
     build_knowledge_prompt,
     parse_explicit_knowledge_request,
@@ -7520,6 +7528,70 @@ def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
     return True
 
 
+def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
+    """Handle one fresh external-information request before ordinary LLM fallback."""
+    response = search_web(route)
+    if response.status != "ready":
+        messages = {
+            "configuration_missing": "외부 Web Search 설정이 없어 최신 정보를 확인할 수 없습니다.",
+            "no_results": "외부 Web Search에서 확인 가능한 결과를 찾지 못했습니다.",
+        }
+        content = messages.get(response.reason_code, "외부 Web Search를 완료하지 못했습니다. 최신 사실을 확인하지 않았습니다.")
+        room.setdefault("messages", []).append({
+            "id": str(uuid.uuid4()),
+            "role": "assistant",
+            "content": content,
+            "time": make_ts(),
+            "seq": _next_seq(),
+            **_message_meta("web_search"),
+            "meta": {"web_search": True, "status": response.status, "reason_code": response.reason_code},
+        })
+        _sync_room_meta(room, materialize=True)
+        save_chat_rooms()
+        st.error(content)
+        log.info("[web.search] result=%s reason=%s", response.status, response.reason_code)
+        return True
+
+    try:
+        llm_response = call_chat_protected(
+            messages=build_web_search_prompt(route=route, response=response),
+            model=EXPECTED_LM_MODEL or st.session_state.get("selected_model") or "",
+            temperature=0.2,
+            stream=False,
+            max_retry=0,
+        )
+        summary = str(extract_chat_completion_text(llm_response).get("content") or "").strip()
+    except Exception as exc:
+        log.warning("[web.search] summary_failed error_type=%s", type(exc).__name__)
+        summary = "검색 결과를 LLM으로 요약하지 못했습니다. 아래 출처를 직접 확인해 주세요."
+
+    content = render_web_search_answer(summary=summary, response=response)
+    room.setdefault("messages", []).append({
+        "id": str(uuid.uuid4()),
+        "role": "assistant",
+        "content": content,
+        "time": make_ts(),
+        "seq": _next_seq(),
+        **_message_meta("web_search"),
+        "meta": {
+            "web_search": True,
+            "status": "ready",
+            "query": route.query,
+            "reference_at": route.reference_at.isoformat(),
+            "result_count": len(response.results),
+            "sources": [
+                {"title": item.title, "url": item.url, "source": item.source, "published_at": item.published_at}
+                for item in response.results
+            ],
+        },
+    })
+    _sync_room_meta(room, materialize=True)
+    save_chat_rooms()
+    with st.chat_message("assistant"):
+        st.markdown(content)
+    log.info("[web.search] result=stored sources=%s", len(response.results))
+    return True
+
 def _consume_company_change_notice(room: dict[str, Any]) -> None:
     """
     ssai_login.py에서 큐잉한 회사 변경 안내를 현재 채팅방에 표시/저장한다.
@@ -11232,6 +11304,13 @@ if user_input and user_input.strip():
     else:
         log.debug("[knowledge.chat] preserve_explicit_command technical_detail=%s", raw_knowledge_route.technical_detail_mode)
 
+    # Strictly recognize standalone calendar/time questions after ordinary
+    # keyboard correction, but before any SIMS/NLQ/current-table router.
+    datetime_answer = resolve_datetime_question(user_input)
+    web_search_route = None
+    if datetime_answer is None and raw_knowledge_route is None:
+        web_search_route = parse_web_search_request(user_input)
+
     st.session_state["__did_user_input"] = True
 
     is_pending_product_pick = _is_pending_product_pick_text(user_input)
@@ -11293,6 +11372,23 @@ if user_input and user_input.strip():
         **_message_meta("chat"),
     })
 
+    if datetime_answer is not None:
+        current_room.setdefault("messages", []).append({
+            "id": str(uuid.uuid4()),
+            "role": "assistant",
+            "content": datetime_answer.text,
+            "time": make_ts(),
+            "seq": _next_seq(),
+            **_message_meta("datetime_tool"),
+        })
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        log.info(
+            "[datetime.tool] result=stored intent=%s timezone=%s llm_call_count=0",
+            datetime_answer.intent,
+            datetime_answer.timezone_name,
+        )
+        st.rerun()
     # A valid slash command is already persisted in its room. Queue its
     # dedicated adapter now, before any current-table, SIMS, NLQ, or ERP
     # router can inspect query payload words.
@@ -11316,6 +11412,17 @@ if user_input and user_input.strip():
 #        st.session_state["__queue_ai"] = False
 #        st.rerun()
 #   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    if web_search_route is not None:
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        st.session_state["__queue_ai"] = True
+        log.info(
+            "[web.search] queued period=%s reference_at=%s",
+            web_search_route.period.kind,
+            web_search_route.reference_at.isoformat(),
+        )
+        st.rerun()
 
     # ✅ 제품 후보표가 열려 있을 때 '취소'도 SIMS/NLQ 입력으로 인정
     pending_pick_for_cancel = st.session_state.get("__io_pending_product_pick")
@@ -12855,9 +12962,12 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
 
         # Explicit Knowledge commands are isolated from ordinary Chat/NLQ routing.
         knowledge_route = parse_explicit_knowledge_request(last_user_text)
+        web_search_route = None if knowledge_route is not None else parse_web_search_request(last_user_text)
         with pending_area:
             if knowledge_route is not None:
                 _run_explicit_knowledge_chat(knowledge_route, room=current_room)
+            elif web_search_route is not None:
+                _run_web_search_chat(web_search_route, room=current_room)
             else:
                 stream_and_append_assistant(
                     messages_for_ai=msgs,

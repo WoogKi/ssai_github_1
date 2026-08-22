@@ -387,7 +387,12 @@ def _extract_natural_period(
     raw = _norm(text)
     if not raw:
         return {}
-    current_day = today or date.today()
+    if today is None:
+        # Ordinary NLQ must share the operating KST boundary with Date/Time Tool.
+        from app.services.datetime_tool import operating_now
+        current_day = operating_now().date()
+    else:
+        current_day = today
 
     if re.search(r"(?:최근\s*)?(?:한\s*달|1\s*개월)", raw):
         return {
@@ -396,16 +401,26 @@ def _extract_natural_period(
             _NLQ_PERIOD_KIND_KEY: "rolling_1month",
         }
 
-    if re.search(r"(?:^|\s)(?:오늘|당일|하루|최근\s*1\s*일)(?=\s|$)", raw):
-        value = current_day.strftime("%Y%m%d")
+    relative_day = re.search(r"(?:^|\s)(오늘|어제|당일|하루|최근\s*1\s*일)(?=\s|$)", raw)
+    if relative_day:
+        token = relative_day.group(1)
+        target_day = current_day - timedelta(days=1) if token == "어제" else current_day
+        value = target_day.strftime("%Y%m%d")
         return {
             "date_from": value,
             "date_to": value,
-            _NLQ_PERIOD_KIND_KEY: "today",
+            _NLQ_PERIOD_KIND_KEY: "yesterday" if token == "어제" else "today",
         }
 
-    if re.search(r"(?:이번\s*달|이번\s*월)", raw):
-        yyyymm = current_day.strftime("%Y%m")
+    relative_month = re.search(r"(이번|지난)\s*(?:달|월)", raw)
+    if relative_month:
+        from app.services.datetime_tool import month_range
+
+        period = month_range(
+            current_day,
+            offset_months=-1 if relative_month.group(1) == "지난" else 0,
+        )
+        yyyymm = period.start.strftime("%Y%m")
         return {
             "month_from": yyyymm,
             "month_to": yyyymm,
@@ -438,8 +453,8 @@ def _strip_nlq_period_expressions(text: str) -> str:
     out = str(text or "")
     patterns = (
         r"(?:최근\s*)?(?:한\s*달|1\s*개월)",
-        r"(?:오늘|당일|하루|최근\s*1\s*일)",
-        r"(?:이번\s*달|이번\s*월)",
+        r"(?:오늘|어제|당일|하루|최근\s*1\s*일)",
+        r"(?:이번|지난)\s*(?:달|월)",
         r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
         r"(?<!\d)\d{1,2}\s*월(?!\s*\d)",
     )
