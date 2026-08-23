@@ -16,7 +16,7 @@ import re
 import subprocess
 import unicodedata
 import uuid
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from app.services.knowledge_scope_policy import (
     KnowledgeClassification,
@@ -88,6 +88,8 @@ class ExtractionArtifact:
     extractor_version: int
     normalized_text: str
     sections: tuple[dict[str, str], ...]
+    source_content_hash: str = ""
+    extractor_kind: str = "text"
 
 
 @dataclass(frozen=True)
@@ -99,10 +101,24 @@ class ContextCitation:
     section_title: str
     source_kind: str = SOURCE_KIND_DOCUMENT
     source_revision: str = ""
+    artifact_content_hash: str = ""
+    source_content_hash: str = ""
+    extractor_kind: str = "text"
+    extractor_version: int = ARTIFACT_VERSION
+    source_location: str = ""
+    ocr_used: bool = False
 
     @property
     def label(self) -> str:
-        return f"[{self.source_name} v{self.version} §{self.section_title}]"
+        details = []
+        if self.source_location:
+            details.append(self.source_location)
+        if self.extractor_kind != "text":
+            details.append(f"{self.extractor_kind} v{self.extractor_version}")
+        if self.ocr_used:
+            details.append("OCR")
+        suffix = f" · {' / '.join(details)}" if details else ""
+        return f"[{self.source_name} v{self.version} §{self.section_title}{suffix}]"
 
     @property
     def identifier(self) -> str:
@@ -360,6 +376,48 @@ def _sectionize(text: str) -> tuple[dict[str, str], ...]:
     return tuple(parts)
 
 
+def build_extraction_artifact(
+    *,
+    sections: Iterable[Mapping[str, Any]],
+    extractor_kind: str,
+    source_content_hash: str = "",
+) -> ExtractionArtifact:
+    """Build provenance from already extracted text without opening the source."""
+    kind = str(extractor_kind or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,79}", kind):
+        raise ValueError("Knowledge extractor kind is invalid")
+    raw_hash = str(source_content_hash or "").strip().lower()
+    if raw_hash and not _SOURCE_CONTENT_HASH_PATTERN.fullmatch(raw_hash):
+        raise ValueError("Knowledge source content hash is invalid")
+
+    normalized_sections: list[dict[str, str]] = []
+    for index, raw in enumerate(sections, start=1):
+        text = _normalize_text(str(raw.get("text") or ""))
+        if not text:
+            continue
+        section_id = str(raw.get("section_id") or f"S{index}").strip()
+        title = str(raw.get("title") or "본문").strip()
+        if not section_id or not title:
+            raise ValueError("Knowledge artifact section metadata is invalid")
+        section = {"section_id": section_id, "title": title, "text": text}
+        for key in ("location_type", "location_label", "page", "paragraph", "table", "row", "ocr_used"):
+            value = raw.get(key)
+            if value is not None and str(value).strip():
+                section[key] = str(value).strip()
+        normalized_sections.append(section)
+    if not normalized_sections:
+        raise ValueError("Knowledge source is empty")
+    normalized_text = _normalize_text("\n\n".join(section["text"] for section in normalized_sections))
+    return ExtractionArtifact(
+        content_hash=_sha256(normalized_text),
+        extractor_version=ARTIFACT_VERSION,
+        normalized_text=normalized_text,
+        sections=tuple(normalized_sections),
+        source_content_hash=raw_hash,
+        extractor_kind=kind,
+    )
+
+
 def _validate_project_source_artifact(
     *,
     artifact: ExtractionArtifact,
@@ -588,12 +646,53 @@ class KnowledgeDocumentRepository:
             conflict_confirmed=conflict_confirmed,
         )
 
+    def register_artifact_checked(
+        self,
+        *,
+        source_name: str,
+        source_key: str,
+        artifact: ExtractionArtifact,
+        scope: str,
+        current_company_id: int | None,
+        permission_codes: Iterable[str] | None,
+        company_id: int | None = None,
+        user_id: int | None = None,
+        version: int = 1,
+        knowledge_classification: str = KnowledgeClassification.GENERAL,
+    ) -> tuple[DocumentSource, bool]:
+        """Explicitly register a previously extracted artifact after the manage gate."""
+        decision = can_manage_document(
+            document={
+                "scope": scope,
+                "company_id": company_id,
+                "user_id": user_id,
+                "status": DOCUMENT_ACTIVE,
+                "knowledge_classification": knowledge_classification,
+            },
+            current_company_id=current_company_id,
+            permission_codes=permission_codes,
+        )
+        if not decision.allowed:
+            raise KnowledgeManagementDenied(decision.reason_code)
+        return self._register_text_trusted(
+            source_name=source_name,
+            source_key=source_key,
+            content=artifact.normalized_text,
+            artifact=artifact,
+            scope=scope,
+            company_id=company_id,
+            user_id=user_id,
+            version=version,
+            knowledge_classification=knowledge_classification,
+        )
+
     def _register_text_trusted(
         self,
         *,
         source_name: str,
         source_key: str,
         content: str | bytes,
+        artifact: ExtractionArtifact | None = None,
         scope: str,
         company_id: int | None = None,
         user_id: int | None = None,
@@ -608,7 +707,14 @@ class KnowledgeDocumentRepository:
     ) -> tuple[DocumentSource, bool]:
         """Internal/fixture boundary after authorization has already succeeded."""
         safe_name = make_safe_filename(source_name, default="knowledge.txt")
-        artifact = extract_text_artifact(source_name=safe_name, content=content)
+        artifact = artifact or extract_text_artifact(source_name=safe_name, content=content)
+        if (
+            not isinstance(artifact, ExtractionArtifact)
+            or artifact.extractor_version != ARTIFACT_VERSION
+            or not artifact.normalized_text
+            or _sha256(artifact.normalized_text) != artifact.content_hash
+        ):
+            raise ValueError("Knowledge artifact integrity mismatch")
         try:
             version = int(version)
         except (TypeError, ValueError) as exc:
@@ -798,6 +904,8 @@ class KnowledgeDocumentRepository:
                 extractor_version=int(raw["extractor_version"]),
                 normalized_text=str(raw["normalized_text"]),
                 sections=tuple(raw["sections"]),
+                source_content_hash=str(raw.get("source_content_hash") or ""),
+                extractor_kind=str(raw.get("extractor_kind") or "text"),
             )
         except Exception as exc:
             raise ValueError("Knowledge artifact is corrupt") from exc
@@ -976,7 +1084,12 @@ class KnowledgeDocumentRepository:
             ):
                 continue
             artifact = self._read_artifact(source.content_hash)
-            for section in artifact.sections:
+            for raw_section in artifact.sections:
+                section = dict(raw_section)
+                section["_artifact_content_hash"] = artifact.content_hash
+                section["_source_content_hash"] = artifact.source_content_hash
+                section["_extractor_kind"] = artifact.extractor_kind
+                section["_extractor_version"] = str(artifact.extractor_version)
                 score = self._score(query, source, section)
                 if score:
                     candidates.append((score, source, section))
@@ -994,6 +1107,12 @@ class KnowledgeDocumentRepository:
                 section_title=section["title"],
                 source_kind=source.source_kind,
                 source_revision=source.source_revision,
+                artifact_content_hash=str(section.get("_artifact_content_hash") or ""),
+                source_content_hash=str(section.get("_source_content_hash") or ""),
+                extractor_kind=str(section.get("_extractor_kind") or "text"),
+                extractor_version=int(section.get("_extractor_version") or ARTIFACT_VERSION),
+                source_location=str(section.get("location_label") or ""),
+                ocr_used=str(section.get("ocr_used") or "").lower() == "true",
             )
             rendered = f"{citation.label}\n{section['text']}"
             remaining = max_chars - total

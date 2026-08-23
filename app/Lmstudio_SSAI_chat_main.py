@@ -43,6 +43,7 @@ import zipfile
 import tempfile
 import traceback
 import shutil
+import base64
 
 from pathlib import Path
 from datetime import datetime
@@ -280,9 +281,11 @@ from app.ui.ssai_login import (
 )
 from app.services.knowledge_document_service import (
     KnowledgeDocumentRepository,
+    build_extraction_artifact,
     build_knowledge_chat_request_context,
 )
 from app.services.datetime_tool import resolve_datetime_question
+from app.services.attachment_summary_policy import build_attachment_summary_plan
 from app.services.web_search_service import (
     build_web_search_prompt,
     parse_web_search_request,
@@ -495,6 +498,12 @@ def get_config(key: str, default=None, cast=str):
 st.session_state.setdefault("__an_busy", False)      # 현재 분석 작업 실행 중
 st.session_state.setdefault("__an_job", None)        # {"id","room_id","sig","started_at"}
 st.session_state.setdefault("__an_cancel", False)    # 사용자가 취소 버튼 클릭
+st.session_state.setdefault("__attachment_uploader_nonce", 0)
+st.session_state.setdefault("__attachment_reanalysis_snapshot", None)
+st.session_state.setdefault("__attachment_analysis_history", None)
+st.session_state.setdefault("__attachment_analysis_target_source_sig", "")
+st.session_state.setdefault("__attachment_image_followup_ref", None)
+st.session_state.setdefault("__attachment_image_followup_request", None)
 st.session_state.setdefault("__sims_was_final", False)
 
 def _sig_of_uploads(files):
@@ -507,6 +516,31 @@ def _sig_of_uploads(files):
             size = 0
         parts.append(f"{getattr(f,'name','unnamed')}:{size}")
     return "|".join(parts)
+
+
+def _attachment_reanalysis_context(room: dict[str, Any]) -> dict[str, Any]:
+    company = get_selected_company() or {}
+    user = get_current_user()
+    return {
+        "room_id": str(room.get("id") or ""),
+        "company_id": _normalize_chat_company_id(company.get("company_id")),
+        "user_id": int(getattr(user, "user_id", 0) or 0),
+    }
+
+
+def _claim_attachment_auto_analysis(files, room: dict[str, Any]) -> bool:
+    """Claim one uploader batch once; a rerun must not analyse it again."""
+    if not files:
+        return False
+    claim = {
+        **_attachment_reanalysis_context(room),
+        "uploader_nonce": int(st.session_state.get("__attachment_uploader_nonce", 0)),
+        "signature": _sig_of_uploads(files),
+    }
+    if st.session_state.get("__attachment_auto_analysis_claim") == claim:
+        return False
+    st.session_state["__attachment_auto_analysis_claim"] = claim
+    return True
 
 def _get_room_by_id(rid: str):
     for r in st.session_state.get("chat_rooms", []):
@@ -2541,6 +2575,14 @@ def _sha256_of_filelike(f) -> str:
 
 if "extraction_cache" not in st.session_state:
     st.session_state.extraction_cache = {}  # {(file_hash, preview, ocr_conf): str}
+if "attachment_extraction_artifact_cache" not in st.session_state:
+    # Existing attachment analysis stays string-based; this is a parallel,
+    # non-persistent provenance cache for explicit future Knowledge approval.
+    st.session_state.attachment_extraction_artifact_cache = {}
+if "attachment_vlm_artifact_cache" not in st.session_state:
+    st.session_state.attachment_vlm_artifact_cache = {}
+if "attachment_vlm_observation_cache" not in st.session_state:
+    st.session_state.attachment_vlm_observation_cache = {}
 
 def cleanup_uploads(max_bytes=2_000_000_000, upload_dir: str | Path | None = None):  # 2GB
     """
@@ -2624,18 +2666,256 @@ def ocr_image_pil(
     try:
         text = pytesseract.image_to_string(proc, lang=lang, config=config)
         return text.strip()
-    except Exception:
+    except Exception as exc:
+        log.warning("[attachment.ocr] phase=tesseract_error error_type=%s", type(exc).__name__)
         return ""
 
 def _ocr_conf_tuple() -> tuple:
+    raw_langs = st.session_state.get("__ocr_langs", ["kor", "eng"])
+    if isinstance(raw_langs, str):
+        raw_langs = raw_langs.replace(",", "+").split("+")
+    langs = tuple(str(lang).strip() for lang in (raw_langs or []) if str(lang).strip())
+    if not langs:
+        # Empty language state makes Tesseract fail before OCR can be useful.
+        # Restore only the documented normal default; explicit valid PSM/OEM stay intact.
+        langs = ("kor", "eng")
+        st.session_state["__ocr_langs"] = list(langs)
     return (
-        tuple(st.session_state.get("ocr_langs", ["kor","eng"])),
-        int(st.session_state.get("ocr_psm", 3)),
-        int(st.session_state.get("ocr_oem", 3)),
-        bool(st.session_state.get("ocr_upscale", True)),
-        bool(st.session_state.get("ocr_binarize", True)),
-        bool(st.session_state.get("ocr_denoise", False)),
+        langs,
+        int(st.session_state.get("__ocr_psm", 3)),
+        int(st.session_state.get("__ocr_oem", 3)),
+        bool(st.session_state.get("__ocr_upscale", True)),
+        bool(st.session_state.get("__ocr_binarize", True)),
+        bool(st.session_state.get("__ocr_denoise", False)),
     )
+def _ocr_runtime_log_fields() -> dict[str, Any]:
+    langs, psm, oem, upscale, binarize, denoise = _ocr_conf_tuple()
+    return {
+        "enabled": bool(st.session_state.get("__ocr_auto", False)),
+        "langs": "+".join(str(value) for value in langs),
+        "psm": psm,
+        "oem": oem,
+        "upscale": upscale,
+        "binarize": binarize,
+        "denoise": denoise,
+    }
+
+def _is_image_attachment(file: Any) -> bool:
+    name = str(getattr(file, "name", "") or "")
+    mime = str(getattr(file, "type", "") or "").lower()
+    return Path(name).suffix.lower() in {".png", ".jpg", ".jpeg"} or mime.startswith("image/")
+
+
+def _attachment_image_data_url(file: Any) -> str:
+    try:
+        raw = bytes(file.getvalue())
+    except Exception:
+        position = file.tell()
+        file.seek(0)
+        raw = file.read()
+        file.seek(position)
+    if not raw:
+        raise ValueError("이미지 원문이 비어 있습니다.")
+    suffix = Path(str(getattr(file, "name", "") or "")).suffix.lower()
+    mime = str(getattr(file, "type", "") or "").lower()
+    if mime not in {"image/png", "image/jpeg"}:
+        mime = "image/png" if suffix == ".png" else "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def _looks_like_attachment_image_followup(question: str) -> bool:
+    text = str(question or "").strip()
+    if not text:
+        return False
+    visual_reference = r"(?:이|그|첨부)?\s*(?:사진|이미지|화면|그림|캡처|스크린샷)"
+    visual_detail = r"(?:작업자.*(?:어디|무엇)|물건.*(?:이동|흐름)|상부.*하부.*구조|중요한\s*부분.*(?:설명|알려)|무엇을\s*뜻|어떻게\s*다른)"
+    return bool(re.search(visual_reference, text, flags=re.IGNORECASE) or re.search(visual_detail, text, flags=re.IGNORECASE))
+
+
+def _set_attachment_image_followup_candidates(*, room: dict[str, Any], candidates: list[dict[str, Any]]) -> None:
+    if len(candidates) == 1:
+        candidate = candidates[0]
+        _store_attachment_image_followup_reference(
+            room=room,
+            file=candidate["file"],
+            source_content_hash=str(candidate["source_hash"]),
+        )
+        return
+    if candidates:
+        st.session_state.pop("__attachment_image_followup_ref", None)
+        log.info("[attachment.image_followup] phase=reference_ambiguous candidate_count=%s", len(candidates))
+
+
+def _store_attachment_image_followup_reference(*, room: dict[str, Any], file: Any, source_content_hash: str) -> None:
+    if not _is_image_attachment(file) or not source_content_hash:
+        return
+    st.session_state["__attachment_image_followup_ref"] = {
+        **_attachment_reanalysis_context(room),
+        "source_hash": str(source_content_hash),
+        "file": file,
+    }
+    log.info("[attachment.image_followup] phase=reference_updated source_hash=%s", str(source_content_hash)[:12])
+
+
+def _resolve_attachment_image_followup_reference(room: dict[str, Any]) -> dict[str, Any] | None:
+    reference = st.session_state.get("__attachment_image_followup_ref") or {}
+    context = _attachment_reanalysis_context(room)
+    if not all(reference.get(key) == value for key, value in context.items()):
+        return None
+    if not _is_image_attachment(reference.get("file")):
+        return None
+    if not str(reference.get("source_hash") or ""):
+        return None
+    try:
+        if _sha256_of_filelike(reference["file"]) != str(reference["source_hash"]):
+            return None
+    except Exception:
+        return None
+    return reference
+
+
+def _append_attachment_image_followup_unavailable(*, room: dict[str, Any], reason: str) -> None:
+    result = {
+        "id": str(uuid.uuid4()),
+        "role": "assistant",
+        "content": "최근 이미지 원본을 안전하게 찾지 못했습니다. 이미지를 한 장 다시 첨부한 뒤 질문해 주세요.",
+        "time": make_ts(),
+        "seq": _next_seq(),
+        **_message_meta("image_followup_unavailable"),
+    }
+    room.setdefault("messages", []).append(result)
+    room.setdefault("gen_messages", []).append(result.copy())
+    _sync_room_meta(room, materialize=True)
+    save_chat_rooms()
+    log.info("[attachment.image_followup] route=unavailable reason=%s", reason)
+
+
+def _run_attachment_image_followup(*, room: dict[str, Any], question: str) -> bool:
+    reference = _resolve_attachment_image_followup_reference(room)
+    if reference is None:
+        _append_attachment_image_followup_unavailable(room=room, reason="missing_or_out_of_scope")
+        return True
+
+    source_hash = str(reference["source_hash"])
+    model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
+    started = time.perf_counter()
+    try:
+        image_url = _attachment_image_data_url(reference["file"])
+        client = getattr(CLIENT, "with_options", lambda **_kwargs: CLIENT)(timeout=LLM_TIMEOUT_S, max_retries=0)
+        response = client.chat.completions.create(
+            model=model_id,
+            temperature=0.2,
+            max_tokens=700,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "첨부된 원본 이미지를 직접 보고 사용자의 질문에 답하세요. "
+                            "OCR 텍스트나 이전 요약만으로 판단하지 말고, 보이는 사실과 불확실한 부분을 구분하세요. "
+                            "금액·재고·의약품 수치·설비 모델·안전 판단은 원본 확인 없이는 확정하지 마세요.\n\n"
+                            f"사용자 질문: {question}"
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            }],
+        )
+        answer = str(extract_chat_completion_text(response).get("content") or "").strip()
+        if not answer:
+            raise RuntimeError("이미지 후속 관찰 결과가 비어 있습니다.")
+    except Exception as exc:
+        log.warning(
+            "[attachment.image_followup] route=failed source_hash=%s actual_image_input=%s model=%s elapsed_ms=%s retry_count=0 error_type=%s",
+            source_hash[:12],
+            True,
+            model_id,
+            int((time.perf_counter() - started) * 1000),
+            type(exc).__name__,
+        )
+        st.error("이미지 원본을 다시 확인하지 못했습니다. 일반 텍스트 추측으로 답하지 않습니다.")
+        return True
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    result = {
+        "id": str(uuid.uuid4()),
+        "role": "assistant",
+        "content": "## 이미지 후속 관찰(VLM)\n\n" + answer + "\n\n_원본 이미지를 다시 입력해 관찰한 결과입니다. 원본 확인이 필요합니다._",
+        "time": make_ts(),
+        "seq": _next_seq(),
+        "image_followup_provenance": {
+            "source_hash": source_hash,
+            "extractor_kind": "lmstudio_vlm_image_url",
+            "input_mode": "actual_image_data_url",
+            "model": model_id,
+            "elapsed_ms": elapsed_ms,
+            "retry_count": 0,
+        },
+        **_message_meta("image_followup_vlm"),
+    }
+    room.setdefault("messages", []).append(result)
+    room.setdefault("gen_messages", []).append(result.copy())
+    _sync_room_meta(room, materialize=True)
+    save_chat_rooms()
+    log.info(
+        "[attachment.image_followup] route=direct_image source_hash=%s actual_image_input=%s model=%s elapsed_ms=%s retry_count=0",
+        source_hash[:12],
+        True,
+        model_id,
+        elapsed_ms,
+    )
+    return True
+
+def analyze_attachment_image_vlm(*, file: Any, source_content_hash: str) -> tuple[str, dict[str, str], Any]:
+    """Run one explicit, direct-image VLM observation without changing OCR extraction."""
+    image_url = _attachment_image_data_url(file)
+    model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
+    prompt = (
+        "첨부 이미지 자체를 보고 '이미지 관찰 결과'만 한국어로 간결하게 작성하세요. "
+        "보이는 글자/숫자, 화면·표·레이아웃, 장면·물체·상황을 구분하세요. "
+        "금액·재고·의약품 수치·설비 모델·안전 판단은 원본 확인 없이는 확정하지 말고, "
+        "보이지 않는 내용은 추측하지 마세요."
+    )
+    started = time.perf_counter()
+    client = getattr(CLIENT, "with_options", lambda **_kwargs: CLIENT)(timeout=LLM_TIMEOUT_S, max_retries=0)
+    response = client.chat.completions.create(
+        model=model_id,
+        temperature=0,
+        max_tokens=600,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }],
+    )
+    observation = str(extract_chat_completion_text(response).get("content") or "").strip()
+    if not observation:
+        raise RuntimeError("VLM 관찰 결과가 비어 있습니다.")
+    provenance = {
+        "source_name": str(getattr(file, "name", "") or "uploaded_image"),
+        "source_content_hash": str(source_content_hash or ""),
+        "extractor_kind": "lmstudio_vlm_image_url",
+        "extractor_version": str(model_id or "unknown"),
+        "input_mode": "actual_image_data_url",
+        "ocr_used": "false",
+        "elapsed_ms": str(int((time.perf_counter() - started) * 1000)),
+    }
+    artifact = build_extraction_artifact(
+        sections=[{
+            "section_id": "VLM1",
+            "title": "이미지 관찰 결과(VLM)",
+            "text": observation,
+            "location_type": "image_vlm",
+            "location_label": "이미지 장면 관찰(VLM)",
+            "ocr_used": "false",
+        }],
+        extractor_kind="lmstudio_vlm_image_url",
+        source_content_hash=str(source_content_hash or ""),
+    )
+    return observation, provenance, artifact
 
 # === 시간/순서 유틸 ===
 import re
@@ -2804,11 +3084,12 @@ def _build_current_room_compact_context(limit_chars: int = 5000) -> str:
         return ""
 
 # =========================
-# 요약 파이프라인
+# 첨부 공통 요약 파이프라인
 # =========================
-MAX_CHUNK_CHARS = 4000
-CHUNK_OVERLAP   = 200
-DEFAULT_SUMMARY_TARGET = 1500
+MAX_CHUNK_CHARS = 6000
+CHUNK_OVERLAP = 200
+DEFAULT_SUMMARY_TARGET = 1200
+
 
 def _split_into_chunks(text: str, chunk_size: int = MAX_CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
     text = text or ""
@@ -2817,17 +3098,31 @@ def _split_into_chunks(text: str, chunk_size: int = MAX_CHUNK_CHARS, overlap: in
     chunks, i = [], 0
     step = max(1, chunk_size - overlap)
     while i < len(text):
-        chunks.append(text[i:i+chunk_size])
+        chunks.append(text[i:i + chunk_size])
         i += step
     return chunks
 
+
 def summarize_text_long(
     text: str,
-    target_chars: int = DEFAULT_SUMMARY_TARGET,
-    system_prompt: str | None = "너는 문서 요약 전문가다. 수치/날짜/단위는 보존하고 군더더기를 제거하라."
+    target_chars: int | None = None,
+    system_prompt: str | None = "너는 문서 요약 전문가다. 수치/날짜/단위/표 핵심값을 원문 그대로 보존하고 군더더기를 제거하라.",
+    *,
+    section_count: int = 0,
+    user_request: str = "",
 ) -> str:
-    if not text or not text.strip():
+    """Summarize existing extraction text with a file-type-independent depth plan."""
+    normalized = str(text or "").strip()
+    if not normalized:
         return ""
+    plan = build_attachment_summary_plan(
+        normalized,
+        section_count=section_count,
+        user_request=user_request,
+        requested_target=target_chars,
+    )
+    if plan.mode == "preserve":
+        return normalized
 
     def _first_content(resp) -> str:
         try:
@@ -2843,70 +3138,53 @@ def summarize_text_long(
 
     model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
 
-    # 1) 청크 요약
-    parts: list[str] = []
-    for idx, ck in enumerate(_split_into_chunks(text), start=1):
-        msgs = [
-            {"role": "user",
-             "content": f"아래 텍스트의 핵심만 간결히 요약해줘(불필요한 개행/잡음 제거):\n\n{ck}"}
-        ]
+    def _request_summary(source: str, target: int, instruction: str) -> str:
+        messages = [{
+            "role": "user",
+            "content": (
+                f"{instruction}\n최종 길이는 약 {target}자 내외. "
+                "섹션 구조를 유지하고 숫자·날짜·단위·표의 핵심값을 임의 변경하지 마라.\n\n"
+                f"{source}"
+            ),
+        }]
         if system_prompt:
-            msgs.insert(0, {"role": "system", "content": system_prompt})
-
+            messages.insert(0, {"role": "system", "content": system_prompt})
         try:
-            resp = call_chat_with_retry(
-                messages=msgs,
+            return _first_content(call_chat_with_retry(
+                messages=messages,
                 model=model_id,
                 temperature=0.2,
                 stream=False,
-            )
-            parts.append(_first_content(resp))
-        except Exception as e:
-            parts.append(f"[청크 요약 실패 {idx}: {e}]")
+            ))
+        except Exception as exc:
+            return f"[요약 실패] {exc}"
 
-    # 2) 메타 요약 (부분 요약 통합)
-    merged = "\n\n".join(parts)
-    merged = _clip_for_model(merged, limit=120_000)
+    if plan.mode in {"requested", "single_pass"}:
+        request_note = f"사용자 요청: {user_request.strip()}" if user_request.strip() else ""
+        return _request_summary(normalized, plan.target_chars, f"아래 첨부 문서를 구조적으로 요약해줘. {request_note}".strip())
 
-    msgs2 = [{
-        "role": "user",
-        "content": (
-            f"아래 부분 요약들을 하나로 통합해 핵심 위주로 정리해줘. "
-            f"최종 길이는 약 {target_chars}자 내외. 항목형/문단형 혼합 OK, 수치/날짜 보존:\n\n{merged}"
-        )
-    }]
-    if system_prompt:
-        msgs2.insert(0, {"role": "system", "content": system_prompt})
+    chunks = _split_into_chunks(normalized, chunk_size=plan.chunk_chars)
+    part_target = max(700, min(2200, plan.target_chars // max(1, len(chunks))))
+    parts = [
+        _request_summary(chunk, part_target, f"첨부 문서 청크 {idx}의 핵심을 보존해 요약해줘.")
+        for idx, chunk in enumerate(chunks, start=1)
+    ]
 
-    try:
-        resp2 = call_chat_with_retry(
-            messages=msgs2,
-            model=model_id,
-            temperature=0.2,
-            stream=False,
-        )
-        final = _first_content(resp2)
-    except Exception as e:
-        return f"[최종 요약 실패] {e}"
+    while len("\n\n".join(parts)) > plan.merge_batch_chars:
+        grouped, batch, batch_len = [], [], 0
+        for part in parts:
+            if batch and batch_len + len(part) > plan.merge_batch_chars:
+                grouped.append(_request_summary("\n\n".join(batch), min(plan.target_chars, 3000), "부분 요약들을 구조를 잃지 않게 통합해줘."))
+                batch, batch_len = [], 0
+            batch.append(part)
+            batch_len += len(part)
+        if batch:
+            grouped.append(_request_summary("\n\n".join(batch), min(plan.target_chars, 3000), "부분 요약들을 구조를 잃지 않게 통합해줘."))
+        if len(grouped) >= len(parts):
+            break
+        parts = grouped
 
-    # 3) 길면 한 번 더 압축
-    if len(final) > target_chars + 400:
-        msgs3 = [{"role": "user", "content": f"다음 요약을 {target_chars}자 내로 더 압축해줘:\n\n{final}"}]
-        if system_prompt:
-            msgs3.insert(0, {"role": "system", "content": system_prompt})
-        try:
-            resp3 = call_chat_with_retry(
-                messages=msgs3,
-                model=model_id,
-                temperature=0.2,
-                stream=False,
-            )
-            final = _first_content(resp3) or final
-        except Exception as e:
-            final = f"[재압축 실패] {e}\n\n{final}"
-
-    return final
-
+    return _request_summary("\n\n".join(parts), plan.target_chars, "아래 부분 요약들을 하나의 첨부 분석 결과로 통합해줘.")
 # =========================
 # LLM 호출 헬퍼/가드
 # =========================
@@ -6548,6 +6826,14 @@ def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_com
         "__an_busy",
         "__an_job",
         "__an_cancel",
+        "__attachment_reanalysis_snapshot",
+        "__attachment_analysis_history",
+        "__attachment_analysis_target_source_sig",
+        "__attachment_analysis_target_ids",
+        "__attachment_image_followup_ref",
+        "__attachment_image_followup_candidates",
+        "__attachment_image_followup_target_id",
+        "__attachment_image_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
         "__chat_room_nav_request",
@@ -9003,6 +9289,14 @@ def _reset_chat_session_when_user_changed() -> None:
         "__an_busy",
         "__an_job",
         "__an_cancel",
+        "__attachment_reanalysis_snapshot",
+        "__attachment_analysis_history",
+        "__attachment_analysis_target_source_sig",
+        "__attachment_analysis_target_ids",
+        "__attachment_image_followup_ref",
+        "__attachment_image_followup_candidates",
+        "__attachment_image_followup_target_id",
+        "__attachment_image_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
     ]:
@@ -9484,11 +9778,28 @@ def process_file(file, preview: bool = True) -> str:
     if file_hash and cache_key in st.session_state.extraction_cache:
         cached = st.session_state.extraction_cache[cache_key]
         if cached is not None:
+            log.info("[attachment.ocr] phase=cache_hit file_hash=%s", str(file_hash)[:12])
             return cached
+    log.info("[attachment.ocr] phase=cache_miss file_hash=%s", str(file_hash)[:12])
 
-    def _cache_and_return(txt: str) -> str:
+    artifact_cache_key = (file_hash, ocr_conf)
+
+    def _artifact_from_sections(*, extractor_kind: str, sections: list[dict[str, str]]):
+        try:
+            return build_extraction_artifact(
+                sections=sections,
+                extractor_kind=extractor_kind,
+                source_content_hash=str(file_hash or ""),
+            )
+        except Exception as exc:
+            log.warning("[attachment.artifact] provenance_build_failed kind=%s error_type=%s", extractor_kind, type(exc).__name__)
+            return None
+
+    def _cache_and_return(txt: str, *, artifact=None) -> str:
         if file_hash:
             st.session_state.extraction_cache[cache_key] = txt
+            if artifact is not None:
+                st.session_state.attachment_extraction_artifact_cache[artifact_cache_key] = artifact
         return txt
 
     # 2) 메타
@@ -9510,17 +9821,30 @@ def process_file(file, preview: bool = True) -> str:
             file.seek(0)
             reader = PyPDF2.PdfReader(file)
             parts = []
+            sections = []
             for i, page in enumerate(reader.pages):
                 try:
                     txt = page.extract_text() or ""
                     if txt.strip():
                         parts.append(txt)
+                        sections.append({
+                            "section_id": f"P{i + 1}",
+                            "title": f"{i + 1}쪽",
+                            "text": txt,
+                            "location_type": "pdf_page",
+                            "location_label": f"PDF {i + 1}쪽",
+                            "page": str(i + 1),
+                            "ocr_used": "false",
+                        })
                 except Exception:
                     parts.append(f"[{i+1}쪽 텍스트 추출 실패, 이후 계속 진행]")
             text = "\n".join(parts).strip()
             if not text:
                 return _cache_and_return("PDF에서 텍스트를 추출하지 못했습니다. (스캔/이미지형 PDF 가능성)")
-            return _cache_and_return(_out(text, preview))
+            return _cache_and_return(
+                _out(text, preview),
+                artifact=_artifact_from_sections(extractor_kind="pdf_text_pypdf2", sections=sections),
+            )
         except Exception as e:
             return _cache_and_return(f"[PDF 읽기 오류] {e}")
 
@@ -9614,11 +9938,39 @@ def process_file(file, preview: bool = True) -> str:
             file.seek(0)
             d = docx.Document(file)
             paras = [p.text for p in d.paragraphs]
-            for t in d.tables:
-                for row in t.rows:
-                    paras.append(" | ".join(cell.text.strip() for cell in row.cells))
+            sections = [
+                {
+                    "section_id": f"P{index}",
+                    "title": f"문단 {index}",
+                    "text": value,
+                    "location_type": "docx_paragraph",
+                    "location_label": f"DOCX 문단 {index}",
+                    "paragraph": str(index),
+                    "ocr_used": "false",
+                }
+                for index, value in enumerate(paras, start=1)
+                if str(value or "").strip()
+            ]
+            for table_index, table in enumerate(d.tables, start=1):
+                for row_index, row in enumerate(table.rows, start=1):
+                    row_text = " | ".join(cell.text.strip() for cell in row.cells)
+                    paras.append(row_text)
+                    if row_text.strip():
+                        sections.append({
+                            "section_id": f"T{table_index}R{row_index}",
+                            "title": f"표 {table_index} 행 {row_index}",
+                            "text": row_text,
+                            "location_type": "docx_table_row",
+                            "location_label": f"DOCX 표 {table_index} 행 {row_index}",
+                            "table": str(table_index),
+                            "row": str(row_index),
+                            "ocr_used": "false",
+                        })
             text = "\n".join([p for p in paras if p is not None]).strip()
-            return _cache_and_return(_out(text, preview) if text else "DOCX에서 텍스트를 추출하지 못했습니다.")
+            return _cache_and_return(
+                _out(text, preview) if text else "DOCX에서 텍스트를 추출하지 못했습니다.",
+                artifact=_artifact_from_sections(extractor_kind="docx_python_docx", sections=sections) if text else None,
+            )
         except Exception as e:
             return _cache_and_return(f"[DOCX 읽기 오류] {e}")
 
@@ -9654,22 +10006,50 @@ def process_file(file, preview: bool = True) -> str:
                 info.append("EXIF: " + ", ".join(f"{k}={v}" for k, v in exif.items()))
 
             # 자동 OCR
-            if _TESS_AVAILABLE and st.session_state.get("ocr_auto", False):
+            artifact = None
+            ocr_runtime = _ocr_runtime_log_fields()
+            log.info(
+                "[attachment.ocr] phase=image_enter file_hash=%s tess_available=%s enabled=%s langs=%s psm=%s oem=%s upscale=%s binarize=%s denoise=%s",
+                str(file_hash)[:12],
+                bool(_TESS_AVAILABLE),
+                ocr_runtime["enabled"],
+                ocr_runtime["langs"],
+                ocr_runtime["psm"],
+                ocr_runtime["oem"],
+                ocr_runtime["upscale"],
+                ocr_runtime["binarize"],
+                ocr_runtime["denoise"],
+            )
+            if _TESS_AVAILABLE and ocr_runtime["enabled"]:
                 ocr_text = ocr_image_pil(
                     img=img,
-                    langs=st.session_state.get("ocr_langs", ["kor", "eng"]),
-                    psm=int(st.session_state.get("ocr_psm", 3)),
-                    oem=int(st.session_state.get("ocr_oem", 3)),
-                    upscale=bool(st.session_state.get("ocr_upscale", True)),
-                    binarize=bool(st.session_state.get("ocr_binarize", True)),
-                    denoise=bool(st.session_state.get("ocr_denoise", False)),
+                    langs=st.session_state.get("__ocr_langs", ["kor", "eng"]),
+                    psm=int(st.session_state.get("__ocr_psm", 3)),
+                    oem=int(st.session_state.get("__ocr_oem", 3)),
+                    upscale=bool(st.session_state.get("__ocr_upscale", True)),
+                    binarize=bool(st.session_state.get("__ocr_binarize", True)),
+                    denoise=bool(st.session_state.get("__ocr_denoise", False)),
                 )
+                log.info("[attachment.ocr] phase=tesseract_return file_hash=%s text_len=%s", str(file_hash)[:12], len(ocr_text or ""))
                 if ocr_text:
                     info.append("\n[OCR 결과]\n" + (_truncate(ocr_text) if preview else ocr_text))
+                    log.info("[attachment.ocr] phase=artifact_ready file_hash=%s text_len=%s", str(file_hash)[:12], len(ocr_text))
+                    artifact = _artifact_from_sections(
+                        extractor_kind="image_ocr_tesseract",
+                        sections=[{
+                            "section_id": "OCR1",
+                            "title": "OCR 결과",
+                            "text": ocr_text,
+                            "location_type": "image_ocr",
+                            "location_label": "이미지 OCR 결과",
+                            "ocr_used": "true",
+                        }],
+                    )
                 else:
+                    log.info("[attachment.ocr] phase=no_text file_hash=%s", str(file_hash)[:12])
                     info.append("\n[OCR 결과] 추출된 텍스트가 없습니다.")
 
-            return _cache_and_return("\n".join(info))
+            return _cache_and_return("\n".join(info), artifact=artifact)
 
         except Image.DecompressionBombError:
             # PIL 안전장치에 걸릴 때
@@ -11424,6 +11804,16 @@ if user_input and user_input.strip():
         )
         st.rerun()
 
+    if _looks_like_attachment_image_followup(user_input):
+        st.session_state["__attachment_image_followup_request"] = {
+            **_attachment_reanalysis_context(current_room),
+        }
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        st.session_state["__queue_ai"] = True
+        log.info("[attachment.image_followup] route=queued")
+        st.rerun()
+
     # ✅ 제품 후보표가 열려 있을 때 '취소'도 SIMS/NLQ 입력으로 인정
     pending_pick_for_cancel = st.session_state.get("__io_pending_product_pick")
     has_pending_product_pick_for_cancel = (
@@ -11867,6 +12257,29 @@ with st.container():
     except Exception:
         pass
 
+    # A queued direct-image follow-up must complete before the display list is
+    # built. Otherwise its persisted result appears only on a later rerun.
+    pending_image_followup = st.session_state.get("__attachment_image_followup_request")
+    if isinstance(pending_image_followup, dict):
+        st.session_state.pop("__attachment_image_followup_request", None)
+        st.session_state["__queue_ai"] = False
+        image_followup_context_matches = all(
+            pending_image_followup.get(key) == value
+            for key, value in _attachment_reanalysis_context(current_room).items()
+        )
+        last_image_question = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(current_room.get("messages") or [])
+                if isinstance(message, dict) and message.get("role") == "user"
+            ),
+            "",
+        )
+        if image_followup_context_matches:
+            _run_attachment_image_followup(room=current_room, question=last_image_question)
+        else:
+            _append_attachment_image_followup_unavailable(room=current_room, reason="request_context_mismatch")
+
     # SIMS 표 버블 전용 렌더
     # Display-only chronological merge across normal/SIMS channels.
     # Keep the persisted JSON layout unchanged and do not copy table payloads.
@@ -11880,6 +12293,41 @@ with st.container():
 
         if str(m.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE:
             return _render_knowledge_answer_message(m, room=current_room)
+
+        if str(meta.get("message_type") or "") == "file_analysis_result":
+            detail = m.get("attachment_analysis_detail") or {}
+            with st.chat_message("assistant"):
+                st.markdown(m.get("content") or "📎 첨부 분석 완료")
+                if isinstance(detail, dict):
+                    with st.expander("추출·관찰 상세", expanded=False):
+                        ocr_text = str(detail.get("ocr_text") or "").strip()
+                        if ocr_text:
+                            st.markdown("#### OCR 결과")
+                            st.markdown(ocr_text)
+                        for item in detail.get("vlm_results") or []:
+                            if not isinstance(item, dict):
+                                continue
+                            st.markdown(f"#### 이미지 관찰: {item.get('name') or '이미지'}")
+                            st.markdown(str(item.get("text") or item.get("error") or "관찰 결과가 없습니다."))
+                            provenance = item.get("provenance") or {}
+                            if isinstance(provenance, dict) and provenance:
+                                st.caption(
+                                    "VLM provenance: "
+                                    f"{provenance.get('extractor_kind', '')} · "
+                                    f"{provenance.get('elapsed_ms', '')}ms · 실제 이미지 입력"
+                                )
+                        for provenance in detail.get("extraction_provenance") or []:
+                            if not isinstance(provenance, dict):
+                                continue
+                            source_hash = str(provenance.get("source_content_hash") or "")[:12]
+                            st.caption(
+                                "추출 provenance: "
+                                f"{provenance.get('name') or '첨부파일'} · "
+                                f"{provenance.get('extractor_kind') or 'text'} "
+                                f"v{provenance.get('extractor_version') or '-'} · "
+                                f"sections={provenance.get('section_count') or 0} · hash={source_hash}"
+                            )
+            return True
 
         if str(m.get("type") or "").strip().lower() == "dashboard_lite":
             dashboard_item = dict(m)
@@ -12387,10 +12835,12 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
             "📂 파일 첨부 (PDF, Excel, CSV, TXT, DOCX, 이미지 등)",
             type=["pdf", "csv", "xlsx", "xls", "txt", "docx", "png", "jpg", "jpeg"],
             accept_multiple_files=True,
-            key="file_upload_below_input",
+            key=f"file_upload_below_input_{int(st.session_state.get('__attachment_uploader_nonce', 0))}",
             disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
             help=_upload_unavailable_help() if not can_upload_file else None,
         )
+        uploaded_files = list(uploaded_files or [])
+        attachment_file_source = "uploader"
 
         # 2) SIMS 결과(모드별 실행 방식)
         # ✅ 렌더 조건은 로컬 변수로만 판정한다.
@@ -12963,11 +13413,27 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
         # Explicit Knowledge commands are isolated from ordinary Chat/NLQ routing.
         knowledge_route = parse_explicit_knowledge_request(last_user_text)
         web_search_route = None if knowledge_route is not None else parse_web_search_request(last_user_text)
+        image_followup_request = st.session_state.pop("__attachment_image_followup_request", None)
+        image_followup_context_matches = (
+            isinstance(image_followup_request, dict)
+            and all(
+                image_followup_request.get(key) == value
+                for key, value in _attachment_reanalysis_context(current_room).items()
+            )
+        )
         with pending_area:
             if knowledge_route is not None:
                 _run_explicit_knowledge_chat(knowledge_route, room=current_room)
             elif web_search_route is not None:
                 _run_web_search_chat(web_search_route, room=current_room)
+            elif isinstance(image_followup_request, dict):
+                if image_followup_context_matches:
+                    _run_attachment_image_followup(room=current_room, question=last_user_text)
+                else:
+                    _append_attachment_image_followup_unavailable(
+                        room=current_room,
+                        reason="request_context_mismatch",
+                    )
             else:
                 stream_and_append_assistant(
                     messages_for_ai=msgs,
@@ -12984,6 +13450,7 @@ st.write("")  # 시각적 여백
 # 4) 파일 분석 → 요약 → 즉시 AI 요청 (항상 자동)
 # =========================
 st.session_state.setdefault("__attach_keep_raw", False)
+st.session_state.setdefault("__attach_image_vlm", True)
 
 can_upload_file = require_permission("UPLOAD_FILE", show_error=False)
 
@@ -12991,16 +13458,44 @@ with st.expander("📎 첨부 처리 옵션", expanded=False):
     if not can_upload_file:
         st.info(_upload_unavailable_message())
 
+    # The uploader selection itself is the analysis batch. It is cleared after
+    # completion, so stale files never become the next batch implicitly.
+    analysis_target_files = list(uploaded_files or [])
+
+    def _mark_attach_summary_target_explicit() -> None:
+        st.session_state["__attach_summary_target_explicit"] = True
+
     summary_target = st.number_input(
         "요약 목표 길이(문자)",
         min_value=300,
-        max_value=4000,
+        max_value=12000,
         value=1200,
         step=100,
-        help="긴 텍스트는 청크 요약 → 통합 요약으로 압축해 이 길이 내외로 정리합니다.",
+        key="__attach_summary_target",
+        on_change=_mark_attach_summary_target_explicit,
+        help="기본값은 추출 본문 길이·구조에 따라 자동 조정됩니다. 값을 직접 바꾸면 해당 길이를 우선합니다.",
         disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
     )
-
+    attachment_analysis_request = st.text_input(
+        "분석 요청(선택)",
+        key="__attach_analysis_request",
+        placeholder="예: 간단히 / 자세히 / 1000자로 정리",
+        disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
+    )
+    has_image_attachments = any(_is_image_attachment(item) for item in (uploaded_files or []))
+    if has_image_attachments:
+        st.checkbox(
+            "이미지 장면 분석(VLM)",
+            key="__attach_image_vlm",
+            help="선택한 이미지에만 실제 이미지 VLM 분석을 실행합니다. OCR도 켜면 OCR+VLM으로 결과를 분리 표시합니다.",
+            disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
+        )
+        if st.session_state.get("__attach_image_vlm", False):
+            mode_label = "OCR + VLM (분리 표시)" if st.session_state.get("__ocr_auto", False) else "VLM only"
+            st.caption(f"선택 상태: {mode_label}")
+    else:
+        # Preserve the image opt-in across non-image uploads; it applies only when an image is selected.
+        pass
     st.checkbox(
         "원문 메시지도 함께 남기기",
         key="__attach_keep_raw",
@@ -13012,8 +13507,20 @@ with st.expander("📎 첨부 처리 옵션", expanded=False):
 
 # ✔ 체크박스 값은 세션에서 읽어 사용
 keep_raw = st.session_state.get("__attach_keep_raw", False)
+auto_analysis_ready = bool(
+    can_upload_file
+    and analysis_target_files
+    and not st.session_state.get("__an_busy", False)
+    and _claim_attachment_auto_analysis(analysis_target_files, current_room)
+)
+if auto_analysis_ready:
+    log.info(
+        "[attachment.analysis] phase=auto_queued file_count=%s signature=%s",
+        len(analysis_target_files),
+        _sig_of_uploads(analysis_target_files),
+    )
 
-# 파일 '분석하기'
+# 파일은 선택 즉시 현재 uploader batch만 자동 분석한다.
 if uploaded_files:
     if not can_upload_file:
         st.info(_upload_unavailable_message())
@@ -13025,7 +13532,7 @@ if uploaded_files:
             help=_upload_unavailable_help(),
         )
     else:
-        st.info(f"{len(uploaded_files)}개 파일이 첨부되었습니다.")
+        st.info(f"{len(uploaded_files)}개 파일이 첨부되었습니다. 이번 분석 대상: {len(analysis_target_files)}개")
 
     # 이미 분석 중이면 취소 버튼만 노출
     if st.session_state.get("__an_busy", False):
@@ -13037,25 +13544,37 @@ if uploaded_files:
             on_click=lambda: st.session_state.__setitem__("__an_cancel", True),
         )
 
-    # 분석 시작 버튼
-    elif st.button("🔍 파일 분석하기", width="stretch", key="__btn_analyze"):
+    # 현재 uploader batch는 한 번만 자동 분석한다.
+    elif auto_analysis_ready:
         # ── 작업 시작 플래그/메타 ─────────────────────────────────
         st.session_state["__an_busy"] = True
         st.session_state["__an_cancel"] = False
         st.session_state["__an_job"] = {
             "id": str(uuid.uuid4()),
             "room_id": current_room.get("id"),
-            "sig": _sig_of_uploads(uploaded_files),
+            "sig": _sig_of_uploads(analysis_target_files),
             "started_at": time.time(),
         }
 
         attached_texts = []
+        attached_section_count = 0
+        log.info(
+            "[attachment.analysis] phase=start file_source=%s ocr=%s vlm=%s",
+            attachment_file_source,
+            _ocr_runtime_log_fields(),
+            bool(st.session_state.get("__attach_image_vlm", False)),
+        )
         attached_saved_names = []
+        use_image_vlm = bool(st.session_state.get("__attach_image_vlm", False))
+        image_vlm_results = []
+        extraction_provenance = []
         progress = st.progress(0.0, text="파일 분석 시작…")
-        total = len(uploaded_files)
+        total = len(analysis_target_files)
 
         # ── 파일 루프 ───────────────────────────────────────────
-        for idx, uf in enumerate(uploaded_files, start=1):
+        image_analysis_candidates = []
+
+        for idx, uf in enumerate(analysis_target_files, start=1):
             # 사용자가 취소를 누르면 중단
             if st.session_state.get("__an_cancel"):
                 st.info("⛔ 분석이 취소되었습니다.")
@@ -13074,6 +13593,12 @@ if uploaded_files:
                     f.write(uf.getbuffer())
 
             attached_saved_names.append(save_path.name)
+            if _is_image_attachment(uf):
+                image_analysis_candidates.append({
+                    "file": uf,
+                    "source_hash": file_hash,
+                    "label": f"{uf.name} ({str(file_hash)[:8]})",
+                })
             cleanup_uploads(upload_dir=save_path.parent)
             
             # 텍스트 추출(분석용 bounded extraction)
@@ -13083,14 +13608,56 @@ if uploaded_files:
                 pass
             extracted = process_file(uf, preview=False)
             attached_texts.append(f"### {uf.name}\n{extracted}")
-
+            artifact = st.session_state.get("attachment_extraction_artifact_cache", {}).get((file_hash, _ocr_conf_tuple()))
+            attached_section_count += len(getattr(artifact, "sections", ()) or ()) if artifact is not None else 1
+            if artifact is not None:
+                extraction_provenance.append({
+                    "name": uf.name,
+                    "extractor_kind": str(getattr(artifact, "extractor_kind", "") or ""),
+                    "extractor_version": int(getattr(artifact, "extractor_version", 0) or 0),
+                    "source_content_hash": str(getattr(artifact, "source_content_hash", "") or file_hash),
+                    "section_count": len(getattr(artifact, "sections", ()) or ()),
+                })
+            if use_image_vlm and _is_image_attachment(uf):
+                model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
+                vlm_cache_key = (file_hash, model_id)
+                cached_vlm = st.session_state.get("attachment_vlm_observation_cache", {}).get(vlm_cache_key)
+                vlm_cache_status = "hit" if cached_vlm is not None else "miss"
+                try:
+                    if cached_vlm is None:
+                        observation, provenance, vlm_artifact = analyze_attachment_image_vlm(
+                            file=uf,
+                            source_content_hash=file_hash,
+                        )
+                        cached_vlm = {"text": observation, "provenance": provenance}
+                        st.session_state.attachment_vlm_observation_cache[vlm_cache_key] = cached_vlm
+                        st.session_state.attachment_vlm_artifact_cache[vlm_cache_key] = vlm_artifact
+                    image_vlm_results.append({"name": uf.name, **cached_vlm})
+                    log.info(
+                        "[attachment.vlm] status=ok file_hash=%s cache=%s observation=%s elapsed_ms=%s",
+                        str(file_hash)[:12],
+                        vlm_cache_status,
+                        bool(cached_vlm.get("text")),
+                        cached_vlm.get("provenance", {}).get("elapsed_ms", ""),
+                    )
+                except Exception as exc:
+                    image_vlm_results.append({
+                        "name": uf.name,
+                        "error": "이미지 장면 분석(VLM)을 완료하지 못했습니다.",
+                    })
+                    log.warning("[attachment.vlm] status=failed file_hash=%s error_type=%s", str(file_hash)[:12], type(exc).__name__)
             progress.progress(idx/total, text=f"분석 중... ({idx}/{total})")
 
         progress.empty()
 
         # ── 취소가 아니면 요약/전송 진행 ─────────────────────────
         if not st.session_state.get("__an_cancel"):
+            _set_attachment_image_followup_candidates(
+                room=current_room,
+                candidates=image_analysis_candidates,
+            )
             combined_input = "\n\n---\n\n".join(attached_texts) or "(첨부 파일 분석 요청)"
+            log.info("[attachment.ocr] phase=summary_input chars=%s contains_ocr=%s", len(combined_input), "[OCR 결과]" in combined_input)
 
             # 옵션: 원문 메시지도 남길지 여부
             if keep_raw:
@@ -13106,9 +13673,12 @@ if uploaded_files:
             # 요약 생성
             with st.spinner("첨부 요약 중..."):
                 try:
+                    explicit_target = int(summary_target) if st.session_state.get("__attach_summary_target_explicit", False) else None
                     summary = summarize_text_long(
                         combined_input,
-                        target_chars=int(summary_target),
+                        target_chars=explicit_target,
+                        section_count=attached_section_count,
+                        user_request=attachment_analysis_request,
                     )
                 except Exception as e:
                     summary = _clip_for_model(combined_input, limit=12000)
@@ -13127,11 +13697,29 @@ if uploaded_files:
                 f"{file_list_md}"
             )
 
-            result_msg = (
-                f"📎 첨부 파일 분석 결과({len(attached_saved_names)}개)\n\n"
-                f"{summary}"
+            summary_preview = _clip_for_model(str(summary or "").strip(), limit=700)
+            has_image_attachment = bool(image_analysis_candidates)
+            primary_observation = next(
+                (str(item.get("text") or "").strip() for item in image_vlm_results if item.get("text")),
+                "",
             )
-
+            if primary_observation:
+                # OCR preserve-mode text is evidence, not the primary image result.
+                result_msg = (
+                    f"📎 첨부 분석 완료({len(attached_saved_names)}개)\n\n"
+                    "**이미지 관찰 요약**\n"
+                    + _clip_for_model(primary_observation, limit=500)
+                    + "\n\n_이미지 관찰은 원본 확인이 필요한 보조 결과입니다._"
+                )
+            elif has_image_attachment:
+                result_msg = (
+                    f"📎 첨부 분석 완료({len(attached_saved_names)}개)\n\n"
+                    "이미지 추출을 완료했습니다. OCR 판독과 추출 방식은 아래 상세에서 확인하세요."
+                )
+            else:
+                result_msg = f"📎 첨부 분석 완료({len(attached_saved_names)}개)\n\n**문서 핵심 요약**\n{summary_preview}"
+            if len(image_analysis_candidates) > 1:
+                result_msg += "\n\n_여러 이미지를 함께 분석했습니다. 이미지 후속질문은 원하는 이미지 한 장을 다시 첨부해 분석해 주세요._"
             user_item = {
                 "id": str(uuid.uuid4()),
                 "role": "user",
@@ -13149,6 +13737,21 @@ if uploaded_files:
                 "time": make_ts(),
                 "seq": _next_seq(),
                 "files": attached_saved_names,
+                "image_vlm_provenance": [item.get("provenance") for item in image_vlm_results if item.get("provenance")],
+                "attachment_analysis_modes": {
+                    "ocr": "[OCR 결과]" in combined_input,
+                    "vlm": bool(image_vlm_results),
+                },
+                "attachment_analysis_detail": {
+                    "summary": str(summary or ""),
+                    "ocr_text": "\n\n".join(
+                        f"### {name}\n{content.split('[OCR 결과]', 1)[1].strip()}"
+                        for name, content in zip(attached_saved_names, attached_texts)
+                        if "[OCR 결과]" in str(content)
+                    ),
+                    "vlm_results": image_vlm_results,
+                    "extraction_provenance": extraction_provenance,
+                },
                 **_message_meta("file_analysis_result"),
             }
 
@@ -13197,6 +13800,10 @@ if uploaded_files:
             st.session_state["__an_busy"] = False
             st.session_state["__an_job"] = None
             st.session_state["__an_cancel"] = False
+            st.session_state.pop("__attachment_auto_analysis_claim", None)
+            # Streamlit upload widgets cannot be cleared after creation. A new
+            # key on this existing post-analysis rerun creates an empty batch.
+            st.session_state["__attachment_uploader_nonce"] = int(st.session_state.get("__attachment_uploader_nonce", 0)) + 1
             st.rerun()
 
         # ── 작업 종료/정리 ─────────────────────────────────────
@@ -13204,5 +13811,6 @@ if uploaded_files:
         st.session_state["__an_busy"] = False
         st.session_state["__an_job"] = None
         st.session_state["__an_cancel"] = False
+        st.session_state.pop("__attachment_auto_analysis_claim", None)
 
 # 페이지 끝

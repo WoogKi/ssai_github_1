@@ -6,3 +6,6 @@ typing_extensions==4.15.0
 wheel==0.45.1
 python-docx==1.1.2
 lxml==6.1.2
+PyPDF2==3.0.1
+Pillow==12.3.0
+pytesseract==0.3.13

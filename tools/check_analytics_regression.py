@@ -727,7 +727,7 @@ def run_basic_checks() -> list[CheckResult]:
                             stretch_width_counts[node.func.attr] += 1
 
             expected_stretch_width_counts = {
-                "button": 44,
+                "button": 43,
                 "form_submit_button": 38,
                 "dataframe": 12,
                 "download_button": 5,
@@ -743,7 +743,7 @@ def run_basic_checks() -> list[CheckResult]:
                 results.append(
                     _ok(
                         "Streamlit width migration for active UI calls",
-                        "15 active tracked files use width=stretch for 99 direct button/form/dataframe/download calls; helper and test compatibility patterns are excluded",
+                        "15 active tracked files use width=stretch for 98 direct button/form/dataframe/download calls; helper and test compatibility patterns are excluded",
                     )
                 )
         except Exception as exc:
