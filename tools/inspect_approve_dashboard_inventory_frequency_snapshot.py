@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -103,6 +104,162 @@ def _output(inspection: Any, verification: Mapping[str, Any] | None) -> dict[str
     }
 
 
+def _stage(
+    timings: dict[str, int],
+    name: str,
+    *,
+    generation_no: int,
+    checksum: str,
+    action: Any,
+) -> Any:
+    print(
+        f"[snapshot.approval] stage={name} phase=start generation_no={generation_no} checksum={checksum[:12]}",
+        flush=True,
+    )
+    started = time.perf_counter()
+    try:
+        result = action()
+    except Exception:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        timings[name] = elapsed_ms
+        print(
+            f"[snapshot.approval] stage={name} phase=error generation_no={generation_no} "
+            f"checksum={checksum[:12]} elapsed_ms={elapsed_ms}",
+            flush=True,
+        )
+        raise
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    timings[name] = elapsed_ms
+    print(
+        f"[snapshot.approval] stage={name} phase=complete generation_no={generation_no} "
+        f"checksum={checksum[:12]} elapsed_ms={elapsed_ms}",
+        flush=True,
+    )
+    return result
+
+
+def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str, Any]:
+    """Run the inspect/approve contract once; every external stage is timed and has no retry."""
+    key = _key(args)
+    expected_checksum = str(args.expected_checksum).strip().lower()
+    timings: dict[str, int] = {}
+    inspection = _stage(
+        timings,
+        "pre_approval_inspect_generation",
+        generation_no=args.generation,
+        checksum=expected_checksum,
+        action=lambda: repository.inspect_generation(key, args.generation),
+    )
+    if inspection.status == "corrupt" or not inspection.payload:
+        raise ValueError(f"snapshot inspection failed: {inspection.status}: {inspection.reason}")
+    if inspection.checksum.lower() != expected_checksum:
+        raise ValueError("expected checksum does not match inspected generation")
+    verification = _stage(
+        timings,
+        "pre_approval_verification",
+        generation_no=args.generation,
+        checksum=inspection.checksum,
+        action=lambda: _verify_expected(inspection.payload, args),
+    )
+    output = _output(inspection, verification)
+    preserved = None
+    if args.preserve_generation:
+        preserved = _stage(
+            timings,
+            "preserve_generation_inspect",
+            generation_no=args.preserve_generation,
+            checksum=expected_checksum,
+            action=lambda: repository.inspect_generation(key, args.preserve_generation),
+        )
+        output["preserved_generation"] = {
+            "generation_no": preserved.generation_no,
+            "integrity_status": preserved.status,
+            "manifest_status": preserved.manifest_status,
+            "approval_status": preserved.approval_status,
+            "checksum": preserved.checksum,
+        }
+    if not args.approve:
+        output.update({"mode": "inspect", "approval": "not executed", "stage_elapsed_ms": timings})
+        return output
+    if inspection.status != "unapproved" or inspection.manifest_status != "draft" or inspection.approval_status != "pending":
+        raise ValueError("only a draft/pending generation can be approved")
+    if preserved is not None and (
+        preserved.status != "unapproved"
+        or preserved.manifest_status != "draft"
+        or preserved.approval_status != "pending"
+    ):
+        raise ValueError("preserved generation must remain draft/pending before approval")
+    _stage(
+        timings,
+        "approve_checked",
+        generation_no=args.generation,
+        checksum=expected_checksum,
+        action=lambda: repository.approve_checked(
+            key,
+            args.generation,
+            expected_checksum=args.expected_checksum,
+            approved_by=args.approved_by,
+            approval_reason=args.approval_reason,
+        ),
+    )
+    post = _stage(
+        timings,
+        "post_approval_inspect_generation",
+        generation_no=args.generation,
+        checksum=expected_checksum,
+        action=lambda: repository.inspect_generation(key, args.generation),
+    )
+    if (
+        post.status != "ready"
+        or post.manifest_status != "published"
+        or post.approval_status != "approved"
+        or post.generation_no != args.generation
+        or post.checksum.lower() != expected_checksum
+        or not post.payload
+    ):
+        raise ValueError("post-approval inspection did not confirm the published generation")
+    post_verification = _stage(
+        timings,
+        "post_approval_verification",
+        generation_no=args.generation,
+        checksum=post.checksum,
+        action=lambda: _verify_expected(post.payload, args),
+    )
+    preserved_after = None
+    if args.preserve_generation:
+        preserved_after = _stage(
+            timings,
+            "preserved_after_inspect_generation",
+            generation_no=args.preserve_generation,
+            checksum=expected_checksum,
+            action=lambda: repository.inspect_generation(key, args.preserve_generation),
+        )
+        if (
+            preserved_after.status != "unapproved"
+            or preserved_after.manifest_status != "draft"
+            or preserved_after.approval_status != "pending"
+        ):
+            raise ValueError("preserved generation changed during approval")
+    final_output = _output(post, post_verification)
+    if preserved_after is not None:
+        final_output["preserved_generation"] = {
+            "generation_no": preserved_after.generation_no,
+            "integrity_status": preserved_after.status,
+            "manifest_status": preserved_after.manifest_status,
+            "approval_status": preserved_after.approval_status,
+            "checksum": preserved_after.checksum,
+        }
+    final_output.update(
+        {
+            "mode": "approve",
+            "approval": "ready",
+            "approved_generation": args.generation,
+            "stage_elapsed_ms": timings,
+        }
+    )
+    return final_output
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Inspect and explicitly approve one Dashboard frequency snapshot generation")
     parser.add_argument("--company-id", required=True, type=int)
@@ -125,71 +282,8 @@ def main() -> int:
         args.expected_grade_counts = _parse_grade_counts(args.expected_grade_counts)
         if args.approve and (not str(args.approved_by).strip() or not str(args.approval_reason).strip()):
             raise ValueError("--approved-by and --approval-reason are required with --approve")
-        repository = SqlServerSnapshotRepository()
-        inspection = repository.inspect_generation(_key(args), args.generation)
-        if inspection.status == "corrupt" or not inspection.payload:
-            raise ValueError(f"snapshot inspection failed: {inspection.status}: {inspection.reason}")
-        if inspection.checksum.lower() != str(args.expected_checksum).strip().lower():
-            raise ValueError("expected checksum does not match inspected generation")
-        verification = _verify_expected(inspection.payload, args)
-        output = _output(inspection, verification)
-        preserved = None
-        if args.preserve_generation:
-            preserved = repository.inspect_generation(_key(args), args.preserve_generation)
-            output["preserved_generation"] = {
-                "generation_no": preserved.generation_no,
-                "integrity_status": preserved.status,
-                "manifest_status": preserved.manifest_status,
-                "approval_status": preserved.approval_status,
-                "checksum": preserved.checksum,
-            }
-        if not args.approve:
-            output["mode"] = "inspect"
-            output["approval"] = "not executed"
-            print(json.dumps(output, ensure_ascii=False, indent=2))
-            return 0
-        if inspection.status != "unapproved" or inspection.manifest_status != "draft" or inspection.approval_status != "pending":
-            raise ValueError("only a draft/pending generation can be approved")
-        if preserved is None:
-            raise ValueError("--preserve-generation is required with --approve")
-        if (
-            preserved.status != "unapproved"
-            or preserved.manifest_status != "draft"
-            or preserved.approval_status != "pending"
-        ):
-            raise ValueError("preserved generation must remain draft/pending before approval")
-        repository.approve_checked(
-            _key(args), args.generation, expected_checksum=args.expected_checksum,
-            approved_by=args.approved_by, approval_reason=args.approval_reason,
-        )
-        post = repository.inspect_generation(_key(args), args.generation)
-        if (
-            post.status != "ready"
-            or post.manifest_status != "published"
-            or post.approval_status != "approved"
-            or post.generation_no != args.generation
-            or post.checksum.lower() != str(args.expected_checksum).strip().lower()
-            or not post.payload
-        ):
-            raise ValueError("post-approval inspection did not confirm the published generation")
-        post_verification = _verify_expected(post.payload, args)
-        preserved_after = repository.inspect_generation(_key(args), args.preserve_generation)
-        if (
-            preserved_after.status != "unapproved"
-            or preserved_after.manifest_status != "draft"
-            or preserved_after.approval_status != "pending"
-        ):
-            raise ValueError("preserved generation changed during approval")
-        final_output = _output(post, post_verification)
-        final_output["preserved_generation"] = {
-            "generation_no": preserved_after.generation_no,
-            "integrity_status": preserved_after.status,
-            "manifest_status": preserved_after.manifest_status,
-            "approval_status": preserved_after.approval_status,
-            "checksum": preserved_after.checksum,
-        }
-        final_output.update({"mode": "approve", "approval": "ready", "approved_generation": args.generation})
-        print(json.dumps(final_output, ensure_ascii=False, indent=2))
+        output = run_approval_workflow(args, SqlServerSnapshotRepository())
+        print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
         print(json.dumps({"ok": False, "error_type": type(exc).__name__, "error": str(exc)}, ensure_ascii=False, indent=2))

@@ -24,6 +24,7 @@ from app.services.ssai_snapshot_repository import (
 
 PayloadValidator = Callable[[Mapping[str, Any], SnapshotKey], SnapshotReadResult]
 log = logging.getLogger("ssai.sims.dashboard_snapshot")
+INSPECTION_QUERY_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -386,10 +387,24 @@ class SqlServerSnapshotRepository:
 
     def inspect_generation(self, key: SnapshotKey, generation_no: int) -> SnapshotGenerationInspection:
         """Read exactly one generation and prove storage and contract integrity without changing it."""
-        conn = self._reader_connection_factory()
+        total_started = time.perf_counter()
+        conn = None
+        payload_size = 0
         try:
+            started = time.perf_counter()
+            conn = self._reader_connection_factory()
+            # pyodbc exposes statement timeout on the connection, not the cursor.
+            # This bounds a blocked post-approval reader without adding a retry path.
+            conn.timeout = INSPECTION_QUERY_TIMEOUT_SECONDS
+            _log_read_stage(
+                key,
+                "inspect_db_connection",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                generation_no=int(generation_no),
+            )
             cursor = conn.cursor()
-            row = cursor.execute(
+            started = time.perf_counter()
+            statement = cursor.execute(
                 """
                 /* snapshot.inspect.generation */
                 SELECT m.manifest_id, m.status, m.approval_status, m.checksum,
@@ -402,12 +417,45 @@ class SqlServerSnapshotRepository:
                 """,
                 *_key_values(key),
                 int(generation_no),
-            ).fetchone()
+            )
+            _log_read_stage(
+                key,
+                "inspect_sql_execute",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                generation_no=int(generation_no),
+            )
+            started = time.perf_counter()
+            row = statement.fetchone()
+            _log_read_stage(
+                key,
+                "inspect_sql_fetch",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                generation_no=int(generation_no),
+            )
             if not row:
                 return SnapshotGenerationInspection(status=SNAPSHOT_STATUS_MISSING, generation_no=int(generation_no))
+            started = time.perf_counter()
             payload_json = str(row[4])
             payload_bytes = payload_json.encode("utf-8")
-            if len(payload_bytes) != int(row[6]) or _storage_checksum(payload_bytes) != str(row[5]):
+            payload_size = len(payload_bytes)
+            _log_read_stage(
+                key,
+                "inspect_payload_byte_conversion",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                generation_no=int(generation_no),
+                payload_bytes=payload_size,
+            )
+            started = time.perf_counter()
+            storage_valid = payload_size == int(row[6]) and _storage_checksum(payload_bytes) == str(row[5])
+            _log_read_stage(
+                key,
+                "inspect_storage_checksum",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                generation_no=int(generation_no),
+                payload_bytes=payload_size,
+                status="valid" if storage_valid else "corrupt",
+            )
+            if not storage_valid:
                 return SnapshotGenerationInspection(
                     status=SNAPSHOT_STATUS_CORRUPT,
                     manifest_status=str(row[1]), approval_status=str(row[2]),
@@ -415,9 +463,35 @@ class SqlServerSnapshotRepository:
                     storage_checksum=str(row[5]), payload_size=int(row[6]), reason="storage checksum mismatch",
                 )
             try:
+                started = time.perf_counter()
                 payload = json.loads(payload_json)
+                _log_read_stage(
+                    key,
+                    "inspect_json_decode",
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    generation_no=int(generation_no),
+                    payload_bytes=payload_size,
+                )
+                started = time.perf_counter()
                 self._validate_payload(payload, key)
+                _log_read_stage(
+                    key,
+                    "inspect_contract_validation",
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    generation_no=int(generation_no),
+                    payload_bytes=payload_size,
+                    status="valid",
+                )
             except Exception as exc:
+                _log_read_stage(
+                    key,
+                    "inspect_contract_validation",
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    generation_no=int(generation_no),
+                    payload_bytes=payload_size,
+                    status="corrupt",
+                    reason_code=_snapshot_exception_code(exc),
+                )
                 return SnapshotGenerationInspection(
                     status=SNAPSHOT_STATUS_CORRUPT,
                     manifest_status=str(row[1]), approval_status=str(row[2]),
@@ -437,9 +511,20 @@ class SqlServerSnapshotRepository:
                 manifest_id=int(row[0]), generation_no=int(generation_no), checksum=str(row[3]),
                 storage_checksum=str(row[5]), payload_size=int(row[6]),
             )
+        except Exception as exc:
+            _log_read_stage(
+                key,
+                "inspect_error",
+                elapsed_ms=int((time.perf_counter() - total_started) * 1000),
+                generation_no=int(generation_no),
+                payload_bytes=payload_size,
+                status="error",
+                reason_code=_snapshot_exception_code(exc),
+            )
+            raise
         finally:
-            conn.close()
-
+            if conn is not None:
+                conn.close()
     def read(self, key: SnapshotKey) -> SnapshotReadResult:
         total_started = time.perf_counter()
         conn = None

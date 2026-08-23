@@ -102,6 +102,9 @@ def test_tcode_and_event_contract() -> None:
     _assert(not is_normal_outbound_tcode("0012", "5"), "005 must not be treated as 5xx")
     _assert(not is_normal_outbound_tcode("0012", "600"), "6xx return must be excluded")
     _assert(not is_normal_outbound_tcode("0013", "500"), "wrong group must be excluded")
+    _assert(not is_normal_outbound_tcode("0012", "5A0"), "non-numeric 3-character code must be excluded")
+    _assert(not is_normal_outbound_tcode("0012", "0500"), "four-character numeric code must be excluded")
+    _assert(not is_normal_outbound_tcode("0012", "600"), "600-series return code must not become normal outbound")
 
     rows = [
         _row(1, fixed_flag="anything", record_flag="anything"),

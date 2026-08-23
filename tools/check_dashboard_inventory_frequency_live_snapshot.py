@@ -19,10 +19,13 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     snapshot_key_from_payload,
     validate_frequency_snapshot_payload,
 )
+from app.services.sql_server_snapshot_repository import SnapshotGenerationInspection
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
+    _aggregate_event_grain_chunks,
     _aggregate_result,
     build_frequency_snapshot_plan,
     generate_frequency_snapshot_draft,
+    outbound_event_grain_stream_sql,
     outbound_monthly_aggregate_sql,
     outbound_values_fixture_sql,
     product_universe_sql,
@@ -100,14 +103,28 @@ def test_sql_contract() -> None:
         "io_gcode = '0012'",
         "BETWEEN 500 AND 599",
         "outbound_quantity > 0",
-        "ROW_NUMBER() OVER",
+        "ExactRows AS",
+        "EventGrain AS",
+        "MonthlyDays AS",
         "return_nonpositive_row_count",
     ):
         _assert(fragment in compact, f"SQL contract missing: {fragment}")
+    _assert("TRY_CONVERT" not in compact and "TRY_CAST" not in compact, "legacy ERP SQL must not require TRY_CONVERT/TRY_CAST")
+    _assert("(CASE WHEN LTRIM(RTRIM(CAST(io_tcode AS NVARCHAR(100))))" in compact, "legacy safe integer guard missing")
     for forbidden in ("Rd12_Fixed_Flag", "Rd12_Record_Flag", "Rd12_Reform_Flag", "Rd12_Validation"):
         _assert(forbidden not in sql, f"flag must not exclude rows: {forbidden}")
     _assert(binds["basis_from"] == "20251001" and binds["basis_to"] == "20251231", "date binds mismatch")
     _assert({binds["stock_0"], binds["stock_1"]} == {"00001", "00247"}, "stock binds mismatch")
+    _assert("O.Rd12_Stock_Cd_Gcode = '0018'" in compact, "stock group predicate must remain native-column")
+    _assert("O.Rd12_Stock_Cd IN (:stock_0, :stock_1)" in compact, "stock scope predicate must remain native-column")
+    _assert("LTRIM(RTRIM(O.Rd12_Stock_Cd_Gcode)) = '0018'" not in compact, "stock predicate must not wrap ERP columns")
+    _assert("BaseDiagnostics AS" in compact and "EventAnnotated AS" in compact, "event diagnostics CTEs missing")
+    _assert("ROW_NUMBER() OVER" not in compact, "exact duplicates must use grouped event grain")
+    stream_sql, stream_binds = outbound_event_grain_stream_sql(plan)
+    stream_compact = " ".join(stream_sql.split())
+    _assert(stream_binds == binds, "event stream binds changed")
+    _assert("EventGrain AS" in stream_compact and "BaseDiagnostics AS" in stream_compact, "event stream contract missing")
+    _assert("MonthlyDays AS" not in stream_compact and "GROUPING SETS" not in stream_compact, "event stream must not retain monthly SQL rollup")
 
 
 def test_values_fixture_base_row_mapping() -> None:
@@ -184,6 +201,36 @@ def _payload_from_sql_fixture(rows: list[dict[str, object]]) -> dict[str, object
     )
 
 
+def test_event_grain_stream_python_rollup() -> None:
+    diagnostics = {
+        "source_row_count": 5,
+        "normal_positive_row_count": 3,
+        "normal_positive_missing_key_row_count": 0,
+        "normal_positive_nonintegral_row_count": 0,
+        "normal_nonpositive_row_count": 0,
+        "return_positive_row_count": 1,
+        "return_nonpositive_row_count": 0,
+        "other_tcode_row_count": 1,
+    }
+    chunk = pd.DataFrame([
+        {"row_kind": "event", "outbound_date": "20251001", "product_code": "P1", "stock_code": "00001", "outbound_quantity": 3, "mapping_count": 1, "exact_duplicate_row_count": 1},
+        {"row_kind": "event", "outbound_date": "20251002", "product_code": "P1", "stock_code": "00001", "outbound_quantity": 4, "mapping_count": 1, "exact_duplicate_row_count": 0},
+        {"row_kind": "diagnostics", "outbound_date": "", "product_code": "", "stock_code": "", "outbound_quantity": None, "mapping_count": None, "exact_duplicate_row_count": None, **diagnostics},
+    ])
+    rows, result = _aggregate_event_grain_chunks([chunk.iloc[:1], chunk.iloc[1:]])
+    _assert(rows == [{"month": "202510", "product_code": "P1", "stock_code": "00001", "occurrence_count": 2, "outbound_quantity": 7, "outbound_day_count": 2}], "streamed monthly rollup changed")
+    _assert(result["normal_positive_duplicate_row_count"] == 1 and result["normal_positive_accepted_row_count"] == 2, "stream diagnostics changed")
+
+    conflict = chunk.copy()
+    conflict.loc[0, "mapping_count"] = 2
+    try:
+        _aggregate_event_grain_chunks([conflict])
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("streamed conflicting event must fail closed")
+
+
 def test_sqlserver_values_python_equivalence() -> None:
     """Directly compare a SQL Server VALUES CTE result against the raw-event helper."""
     rows = _valid_sql_fixture_rows()
@@ -230,6 +277,20 @@ class _DraftRepository:
             approval_status="pending",
         )
 
+    def inspect_generation(self, key, generation_no: int):
+        if self.published is None or generation_no != 7:
+            return SnapshotGenerationInspection(status="missing", generation_no=generation_no)
+        stored_key, payload, _created_by, _force = self.published
+        if key != stored_key:
+            return SnapshotGenerationInspection(status="missing", generation_no=generation_no)
+        return SnapshotGenerationInspection(
+            status="unapproved",
+            manifest_status="draft",
+            approval_status="pending",
+            payload=payload,
+            generation_no=7,
+            checksum=str(payload["checksum"]),
+        )
     def read(self, key):
         return SnapshotReadResult(status="unapproved", generation_no=7, manifest_id=17)
 
@@ -271,6 +332,7 @@ def test_generation_boundary() -> None:
     )
     _assert(len(calls) == 2, "generation must issue exactly two ERP reads")
     _assert(result["read_status"] == "unapproved", "draft must fail closed before approval")
+    _assert(result["draft_inspection_status"] == "unapproved", "exact draft inspection must validate the pending generation")
     _assert(result["draft"].status == "draft", "generator must not approve/publish")
     _assert(result["payload"]["summary"]["grade_counts"]["X"] == 1, "universe X row missing")
     _assert(progress == ["제품 조회 중", "출고 집계 중", "등급 계산 중", "draft 저장 중"], "progress phases mismatch")
@@ -289,6 +351,27 @@ def test_diagnostics_fail_closed() -> None:
         raise AssertionError("incomplete event key must fail closed")
 
 
+def test_sql_event_grain_duplicate_conflict_diagnostics() -> None:
+    rows = [
+        _event(day="20251001", seq=1, product="P1"),
+        _event(day="20251001", seq=1, product="P1"),
+        _event(day="20251001", seq=1, product="P1"),
+        _event(day="20251001", seq=1, product="P2"),
+    ]
+    sql, binds = outbound_values_fixture_sql(rows)
+    frame = query_sqlserver_fixture(sql, binds)
+    summary = frame.loc[frame["row_kind"].astype(str).eq("summary")].iloc[0]
+    _assert(int(summary["source_row_count"]) == 4, "source row diagnostic changed")
+    _assert(int(summary["normal_positive_duplicate_row_count"]) == 2, "exact duplicate diagnostic changed")
+    _assert(int(summary["normal_positive_conflicting_row_count"]) == 2, "conflicting row diagnostic changed")
+    _assert(int(summary["conflicting_event_count"]) == 1, "conflicting event diagnostic changed")
+    _assert(int(summary["normal_positive_accepted_row_count"]) == 0, "conflicting event must not be accepted")
+    try:
+        _aggregate_result(frame)
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("conflicting event must remain fail-closed")
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--live-sqlserver", action="store_true", help="run the direct SQL Server VALUES CTE equivalence")
@@ -297,6 +380,7 @@ def main() -> int:
         test_sql_contract,
         test_values_fixture_base_row_mapping,
         test_python_aggregate_equivalence,
+        test_event_grain_stream_python_rollup,
         test_generation_boundary,
         test_diagnostics_fail_closed,
     )
@@ -304,7 +388,7 @@ def main() -> int:
         test()
         print(f"PASS {test.__name__}")
     if args.live_sqlserver:
-        for test in (test_sqlserver_values_python_equivalence, test_sql_diagnostics_fail_closed):
+        for test in (test_sqlserver_values_python_equivalence, test_sql_diagnostics_fail_closed, test_sql_event_grain_duplicate_conflict_diagnostics):
             test()
             print(f"PASS {test.__name__}")
     print(f"RESULT OK tests={len(tests)}")

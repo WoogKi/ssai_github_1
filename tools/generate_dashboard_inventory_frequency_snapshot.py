@@ -36,7 +36,7 @@ def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, sco
         },
         "erp_read_plan": {
             "sql_call_count": plan.erp_sql_call_count,
-            "queries": ["Rddbc040 product universe", "Rddbc120 monthly outbound aggregate"],
+            "queries": ["Rddbc040 product universe", "Rddbc120 bounded event stream + Python monthly aggregation"],
             "timeout_seconds_each": timeout_seconds,
             "retry_count": 0,
         },

@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import pandas as pd
 from sqlalchemy import text
+from app.db.sql_utils import sql_safe_int
 
 from app.db.mssql_client import get_current_company_id, get_engine, set_current_company_id
 from app.services.dashboard_inventory_frequency_snapshot import (
@@ -282,6 +283,8 @@ ORDER BY product_code
 
 
 def _aggregate_sql(base_rows_sql: str) -> str:
+    """Aggregate outbound events once at exact-row, event, day, then month grain."""
+    io_tcode_number = sql_safe_int("io_tcode")
     return f"""
 WITH BaseRows AS (
     {base_rows_sql}
@@ -289,80 +292,127 @@ WITH BaseRows AS (
     SELECT *,
         CASE WHEN io_gcode = '0012' AND LEN(io_tcode) = 3
                   AND io_tcode NOT LIKE '%[^0-9]%'
-                  AND TRY_CONVERT(int, io_tcode) BETWEEN 500 AND 599 THEN 1 ELSE 0 END AS is_normal,
+                  AND {io_tcode_number} BETWEEN 500 AND 599 THEN 1 ELSE 0 END AS is_normal,
         CASE WHEN io_gcode = '0012' AND LEN(io_tcode) = 3
                   AND io_tcode NOT LIKE '%[^0-9]%'
-                  AND TRY_CONVERT(int, io_tcode) BETWEEN 600 AND 699 THEN 1 ELSE 0 END AS is_return
+                  AND {io_tcode_number} BETWEEN 600 AND 699 THEN 1 ELSE 0 END AS is_return
     FROM BaseRows
 ), NormalPositive AS (
     SELECT * FROM Classified WHERE is_normal = 1 AND outbound_quantity > 0
-), ValidNormalPositive AS (
-    SELECT *, ROW_NUMBER() OVER (
-        PARTITION BY outbound_date, vendor_code, outbound_seq, product_code, stock_code, outbound_quantity
-        ORDER BY outbound_date
-    ) AS exact_duplicate_rank
+), ExactRows AS (
+    SELECT outbound_date, vendor_code, outbound_seq, product_code, stock_code, outbound_quantity,
+           COUNT_BIG(*) AS exact_duplicate_count
     FROM NormalPositive
     WHERE NULLIF(outbound_date, '') IS NOT NULL AND NULLIF(vendor_code, '') IS NOT NULL
       AND NULLIF(outbound_seq, '') IS NOT NULL AND NULLIF(product_code, '') IS NOT NULL
       AND NULLIF(stock_code, '') IS NOT NULL
       AND outbound_quantity = FLOOR(outbound_quantity)
-), UniqueNormalEvents AS (
-    SELECT * FROM ValidNormalPositive WHERE exact_duplicate_rank = 1
-), EventMappingCounts AS (
-    SELECT outbound_date, vendor_code, outbound_seq, COUNT_BIG(*) AS mapping_count
-    FROM UniqueNormalEvents
+    GROUP BY outbound_date, vendor_code, outbound_seq, product_code, stock_code, outbound_quantity
+), EventGrain AS (
+    SELECT outbound_date, vendor_code, outbound_seq,
+           COUNT_BIG(*) AS mapping_count,
+           MAX(product_code) AS product_code,
+           MAX(stock_code) AS stock_code,
+           MAX(outbound_quantity) AS outbound_quantity,
+           SUM(exact_duplicate_count - 1) AS exact_duplicate_row_count
+    FROM ExactRows
     GROUP BY outbound_date, vendor_code, outbound_seq
-), AcceptedEvents AS (
-    SELECT E.*
-    FROM UniqueNormalEvents AS E
-    INNER JOIN EventMappingCounts AS M
-        ON M.outbound_date = E.outbound_date AND M.vendor_code = E.vendor_code AND M.outbound_seq = E.outbound_seq
-    WHERE M.mapping_count = 1
-), Monthly AS (
-    SELECT LEFT(E.outbound_date, 6) AS [month], E.product_code, E.stock_code,
-        COUNT_BIG(*) AS occurrence_count, SUM(E.outbound_quantity) AS outbound_quantity,
-        COUNT(DISTINCT E.outbound_date) AS outbound_day_count
-    FROM AcceptedEvents AS E
-    GROUP BY LEFT(E.outbound_date, 6), E.product_code, E.stock_code
-), Diagnostics AS (
+), EventAnnotated AS (
+    SELECT *,
+           COALESCE(SUM(exact_duplicate_row_count) OVER (), 0) AS normal_positive_duplicate_row_count,
+           COALESCE(SUM(CASE WHEN mapping_count > 1 THEN mapping_count ELSE 0 END) OVER (), 0) AS normal_positive_conflicting_row_count,
+           COALESCE(SUM(CASE WHEN mapping_count > 1 THEN 1 ELSE 0 END) OVER (), 0) AS conflicting_event_count,
+           COALESCE(SUM(CASE WHEN mapping_count = 1 THEN 1 ELSE 0 END) OVER (), 0) AS accepted_row_count
+    FROM EventGrain
+), BaseDiagnostics AS (
     SELECT
-        (SELECT COUNT_BIG(*) FROM BaseRows) AS source_row_count,
-        (SELECT COUNT_BIG(*) FROM AcceptedEvents) AS normal_positive_accepted_row_count,
-        (SELECT COUNT_BIG(*) FROM ValidNormalPositive WHERE exact_duplicate_rank > 1) AS normal_positive_duplicate_row_count,
-        (SELECT COUNT_BIG(*) FROM UniqueNormalEvents AS E INNER JOIN EventMappingCounts AS M
-          ON M.outbound_date = E.outbound_date AND M.vendor_code = E.vendor_code AND M.outbound_seq = E.outbound_seq
-          WHERE M.mapping_count > 1) AS normal_positive_conflicting_row_count,
-        (SELECT COUNT_BIG(*) FROM NormalPositive WHERE NULLIF(outbound_date, '') IS NULL OR NULLIF(vendor_code, '') IS NULL OR NULLIF(outbound_seq, '') IS NULL OR NULLIF(product_code, '') IS NULL OR NULLIF(stock_code, '') IS NULL) AS normal_positive_missing_key_row_count,
-        (SELECT COUNT_BIG(*) FROM NormalPositive WHERE NULLIF(outbound_date, '') IS NOT NULL AND NULLIF(vendor_code, '') IS NOT NULL AND NULLIF(outbound_seq, '') IS NOT NULL AND NULLIF(product_code, '') IS NOT NULL AND NULLIF(stock_code, '') IS NOT NULL AND outbound_quantity <> FLOOR(outbound_quantity)) AS normal_positive_nonintegral_row_count,
-        (SELECT COUNT_BIG(*) FROM Classified WHERE is_normal = 1 AND outbound_quantity <= 0) AS normal_nonpositive_row_count,
-        (SELECT COUNT_BIG(*) FROM Classified WHERE is_return = 1 AND outbound_quantity > 0) AS return_positive_row_count,
-        (SELECT COUNT_BIG(*) FROM Classified WHERE is_return = 1 AND outbound_quantity <= 0) AS return_nonpositive_row_count,
-        (SELECT COUNT_BIG(*) FROM Classified WHERE is_normal = 0 AND is_return = 0) AS other_tcode_row_count,
-        (SELECT COUNT_BIG(*) FROM NormalPositive) AS normal_positive_row_count,
-        (SELECT COUNT_BIG(*) FROM AcceptedEvents) AS distinct_normal_event_count,
-        (SELECT COUNT_BIG(*) FROM EventMappingCounts WHERE mapping_count > 1) AS conflicting_event_count
+        COUNT_BIG(*) AS source_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity > 0 THEN 1 ELSE 0 END), 0) AS normal_positive_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity > 0
+            AND (NULLIF(outbound_date, '') IS NULL OR NULLIF(vendor_code, '') IS NULL
+                OR NULLIF(outbound_seq, '') IS NULL OR NULLIF(product_code, '') IS NULL
+                OR NULLIF(stock_code, '') IS NULL) THEN 1 ELSE 0 END), 0) AS normal_positive_missing_key_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity > 0
+            AND NULLIF(outbound_date, '') IS NOT NULL AND NULLIF(vendor_code, '') IS NOT NULL
+            AND NULLIF(outbound_seq, '') IS NOT NULL AND NULLIF(product_code, '') IS NOT NULL
+            AND NULLIF(stock_code, '') IS NOT NULL AND outbound_quantity <> FLOOR(outbound_quantity)
+            THEN 1 ELSE 0 END), 0) AS normal_positive_nonintegral_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity <= 0 THEN 1 ELSE 0 END), 0) AS normal_nonpositive_row_count,
+        COALESCE(SUM(CASE WHEN is_return = 1 AND outbound_quantity > 0 THEN 1 ELSE 0 END), 0) AS return_positive_row_count,
+        COALESCE(SUM(CASE WHEN is_return = 1 AND outbound_quantity <= 0 THEN 1 ELSE 0 END), 0) AS return_nonpositive_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 0 AND is_return = 0 THEN 1 ELSE 0 END), 0) AS other_tcode_row_count
+    FROM Classified
+), MonthlyDays AS (
+    SELECT LEFT(E.outbound_date, 6) AS [month], E.product_code, E.stock_code, E.outbound_date,
+           COUNT_BIG(*) AS occurrence_count, SUM(E.outbound_quantity) AS outbound_quantity,
+           MAX(E.normal_positive_duplicate_row_count) AS normal_positive_duplicate_row_count,
+           MAX(E.normal_positive_conflicting_row_count) AS normal_positive_conflicting_row_count,
+           MAX(E.conflicting_event_count) AS conflicting_event_count,
+           MAX(E.accepted_row_count) AS accepted_row_count,
+           MAX(B.source_row_count) AS source_row_count,
+           MAX(B.normal_positive_row_count) AS normal_positive_row_count,
+           MAX(B.normal_positive_missing_key_row_count) AS normal_positive_missing_key_row_count,
+           MAX(B.normal_positive_nonintegral_row_count) AS normal_positive_nonintegral_row_count,
+           MAX(B.normal_nonpositive_row_count) AS normal_nonpositive_row_count,
+           MAX(B.return_positive_row_count) AS return_positive_row_count,
+           MAX(B.return_nonpositive_row_count) AS return_nonpositive_row_count,
+           MAX(B.other_tcode_row_count) AS other_tcode_row_count
+    FROM EventAnnotated AS E
+    CROSS JOIN BaseDiagnostics AS B
+    WHERE E.mapping_count = 1
+    GROUP BY LEFT(E.outbound_date, 6), E.product_code, E.stock_code, E.outbound_date
+), MonthlyAndSummary AS (
+    SELECT
+        CASE WHEN GROUPING([month]) = 1 THEN 'summary' ELSE 'monthly' END AS row_kind,
+        CASE WHEN GROUPING([month]) = 1 THEN '' ELSE [month] END AS [month],
+        CASE WHEN GROUPING([month]) = 1 THEN '' ELSE product_code END AS product_code,
+        CASE WHEN GROUPING([month]) = 1 THEN '' ELSE stock_code END AS stock_code,
+        CASE WHEN GROUPING([month]) = 1 THEN 0 ELSE SUM(occurrence_count) END AS occurrence_count,
+        CASE WHEN GROUPING([month]) = 1 THEN 0 ELSE SUM(outbound_quantity) END AS outbound_quantity,
+        CASE WHEN GROUPING([month]) = 1 THEN 0 ELSE COUNT_BIG(*) END AS outbound_day_count,
+        MAX(source_row_count) AS source_row_count,
+        MAX(accepted_row_count) AS normal_positive_accepted_row_count,
+        MAX(normal_positive_duplicate_row_count) AS normal_positive_duplicate_row_count,
+        MAX(normal_positive_conflicting_row_count) AS normal_positive_conflicting_row_count,
+        MAX(normal_positive_missing_key_row_count) AS normal_positive_missing_key_row_count,
+        MAX(normal_positive_nonintegral_row_count) AS normal_positive_nonintegral_row_count,
+        MAX(normal_nonpositive_row_count) AS normal_nonpositive_row_count,
+        MAX(return_positive_row_count) AS return_positive_row_count,
+        MAX(return_nonpositive_row_count) AS return_nonpositive_row_count,
+        MAX(other_tcode_row_count) AS other_tcode_row_count,
+        MAX(normal_positive_row_count) AS normal_positive_row_count,
+        MAX(accepted_row_count) AS distinct_normal_event_count,
+        MAX(conflicting_event_count) AS conflicting_event_count
+    FROM MonthlyDays
+    GROUP BY GROUPING SETS (([month], product_code, stock_code), ())
+), EventFallbackDiagnostics AS (
+    SELECT
+        COALESCE(SUM(exact_duplicate_row_count), 0) AS normal_positive_duplicate_row_count,
+        COALESCE(SUM(CASE WHEN mapping_count > 1 THEN mapping_count ELSE 0 END), 0) AS normal_positive_conflicting_row_count,
+        COALESCE(SUM(CASE WHEN mapping_count > 1 THEN 1 ELSE 0 END), 0) AS conflicting_event_count,
+        COALESCE(SUM(CASE WHEN mapping_count = 1 THEN 1 ELSE 0 END), 0) AS accepted_row_count
+    FROM EventGrain
+), EmptyAcceptedSummary AS (
+    SELECT 'summary' AS row_kind, '' AS [month], '' AS product_code, '' AS stock_code,
+           0 AS occurrence_count, 0 AS outbound_quantity, 0 AS outbound_day_count,
+           B.source_row_count, E.accepted_row_count AS normal_positive_accepted_row_count,
+           E.normal_positive_duplicate_row_count, E.normal_positive_conflicting_row_count,
+           B.normal_positive_missing_key_row_count, B.normal_positive_nonintegral_row_count,
+           B.normal_nonpositive_row_count, B.return_positive_row_count, B.return_nonpositive_row_count,
+           B.other_tcode_row_count, B.normal_positive_row_count, E.accepted_row_count AS distinct_normal_event_count,
+           E.conflicting_event_count
+    FROM BaseDiagnostics AS B
+    CROSS JOIN EventFallbackDiagnostics AS E
+    WHERE NOT EXISTS (SELECT 1 FROM EventAnnotated WHERE mapping_count = 1)
 )
-SELECT 'monthly' AS row_kind, M.[month], M.product_code, M.stock_code,
-    M.occurrence_count, M.outbound_quantity, M.outbound_day_count,
-    D.source_row_count, D.normal_positive_accepted_row_count, D.normal_positive_duplicate_row_count,
-    D.normal_positive_conflicting_row_count, D.normal_positive_missing_key_row_count,
-    D.normal_positive_nonintegral_row_count, D.normal_nonpositive_row_count,
-    D.return_positive_row_count, D.return_nonpositive_row_count, D.other_tcode_row_count,
-    D.normal_positive_row_count, D.distinct_normal_event_count, D.conflicting_event_count
-FROM Monthly AS M CROSS JOIN Diagnostics AS D
+SELECT * FROM MonthlyAndSummary
 UNION ALL
-SELECT 'summary', '', '', '', 0, 0, 0,
-    D.source_row_count, D.normal_positive_accepted_row_count, D.normal_positive_duplicate_row_count,
-    D.normal_positive_conflicting_row_count, D.normal_positive_missing_key_row_count,
-    D.normal_positive_nonintegral_row_count, D.normal_nonpositive_row_count,
-    D.return_positive_row_count, D.return_nonpositive_row_count, D.other_tcode_row_count,
-    D.normal_positive_row_count, D.distinct_normal_event_count, D.conflicting_event_count
-FROM Diagnostics AS D
+SELECT * FROM EmptyAcceptedSummary
 ORDER BY row_kind, [month], product_code, stock_code
 """.strip()
 
-
-def outbound_monthly_aggregate_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+def outbound_base_rows_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+    """Build the shared Rddbc120 source for aggregate and read-only profiling."""
     binds: dict[str, Any] = {"basis_from": plan.basis_from, "basis_to": plan.basis_to}
     stock_clause = ""
     if plan.stock_codes:
@@ -371,7 +421,9 @@ def outbound_monthly_aggregate_sql(plan: FrequencySnapshotPlan) -> tuple[str, di
             key = f"stock_{index}"
             binds[key] = code
             names.append(f":{key}")
-        stock_clause = "AND LTRIM(RTRIM(O.Rd12_Stock_Cd_Gcode)) = '0018'\n      AND LTRIM(RTRIM(O.Rd12_Stock_Cd)) IN (" + ", ".join(names) + ")"
+        # SQL Server character equality already ignores trailing blanks. Keep the
+        # predicate on native columns so the ERP date/stock index remains usable.
+        stock_clause = "AND O.Rd12_Stock_Cd_Gcode = '0018'\n      AND O.Rd12_Stock_Cd IN (" + ", ".join(names) + ")"
     base = f"""
 SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
     LTRIM(RTRIM(O.Rd12_Ven_Cd)) AS vendor_code,
@@ -385,8 +437,87 @@ FROM dbo.Rddbc120 AS O
 WHERE O.Rd12_Out_YyMmDd >= :basis_from AND O.Rd12_Out_YyMmDd <= :basis_to
   {stock_clause}
 """.strip()
+    return base, binds
+
+
+def outbound_monthly_aggregate_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+    base, binds = outbound_base_rows_sql(plan)
     return _aggregate_sql(base), binds
 
+
+def outbound_event_grain_stream_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+    """Return event-grain rows plus one base-diagnostics row for bounded local rollup."""
+    base_rows_sql, binds = outbound_base_rows_sql(plan)
+    io_tcode_number = sql_safe_int("io_tcode")
+    return f"""
+WITH BaseRows AS (
+    {base_rows_sql}
+), Classified AS (
+    SELECT *,
+        CASE WHEN io_gcode = '0012' AND LEN(io_tcode) = 3
+                  AND io_tcode NOT LIKE '%[^0-9]%'
+                  AND {io_tcode_number} BETWEEN 500 AND 599 THEN 1 ELSE 0 END AS is_normal,
+        CASE WHEN io_gcode = '0012' AND LEN(io_tcode) = 3
+                  AND io_tcode NOT LIKE '%[^0-9]%'
+                  AND {io_tcode_number} BETWEEN 600 AND 699 THEN 1 ELSE 0 END AS is_return
+    FROM BaseRows
+), NormalPositive AS (
+    SELECT * FROM Classified WHERE is_normal = 1 AND outbound_quantity > 0
+), ExactRows AS (
+    SELECT outbound_date, vendor_code, outbound_seq, product_code, stock_code, outbound_quantity,
+           COUNT_BIG(*) AS exact_duplicate_count
+    FROM NormalPositive
+    WHERE NULLIF(outbound_date, '') IS NOT NULL AND NULLIF(vendor_code, '') IS NOT NULL
+      AND NULLIF(outbound_seq, '') IS NOT NULL AND NULLIF(product_code, '') IS NOT NULL
+      AND NULLIF(stock_code, '') IS NOT NULL
+      AND outbound_quantity = FLOOR(outbound_quantity)
+    GROUP BY outbound_date, vendor_code, outbound_seq, product_code, stock_code, outbound_quantity
+), EventGrain AS (
+    SELECT outbound_date, vendor_code, outbound_seq,
+           COUNT_BIG(*) AS mapping_count,
+           MAX(product_code) AS product_code,
+           MAX(stock_code) AS stock_code,
+           MAX(outbound_quantity) AS outbound_quantity,
+           SUM(exact_duplicate_count - 1) AS exact_duplicate_row_count
+    FROM ExactRows
+    GROUP BY outbound_date, vendor_code, outbound_seq
+), BaseDiagnostics AS (
+    SELECT
+        COUNT_BIG(*) AS source_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity > 0 THEN 1 ELSE 0 END), 0) AS normal_positive_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity > 0
+            AND (NULLIF(outbound_date, '') IS NULL OR NULLIF(vendor_code, '') IS NULL
+                OR NULLIF(outbound_seq, '') IS NULL OR NULLIF(product_code, '') IS NULL
+                OR NULLIF(stock_code, '') IS NULL) THEN 1 ELSE 0 END), 0) AS normal_positive_missing_key_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity > 0
+            AND NULLIF(outbound_date, '') IS NOT NULL AND NULLIF(vendor_code, '') IS NOT NULL
+            AND NULLIF(outbound_seq, '') IS NOT NULL AND NULLIF(product_code, '') IS NOT NULL
+            AND NULLIF(stock_code, '') IS NOT NULL AND outbound_quantity <> FLOOR(outbound_quantity)
+            THEN 1 ELSE 0 END), 0) AS normal_positive_nonintegral_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 1 AND outbound_quantity <= 0 THEN 1 ELSE 0 END), 0) AS normal_nonpositive_row_count,
+        COALESCE(SUM(CASE WHEN is_return = 1 AND outbound_quantity > 0 THEN 1 ELSE 0 END), 0) AS return_positive_row_count,
+        COALESCE(SUM(CASE WHEN is_return = 1 AND outbound_quantity <= 0 THEN 1 ELSE 0 END), 0) AS return_nonpositive_row_count,
+        COALESCE(SUM(CASE WHEN is_normal = 0 AND is_return = 0 THEN 1 ELSE 0 END), 0) AS other_tcode_row_count
+    FROM Classified
+)
+SELECT 'event' AS row_kind, E.outbound_date, E.product_code, E.stock_code,
+       E.outbound_quantity, E.mapping_count, E.exact_duplicate_row_count,
+       CAST(NULL AS bigint) AS source_row_count,
+       CAST(NULL AS bigint) AS normal_positive_row_count,
+       CAST(NULL AS bigint) AS normal_positive_missing_key_row_count,
+       CAST(NULL AS bigint) AS normal_positive_nonintegral_row_count,
+       CAST(NULL AS bigint) AS normal_nonpositive_row_count,
+       CAST(NULL AS bigint) AS return_positive_row_count,
+       CAST(NULL AS bigint) AS return_nonpositive_row_count,
+       CAST(NULL AS bigint) AS other_tcode_row_count
+FROM EventGrain AS E
+UNION ALL
+SELECT 'diagnostics', '', '', '', CAST(NULL AS decimal(38, 6)), CAST(NULL AS bigint), CAST(NULL AS bigint),
+       B.source_row_count, B.normal_positive_row_count, B.normal_positive_missing_key_row_count,
+       B.normal_positive_nonintegral_row_count, B.normal_nonpositive_row_count,
+       B.return_positive_row_count, B.return_nonpositive_row_count, B.other_tcode_row_count
+FROM BaseDiagnostics AS B
+""".strip(), binds
 
 def _fixture_decimal(value: Any, *, field: str) -> Decimal:
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -450,6 +581,131 @@ def _query_company_df(company_id: int, sql: str, params: Mapping[str, Any], time
         set_current_company_id(previous_company_id)
 
 
+def _query_company_chunks(
+    company_id: int,
+    sql: str,
+    params: Mapping[str, Any],
+    timeout_seconds: int,
+    *,
+    chunk_rows: int = 50000,
+) -> Iterable[pd.DataFrame]:
+    """Read one ERP statement incrementally without retaining its full event result."""
+    previous_company_id = get_current_company_id()
+    set_current_company_id(company_id)
+    try:
+        with get_engine().connect() as conn:
+            raw = getattr(conn.connection, "driver_connection", conn.connection)
+            if hasattr(raw, "timeout"):
+                raw.timeout = max(1, int(timeout_seconds))
+            chunks = pd.read_sql_query(text(sql), conn, params=dict(params), chunksize=max(1, int(chunk_rows)))
+            for chunk in chunks:
+                if not isinstance(chunk, pd.DataFrame):
+                    raise SnapshotContractError("outbound event stream returned an invalid chunk")
+                yield chunk
+    finally:
+        set_current_company_id(previous_company_id)
+
+
+def _event_grain_int(value: Any, *, field: str) -> int:
+    if value is None or pd.isna(value):
+        raise SnapshotContractError(f"outbound event stream {field} is required")
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise SnapshotContractError(f"outbound event stream {field} must be numeric") from exc
+    if number != number.to_integral_value():
+        raise SnapshotContractError(f"outbound event stream {field} must be integral")
+    return int(number)
+
+
+def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Rebuild monthly activity from a single chunked exact event stream.
+
+    The SQL result already suppresses exact duplicates and marks conflicting
+    event keys.  Keeping only one integer day bitmap per month/product/stock
+    bounds local state by output grain rather than ERP event row count.
+    """
+    monthly: dict[tuple[str, str, str], list[int]] = {}
+    diagnostics: dict[str, int] | None = None
+    duplicate_rows = 0
+    conflicting_rows = 0
+    conflicting_events = 0
+    accepted_rows = 0
+    event_rows = 0
+    required = {
+        "row_kind", "outbound_date", "product_code", "stock_code", "outbound_quantity",
+        "mapping_count", "exact_duplicate_row_count", *ROW_PARTITION_FIELDS[3:], "source_row_count", "normal_positive_row_count",
+    }
+    for chunk in chunks:
+        if not isinstance(chunk, pd.DataFrame) or not required.issubset(chunk.columns):
+            raise SnapshotContractError("outbound event stream columns are invalid")
+        for record in chunk.to_dict("records"):
+            kind = str(record.get("row_kind") or "").strip()
+            if kind == "diagnostics":
+                if diagnostics is not None:
+                    raise SnapshotContractError("outbound event stream has duplicate diagnostics")
+                diagnostics = {
+                    "source_row_count": _event_grain_int(record.get("source_row_count"), field="source_row_count"),
+                    "normal_positive_row_count": _event_grain_int(record.get("normal_positive_row_count"), field="normal_positive_row_count"),
+                    "normal_positive_missing_key_row_count": _event_grain_int(record.get("normal_positive_missing_key_row_count"), field="normal_positive_missing_key_row_count"),
+                    "normal_positive_nonintegral_row_count": _event_grain_int(record.get("normal_positive_nonintegral_row_count"), field="normal_positive_nonintegral_row_count"),
+                    "normal_nonpositive_row_count": _event_grain_int(record.get("normal_nonpositive_row_count"), field="normal_nonpositive_row_count"),
+                    "return_positive_row_count": _event_grain_int(record.get("return_positive_row_count"), field="return_positive_row_count"),
+                    "return_nonpositive_row_count": _event_grain_int(record.get("return_nonpositive_row_count"), field="return_nonpositive_row_count"),
+                    "other_tcode_row_count": _event_grain_int(record.get("other_tcode_row_count"), field="other_tcode_row_count"),
+                }
+                continue
+            if kind != "event":
+                raise SnapshotContractError("outbound event stream row kind is invalid")
+            event_rows += 1
+            mapping_count = _event_grain_int(record.get("mapping_count"), field="mapping_count")
+            exact_duplicates = _event_grain_int(record.get("exact_duplicate_row_count"), field="exact_duplicate_row_count")
+            if mapping_count < 1 or exact_duplicates < 0:
+                raise SnapshotContractError("outbound event stream count is invalid")
+            duplicate_rows += exact_duplicates
+            if mapping_count > 1:
+                conflicting_rows += mapping_count
+                conflicting_events += 1
+                continue
+            outbound_date = str(record.get("outbound_date") or "").strip()
+            product_code = str(record.get("product_code") or "").strip()
+            stock_code = str(record.get("stock_code") or "").strip()
+            if len(outbound_date) != 8 or not outbound_date.isdigit() or not product_code or not stock_code:
+                raise SnapshotContractError("outbound event stream accepted row is invalid")
+            quantity = _event_grain_int(record.get("outbound_quantity"), field="outbound_quantity")
+            day_of_month = int(outbound_date[6:])
+            if quantity <= 0 or day_of_month < 1 or day_of_month > 31:
+                raise SnapshotContractError("outbound event stream accepted row is invalid")
+            accepted_rows += 1
+            key = (outbound_date[:6], product_code, stock_code)
+            current = monthly.setdefault(key, [0, 0, 0])
+            current[0] += 1
+            current[1] += quantity
+            current[2] |= 1 << (day_of_month - 1)
+    if diagnostics is None:
+        raise SnapshotContractError("outbound event stream returned no diagnostics")
+    diagnostics.update({
+        "normal_positive_accepted_row_count": accepted_rows,
+        "normal_positive_duplicate_row_count": duplicate_rows,
+        "normal_positive_conflicting_row_count": conflicting_rows,
+        "distinct_normal_event_count": accepted_rows,
+        "conflicting_event_count": conflicting_events,
+    })
+    frame_rows = [
+        {
+            "row_kind": "monthly", "month": month, "product_code": product_code, "stock_code": stock_code,
+            "occurrence_count": values[0], "outbound_quantity": values[1], "outbound_day_count": values[2].bit_count(),
+            **diagnostics,
+        }
+        for (month, product_code, stock_code), values in sorted(monthly.items())
+    ]
+    frame_rows.append({
+        "row_kind": "summary", "month": "", "product_code": "", "stock_code": "",
+        "occurrence_count": 0, "outbound_quantity": 0, "outbound_day_count": 0, **diagnostics,
+    })
+    return _aggregate_result(pd.DataFrame(frame_rows))
+
+
 def query_sqlserver_fixture(sql: str, binds: Mapping[str, Any], *, timeout_seconds: int = 30) -> pd.DataFrame:
     """Execute a parameterized VALUES CTE against SQL Server only for test equivalence."""
     from app.services.ssai_analytics_db import connect_analytics_db
@@ -502,9 +758,17 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
     product_codes = sorted({str(value).strip() for value in universe_df["product_code"].tolist() if str(value).strip()})
     if not product_codes:
         raise SnapshotContractError("official Rddbc040 product universe is empty")
-    aggregate_sql, aggregate_binds = outbound_monthly_aggregate_sql(plan)
     report("출고 집계 중")
-    monthly_rows, diagnostics = _aggregate_result(query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds))
+    if query_executor is None:
+        aggregate_sql, aggregate_binds = outbound_event_grain_stream_sql(plan)
+        monthly_rows, diagnostics = _aggregate_event_grain_chunks(
+            _query_company_chunks(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds)
+        )
+    else:
+        # Fixture callers remain DataFrame-based; the production path above is
+        # the bounded event stream and still makes exactly two ERP calls.
+        aggregate_sql, aggregate_binds = outbound_monthly_aggregate_sql(plan)
+        monthly_rows, diagnostics = _aggregate_result(query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds))
     report("등급 계산 중")
     payload = build_frequency_snapshot_payload_from_aggregates(
         company_id=plan.company_id, evaluation_month=plan.evaluation_month, monthly_rows=monthly_rows,
@@ -517,7 +781,27 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
     )
     report("draft 저장 중")
     draft = repo.publish(key, payload, created_by=actor, force=bool(force))
-    blocked = repo.read(key)
-    if blocked.status != "unapproved":
-        raise SnapshotContractError("draft generation was readable before manual approval")
-    return {"plan": plan, "payload": payload, "draft": draft, "read_status": blocked.status}
+    draft_generation_no = int(draft.generation_no or 0)
+    draft_inspection = repo.inspect_generation(key, draft_generation_no)
+    if (
+        draft_generation_no <= 0
+        or draft_inspection.status != "unapproved"
+        or draft_inspection.manifest_status != "draft"
+        or draft_inspection.approval_status != "pending"
+        or draft_inspection.generation_no != draft_generation_no
+        or draft_inspection.checksum.lower() != str(payload.get("checksum") or "").lower()
+        or not draft_inspection.payload
+    ):
+        raise SnapshotContractError("draft generation exact inspection failed before manual approval")
+    operating_read = repo.read(key)
+    if operating_read.status == "ready" and operating_read.generation_no == draft_generation_no:
+        raise SnapshotContractError("draft generation was exposed through the operating read before manual approval")
+    if operating_read.status not in {"ready", "unapproved"}:
+        raise SnapshotContractError(f"operating snapshot read failed after draft save: {operating_read.status}")
+    return {
+        "plan": plan,
+        "payload": payload,
+        "draft": draft,
+        "read_status": operating_read.status,
+        "draft_inspection_status": draft_inspection.status,
+    }
