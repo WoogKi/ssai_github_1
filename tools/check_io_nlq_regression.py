@@ -6411,7 +6411,7 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                 ])
             return pd.DataFrame()
         goods_service.search_goods_full = _goods_like_fixture
-        shared._load_stock_code_options = lambda: [(".본사 창고 (00001)", "00001", ".본사 창고")]
+        shared._load_stock_code_options = lambda: [(".본사 창고 (00001)", "00001", ".본사 창고"), (".지점 창고 (00002)", "00002", ".지점 창고")]
 
         empty = io_nlq.resolve_current_stock_entity_condition("현재고", params={})
         results.append(_ok("current stock requires manufacturer/product", "input_required") if empty.get("status") == "input_required" else _fail("current stock requires manufacturer/product", repr(empty)))
@@ -6428,7 +6428,7 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
         located = io_nlq.resolve_current_stock_entity_condition("현재고 재고위치 본사 창고 제품명 타이레놀", params=located_params_input)
         located_params = dict(located.get("params") or {})
         results.append(_ok("current stock explicit location", "00001") if located.get("status") == "resolved" and located_params.get("stock_cds") == ["00001"] and located_params.get("physic_nm") == "타이레놀" else _fail("current stock explicit location", repr(located)))
-        results.append(_ok("current stock location code/name map", "00001=.본사 창고") if located_params.get("stock_location_name_map") == {"00001": ".본사 창고"} else _fail("current stock location code/name map", repr(located_params)))
+        results.append(_ok("current stock location code/name map", "00001/00002 shared names") if located_params.get("stock_location_name_map") == {"00001": ".본사 창고", "00002": ".지점 창고"} else _fail("current stock location code/name map", repr(located_params)))
 
         compound_cases = {
             "현재고 제약사 바이엘 제품 아스피린": {"maker_nm": "바이엘", "physic_nm": "아스피린"},
@@ -6864,6 +6864,67 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
             and effective.get("group_basis") == "stock"
         )
         results.append(_ok("current stock saved stock / all io", repr(effective)) if defaults_ok else _fail("current stock saved stock / all io", repr(effective)))
+        frequency_defaults = router._apply_current_stock_defaults(
+            {"frequency_grade": "A"}, session_state={}
+        )
+        frequency_display, _frequency_source, _frequency_meta = inventory_service._build_current_stock_table_frames(
+            current_stock_frame,
+            frequency_defaults,
+        )
+        frequency_location_ok = (
+            frequency_defaults.get("stock_location_name_map") == {
+                "00001": ".본사 창고",
+                "00002": ".지점 창고",
+            }
+            and frequency_display.loc[
+                frequency_display["재고위치코드"] == "00001", "재고위치명"
+            ].eq(".본사 창고").all()
+            and frequency_display.loc[
+                frequency_display["재고위치코드"] == "00002", "재고위치명"
+            ].eq(".지점 창고").all()
+        )
+        results.append(
+            _ok("current stock frequency keeps code and display name separate", "00001/00002 -> shared names")
+            if frequency_location_ok
+            else _fail(
+                "current stock frequency keeps code and display name separate",
+                repr(frequency_display[["재고위치코드", "재고위치명"]].to_dict("records")),
+            )
+        )
+
+        explanation_cases = (
+            "재고 부족 기준이 뭐야?",
+            "재고 부족은 어떻게 판단해?",
+            "재고 부족 산정 기준 알려줘",
+            "재고 부족 계산 기준은?",
+            "재고 부족 기준 설명해줘",
+        )
+        lookup_cases = (
+            "재고 부족 보여줘",
+            "재고 부족 품목 조회해줘",
+            "품목별 재고부족현황",
+            "이번달 재고 부족 품목은?",
+            "재고 부족 제품 리스트 보여줘",
+        )
+        explanation_route_ok = all(
+            router._resolve_analytics_action(question) is None
+            and router.resolve_new_sims_nlq_candidate(question) is None
+            for question in explanation_cases
+        )
+        lookup_route_ok = all(
+            router._resolve_analytics_action(question) == "품목별 재고부족현황"
+            for question in lookup_cases
+        )
+        results.append(
+            _ok("stock shortage explanation bypasses NLQ", "criteria questions have no action/candidate")
+            if explanation_route_ok
+            else _fail("stock shortage explanation bypasses NLQ", repr(explanation_cases))
+        )
+        results.append(
+            _ok("stock shortage lookup keeps analytics action", "query questions -> 품목별 재고부족현황")
+            if lookup_route_ok
+            else _fail("stock shortage lookup keeps analytics action", repr(lookup_cases))
+        )
 
         frequency_fixture = pd.DataFrame(
             {

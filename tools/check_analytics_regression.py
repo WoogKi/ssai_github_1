@@ -6645,11 +6645,10 @@ def run_basic_checks() -> list[CheckResult]:
                 and "[chat.room.autoscroll]" not in main_src
                 and "setTimeout(run" not in main_src
                 and "focus({ preventScroll: true })" not in main_src
-                and "ssai-chat-bottom-anchor" in main_src
-                and "ssai-latest-message-link" in main_src
-                and 'href="#ssai-chat-bottom-anchor"' in main_src
-                and '[data-testid="stChatInput"]' in main_src
-                and "position: sticky" in main_src
+                and 'composer_submission = st.chat_input(' in main_src
+                and 'accept_file="multiple" if can_upload_file else False' in main_src
+                and main_src.index('composer_submission = st.chat_input(')
+                < main_src.index('with st.container():')
             )
             has_chronological_render_merge = (
                 "def _build_room_render_messages" in main_src
@@ -15610,6 +15609,7 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
         customer_mod = importlib.import_module("app.services.analytics_customer_sales_forecast_service")
         chat_mod = importlib.import_module("app.ui.chat_middleware")
         views_mod = importlib.import_module("app.sims.views.analytics_views")
+        router_mod = importlib.import_module("app.sims.nlq.nlq_router")
     except Exception as e:
         return [_fail("customer sales forecast import", f"{type(e).__name__}: {e}")]
 
@@ -15782,6 +15782,63 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
             mismatches.append("salesperson current sales should match customer current sales")
         if abs(float(current_region["당월 현재매출"].sum()) - current_sales_customer) > 1e-9:
             mismatches.append("region current sales should match customer current sales")
+        # Golden semantic fixture: one final row per salesperson, with exact
+        # completed-month, current-month, forecast, remaining, and progress values.
+        salesperson_golden = {
+            "S1": {
+                "담당영업사원명": "김영업",
+                "매출처수": 1,
+                "완료월수": 6,
+                "완료월평균매출": 1466.6666666667,
+                "당월 현재매출": 1870.0,
+                "당월 예상매출": 1753.125,
+                "당월 잔여예상": 0.0,
+                "당월 진척률": 106.6666666667,
+            },
+            "S2": {
+                "담당영업사원명": "박영업",
+                "매출처수": 1,
+                "완료월수": 6,
+                "완료월평균매출": 0.0,
+                "당월 현재매출": 990.0,
+                "당월 예상매출": 0.0,
+                "당월 잔여예상": 0.0,
+                "당월 진척률": 0.0,
+            },
+        }
+        salesperson_by_code = {
+            str(row["영업사원코드"]): row
+            for _, row in current_salesperson.iterrows()
+        }
+        if set(salesperson_by_code) != set(salesperson_golden):
+            mismatches.append(
+                f"salesperson forecast golden codes expected={sorted(salesperson_golden)} got={sorted(salesperson_by_code)}"
+            )
+        for salesperson_code, expected in salesperson_golden.items():
+            actual = salesperson_by_code.get(salesperson_code)
+            if actual is None:
+                continue
+            for column, expected_value in expected.items():
+                value = actual.get(column)
+                if isinstance(expected_value, str):
+                    if str(value) != expected_value:
+                        mismatches.append(
+                            f"salesperson forecast golden {salesperson_code} {column} expected={expected_value!r} got={value!r}"
+                        )
+                elif abs(float(value) - float(expected_value)) > 1e-6:
+                    mismatches.append(
+                        f"salesperson forecast golden {salesperson_code} {column} expected={expected_value} got={value}"
+                    )
+        router_params = router_mod._build_analytics_params(
+            "영업사원별 매출 예상",
+            "영업사원별 매출 예상",
+        )
+        if str(router_params.get("sales_man_nm") or "").strip():
+            mismatches.append(
+                f"salesperson grouping label leaked into a master filter params={router_params}"
+            )
+        if router_mod._resolve_analytics_action("영업사원별 매출 예상") != "영업사원별 매출 예상":
+            mismatches.append("salesperson forecast action routing failed")
         if current_salesperson[["영업사원코드", "담당영업사원명"]].duplicated().any():
             mismatches.append("salesperson forecast should keep one final row per salesperson")
         if current_region[["시도명", "시구군명"]].duplicated().any():

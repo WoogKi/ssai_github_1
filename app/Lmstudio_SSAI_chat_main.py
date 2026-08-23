@@ -10428,7 +10428,6 @@ def _render_sims_sidebar_fragment() -> None:
     - 기존 채팅 표, 특히 974 x 97 styled table 재렌더링 방지
     - 실제 [SIMS 실행] 버튼을 누를 때만 전체 앱 rerun
     """
-    st.markdown("---")
     st.markdown("### 🧩 SIMS 모드")
 
     # 조회 결과를 채팅창으로 보낸 뒤에도 SIMS 패널은 열린 상태를 유지한다.
@@ -11205,7 +11204,7 @@ with st.sidebar:
     # 🔎 사이드바의 3) "채팅 검색" 섹션 (옵션만) ===
     # =========================
     st.markdown("---")
-    st.markdown("## 🔎 채팅 검색")
+    st.markdown("### 🔎 채팅 검색")
     
     #  (A) 기본값 방어: 위젯 렌더 전에만 setdefault
     st.session_state.setdefault("__search_open", False)
@@ -11268,10 +11267,55 @@ with st.sidebar:
     _render_sims_sidebar_fragment()
 
     # =========================
-    # 🖼️ 5) OCR 옵션 (정리판: 토글+익스펜더)
+    # 📎 5) 첨부 옵션
     # =========================
-    st.markdown("---")
-    st.markdown("## 🖼️ OCR 옵션")
+    # expander is intentionally rendered even while closed so the existing
+    # widget keys keep their state across normal Streamlit reruns.
+    st.markdown("### 📎 첨부 옵션")
+    st.session_state.setdefault("__attach_keep_raw", False)
+    st.session_state.setdefault("__attach_image_vlm", True)
+    attachment_options_available = require_permission("UPLOAD_FILE", show_error=False)
+
+    def _mark_attach_summary_target_explicit() -> None:
+        st.session_state["__attach_summary_target_explicit"] = True
+
+    with st.expander("첨부 옵션 열기", expanded=False):
+        if not attachment_options_available:
+            st.info(_upload_unavailable_message())
+        summary_target = st.number_input(
+            "요약 목표 길이(문자)",
+            min_value=300,
+            max_value=12000,
+            value=1200,
+            step=100,
+            key="__attach_summary_target",
+            on_change=_mark_attach_summary_target_explicit,
+            help="기본값은 추출 본문 길이·구조에 따라 자동 조정됩니다. 값을 직접 바꾸면 해당 길이를 우선합니다.",
+            disabled=(not attachment_options_available) or st.session_state.get("__an_busy", False),
+        )
+        attachment_analysis_request = st.text_input(
+            "분석 요청(선택)",
+            key="__attach_analysis_request",
+            placeholder="예: 간단히 / 자세히 / 1000자로 정리",
+            disabled=(not attachment_options_available) or st.session_state.get("__an_busy", False),
+        )
+        st.checkbox(
+            "이미지 장면 분석(VLM)",
+            key="__attach_image_vlm",
+            help="이미지 첨부 시에만 실제 이미지 VLM 분석을 실행합니다. OCR도 켜면 OCR+VLM으로 결과를 분리 표시합니다.",
+            disabled=(not attachment_options_available) or st.session_state.get("__an_busy", False),
+        )
+        st.checkbox(
+            "원문 메시지도 함께 남기기",
+            key="__attach_keep_raw",
+            help=_upload_unavailable_help() if not attachment_options_available else "체크하지 않으면 대화에는 요약만 남깁니다(원문은 파일 보관).",
+            disabled=(not attachment_options_available) or st.session_state.get("__an_busy", False),
+        )
+
+    # =========================
+    # 🖼️ 6) OCR 옵션 (정리판: 토글+익스펜더)
+    # =========================
+    st.markdown("### 🖼️ OCR 옵션")
 
     # (A) 기본값(위젯 렌더 전 setdefault)
     st.session_state.setdefault("__ocr_open", False)
@@ -12130,6 +12174,37 @@ DEFAULT_MODE = "Panel (A)"
 # =========================
 # 2) 채팅 렌더 + 파일/SIMS
 # =========================
+# Native chat_input is pinned by Streamlit and keeps the text composer and
+# file picker in one control without a separate, persistent upload panel.
+can_upload_file = require_permission("UPLOAD_FILE", show_error=False)
+composer_submission = st.chat_input(
+    "메시지를 입력하세요...",
+    key=f"__chat_composer_{int(st.session_state.get('__attachment_uploader_nonce', 0))}",
+    accept_file="multiple" if can_upload_file else False,
+    file_type=["pdf", "csv", "xlsx", "xls", "txt", "docx", "png", "jpg", "jpeg"],
+    disabled=st.session_state.get("__an_busy", False),
+)
+uploaded_files = []
+attachment_file_source = "chat_composer"
+if composer_submission is not None:
+    if isinstance(composer_submission, str):
+        composer_text = composer_submission.strip()
+    else:
+        composer_text = str(getattr(composer_submission, "text", "") or "").strip()
+        uploaded_files = list(getattr(composer_submission, "files", ()) or ())
+    if composer_text:
+        st.session_state["__sims_auto_user_input"] = composer_text
+    if uploaded_files:
+        log.info(
+            "[attachment.analysis] phase=composer_submit file_source=%s file_count=%s",
+            attachment_file_source,
+            len(uploaded_files),
+        )
+    elif composer_text:
+        # chat_input returns after the top-of-run input dispatcher. Queue one
+        # clean rerun so ordinary text keeps the former Enter-send behavior.
+        st.rerun()
+
 with st.container():
 
 
@@ -12714,87 +12789,6 @@ with st.container():
     # ✅ (2) 기존 앵커도 동일 위치로 (있다면 같이 유지)
     set_chat_render_anchor(pending_area)
 
-    # ✅ 다음 메시지 입력창
-    # - 위치: 채팅 결과 바로 아래 / 파일 첨부 바로 위
-    # - Enter 전송
-    # - 전송 버튼 없음
-    # - 전송 후 입력창 자동 비움
-    # - 기존 text_area/form 방식 잔여 상태 제거
-    st.session_state.pop("__chat_inline_input_text", None)
-
-    def _submit_inline_chat_input() -> None:
-        text = str(st.session_state.get("__chat_inline_text") or "").strip()
-        if not text:
-            return
-
-        st.session_state["__sims_auto_user_input"] = text
-        st.session_state["__chat_inline_text"] = ""
-
-    st.markdown(
-        """
-<style>
-html { scroll-behavior: auto; }
-#ssai-chat-bottom-anchor {
-  display: block;
-  height: 1px;
-  scroll-margin-bottom: 96px;
-}
-.ssai-chat-bottom-spacer { height: 72px; }
-.ssai-latest-message-link {
-  position: fixed;
-  right: 24px;
-  bottom: 72px;
-  z-index: 900;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: 32px;
-  padding: 6px 12px;
-  border: 1px solid rgba(49, 51, 63, 0.18);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.94);
-  color: rgb(49, 51, 63);
-  text-decoration: none;
-  font-size: 13px;
-  line-height: 1.2;
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.10);
-}
-.ssai-latest-message-link:hover {
-  text-decoration: none;
-  border-color: rgba(255, 75, 75, 0.45);
-}
-[data-testid="stChatInput"],
-div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
-  position: sticky;
-  bottom: 0;
-  z-index: 850;
-  background: var(--background-color, #ffffff);
-  padding-top: 4px;
-  padding-bottom: 8px;
-}
-@media (max-width: 768px) {
-  .ssai-latest-message-link {
-    right: 12px;
-    bottom: 68px;
-  }
-}
-</style>
-""",
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div id="ssai-chat-bottom-anchor"></div>', unsafe_allow_html=True)
-    st.markdown('<a class="ssai-latest-message-link" href="#ssai-chat-bottom-anchor">↓ 최신 메시지</a>', unsafe_allow_html=True)
-    st.markdown('<div class="ssai-chat-bottom-spacer"></div>', unsafe_allow_html=True)
-
-    st.text_input(
-        "다음 메시지",
-        key="__chat_inline_text",
-        placeholder="메시지를 입력하세요... Enter 전송",
-        label_visibility="collapsed",
-        disabled=st.session_state.get("__an_busy", False),
-        on_change=_submit_inline_chat_input,
-    )
-
     # ✅ 스크롤 타겟(바닥)
     st.markdown("<div id='__chat_bottom'></div>", unsafe_allow_html=True)
  
@@ -12818,29 +12812,11 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
     except Exception:
         log.exception("[ui] scrollIntoView failed")
 
-    # (D) 파일 첨부 + SIMS 섹션
-    with st.container(): 
-        st.divider()
+    # (D) SIMS 섹션. The native composer remains pinned below this panel.
+    with st.container():
         # SIMS 토글/쿼리 기본값 방어 (첫 렌더 대비)
         st.session_state.setdefault("__sims_open", False)
         st.session_state.setdefault("__sims_q", "")
-
-
-        can_upload_file = require_permission("UPLOAD_FILE", show_error=False)
-
-        if not can_upload_file:
-            st.info(_upload_unavailable_message())
-
-        uploaded_files = st.file_uploader(
-            "📂 파일 첨부 (PDF, Excel, CSV, TXT, DOCX, 이미지 등)",
-            type=["pdf", "csv", "xlsx", "xls", "txt", "docx", "png", "jpg", "jpeg"],
-            accept_multiple_files=True,
-            key=f"file_upload_below_input_{int(st.session_state.get('__attachment_uploader_nonce', 0))}",
-            disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
-            help=_upload_unavailable_help() if not can_upload_file else None,
-        )
-        uploaded_files = list(uploaded_files or [])
-        attachment_file_source = "uploader"
 
         # 2) SIMS 결과(모드별 실행 방식)
         # ✅ 렌더 조건은 로컬 변수로만 판정한다.
@@ -13444,66 +13420,12 @@ div[data-testid="stTextInput"]:has(input[placeholder*="Enter"]) {
                 log.debug("[chat] stream_and_append_assistant finished")
 # =========================
 
-st.write("")  # 시각적 여백
-
 # =========================
 # 4) 파일 분석 → 요약 → 즉시 AI 요청 (항상 자동)
 # =========================
-st.session_state.setdefault("__attach_keep_raw", False)
-st.session_state.setdefault("__attach_image_vlm", True)
-
-can_upload_file = require_permission("UPLOAD_FILE", show_error=False)
-
-with st.expander("📎 첨부 처리 옵션", expanded=False):
-    if not can_upload_file:
-        st.info(_upload_unavailable_message())
-
-    # The uploader selection itself is the analysis batch. It is cleared after
-    # completion, so stale files never become the next batch implicitly.
-    analysis_target_files = list(uploaded_files or [])
-
-    def _mark_attach_summary_target_explicit() -> None:
-        st.session_state["__attach_summary_target_explicit"] = True
-
-    summary_target = st.number_input(
-        "요약 목표 길이(문자)",
-        min_value=300,
-        max_value=12000,
-        value=1200,
-        step=100,
-        key="__attach_summary_target",
-        on_change=_mark_attach_summary_target_explicit,
-        help="기본값은 추출 본문 길이·구조에 따라 자동 조정됩니다. 값을 직접 바꾸면 해당 길이를 우선합니다.",
-        disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
-    )
-    attachment_analysis_request = st.text_input(
-        "분석 요청(선택)",
-        key="__attach_analysis_request",
-        placeholder="예: 간단히 / 자세히 / 1000자로 정리",
-        disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
-    )
-    has_image_attachments = any(_is_image_attachment(item) for item in (uploaded_files or []))
-    if has_image_attachments:
-        st.checkbox(
-            "이미지 장면 분석(VLM)",
-            key="__attach_image_vlm",
-            help="선택한 이미지에만 실제 이미지 VLM 분석을 실행합니다. OCR도 켜면 OCR+VLM으로 결과를 분리 표시합니다.",
-            disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
-        )
-        if st.session_state.get("__attach_image_vlm", False):
-            mode_label = "OCR + VLM (분리 표시)" if st.session_state.get("__ocr_auto", False) else "VLM only"
-            st.caption(f"선택 상태: {mode_label}")
-    else:
-        # Preserve the image opt-in across non-image uploads; it applies only when an image is selected.
-        pass
-    st.checkbox(
-        "원문 메시지도 함께 남기기",
-        key="__attach_keep_raw",
-        help=_upload_unavailable_help() if not can_upload_file else "체크하지 않으면 대화에는 요약만 남깁니다(원문은 파일 보관).",
-        disabled=(not can_upload_file) or st.session_state.get("__an_busy", False),
-    )
-
-
+# Sidebar attachment options preserve these keys; the composer submission is
+# still the one-shot analysis batch.
+analysis_target_files = list(uploaded_files or [])
 
 # ✔ 체크박스 값은 세션에서 읽어 사용
 keep_raw = st.session_state.get("__attach_keep_raw", False)

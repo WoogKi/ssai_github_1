@@ -2157,14 +2157,8 @@ def _apply_current_stock_code_scope(
     )
 
 
-def resolve_current_stock_entity_condition(
-    text: str,
-    *,
-    params: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Resolve the required manufacturer-or-product scope for current stock."""
-    out = dict(params or {})
-    lookup_text = str(text or "")
+def get_current_stock_location_name_map() -> dict[str, str]:
+    """Return the existing shared stock-location display map."""
     stock_location_name_map: dict[str, str] = {}
     try:
         from app.sims.views.rddbc_io_shared import _load_stock_code_options
@@ -2185,7 +2179,19 @@ def resolve_current_stock_entity_condition(
             if code and name:
                 stock_location_name_map[code] = name
     except Exception:
-        stock_location_name_map = {}
+        return {}
+    return stock_location_name_map
+
+
+def resolve_current_stock_entity_condition(
+    text: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve the required manufacturer-or-product scope for current stock."""
+    out = dict(params or {})
+    lookup_text = str(text or "")
+    stock_location_name_map = get_current_stock_location_name_map()
     if stock_location_name_map:
         out["stock_location_name_map"] = stock_location_name_map
     if "재고위치" in lookup_text and not (out.get("stock_cds") or out.get("stock_cd_list")):

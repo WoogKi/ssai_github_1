@@ -1030,6 +1030,18 @@ def _analytics_grouping_guard_payload(
     }
 
 
+def _is_stock_shortage_explanation_request(txt: str) -> bool:
+    """Keep policy/criterion questions off the stock-shortage query route."""
+    compact = re.sub(r"\s+", "", str(txt or ""))
+    if "재고부족" not in compact:
+        return False
+    explanation_markers = ("기준", "판단", "계산", "산정", "뭐야", "무엇", "설명", "어떻게")
+    if not any(marker in compact for marker in explanation_markers):
+        return False
+    query_markers = ("조회", "보여", "목록", "리스트", "현황", "품목", "제품", "이번달", "이번달")
+    return not any(marker in compact for marker in query_markers)
+
+
 def _resolve_analytics_action(txt: str) -> str | None:
     """
     분석/KPI 문장에서 실행할 action을 결정한다.
@@ -1046,6 +1058,8 @@ def _resolve_analytics_action(txt: str) -> str | None:
     """
     t = (txt or "").strip()
     if not t:
+        return None
+    if _is_stock_shortage_explanation_request(t):
         return None
 
     compact_t = re.sub(r"\s+", "", t)
@@ -1089,6 +1103,8 @@ def _looks_like_analytics_nlq(txt: str) -> bool:
     분석/KPI NLQ 여부.
     별도 signal word를 중복 관리하지 않고 action 판정으로 일원화한다.
     """
+    if _is_stock_shortage_explanation_request(txt):
+        return False
     return _resolve_analytics_action(txt) is not None or _classify_analytics_metric_grouping(txt) is not None
 
 
@@ -1480,6 +1496,7 @@ def _clear_analytics_grouping_artifacts(params: Dict[str, Any], text: str) -> Di
         ("제약사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
         ("제조사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
         ("매입처별", ("buy_nm", "buy_cd")),
+        ("영업사원별", ("sales_man", "sales_man_nm", "salesperson_cd", "salesperson_nm")),
     )
     for phrase, fields in grouping_fields:
         if phrase not in compact:
@@ -5301,6 +5318,14 @@ def _apply_current_stock_defaults(
     out["group_basis"] = "stock"
     out["current_stock_query"] = True
     out["io_gu_scope"] = "all"
+    # Frequency-only requests bypass entity resolution, but must keep the
+    # same code-to-display-name contract as ordinary current-stock requests.
+    if not out.get("stock_location_name_map"):
+        from app.services.io_nlq import get_current_stock_location_name_map
+
+        stock_location_name_map = get_current_stock_location_name_map()
+        if stock_location_name_map:
+            out["stock_location_name_map"] = stock_location_name_map
     return out
 
 
@@ -6526,6 +6551,10 @@ def try_handle_nlq(
     """
     raw = (user_text or "").strip()
     if not raw:
+        return False
+    # Policy/criterion questions must remain on the explanatory route. They
+    # are not a request to execute an inventory-shortage analytics action.
+    if _is_stock_shortage_explanation_request(raw):
         return False
 
     # A shared push boundary completes this record.  Starting here captures
