@@ -14,22 +14,25 @@ from app.db.sql_utils import sql_safe_int
 from app.db.mssql_client import get_current_company_id, get_engine, set_current_company_id
 from app.services.dashboard_inventory_frequency_snapshot import (
     ALGORITHM_VERSION,
+    FrequencyProjectionReadResult,
+    RELATIONAL_FREQUENCY_REPRESENTATION,
+    RelationalFrequencySnapshot,
     SCHEMA_VERSION,
     SNAPSHOT_TYPE,
     SnapshotContractError,
-    build_frequency_snapshot_payload_from_aggregates,
+    build_relational_frequency_snapshot_from_aggregates,
     completed_month_basis,
     scope_fingerprint,
-    snapshot_key_from_payload,
-    validate_frequency_snapshot_payload,
 )
 from app.services.ssai_snapshot_repository import (
+    SNAPSHOT_STATUS_CORRUPT,
     SNAPSHOT_STATUS_MISSING,
     SNAPSHOT_STATUS_STALE,
     SnapshotKey,
     SnapshotReadResult,
 )
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository
+from app.services.ssai_analytics_target_resolver import connect_company_analytics_db
 
 
 QueryExecutor = Callable[[int, str, Mapping[str, Any], int], pd.DataFrame]
@@ -173,6 +176,14 @@ _FREQUENCY_READ_CACHE_TTL_SECONDS = 300.0
 _frequency_read_cache: dict[SnapshotKey, tuple[float, SnapshotReadResult]] = {}
 
 
+def _company_snapshot_repository(company_id: int) -> SqlServerSnapshotRepository:
+    """Bind the common repository to one explicit same-server analytics target."""
+    return SqlServerSnapshotRepository(
+        reader_connection_factory=lambda: connect_company_analytics_db(company_id, "reader"),
+        writer_connection_factory=lambda: connect_company_analytics_db(company_id, "writer"),
+    )
+
+
 def _snapshot_exception_code(exc: Exception) -> str:
     """Return only an exception class and optional SQLSTATE, never its text."""
     sqlstate = ""
@@ -225,12 +236,7 @@ def read_approved_frequency_snapshot(
         return cached[1]
     started = time.perf_counter()
     try:
-        repo = repository or SqlServerSnapshotRepository(
-            payload_validator=lambda candidate, expected_key: validate_frequency_snapshot_payload(
-                candidate,
-                expected_key=expected_key,
-            )
-        )
+        repo = repository or _company_snapshot_repository(int(plan.company_id))
         result = repo.read(key)
     except Exception as exc:
         reason_code = _snapshot_exception_code(exc)
@@ -262,6 +268,44 @@ def read_approved_frequency_snapshot(
         int((time.perf_counter() - started) * 1000),
     )
     return result
+
+
+def read_approved_frequency_projection(
+    *,
+    company_id: Any,
+    evaluation_month: Any,
+    stock_codes: Sequence[Any] | None,
+    product_codes: Sequence[Any] | None = None,
+    frequency_grade: str = "",
+    repository: Any | None = None,
+) -> FrequencyProjectionReadResult:
+    """Read only the approved derived product-frequency rows for one exact key.
+
+    ``legacy`` is a representation-availability result, not an authorization
+    result. Callers may use the established full-payload path only for that
+    case; a malformed projection remains corrupt and fail-closed.
+    """
+    try:
+        plan = build_frequency_snapshot_plan(
+            company_id=company_id,
+            evaluation_month=evaluation_month,
+            stock_codes=stock_codes,
+        )
+        key = frequency_snapshot_key(plan)
+    except SnapshotContractError as exc:
+        return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
+    repo = repository or _company_snapshot_repository(int(plan.company_id))
+    reader = getattr(repo, "read_frequency_projection", None)
+    if not callable(reader):
+        return FrequencyProjectionReadResult(status="legacy", reason="projection reader is unavailable")
+    try:
+        return reader(
+            key,
+            product_codes=tuple(str(code or "").strip() for code in product_codes or () if str(code or "").strip()),
+            frequency_grade=str(frequency_grade or "").strip(),
+        )
+    except Exception as exc:
+        return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason=_snapshot_exception_code(exc))
 
 
 def clear_frequency_snapshot_read_cache() -> None:
@@ -770,17 +814,18 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
         aggregate_sql, aggregate_binds = outbound_monthly_aggregate_sql(plan)
         monthly_rows, diagnostics = _aggregate_result(query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds))
     report("등급 계산 중")
-    payload = build_frequency_snapshot_payload_from_aggregates(
+    relational_snapshot = build_relational_frequency_snapshot_from_aggregates(
         company_id=plan.company_id, evaluation_month=plan.evaluation_month, monthly_rows=monthly_rows,
         product_codes=product_codes, stock_codes=plan.stock_codes, source_watermark=None,
         source_watermark_status="unverified", source_diagnostics=diagnostics,
     )
-    key = snapshot_key_from_payload(payload)
-    repo = repository or SqlServerSnapshotRepository(
-        payload_validator=lambda candidate, expected_key: validate_frequency_snapshot_payload(candidate, expected_key=expected_key)
-    )
+    key = relational_snapshot.key
+    repo = repository or _company_snapshot_repository(int(plan.company_id))
     report("draft 저장 중")
-    draft = repo.publish(key, payload, created_by=actor, force=bool(force))
+    publish_relational = getattr(repo, "publish_relational", None)
+    if not callable(publish_relational):
+        raise SnapshotContractError("repository does not support relational_frequency_v1")
+    draft = publish_relational(relational_snapshot, created_by=actor, force=bool(force))
     draft_generation_no = int(draft.generation_no or 0)
     draft_inspection = repo.inspect_generation(key, draft_generation_no)
     if (
@@ -789,8 +834,9 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
         or draft_inspection.manifest_status != "draft"
         or draft_inspection.approval_status != "pending"
         or draft_inspection.generation_no != draft_generation_no
-        or draft_inspection.checksum.lower() != str(payload.get("checksum") or "").lower()
-        or not draft_inspection.payload
+        or draft_inspection.checksum.lower() != relational_snapshot.checksum.lower()
+        or draft_inspection.representation != RELATIONAL_FREQUENCY_REPRESENTATION
+        or draft_inspection.relational_snapshot is None
     ):
         raise SnapshotContractError("draft generation exact inspection failed before manual approval")
     operating_read = repo.read(key)
@@ -800,7 +846,7 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
         raise SnapshotContractError(f"operating snapshot read failed after draft save: {operating_read.status}")
     return {
         "plan": plan,
-        "payload": payload,
+        "relational_snapshot": relational_snapshot,
         "draft": draft,
         "read_status": operating_read.status,
         "draft_inspection_status": draft_inspection.status,

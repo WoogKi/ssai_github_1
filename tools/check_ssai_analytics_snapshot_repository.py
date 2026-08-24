@@ -14,14 +14,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
+    FREQUENCY_PROJECTION_GRADES,
+    build_frequency_projection,
     build_frequency_snapshot_payload,
     snapshot_key_from_payload,
     validate_frequency_snapshot_payload,
 )
 from app.services.ssai_analytics_snapshot_migration import (  # noqa: E402
     MIGRATION_001_SQL,
+    MIGRATION_002_SQL,
     MIGRATIONS,
     SnapshotMigration,
+    SnapshotMigrationError,
     apply_snapshot_migrations,
 )
 from app.services import ssai_analytics_db as analytics_db  # noqa: E402
@@ -74,6 +78,8 @@ class _State:
     def __init__(self) -> None:
         self.manifests: list[dict[str, Any]] = []
         self.payloads: dict[int, dict[str, Any]] = {}
+        self.frequency_products: dict[int, list[dict[str, Any]]] = {}
+        self.frequency_projections: dict[int, list[dict[str, Any]]] = {}
         self.next_id = 1
 
 
@@ -81,6 +87,7 @@ class _Cursor:
     def __init__(self, state: _State) -> None:
         self.state = state
         self.row: tuple[Any, ...] | None = None
+        self.rows: list[tuple[Any, ...]] = []
 
     @staticmethod
     def _matches(item: dict[str, Any], values: tuple[Any, ...], *, include_version: bool = True) -> bool:
@@ -91,7 +98,19 @@ class _Cursor:
 
     def execute(self, sql: str, *params: Any) -> "_Cursor":
         self.row = None
-        if "snapshot.publish.latest" in sql:
+        self.rows = []
+        if "storage_representation" in sql and "FROM snapshot.manifest" in sql and "snapshot.read.published" not in sql and "snapshot.approve.load" not in sql and "snapshot.projection.manifest" not in sql:
+            rows = [
+                m for m in self.state.manifests
+                if self._matches(m, params) and m["status"] == "published" and m["approval_status"] == "approved"
+            ]
+            if rows:
+                item = max(rows, key=lambda value: value["generation_no"])
+                self.row = (
+                    item["manifest_id"], item["generation_no"], item["checksum"], item["approval_status"],
+                    item["approved_at"], item["approved_by"], item["approval_reason"], "legacy_json_v1",
+                )
+        elif "snapshot.publish.latest" in sql:
             rows = [m for m in self.state.manifests if self._matches(m, params)]
             if rows:
                 item = max(rows, key=lambda value: value["generation_no"])
@@ -121,6 +140,14 @@ class _Cursor:
             self.state.payloads[int(params[0])] = {
                 "payload_json": params[1], "storage_checksum": params[2], "payload_size": int(params[3])
             }
+        elif "snapshot.publish.frequency_product" in sql:
+            self.state.frequency_products.setdefault(int(params[0]), []).append(
+                {"product_code": params[1], "occurrence_count_3m": params[2], "frequency_grade": params[3], "data_status": params[4], "row_checksum": params[5]}
+            )
+        elif "snapshot.publish.frequency_projection" in sql:
+            self.state.frequency_projections.setdefault(int(params[0]), []).append(
+                {"frequency_grade": params[1], "expected_product_count": params[2], "projection_checksum": params[3]}
+            )
         elif "snapshot.inspect.generation" in sql:
             candidates = [
                 m for m in self.state.manifests
@@ -143,7 +170,7 @@ class _Cursor:
                 payload = self.state.payloads[item["manifest_id"]]
                 self.row = (
                     item["manifest_id"], item["status"], item["approval_status"], item["checksum"],
-                    payload["payload_json"], payload["storage_checksum"], payload["payload_size"],
+                    "legacy_json_v1", payload["payload_json"], payload["storage_checksum"], payload["payload_size"],
                 )
         elif "snapshot.approve.supersede" in sql:
             for item in self.state.manifests:
@@ -170,6 +197,39 @@ class _Cursor:
                     gzip.compress(str(payload["payload_json"]).encode("utf-16le")),
                     payload["storage_checksum"], payload["payload_size"],
                 )
+        elif "snapshot.projection.manifest" in sql:
+            rows = [m for m in self.state.manifests if self._matches(m, params) and m["status"] == "published" and m["approval_status"] == "approved"]
+            if rows:
+                item = max(rows, key=lambda value: value["generation_no"])
+                self.row = (item["manifest_id"], item["generation_no"], item["checksum"], item["item_count"], "legacy_json_v1", 1)
+        elif "snapshot.projection.headers" in sql:
+            self.rows = [
+                (row["frequency_grade"], row["expected_product_count"], row["projection_checksum"])
+                for row in sorted(self.state.frequency_projections.get(int(params[0]), []), key=lambda row: row["frequency_grade"])
+            ]
+        elif "snapshot.projection.product_presence" in sql:
+            if self.state.frequency_products.get(int(params[0])):
+                self.row = (int(params[0]),)
+        elif "snapshot.projection.product_count" in sql:
+            self.row = (len(self.state.frequency_products.get(int(params[0]), [])),)
+        elif "snapshot.projection.rows_by_grade" in sql:
+            self.rows = [
+                (row["product_code"], row["occurrence_count_3m"], row["frequency_grade"], row["data_status"], row["row_checksum"])
+                for row in sorted(self.state.frequency_products.get(int(params[0]), []), key=lambda row: row["product_code"])
+                if row["frequency_grade"] == params[1]
+            ]
+        elif "snapshot.projection.rows_all" in sql:
+            self.rows = [
+                (row["product_code"], row["occurrence_count_3m"], row["frequency_grade"], row["data_status"], row["row_checksum"])
+                for row in sorted(self.state.frequency_products.get(int(params[0]), []), key=lambda row: (row["frequency_grade"], row["product_code"]))
+            ]
+        elif "snapshot.projection.rows_subset" in sql:
+            requested = set(params[1:])
+            self.rows = [
+                (row["product_code"], row["occurrence_count_3m"], row["frequency_grade"], row["data_status"], row["row_checksum"])
+                for row in sorted(self.state.frequency_products.get(int(params[0]), []), key=lambda row: row["product_code"])
+                if row["product_code"] in requested
+            ]
         elif "snapshot.read.exact" in sql:
             rows = [m for m in self.state.manifests if self._matches(m, params)]
             if rows:
@@ -193,6 +253,14 @@ class _Cursor:
 
     def fetchone(self) -> tuple[Any, ...] | None:
         return self.row
+
+    def fetchall(self) -> list[tuple[Any, ...]]:
+        return self.rows
+
+    def executemany(self, sql: str, params_seq: list[tuple[Any, ...]]) -> "_Cursor":
+        for params in params_seq:
+            self.execute(sql, *params)
+        return self
 
 
 class _Connection:
@@ -227,6 +295,10 @@ def test_repository_lifecycle_and_isolation() -> None:
     draft = repository.publish(key, first_payload, created_by="fixture-generator")
     _assert(draft.status == "draft" and draft.generation_no == 1, "publish creates draft generation")
     _assert(repository.read(key).status == SNAPSHOT_STATUS_UNAPPROVED, "draft read must fail closed")
+    _assert(
+        repository.read_frequency_projection(key).status == SNAPSHOT_STATUS_UNAPPROVED,
+        "draft projection read must fail closed",
+    )
     inspected = repository.inspect_generation(key, 1)
     _assert(
         inspected.status == SNAPSHOT_STATUS_UNAPPROVED and inspected.payload == first_payload,
@@ -268,6 +340,27 @@ def test_repository_lifecycle_and_isolation() -> None:
         ready.payload and ready.payload["source_watermark_status"] == "unverified",
         "manual approval does not rewrite watermark provenance",
     )
+    projection_a = repository.read_frequency_projection(key, frequency_grade="A")
+    _assert(projection_a.usable and [row["product_code"] for row in projection_a.rows] == ["P1"], "approved A projection must be exact")
+    projection_subset = repository.read_frequency_projection(key, product_codes=("P2",))
+    _assert(projection_subset.usable and projection_subset.rows[0]["frequency_grade"] == "X", "subset projection must preserve X rows")
+    active_manifest_id = int(ready.manifest_id or 0)
+    saved_projection_rows = copy.deepcopy(state.frequency_products[active_manifest_id])
+    saved_projection_headers = copy.deepcopy(state.frequency_projections[active_manifest_id])
+    state.frequency_products.pop(active_manifest_id)
+    state.frequency_projections.pop(active_manifest_id)
+    _assert(repository.read_frequency_projection(key).status == "legacy", "projection absence must retain legacy compatibility")
+    state.frequency_products[active_manifest_id] = saved_projection_rows
+    state.frequency_projections[active_manifest_id] = saved_projection_headers
+    original_projection_row = dict(state.frequency_products[active_manifest_id][0])
+    state.frequency_products[active_manifest_id][0]["frequency_grade"] = "B"
+    _assert(repository.read_frequency_projection(key, frequency_grade="A").status == SNAPSHOT_STATUS_CORRUPT, "substituted projection row must fail closed")
+    state.frequency_products[active_manifest_id][0] = original_projection_row
+    state.frequency_products[active_manifest_id] = [
+        row for row in state.frequency_products[active_manifest_id] if row["product_code"] != "P1"
+    ]
+    _assert(repository.read_frequency_projection(key, frequency_grade="A").status == SNAPSHOT_STATUS_CORRUPT, "missing projection row must fail closed")
+    state.frequency_products[active_manifest_id].append(original_projection_row)
 
     second_payload = copy.deepcopy(first_payload)
     second_payload["source_watermark"] = "manual-range-2"
@@ -347,7 +440,12 @@ class _MigrationCursor:
 
     def execute(self, sql: str, *params: Any) -> "_MigrationCursor":
         self.row = None
-        if "SELECT migration_checksum" in sql:
+        if "SET ANSI_NULLS ON" in sql:
+            if not self.conn.ignore_session_set:
+                self.conn.session_values = (1, 1, 1, 1, 1, 1, 0)
+        elif "SESSIONPROPERTY('ANSI_NULLS')" in sql:
+            self.row = self.conn.session_values
+        elif "SELECT migration_checksum" in sql:
             checksum = self.conn.ledger.get(str(params[0]))
             self.row = (checksum,) if checksum else None
         elif "INSERT INTO snapshot.schema_migrations" in sql:
@@ -359,11 +457,16 @@ class _MigrationCursor:
     def fetchone(self) -> tuple[Any, ...] | None:
         return self.row
 
+    def close(self) -> None:
+        return None
+
 
 class _MigrationConnection:
-    def __init__(self, *, fail_sql: str = "") -> None:
+    def __init__(self, *, fail_sql: str = "", ignore_session_set: bool = False) -> None:
         self.ledger: dict[str, str] = {}
         self.fail_sql = fail_sql
+        self.ignore_session_set = ignore_session_set
+        self.session_values = (1, 1, 1, 0, 1, 1, 0)
         self.commits = 0
         self.rollbacks = 0
 
@@ -381,15 +484,25 @@ def test_migration_idempotency_and_rollback() -> None:
     conn = _MigrationConnection()
     first = apply_snapshot_migrations(conn, applied_by="fixture")
     second = apply_snapshot_migrations(conn, applied_by="fixture")
-    _assert(first["applied"] == [MIGRATIONS[0].migration_id], "first migration applies")
-    _assert(second["skipped"] == [MIGRATIONS[0].migration_id], "second migration is no-op")
+    _assert(first["applied"] == [migration.migration_id for migration in MIGRATIONS], "first migrations apply")
+    _assert(second["skipped"] == [migration.migration_id for migration in MIGRATIONS], "second migrations are no-op")
+    _assert(first["session_options"]["ARITHABORT"] == 1, "migration session enables ARITHABORT")
+
+    bad_session_conn = _MigrationConnection(ignore_session_set=True)
+    try:
+        apply_snapshot_migrations(bad_session_conn, applied_by="fixture")
+    except SnapshotMigrationError as exc:
+        _assert(exc.migration_id == "__session_options__", "invalid session fails before DDL")
+    else:
+        raise AssertionError("invalid migration session must fail closed")
+    _assert(bad_session_conn.rollbacks == 1 and not bad_session_conn.ledger, "invalid session performs no DDL")
 
     failing = SnapshotMigration("fixture_failure", "RAISE_FIXTURE")
     failed_conn = _MigrationConnection(fail_sql=failing.sql)
     try:
         apply_snapshot_migrations(failed_conn, applied_by="fixture", migrations=(failing,))
-    except RuntimeError:
-        pass
+    except SnapshotMigrationError as exc:
+        _assert(exc.migration_id == "fixture_failure", "failure reports exact migration id")
     else:
         raise AssertionError("migration failure must propagate")
     _assert(failed_conn.rollbacks == 1 and failed_conn.commits == 0, "migration failure rolls back")
@@ -399,6 +512,8 @@ def test_migration_idempotency_and_rollback() -> None:
     _assert("GRANT UPDATE ON OBJECT::snapshot.payload" not in MIGRATION_001_SQL, "payload update is forbidden")
     _assert("SSAI_COMPANIES" not in MIGRATION_001_SQL and "Rddbc" not in MIGRATION_001_SQL, "no cross-DB dependency")
     _assert("CREATE DATABASE" not in MIGRATION_001_SQL.upper(), "migration must not create a database")
+    _assert("snapshot.frequency_product" in MIGRATION_002_SQL and "snapshot.frequency_projection" in MIGRATION_002_SQL, "projection tables must be migrated")
+    _assert("GRANT INSERT ON OBJECT::snapshot.frequency_product" in MIGRATION_002_SQL, "projection writer insert grant required")
 
 
 def test_analytics_connector_fail_closed() -> None:

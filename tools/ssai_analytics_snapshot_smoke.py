@@ -19,6 +19,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     validate_frequency_snapshot_payload,
 )
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
+from app.services.ssai_analytics_target_resolver import connect_company_analytics_db  # noqa: E402
 
 
 def _fixture_payload(*, company_id: str, evaluation_month: str) -> dict[str, object]:
@@ -55,6 +56,7 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--evaluation-month", required=True)
     parser.add_argument("--company-id", default="__SSAI_SNAPSHOT_SMOKE__")
+    parser.add_argument("--analytics-company-id", type=int, default=0)
     parser.add_argument("--actor", default="")
     args = parser.parse_args()
     actor = str(args.actor or getpass.getuser() or "").strip()
@@ -70,12 +72,18 @@ def main() -> int:
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
 
+    if args.analytics_company_id <= 0:
+        print(json.dumps({**plan, "ok": False, "error_type": "ValueError"}, ensure_ascii=False, indent=2))
+        return 1
+
     try:
         payload1 = _fixture_payload(
             company_id=str(args.company_id), evaluation_month=str(args.evaluation_month)
         )
         key = snapshot_key_from_payload(payload1)
         repository = SqlServerSnapshotRepository(
+            reader_connection_factory=lambda: connect_company_analytics_db(args.analytics_company_id, "reader"),
+            writer_connection_factory=lambda: connect_company_analytics_db(args.analytics_company_id, "writer"),
             payload_validator=lambda payload, expected_key: validate_frequency_snapshot_payload(
                 payload, expected_key=expected_key
             )

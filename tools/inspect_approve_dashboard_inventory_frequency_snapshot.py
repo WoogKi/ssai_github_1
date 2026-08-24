@@ -19,6 +19,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     scope_fingerprint,
 )
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
+from app.services.ssai_analytics_target_resolver import connect_company_analytics_db  # noqa: E402
 from app.services.ssai_snapshot_repository import SnapshotKey  # noqa: E402
 
 
@@ -76,6 +77,27 @@ def _verify_expected(payload: Mapping[str, Any], args: argparse.Namespace) -> di
         "accepted_normal": int(diagnostics.get("normal_positive_accepted_row_count") or 0)
         == int(summary.get("normal_event_count") or 0),
     }
+
+
+def _inspection_authority(inspection: Any) -> Mapping[str, Any] | None:
+    if isinstance(getattr(inspection, "payload", None), Mapping):
+        return inspection.payload
+    native = getattr(inspection, "relational_snapshot", None)
+    if native is None:
+        return None
+    grade_counts = {key: 0 for key in _GRADE_KEYS}
+    for row in native.frequency_products:
+        grade = str(row.get("frequency_grade") or "")
+        if grade in grade_counts:
+            grade_counts[grade] += 1
+    return {
+        "summary": {
+            "product_count": native.item_count,
+            "normal_event_count": sum(int(row.get("occurrence_count") or 0) for row in native.monthly_activity),
+            "grade_counts": grade_counts,
+        },
+        "source_diagnostics": native.source_diagnostics,
+    }
     if not all(checks.values()):
         failed = ", ".join(key for key, value in checks.items() if not value)
         raise ValueError(f"approval expectation mismatch: {failed}")
@@ -97,8 +119,9 @@ def _output(inspection: Any, verification: Mapping[str, Any] | None) -> dict[str
         "generation_no": inspection.generation_no,
         "checksum": inspection.checksum,
         "storage_checksum_verified": bool(inspection.payload),
-        "contract_checksum_verified": bool(inspection.payload),
+        "contract_checksum_verified": bool(_inspection_authority(inspection)),
         "payload_size": inspection.payload_size,
+        "representation": getattr(inspection, "representation", "legacy_json_v1"),
         "verification": verification or {},
         "reason": inspection.reason,
     }
@@ -150,7 +173,8 @@ def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str
         checksum=expected_checksum,
         action=lambda: repository.inspect_generation(key, args.generation),
     )
-    if inspection.status == "corrupt" or not inspection.payload:
+    authority = _inspection_authority(inspection)
+    if inspection.status == "corrupt" or authority is None:
         raise ValueError(f"snapshot inspection failed: {inspection.status}: {inspection.reason}")
     if inspection.checksum.lower() != expected_checksum:
         raise ValueError("expected checksum does not match inspected generation")
@@ -159,7 +183,7 @@ def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str
         "pre_approval_verification",
         generation_no=args.generation,
         checksum=inspection.checksum,
-        action=lambda: _verify_expected(inspection.payload, args),
+        action=lambda: _verify_expected(authority, args),
     )
     output = _output(inspection, verification)
     preserved = None
@@ -215,7 +239,7 @@ def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str
         or post.approval_status != "approved"
         or post.generation_no != args.generation
         or post.checksum.lower() != expected_checksum
-        or not post.payload
+        or _inspection_authority(post) is None
     ):
         raise ValueError("post-approval inspection did not confirm the published generation")
     post_verification = _stage(
@@ -223,7 +247,7 @@ def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str
         "post_approval_verification",
         generation_no=args.generation,
         checksum=post.checksum,
-        action=lambda: _verify_expected(post.payload, args),
+        action=lambda: _verify_expected(_inspection_authority(post) or {}, args),
     )
     preserved_after = None
     if args.preserve_generation:
@@ -282,7 +306,13 @@ def main() -> int:
         args.expected_grade_counts = _parse_grade_counts(args.expected_grade_counts)
         if args.approve and (not str(args.approved_by).strip() or not str(args.approval_reason).strip()):
             raise ValueError("--approved-by and --approval-reason are required with --approve")
-        output = run_approval_workflow(args, SqlServerSnapshotRepository())
+        output = run_approval_workflow(
+            args,
+            SqlServerSnapshotRepository(
+                reader_connection_factory=lambda: connect_company_analytics_db(args.company_id, "reader"),
+                writer_connection_factory=lambda: connect_company_analytics_db(args.company_id, "writer"),
+            ),
+        )
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:

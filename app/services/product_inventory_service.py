@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 import logging
 import os
@@ -16,10 +16,12 @@ import pandas as pd
 from app.db.mssql_client import get_current_company_id
 from app.services.dashboard_inventory_frequency_snapshot import (
     FREQUENCY_INSUFFICIENT_GRADE,
+    FrequencyProjectionReadResult,
     frequency_rows_for_product_subset,
     scope_fingerprint,
 )
 from app.services.dashboard_inventory_frequency_snapshot_service import (
+    read_approved_frequency_projection,
     read_approved_frequency_snapshot,
     resolve_dashboard_profile_stock_scope,
 )
@@ -526,6 +528,98 @@ def _inventory_frequency_context(params: Dict[str, Any], date_to: str) -> tuple[
     return company_id, evaluation_month, ""
 
 
+def _resolve_frequency_snapshot_grade_product_scope(
+    params: Dict[str, Any],
+    *,
+    date_to: str,
+    requested_grade: str,
+    profile_scope_resolver: Callable[..., Any] | None = None,
+    snapshot_reader: Callable[..., SnapshotReadResult] | None = None,
+    projection_reader: Callable[..., FrequencyProjectionReadResult] | None = None,
+) -> tuple[list[str], Dict[str, Any]]:
+    """Return validated Snapshot product codes for one requested frequency grade.
+
+    This resolves only the approved Snapshot scope.  Each inventory route keeps
+    ownership of its own eligibility check, SQL predicate, and external state.
+    """
+    grade = _normalize_product_inventory_frequency_filter(requested_grade)
+    meta: Dict[str, Any] = {
+        "requested_grade": grade,
+        "product_code_count": 0,
+        "snapshot_status": "",
+        "snapshot_reason": "",
+        "fallback_reason": "",
+    }
+    if not grade:
+        meta["fallback_reason"] = "frequency_grade_missing"
+        return [], meta
+
+    company_id, evaluation_month, context_reason = _inventory_frequency_context(params, date_to)
+    if context_reason:
+        meta["fallback_reason"] = context_reason
+        return [], meta
+
+    profile_scope_resolver = profile_scope_resolver or resolve_dashboard_profile_stock_scope
+    snapshot_reader = snapshot_reader or read_approved_frequency_snapshot
+    try:
+        scope = profile_scope_resolver(company_id=company_id)
+        active_projection_reader = projection_reader
+        if active_projection_reader is None and snapshot_reader is read_approved_frequency_snapshot:
+            active_projection_reader = read_approved_frequency_projection
+        projection = (
+            active_projection_reader(
+                company_id=company_id,
+                evaluation_month=evaluation_month,
+                stock_codes=list(scope.stock_codes),
+                frequency_grade=grade,
+            )
+            if active_projection_reader is not None
+            else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
+        )
+    except Exception as exc:
+        meta["fallback_reason"] = f"frequency_snapshot_unavailable:{type(exc).__name__}"
+        return [], meta
+
+    meta["snapshot_status"] = clean_text(projection.status)
+    meta["snapshot_reason"] = clean_text(projection.reason)
+    if projection.usable:
+        product_codes = list(
+            dict.fromkeys(
+                clean_text(row.get("product_code"))
+                for row in projection.rows
+                if clean_text(row.get("product_code"))
+            )
+        )
+    elif projection.status == "legacy":
+        snapshot = snapshot_reader(
+            company_id=company_id,
+            evaluation_month=evaluation_month,
+            stock_codes=list(scope.stock_codes),
+        )
+        meta["snapshot_status"] = clean_text(snapshot.status)
+        meta["snapshot_reason"] = clean_text(snapshot.reason)
+        if not snapshot.usable:
+            meta["fallback_reason"] = f"snapshot_{clean_text(snapshot.status) or 'missing'}"
+            return [], meta
+        product_codes = list(
+            dict.fromkeys(
+                clean_text(row.get("product_code"))
+                for row in list((snapshot.payload or {}).get("product_frequency") or [])
+                if isinstance(row, Mapping)
+                and clean_text(row.get("frequency_grade")) == grade
+                and clean_text(row.get("product_code"))
+            )
+        )
+    else:
+        meta["fallback_reason"] = f"projection_{clean_text(projection.status) or 'missing'}"
+        return [], meta
+
+    meta["product_code_count"] = len(product_codes)
+    if not product_codes:
+        meta["fallback_reason"] = f"snapshot_grade_{grade.lower()}_empty"
+    return product_codes, meta
+
+
 def attach_dashboard_frequency_snapshot(
     df: pd.DataFrame,
     *,
@@ -533,6 +627,7 @@ def attach_dashboard_frequency_snapshot(
     date_to: str,
     profile_scope_resolver: Callable[..., Any] = resolve_dashboard_profile_stock_scope,
     snapshot_reader: Callable[..., SnapshotReadResult] = read_approved_frequency_snapshot,
+    projection_reader: Callable[..., FrequencyProjectionReadResult] | None = None,
 ) -> tuple[pd.DataFrame, Dict[str, Any]]:
     """Attach the Dashboard's approved frequency snapshot to inventory output only.
 
@@ -573,11 +668,43 @@ def attach_dashboard_frequency_snapshot(
 
     try:
         scope = profile_scope_resolver(company_id=company_id)
-        snapshot = snapshot_reader(
-            company_id=company_id,
-            evaluation_month=evaluation_month,
-            stock_codes=list(scope.stock_codes),
+        requested_codes = product_codes.loc[detail_mask].drop_duplicates().tolist()
+        active_projection_reader = projection_reader
+        if active_projection_reader is None and snapshot_reader is read_approved_frequency_snapshot:
+            active_projection_reader = read_approved_frequency_projection
+        projection = (
+            active_projection_reader(
+                company_id=company_id,
+                evaluation_month=evaluation_month,
+                stock_codes=list(scope.stock_codes),
+                product_codes=requested_codes,
+            )
+            if active_projection_reader is not None
+            else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
         )
+        if projection.usable:
+            frequency_rows = list(projection.rows)
+            snapshot_status = projection.status
+            snapshot_reason = projection.reason
+            snapshot_generation_no = projection.generation_no
+            snapshot_checksum = projection.checksum
+        elif projection.status == "legacy":
+            snapshot = snapshot_reader(
+                company_id=company_id,
+                evaluation_month=evaluation_month,
+                stock_codes=list(scope.stock_codes),
+            )
+            frequency_rows = frequency_rows_for_product_subset(snapshot, requested_codes)
+            snapshot_status = str(snapshot.status or "missing")
+            snapshot_reason = str(snapshot.reason or "")
+            snapshot_generation_no = snapshot.generation_no
+            snapshot_checksum = str(snapshot.checksum or "")
+        else:
+            frequency_rows = []
+            snapshot_status = str(projection.status or "missing")
+            snapshot_reason = str(projection.reason or "")
+            snapshot_generation_no = projection.generation_no
+            snapshot_checksum = str(projection.checksum or "")
     except Exception as exc:
         base_meta["frequency_snapshot_reason"] = f"frequency_snapshot_unavailable:{type(exc).__name__}"
         out.loc[detail_mask, _FREQUENCY_GRADE_COLUMN] = FREQUENCY_INSUFFICIENT_GRADE
@@ -585,17 +712,13 @@ def attach_dashboard_frequency_snapshot(
 
     base_meta.update(
         {
-            "frequency_snapshot_status": str(snapshot.status or "missing"),
-            "frequency_snapshot_reason": str(snapshot.reason or ""),
+            "frequency_snapshot_status": snapshot_status,
+            "frequency_snapshot_reason": snapshot_reason,
             "frequency_snapshot_scope": list(scope.stock_codes),
             "frequency_snapshot_scope_fingerprint": scope_fingerprint(scope.stock_codes),
-            "frequency_snapshot_generation_no": snapshot.generation_no,
-            "frequency_snapshot_checksum": str(snapshot.checksum or ""),
+            "frequency_snapshot_generation_no": snapshot_generation_no,
+            "frequency_snapshot_checksum": snapshot_checksum,
         }
-    )
-    frequency_rows = frequency_rows_for_product_subset(
-        snapshot,
-        product_codes.loc[detail_mask].drop_duplicates().tolist(),
     )
     frequency_frame = pd.DataFrame(frequency_rows)
     if frequency_frame.empty:
@@ -620,6 +743,212 @@ def attach_dashboard_frequency_snapshot(
     missing_mask = detail_mask & ~attached_valid
     base_meta["frequency_missing_product_count"] = int(product_codes.loc[missing_mask].nunique())
     return _place_frequency_columns(out), base_meta
+
+
+def _is_frequency_a_only_current_stock_request(params: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    """Return whether the approved A-grade scope may narrow a plain current-stock request."""
+    if not bool(cfg.get("current_stock_query")):
+        return False
+    if _normalize_product_inventory_frequency_filter(params.get("frequency_grade")) != "A":
+        return False
+    if clean_text(params.get("current_stock_entity_scope")):
+        return False
+    if params.get("current_stock_product_codes") or params.get("current_stock_manufacturer_codes"):
+        return False
+    return not any(
+        clean_text(params.get(key))
+        for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm", "nlq_unlabeled_name")
+    )
+
+
+def _current_stock_product_scope_safe_limit(
+    params: Dict[str, Any],
+    cfg: Dict[str, Any],
+    *,
+    date_from: str,
+    date_to: str,
+) -> int:
+    """Calculate the smallest single-query product IN bound across current-stock sources."""
+    probe = dict(params)
+    probe.update(
+        {
+            "base_month": date_from[:6],
+            "current_stock_entity_scope": "product",
+            "current_stock_product_codes": ["__frequency_scope_probe__"],
+            "current_stock_product_filter_mode": "code_in",
+        }
+    )
+    sqls = [
+        _build_month_carry_sql(probe, cfg)[0],
+        _build_detail_sql("in", probe, cfg, date_from, date_to, "period")[0],
+        _build_detail_sql("out", probe, cfg, date_from, date_to, "period")[0],
+    ]
+    limits = []
+    for sql in sqls:
+        bind_count = len(re.findall(r"%\(([^)]+)\)s", sql))
+        # The probe represents one product-code bind in this statement.
+        limits.append(max(0, SQL_SERVER_PARAMETER_LIMIT - (bind_count - 1) - SQL_PARAMETER_SAFETY_MARGIN))
+    return min(limits) if limits else 0
+
+
+def _apply_current_stock_frequency_a_snapshot_scope(
+    params: Dict[str, Any],
+    cfg: Dict[str, Any],
+    *,
+    date_from: str,
+    date_to: str,
+    profile_scope_resolver: Callable[..., Any] | None = None,
+    snapshot_reader: Callable[..., SnapshotReadResult] | None = None,
+    projection_reader: Callable[..., FrequencyProjectionReadResult] | None = None,
+) -> Dict[str, Any]:
+    """Apply a validated approved A-grade product scope before existing ERP reads.
+
+    The post-read attachment/filter remains authoritative.  This only narrows a
+    plain current-stock A request to products that can survive that same filter.
+    """
+    meta: Dict[str, Any] = {
+        "requested": _is_frequency_a_only_current_stock_request(params, cfg),
+        "applied": False,
+        "product_code_count": 0,
+        "safe_limit": 0,
+        "snapshot_status": "",
+        "snapshot_reason": "",
+        "fallback_reason": "not_frequency_a_only_current_stock",
+    }
+    if not meta["requested"]:
+        return meta
+
+    product_codes, scope_meta = _resolve_frequency_snapshot_grade_product_scope(
+        params,
+        date_to=date_to,
+        requested_grade="A",
+        profile_scope_resolver=profile_scope_resolver,
+        snapshot_reader=snapshot_reader,
+        projection_reader=projection_reader,
+    )
+    meta.update({
+        "product_code_count": int(scope_meta.get("product_code_count") or 0),
+        "snapshot_status": clean_text(scope_meta.get("snapshot_status")),
+        "snapshot_reason": clean_text(scope_meta.get("snapshot_reason")),
+        "fallback_reason": clean_text(scope_meta.get("fallback_reason")),
+    })
+    if meta["fallback_reason"]:
+        return meta
+
+    safe_limit = _current_stock_product_scope_safe_limit(
+        params,
+        cfg,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    meta["safe_limit"] = safe_limit
+    if len(product_codes) > safe_limit:
+        meta["fallback_reason"] = "sql_parameter_limit"
+        return meta
+
+    params["current_stock_entity_scope"] = "product"
+    params["current_stock_product_codes"] = product_codes
+    params["current_stock_product_filter_mode"] = "code_in"
+    params["current_stock_code_in_used"] = True
+    params["current_stock_predicate_mode"] = "frequency_snapshot_a_code_in"
+    meta["applied"] = True
+    meta["fallback_reason"] = ""
+    return meta
+
+
+def _is_frequency_a_product_inventory_request(params: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    """Keep the initial source-narrowing rollout limited to explicit product-inventory A."""
+    return (
+        not bool(cfg.get("current_stock_query"))
+        and _normalize_product_inventory_frequency_filter(params.get("frequency_grade")) == "A"
+        and not clean_text(params.get("nlq_unlabeled_name"))
+    )
+
+
+def _product_inventory_frequency_scope_safe_limit(params: Dict[str, Any], cfg: Dict[str, Any]) -> int:
+    """Return the one-query product IN bound across product-inventory monthly sources."""
+    probe = dict(params)
+    probe.update(
+        {
+            "base_month": clean_text(params.get("date_from"))[:6],
+            "_product_inventory_explicit_product_codes": ["__frequency_scope_probe__"],
+            "_product_inventory_explicit_product_scope_applied": True,
+        }
+    )
+    sqls = [
+        _build_month_carry_sql(probe, cfg)[0],
+        _build_month_period_sql(probe, cfg)[0],
+    ]
+    limits = []
+    for sql in sqls:
+        bind_count = len(re.findall(r"%\(([^)]+)\)s", sql))
+        # The probe represents one product-code bind in this statement.
+        limits.append(max(0, SQL_SERVER_PARAMETER_LIMIT - (bind_count - 1) - SQL_PARAMETER_SAFETY_MARGIN))
+    return min(limits) if limits else 0
+
+
+def _apply_product_inventory_frequency_snapshot_scope(
+    params: Dict[str, Any],
+    cfg: Dict[str, Any],
+    *,
+    date_to: str,
+    profile_scope_resolver: Callable[..., Any] | None = None,
+    snapshot_reader: Callable[..., SnapshotReadResult] | None = None,
+    projection_reader: Callable[..., FrequencyProjectionReadResult] | None = None,
+) -> Dict[str, Any]:
+    """Narrow explicit product-inventory A with its validated Snapshot grade set.
+
+    The established post-source Snapshot attachment/filter remains authoritative.
+    A scope resolution failure intentionally leaves the pre-existing product
+    inventory route unchanged; it does not introduce a new fallback query path.
+    """
+    requested_grade = _normalize_product_inventory_frequency_filter(params.get("frequency_grade"))
+    meta: Dict[str, Any] = {
+        "requested": _is_frequency_a_product_inventory_request(params, cfg),
+        "applied": False,
+        "frequency_grade": requested_grade,
+        "product_code_count": 0,
+        "safe_limit": 0,
+        "snapshot_status": "",
+        "snapshot_reason": "",
+        "fallback_reason": "not_frequency_a_product_inventory",
+    }
+    if not meta["requested"]:
+        return meta
+
+    product_codes, scope_meta = _resolve_frequency_snapshot_grade_product_scope(
+        params,
+        date_to=date_to,
+        requested_grade=requested_grade,
+        profile_scope_resolver=profile_scope_resolver,
+        snapshot_reader=snapshot_reader,
+        projection_reader=projection_reader,
+    )
+    meta.update({
+        "product_code_count": int(scope_meta.get("product_code_count") or 0),
+        "snapshot_status": clean_text(scope_meta.get("snapshot_status")),
+        "snapshot_reason": clean_text(scope_meta.get("snapshot_reason")),
+        "fallback_reason": clean_text(scope_meta.get("fallback_reason")),
+    })
+    if meta["fallback_reason"]:
+        return meta
+
+    safe_limit = _product_inventory_frequency_scope_safe_limit(params, cfg)
+    meta["safe_limit"] = safe_limit
+    if len(product_codes) > safe_limit:
+        meta["fallback_reason"] = "sql_parameter_limit"
+        return meta
+
+    params["_product_inventory_explicit_product_codes"] = product_codes
+    params["_product_inventory_explicit_product_scope_applied"] = True
+    params["_product_inventory_frequency_snapshot_prefilter_applied"] = True
+    params["_product_inventory_frequency_snapshot_prefilter_grade"] = requested_grade
+    params["_product_inventory_frequency_snapshot_prefilter_code_in_used"] = True
+    params["_product_inventory_frequency_snapshot_prefilter"] = meta
+    meta["applied"] = True
+    meta["fallback_reason"] = ""
+    return meta
+
 
 def _finalize_display_df_260(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -1147,6 +1476,8 @@ def resolve_product_inventory_source_path(params: Optional[Dict[str, Any]] = Non
 
 
 def _inventory_predicate_mode(params: Dict[str, Any]) -> str:
+    if bool(params.get("_product_inventory_frequency_snapshot_prefilter_applied")):
+        return "frequency_snapshot_grade_code_in"
     if clean_text(params.get("nlq_unlabeled_name")):
         return "unlabeled_like_or"
     if clean_text(params.get("maker_cd")):
@@ -1243,7 +1574,10 @@ def _apply_master_filters(
             explicit_product_codes,
             "explicit_product",
         )
-    elif clean_text(params.get("physic_nm")) and not current_stock_scoped:
+    if clean_text(params.get("physic_nm")) and not current_stock_scoped and (
+        not explicit_product_scope_applied
+        or bool(params.get("_product_inventory_frequency_snapshot_prefilter_applied"))
+    ):
         sql_params["physic_nm_like"] = f"%{clean_text(params.get('physic_nm'))}%"
         where.append("P.Rd04_Physic_Nm LIKE %(physic_nm_like)s")
 
@@ -2001,12 +2335,20 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
                 clean_text(params.get("current_stock_fallback_reason")),
             )
         else:
+            frequency_prefilter = dict(params.get("_product_inventory_frequency_snapshot_prefilter") or {})
             log.info(
-                "[product_inventory.perf] stage=sql sql_stage=%s rows=%s elapsed_ms=%s predicate_mode=%s",
+                "[product_inventory.perf] stage=sql sql_stage=%s rows=%s elapsed_ms=%s predicate_mode=%s "
+                "frequency_prefilter_applied=%s frequency_prefilter_grade=%s "
+                "frequency_prefilter_product_code_count=%s code_in_used=%s fallback_reason=%s",
                 stage,
                 int(len(df)),
                 elapsed_ms,
                 predicate_mode,
+                bool(frequency_prefilter.get("applied")),
+                clean_text(frequency_prefilter.get("frequency_grade")),
+                int(frequency_prefilter.get("product_code_count") or 0),
+                bool(params.get("_product_inventory_frequency_snapshot_prefilter_code_in_used")),
+                clean_text(frequency_prefilter.get("fallback_reason")),
             )
         return df
 
@@ -2881,6 +3223,43 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                     },
                 )
 
+        frequency_prefilter_meta = _apply_current_stock_frequency_a_snapshot_scope(
+            work_params,
+            cfg,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        work_params["_current_stock_frequency_snapshot_prefilter"] = frequency_prefilter_meta
+        log.info(
+            "[current_stock.frequency_prefilter] requested=%s applied=%s product_code_count=%s "
+            "safe_limit=%s snapshot_status=%s fallback_reason=%s",
+            bool(frequency_prefilter_meta.get("requested")),
+            bool(frequency_prefilter_meta.get("applied")),
+            int(frequency_prefilter_meta.get("product_code_count") or 0),
+            int(frequency_prefilter_meta.get("safe_limit") or 0),
+            clean_text(frequency_prefilter_meta.get("snapshot_status")),
+            clean_text(frequency_prefilter_meta.get("fallback_reason")),
+        )
+
+        product_inventory_frequency_prefilter_meta = _apply_product_inventory_frequency_snapshot_scope(
+            work_params,
+            cfg,
+            date_to=date_to,
+        )
+        work_params["_product_inventory_frequency_snapshot_prefilter"] = product_inventory_frequency_prefilter_meta
+        log.info(
+            "[product_inventory.frequency_prefilter] requested=%s applied=%s grade=%s "
+            "product_code_count=%s safe_bound=%s code_in_used=%s snapshot_status=%s fallback_reason=%s",
+            bool(product_inventory_frequency_prefilter_meta.get("requested")),
+            bool(product_inventory_frequency_prefilter_meta.get("applied")),
+            clean_text(product_inventory_frequency_prefilter_meta.get("frequency_grade")),
+            int(product_inventory_frequency_prefilter_meta.get("product_code_count") or 0),
+            int(product_inventory_frequency_prefilter_meta.get("safe_limit") or 0),
+            bool(work_params.get("_product_inventory_frequency_snapshot_prefilter_code_in_used")),
+            clean_text(product_inventory_frequency_prefilter_meta.get("snapshot_status")),
+            clean_text(product_inventory_frequency_prefilter_meta.get("fallback_reason")),
+        )
+
         product_scope_meta: Dict[str, Any] = {
             "product_name_scope": False,
             "candidate_count": 0,
@@ -2905,6 +3284,12 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 safe_limit=safe_limit,
             )
             if product_scope_meta.get("scope_applied"):
+                if product_inventory_frequency_prefilter_meta.get("applied"):
+                    snapshot_codes = set(work_params.get("_product_inventory_explicit_product_codes") or [])
+                    product_codes = [code for code in product_codes if code in snapshot_codes]
+                    product_scope_meta["frequency_snapshot_intersection_count"] = len(product_codes)
+                    if not product_codes:
+                        product_scope_meta["fallback_reason"] = "frequency_snapshot_intersection_empty"
                 work_params["_product_inventory_explicit_product_codes"] = product_codes
                 work_params["_product_inventory_explicit_product_scope_applied"] = True
         work_params["_product_inventory_product_name_scope"] = product_scope_meta
@@ -2921,7 +3306,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             _inventory_predicate_mode(work_params),
         )
 
-        if product_scope_meta.get("fallback_reason") == "no_candidates":
+        if product_scope_meta.get("fallback_reason") in {"no_candidates", "frequency_snapshot_intersection_empty"}:
             return _inventory_text_payload(
                 message="해당 조회조건의 자료가 없습니다.",
                 params=params,
@@ -2957,6 +3342,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             df_display, df_full, meta = _build_current_stock_table_frames(grp, cfg)
             frame_elapsed_ms = round((time.perf_counter() - frame_started) * 1000, 1)
             meta.update(frequency_meta)
+            meta["frequency_snapshot_prefilter"] = frequency_prefilter_meta
             meta["frequency_filter_ms"] = frequency_filter_ms
             meta["current_stock_query_perf"] = dict(work_params.get("_current_stock_query_perf") or {})
             meta["current_stock_source_elapsed_ms"] = source_elapsed_ms
@@ -2964,7 +3350,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             meta["current_stock_frame_elapsed_ms"] = frame_elapsed_ms
             meta["current_stock_service_elapsed_ms"] = round((time.perf_counter() - service_started) * 1000, 1)
             log.info(
-                "[current_stock.perf] stage=service_complete source_elapsed_ms=%s group_elapsed_ms=%s frequency_filter_ms=%s frame_elapsed_ms=%s total_elapsed_ms=%s detail_rows=%s predicate_mode=%s",
+                "[current_stock.perf] stage=service_complete source_elapsed_ms=%s group_elapsed_ms=%s frequency_filter_ms=%s frame_elapsed_ms=%s total_elapsed_ms=%s detail_rows=%s predicate_mode=%s frequency_prefilter_applied=%s frequency_prefilter_product_code_count=%s",
                 source_elapsed_ms,
                 group_elapsed_ms,
                 frequency_filter_ms,
@@ -2972,6 +3358,8 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 meta["current_stock_service_elapsed_ms"],
                 int(meta.get("detail_count", 0) or 0),
                 clean_text(work_params.get("current_stock_predicate_mode")) or "standard",
+                bool(frequency_prefilter_meta.get("applied")),
+                int(frequency_prefilter_meta.get("product_code_count") or 0),
             )
         else:
             display_perf: Dict[str, Any] = {}
@@ -2995,6 +3383,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 "display": display_perf,
                 "last_cost_scope": dict(work_params.get("_product_inventory_last_cost_scope") or {}),
                 "product_name_scope": dict(work_params.get("_product_inventory_product_name_scope") or {}),
+                "frequency_snapshot_prefilter": dict(work_params.get("_product_inventory_frequency_snapshot_prefilter") or {}),
                 "service_total_ms": service_total_ms,
             }
             meta["product_inventory_perf"] = perf_meta
@@ -3005,7 +3394,8 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 "unit_calc_ms=%s amount_calc_ms=%s dc_calc_ms=%s group_finalize_ms=%s "
                 "frequency_attach_ms=%s frequency_filter_ms=%s frequency_rows_before_filter=%s "
                 "frequency_rows_after_filter=%s final_display_frame_ms=%s subtotal_ms=%s subtotal_rows=%s final_total_ms=%s "
-                "service_total_ms=%s source_rows=%s result_rows=%s",
+                "service_total_ms=%s source_rows=%s result_rows=%s frequency_prefilter_applied=%s "
+                "frequency_prefilter_grade=%s frequency_prefilter_product_code_count=%s safe_bound=%s code_in_used=%s fallback_reason=%s",
                 source_path,
                 perf_meta["predicate_mode"],
                 filter_prepare_ms,
@@ -3029,6 +3419,12 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 service_total_ms,
                 int(len(src_df)),
                 int(len(df_display)),
+                bool(perf_meta["frequency_snapshot_prefilter"].get("applied")),
+                clean_text(perf_meta["frequency_snapshot_prefilter"].get("frequency_grade")),
+                int(perf_meta["frequency_snapshot_prefilter"].get("product_code_count") or 0),
+                int(perf_meta["frequency_snapshot_prefilter"].get("safe_limit") or 0),
+                bool(work_params.get("_product_inventory_frequency_snapshot_prefilter_code_in_used")),
+                clean_text(perf_meta["frequency_snapshot_prefilter"].get("fallback_reason")),
             )
 
         detail_count = int(meta.get("detail_count", 0) or 0)

@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping
 
+import pandas as pd
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -15,10 +17,12 @@ if str(ROOT) not in sys.path:
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     ALGORITHM_VERSION,
     FREQUENCY_INSUFFICIENT_GRADE,
+    FrequencyProjectionReadResult,
     SCHEMA_VERSION,
     SNAPSHOT_TYPE,
     SnapshotContractError,
     assign_frequency_grades,
+    build_frequency_projection,
     build_frequency_snapshot_payload,
     calculate_payload_checksum,
     completed_month_basis,
@@ -27,6 +31,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     is_normal_outbound_tcode,
     snapshot_key_from_payload,
     validate_frequency_snapshot_payload,
+    validate_frequency_projection,
 )
 from app.services.ssai_snapshot_repository import (  # noqa: E402
     SNAPSHOT_STATUS_CORRUPT,
@@ -49,6 +54,7 @@ from app.services.product_inventory_service import (  # noqa: E402
     filter_product_inventory_frequency_rows,
 )
 from app.services.ssai_analysis_profile_service import DashboardProfileLoadResult  # noqa: E402
+from app.services.dashboard_lite_facts import _attach_inventory_status_and_frequency  # noqa: E402
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -322,7 +328,7 @@ def test_dashboard_profile_stock_scope_contract() -> None:
 
 def test_product_inventory_snapshot_attachment() -> None:
     payload = _build([_row(1), _row(2, outbound_date="20251110", product="P2")])
-    ready = validate_frequency_snapshot_payload(payload, expected_key=snapshot_key_from_payload(payload))
+    validate_frequency_snapshot_payload(payload, expected_key=snapshot_key_from_payload(payload))
     expected = {row["product_code"]: row for row in payload["product_frequency"]}
     calls: list[dict[str, Any]] = []
 
@@ -408,6 +414,340 @@ def test_product_inventory_snapshot_attachment() -> None:
         len(filter_product_inventory_frequency_rows(filter_source, "전체")) == len(filter_source),
         "all frequency filter must preserve existing rows",
     )
+
+
+def test_current_stock_frequency_a_snapshot_prefilter() -> None:
+    """A ready Snapshot may narrow only a plain current-stock A request before ERP reads."""
+    payload = _build(
+        [
+            _row(1, product="A1", outbound_date="20251010"),
+            _row(2, product="A1", outbound_date="20251110"),
+            _row(3, product="A1", outbound_date="20251210"),
+            _row(4, product="B1", outbound_date="20251211"),
+        ],
+        product_codes=["A1", "B1", "X1"],
+    )
+    ready_result = validate_frequency_snapshot_payload(payload, expected_key=snapshot_key_from_payload(payload))
+    ready = ready_result.payload
+    _assert(ready is not None, "validated fixture must retain its payload")
+    grade_by_product = {
+        row["product_code"]: row["frequency_grade"]
+        for row in ready["product_frequency"]
+    }
+    _assert(grade_by_product["A1"] == "A", "fixture must contain an A-grade product")
+
+    def _scope(**kwargs: Any) -> DashboardProfileStockScope:
+        _assert(kwargs == {"company_id": 6}, "prefilter must use selected company profile scope")
+        return DashboardProfileStockScope(6, ("00001",), "ready", "dashboard_profile")
+
+    def _reader(**kwargs: Any) -> SnapshotReadResult:
+        _assert(kwargs == {"company_id": 6, "evaluation_month": "202601", "stock_codes": ["00001"]}, "prefilter key must be profile scoped")
+        return SnapshotReadResult(status=SNAPSHOT_STATUS_READY, payload=ready, generation_no=4, checksum=ready["checksum"])
+
+    params: dict[str, Any] = {
+        "company_id": 6,
+        "current_stock_query": True,
+        "frequency_grade": "A",
+        "stock_cds": ["00001"],
+    }
+    cfg = product_inventory_service._settings(params)
+    meta = product_inventory_service._apply_current_stock_frequency_a_snapshot_scope(
+        params,
+        cfg,
+        date_from="20260101",
+        date_to="20260131",
+        profile_scope_resolver=_scope,
+        snapshot_reader=_reader,
+    )
+    _assert(meta["applied"] and params["current_stock_product_codes"] == ["A1"], "only ready Snapshot A codes may become the existing code_in scope")
+    _assert(params["current_stock_entity_scope"] == "product" and params["current_stock_product_filter_mode"] == "code_in", "prefilter must reuse the shared current-stock product predicate")
+    _assert(meta["safe_limit"] >= len(params["current_stock_product_codes"]), "A scope must fit the single-query parameter contract")
+    params["date_from"] = "20260101"
+    params["date_to"] = "20260131"
+
+    projection_rows, _headers = build_frequency_projection(ready)
+    direct_params = {
+        "company_id": 6,
+        "current_stock_query": True,
+        "frequency_grade": "A",
+        "stock_cds": ["00001"],
+    }
+    direct_meta = product_inventory_service._apply_current_stock_frequency_a_snapshot_scope(
+        direct_params,
+        product_inventory_service._settings(direct_params),
+        date_from="20260101",
+        date_to="20260131",
+        profile_scope_resolver=_scope,
+        snapshot_reader=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("projection must avoid full payload")),
+        projection_reader=lambda **kwargs: (
+            _assert(kwargs["frequency_grade"] == "A" and not kwargs.get("product_codes"), "A prefilter must request grade projection"),
+            FrequencyProjectionReadResult(status="ready", rows=tuple(row for row in projection_rows if row["frequency_grade"] == "A"), generation_no=4, checksum=str(ready["checksum"])),
+        )[1],
+    )
+    _assert(direct_meta["applied"] and direct_params["current_stock_product_codes"] == ["A1"], "A prefilter must use the direct projection rows")
+
+    calls: list[dict[str, Any]] = []
+    original_query = product_inventory_service._query_df_safe
+    product_inventory_service._query_df_safe = lambda sql, sql_params: (calls.append(dict(sql_params)) or pd.DataFrame())
+    try:
+        product_inventory_service._collect_source_df(params, cfg)
+    finally:
+        product_inventory_service._query_df_safe = original_query
+    _assert(len(calls) == 3, "current-stock first-day path must keep month_carry/period_in/period_out at one call each")
+    _assert(all(call.get("current_stock_product_0") == "A1" for call in calls), "all three ERP sources must receive the same A product scope")
+
+    full_source = pd.DataFrame(
+        {
+            "제품코드": ["A1", "A1", "B1", "X1"],
+            "재고위치코드": ["00001", "00008", "00001", "00013"],
+            "재고수량": [3.0, float("nan"), 9.0, 1.0],
+            "재고금액": [30.0, 0.0, 90.0, 10.0],
+        }
+    )
+    full_attached, _ = attach_dashboard_frequency_snapshot(
+        full_source,
+        params={"company_id": 6},
+        date_to="20260131",
+        profile_scope_resolver=_scope,
+        snapshot_reader=_reader,
+    )
+    old_full_scan_result = filter_product_inventory_frequency_rows(full_attached, "A").reset_index(drop=True)
+    prefiltered_source = full_source.loc[full_source["제품코드"].isin(params["current_stock_product_codes"])].copy()
+    prefiltered_attached, _ = attach_dashboard_frequency_snapshot(
+        prefiltered_source,
+        params={"company_id": 6},
+        date_to="20260131",
+        profile_scope_resolver=_scope,
+        snapshot_reader=_reader,
+    )
+    new_prefilter_result = filter_product_inventory_frequency_rows(prefiltered_attached, "A").reset_index(drop=True)
+    pd.testing.assert_frame_equal(old_full_scan_result, new_prefilter_result, check_dtype=True)
+
+    for status in (SNAPSHOT_STATUS_MISSING, SNAPSHOT_STATUS_STALE, SNAPSHOT_STATUS_CORRUPT, SNAPSHOT_STATUS_VERSION_MISMATCH):
+        unavailable_params = {
+            "company_id": 6,
+            "current_stock_query": True,
+            "frequency_grade": "A",
+            "stock_cds": ["00001"],
+        }
+        unavailable_meta = product_inventory_service._apply_current_stock_frequency_a_snapshot_scope(
+            unavailable_params,
+            product_inventory_service._settings(unavailable_params),
+            date_from="20260101",
+            date_to="20260131",
+            profile_scope_resolver=_scope,
+            snapshot_reader=lambda **_kwargs: SnapshotReadResult(status=status),
+        )
+        _assert(not unavailable_meta["applied"] and not unavailable_params.get("current_stock_product_codes"), f"{status} must not prefilter before the existing fail-closed attachment")
+
+    mismatch_params = {"company_id": 6, "current_stock_query": True, "frequency_grade": "A"}
+    mismatch_meta = product_inventory_service._apply_current_stock_frequency_a_snapshot_scope(
+        mismatch_params,
+        product_inventory_service._settings(mismatch_params),
+        date_from="20260101",
+        date_to="20260131",
+        profile_scope_resolver=lambda **_kwargs: (_ for _ in ()).throw(SnapshotContractError("scope mismatch")),
+    )
+    _assert(not mismatch_meta["applied"] and not mismatch_params.get("current_stock_product_codes"), "scope mismatch must retain the existing fail-closed path")
+
+    for grade in ("B", "C", "D", "E", "", "전체"):
+        other_params = {"company_id": 6, "current_stock_query": True, "frequency_grade": grade}
+        other_meta = product_inventory_service._apply_current_stock_frequency_a_snapshot_scope(
+            other_params,
+            product_inventory_service._settings(other_params),
+            date_from="20260101",
+            date_to="20260131",
+            profile_scope_resolver=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("other grades must not read Snapshot")),
+        )
+        _assert(not other_meta["requested"] and not other_meta["applied"], f"{grade or 'none'} must remain unchanged")
+
+
+def test_product_inventory_frequency_a_snapshot_prefilter() -> None:
+    """Product inventory must narrow A before both monthly ERP source queries."""
+    projection_rows = (
+        {"product_code": "A1", "frequency_grade": "A", "occurrence_count_3m": 8, "data_status": "ready"},
+        {"product_code": "A2", "frequency_grade": "A", "occurrence_count_3m": 7, "data_status": "ready"},
+    )
+
+    def _scope(**kwargs: Any) -> DashboardProfileStockScope:
+        _assert(kwargs == {"company_id": 6}, "product prefilter must use the selected company profile scope")
+        return DashboardProfileStockScope(6, ("00001",), "ready", "dashboard_profile")
+
+    def _projection(**kwargs: Any) -> FrequencyProjectionReadResult:
+        _assert(kwargs["frequency_grade"] == "A", "product prefilter must request the selected grade projection")
+        _assert(kwargs["stock_codes"] == ["00001"], "product prefilter must retain the profile scope key")
+        return FrequencyProjectionReadResult(status="ready", rows=projection_rows, generation_no=4, checksum="a" * 64)
+
+    params: dict[str, Any] = {
+        "company_id": 6,
+        "frequency_grade": "A",
+        "date_from": "20260101",
+        "date_to": "20260131",
+        "month_from": "202601",
+        "month_to": "202601",
+        "stock_cds": ["00001"],
+    }
+    cfg = product_inventory_service._settings(params)
+    meta = product_inventory_service._apply_product_inventory_frequency_snapshot_scope(
+        params,
+        cfg,
+        date_to="20260131",
+        profile_scope_resolver=_scope,
+        projection_reader=_projection,
+    )
+    _assert(meta["applied"], "ready A projection must apply to product inventory")
+    _assert(params["_product_inventory_explicit_product_codes"] == ["A1", "A2"], "product inventory must reuse the shared explicit product-code scope")
+    _assert(meta["safe_limit"] >= 2, "A projection must fit both monthly source bounds")
+    _assert(product_inventory_service._inventory_predicate_mode(params) == "frequency_snapshot_grade_code_in", "prefilter must expose its distinct predicate mode")
+
+    calls: list[dict[str, Any]] = []
+    original_query = product_inventory_service._query_df_safe
+    product_inventory_service._query_df_safe = lambda _sql, sql_params: (calls.append(dict(sql_params)) or pd.DataFrame())
+    try:
+        product_inventory_service._collect_source_df(params, cfg)
+    finally:
+        product_inventory_service._query_df_safe = original_query
+    _assert(len(calls) == 2, "monthly product inventory must keep one month_carry and one month_period query")
+    _assert(all(call.get("explicit_product_0") == "A1" and call.get("explicit_product_1") == "A2" for call in calls), "both monthly sources must receive the same A code IN scope")
+
+    name_params = dict(params, physic_nm="테스트")
+    carry_sql, carry_bindings = product_inventory_service._build_month_carry_sql(name_params, cfg)
+    period_sql, period_bindings = product_inventory_service._build_month_period_sql(name_params, cfg)
+    _assert("P.Rd04_Physic_Cd IN" in carry_sql and "P.Rd04_Physic_Cd IN" in period_sql, "A scope must be present in both monthly SQL statements")
+    _assert(carry_bindings["explicit_product_0"] == "A1" and period_bindings["explicit_product_1"] == "A2", "monthly bindings must retain all Snapshot A codes")
+    _assert("physic_nm_like" in carry_bindings and "physic_nm_like" in period_bindings, "A plus product-name must remain an AND intersection")
+
+    full_source = pd.DataFrame(
+        {
+            "제품코드": ["A1", "A2", "B1"],
+            "재고위치코드": ["00001", "00001", "00001"],
+            "재고수량": [3.0, float("nan"), 9.0],
+            "재고금액": [30.0, 0.0, 90.0],
+            "단가": [10.0, float("nan"), 10.0],
+        }
+    )
+    full_attached = full_source.copy()
+    full_attached["출고빈도등급"] = full_attached["제품코드"].map({"A1": "A", "A2": "A", "B1": "B"})
+    full_attached["3개월 출고발생수"] = full_attached["제품코드"].map({"A1": 8, "A2": 7, "B1": 1}).astype("Int64")
+    old_full_scan_result = filter_product_inventory_frequency_rows(full_attached, "A").reset_index(drop=True)
+    new_prefilter_result = filter_product_inventory_frequency_rows(
+        full_attached.loc[full_attached["제품코드"].isin(params["_product_inventory_explicit_product_codes"])].copy(),
+        "A",
+    ).reset_index(drop=True)
+    pd.testing.assert_frame_equal(old_full_scan_result, new_prefilter_result, check_dtype=True)
+
+    for status in ("missing", "stale", "corrupt", "version_mismatch"):
+        unavailable_params = {
+            "company_id": 6,
+            "frequency_grade": "A",
+            "date_from": "20260101",
+            "date_to": "20260131",
+            "stock_cds": ["00001"],
+        }
+        unavailable_meta = product_inventory_service._apply_product_inventory_frequency_snapshot_scope(
+            unavailable_params,
+            product_inventory_service._settings(unavailable_params),
+            date_to="20260131",
+            profile_scope_resolver=_scope,
+            projection_reader=lambda **_kwargs: FrequencyProjectionReadResult(status=status),
+        )
+        _assert(not unavailable_meta["applied"] and not unavailable_params.get("_product_inventory_explicit_product_codes"), f"{status} must keep the existing product-inventory path unchanged")
+
+    other_grade_params = {"company_id": 6, "frequency_grade": "B"}
+    other_grade_meta = product_inventory_service._apply_product_inventory_frequency_snapshot_scope(
+        other_grade_params,
+        product_inventory_service._settings(other_grade_params),
+        date_to="20260131",
+        profile_scope_resolver=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("B rollout must not read Snapshot")),
+    )
+    _assert(not other_grade_meta["requested"] and not other_grade_meta["applied"], "only A may prefilter in this rollout")
+
+
+def test_frequency_projection_integrity_contract() -> None:
+    """Derived rows must detect count-preserving substitutions and partial writes."""
+    source_rows = [
+        {"product_code": f"A{index:03d}", "occurrence_count_3m": 10, "frequency_grade": "A", "data_status": "ready"}
+        for index in range(192)
+    ]
+    source_rows.extend(
+        {"product_code": f"{grade}1", "occurrence_count_3m": 1, "frequency_grade": grade, "data_status": "ready"}
+        for grade in ("B", "C", "D", "E", "X")
+    )
+    rows, headers = build_frequency_projection({"checksum": "a" * 64, "product_frequency": source_rows})
+    ready_a = validate_frequency_projection(
+        manifest_checksum="a" * 64, rows=[row for row in rows if row["frequency_grade"] == "A"], headers=headers, required_grade="A"
+    )
+    _assert(len(ready_a) == 192, "A projection must retain all 192 product codes")
+    ready_all = validate_frequency_projection(
+        manifest_checksum="a" * 64, rows=rows, headers=headers, require_complete=True
+    )
+    _assert({row["frequency_grade"] for row in ready_all} == {"A", "B", "C", "D", "E", "X"}, "all grades must remain available")
+
+    duplicate = copy.deepcopy(rows)
+    duplicate.append(copy.deepcopy(duplicate[0]))
+    try:
+        validate_frequency_projection(manifest_checksum="a" * 64, rows=duplicate, headers=headers, require_complete=True)
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("duplicate projection product must fail")
+    missing = [row for row in rows if row["product_code"] != "A000"]
+    try:
+        validate_frequency_projection(manifest_checksum="a" * 64, rows=missing, headers=headers, required_grade="A")
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("missing projection product must fail")
+    substituted = copy.deepcopy(rows)
+    substituted[0]["product_code"] = "A999"
+    try:
+        validate_frequency_projection(manifest_checksum="a" * 64, rows=substituted, headers=headers, required_grade="A")
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("same-count substituted projection product must fail")
+    bad_headers = copy.deepcopy(headers)
+    bad_headers[0]["projection_checksum"] = "0" * 64
+    try:
+        validate_frequency_projection(manifest_checksum="a" * 64, rows=rows, headers=bad_headers, require_complete=True)
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("projection checksum mismatch must fail")
+    try:
+        validate_frequency_projection(manifest_checksum="a" * 64, rows=rows, headers=headers[:-1], require_complete=True)
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("partial projection headers must fail")
+
+
+def test_projection_consumer_attachment_equality() -> None:
+    payload = _build([_row(1, product="A1"), _row(2, product="B1", tcode="600")], product_codes=["A1", "B1"])
+    snapshot = validate_frequency_snapshot_payload(payload, expected_key=snapshot_key_from_payload(payload))
+    projection_rows, _headers = build_frequency_projection(payload)
+    projection = FrequencyProjectionReadResult(
+        status="ready", rows=tuple(projection_rows), manifest_id=9, generation_no=1, checksum=str(payload["checksum"])
+    )
+    source = pd.DataFrame({"제품코드": ["A1", "B1"], "재고수량": [1, 2]})
+    scope = lambda **_kwargs: DashboardProfileStockScope(6, ("00001",), "ready", "fixture")
+    legacy_attached, _ = attach_dashboard_frequency_snapshot(
+        source, params={"company_id": 6}, date_to="20260131", profile_scope_resolver=scope,
+        snapshot_reader=lambda **_kwargs: snapshot,
+    )
+    projection_attached, projection_meta = attach_dashboard_frequency_snapshot(
+        source, params={"company_id": 6}, date_to="20260131", profile_scope_resolver=scope,
+        snapshot_reader=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("projection must avoid full payload")),
+        projection_reader=lambda **_kwargs: projection,
+    )
+    pd.testing.assert_frame_equal(legacy_attached, projection_attached, check_dtype=True)
+    _assert(projection_meta["frequency_snapshot_generation_no"] == 1, "projection attach must retain manifest provenance")
+    dashboard = _attach_inventory_status_and_frequency(
+        [{"product_code": "A1", "inventory_current_stock_present": True, "evaluation_expected_demand_present": True, "current_stock_qty": 3, "evaluation_expected_demand_qty": 2}],
+        frequency_snapshot=SnapshotReadResult(status="ready", generation_no=1, checksum=str(payload["checksum"])),
+        frequency_rows=tuple(projection_rows),
+    )
+    _assert(dashboard["detail_rows"][0]["출고빈도등급"] == "A", "Dashboard must attach projection data without payload JSON")
 
 
 def test_product_inventory_frequency_filter_totals_and_summary() -> None:
@@ -508,6 +848,10 @@ def main() -> int:
         test_repository_boundary,
         test_dashboard_profile_stock_scope_contract,
         test_product_inventory_snapshot_attachment,
+        test_current_stock_frequency_a_snapshot_prefilter,
+        test_product_inventory_frequency_a_snapshot_prefilter,
+        test_frequency_projection_integrity_contract,
+        test_projection_consumer_attachment_equality,
         test_product_inventory_frequency_filter_totals_and_summary,
     )
     for test in tests:

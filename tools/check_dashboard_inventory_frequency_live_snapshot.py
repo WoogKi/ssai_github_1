@@ -270,26 +270,27 @@ class _DraftRepository:
     def __init__(self) -> None:
         self.published = None
 
-    def publish(self, key, payload, *, created_by: str, force: bool = False):
-        self.published = (key, payload, created_by, force)
+    def publish_relational(self, snapshot, *, created_by: str, force: bool = False):
+        self.published = (snapshot.key, snapshot, created_by, force)
         return SnapshotPublishResult(
-            status="draft", generation_no=7, checksum=str(payload["checksum"]), manifest_id=17,
+            status="draft", generation_no=7, checksum=str(snapshot.checksum), manifest_id=17,
             approval_status="pending",
         )
 
     def inspect_generation(self, key, generation_no: int):
         if self.published is None or generation_no != 7:
             return SnapshotGenerationInspection(status="missing", generation_no=generation_no)
-        stored_key, payload, _created_by, _force = self.published
+        stored_key, snapshot, _created_by, _force = self.published
         if key != stored_key:
             return SnapshotGenerationInspection(status="missing", generation_no=generation_no)
         return SnapshotGenerationInspection(
             status="unapproved",
             manifest_status="draft",
             approval_status="pending",
-            payload=payload,
+            representation="relational_frequency_v1",
+            relational_snapshot=snapshot,
             generation_no=7,
-            checksum=str(payload["checksum"]),
+            checksum=str(snapshot.checksum),
         )
     def read(self, key):
         return SnapshotReadResult(status="unapproved", generation_no=7, manifest_id=17)
@@ -334,7 +335,10 @@ def test_generation_boundary() -> None:
     _assert(result["read_status"] == "unapproved", "draft must fail closed before approval")
     _assert(result["draft_inspection_status"] == "unapproved", "exact draft inspection must validate the pending generation")
     _assert(result["draft"].status == "draft", "generator must not approve/publish")
-    _assert(result["payload"]["summary"]["grade_counts"]["X"] == 1, "universe X row missing")
+    _assert(
+        [row["product_code"] for row in result["relational_snapshot"].frequency_products if row["frequency_grade"] == "X"] == ["P2"],
+        "universe X row missing",
+    )
     _assert(progress == ["제품 조회 중", "출고 집계 중", "등급 계산 중", "draft 저장 중"], "progress phases mismatch")
 
 

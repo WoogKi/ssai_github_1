@@ -46,10 +46,13 @@ class SnapshotReadResult:
     approved_at: str = ""
     approved_by: str = ""
     approval_reason: str = ""
+    representation: str = "legacy_json_v1"
 
     @property
     def usable(self) -> bool:
-        return self.status == SNAPSHOT_STATUS_READY and self.payload is not None
+        return self.status == SNAPSHOT_STATUS_READY and (
+            self.payload is not None or self.representation == "relational_frequency_v1"
+        )
 
 
 @dataclass(frozen=True)

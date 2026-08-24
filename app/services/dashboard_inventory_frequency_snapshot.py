@@ -40,6 +40,71 @@ class SnapshotContractError(ValueError):
     pass
 
 
+FREQUENCY_PROJECTION_GRADES = (*FREQUENCY_GRADES, "X")
+RELATIONAL_FREQUENCY_REPRESENTATION = "relational_frequency_v1"
+LEGACY_JSON_REPRESENTATION = "legacy_json_v1"
+RELATIONAL_DIAGNOSTIC_FIELDS = (
+    "source_row_count",
+    "normal_positive_accepted_row_count",
+    "normal_positive_duplicate_row_count",
+    "normal_positive_conflicting_row_count",
+    "normal_positive_missing_key_row_count",
+    "normal_positive_nonintegral_row_count",
+    "normal_nonpositive_row_count",
+    "return_positive_row_count",
+    "return_nonpositive_row_count",
+    "other_tcode_row_count",
+    "normal_positive_row_count",
+    "distinct_normal_event_count",
+    "conflicting_event_count",
+    "ignored_product_event_count",
+)
+RELATIONAL_PARTITION_FIELDS = RELATIONAL_DIAGNOSTIC_FIELDS[1:10]
+
+
+@dataclass(frozen=True)
+class FrequencyProjectionReadResult:
+    """Read-model result for approved product-frequency lookups.
+
+    This is deliberately separate from SnapshotReadResult: projection rows are
+    derived read data, while the full payload remains the approval authority.
+    """
+
+    status: str
+    rows: tuple[Mapping[str, Any], ...] = ()
+    reason: str = ""
+    manifest_id: int | None = None
+    generation_no: int | None = None
+    checksum: str = ""
+
+    @property
+    def usable(self) -> bool:
+        return self.status == SNAPSHOT_STATUS_READY
+
+
+@dataclass(frozen=True)
+class RelationalFrequencySnapshot:
+    """Typed authority data for a payload-less frequency generation."""
+
+    key: SnapshotKey
+    basis_from: str
+    basis_to: str
+    scope_mode: str
+    stock_codes: tuple[str, ...]
+    source_watermark: str | None
+    source_watermark_status: str
+    source_fingerprint: str
+    source_contract: Mapping[str, Any]
+    source_diagnostics: Mapping[str, Any]
+    monthly_activity: tuple[Mapping[str, Any], ...]
+    frequency_products: tuple[Mapping[str, Any], ...]
+    checksum: str
+
+    @property
+    def item_count(self) -> int:
+        return len(self.frequency_products)
+
+
 @dataclass(frozen=True)
 class CompletedMonthBasis:
     evaluation_month: str
@@ -186,6 +251,414 @@ def calculate_payload_checksum(payload: Mapping[str, Any]) -> str:
     canonical = {key: value for key, value in payload.items() if key != "checksum"}
     encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _canonical_scalar(value: Any) -> bytes:
+    if value is None:
+        text = "null"
+    elif value is True:
+        text = "true"
+    elif value is False:
+        text = "false"
+    else:
+        text = str(value)
+    encoded = text.encode("utf-8")
+    return len(encoded).to_bytes(8, "big") + encoded
+
+
+def _canonical_section(name: str, columns: Sequence[str], rows: Iterable[Sequence[Any]]) -> bytes:
+    body = bytearray()
+    body.extend(_canonical_scalar(name))
+    body.extend(len(columns).to_bytes(4, "big"))
+    for column in columns:
+        body.extend(_canonical_scalar(column))
+    normalized_rows = [tuple(row) for row in rows]
+    body.extend(len(normalized_rows).to_bytes(8, "big"))
+    for row in normalized_rows:
+        if len(row) != len(columns):
+            raise SnapshotContractError(f"canonical section {name} column count mismatch")
+        for value in row:
+            body.extend(_canonical_scalar(value))
+    return bytes(body)
+
+
+def _canonical_relational_bytes(
+    *,
+    key: SnapshotKey,
+    basis_from: str,
+    basis_to: str,
+    scope_mode: str,
+    stock_codes: Sequence[str],
+    source_watermark: str | None,
+    source_watermark_status: str,
+    source_fingerprint: str,
+    source_contract: Mapping[str, Any],
+    source_diagnostics: Mapping[str, Any],
+    monthly_activity: Sequence[Mapping[str, Any]],
+    frequency_products: Sequence[Mapping[str, Any]],
+) -> bytes:
+    contract_columns = (
+        "table", "io_gu_gcode", "normal_tcode_from", "normal_tcode_to", "event_key_fields",
+        "positive_quantity_expression", "return_tcode_from", "return_tcode_to", "returns_are_netted",
+        "flag_exclusion_fields", "non_exclusion_flag_fields", "universe_mode", "dashboard_product_filters",
+        "include_rd04_del_flag_e", "fingerprint_contract_version", "fingerprint_mode",
+    )
+    parts = [
+        _canonical_section(
+            "manifest",
+            ("company_id", "snapshot_type", "evaluation_month", "scope_fingerprint", "schema_version", "algorithm_version", "basis_from", "basis_to", "scope_mode", "source_watermark", "source_watermark_status", "source_fingerprint"),
+            [(key.company_id, key.snapshot_type, key.evaluation_month, key.scope_fingerprint, key.schema_version, key.algorithm_version, basis_from, basis_to, scope_mode, source_watermark, source_watermark_status, source_fingerprint)],
+        ),
+        _canonical_section("scope_stock", ("stock_code",), [(code,) for code in sorted(stock_codes)]),
+        _canonical_section("source_contract", contract_columns, [tuple("|".join(map(str, source_contract.get(column, ()))) if isinstance(source_contract.get(column), (list, tuple)) else source_contract.get(column) for column in contract_columns)]),
+        _canonical_section("source_diagnostics", RELATIONAL_DIAGNOSTIC_FIELDS + ("diagnostic_contract_version",), [tuple(source_diagnostics.get(column, 0) for column in RELATIONAL_DIAGNOSTIC_FIELDS) + (source_diagnostics.get("diagnostic_contract_version", 0),)]),
+        _canonical_section(
+            "monthly_activity",
+            ("month", "product_code", "stock_code", "occurrence_count", "outbound_quantity", "outbound_day_count"),
+            [
+                (row.get("month"), row.get("product_code"), row.get("stock_code"), row.get("occurrence_count"), row.get("outbound_quantity"), row.get("outbound_day_count"))
+                for row in sorted(monthly_activity, key=lambda row: (str(row.get("month") or ""), str(row.get("product_code") or ""), str(row.get("stock_code") or "")))
+            ],
+        ),
+        _canonical_section(
+            "frequency_product",
+            ("product_code", "occurrence_count_3m", "frequency_grade", "data_status"),
+            [
+                (row.get("product_code"), row.get("occurrence_count_3m"), row.get("frequency_grade"), row.get("data_status"))
+                for row in sorted(frequency_products, key=lambda row: str(row.get("product_code") or ""))
+            ],
+        ),
+    ]
+    return b"RELATIONAL_FREQUENCY_V1\x00" + b"".join(parts)
+
+
+def calculate_relational_frequency_checksum(**kwargs: Any) -> str:
+    """Hash typed rows using a length-prefixed canonical encoder, never JSON."""
+    return hashlib.sha256(_canonical_relational_bytes(**kwargs)).hexdigest()
+
+
+def _relational_row_checksum(section: str, columns: Sequence[str], row: Sequence[Any]) -> str:
+    return hashlib.sha256(_canonical_section(section, columns, [row])).hexdigest()
+
+
+def relational_row_checksum(section: str, columns: Sequence[str], row: Sequence[Any]) -> str:
+    return _relational_row_checksum(section, columns, row)
+
+
+def _relational_projection_digest(rows: Iterable[Mapping[str, Any]]) -> str:
+    canonical = [
+        (str(row.get("product_code") or ""), int(row.get("occurrence_count_3m") or 0), str(row.get("frequency_grade") or ""), str(row.get("data_status") or ""))
+        for row in rows
+    ]
+    return hashlib.sha256(_canonical_section("frequency_projection", ("product_code", "occurrence_count_3m", "frequency_grade", "data_status"), sorted(canonical))).hexdigest()
+
+
+def build_relational_frequency_snapshot_from_aggregates(
+    *,
+    company_id: Any,
+    evaluation_month: Any,
+    monthly_rows: Iterable[Mapping[str, Any]],
+    product_codes: Iterable[Any],
+    stock_codes: Iterable[Any] | None = None,
+    source_watermark: Any = None,
+    source_watermark_status: str = "unverified",
+    source_diagnostics: Mapping[str, Any] | None = None,
+) -> RelationalFrequencySnapshot:
+    company = _normalize_code(company_id, field="company_id")
+    basis = completed_month_basis(evaluation_month)
+    universe = tuple(sorted({_normalize_code(code, field="product_code") for code in product_codes}))
+    scope_codes = _normalized_scope(stock_codes)
+    normalized_monthly: list[dict[str, Any]] = []
+    counts: dict[str, int] = defaultdict(int)
+    seen: set[tuple[str, str, str]] = set()
+    for source in monthly_rows:
+        row = {
+            "month": str(source.get("month") or ""),
+            "product_code": _normalize_code(source.get("product_code"), field="product_code"),
+            "stock_code": _normalize_code(source.get("stock_code"), field="stock_code"),
+            "occurrence_count": _required_nonnegative_int(source.get("occurrence_count"), field="occurrence_count"),
+            "outbound_quantity": _required_nonnegative_int(source.get("outbound_quantity"), field="outbound_quantity"),
+            "outbound_day_count": _required_nonnegative_int(source.get("outbound_day_count"), field="outbound_day_count"),
+        }
+        key = (row["month"], row["product_code"], row["stock_code"])
+        if key in seen or row["month"] not in basis.months or row["product_code"] not in universe:
+            raise SnapshotContractError("relational monthly activity is invalid")
+        if scope_codes and row["stock_code"] not in scope_codes:
+            raise SnapshotContractError("relational monthly activity is outside scope")
+        if row["occurrence_count"] <= 0 or row["outbound_quantity"] <= 0 or not 0 < row["outbound_day_count"] <= row["occurrence_count"]:
+            raise SnapshotContractError("relational monthly activity aggregate is invalid")
+        seen.add(key)
+        counts[row["product_code"]] += row["occurrence_count"]
+        normalized_monthly.append(row)
+    frequency_products = assign_frequency_grades(counts, universe)
+    diagnostics = {field: _required_nonnegative_int((source_diagnostics or {}).get(field, 0), field=field) for field in RELATIONAL_DIAGNOSTIC_FIELDS}
+    diagnostics["diagnostic_contract_version"] = int((source_diagnostics or {}).get("diagnostic_contract_version") or 0)
+    if diagnostics["diagnostic_contract_version"] >= 2 and sum(diagnostics[field] for field in RELATIONAL_PARTITION_FIELDS) != diagnostics["source_row_count"]:
+        raise SnapshotContractError("relational source diagnostics do not reconcile")
+    source_contract = {
+        "table": "Rddbc120", "io_gu_gcode": "0012", "normal_tcode_from": "500", "normal_tcode_to": "599",
+        "event_key_fields": _EVENT_KEY_FIELDS, "positive_quantity_expression": "quantity + oquantity > 0",
+        "return_tcode_from": "600", "return_tcode_to": "699", "returns_are_netted": False,
+        "flag_exclusion_fields": (), "non_exclusion_flag_fields": _NON_EXCLUSION_FLAG_FIELDS,
+        "universe_mode": "all_rddbc040_baseline", "dashboard_product_filters": "post_grade",
+        "include_rd04_del_flag_e": True, "fingerprint_contract_version": 2,
+        "fingerprint_mode": "monthly_aggregate_v1",
+    }
+    key = SnapshotKey(company, SNAPSHOT_TYPE, basis.evaluation_month, scope_fingerprint(scope_codes), SCHEMA_VERSION, ALGORITHM_VERSION)
+    source_fingerprint = hashlib.sha256(_canonical_section("source_monthly", ("month", "product_code", "stock_code", "occurrence_count", "outbound_quantity", "outbound_day_count"), [(row["month"], row["product_code"], row["stock_code"], row["occurrence_count"], row["outbound_quantity"], row["outbound_day_count"]) for row in sorted(normalized_monthly, key=lambda row: (row["month"], row["product_code"], row["stock_code"]))]) + _canonical_section("source_diagnostics", RELATIONAL_DIAGNOSTIC_FIELDS, [tuple(diagnostics[field] for field in RELATIONAL_DIAGNOSTIC_FIELDS)])).hexdigest()
+    checksum = calculate_relational_frequency_checksum(
+        key=key, basis_from=basis.basis_from, basis_to=basis.basis_to, scope_mode="selected" if scope_codes else "all", stock_codes=scope_codes,
+        source_watermark=None if source_watermark is None else str(source_watermark), source_watermark_status=str(source_watermark_status or "unverified"), source_fingerprint=source_fingerprint,
+        source_contract=source_contract, source_diagnostics=diagnostics, monthly_activity=normalized_monthly, frequency_products=frequency_products,
+    )
+    return RelationalFrequencySnapshot(key, basis.basis_from, basis.basis_to, "selected" if scope_codes else "all", scope_codes, None if source_watermark is None else str(source_watermark), str(source_watermark_status or "unverified"), source_fingerprint, source_contract, diagnostics, tuple(normalized_monthly), tuple(frequency_products), checksum)
+
+
+def build_relational_frequency_projection(snapshot: RelationalFrequencySnapshot) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    columns = ("product_code", "occurrence_count_3m", "frequency_grade", "data_status")
+    for source in snapshot.frequency_products:
+        row = _canonical_projection_row(source)
+        row["row_checksum"] = _relational_row_checksum("frequency_product", columns, tuple(row[column] for column in columns))
+        rows.append(row)
+    headers = [
+        {
+            "frequency_grade": grade,
+            "expected_product_count": len([row for row in rows if row["frequency_grade"] == grade]),
+            "projection_checksum": _relational_projection_digest(row for row in rows if row["frequency_grade"] == grade),
+        }
+        for grade in FREQUENCY_PROJECTION_GRADES
+    ]
+    return rows, headers
+
+
+def validate_relational_frequency_projection(
+    *,
+    rows: Iterable[Mapping[str, Any]],
+    headers: Iterable[Mapping[str, Any]],
+    required_grade: str = "",
+    require_complete: bool = False,
+) -> tuple[dict[str, Any], ...]:
+    product_columns = ("product_code", "occurrence_count_3m", "frequency_grade", "data_status")
+    normalized_headers = {
+        str(row.get("frequency_grade") or ""): {
+            "expected_product_count": _required_nonnegative_int(row.get("expected_product_count"), field="expected_product_count"),
+            "projection_checksum": str(row.get("projection_checksum") or ""),
+        }
+        for row in headers
+        if isinstance(row, Mapping)
+    }
+    if set(normalized_headers) != set(FREQUENCY_PROJECTION_GRADES):
+        raise SnapshotContractError("relational projection headers are incomplete")
+    normalized_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in rows:
+        row = _canonical_projection_row(source)
+        if row["frequency_grade"] not in FREQUENCY_PROJECTION_GRADES or row["data_status"] != SNAPSHOT_STATUS_READY or row["product_code"] in seen:
+            raise SnapshotContractError("relational projection row is invalid")
+        if str(source.get("row_checksum") or "") != _relational_row_checksum("frequency_product", product_columns, tuple(row[column] for column in product_columns)):
+            raise SnapshotContractError("relational projection row checksum does not match")
+        seen.add(row["product_code"])
+        row["row_checksum"] = str(source.get("row_checksum"))
+        normalized_rows.append(row)
+    if required_grade:
+        grade_rows = [row for row in normalized_rows if row["frequency_grade"] == required_grade]
+        header = normalized_headers.get(required_grade)
+        if header is None or len(grade_rows) != header["expected_product_count"] or _relational_projection_digest(grade_rows) != header["projection_checksum"]:
+            raise SnapshotContractError("relational projection grade checksum does not match")
+    elif require_complete:
+        if sum(row["expected_product_count"] for row in normalized_headers.values()) != len(normalized_rows):
+            raise SnapshotContractError("relational projection product count does not match")
+        for grade, header in normalized_headers.items():
+            grade_rows = [row for row in normalized_rows if row["frequency_grade"] == grade]
+            if len(grade_rows) != header["expected_product_count"] or _relational_projection_digest(grade_rows) != header["projection_checksum"]:
+                raise SnapshotContractError("relational projection checksum does not match")
+    return tuple(normalized_rows)
+
+
+def validate_relational_frequency_snapshot(snapshot: RelationalFrequencySnapshot) -> None:
+    """Validate the complete native authority set before draft approval."""
+    if snapshot.scope_mode not in {"all", "selected"}:
+        raise SnapshotContractError("relational scope mode is invalid")
+    if snapshot.scope_mode == "all" and snapshot.stock_codes:
+        raise SnapshotContractError("relational all scope contains stock rows")
+    if snapshot.scope_mode == "selected" and not snapshot.stock_codes:
+        raise SnapshotContractError("relational selected scope is empty")
+    basis = completed_month_basis(snapshot.key.evaluation_month)
+    if snapshot.basis_from != basis.basis_from or snapshot.basis_to != basis.basis_to:
+        raise SnapshotContractError("relational basis range does not match")
+    if snapshot.key.scope_fingerprint != scope_fingerprint(snapshot.stock_codes):
+        raise SnapshotContractError("relational scope fingerprint does not match")
+    if snapshot.source_watermark_status not in {"verified", "unverified"}:
+        raise SnapshotContractError("relational source watermark status is invalid")
+    if len(snapshot.source_fingerprint) != 64:
+        raise SnapshotContractError("relational source fingerprint is invalid")
+    diagnostics = snapshot.source_diagnostics
+    if int(diagnostics.get("diagnostic_contract_version") or 0) >= 2:
+        if int(snapshot.source_contract.get("fingerprint_contract_version") or 0) != 2:
+            raise SnapshotContractError("relational source contract version is invalid")
+        if str(snapshot.source_contract.get("fingerprint_mode") or "") != "monthly_aggregate_v1":
+            raise SnapshotContractError("relational source fingerprint mode is invalid")
+        if sum(_required_nonnegative_int(diagnostics.get(field), field=field) for field in RELATIONAL_PARTITION_FIELDS) != _required_nonnegative_int(diagnostics.get("source_row_count"), field="source_row_count"):
+            raise SnapshotContractError("relational source diagnostics do not reconcile")
+    product_counts: dict[str, int] = {}
+    for row in snapshot.frequency_products:
+        code = _normalize_code(row.get("product_code"), field="product_code")
+        if code in product_counts:
+            raise SnapshotContractError("relational product code is duplicated")
+        product_counts[code] = _required_nonnegative_int(row.get("occurrence_count_3m"), field="occurrence_count_3m")
+        if str(row.get("frequency_grade") or "") not in FREQUENCY_PROJECTION_GRADES or str(row.get("data_status") or "") != SNAPSHOT_STATUS_READY:
+            raise SnapshotContractError("relational product grade/status is invalid")
+    monthly_counts: dict[str, int] = defaultdict(int)
+    seen: set[tuple[str, str, str]] = set()
+    for row in snapshot.monthly_activity:
+        month = str(row.get("month") or "")
+        product = _normalize_code(row.get("product_code"), field="product_code")
+        stock = _normalize_code(row.get("stock_code"), field="stock_code")
+        row_key = (month, product, stock)
+        if row_key in seen or month not in basis.months or product not in product_counts:
+            raise SnapshotContractError("relational monthly row is invalid")
+        seen.add(row_key)
+        occurrence = _required_nonnegative_int(row.get("occurrence_count"), field="occurrence_count")
+        quantity = _required_nonnegative_int(row.get("outbound_quantity"), field="outbound_quantity")
+        day_count = _required_nonnegative_int(row.get("outbound_day_count"), field="outbound_day_count")
+        if occurrence <= 0 or quantity <= 0 or not 0 < day_count <= occurrence:
+            raise SnapshotContractError("relational monthly aggregate is invalid")
+        monthly_counts[product] += occurrence
+    if product_counts != {code: monthly_counts.get(code, 0) for code in sorted(product_counts)}:
+        raise SnapshotContractError("relational monthly totals do not match product totals")
+    expected_grades = {row["product_code"]: row["frequency_grade"] for row in assign_frequency_grades(product_counts, product_counts)}
+    if expected_grades != {str(row.get("product_code")): str(row.get("frequency_grade")) for row in snapshot.frequency_products}:
+        raise SnapshotContractError("relational grades do not match occurrence bands")
+    expected_checksum = calculate_relational_frequency_checksum(
+        key=snapshot.key, basis_from=snapshot.basis_from, basis_to=snapshot.basis_to, scope_mode=snapshot.scope_mode, stock_codes=snapshot.stock_codes,
+        source_watermark=snapshot.source_watermark, source_watermark_status=snapshot.source_watermark_status, source_fingerprint=snapshot.source_fingerprint,
+        source_contract=snapshot.source_contract, source_diagnostics=snapshot.source_diagnostics, monthly_activity=snapshot.monthly_activity, frequency_products=snapshot.frequency_products,
+    )
+    if expected_checksum != snapshot.checksum:
+        raise SnapshotContractError("relational snapshot checksum does not match")
+
+
+def _canonical_projection_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "product_code": _normalize_code(row.get("product_code"), field="product_code"),
+        "occurrence_count_3m": _required_nonnegative_int(
+            row.get("occurrence_count_3m"), field="occurrence_count_3m"
+        ),
+        "frequency_grade": str(row.get("frequency_grade") or ""),
+        "data_status": str(row.get("data_status") or ""),
+    }
+
+
+def _projection_digest(rows: Iterable[Mapping[str, Any]]) -> str:
+    canonical = [_canonical_projection_row(row) for row in rows]
+    canonical.sort(key=lambda row: row["product_code"])
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _projection_row_checksum(*, manifest_checksum: str, row: Mapping[str, Any]) -> str:
+    canonical = {"manifest_checksum": manifest_checksum, "row": _canonical_projection_row(row)}
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def build_frequency_projection(payload: Mapping[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build the non-authoritative product-frequency projection from a valid payload."""
+    manifest_checksum = str(payload.get("checksum") or "")
+    if len(manifest_checksum) != 64:
+        raise SnapshotContractError("projection requires the payload checksum")
+    source_rows = payload.get("product_frequency")
+    if not isinstance(source_rows, list):
+        raise SnapshotContractError("projection source rows are invalid")
+
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in source_rows:
+        if not isinstance(source, Mapping):
+            raise SnapshotContractError("projection source row is invalid")
+        row = _canonical_projection_row(source)
+        if row["product_code"] in seen:
+            raise SnapshotContractError("projection source contains duplicate product_code")
+        if row["frequency_grade"] not in FREQUENCY_PROJECTION_GRADES or row["data_status"] != SNAPSHOT_STATUS_READY:
+            raise SnapshotContractError("projection source grade/status is invalid")
+        seen.add(row["product_code"])
+        row["row_checksum"] = _projection_row_checksum(manifest_checksum=manifest_checksum, row=row)
+        rows.append(row)
+
+    headers: list[dict[str, Any]] = []
+    for grade in FREQUENCY_PROJECTION_GRADES:
+        grade_rows = [row for row in rows if row["frequency_grade"] == grade]
+        headers.append(
+            {
+                "frequency_grade": grade,
+                "expected_product_count": len(grade_rows),
+                "projection_checksum": _projection_digest(grade_rows),
+            }
+        )
+    return rows, headers
+
+
+def validate_frequency_projection(
+    *,
+    manifest_checksum: str,
+    rows: Iterable[Mapping[str, Any]],
+    headers: Iterable[Mapping[str, Any]],
+    required_grade: str = "",
+    require_complete: bool = False,
+) -> tuple[dict[str, Any], ...]:
+    """Validate a derived projection without making it an approval authority."""
+    checksum = str(manifest_checksum or "")
+    if len(checksum) != 64:
+        raise SnapshotContractError("projection manifest checksum is invalid")
+    normalized_headers: dict[str, dict[str, Any]] = {}
+    for source in headers:
+        if not isinstance(source, Mapping):
+            raise SnapshotContractError("projection header is invalid")
+        grade = str(source.get("frequency_grade") or "")
+        count = _required_nonnegative_int(source.get("expected_product_count"), field="expected_product_count")
+        digest = str(source.get("projection_checksum") or "")
+        if grade not in FREQUENCY_PROJECTION_GRADES or len(digest) != 64 or grade in normalized_headers:
+            raise SnapshotContractError("projection header is invalid")
+        normalized_headers[grade] = {
+            "frequency_grade": grade,
+            "expected_product_count": count,
+            "projection_checksum": digest,
+        }
+    if set(normalized_headers) != set(FREQUENCY_PROJECTION_GRADES):
+        raise SnapshotContractError("projection headers are incomplete")
+
+    normalized_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in rows:
+        if not isinstance(source, Mapping):
+            raise SnapshotContractError("projection row is invalid")
+        row = _canonical_projection_row(source)
+        if row["frequency_grade"] not in FREQUENCY_PROJECTION_GRADES or row["data_status"] != SNAPSHOT_STATUS_READY:
+            raise SnapshotContractError("projection row grade/status is invalid")
+        if row["product_code"] in seen:
+            raise SnapshotContractError("projection contains duplicate product_code")
+        if str(source.get("row_checksum") or "") != _projection_row_checksum(manifest_checksum=checksum, row=row):
+            raise SnapshotContractError("projection row checksum does not match")
+        seen.add(row["product_code"])
+        row["row_checksum"] = str(source.get("row_checksum"))
+        normalized_rows.append(row)
+
+    if required_grade:
+        if required_grade not in FREQUENCY_PROJECTION_GRADES:
+            raise SnapshotContractError("projection grade is invalid")
+        grade_rows = [row for row in normalized_rows if row["frequency_grade"] == required_grade]
+        header = normalized_headers[required_grade]
+        if len(grade_rows) != header["expected_product_count"] or _projection_digest(grade_rows) != header["projection_checksum"]:
+            raise SnapshotContractError("projection grade checksum does not match")
+    elif require_complete:
+        if sum(header["expected_product_count"] for header in normalized_headers.values()) != len(normalized_rows):
+            raise SnapshotContractError("projection product count does not match")
+        for grade, header in normalized_headers.items():
+            grade_rows = [row for row in normalized_rows if row["frequency_grade"] == grade]
+            if len(grade_rows) != header["expected_product_count"] or _projection_digest(grade_rows) != header["projection_checksum"]:
+                raise SnapshotContractError("projection checksum does not match")
+    return tuple(normalized_rows)
 
 
 def _source_fingerprint(

@@ -107,18 +107,22 @@ def main() -> int:
             force=bool(args.force),
             progress_reporter=lambda message: print(f"[진행] {message}"),
         )
-        payload = result["payload"]
+        relational_snapshot = result["relational_snapshot"]
         draft = result["draft"]
-        summary = dict(payload.get("summary") or {})
+        grade_counts: dict[str, int] = {}
+        for row in relational_snapshot.frequency_products:
+            grade = str(row["frequency_grade"])
+            grade_counts[grade] = grade_counts.get(grade, 0) + 1
         output.update(
             {
                 "ok": True,
-                "product_count": summary.get("product_count"),
-                "normal_event_count": summary.get("normal_event_count"),
-                "ignored_product_event_count": summary.get("ignored_product_event_count"),
-                "grade_counts": summary.get("grade_counts"),
-                "excluded_counts": payload.get("source_diagnostics"),
-                "checksum": payload.get("checksum"),
+                "representation": "relational_frequency_v1",
+                "product_count": relational_snapshot.item_count,
+                "normal_event_count": sum(int(row["occurrence_count"]) for row in relational_snapshot.monthly_activity),
+                "ignored_product_event_count": relational_snapshot.source_diagnostics.get("ignored_product_event_count"),
+                "grade_counts": grade_counts,
+                "excluded_counts": relational_snapshot.source_diagnostics,
+                "checksum": relational_snapshot.checksum,
                 "generation_no": draft.generation_no,
                 "manifest_id": draft.manifest_id,
                 "draft_status": draft.status,

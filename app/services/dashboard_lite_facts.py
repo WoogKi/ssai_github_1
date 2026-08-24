@@ -26,6 +26,7 @@ from app.db.mssql_client import (
     get_active_dashboard_query_measurement,
 )
 from app.services.product_supplier_scope_service import apply_product_supplier_scope, supplier_scope_filter_active
+from app.services.dashboard_inventory_frequency_snapshot import FrequencyProjectionReadResult
 from app.services.ssai_snapshot_repository import SnapshotReadResult
 
 
@@ -1349,6 +1350,7 @@ def _attach_inventory_status_and_frequency(
     rows: list[dict[str, Any]],
     *,
     frequency_snapshot: SnapshotReadResult,
+    frequency_rows: tuple[Mapping[str, Any], ...] | None = None,
 ) -> dict[str, Any]:
     """Attach display-only inventory state and approved outbound frequency facts.
 
@@ -1358,7 +1360,13 @@ def _attach_inventory_status_and_frequency(
     """
     snapshot_status = str(frequency_snapshot.status or "missing")
     frequency_by_product: dict[str, Mapping[str, Any]] = {}
-    if frequency_snapshot.usable and isinstance(frequency_snapshot.payload, Mapping):
+    if frequency_rows is not None:
+        frequency_by_product = {
+            str(item.get("product_code") or "").strip(): item
+            for item in frequency_rows
+            if isinstance(item, Mapping) and str(item.get("product_code") or "").strip()
+        }
+    elif frequency_snapshot.usable and isinstance(frequency_snapshot.payload, Mapping):
         frequency_by_product = {
             str(item.get("product_code") or "").strip(): item
             for item in (frequency_snapshot.payload.get("product_frequency") or [])
@@ -2524,6 +2532,7 @@ def _build_inventory_facts(
     overstock_inactive_days: int = 90,
     stock_mode: str = "real",
     frequency_snapshot: SnapshotReadResult | None = None,
+    frequency_rows: tuple[Mapping[str, Any], ...] | None = None,
     measurement: DashboardQueryMeasurement | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -2802,6 +2811,7 @@ def _build_inventory_facts(
     inventory_status = _attach_inventory_status_and_frequency(
         rows,
         frequency_snapshot=frequency_snapshot or SnapshotReadResult(status="missing", reason="frequency snapshot was not requested"),
+        frequency_rows=frequency_rows,
     )
     _record_inventory_phase(
         "inventory_status_frequency_attach",
@@ -3164,6 +3174,7 @@ def build_dashboard_lite_facts(
     inbound_facts_df: pd.DataFrame | None = None,
     sales_transaction_cycle_df: pd.DataFrame | None = None,
     frequency_snapshot_reader: Callable[[Any, Any, list[str]], SnapshotReadResult] | None = None,
+    frequency_projection_reader: Callable[..., FrequencyProjectionReadResult] | None = None,
     today: date | None = None,
 ) -> dict[str, Any]:
     """Build Dashboard Lite v0.1 facts from existing analytics payloads."""
@@ -3491,7 +3502,39 @@ def build_dashboard_lite_facts(
     )
     t_stock = time.perf_counter()
     stock_codes = list(service_params.get("stock_cd_list") or [])
-    if frequency_snapshot_reader is None:
+    stock_frequency_source = _payload_df(stock_shortage_payload)
+    projection_product_codes = (
+        stock_frequency_source["제품코드"].fillna("").astype(str).str.strip().loc[
+            stock_frequency_source["제품코드"].fillna("").astype(str).str.strip().ne("")
+        ].drop_duplicates().tolist()
+        if "제품코드" in stock_frequency_source.columns
+        else []
+    )
+    active_projection_reader = frequency_projection_reader
+    if active_projection_reader is None and frequency_snapshot_reader is None:
+        from app.services.dashboard_inventory_frequency_snapshot_service import read_approved_frequency_projection
+
+        active_projection_reader = read_approved_frequency_projection
+    projection = (
+        active_projection_reader(
+            company_id=service_params.get("company_id"),
+            evaluation_month=service_params.get("evaluation_month"),
+            stock_codes=stock_codes,
+            product_codes=projection_product_codes,
+        )
+        if active_projection_reader is not None
+        else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
+    )
+    frequency_rows: tuple[Mapping[str, Any], ...] | None = None
+    if projection.usable:
+        frequency_rows = projection.rows
+        frequency_snapshot = SnapshotReadResult(
+            status="ready",
+            manifest_id=projection.manifest_id,
+            generation_no=projection.generation_no,
+            checksum=projection.checksum,
+        )
+    elif projection.status == "legacy" and frequency_snapshot_reader is None:
         from app.services.dashboard_inventory_frequency_snapshot_service import read_approved_frequency_snapshot
 
         frequency_snapshot = read_approved_frequency_snapshot(
@@ -3499,11 +3542,19 @@ def build_dashboard_lite_facts(
             evaluation_month=service_params.get("evaluation_month"),
             stock_codes=stock_codes,
         )
-    else:
+    elif projection.status == "legacy":
         frequency_snapshot = frequency_snapshot_reader(
             service_params.get("company_id"),
             service_params.get("evaluation_month"),
             stock_codes,
+        )
+    else:
+        frequency_snapshot = SnapshotReadResult(
+            status=str(projection.status or "missing"),
+            reason=str(projection.reason or ""),
+            manifest_id=projection.manifest_id,
+            generation_no=projection.generation_no,
+            checksum=projection.checksum,
         )
     inventory = _build_inventory_facts(
         stock_shortage_payload,
@@ -3520,6 +3571,7 @@ def build_dashboard_lite_facts(
         overstock_inactive_days=int(service_params["overstock_inactive_days"]),
         stock_mode=str(service_params.get("stock_mode") or "real"),
         frequency_snapshot=frequency_snapshot,
+        frequency_rows=frequency_rows,
         measurement=physical_measurement,
     )
     def _product_codes(frame: Any, *columns: str) -> set[str]:
