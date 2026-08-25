@@ -2030,6 +2030,19 @@ def _attach_major_purchase_vendors(
         "purchase_unclassified_rows": int(purchase_unclassified_rows), "missing_product_code_rows": int(missing_product_code_rows),
         "missing_month_rows": int(missing_month_rows), "invalid_numeric_rows": int(invalid_numeric_rows), "other_excluded_rows": int(other_excluded_rows),
     }
+    # The narrow monthly representation deliberately returns only the visual
+    # month totals plus this already-validated diagnostic vector.  Inbound
+    # remains the authoritative vendor assignment source above; only the
+    # purchase classification counters are supplied by the compact projection.
+    diagnostic_override = getattr(source, "attrs", {}).get("dashboard_purchase_diagnostics")
+    if isinstance(diagnostic_override, Mapping):
+        for key in (
+            "purchase_source_rows", "purchase_positive_rows", "purchase_nonpositive_rows",
+            "purchase_unclassified_rows", "missing_product_code_rows", "missing_month_rows",
+            "invalid_numeric_rows", "other_excluded_rows",
+        ):
+            if key in diagnostic_override:
+                summary[key] = int(diagnostic_override[key] or 0)
     log.info("[dashboard.vendor_stock_risk] inventory_rows=%s risk_rows=%s assigned_rows=%s unassigned_rows=%s vendor_rows=%s status_risk_rows=%s status_emergency_rows=%s status_warning_rows=%s amount_positive_risk_rows=%s amount_positive_emergency_rows=%s amount_positive_warning_rows=%s amount_zero_risk_rows=%s amount_zero_emergency_rows=%s amount_zero_warning_rows=%s total_adjusted_shortage_amount=%s assigned_adjusted_shortage_amount=%s unassigned_adjusted_shortage_amount=%s recent_purchase_none_rows=%s vendor_unknown_rows=%s top_vendor_count=%s purchase_source_rows=%s purchase_positive_rows=%s purchase_nonpositive_rows=%s purchase_unclassified_rows=%s missing_product_code_rows=%s missing_month_rows=%s invalid_numeric_rows=%s other_excluded_rows=%s major_vendor_aggregate_ms=%s major_vendor_rank_ms=%s vendor_risk_group_ms=%s basis_mode=%s basis_days=%s basis_cutoff_date=%s source_call_count=%s elapsed_ms=%s", summary["inventory_rows"], summary["risk_rows"], summary["assigned_rows"], summary["unassigned_rows"], summary["vendor_count"], summary["status_risk_rows"], summary["status_emergency_rows"], summary["status_warning_rows"], summary["amount_positive_risk_rows"], summary["amount_positive_emergency_rows"], summary["amount_positive_warning_rows"], summary["amount_zero_risk_rows"], summary["amount_zero_emergency_rows"], summary["amount_zero_warning_rows"], summary["total_adjusted_shortage_amount"], summary["assigned_adjusted_shortage_amount"], summary["unassigned_adjusted_shortage_amount"], summary["recent_purchase_none_rows"], summary["vendor_unknown_rows"], summary["top_vendor_count"], summary["purchase_source_rows"], summary["purchase_positive_rows"], summary["purchase_nonpositive_rows"], summary["purchase_unclassified_rows"], summary["missing_product_code_rows"], summary["missing_month_rows"], summary["invalid_numeric_rows"], summary["other_excluded_rows"], aggregate_ms, rank_ms, vendor_risk_group_ms, summary["basis_mode"], summary["basis_days"], summary["basis_cutoff_date"], int(source_call_count), int((time.perf_counter() - started) * 1000))
     return {"summary": summary, "rows": vendor_rows, "top_rows": vendor_rows[:10], "aggregate_ms": aggregate_ms, "rank_ms": rank_ms, "group_ms": vendor_risk_group_ms}
 
@@ -3251,9 +3264,13 @@ def build_dashboard_lite_facts(
     product_filter_elapsed_ms = 0
     range_slice_elapsed_ms = 0
     history_aggregate_elapsed_ms = 0
+    manufacturer_summary_elapsed_ms = 0
     stock_timing = _stock_timing_meta({}, fallback_total_ms=0)
     purchase_vendor_df: pd.DataFrame | None = None
     purchase_bundle_perf: dict[str, Any] = {}
+    narrow_sales_bundle: Any = None
+    sales_representation = "legacy_row_bundle"
+    sales_representation_reason = "legacy_default"
     sales_source_elapsed_ms = 0
     stock_source_elapsed_ms = 0
     inbound_source_elapsed_ms = 0
@@ -3300,7 +3317,11 @@ def build_dashboard_lite_facts(
         inbound_source_elapsed_ms,
     )
     if needs_sales_source or needs_stock_source:
-        from app.services.analytics_sales_trend_service import get_dashboard_sales_source_bundle
+        from app.services.analytics_sales_trend_service import (
+            adapt_dashboard_narrow_bundle_for_forecast,
+            adapt_dashboard_narrow_bundle_for_visual,
+            get_dashboard_sales_source_bundle,
+        )
 
         t_source = time.perf_counter()
         with dashboard_query_measurement(
@@ -3310,11 +3331,34 @@ def build_dashboard_lite_facts(
             source_mode=str(source_params.get("source_mode") or ""),
         ):
             source_bundle = get_dashboard_sales_source_bundle(dict(source_params))
-        expanded_sales_source_df = source_bundle.get("sales_df")
-        purchase_vendor_df = source_bundle.get("purchase_vendor_df")
-        purchase_bundle_perf = dict(source_bundle.get("perf") or {})
+            narrow_sales_bundle = source_bundle.get("narrow_bundle")
+            sales_representation = str(source_bundle.get("representation") or "legacy_row_bundle")
+            sales_representation_reason = str(source_bundle.get("representation_reason") or "legacy_default")
+            if narrow_sales_bundle is not None:
+                expanded_sales_source_df = adapt_dashboard_narrow_bundle_for_forecast(narrow_sales_bundle)
+                purchase_vendor_df = adapt_dashboard_narrow_bundle_for_visual(narrow_sales_bundle)
+                purchase_vendor_df.attrs["dashboard_purchase_diagnostics"] = dict(narrow_sales_bundle.purchase_diagnostics)
+                purchase_bundle_perf = dict(source_bundle.get("perf") or {})
+            else:
+                expanded_sales_source_df = source_bundle.get("sales_df")
+                purchase_vendor_df = source_bundle.get("purchase_vendor_df")
+                purchase_bundle_perf = dict(source_bundle.get("perf") or {})
         source_elapsed_ms = int((time.perf_counter() - t_source) * 1000)
         sales_source_elapsed_ms = source_elapsed_ms
+        if narrow_sales_bundle is not None:
+            projection_results = dict(purchase_bundle_perf.get("projection_results") or {})
+            log.info(
+                "[dashboard.narrow_sales_candidate] representation=%s source_call_count=1 physical_query_count=%s product_month_sales_ms=%s product_identity_ms=%s manufacturer_vendor_relation_ms=%s purchase_facts_ms=%s manufacturer_reconstruction_ms=%s bundle_assembly_ms=%s sales_logical_source_total_ms=%s",
+                sales_representation,
+                int(purchase_bundle_perf.get("physical_query_count") or 0),
+                int((projection_results.get("product_month_sales") or {}).get("elapsed_ms") or 0),
+                int((projection_results.get("product_identity") or {}).get("elapsed_ms") or 0),
+                int((projection_results.get("manufacturer_vendor_relation") or {}).get("elapsed_ms") or 0),
+                int((projection_results.get("purchase_facts") or {}).get("elapsed_ms") or 0),
+                int(purchase_bundle_perf.get("manufacturer_reconstruction_ms") or 0),
+                int(purchase_bundle_perf.get("bundle_assembly_ms") or 0),
+                int(purchase_bundle_perf.get("elapsed_ms") or source_elapsed_ms),
+            )
         t_filter = time.perf_counter()
         expanded_sales_source_df = _filter_sales_source_for_dashboard(expanded_sales_source_df, service_params)
         if isinstance(purchase_vendor_df, pd.DataFrame) and isinstance(expanded_sales_source_df, pd.DataFrame) and "제품코드" in purchase_vendor_df.columns and "제품코드" in expanded_sales_source_df.columns:
@@ -3338,7 +3382,9 @@ def build_dashboard_lite_facts(
             existing_support_sales_df = expanded_sales_source_df
             visible_sales_df = expanded_sales_source_df
         range_slice_elapsed_ms = int((time.perf_counter() - t_ranges) * 1000)
-        source_monthly_actuals = _monthly_sales_actuals_from_source(existing_support_sales_df)
+        source_monthly_actuals = _monthly_sales_actuals_from_source(
+            narrow_sales_bundle.sales_month_total_df if narrow_sales_bundle is not None else existing_support_sales_df
+        )
         t_history = time.perf_counter()
         demand_surge_history = _build_demand_surge_history_by_product(
             expanded_sales_source_df,
@@ -3350,7 +3396,7 @@ def build_dashboard_lite_facts(
         if isinstance(expanded_sales_source_df, pd.DataFrame):
             filter_diagnostics.extend(list(expanded_sales_source_df.attrs.get("dashboard_filter_diagnostics") or []))
         log.info(
-            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s supplier_scope_mode=%s supplier_scope_product_count=%s expanded_history_month_from=%s expanded_history_month_to=%s expanded_history_rows=%s existing_support_rows=%s visible_rows=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s range_slice_ms=%s history_aggregate_ms=%s purchase_source_rows=%s purchase_source_sql_included=%s purchase_min_frame_ms=%s elapsed_ms=%s",
+            "[dashboard.source_load] source=shared_sales_source company_id=%s month_from=%s month_to=%s evaluation_month=%s rows=%s source_call_count=%s cache_used=%s representation=%s representation_reason=%s supplier_scope_mode=%s supplier_scope_product_count=%s expanded_history_month_from=%s expanded_history_month_to=%s expanded_history_rows=%s existing_support_rows=%s visible_rows=%s sales_source_sql_ms=%s product_master_merge_ms=%s product_filter_ms=%s range_slice_ms=%s history_aggregate_ms=%s purchase_source_rows=%s purchase_source_sql_included=%s purchase_min_frame_ms=%s elapsed_ms=%s",
             service_params.get("company_id") or "",
             service_params.get("month_from"),
             service_params.get("month_to"),
@@ -3358,6 +3404,8 @@ def build_dashboard_lite_facts(
             0 if expanded_sales_source_df is None else len(expanded_sales_source_df),
             1,
             False,
+            sales_representation,
+            sales_representation_reason,
             supplier_scope["product_supplier_scope_mode"],
             int(expanded_sales_source_df["제품코드"].nunique()) if isinstance(expanded_sales_source_df, pd.DataFrame) and "제품코드" in expanded_sales_source_df.columns else 0,
             source_params.get("dashboard_lite_history_month_from") or "",
@@ -3386,11 +3434,14 @@ def build_dashboard_lite_facts(
 
     if manufacturer_summary_payload is None:
         from app.services.analytics_manufacturer_sales_trend_service import get_manufacturer_sales_trend_summary_result
+        from app.services.analytics_sales_trend_service import adapt_dashboard_narrow_bundle_for_manufacturer
 
+        t_manufacturer = time.perf_counter()
         manufacturer_summary_payload = get_manufacturer_sales_trend_summary_result(
             dict(existing_support_params),
-            raw_df=existing_support_sales_df,
+            raw_df=(adapt_dashboard_narrow_bundle_for_manufacturer(narrow_sales_bundle) if narrow_sales_bundle is not None else existing_support_sales_df),
         )
+        manufacturer_summary_elapsed_ms = int((time.perf_counter() - t_manufacturer) * 1000)
     else:
         manufacturer_summary_payload = _filter_payload_df_for_dashboard(manufacturer_summary_payload, service_params)
         payload_df = _payload_df(manufacturer_summary_payload)
@@ -3411,6 +3462,14 @@ def build_dashboard_lite_facts(
             raw_df=visible_sales_df,
         )
         forecast_elapsed_ms = int((time.perf_counter() - t_forecast) * 1000)
+        if narrow_sales_bundle is not None:
+            log.info(
+                "[dashboard.narrow_sales_candidate_consumers] representation=%s forecast_ms=%s demand_surge_history_ms=%s manufacturer_summary_ms=%s",
+                sales_representation,
+                forecast_elapsed_ms,
+                history_aggregate_elapsed_ms,
+                manufacturer_summary_elapsed_ms,
+            )
         t_source = time.perf_counter()
         with dashboard_query_measurement(
             physical_measurement,

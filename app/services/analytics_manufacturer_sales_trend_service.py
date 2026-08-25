@@ -266,6 +266,7 @@ def _clean_public_columns(df: pd.DataFrame, columns: list[str], dynamic_cols: Op
 
 def _prepare_manufacturer_monthly(raw: pd.DataFrame, params: Dict[str, Any]) -> tuple[pd.DataFrame, list[str], Dict[str, Any]]:
     work = raw.copy()
+    narrow_monthly = bool(work.get("__dashboard_narrow_manufacturer_month", pd.Series(False, index=work.index)).fillna(False).astype(bool).all())
     work["기준월"] = work["기준월"].map(_parse_yyyymm)
     work["제약사명"] = work["제조사명"].map(_normalize_manufacturer_name)
     for c in ["매출공급가액", "매출세액", "매출합계", "집계건수"]:
@@ -278,19 +279,36 @@ def _prepare_manufacturer_monthly(raw: pd.DataFrame, params: Dict[str, Any]) -> 
     groups = sorted({_normalize_manufacturer_name(v) for v in work["제약사명"].dropna().tolist()})
     idx = pd.MultiIndex.from_product([groups, months], names=["제약사명", "기준월"])
 
-    agg = (
-        work.groupby(["제약사명", "기준월"], dropna=False)
-        .agg(
-            매출공급가액=("매출공급가액", "sum"),
-            매출세액=("매출세액", "sum"),
-            매출합계=("매출합계", "sum"),
-            집계건수=("집계건수", "sum"),
-            제품수=("제품코드", "nunique") if "제품코드" in work.columns else ("제약사명", "size"),
-            매입처수=("매입처코드", "nunique") if "매입처코드" in work.columns else ("제약사명", "size"),
+    if narrow_monthly:
+        for column in ("제품수", "매입처수"):
+            work[column] = pd.to_numeric(work.get(column, 0), errors="coerce").fillna(0)
+        agg = (
+            work.groupby(["제약사명", "기준월"], dropna=False)
+            .agg(
+                매출공급가액=("매출공급가액", "sum"),
+                매출세액=("매출세액", "sum"),
+                매출합계=("매출합계", "sum"),
+                집계건수=("집계건수", "sum"),
+                제품수=("제품수", "max"),
+                매입처수=("매입처수", "max"),
+            )
+            .reindex(idx, fill_value=0)
+            .reset_index()
         )
-        .reindex(idx, fill_value=0)
-        .reset_index()
-    )
+    else:
+        agg = (
+            work.groupby(["제약사명", "기준월"], dropna=False)
+            .agg(
+                매출공급가액=("매출공급가액", "sum"),
+                매출세액=("매출세액", "sum"),
+                매출합계=("매출합계", "sum"),
+                집계건수=("집계건수", "sum"),
+                제품수=("제품코드", "nunique") if "제품코드" in work.columns else ("제약사명", "size"),
+                매입처수=("매입처코드", "nunique") if "매입처코드" in work.columns else ("제약사명", "size"),
+            )
+            .reindex(idx, fill_value=0)
+            .reset_index()
+        )
     source_label = _effective_source_label(_resolve_source_mode(params), raw)
     agg["분석자료원"] = source_label
     labels = _period_label_map(months, params)

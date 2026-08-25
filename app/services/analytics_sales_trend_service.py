@@ -14,6 +14,7 @@ import logging
 import os
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -1192,32 +1193,30 @@ WHERE V.Rd03_Ven_Cd IN ({",".join(placeholders)})
     return out.drop_duplicates(subset=["거래처코드"], keep="first")
 
 
-def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> tuple[str, Dict[str, Any]]:
+def _build_dashboard_monthly_common_predicates(
+    params: Dict[str, Any],
+    spec: Dict[str, str],
+    *,
+    supplier_bind_prefix: str,
+    stock_bind_prefix: str,
+    table_alias: str = "M",
+) -> tuple[list[str], Dict[str, Any]]:
+    """Build only the Dashboard monthly predicates shared by sales and purchase."""
     clauses: list[str] = []
     bind_params = apply_product_supplier_scope(params)
     p = spec["prefix"]
+    a = table_alias
 
     if clean_text(bind_params.get("month_from")):
-        _add_filter(clauses, f"M.{p}_Stock_YyMm >= %(month_from)s")
+        _add_filter(clauses, f"{a}.{p}_Stock_YyMm >= %(month_from)s")
     if clean_text(bind_params.get("month_to")):
-        _add_filter(clauses, f"M.{p}_Stock_YyMm <= %(month_to)s")
-
-    sales_io_mode, _ = _add_sales_io_scope_filter(
-        clauses,
-        bind_params,
-        gcode_sql=f"M.{p}_Io_Gu_Gcode",
-        tcode_sql=f"M.{p}_Io_Gu",
-    )
-    # Monthly stock tables contain inbound and outbound movements together.
-    # Exact selection narrows the requested Tcodes; this guard preserves the
-    # sales-source direction and prevents selected inbound Tcodes entering sales.
-    _add_filter(clauses, f"LEFT(M.{p}_Io_Gu, 1) IN ({spec['out_prefixes']})")
+        _add_filter(clauses, f"{a}.{p}_Stock_YyMm <= %(month_to)s")
 
     if clean_text(bind_params.get("physic_cd")):
-        _add_filter(clauses, f"M.{p}_Physic_Cd = %(physic_cd)s")
+        _add_filter(clauses, f"{a}.{p}_Physic_Cd = %(physic_cd)s")
 
     supplier_scope_sql = build_product_supplier_scope_sql(
-        bind_params, bind_params, product_code_sql=f"M.{p}_Physic_Cd", bind_prefix="fast_supplier"
+        bind_params, bind_params, product_code_sql=f"{a}.{p}_Physic_Cd", bind_prefix=supplier_bind_prefix
     )
     if supplier_scope_sql:
         _add_filter(clauses, supplier_scope_sql)
@@ -1226,16 +1225,95 @@ def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> t
     if stock_codes:
         names: list[str] = []
         for i, cd in enumerate(stock_codes):
-            key = f"fast_stock_cd_{i}"
+            key = f"{stock_bind_prefix}_{i}"
             bind_params[key] = clean_text(cd)
             names.append(f"%({key})s")
-        _add_filter(clauses, f"M.{p}_Stock_Cd IN ({','.join(names)})")
+        _add_filter(clauses, f"{a}.{p}_Stock_Cd IN ({','.join(names)})")
     elif clean_text(bind_params.get("stock_cd")):
         bind_params["stock_cd"] = clean_text(bind_params.get("stock_cd"))
-        _add_filter(clauses, f"M.{p}_Stock_Cd = %(stock_cd)s")
+        _add_filter(clauses, f"{a}.{p}_Stock_Cd = %(stock_cd)s")
 
     if clean_text(bind_params.get("buy_cd")):
-        _add_filter(clauses, f"M.{p}_Ven_Cd = %(buy_cd)s")
+        _add_filter(clauses, f"{a}.{p}_Ven_Cd = %(buy_cd)s")
+
+    return clauses, bind_params
+
+
+def build_dashboard_product_dimension_scope_predicates(
+    params: Dict[str, Any],
+    bind_params: Dict[str, Any],
+    *,
+    product_alias: str,
+) -> list[str]:
+    """Build exact Dashboard product-dimension code-pair predicates once.
+
+    The caller owns the product-master relation.  Keeping this separate from
+    movement predicates lets compact projections share the same Gcode:Tcode
+    contract as the established enriched Dashboard frame.
+    """
+    clauses: list[str] = []
+    _add_dashboard_code_pair_filter(
+        clauses,
+        bind_params,
+        gcode_sql=f"{product_alias}.Rd04_Physic_Group_Gcode",
+        tcode_sql=f"{product_alias}.Rd04_Physic_Group",
+        key="dashboard_product_group_list",
+    )
+    _add_dashboard_code_pair_filter(
+        clauses,
+        bind_params,
+        gcode_sql=f"{product_alias}.Rd04_Physic_Di_Gcode",
+        tcode_sql=f"{product_alias}.Rd04_Physic_Di",
+        key="dashboard_product_di_list",
+    )
+    _add_dashboard_code_pair_filter(
+        clauses,
+        bind_params,
+        gcode_sql=f"{product_alias}.Rd04_Physic_Tax_Gcode",
+        tcode_sql=f"{product_alias}.Rd04_Physic_Tax",
+        key="dashboard_product_class_list",
+    )
+    return clauses
+
+
+def _build_dashboard_sales_branch_predicates(
+    params: Dict[str, Any],
+    spec: Dict[str, str],
+    bind_params: Dict[str, Any],
+    *,
+    table_alias: str,
+) -> list[str]:
+    """Build the sales-only movement predicates after the shared scope."""
+    p = spec["prefix"]
+    clauses: list[str] = []
+    _add_sales_io_scope_filter(
+        clauses,
+        bind_params,
+        gcode_sql=f"{table_alias}.{p}_Io_Gu_Gcode",
+        tcode_sql=f"{table_alias}.{p}_Io_Gu",
+    )
+    # Monthly stock tables contain inbound and outbound movements together.
+    # Exact selection narrows the requested Tcodes; this guard preserves the
+    # sales-source direction and prevents selected inbound Tcodes entering sales.
+    _add_filter(clauses, f"LEFT({table_alias}.{p}_Io_Gu, 1) IN ({spec['out_prefixes']})")
+    return clauses
+
+
+def _build_monthly_fast_where(params: Dict[str, Any], spec: Dict[str, str]) -> tuple[str, Dict[str, Any]]:
+    clauses, bind_params = _build_dashboard_monthly_common_predicates(
+        params,
+        spec,
+        supplier_bind_prefix="fast_supplier",
+        stock_bind_prefix="fast_stock_cd",
+    )
+    clauses.extend(
+        _build_dashboard_sales_branch_predicates(
+            params,
+            spec,
+            bind_params,
+            table_alias="M",
+        )
+    )
 
     return ("\n  AND " + "\n  AND ".join(clauses)) if clauses else "", bind_params
 
@@ -1421,38 +1499,484 @@ OPTION (RECOMPILE)
 
 def _build_dashboard_purchase_vendor_where(params: Dict[str, Any], spec: Dict[str, str]) -> tuple[str, Dict[str, Any]]:
     """Build the purchase branch filters without changing the sales fast-path filters."""
-    clauses: list[str] = []
-    bind_params = apply_product_supplier_scope(params)
-    p = spec["prefix"]
-
-    if clean_text(bind_params.get("month_from")):
-        _add_filter(clauses, f"M.{p}_Stock_YyMm >= %(month_from)s")
-    if clean_text(bind_params.get("month_to")):
-        _add_filter(clauses, f"M.{p}_Stock_YyMm <= %(month_to)s")
-    if clean_text(bind_params.get("physic_cd")):
-        _add_filter(clauses, f"M.{p}_Physic_Cd = %(physic_cd)s")
-
-    supplier_scope_sql = build_product_supplier_scope_sql(
-        bind_params, bind_params, product_code_sql=f"M.{p}_Physic_Cd", bind_prefix="purchase_supplier"
+    clauses, bind_params = _build_dashboard_monthly_common_predicates(
+        params,
+        spec,
+        supplier_bind_prefix="purchase_supplier",
+        stock_bind_prefix="dashboard_purchase_stock_cd",
     )
-    if supplier_scope_sql:
-        _add_filter(clauses, supplier_scope_sql)
-
-    stock_codes = _clean_list_param(bind_params.get("stock_cd_list"))
-    if stock_codes:
-        names = []
-        for i, code in enumerate(stock_codes):
-            key = f"dashboard_purchase_stock_cd_{i}"
-            bind_params[key] = clean_text(code)
-            names.append(f"%({key})s")
-        _add_filter(clauses, f"M.{p}_Stock_Cd IN ({','.join(names)})")
-    elif clean_text(bind_params.get("stock_cd")):
-        bind_params["stock_cd"] = clean_text(bind_params.get("stock_cd"))
-        _add_filter(clauses, f"M.{p}_Stock_Cd = %(stock_cd)s")
-
-    if clean_text(bind_params.get("buy_cd")):
-        _add_filter(clauses, f"M.{p}_Ven_Cd = %(buy_cd)s")
     return ("\n  AND " + "\n  AND ".join(clauses)) if clauses else "", bind_params
+
+
+@dataclass(frozen=True)
+class DashboardSalesPurchaseGrains:
+    """Dashboard consumers' explicit grains derived from the legacy source frames.
+
+    This is intentionally an in-memory contract.  The production SQL and the
+    legacy ``sales_df`` remain untouched until the equality gate proves that a
+    smaller transport shape preserves every downstream fact.
+    """
+
+    sales_product_month_df: pd.DataFrame
+    manufacturer_vendor_df: pd.DataFrame
+    purchase_product_vendor_df: pd.DataFrame
+    purchase_product_month_df: pd.DataFrame
+    purchase_diagnostics: Dict[str, int]
+
+
+@dataclass(frozen=True)
+class DashboardNarrowSalesPurchaseBundle:
+    """Narrow, consumer-shaped Dashboard sales/purchase projections.
+
+    This is deliberately an in-memory preparation contract.  It records the
+    minimum typed frames a later DB-side implementation must return, without
+    changing the current raw Dashboard source or its routing.
+    """
+
+    product_identity_df: pd.DataFrame
+    product_month_sales_df: pd.DataFrame
+    manufacturer_month_df: pd.DataFrame
+    sales_month_total_df: pd.DataFrame
+    purchase_month_total_df: pd.DataFrame
+    purchase_diagnostics: Dict[str, int]
+    sales_attrs: Dict[str, Any]
+    sales_columns: tuple[str, ...]
+
+
+def _dashboard_text_column(frame: pd.DataFrame, column: str) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series("", index=frame.index, dtype="object")
+    return frame[column].fillna("").astype(str).str.strip()
+
+
+def _dashboard_add_months(yyyymm: str, delta: int) -> str:
+    value = str(yyyymm or "").strip()
+    if len(value) != 6 or not value.isdigit():
+        return ""
+    year, month = int(value[:4]), int(value[4:])
+    total = year * 12 + (month - 1) + int(delta)
+    return f"{total // 12:04d}{(total % 12) + 1:02d}"
+
+
+def build_dashboard_sales_purchase_grains(
+    sales_df: pd.DataFrame | None,
+    purchase_vendor_df: pd.DataFrame | None,
+    *,
+    evaluation_month: str,
+    history_month_from: str,
+) -> DashboardSalesPurchaseGrains:
+    """Build typed Dashboard facts without changing the legacy source contract.
+
+    Each projection deliberately follows the current consumers' grain.  This
+    function is a preparation boundary for a later DB aggregation change; it
+    does not issue SQL or alter ``source_call_count``.
+    """
+
+    sales_source = sales_df.copy() if isinstance(sales_df, pd.DataFrame) else pd.DataFrame()
+    sales_text_columns = (
+        "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명",
+        "제품그룹Gcode", "제품그룹코드", "제품그룹명", "제품구분Gcode", "제품구분코드", "제품구분명",
+        "제품분류Gcode", "제품분류코드", "제품분류명", "매입처코드", "매입처명",
+        "재고적용처코드", "재고적용처명", "분석자료원",
+    )
+    sales_numeric_columns = ("출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수")
+    for column in sales_text_columns:
+        sales_source[column] = _dashboard_text_column(sales_source, column)
+    for column in sales_numeric_columns:
+        numeric_source = sales_source[column] if column in sales_source.columns else pd.Series(0.0, index=sales_source.index)
+        sales_source[column] = pd.to_numeric(numeric_source, errors="coerce").fillna(0.0)
+
+    sales_group_columns = [
+        "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명",
+        "제품그룹Gcode", "제품그룹코드", "제품그룹명", "제품구분Gcode", "제품구분코드", "제품구분명",
+        "제품분류Gcode", "제품분류코드", "제품분류명", "분석자료원",
+    ]
+    if sales_source.empty:
+        sales_product_month_df = pd.DataFrame(columns=[*sales_group_columns, *sales_numeric_columns, "매입처수"])
+        manufacturer_vendor_df = pd.DataFrame(columns=["제품코드", "제조사코드", "제조사명", "매입처코드"])
+    else:
+        sales_product_month_df = (
+            sales_source.groupby(sales_group_columns, dropna=False, as_index=False)[list(sales_numeric_columns)]
+            .sum()
+        )
+        vendor_counts = (
+            sales_source.groupby(["기준월", "제품코드"], dropna=False)["매입처코드"]
+            .nunique()
+            .rename("매입처수")
+            .reset_index()
+        )
+        sales_product_month_df = sales_product_month_df.merge(
+            vendor_counts,
+            on=["기준월", "제품코드"],
+            how="left",
+            validate="one_to_one",
+        )
+        manufacturer_vendor_df = (
+            sales_source.loc[:, ["제품코드", "제조사코드", "제조사명", "매입처코드"]]
+            .drop_duplicates()
+            .sort_values(["제조사코드", "제조사명", "매입처코드", "제품코드"], kind="stable")
+            .reset_index(drop=True)
+        )
+
+    purchase_columns = ["기준월", "제품코드", "매입처코드", "매입처명", "입고수량", "매입금액", "매입발생건수"]
+    purchase_source = purchase_vendor_df.copy() if isinstance(purchase_vendor_df, pd.DataFrame) else pd.DataFrame()
+    for column in purchase_columns:
+        if column not in purchase_source.columns:
+            purchase_source[column] = "" if column in purchase_columns[:4] else 0.0
+    for column in purchase_columns[:4]:
+        purchase_source[column] = _dashboard_text_column(purchase_source, column)
+    numeric_invalid = pd.Series(False, index=purchase_source.index)
+    for column in purchase_columns[4:]:
+        raw = purchase_source[column]
+        numeric = pd.to_numeric(raw, errors="coerce")
+        numeric_invalid |= raw.notna() & raw.astype(str).str.strip().ne("") & numeric.isna()
+        purchase_source[column] = numeric.fillna(0.0)
+
+    product_missing = purchase_source["제품코드"].eq("")
+    month_missing = purchase_source["기준월"].eq("")
+    month_valid = purchase_source["기준월"].str.fullmatch(r"\d{6}", na=False)
+    period_valid = (
+        month_valid
+        & purchase_source["기준월"].between(str(history_month_from or "000000"), str(evaluation_month or "999999"))
+        & purchase_source["기준월"].lt(str(evaluation_month or ""))
+    )
+    classification = pd.Series("classified", index=purchase_source.index, dtype="object")
+    classification.loc[product_missing] = "missing_product_code"
+    classification.loc[classification.eq("classified") & month_missing] = "missing_month"
+    classification.loc[classification.eq("classified") & numeric_invalid] = "invalid_numeric"
+    classification.loc[classification.eq("classified") & ~period_valid] = "other_excluded"
+    classified = purchase_source.loc[classification.eq("classified")].copy()
+    if not classified.empty:
+        classified["_positive_purchase"] = (classified["매입금액"] > 1e-9) | (classified["입고수량"] > 1e-9)
+        recent_from = _dashboard_add_months(str(evaluation_month), -6)
+        recent_to = _dashboard_add_months(str(evaluation_month), -1)
+        recent_mask = classified["기준월"].between(recent_from, recent_to)
+        classified["_recent_purchase_amount"] = classified["매입금액"].where(recent_mask, 0.0)
+        classified["_recent_inbound_qty"] = classified["입고수량"].where(recent_mask, 0.0)
+        classified["_recent_purchase_event_count"] = classified["매입발생건수"].where(recent_mask, 0.0)
+        purchase_product_vendor_df = (
+            classified.groupby(["제품코드", "매입처코드", "매입처명"], dropna=False, as_index=False)
+            .agg(
+                최근6완료월순매입금액=("_recent_purchase_amount", "sum"),
+                최근6완료월순입고수량=("_recent_inbound_qty", "sum"),
+                최근6완료월매입발생건수=("_recent_purchase_event_count", "sum"),
+                지원기간순매입금액=("매입금액", "sum"),
+                지원기간순입고수량=("입고수량", "sum"),
+                지원기간매입발생건수=("매입발생건수", "sum"),
+            )
+        )
+        positive = classified.loc[classified["_positive_purchase"]]
+        if not positive.empty:
+            keys = ["제품코드", "매입처코드", "매입처명"]
+            latest = positive.groupby(keys, dropna=False)["기준월"].max().rename("지원기간최근매입월").reset_index()
+            recent_latest = positive.loc[positive["기준월"].between(recent_from, recent_to)].groupby(keys, dropna=False)["기준월"].max().rename("최근6완료월최근매입월").reset_index()
+            purchase_product_vendor_df = purchase_product_vendor_df.merge(latest, on=keys, how="left", validate="one_to_one")
+            purchase_product_vendor_df = purchase_product_vendor_df.merge(recent_latest, on=keys, how="left", validate="one_to_one")
+        else:
+            purchase_product_vendor_df["지원기간최근매입월"] = ""
+            purchase_product_vendor_df["최근6완료월최근매입월"] = ""
+    else:
+        purchase_product_vendor_df = pd.DataFrame(columns=["제품코드", "매입처코드", "매입처명"])
+
+    trend_source = purchase_source.loc[purchase_source["기준월"].str.fullmatch(r"\d{6}", na=False)].copy()
+    if trend_source.empty:
+        purchase_product_month_df = pd.DataFrame(columns=["기준월", "제품코드", "매입금액", "입고수량", "매입발생건수"])
+    else:
+        purchase_product_month_df = (
+            trend_source.groupby(["기준월", "제품코드"], dropna=False, as_index=False)[["매입금액", "입고수량", "매입발생건수"]]
+            .sum()
+        )
+    diagnostics = {
+        "purchase_source_rows": int(len(purchase_source)),
+        "purchase_positive_rows": int(classified.get("_positive_purchase", pd.Series(dtype="bool")).sum()),
+        "purchase_nonpositive_rows": int(len(classified) - classified.get("_positive_purchase", pd.Series(dtype="bool")).sum()),
+        "purchase_unclassified_rows": int(classification.ne("classified").sum()),
+        "missing_product_code_rows": int(classification.eq("missing_product_code").sum()),
+        "missing_month_rows": int(classification.eq("missing_month").sum()),
+        "invalid_numeric_rows": int(classification.eq("invalid_numeric").sum()),
+        "other_excluded_rows": int(classification.eq("other_excluded").sum()),
+    }
+    return DashboardSalesPurchaseGrains(
+        sales_product_month_df=sales_product_month_df,
+        manufacturer_vendor_df=manufacturer_vendor_df,
+        purchase_product_vendor_df=purchase_product_vendor_df,
+        purchase_product_month_df=purchase_product_month_df,
+        purchase_diagnostics=diagnostics,
+    )
+
+
+def _dashboard_normalized_manufacturer(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text else "제약사 미지정"
+
+
+def build_dashboard_narrow_sales_purchase_bundle(
+    sales_df: pd.DataFrame | None,
+    purchase_vendor_df: pd.DataFrame | None,
+    *,
+    evaluation_month: str,
+    history_month_from: str,
+) -> DashboardNarrowSalesPurchaseBundle:
+    """Derive production-shaped narrow frames from the legacy source frames.
+
+    The function issues no SQL.  Its purpose is to make the future transport
+    contract explicit and equality-testable before production routing changes.
+    """
+
+    legacy = build_dashboard_sales_purchase_grains(
+        sales_df,
+        purchase_vendor_df,
+        evaluation_month=evaluation_month,
+        history_month_from=history_month_from,
+    )
+    identity_columns = [
+        "제품코드", "제품명", "규격", "제조사코드", "제조사명",
+        "제품그룹Gcode", "제품그룹코드", "제품그룹명",
+        "제품구분Gcode", "제품구분코드", "제품구분명",
+        "제품분류Gcode", "제품분류코드", "제품분류명", "분석자료원",
+    ]
+    sales_source = sales_df.copy() if isinstance(sales_df, pd.DataFrame) else pd.DataFrame()
+    for column in identity_columns:
+        sales_source[column] = _dashboard_text_column(sales_source, column)
+    sales_source["제품코드"] = _dashboard_text_column(sales_source, "제품코드")
+
+    identity_key = "__dashboard_product_identity_id"
+    if sales_source.empty:
+        product_identity_df = pd.DataFrame(columns=[identity_key, *identity_columns, "매입처수"])
+    else:
+        identity_source = sales_source.loc[:, identity_columns].drop_duplicates(keep="first").copy()
+        identity_source.insert(0, identity_key, [str(index) for index in range(len(identity_source))])
+        vendor_counts = (
+            sales_source.groupby(identity_columns, dropna=False)["매입처코드"]
+            .nunique()
+            .rename("매입처수")
+            .reset_index()
+        )
+        product_identity_df = (
+            identity_source
+            .merge(
+                vendor_counts,
+                on=identity_columns,
+                how="left",
+                validate="one_to_one",
+            )
+            .sort_values(["제품코드", identity_key], kind="stable")
+            .reset_index(drop=True)
+        )
+
+    sales_metric_columns = [
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수",
+    ]
+    product_month_sales_df = legacy.sales_product_month_df.merge(
+        product_identity_df.loc[:, [identity_key, *identity_columns]],
+        on=identity_columns,
+        how="left",
+        validate="many_to_one",
+    ).reindex(columns=["기준월", "제품코드", identity_key, *sales_metric_columns]).copy()
+    product_month_sales_df = product_month_sales_df.sort_values(
+        ["제품코드", identity_key, "기준월"], kind="stable"
+    ).reset_index(drop=True)
+
+    manufacturer_source = legacy.sales_product_month_df.copy()
+    manufacturer_source["제약사명"] = manufacturer_source.get(
+        "제조사명", pd.Series("", index=manufacturer_source.index)
+    ).map(_dashboard_normalized_manufacturer)
+    if manufacturer_source.empty:
+        manufacturer_month_df = pd.DataFrame(columns=[
+            "제약사명", "기준월", "매출공급가액", "매출세액", "매출합계", "집계건수", "제품수", "매입처수",
+        ])
+    else:
+        manufacturer_month_df = (
+            manufacturer_source.groupby(["제약사명", "기준월"], dropna=False, as_index=False)
+            .agg(
+                매출공급가액=("매출공급가액", "sum"),
+                매출세액=("매출세액", "sum"),
+                매출합계=("매출합계", "sum"),
+                집계건수=("집계건수", "sum"),
+                제품수=("제품코드", "nunique"),
+                매입처수=("매입처수", "sum"),
+            )
+            .sort_values(["제약사명", "기준월"], kind="stable")
+            .reset_index(drop=True)
+        )
+        # Per-product month vendor counts are not additive.  Recompute the
+        # normalized manufacturer/month distinct set from the authoritative
+        # legacy rows while retaining the narrow product identity contract.
+        vendor_source = sales_source.loc[:, ["기준월", "제품코드", "제조사명", "매입처코드"]].copy()
+        vendor_source["제약사명"] = vendor_source["제조사명"].map(_dashboard_normalized_manufacturer)
+        vendor_counts = (
+            vendor_source.groupby(["제약사명", "기준월"], dropna=False)["매입처코드"]
+            .nunique()
+            .rename("매입처수")
+            .reset_index()
+        )
+        manufacturer_month_df = manufacturer_month_df.drop(columns=["매입처수"]).merge(
+            vendor_counts,
+            on=["제약사명", "기준월"],
+            how="left",
+            validate="one_to_one",
+        )
+
+    sales_month_total_df = (
+        product_month_sales_df.groupby("기준월", dropna=False, as_index=False)["매출합계"]
+        .sum()
+        .sort_values("기준월", kind="stable")
+        .reset_index(drop=True)
+        if not product_month_sales_df.empty
+        else pd.DataFrame(columns=["기준월", "매출합계"])
+    )
+    purchase_month_total_df = (
+        legacy.purchase_product_month_df.groupby("기준월", dropna=False, as_index=False)["매입금액"]
+        .sum()
+        .sort_values("기준월", kind="stable")
+        .reset_index(drop=True)
+        if not legacy.purchase_product_month_df.empty
+        else pd.DataFrame(columns=["기준월", "매입금액"])
+    )
+    return DashboardNarrowSalesPurchaseBundle(
+        product_identity_df=product_identity_df,
+        product_month_sales_df=product_month_sales_df,
+        manufacturer_month_df=manufacturer_month_df,
+        sales_month_total_df=sales_month_total_df,
+        purchase_month_total_df=purchase_month_total_df,
+        purchase_diagnostics=dict(legacy.purchase_diagnostics),
+        sales_attrs=dict(getattr(sales_df, "attrs", {}) or {}),
+        sales_columns=tuple(sales_df.columns) if isinstance(sales_df, pd.DataFrame) else (),
+    )
+
+
+def adapt_dashboard_narrow_bundle_for_forecast(
+    bundle: DashboardNarrowSalesPurchaseBundle,
+) -> pd.DataFrame:
+    """Return the bounded product-month input accepted by the existing forecast code."""
+
+    frame = bundle.product_month_sales_df.merge(
+        bundle.product_identity_df,
+        on="__dashboard_product_identity_id",
+        how="left",
+        validate="many_to_one",
+    )
+    frame = frame.drop(columns=["제품코드_y", "__dashboard_product_identity_id"]).rename(columns={"제품코드_x": "제품코드"})
+    source_columns = [
+        column for column in bundle.sales_columns
+        if column in frame.columns and column not in {"매입처코드", "매입처명", "재고적용처코드", "재고적용처명"}
+    ]
+    if "매입처수" not in source_columns:
+        source_columns.append("매입처수")
+    frame = frame.loc[:, source_columns]
+    frame.attrs.update(bundle.sales_attrs)
+    return frame
+
+
+def adapt_dashboard_narrow_bundle_for_manufacturer(
+    bundle: DashboardNarrowSalesPurchaseBundle,
+) -> pd.DataFrame:
+    """Mark normalized manufacturer-month aggregates for the existing service."""
+
+    frame = bundle.manufacturer_month_df.copy()
+    frame["제조사명"] = frame.get("제약사명", pd.Series("", index=frame.index))
+    frame["__dashboard_narrow_manufacturer_month"] = True
+    frame.attrs.update(bundle.sales_attrs)
+    return frame
+
+
+def adapt_dashboard_narrow_bundle_for_visual(
+    bundle: DashboardNarrowSalesPurchaseBundle,
+) -> pd.DataFrame:
+    """Return the only purchase fields consumed by the visual trend."""
+
+    return bundle.purchase_month_total_df.copy()
+
+
+_DASHBOARD_PURCHASE_DIAGNOSTIC_COLUMNS = (
+    "purchase_source_rows",
+    "purchase_positive_rows",
+    "purchase_nonpositive_rows",
+    "purchase_unclassified_rows",
+    "missing_product_code_rows",
+    "missing_month_rows",
+    "invalid_numeric_rows",
+    "other_excluded_rows",
+)
+
+
+def build_dashboard_narrow_bundle_from_projections(
+    product_identity_df: pd.DataFrame,
+    sales_facts_df: pd.DataFrame,
+    purchase_facts_df: pd.DataFrame,
+    *,
+    sales_attrs: Optional[Dict[str, Any]] = None,
+) -> DashboardNarrowSalesPurchaseBundle:
+    """Validate and assemble a DB-side narrow projection result.
+
+    This is fail-closed by design: a missing projection or diagnostic field is
+    a contract error, not a request to recreate a legacy raw frame.
+    """
+
+    identity_key = "__dashboard_product_identity_id"
+    identity_columns = [
+        identity_key, "제품코드", "제품명", "규격", "제조사코드", "제조사명",
+        "제품그룹Gcode", "제품그룹코드", "제품그룹명",
+        "제품구분Gcode", "제품구분코드", "제품구분명",
+        "제품분류Gcode", "제품분류코드", "제품분류명", "분석자료원", "매입처수",
+    ]
+    sales_columns = [
+        "projection_kind", "기준월", identity_key, "제품코드", "제약사명",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수",
+        "제품수", "매입처수",
+    ]
+    purchase_columns = ["projection_kind", "기준월", "매입금액", *_DASHBOARD_PURCHASE_DIAGNOSTIC_COLUMNS]
+    for name, frame, columns in (
+        ("product_identity", product_identity_df, identity_columns),
+        ("sales_facts", sales_facts_df, sales_columns),
+        ("purchase_facts", purchase_facts_df, purchase_columns),
+    ):
+        missing = [column for column in columns if column not in frame.columns]
+        if missing:
+            raise ValueError(f"dashboard narrow {name} missing columns: {missing}")
+
+    identity = product_identity_df.loc[:, identity_columns].copy()
+    if identity[identity_key].duplicated().any():
+        raise ValueError("dashboard narrow product_identity has duplicate identity key")
+    sales = sales_facts_df.loc[:, sales_columns].copy()
+    purchase = purchase_facts_df.loc[:, purchase_columns].copy()
+    product_month = sales.loc[sales["projection_kind"].eq("product_month_sales")].drop(columns=["projection_kind", "제약사명", "제품수", "매입처수"])
+    product_month = product_month.reindex(columns=[
+        "기준월", "제품코드", identity_key,
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수",
+    ])
+    manufacturer_month = sales.loc[sales["projection_kind"].eq("manufacturer_month")].drop(columns=["projection_kind", identity_key, "제품코드", "출고수량", "출고할증수량"])
+    manufacturer_month = manufacturer_month.reindex(columns=[
+        "제약사명", "기준월", "매출공급가액", "매출세액", "매출합계", "집계건수", "제품수", "매입처수",
+    ])
+    sales_month_total = sales.loc[sales["projection_kind"].eq("sales_month_total"), ["기준월", "매출합계"]].copy()
+    if len(product_month) + len(manufacturer_month) + len(sales_month_total) != len(sales):
+        raise ValueError("dashboard narrow sales_facts has unknown projection_kind")
+
+    purchase_month_total = purchase.loc[purchase["projection_kind"].eq("purchase_month_total"), ["기준월", "매입금액"]].copy()
+    diagnostic_rows = purchase.loc[purchase["projection_kind"].eq("purchase_diagnostics")]
+    if len(diagnostic_rows) != 1 or len(purchase_month_total) + len(diagnostic_rows) != len(purchase):
+        raise ValueError("dashboard narrow purchase_facts must contain one diagnostics row and known kinds only")
+    diagnostics: Dict[str, int] = {}
+    for column in _DASHBOARD_PURCHASE_DIAGNOSTIC_COLUMNS:
+        value = pd.to_numeric(diagnostic_rows.iloc[0][column], errors="coerce")
+        diagnostics[column] = 0 if pd.isna(value) else int(value)
+    source_columns = (
+        "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명",
+        "제품그룹Gcode", "제품그룹코드", "제품그룹명", "제품구분Gcode", "제품구분코드", "제품구분명",
+        "제품분류Gcode", "제품분류코드", "제품분류명", "출고수량", "출고할증수량",
+        "매출공급가액", "매출세액", "매출합계", "집계건수", "매입처코드", "분석자료원",
+    )
+    return DashboardNarrowSalesPurchaseBundle(
+        product_identity_df=identity,
+        product_month_sales_df=product_month.sort_values(["제품코드", identity_key, "기준월"], kind="stable").reset_index(drop=True),
+        manufacturer_month_df=manufacturer_month.sort_values(["제약사명", "기준월"], kind="stable").reset_index(drop=True),
+        sales_month_total_df=sales_month_total.sort_values("기준월", kind="stable").reset_index(drop=True),
+        purchase_month_total_df=purchase_month_total.sort_values("기준월", kind="stable").reset_index(drop=True),
+        purchase_diagnostics=diagnostics,
+        sales_attrs=dict(sales_attrs or {}),
+        sales_columns=source_columns,
+    )
 
 
 def get_dashboard_sales_source_bundle(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1468,12 +1992,51 @@ def get_dashboard_sales_source_bundle(params: Optional[Dict[str, Any]] = None) -
     source_policy = params.get("_period_source_policy") or {}
     source_mode = _resolve_source_mode(params)
     measurement = get_active_dashboard_query_measurement()
+
+    # The compact representation is a source representation, not a Dashboard-only
+    # shortcut.  Keeping selection here preserves the public bundle seam used by
+    # callers and by injected regression fixtures.
+    from app.services.dashboard_narrow_sales_candidate_service import (
+        can_use_dashboard_narrow_sales_candidate,
+        load_dashboard_narrow_sales_candidate,
+    )
+
+    candidate_allowed, representation_reason = can_use_dashboard_narrow_sales_candidate(params)
+    log.info(
+        "[analytics.dashboard_sales_representation] company_id=%s source_mode=%s evaluation_month=%s use_hybrid=%s "
+        "product_group_count=%s product_di_count=%s product_class_count=%s exclude_product_group_count=%s "
+        "exclude_product_di_count=%s exclude_product_class_count=%s candidate_allowed=%s representation_reason=%s",
+        params.get("company_id") or "",
+        source_mode,
+        params.get("evaluation_month") or "",
+        bool(source_policy.get("use_hybrid") or source_policy.get("use_hybrid_detail")),
+        len(_clean_list_param(params.get("product_group_list"))),
+        len(_clean_list_param(params.get("product_di_list"))),
+        len(_clean_list_param(params.get("product_class_list"))),
+        len(_clean_list_param(params.get("exclude_product_group_list"))),
+        len(_clean_list_param(params.get("exclude_product_di_list"))),
+        len(_clean_list_param(params.get("exclude_product_class_list"))),
+        candidate_allowed,
+        representation_reason,
+    )
+    if candidate_allowed:
+        candidate = load_dashboard_narrow_sales_candidate(params)
+        return {
+            "narrow_bundle": candidate["bundle"],
+            "vendor_relation_df": candidate.get("vendor_relation_df"),
+            "perf": dict(candidate.get("perf") or {}),
+            "representation": "narrow_monthly_v1",
+            "representation_reason": representation_reason,
+        }
+
     if source_mode not in {"monthly_book", "monthly_real"}:
         sales_df = get_sales_trend_df(params)
         return {
             "sales_df": sales_df,
             "purchase_vendor_df": pd.DataFrame(columns=["기준월", "제품코드", "매입처코드", "매입처명", "입고수량", "매입금액", "매입발생건수"]),
             "perf": {"purchase_source_sql_included": False, "purchase_source_rows": 0, "elapsed_ms": int((time.perf_counter() - t0) * 1000)},
+            "representation": "legacy_row_bundle",
+            "representation_reason": representation_reason,
         }
 
     spec = _monthly_spec(source_mode)
@@ -1751,7 +2314,13 @@ OPTION (RECOMPILE)
     sales_df.attrs.update(perf)
     log.info("[analytics.sales_io_scope] filter_mode=%s selected_count=%s gcode_applied=%s direction_guard_applied=True prefix_expansion=False", sales_bind.get("_sales_io_filter_mode", "legacy_broad_fallback"), int(sales_bind.get("_sales_io_selected_count") or 0), sales_bind.get("_sales_io_filter_mode") == "exact_selected")
     log.info("[analytics.sales_trend.dashboard_bundle] source_mode=%s source_scan_mode=%s raw_bundle_rows=%s sales_rows=%s purchase_source_rows=%s purchase_source_sql_included=True sql_ms=%s sales_finalize_ms=%s purchase_min_frame_ms=%s elapsed_ms=%s", source_mode, perf["source_scan_mode"], raw_bundle_rows, len(sales_df), len(purchase_df), perf["sql_ms"], sales_finalize_ms, purchase_min_frame_ms, elapsed_ms)
-    return {"sales_df": sales_df, "purchase_vendor_df": purchase_df, "perf": perf}
+    return {
+        "sales_df": sales_df,
+        "purchase_vendor_df": purchase_df,
+        "perf": perf,
+        "representation": "legacy_row_bundle",
+        "representation_reason": representation_reason,
+    }
 
 
 def get_sales_trend_monthly_df(params: Optional[Dict[str, Any]] = None, source_mode: str = "monthly_book") -> pd.DataFrame:
@@ -2674,6 +3243,16 @@ def get_sales_trend_summary_df(
             .nunique()
             .reset_index()
             .rename(columns={count_col: count_label})
+        )
+        base = base.merge(cnt, on=product_cols, how="left")
+    elif "매입처수" in df.columns:
+        # Narrow Dashboard adapters retain the legacy distinct vendor count at
+        # product grain, without expanding a product-month row back to one row
+        # per vendor merely for this summary API.
+        cnt = (
+            df.groupby(product_cols, dropna=False)["매입처수"]
+            .max()
+            .reset_index()
         )
         base = base.merge(cnt, on=product_cols, how="left")
     t_group = time.perf_counter()
