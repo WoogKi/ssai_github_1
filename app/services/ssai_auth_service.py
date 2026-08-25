@@ -770,7 +770,10 @@ def get_sims_user_for_login(
         return dict(zip(columns, row))
 
 
-def verify_sims_plain_password(input_password: str, sims_password: str) -> bool:
+def verify_sims_plain_password(
+    input_password: str | None,
+    sims_password: str | None,
+) -> bool:
     """
     SIMS Rddbc060.Rd06_Password 평문 비교.
 
@@ -782,7 +785,9 @@ def verify_sims_plain_password(input_password: str, sims_password: str) -> bool:
     if not left:
         return False
 
-    return hmac.compare_digest(left, right)
+    # compare_digest(str, str)는 ASCII만 지원하므로 평문 계약은 유지한 채
+    # 동일한 UTF-8 bytes 경계에서 constant-time 비교한다.
+    return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
 
 
 def authenticate_wholesale_user(login_id: str, password: str) -> AuthResult:
