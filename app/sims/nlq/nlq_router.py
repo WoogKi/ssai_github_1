@@ -176,11 +176,6 @@ _VENDOR_MASTER_ATTR_WORDS = (
 
 )
 
-_VENDOR_TXN_SIGNAL_WORDS = (
-    "내역", "거래내역", "현황", "명세", "이력",
-    "전표", "집계", "검증", "수불", "재고",
-)
-
 _PRODUCT_SIGNAL_WORDS = (
     "제품", "상품", "보험", "바코드", "제품코드", "보험코드", "품목",
 )
@@ -485,8 +480,9 @@ def _should_try_goods_before_users(txt: str) -> bool:
     return False
 
 def _has_vendor_txn_signal(txt: str) -> bool:
-    t = (txt or "").strip()
-    return any(k in t for k in _VENDOR_TXN_SIGNAL_WORDS)
+    from app.services.io_nlq import has_transaction_query_signal
+
+    return has_transaction_query_signal(txt)
 
 def _should_try_vendors_before_goods(txt: str) -> bool:
     """
@@ -5647,6 +5643,14 @@ def _try_handle_io_nlq(
             if action == "현재고 조회"
             else resolve_unlabeled_io_entity_condition(entity_text, action=action, params=params)
         )
+    resolved_params = entity_resolution.get("params")
+    if isinstance(resolved_params, dict):
+        # The resolver may remove parser-tentative fields even when no
+        # unlabeled entity remains.  Keep that action-consumed cleanup before
+        # evaluating its status; otherwise raw action text re-enters params.
+        params = dict(resolved_params)
+        parsed["params"] = params
+
     entity_status = str(entity_resolution.get("status") or "")
     if entity_status in {"input_required", "candidate_required", "not_found", "resolution_unavailable"}:
         candidates = list(entity_resolution.get("candidates") or [])
@@ -5730,8 +5734,6 @@ def _try_handle_io_nlq(
         return True
     resolved_kind = ""
     if entity_status == "resolved":
-        params = dict(entity_resolution.get("params") or params)
-        parsed["params"] = params
         resolved_kind = str(entity_resolution.get("resolved_kind") or "").strip()
         logger.info(
             "[nlq.router] io unlabeled entity resolved action=%r resolved_kind=%s",
@@ -6841,7 +6843,11 @@ def try_handle_nlq(
             "소재지",
         )
 
-        if (not _is_explicit_io_nlq_phrase(txt)) and any(w in txt for w in master_vendor_words):
+        if (
+            not _is_explicit_io_nlq_phrase(txt)
+            and not _has_vendor_txn_signal(txt)
+            and any(w in txt for w in master_vendor_words)
+        ):
             from app.sims.nlq.nlq_vendors import try_handle_vendors_nlq
 
             if try_handle_vendors_nlq(

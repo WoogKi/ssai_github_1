@@ -103,9 +103,14 @@ _SALES_SIDE_VENDOR_WORDS = (
     "매출처",
 )
 
-def _has_transaction_signal(text: str) -> bool:
+def has_transaction_query_signal(text: str) -> bool:
+    """Return whether text requests transactional/business data, not a master lookup."""
     t = _norm(text)
     return any(w in t for w in _TRANSACTION_SIGNAL_WORDS)
+
+
+def _has_transaction_signal(text: str) -> bool:
+    return has_transaction_query_signal(text)
 
 
 def _has_master_query_signal(text: str) -> bool:
@@ -1688,6 +1693,88 @@ def _resolve_single_product_code_by_name(name: str) -> Optional[str]:
     return code
 
 
+def _action_consumed_aliases(action: str) -> tuple[str, ...]:
+    """Return registered aliases for the already-resolved IO action only."""
+    normalized_action = clean_text(action)
+    phrases = {normalized_action, re.sub(r"\s*조회\s*$", "", normalized_action)}
+    try:
+        from app.sims.nlq.action_inventory import implemented_actions
+
+        for spec in implemented_actions():
+            if clean_text(spec.canonical_action) != normalized_action:
+                continue
+            phrases.add(clean_text(spec.panel_action))
+            phrases.update(clean_text(alias) for alias in spec.label_aliases)
+    except Exception:
+        pass
+
+    if normalized_action == "제품수불현황 조회":
+        phrases.update(_PRODUCT_FLOW_WORDS)
+    elif normalized_action == "제품재고현황 조회":
+        phrases.update(_PRODUCT_INVENTORY_WORDS)
+    elif normalized_action == "현재고 조회":
+        phrases.update(_CURRENT_STOCK_WORDS)
+    return tuple(sorted((phrase for phrase in phrases if phrase), key=len, reverse=True))
+
+
+def _single_edit_distance_at_most_one(left: str, right: str) -> bool:
+    """Return a strict, bounded edit-distance match for one action token."""
+    if left == right:
+        return True
+    if abs(len(left) - len(right)) > 1:
+        return False
+    left_index = right_index = edits = 0
+    while left_index < len(left) and right_index < len(right):
+        if left[left_index] == right[right_index]:
+            left_index += 1
+            right_index += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return False
+        if len(left) == len(right):
+            left_index += 1
+            right_index += 1
+        elif len(left) < len(right):
+            right_index += 1
+        else:
+            left_index += 1
+    return edits + (len(left) - left_index) + (len(right) - right_index) <= 1
+
+
+def _consume_io_action_text(text: str, action: str) -> str:
+    """Remove action-consumed text before considering an unlabeled entity.
+
+    Parsing resolves an action from the full user input, while entity resolution
+    must only receive what remains after that action.  Exact registered aliases
+    are removed normally.  A one-token, one-character near match is also
+    consumed only when it is the full action token, so a keyboard/STT typo does
+    not become an OR-LIKE entity predicate.
+    """
+    source = _norm(text)
+    if not source:
+        return ""
+
+    aliases = _action_consumed_aliases(action)
+    alias_tokens = {
+        re.sub(r"\s+", "", phrase)
+        for phrase in aliases
+        if len(re.sub(r"\s+", "", phrase)) >= 4
+    }
+    parts = source.split()
+    retained_parts: list[str] = []
+    for part in parts:
+        token = re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", part)
+        compact_token = re.sub(r"\s+", "", token)
+        if compact_token and any(
+            _single_edit_distance_at_most_one(compact_token, alias)
+            for alias in alias_tokens
+        ):
+            continue
+        retained_parts.append(part)
+    return " ".join(retained_parts)
+
+
 def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     """Return a conservative proper-noun candidate left after IO syntax removal.
 
@@ -1695,7 +1782,7 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     of truth, and a phrase is considered only when it is the sole residual token
     around a resolved IO action.
     """
-    candidate = _norm(_strip_nlq_period_expressions(text))
+    candidate = _norm(_strip_nlq_period_expressions(_consume_io_action_text(text, action)))
     if not candidate:
         return ""
 
@@ -1916,26 +2003,29 @@ def resolve_unlabeled_io_entity_condition(
     # contract for transaction vendor, product and manufacturer names.
     if (
         action in {"입고명세 조회", "출고명세 조회", "제품재고현황 조회"}
-        and phrase
         and not _has_explicit_name_label(text)
     ):
+        # Generic parsing may tentatively put raw residual text in physic_nm
+        # before the action is known.  It is authoritative only after the
+        # common action-consumed residual contract below confirms a phrase.
         out.pop("physic_nm", None)
-        out["nlq_unlabeled_name"] = phrase
-        _log_entity_resolver(
-            action=action,
-            resolver_type="detail_name_search",
-            status="success",
-            candidate_count=0,
-            elapsed_ms=0,
-            final_decision="resolved_like",
-        )
-        return {
-            "status": "resolved",
-            "params": out,
-            "phrase": phrase,
-            "resolved_kind": "unlabeled_like",
-            "candidates": [],
-        }
+        if phrase:
+            out["nlq_unlabeled_name"] = phrase
+            _log_entity_resolver(
+                action=action,
+                resolver_type="detail_name_search",
+                status="success",
+                candidate_count=0,
+                elapsed_ms=0,
+                final_decision="resolved_like",
+            )
+            return {
+                "status": "resolved",
+                "params": out,
+                "phrase": phrase,
+                "resolved_kind": "unlabeled_like",
+                "candidates": [],
+            }
 
     explicit_keys = (
         "ven_cd", "ven_nm", "physic_cd", "physic_nm", "maker_cd",

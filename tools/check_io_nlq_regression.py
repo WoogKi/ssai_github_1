@@ -97,6 +97,7 @@ class ParserCase:
     expected_action: str
     expected_params: dict[str, Any]
     forbidden_params: tuple[str, ...] = ()
+    today: date | None = None
 
 def _ok(name: str, detail: str = "") -> CheckResult:
     return CheckResult(name=name, ok=True, detail=detail)
@@ -266,6 +267,27 @@ def _parser_cases() -> list[ParserCase]:
             forbidden_params=("buy_nm",),
         ),
         ParserCase(
+            query="매입현황 거래처 온라인팜",
+            expected_action="입고명세 조회",
+            expected_params={"ven_nm": "온라인팜"},
+            forbidden_params=("buy_nm",),
+        ),
+        ParserCase(
+            query="매출현황 거래처 소망약국",
+            expected_action="출고명세 조회",
+            expected_params={"ven_nm": "소망약국"},
+        ),
+        ParserCase(
+            query="오늘 매출 현황 거래처 약국 조회",
+            expected_action="출고명세 조회",
+            expected_params={
+                "ven_nm": "약국",
+                "date_from": "20260826",
+                "date_to": "20260826",
+            },
+            today=date(2026, 8, 26),
+        ),
+        ParserCase(
             query="매입처 온라인팜 제품 낙소졸 입고현황",
             expected_action="입고명세 조회",
             expected_params={"ven_nm": "온라인팜", "physic_nm": "낙소졸"},
@@ -419,7 +441,7 @@ def _evaluate_parser_case(case: ParserCase) -> CheckResult:
     try:
         from app.services.io_nlq import resolve_io_nlq
 
-        parsed = resolve_io_nlq(case.query)
+        parsed = resolve_io_nlq(case.query, today=case.today)
     except Exception as e:
         return _fail(name, f"{type(e).__name__}: {e}")
 
@@ -458,6 +480,150 @@ def _evaluate_parser_case(case: ParserCase) -> CheckResult:
 
 def run_parser_checks() -> list[CheckResult]:
     return [_evaluate_parser_case(case) for case in _parser_cases()]
+
+
+def run_vendor_master_business_intent_priority_checks() -> list[CheckResult]:
+    """Ensure transaction queries cannot be intercepted by the vendor master route."""
+    from unittest.mock import MagicMock, patch
+
+    from app.services.io_nlq import resolve_io_nlq
+    from app.sims.nlq import nlq_router, nlq_vendors
+
+    results: list[CheckResult] = []
+    transaction_queries = (
+        "매입현황 거래처 온라인팜",
+        "매출현황 거래처 소망약국",
+        "오늘 매출 현황 거래처 약국 조회",
+    )
+    other_business_entity_queries = (
+        "매출현황 제품 타이레놀",
+        "매출현황 제약사 한미",
+        "출고현황 영업사원 김",
+    )
+    master_queries = (
+        "거래처 매출처 조회",
+        "거래처 매출처 소망 조회",
+        "거래처 매입처 조회",
+        "거래처 매입처 삼진 조회",
+        "거래처코드조회",
+        "거래처 제약사 조회",
+    )
+    master_guard_queries = (
+        "매출처 조회",
+        "매출처 소망 조회",
+        "매입처 조회",
+        "매입처 삼진 조회",
+        "거래처코드조회",
+        "제약사 조회",
+    )
+
+    common_patches = (
+        patch.object(nlq_router, "_try_handle_dashboard_nlq", return_value=False),
+        patch.object(nlq_router, "_try_handle_analytics_nlq", return_value=False),
+        patch.object(nlq_router, "_try_handle_road_address_nlq", return_value=False),
+    )
+
+    def _handle_only_io_queries(query: str, **_kwargs: Any) -> bool:
+        return isinstance(resolve_io_nlq(query), dict)
+
+    with (
+        common_patches[0],
+        common_patches[1],
+        common_patches[2],
+        patch.object(nlq_vendors, "try_handle_vendors_nlq", return_value=True) as vendor_handler,
+        patch.object(nlq_router, "_try_handle_io_nlq", side_effect=_handle_only_io_queries) as io_handler,
+    ):
+        transaction_handled = [
+            nlq_router.try_handle_nlq(
+                query,
+                room={},
+                session_state={},
+                make_ts=lambda: "2026-08-26 00:00:00",
+                next_seq=lambda: 1,
+                logger=MagicMock(),
+            )
+            for query in transaction_queries
+        ]
+        transaction_vendor_calls = vendor_handler.call_count
+        transaction_io_calls = io_handler.call_count
+
+        vendor_handler.reset_mock()
+        io_handler.reset_mock()
+        other_business_entity_handled = [
+            nlq_router.try_handle_nlq(
+                query,
+                room={},
+                session_state={},
+                make_ts=lambda: "2026-08-26 00:00:00",
+                next_seq=lambda: 1,
+                logger=MagicMock(),
+            )
+            for query in other_business_entity_queries
+        ]
+        other_business_entity_vendor_calls = vendor_handler.call_count
+        other_business_entity_io_calls = io_handler.call_count
+
+        vendor_handler.reset_mock()
+        io_handler.reset_mock()
+        master_handled = [
+            nlq_router.try_handle_nlq(
+                query,
+                room={},
+                session_state={},
+                make_ts=lambda: "2026-08-26 00:00:00",
+                next_seq=lambda: 1,
+                logger=MagicMock(),
+            )
+            for query in master_queries
+        ]
+        master_vendor_calls = vendor_handler.call_count
+        master_io_calls = io_handler.call_count
+
+    results.append(
+        CheckResult(
+            "transaction vendor phrases route to IO before vendor master",
+            all(transaction_handled)
+            and transaction_vendor_calls == 0
+            and transaction_io_calls == len(transaction_queries),
+            (
+                f"handled={transaction_handled!r}, vendor_calls={transaction_vendor_calls}, "
+                f"io_calls={transaction_io_calls}"
+            ),
+        )
+    )
+    results.append(
+        CheckResult(
+            "business queries with product, manufacturer, or sales-person entities retain IO priority",
+            all(other_business_entity_handled)
+            and other_business_entity_vendor_calls == 0
+            and other_business_entity_io_calls == len(other_business_entity_queries),
+            (
+                f"handled={other_business_entity_handled!r}, "
+                f"vendor_calls={other_business_entity_vendor_calls}, "
+                f"io_calls={other_business_entity_io_calls}"
+            ),
+        )
+    )
+    results.append(
+        CheckResult(
+            "vendor master phrases remain on the vendor master route",
+            all(master_handled)
+            and master_vendor_calls == len(master_queries)
+            and master_io_calls == 0,
+            (
+                f"handled={master_handled!r}, vendor_calls={master_vendor_calls}, "
+                f"io_calls={master_io_calls}"
+            ),
+        )
+    )
+    results.append(
+        CheckResult(
+            "vendor master-only phrases remain eligible for master routing",
+            all(not nlq_router._has_vendor_txn_signal(query) for query in master_guard_queries),
+            f"queries={master_guard_queries!r}",
+        )
+    )
+    return results
 
 
 # ---------------------------------------------------------------------
@@ -703,6 +869,10 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
     )
 
     inventory_cases = (
+        ("제품재고장", {}, ("nlq_unlabeled_name", "physic_nm", "maker_nm")),
+        ("재품재고장", {}, ("nlq_unlabeled_name", "physic_nm", "maker_nm")),
+        ("재품재고장 한미", {"nlq_unlabeled_name": "한미"}, ("physic_nm", "maker_nm")),
+        ("재품재고장 제조사 한미", {"maker_nm": "한미"}, ("nlq_unlabeled_name", "physic_nm")),
         ("제품재고장 한미", {"nlq_unlabeled_name": "한미"}, ("physic_nm", "maker_nm")),
         ("제품재고장 실재고 한미", {"stock_mode": "실재고", "nlq_unlabeled_name": "한미"}, ("physic_nm",)),
         ("제품재고장 장부재고 한미", {"stock_mode": "장부재고", "nlq_unlabeled_name": "한미"}, ("physic_nm",)),
@@ -6206,6 +6376,7 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
             company["id"] = 4
             public_results = []
             for query in (
+                "재품재고장",
                 "제품재고장 한미",
                 "제품재고장 실재고 한미",
                 "제품재고장 전체 재고위치 한미",
@@ -6227,14 +6398,16 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
 
         public_params = service_calls[0] if len(service_calls) >= 1 else {}
         results.append(
-            _ok("product inventory public router applies company stock defaults before service", repr(public_params))
+            _ok("product inventory action-consumed typo leaves standard scope", repr(public_params))
             if public_results[0]
-            and len(service_calls) == 6
+            and len(service_calls) == 7
             and public_params.get("stock_mode") == "real"
             and public_params.get("stock_cds") == ["00001", "00247", "00901"]
+            and not public_params.get("nlq_unlabeled_name")
+            and not public_params.get("physic_nm")
             else _fail("product inventory public router applies company stock defaults before service", repr(public_params))
         )
-        explicit_real_params = service_calls[1] if len(service_calls) >= 2 else {}
+        explicit_real_params = service_calls[2] if len(service_calls) >= 3 else {}
         results.append(
             _ok("product inventory public router preserves stock mode with unlabeled search", repr(explicit_real_params))
             if public_results[1]
@@ -6244,7 +6417,7 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
             and not explicit_real_params.get("physic_nm")
             else _fail("product inventory public router preserves stock mode with unlabeled search", repr(explicit_real_params))
         )
-        clear_params = service_calls[2] if len(service_calls) >= 3 else {}
+        clear_params = service_calls[3] if len(service_calls) >= 4 else {}
         results.append(
             _ok("product inventory public router preserves unlabeled search with explicit stock clear", repr(clear_params))
             if public_results[2]
@@ -6256,12 +6429,13 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
         )
         public_source_errors: list[str] = []
         source_expectations = (
-            (0, {"stock_mode": "company_default", "stock_cd_list": "company_default", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
-            (1, {"stock_mode": "explicit", "stock_cd_list": "company_default", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
-            (2, {"stock_mode": "company_default", "stock_cd_list": "explicit_clear", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
-            (3, {"manufacturer_name": "explicit", "stock_mode": "company_default", "stock_cd_list": "company_default"}),
-            (4, {"product_name": "explicit", "stock_mode": "company_default", "stock_cd_list": "company_default"}),
-            (5, {"stock_cd_list": "explicit", "stock_mode": "company_default"}),
+            (0, {"stock_mode": "company_default", "stock_cd_list": "company_default", "date_from": "action_default", "date_to": "action_default"}),
+            (1, {"stock_mode": "company_default", "stock_cd_list": "company_default", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
+            (2, {"stock_mode": "explicit", "stock_cd_list": "company_default", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
+            (3, {"stock_mode": "company_default", "stock_cd_list": "explicit_clear", "unlabeled_name": "explicit", "date_from": "action_default", "date_to": "action_default"}),
+            (4, {"manufacturer_name": "explicit", "stock_mode": "company_default", "stock_cd_list": "company_default"}),
+            (5, {"product_name": "explicit", "stock_mode": "company_default", "stock_cd_list": "company_default"}),
+            (6, {"stock_cd_list": "explicit", "stock_mode": "company_default"}),
         )
         for index, expected_sources in source_expectations:
             actual_sources = dict((pushed_payloads[index].get("meta") or {}).get("condition_sources") or {}) if len(pushed_payloads) > index else {}
@@ -7023,6 +7197,12 @@ def main() -> int:
 
     parser_results = run_parser_checks()
     failed += _print_results("IO NLQ PARSER CHECKS", parser_results)
+
+    vendor_priority_results = run_vendor_master_business_intent_priority_checks()
+    failed += _print_results(
+        "VENDOR MASTER / BUSINESS INTENT PRIORITY CHECKS",
+        vendor_priority_results,
+    )
 
     unlabeled_entity_results = run_unlabeled_io_entity_resolution_checks()
     failed += _print_results(
