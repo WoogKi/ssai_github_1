@@ -2670,16 +2670,29 @@ def ocr_image_pil(
         log.warning("[attachment.ocr] phase=tesseract_error error_type=%s", type(exc).__name__)
         return ""
 
-def _ocr_conf_tuple() -> tuple:
-    raw_langs = st.session_state.get("__ocr_langs", ["kor", "eng"])
+_OCR_DEFAULT_LANGS = ("kor", "eng")
+
+
+def _normalized_ocr_langs(raw_langs: Any) -> tuple[str, ...]:
     if isinstance(raw_langs, str):
         raw_langs = raw_langs.replace(",", "+").split("+")
     langs = tuple(str(lang).strip() for lang in (raw_langs or []) if str(lang).strip())
     if not langs:
-        # Empty language state makes Tesseract fail before OCR can be useful.
-        # Restore only the documented normal default; explicit valid PSM/OEM stay intact.
-        langs = ("kor", "eng")
-        st.session_state["__ocr_langs"] = list(langs)
+        return _OCR_DEFAULT_LANGS
+    return langs
+
+
+def _ocr_normalize_lang_widget_value() -> None:
+    """Restore the OCR language default inside the widget callback window."""
+    st.session_state["__ocr_langs"] = list(
+        _normalized_ocr_langs(st.session_state.get("__ocr_langs"))
+    )
+
+
+def _ocr_conf_tuple() -> tuple:
+    langs = _normalized_ocr_langs(
+        st.session_state.get("__ocr_langs", _OCR_DEFAULT_LANGS)
+    )
     return (
         langs,
         int(st.session_state.get("__ocr_psm", 3)),
@@ -11341,7 +11354,7 @@ with st.sidebar:
     # (A) 기본값(위젯 렌더 전 setdefault)
     st.session_state.setdefault("__ocr_open", False)
     st.session_state.setdefault("__ocr_auto", True)
-    st.session_state.setdefault("__ocr_langs", ["kor", "eng"])
+    st.session_state.setdefault("__ocr_langs", list(_OCR_DEFAULT_LANGS))
     st.session_state.setdefault("__ocr_psm", 3)           # 0~13
     st.session_state.setdefault("__ocr_oem", 3)           # 0:legacy, 1:LSTM, 2:both, 3:auto
     st.session_state.setdefault("__ocr_upscale", True)
@@ -11352,7 +11365,7 @@ with st.sidebar:
     # (B) 유틸: 초기화/프리셋
     def _ocr_reset():
         st.session_state["__ocr_auto"] = True
-        st.session_state["__ocr_langs"] = ["kor", "eng"]
+        st.session_state["__ocr_langs"] = list(_OCR_DEFAULT_LANGS)
         st.session_state["__ocr_psm"] = 3
         st.session_state["__ocr_oem"] = 3
         st.session_state["__ocr_upscale"] = True
@@ -11363,7 +11376,7 @@ with st.sidebar:
 
     def _ocr_preset(name: str):
         if name == "kor+eng":
-            st.session_state["__ocr_langs"] = ["kor", "eng"]
+            st.session_state["__ocr_langs"] = list(_OCR_DEFAULT_LANGS)
             st.session_state["__ocr_psm"] = 3
             st.session_state["__ocr_oem"] = 3
         elif name == "eng":
@@ -11388,6 +11401,7 @@ with st.sidebar:
                 "언어", 
                 options=["kor", "eng", "jpn", "chi_sim"],
                 key="__ocr_langs",  # ← default/value 없이 key만!
+                on_change=_ocr_normalize_lang_widget_value,
                 help="여러 언어를 선택하면 'kor+eng'처럼 함께 인식합니다."
             )
 
