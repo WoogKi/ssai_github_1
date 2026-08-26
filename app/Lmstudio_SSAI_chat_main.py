@@ -255,6 +255,7 @@ from app.db.mssql_client import health_check
 
 
 from app.ui.current_table_followups.action_dispatcher import (
+    build_current_table_interpretive_facts,
     classify_current_table_followup_intent,
     current_table_analysis_query_matches,
     handle_current_table_followup_by_action,
@@ -4358,6 +4359,10 @@ def _prepare_current_table_analysis_override(source_query: str) -> bool:
     안내만 반환한다.
     """
     ss = st.session_state
+    log.info(
+        "[current_table.analysis_ctx] stage=facts_prepare_start query=%r",
+        str(source_query or "")[:120],
+    )
     ctx, ctx_source, reason = select_current_table_analysis_context(ss)
     current_table_key = str(ss.get("__sims_current_table_source_key") or "").strip()
     current_action = str(ss.get("__sims_current_table_source_action") or "").strip()
@@ -4391,7 +4396,119 @@ def _prepare_current_table_analysis_override(source_query: str) -> bool:
         ss.pop("__current_table_analysis_query", None)
         return False
 
-    ss["__current_table_analysis_ctx_override"] = ctx
+    analysis_ctx = dict(ctx)
+    if classify_current_table_followup_intent(source_query) == "llm_analysis":
+        try:
+            current_df, resolved_table_key = _current_table_get_latest_df()
+        except Exception:
+            log.exception("[current_table.analysis_ctx] failed to load current source table")
+            current_df, resolved_table_key = None, ""
+
+        if (
+            not isinstance(current_df, pd.DataFrame)
+            or current_df.empty
+            or str(resolved_table_key or "").strip() != current_table_key
+        ):
+            _current_table_push_notice(
+                title="현재표 분석 불가",
+                action="현재표 분석 불가",
+                message="현재표 원본이 변경되었거나 사용할 수 없습니다. 현재표를 다시 조회한 뒤 분석을 요청해 주세요.",
+                query_summary="현재표 / 분석 facts 불가 / source table 불일치",
+                source_query=source_query,
+            )
+            ss.pop("__current_table_analysis_ctx_override", None)
+            ss.pop("__current_table_analysis_query", None)
+            return False
+
+        facts = build_current_table_interpretive_facts(
+            df=current_df,
+            query=source_query,
+            source_action=current_action,
+            source_meta=dict(ctx.get("source_meta") or {}),
+        )
+        facts_status = str(facts.get("status") or "")
+        log.info(
+            "[current_table.analysis_ctx] stage=facts_prepare_result status=%s table_key=%s source_rows=%s fact_rows=%s",
+            facts_status,
+            current_table_key,
+            facts.get("source_row_count"),
+            facts.get("fact_row_count"),
+        )
+        if facts_status == "column_unavailable":
+            missing = list((facts.get("capability") or {}).get("missing_columns") or [])
+            available = list(facts.get("available_columns") or [])
+            _current_table_push_notice(
+                title="현재표 컬럼 부족",
+                action="현재표 컬럼 부족",
+                message=(
+                    f"현재표에 필요한 컬럼이 없습니다: {', '.join(map(str, missing))}\n\n"
+                    f"현재표의 사용 가능한 컬럼: {', '.join(map(str, available[:20]))}"
+                ),
+                query_summary="현재표 / 분석 불가 / 요청 컬럼 없음",
+                source_query=source_query,
+            )
+            ss.pop("__current_table_analysis_ctx_override", None)
+            ss.pop("__current_table_analysis_query", None)
+            return False
+
+        if facts_status not in {"success", "not_applicable"}:
+            _current_table_push_notice(
+                title="현재표 분석 불가",
+                action="현재표 분석 불가",
+                message=(
+                    "요청한 현재표 분석 facts를 결정적으로 만들 수 없습니다. "
+                    "원본 현재표를 LLM으로 대체 해석하지 않았습니다."
+                ),
+                query_summary="현재표 / 분석 불가 / deterministic facts 미생성",
+                source_query=source_query,
+            )
+            ss.pop("__current_table_analysis_ctx_override", None)
+            ss.pop("__current_table_analysis_query", None)
+            return False
+
+        if facts_status == "success":
+            facts_payload = {
+                "grouping_label": facts["grouping_label"],
+                "metric_label": facts["metric_label"],
+                "source_row_count": facts["source_row_count"],
+                "input_row_count": facts["input_row_count"],
+                "excluded_summary_row_count": facts["excluded_summary_row_count"],
+                "fact_row_count": facts["fact_row_count"],
+                "metric_total": facts["metric_total"],
+                "facts_value_total": facts["facts_value_total"],
+                "facts_truncated": facts["facts_truncated"],
+                "facts_compacted": facts["facts_compacted"],
+                "summary_bucket_label": facts["summary_bucket_label"],
+                "rows": facts["facts"],
+            }
+            analysis_ctx = {
+                "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                "analysis_target": "current_table_deterministic_facts",
+                "analysis_key": str(uuid.uuid4()),
+                "table_key": current_table_key,
+                "source_table_key": current_table_key,
+                "action": current_action,
+                "row_count": int(facts["source_row_count"]),
+                "current_table_interpretive_facts": facts_payload,
+                "analysis_text": (
+                    "SIMS_ANALYSIS_CONTEXT_V1\n"
+                    "아래는 현재표 원본을 pandas로 결정적으로 집계한 분석 facts입니다. "
+                    "LLM은 이 수치를 다시 계산하거나 원본 행을 추정하지 말고, facts의 의미만 설명하세요.\n"
+                    f"질문: {str(source_query or '').strip()}\n"
+                    f"집계 차원: {facts['grouping_label']}\n"
+                    f"집계 지표: {facts['metric_label']}\n"
+                    f"입력 행수: {facts['input_row_count']}\n"
+                    f"집계 대상 상세행수: {facts['source_row_count']}\n"
+                    f"제외한 합계/소계/합성행수: {facts['excluded_summary_row_count']}\n"
+                    f"집계 행수: {facts['fact_row_count']}\n"
+                    f"전체 {facts['metric_label']} 합계: {facts['metric_total']}\n"
+                    "`미지정`은 상세행에서만 집계 차원 값이 비어 있을 때의 값입니다.\n"
+                    "rows의 kind=`summary_bucket` 및 label=`기타합산`은 실제 업무 entity가 아닌 압축 요약 버킷입니다.\n"
+                    f"facts: {json.dumps(facts_payload, ensure_ascii=False, default=str)}"
+                ),
+            }
+
+    ss["__current_table_analysis_ctx_override"] = analysis_ctx
     ss["__current_table_analysis_query"] = str(source_query or "").strip()
     return True
 
@@ -5164,6 +5281,7 @@ def _try_handle_current_table_dataframe_followup(
             intent,
             str(t or "")[:120],
         )
+        return False
     
     source_action_current = str(
         st.session_state.get("__sims_current_table_source_action")
@@ -6171,26 +6289,39 @@ def build_messages_with_system(
                 f"[SIMS_META] kind=analysis action={llm_sims_data.get('action')} "
                 f"row_count={log_rows} cols={log_cols} risk_top={log_risk}"
             )
+            deterministic_current_table_facts = (
+                llm_sims_data.get("analysis_target") == "current_table_deterministic_facts"
+            )
+            if deterministic_current_table_facts:
+                analysis_data_rule = (
+                    "- 이 JSON은 현재표 원본을 pandas로 결정적으로 집계한 facts만 담고 있습니다.\n"
+                    "- 제공된 facts의 수치를 다시 계산하거나 원본 행/없는 컬럼을 추정하지 말고, facts의 의미만 설명하세요.\n"
+                    "- facts_truncated가 true이면 제공된 행 밖의 순위·분포를 단정하지 마세요.\n"
+                    "- rows의 kind가 summary_bucket인 `기타합산`은 실제 제조사·제품분류 등 entity가 아닌 요약 버킷으로만 설명하세요.\n"
+                )
+            else:
+                analysis_data_rule = (
+                    "- 이 JSON은 최신 SIMS 조회 결과 전체를 Python으로 집계한 분석 컨텍스트입니다.\n"
+                    "- summary와 *_counts는 전체 결과 기준입니다. 절대 '샘플 데이터'라고 말하지 마세요.\n"
+                    "- 일자/날짜/요일/일별/월별 매출 질문은 sales_time_profile의 daily_sales_top, monthly_sales, weekday_sales를 우선 사용하세요.\n"
+                    "- 제품별/거래처별/영업사원별/수량 TOP 질문은 sales_group_profile을 우선 사용하세요.\n"
+                    "- risk_products_top과 grade_samples는 품목 설명용 대표 목록입니다.\n"
+                )
 
             sims_block = (
-                meta_hint + "\n"
-                "다음 SIMS_ANALYSIS_CONTEXT_V1 JSON만 보고 질문에 답하세요.\n"
-                "\n"
-                "- 이 JSON은 최신 SIMS 조회 결과 전체를 Python으로 집계한 분석 컨텍스트입니다.\n"
-                "- summary와 *_counts는 전체 결과 기준입니다. 절대 '샘플 데이터'라고 말하지 마세요.\n"
-                "- 일자/날짜/요일/일별/월별 매출 질문은 sales_time_profile의 daily_sales_top, monthly_sales, weekday_sales를 우선 사용하세요.\n"
-                "- 제품별/거래처별/영업사원별/수량 TOP 질문은 sales_group_profile을 우선 사용하세요.\n"
-                "- risk_products_top과 grade_samples는 품목 설명용 대표 목록입니다.\n"
-                "- 이전 표, 이전 조회 결과, 이전 답변은 분석 근거로 사용하지 마세요.\n"
-                "- 사용자가 특정 항목/목록/값을 물으면 그 질문에만 직접 답하세요. 이때 핵심 요약, 주의/확인할 점, 다음 조회 제안은 생략하세요.\n"
-                "- 사용자가 요약/분석을 요청한 경우에만 ①핵심 요약 ②주요 수치 ③주의/확인할 점 ④다음 조회 제안 순서로 짧게 정리하세요.\n"
-                "- 사용자가 '표로'라고 요청하면 주요 수치나 목록은 표로 답하세요.\n"
-                "- 내부 key 이름(low_stock_records, zero_stock_records, sample_records, risk_products_top, grade_samples 등)은 답변에 노출하지 마세요.\n"
-
-
-                "- stock_mode 또는 stock_label 값이 '실수불'이면 반드시 '실수불 기준'이라고 그대로 표현하고, '실재고 기준'으로 바꾸지 마세요.\n"
-                "- 답변 본문에 '샘플', '샘플 데이터', 'sample_rows', '대표 목록'이라는 표현을 쓰지 말고, 필요한 경우 '전체 조회 결과 기준'이라고만 표현하세요.\n"
-                f"[SIMS_JSON]\n{ctx_txt}\n[/SIMS_JSON]"
+                meta_hint
+                + "\n"
+                + "다음 SIMS_ANALYSIS_CONTEXT_V1 JSON만 보고 질문에 답하세요.\n"
+                + "\n"
+                + analysis_data_rule
+                + "- 이전 표, 이전 조회 결과, 이전 답변은 분석 근거로 사용하지 마세요.\n"
+                + "- 사용자가 특정 항목/목록/값을 물으면 그 질문에만 직접 답하세요. 이때 핵심 요약, 주의/확인할 점, 다음 조회 제안은 생략하세요.\n"
+                + "- 사용자가 요약/분석을 요청한 경우에만 ①핵심 요약 ②주요 수치 ③주의/확인할 점 ④다음 조회 제안 순서로 짧게 정리하세요.\n"
+                + "- 사용자가 '표로'라고 요청하면 주요 수치나 목록은 표로 답하세요.\n"
+                + "- 내부 key 이름(low_stock_records, zero_stock_records, sample_records, risk_products_top, grade_samples 등)은 답변에 노출하지 마세요.\n"
+                + "- stock_mode 또는 stock_label 값이 '실수불'이면 반드시 '실수불 기준'이라고 그대로 표현하고, '실재고 기준'으로 바꾸지 마세요.\n"
+                + "- 답변 본문에 '샘플', '샘플 데이터', 'sample_rows', '대표 목록'이라는 표현을 쓰지 말고, 필요한 경우 '전체 조회 결과 기준'이라고만 표현하세요.\n"
+                + f"[SIMS_JSON]\n{ctx_txt}\n[/SIMS_JSON]"
             )
 
             log.debug(
@@ -6653,11 +6784,20 @@ def build_messages_with_system(
             default_include_opinion=True,
         )
 
+        deterministic_current_table_facts = bool(
+            isinstance(analysis_ctx, dict)
+            and analysis_ctx.get("analysis_target") == "current_table_deterministic_facts"
+        )
+        analysis_scope_rule = (
+            "- 이 컨텍스트는 현재표를 pandas로 결정적으로 집계한 facts만 담고 있다. 제공된 수치를 다시 계산하거나 원본 행을 추정하지 말고 facts의 의미만 설명하라.\n"
+            if deterministic_current_table_facts
+            else "- 이 컨텍스트는 최신 SIMS 조회 결과 전체 원본 DataFrame을 Python에서 집계한 분석 컨텍스트다.\n"
+        )
         analysis_rule = (
             "\n\n[SIMS_ANALYSIS_RULE]\n"
             "- 현재 SIMS_JSON은 SIMS_ANALYSIS_CONTEXT_V1이다.\n"
-            "- 이 컨텍스트는 최신 SIMS 조회 결과 전체 원본 DataFrame을 Python에서 집계한 분석 컨텍스트다.\n"
-            f"- {response_format_instruction}\n"
+            + analysis_scope_rule
+            + f"- {response_format_instruction}\n"
             "- summary와 shortage_grade_counts, forecast_grade_counts, trend_judge_counts는 전체 결과 기준이다.\n"
             "- 일자/날짜/요일/일별/월별 매출 질문은 sales_time_profile을 우선 근거로 답한다.\n"
             "- 제품별/거래처별/영업사원별/수량 TOP 질문은 sales_group_profile을 우선 근거로 답한다.\n"
@@ -12039,19 +12179,37 @@ if user_input and user_input.strip():
             log.debug("[chat.followup_table] handled → skip LLM/NLQ, content=%r", user_input[:80])
 
         elif is_current_table_forced_followup:
-            # 조회 화면에서는 현재표 stash가 panel render 이후에 완료될 수 있다.
-            # 따라서 여기서 바로 LLM fallback으로 보내지 말고,
-            # panel render 이후 한 번 더 현재표 후속분석을 재시도한다.
-            st.session_state["__deferred_current_table_followup"] = {
-                "user_input": current_table_followup_input,
-                "ts": time.time(),
-                "retry": 0,
-            }
-            deferred_current_followup = True
-            log.debug(
-                "[chat.followup_table] defer current-table followup until after panel render: %r",
-                current_table_followup_input[:80],
-            )            
+            current_table_intent = classify_current_table_followup_intent(
+                current_table_followup_input
+            )
+            if current_table_intent == "llm_analysis":
+                prepared = _prepare_current_table_analysis_override(
+                    current_table_followup_input
+                )
+                log.info(
+                    "[current_table.route] intent=%s stage=immediate_llm_handoff prepared=%s table_key=%s action=%s",
+                    current_table_intent,
+                    prepared,
+                    st.session_state.get("__sims_current_table_source_key") or "",
+                    st.session_state.get("__sims_current_table_source_action") or "",
+                )
+                # 현재표가 이미 선택된 요청은 panel render를 기다릴 이유가 없다.
+                # 기존 __queue_ai runner가 같은 rerun에서 override를 소비한다.
+                handled = not prepared
+            else:
+                # 조회 화면에서는 현재표 stash가 panel render 이후에 완료될 수 있다.
+                # 따라서 여기서 바로 LLM fallback으로 보내지 말고,
+                # panel render 이후 한 번 더 현재표 후속분석을 재시도한다.
+                st.session_state["__deferred_current_table_followup"] = {
+                    "user_input": current_table_followup_input,
+                    "ts": time.time(),
+                    "retry": 0,
+                }
+                deferred_current_followup = True
+                log.debug(
+                    "[chat.followup_table] defer current-table followup until after panel render: %r",
+                    current_table_followup_input[:80],
+                )
 
         elif (
             is_implicit_analytics_current_followup

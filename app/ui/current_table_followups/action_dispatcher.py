@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any, Callable
 
@@ -40,7 +41,10 @@ import pandas as pd
 
 from app.ui.current_table_followups.monthly_stock import handle_monthly_stock_followup
 from app.ui.current_table_followups.validation import handle_validation_followup
-from app.ui.current_table_followups.inventory import handle_inventory_followup
+from app.ui.current_table_followups.inventory import (
+    handle_inventory_followup,
+    inventory_detail_row_mask,
+)
 from app.ui.current_table_followups.stock_ledger import handle_stock_ledger_followup
 from app.ui.current_table_followups.sales_detail import handle_sales_detail_followup
 from app.ui.current_table_followups.purchase_detail import handle_purchase_detail_followup
@@ -150,6 +154,20 @@ def classify_current_table_followup_intent(query: str) -> str:
     )
     if any(marker in intent_compact for marker in explicit_table_markers):
         return "dataframe_table"
+
+    # "분석해줘/의미가 뭐야/추세 설명"은 현재표의 숫자를 먼저 pandas로
+    # 확정한 뒤 LLM이 그 facts만 해석해야 한다. 명시적인 TOP/목록/조건
+    # 요청은 위의 deterministic table 계약을 계속 우선한다.
+    interpretive_analysis_markers = (
+        "분석해",
+        "분석을해",
+        "의미가",
+        "의미를",
+        "추세설명",
+        "경향설명",
+    )
+    if any(marker in intent_compact for marker in interpretive_analysis_markers):
+        return "llm_analysis"
 
     current_table_summary_requests = ("요약", "집계", "분석", "매출")
     if (
@@ -577,6 +595,35 @@ def _current_table_dimension_columns(df: pd.DataFrame, aliases: tuple[str, ...])
     ]
 
 
+def _resolve_current_table_column(df: pd.DataFrame, aliases: tuple[str, ...]) -> str:
+    """Resolve one current-table column by the declared canonical alias order."""
+    if not isinstance(df, pd.DataFrame):
+        return ""
+    normalized_columns: dict[str, str] = {}
+    for column in df.columns:
+        name = str(column)
+        normalized_columns.setdefault(re.sub(r"\s+", "", name), name)
+    for alias in aliases:
+        hit = normalized_columns.get(re.sub(r"\s+", "", str(alias)))
+        if hit:
+            return hit
+    return ""
+
+
+def _resolve_current_table_dimension_column(
+    df: pd.DataFrame,
+    *,
+    grouping: str,
+    kind: str,
+) -> str:
+    source_aliases = _CURRENT_TABLE_SOURCE_GROUPING_ALIASES.get(kind, {}).get(grouping, ())
+    aliases = source_aliases or next(
+        (spec_aliases for key, _label, _phrases, spec_aliases in _CURRENT_TABLE_DIMENSION_SPECS if key == grouping),
+        (),
+    )
+    return _resolve_current_table_column(df, aliases)
+
+
 def _current_table_metric_columns(
     df: pd.DataFrame,
     metric: str,
@@ -591,6 +638,22 @@ def _current_table_metric_columns(
         if key == metric:
             return _current_table_dimension_columns(df, aliases)
     return []
+
+
+def _resolve_current_table_metric_column(
+    df: pd.DataFrame,
+    metric: str,
+    source_kind: str = "",
+) -> str:
+    source_aliases = _CURRENT_TABLE_SOURCE_METRIC_ALIASES.get(source_kind, {}).get(metric, ())
+    if source_aliases:
+        hit = _resolve_current_table_column(df, source_aliases)
+        if hit:
+            return hit
+    for key, _label, aliases in _CURRENT_TABLE_METRIC_SPECS:
+        if key == metric:
+            return _resolve_current_table_column(df, aliases)
+    return ""
 
 
 def _current_table_metric_label(metric: str) -> str:
@@ -632,6 +695,46 @@ def _current_table_requested_metrics(query: str) -> list[str]:
     ):
         metrics.append("stock")
     return metrics
+
+
+def _current_table_unresolved_request_labels(
+    query: str,
+    *,
+    metrics: list[str],
+    groupings: list[str],
+) -> tuple[str, str]:
+    """Return explicit unknown metric/dimension labels without inventing a substitute column."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    body = compact
+    for marker in ("분석해줘", "분석을해줘", "분석", "의미가뭐야", "의미를설명", "추세설명해줘"):
+        if marker in body:
+            body = body.split(marker, 1)[0]
+            break
+    body = body.replace("현재표", "").replace("현재결과", "")
+
+    for _key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
+        for term in (label, *phrases, *aliases):
+            body = body.replace(re.sub(r"\s+", "", term), "")
+    for _key, label, aliases in _CURRENT_TABLE_METRIC_SPECS:
+        for term in (label, *aliases):
+            body = body.replace(re.sub(r"\s+", "", term), "")
+    body = body.replace("별", "").replace("기준", "").replace("으로", "").replace("로", "")
+
+    unknown_dimension = ""
+    unknown_metric = ""
+    if not groupings and "별" in compact:
+        before_grouping = compact.split("별", 1)[0]
+        before_grouping = before_grouping.replace("현재표", "").replace("현재결과", "")
+        for _key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
+            for term in (label, *phrases, *aliases):
+                before_grouping = before_grouping.replace(re.sub(r"\s+", "", term), "")
+        if len(before_grouping) >= 2:
+            unknown_dimension = before_grouping
+    if not metrics:
+        metric_match = re.search(r"([가-힣A-Za-z0-9_]+(?:수량|금액|가액|건수|율))", body)
+        if metric_match:
+            unknown_metric = metric_match.group(1)
+    return unknown_dimension, unknown_metric
 
 
 def _is_sales_trend_current_table(source_action: str) -> bool:
@@ -697,12 +800,22 @@ def _current_table_followup_intent(
         inferred_grouping = _current_table_requested_grouping(query, metrics[0], source_action)
         if inferred_grouping:
             groupings.append(inferred_grouping)
+    unresolved_dimension = ""
+    unresolved_metric = ""
+    if classify_current_table_followup_intent(query) == "llm_analysis":
+        unresolved_dimension, unresolved_metric = _current_table_unresolved_request_labels(
+            query,
+            metrics=metrics,
+            groupings=groupings,
+        )
     return {
         "requested_metrics": metrics,
         "requested_groupings": groupings,
         "requested_metric": metrics[0] if len(metrics) == 1 else "",
         "requested_grouping": groupings[0] if len(groupings) == 1 else "",
         "requested_dimensions": requested_dimensions,
+        "unresolved_dimension_label": unresolved_dimension,
+        "unresolved_metric_label": unresolved_metric,
     }
 
 
@@ -795,17 +908,19 @@ def _current_table_followup_capability(
     metric = intent["requested_metric"]
     grouping = intent["requested_grouping"]
     requested = intent["requested_dimensions"]
+    unresolved_dimension = str(intent.get("unresolved_dimension_label") or "")
+    unresolved_metric = str(intent.get("unresolved_metric_label") or "")
     missing_columns: list[str] = []
     available_columns: list[str] = []
     for grouping_key, label, aliases in requested:
-        source_aliases = _CURRENT_TABLE_SOURCE_GROUPING_ALIASES.get(kind, {}).get(grouping_key, ())
-        matches = _current_table_dimension_columns(df, source_aliases or aliases)
-        if matches:
-            available_columns.extend(matches)
+        resolved = _resolve_current_table_dimension_column(df, grouping=grouping_key, kind=kind)
+        if resolved:
+            available_columns.append(resolved)
         else:
             missing_columns.append(label)
 
-    metric_columns = _current_table_metric_columns(df, metric, kind)
+    resolved_metric = _resolve_current_table_metric_column(df, metric, kind)
+    metric_columns = [resolved_metric] if resolved_metric else []
     semantic_filter = _requested_source_semantic_filter(kind, query)
     if semantic_filter:
         semantic_aliases = _CURRENT_TABLE_SOURCE_SEMANTIC_FILTER_ALIASES[kind][semantic_filter]
@@ -824,6 +939,17 @@ def _current_table_followup_capability(
         "metric_columns": metric_columns,
         "issue_codes": [],
     }
+    if unresolved_dimension:
+        missing_columns.append(unresolved_dimension)
+    if unresolved_metric:
+        missing_columns.append(unresolved_metric)
+    if missing_columns:
+        return {
+            **base,
+            "missing_columns": list(dict.fromkeys(missing_columns)),
+            "status": "column_unavailable",
+            "requires_result_contract": bool(metric and grouping),
+        }
     compact_query = re.sub(r"\s+", "", str(query or ""))
     if (
         any(token in compact_query for token in ("판정결과", "추세판정"))
@@ -853,13 +979,6 @@ def _current_table_followup_capability(
     # A requested metric must be present even when the question does not name a
     # grouping. Otherwise a generic TOP path could silently rank another value.
     metric_missing = bool(metric and not metric_columns)
-    if missing_columns:
-        return {
-            **base,
-            "status": "column_unavailable",
-            "requires_result_contract": bool(metric and grouping),
-        }
-
     if metric_missing:
         return {
             **base,
@@ -904,6 +1023,155 @@ def _current_table_followup_capability(
         **base,
         "status": "success",
         "requires_result_contract": bool(metric and grouping),
+    }
+
+
+def build_current_table_interpretive_facts(
+    *,
+    df: pd.DataFrame,
+    query: str,
+    source_action: str,
+    source_meta: dict[str, Any] | None = None,
+    max_rows: int = 100,
+) -> dict[str, Any]:
+    """Build the exact, compact facts an LLM may interpret for a current-table analysis.
+
+    This deliberately returns only the requested grouping and metric. It never
+    exposes the raw current-table rows to the analysis context.
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return {"status": "no_data", "facts": [], "available_columns": []}
+
+    kind = detect_current_table_kind(source_action)
+    capability = _current_table_followup_capability(
+        df=df,
+        query=query,
+        source_action=source_action,
+        kind=kind,
+        source_meta=source_meta,
+    )
+    metric = str(capability.get("requested_metric") or "")
+    grouping = str(capability.get("requested_grouping") or "")
+
+    if capability.get("status") == "column_unavailable":
+        return {
+            "status": "column_unavailable",
+            "capability": capability,
+            "facts": [],
+            "available_columns": [str(column) for column in df.columns],
+        }
+
+    # Broad "현재표 분석해줘" continues to use its existing compact analysis
+    # context. This helper only owns an explicitly requested dimension + metric.
+    if not metric or not grouping:
+        return {"status": "not_applicable", "capability": capability, "facts": []}
+    if capability.get("status") != "success":
+        return {
+            "status": str(capability.get("status") or "unsupported"),
+            "capability": capability,
+            "facts": [],
+            "available_columns": [str(column) for column in df.columns],
+        }
+
+    group_column = _resolve_current_table_dimension_column(df, grouping=grouping, kind=kind)
+    metric_column = _resolve_current_table_metric_column(df, metric, kind)
+    if not group_column or not metric_column:
+        missing_columns = list((capability.get("missing_columns") or []))
+        if not group_column:
+            missing_columns.append(
+                next(
+                    (label for key, label, _phrases, _aliases in _CURRENT_TABLE_DIMENSION_SPECS if key == grouping),
+                    grouping,
+                )
+            )
+        if not metric_column:
+            missing_columns.append(_current_table_metric_label(metric) or metric)
+        return {
+            "status": "column_unavailable",
+            "capability": {**capability, "missing_columns": list(dict.fromkeys(missing_columns))},
+            "facts": [],
+            "available_columns": [str(column) for column in df.columns],
+        }
+
+    detail_mask = pd.Series(True, index=df.index, dtype="bool")
+    if kind == "inventory":
+        product_column = _resolve_current_table_column(df, ("제품명", "품목명", "상품명"))
+        detail_mask = inventory_detail_row_mask(df, product_column=product_column)
+
+    detail_df = df.loc[detail_mask]
+    work = pd.DataFrame(
+        {
+            group_column: detail_df[group_column].astype("string").fillna("").str.strip(),
+            metric_column: pd.to_numeric(
+                detail_df[metric_column].astype("string").str.replace(",", "", regex=False),
+                errors="coerce",
+            ).fillna(0),
+        }
+    )
+    work[group_column] = work[group_column].mask(work[group_column].eq(""), "미지정")
+    facts_df = (
+        work.groupby(group_column, dropna=False, as_index=False)
+        .agg(**{metric_column: (metric_column, "sum"), "행수": (metric_column, "size")})
+        .sort_values([metric_column, group_column], ascending=[False, True], kind="mergesort")
+        .reset_index(drop=True)
+    )
+    max_fact_rows = max(1, int(max_rows))
+    facts_compacted = len(facts_df) > max_fact_rows
+    if facts_compacted:
+        explicit_row_count = max(0, max_fact_rows - 1)
+        explicit_facts = facts_df.head(explicit_row_count).copy()
+        remainder = facts_df.iloc[explicit_row_count:]
+        summary_bucket = {
+            group_column: "기타합산",
+            metric_column: float(remainder[metric_column].sum()),
+            "행수": int(remainder["행수"].sum()),
+            "kind": "summary_bucket",
+            "label": "기타합산",
+        }
+        limited_facts = [
+            {**row, "kind": "group"}
+            for row in explicit_facts.to_dict(orient="records")
+        ] + [summary_bucket]
+    else:
+        limited_facts = [
+            {**row, "kind": "group"}
+            for row in facts_df.to_dict(orient="records")
+        ]
+
+    metric_total = float(facts_df[metric_column].sum())
+    facts_value_total = float(
+        sum(float(row.get(metric_column) or 0) for row in limited_facts)
+    )
+    if not math.isclose(metric_total, facts_value_total, rel_tol=0.0, abs_tol=1e-9):
+        return {
+            "status": "integrity_error",
+            "capability": capability,
+            "facts": [],
+            "available_columns": [str(column) for column in df.columns],
+        }
+    return {
+        "status": "success",
+        "capability": capability,
+        "grouping": grouping,
+        "grouping_label": next(
+            (label for key, label, _phrases, _aliases in _CURRENT_TABLE_DIMENSION_SPECS if key == grouping),
+            group_column,
+        ),
+        "metric": metric,
+        "metric_label": _current_table_metric_label(metric) or metric_column,
+        "group_column": group_column,
+        "metric_column": metric_column,
+        "input_row_count": int(len(df)),
+        "source_row_count": int(len(detail_df)),
+        "excluded_summary_row_count": int((~detail_mask).sum()),
+        "fact_row_count": int(len(facts_df)),
+        "metric_total": metric_total,
+        "facts_value_total": facts_value_total,
+        "facts": limited_facts,
+        "facts_truncated": facts_compacted,
+        "facts_compacted": facts_compacted,
+        "summary_bucket_label": "기타합산" if facts_compacted else "",
+        "available_columns": [str(column) for column in df.columns],
     }
 
 

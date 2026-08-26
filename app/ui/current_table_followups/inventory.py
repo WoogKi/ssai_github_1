@@ -10,6 +10,30 @@ from typing import Any, Callable
 import pandas as pd
 
 
+def inventory_detail_row_mask(
+    df: pd.DataFrame,
+    *,
+    product_column: str | None,
+) -> pd.Series:
+    """Return the existing 제품재고현황 detail-row contract.
+
+    Product inventory result frames can append a presentation total row with an
+    empty product identity.  Product TOP/list follow-ups have always excluded
+    that row; other deterministic inventory aggregations must use the same
+    boundary before they normalize a blank business dimension.
+    """
+    if not product_column or product_column not in df.columns:
+        return pd.Series(True, index=df.index, dtype="bool")
+
+    name = df[product_column].fillna("").astype(str).str.strip()
+    summary_row = (
+        name.eq("")
+        | name.str.contains(r"^(?:합계|총계|소계|합계금액|전체|TOTAL)$", case=False, regex=True, na=False)
+        | name.str.contains(r"합계\s*금액", case=False, regex=True, na=False)
+    )
+    return ~summary_row
+
+
 def handle_inventory_followup(
     *,
     df: pd.DataFrame,
@@ -122,26 +146,8 @@ def handle_inventory_followup(
             return to_num(df[col])
         return pd.Series([0] * len(df), index=df.index, dtype="float64")
     
-    def _valid_product_name_mask_from_series(s: pd.Series) -> pd.Series:
-        """
-        제품재고현황 결과에는 제품명/제품코드가 비어 있는 전체 합계 라인이 포함될 수 있다.
-        제품별 TOP/목록에서는 이 합계 라인을 제외해야 한다.
-        """
-        name = s.fillna("").astype(str).str.strip()
-
-        bad = (
-            name.eq("")
-            | name.str.contains(r"^(합계|총계|소계|합계금액|전체|TOTAL)$", case=False, regex=True, na=False)
-            | name.str.contains(r"합계\s*금액", case=False, regex=True, na=False)
-        )
-
-        return ~bad
-
     def _filter_real_product_rows(work: pd.DataFrame, *, name_col: str = "제품명") -> pd.DataFrame:
-        if name_col not in work.columns:
-            return work
-
-        mask = _valid_product_name_mask_from_series(work[name_col])
+        mask = inventory_detail_row_mask(work, product_column=name_col)
         return work.loc[mask].copy()
 
 

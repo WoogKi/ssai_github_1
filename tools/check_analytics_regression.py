@@ -17047,6 +17047,7 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "제품코드": "P1",
                     "제품명": "제품1",
                     "제조사명": "한미약품",
+                    "제품분류명": "순환기",
                     "발주처명": "발주처A",
                     "매입처명": "매입처A",
                     "재고위치명": "본사 창고",
@@ -17062,6 +17063,7 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "제품코드": "P2",
                     "제품명": "제품2",
                     "제조사명": "한미약품",
+                    "제품분류명": "순환기",
                     "발주처명": "발주처B",
                     "매입처명": "매입처B",
                     "재고위치명": "전주 창고",
@@ -17077,6 +17079,7 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "제품코드": "P3",
                     "제품명": "제품3",
                     "제조사명": "제조사B",
+                    "제품분류명": "소화기",
                     "발주처명": "발주처A",
                     "매입처명": "매입처A",
                     "재고위치명": "본사 창고",
@@ -17092,6 +17095,7 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     "제품코드": "P4",
                     "제품명": "제품4",
                     "제조사명": "제조사B",
+                    "제품분류명": "소화기",
                     "발주처명": "발주처B",
                     "매입처명": "매입처B",
                     "재고위치명": "전주 창고",
@@ -17143,6 +17147,166 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                 errors.append(
                     f"{query}: intent={intent!r} capability={capability!r}"
                 )
+
+        analysis_cases = (
+            ("현재표 제조사별 재고수량 분석해줘", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
+            ("현재표 제품분류별 재고수량 분석해줘", "product_class", "stock_quantity", [("순환기", 10), ("소화기", 3)]),
+        )
+        for query, expected_grouping, expected_metric, expected_pairs in analysis_cases:
+            facts = dispatcher.build_current_table_interpretive_facts(
+                df=source_df.copy(deep=True),
+                query=query,
+                source_action="제품재고현황 조회",
+                source_meta={"result_status": "success"},
+            )
+            actual_pairs = [
+                (str(row.get(facts.get("group_column") or "")), row.get(facts.get("metric_column") or ""))
+                for row in facts.get("facts") or []
+            ]
+            if (
+                dispatcher.classify_current_table_followup_intent(query) != "llm_analysis"
+                or facts.get("status") != "success"
+                or facts.get("grouping") != expected_grouping
+                or facts.get("metric") != expected_metric
+                or actual_pairs != expected_pairs
+                or facts.get("source_row_count") != len(source_df)
+            ):
+                errors.append(f"{query}: interpretive_facts={facts!r}")
+
+        summary_row_source_df = pd.DataFrame(
+            [
+                {
+                    "제품코드": "S1", "제품명": "상세제품A", "제조사명": "제조사A",
+                    "제조사": "제조사A", "제품분류명": "분류A", "재고수량": 10, "재고금액": 100,
+                },
+                {
+                    "제품코드": "S2", "제품명": "상세제품B", "제조사명": "제조사B",
+                    "제조사": "제조사B", "제품분류명": "분류B", "재고수량": 5, "재고금액": 50,
+                },
+                {
+                    "제품코드": "S3", "제품명": "상세제품C", "제조사명": "",
+                    "제조사": "", "제품분류명": "", "재고수량": 3, "재고금액": 30,
+                },
+                {
+                    "제품코드": "", "제품명": "", "제조사명": "",
+                    "제조사": "합계", "제품분류명": "", "재고수량": 18, "재고금액": 180,
+                },
+            ]
+        )
+        summary_cases = (
+            ("현재표 제조사별 재고수량 분석해줘", "재고수량", {"제조사A": 10, "제조사B": 5, "미지정": 3}),
+            ("현재표 제품분류별 재고수량 분석해줘", "재고수량", {"분류A": 10, "분류B": 5, "미지정": 3}),
+            ("현재표 제조사별 재고금액 분석해줘", "재고금액", {"제조사A": 100, "제조사B": 50, "미지정": 30}),
+        )
+        for query, metric_column, expected_values in summary_cases:
+            facts = dispatcher.build_current_table_interpretive_facts(
+                df=summary_row_source_df.copy(deep=True),
+                query=query,
+                source_action="제품재고현황 조회",
+                source_meta={"result_status": "success"},
+            )
+            actual_values = {
+                str(row.get(facts.get("group_column") or "")): row.get(metric_column)
+                for row in facts.get("facts") or []
+            }
+            if (
+                facts.get("status") != "success"
+                or facts.get("input_row_count") != 4
+                or facts.get("source_row_count") != 3
+                or facts.get("excluded_summary_row_count") != 1
+                or facts.get("metric_total") != sum(expected_values.values())
+                or facts.get("facts_value_total") != facts.get("metric_total")
+                or actual_values != expected_values
+                or "합계" in actual_values
+            ):
+                errors.append(f"{query}: summary row exclusion={facts!r}")
+
+        compact_source_df = pd.DataFrame(
+            [
+                {
+                    "제품코드": f"C{index:03d}", "제품명": f"제품{index:03d}",
+                    "제조사명": f"제조사{index:03d}", "제품분류명": "분류",
+                    "재고수량": 1, "재고금액": 1,
+                }
+                for index in range(101)
+            ]
+        )
+        compact_facts = dispatcher.build_current_table_interpretive_facts(
+            df=compact_source_df,
+            query="현재표 제조사별 재고수량 분석해줘",
+            source_action="제품재고현황 조회",
+            source_meta={"result_status": "success"},
+            max_rows=100,
+        )
+        compact_rows = compact_facts.get("facts") or []
+        summary_bucket = next(
+            (row for row in compact_rows if row.get("kind") == "summary_bucket"),
+            None,
+        )
+        if (
+            compact_facts.get("status") != "success"
+            or not compact_facts.get("facts_compacted")
+            or len(compact_rows) != 100
+            or not isinstance(summary_bucket, dict)
+            or summary_bucket.get("label") != "기타합산"
+            or summary_bucket.get("제조사명") != "기타합산"
+            or compact_facts.get("metric_total") != 101
+            or compact_facts.get("facts_value_total") != 101
+        ):
+            errors.append(f"interpretive facts summary bucket={compact_facts!r}")
+
+        alias_source_df = source_df.copy(deep=True)
+        alias_source_df["제조사"] = alias_source_df["제조사명"]
+        alias_source_df["제품분류"] = alias_source_df["제품분류명"]
+        alias_cases = (
+            ("현재표 제조사별 재고수량 분석해줘", "제조사명", "재고수량"),
+            ("현재표 제품분류별 재고수량 분석해줘", "제품분류명", "재고수량"),
+            ("현재표 제조사별 재고금액 분석해줘", "제조사명", "재고금액"),
+        )
+        for query, expected_group_column, expected_metric_column in alias_cases:
+            facts = dispatcher.build_current_table_interpretive_facts(
+                df=alias_source_df.copy(deep=True),
+                query=query,
+                source_action="제품재고현황 조회",
+                source_meta={"result_status": "success"},
+            )
+            if (
+                facts.get("status") != "success"
+                or facts.get("group_column") != expected_group_column
+                or facts.get("metric_column") != expected_metric_column
+            ):
+                errors.append(f"{query}: alias resolution={facts!r}")
+
+        missing_metric_query = "현재표 제조사별 존재하지않는수량 분석해줘"
+        missing_metric_facts = dispatcher.build_current_table_interpretive_facts(
+            df=alias_source_df.copy(deep=True),
+            query=missing_metric_query,
+            source_action="제품재고현황 조회",
+            source_meta={"result_status": "success"},
+        )
+        missing_metric_columns = list((missing_metric_facts.get("capability") or {}).get("missing_columns") or [])
+        if (
+            missing_metric_facts.get("status") != "column_unavailable"
+            or missing_metric_columns != ["존재하지않는수량"]
+            or "요청 컬럼" in missing_metric_columns
+        ):
+            errors.append(f"{missing_metric_query}: missing metric label={missing_metric_facts!r}")
+
+        chat_main_source = (PROJECT_ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+        handoff_start = chat_main_source.find("elif is_current_table_forced_followup:")
+        handoff_end = chat_main_source.find("elif (\n            is_implicit_analytics_current_followup", handoff_start)
+        handoff_source = chat_main_source[handoff_start:handoff_end]
+        if (
+            handoff_start < 0
+            or handoff_end < 0
+            or 'current_table_intent == "llm_analysis"' not in handoff_source
+            or "stage=immediate_llm_handoff" not in handoff_source
+            or "handled = not prepared" not in handoff_source
+            or handoff_source.find("_prepare_current_table_analysis_override(")
+            > handoff_source.find('st.session_state["__deferred_current_table_followup"]')
+            or "or '요청 컬럼'" in chat_main_source
+        ):
+            errors.append("current-table llm analysis handoff still depends on deferred panel rendering")
 
         generic = importlib.import_module("app.ui.current_table_followups.generic")
         if generic._find_common_column_filter(
