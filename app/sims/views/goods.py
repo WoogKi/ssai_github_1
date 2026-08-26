@@ -23,18 +23,10 @@ from app.sims.views.master_advanced_filters import (
 log = logging.getLogger("ssai")
 
 
-def _master_max_rows(default: int = 30000) -> int:
-    """
-    마스터 조회 공통 상한.
-    새 env를 만들지 않고 기존 SIMS_PANEL_DISPLAY_MAX_ROWS /
-    SIMS_CHAT_DISPLAY_MAX_ROWS 값을 사용한다.
-    """
+def _panel_display_max_rows(default: int = 1000) -> int:
+    """패널 렌더링 행수만 결정한다. SQL source 상한에는 사용하지 않는다."""
     try:
-        raw = (
-            os.getenv("SIMS_PANEL_DISPLAY_MAX_ROWS")
-            or os.getenv("SIMS_CHAT_DISPLAY_MAX_ROWS")
-            or str(default)
-        )
+        raw = os.getenv("SIMS_PANEL_DISPLAY_MAX_ROWS") or str(default)
         v = int(str(raw or default).strip())
     except Exception:
         v = int(default)
@@ -447,7 +439,7 @@ def _build_goods_master_llm_summary(
 
 def view_goods_list(widget_ns: str = "0") -> Dict[str, Any]:
     title = "제품코드 목록"
-    master_max_rows = _master_max_rows()
+    panel_display_max_rows = _panel_display_max_rows()
     st.subheader("제품코드(040) 목록")
     st.caption("제약사명/제품그룹명/구분명/제품분류명은 업무코드 기준 선택형 필터를 사용합니다.")
 
@@ -520,7 +512,7 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
         with c11:
             only_use = st.checkbox("사용(Use_Gu=0)만", value=True)
         with c12:
-            st.caption(f"조회상한: 최대 {master_max_rows:,}건")
+            st.caption(f"화면 표시: 최대 {panel_display_max_rows:,}건")
 
         audit_filter = render_master_audit_filter(
             prefix="goods",
@@ -561,8 +553,8 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
     physic_gu_name_kw = "" if str(physic_gu_name_sel or "").strip() == "전체" else str(physic_gu_name_sel or "").strip()
 
     only_use = bool(only_use)
-    display_top = int(master_max_rows)
-    fetch_top = int(master_max_rows)
+    display_top = int(panel_display_max_rows)
+    fetch_top = 0
 
     df = search_goods_full(
         top=fetch_top,
@@ -616,7 +608,7 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
         top=fetch_top,
     )
     params_out.pop("TopN", None)
-    params_out["조회상한"] = fetch_top
+    params_out["화면표시상한"] = display_top
 
     params_out["등록일자From"] = add_date_from
     params_out["등록일자To"] = add_date_to
@@ -658,12 +650,12 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
                 "row_count_total": 0,
                 "display_row_count": 0,
                 "show_n": 0,
-                "조회상한": fetch_top,
+                "화면표시상한": display_top,
                 "db_total_count": db_total_count,
                 "row_count_loaded": 0,
                 "download_row_count": 0,
                 "fetch_limit": fetch_top,
-                "fetch_limited": bool(db_total_count > 0),
+                "fetch_limited": False,
                 "empty_result": True,
                 "_force_push": True,
 
@@ -701,8 +693,7 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
 
     total = loaded_total
     df_display_all = _build_goods_display_df(df, detail=False)
-    # 화면 표시 제한은 chat/sims_panel 공통 표시 제한에서 처리한다.
-    df_display = df_display_all.copy()
+    df_display = df_display_all.head(display_top).copy()
     display_count = int(len(df_display))
 
     query_condition = _build_goods_query_condition(params_out, total, display_count)
@@ -734,7 +725,7 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
         "fetch_limit": fetch_top,
         "fetch_limited": bool(db_total_count > total),
         "column_count": int(len(df.columns)),
-        "조회상한": fetch_top,
+        "화면표시상한": display_top,
         "only_use": only_use,
         "keyword": keyword,
         "ven_nm_kw": ven_nm_kw,

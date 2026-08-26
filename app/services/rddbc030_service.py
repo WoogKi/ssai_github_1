@@ -196,41 +196,24 @@ def _norm_date_to(value: Optional[str]) -> str:
         return _last_day_of_month(digits)
     return ""
 
-def _service_master_max_rows(default: int = 30000) -> int:
-    """
-    마스터 조회 공통 상한.
-    새 env를 만들지 않고 기존 SIMS_PANEL_DISPLAY_MAX_ROWS /
-    SIMS_CHAT_DISPLAY_MAX_ROWS 값을 사용한다.
-    """
-    try:
-        raw = (
-            os.getenv("SIMS_PANEL_DISPLAY_MAX_ROWS")
-            or os.getenv("SIMS_CHAT_DISPLAY_MAX_ROWS")
-            or str(default)
-        )
-        v = int(str(raw or default).strip())
-    except Exception:
-        v = int(default)
-
-    if v < 1:
-        v = int(default)
-
-    return v
-
-
 def _normalize_top(value: int, default: int = 200, max_value: Optional[int] = None) -> int:
     try:
         v = int(value)
     except Exception:
         v = default
 
-    if v < 1:
+    if v < 0:
         v = default
 
     if max_value is None:
-        max_value = _service_master_max_rows()
+        return v
 
-    return min(v, int(max_value))
+    normalized_max = int(max_value)
+    if normalized_max <= 0:
+        return v
+    if v <= 0:
+        return 0
+    return min(v, normalized_max)
 
 
 def _active_clause(alias: str = "V") -> str:
@@ -292,8 +275,9 @@ def _code_join(alias_name: str, g_expr: str, t_expr: str) -> str:
 
 
 def _base_select(top: int) -> str:
+    top_clause = f"TOP {top}" if top > 0 else ""
     return f"""
-    SELECT TOP {top}
+    SELECT {top_clause}
            V.{COL_VEN_CD}        AS Rd03_Ven_Cd,
            V.{COL_VEN_NM}        AS Rd03_Ven_Nm,
            V.{COL_VEN_PRT}       AS Rd03_Ven_PRT,

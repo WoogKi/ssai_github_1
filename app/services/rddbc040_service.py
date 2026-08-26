@@ -269,7 +269,12 @@ def search_goods_full(
     T040, C040 = _get_table_and_cols()
     from_join, extra = _build_from_join()
 
-    top = int(top or 2000)
+    try:
+        top = int(top)
+    except (TypeError, ValueError):
+        top = 2000
+    if top < 0:
+        top = 2000
     keyword = (keyword or "").strip()
     with_count = bool(with_count)
     order_numeric = bool(order_numeric)
@@ -440,8 +445,9 @@ CROSS APPLY (
 
     order_expr = _sql_safe_int(extra["order_key"]) if order_numeric else extra["order_key"]
 
+    top_clause = f"TOP {top}" if top > 0 else ""
     select_sql = f"""
-SELECT TOP {top}
+SELECT {top_clause}
     a.*,
     {extra['ven_nm']} AS ven_nm,
     {extra['group_name']} AS group_name,

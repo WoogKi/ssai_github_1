@@ -149,6 +149,103 @@ def run_basic_checks() -> list[CheckResult]:
     for module_name, attr_name in required:
         results.append(_require_attr(module_name, attr_name))
 
+    # 채팅 master source 상한은 display ENV와 독립이다.
+    try:
+        limits = importlib.import_module("app.sims.nlq.master_source_limit")
+        resolve_limit = getattr(limits, "resolve_chat_source_limit")
+        previous = os.environ.get("SIMS_MAX_ROWS_CHAT")
+        previous_panel = os.environ.get("SIMS_PANEL_DISPLAY_MAX_ROWS")
+        try:
+            os.environ["SIMS_PANEL_DISPLAY_MAX_ROWS"] = "1000"
+            os.environ["SIMS_MAX_ROWS_CHAT"] = "0"
+            zero_ok = (
+                resolve_limit(2000) == 0
+                and resolve_limit(2000, action_cap=500) == 500
+                and resolve_limit(1000, action_cap=1000) == 1000
+            )
+            os.environ["SIMS_MAX_ROWS_CHAT"] = "1500"
+            positive_ok = (
+                resolve_limit(2000) == 1500
+                and resolve_limit(2000, action_cap=500) == 500
+            )
+        finally:
+            if previous is None:
+                os.environ.pop("SIMS_MAX_ROWS_CHAT", None)
+            else:
+                os.environ["SIMS_MAX_ROWS_CHAT"] = previous
+            if previous_panel is None:
+                os.environ.pop("SIMS_PANEL_DISPLAY_MAX_ROWS", None)
+            else:
+                os.environ["SIMS_PANEL_DISPLAY_MAX_ROWS"] = previous_panel
+
+        if zero_ok and positive_ok:
+            results.append(_ok("chat master source limit", "ENV 0=unlimited, 양수/action cap 계약"))
+        else:
+            results.append(_fail("chat master source limit", "SIMS_MAX_ROWS_CHAT resolver 계약 불일치"))
+    except Exception as e:
+        results.append(_fail("chat master source limit", f"{type(e).__name__}: {e}"))
+
+    try:
+        vendors = importlib.import_module("app.services.rddbc030_service")
+        base_select = getattr(vendors, "_base_select")
+        no_top_sql = str(base_select(0) or "")
+        if "SELECT TOP" not in no_top_sql.upper():
+            results.append(_ok("vendor SQL unlimited top", "top=0 → SQL TOP 생략"))
+        else:
+            results.append(_fail("vendor SQL unlimited top", "top=0인데 SQL TOP이 남아 있음"))
+    except Exception as e:
+        results.append(_fail("vendor SQL unlimited top", f"{type(e).__name__}: {e}"))
+
+    # 조건 없는 거래처 master 목록도 top=0 경로에서 handler가 완료되어야 한다.
+    try:
+        import pandas as pd
+
+        vmod = importlib.import_module("app.sims.nlq.nlq_vendors")
+        service = importlib.import_module("app.services.rddbc030_service")
+        view = importlib.import_module("app.sims.views.vendors")
+        original_search = service.search_vendors_full
+        original_display = view._prepare_vendor_display
+        original_push = vmod.push_sims_result_to_chat
+        original_summary = vmod._build_vendor_master_llm_summary
+        previous = os.environ.get("SIMS_MAX_ROWS_CHAT")
+        captured: list[dict[str, Any]] = []
+        calls: list[dict[str, Any]] = []
+
+        def fake_search(**kwargs):
+            calls.append(dict(kwargs))
+            return pd.DataFrame({"거래처명": ["fixture 거래처"], "거래처코드": ["00001"]})
+
+        try:
+            os.environ["SIMS_MAX_ROWS_CHAT"] = "0"
+            service.search_vendors_full = fake_search
+            view._prepare_vendor_display = lambda df: df.copy()
+            vmod.push_sims_result_to_chat = lambda payload, *_args, **_kwargs: captured.append(payload)
+            vmod._build_vendor_master_llm_summary = None
+            handled = vmod.try_handle_vendors_nlq(
+                "거래처 조회",
+                room={"messages": []},
+                session_state={},
+                make_ts=lambda: "fixture",
+                next_seq=lambda: 1,
+                logger=log,
+            )
+        finally:
+            service.search_vendors_full = original_search
+            view._prepare_vendor_display = original_display
+            vmod.push_sims_result_to_chat = original_push
+            vmod._build_vendor_master_llm_summary = original_summary
+            if previous is None:
+                os.environ.pop("SIMS_MAX_ROWS_CHAT", None)
+            else:
+                os.environ["SIMS_MAX_ROWS_CHAT"] = previous
+
+        if handled and calls and calls[-1].get("top") == 0 and captured:
+            results.append(_ok("vendor unfiltered top=0 handler", "거래처 조회 → handler/push, SQL TOP 생략 계약"))
+        else:
+            results.append(_fail("vendor unfiltered top=0 handler", f"handled={handled}, calls={calls!r}, pushed={len(captured)}"))
+    except Exception as e:
+        results.append(_fail("vendor unfiltered top=0 handler", f"{type(e).__name__}: {e}"))
+
     # 제품명 parser smoke check
     try:
         g = importlib.import_module("app.sims.nlq.nlq_goods")

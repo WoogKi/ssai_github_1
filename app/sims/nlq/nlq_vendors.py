@@ -166,6 +166,17 @@ def _has_vendor_master_anchor(txt: str) -> bool:
     )
 
 
+def _is_unfiltered_vendor_list_request(txt: str) -> bool:
+    """명시적인 거래처 master 목록 요청만 무조건부 source 조회로 허용한다."""
+    normalized = re.sub(r"[\s,?.!！？…]", "", str(txt or ""))
+    return bool(
+        re.fullmatch(
+            r"거래처(?:명|코드)?(?:목록|마스터)?(?:조회|검색|목록|마스터|찾아|찾아줘|보여줘|알려줘)?",
+            normalized,
+        )
+    )
+
+
 def _clean_master_token(s: str) -> str:
     s = _strip_tail_request_words(_strip_tail_josa(s or ""))
     s = _norm_kw(s)
@@ -1226,6 +1237,8 @@ def try_handle_vendors_nlq(
     if not _has_vendor_master_anchor(txt):
         return False
 
+    logger.info("[nlq.vendors] handler-enter unfiltered_list=%s", _is_unfiltered_vendor_list_request(txt))
+
     owner_kw = _extract_owner_keyword(txt)
     ven_nm_kw = forced_ven_nm_kw or _extract_vendorname_keyword(txt)
 
@@ -1320,24 +1333,31 @@ def try_handle_vendors_nlq(
     ]):
         ven_nm_kw = None
 
-    if not any([
+    has_filter = any([
         owner_kw, ven_nm_kw, phone_kw, biz_kw, sm_kw, addr_kw,
         sido_nm, gugun_nm, dong_nm, road_nm, road_addr_kw,
         rel_kw, vendor_scope,
         cost_apply_nm_kw, stock_apply_nm_kw,
         add_user_kw, add_date_from, add_date_to,
         mod_user_kw, mod_date_from, mod_date_to,
-    ]):
+    ])
+    if not has_filter and not _is_unfiltered_vendor_list_request(txt):
         return False
 
     from app.services import rddbc030_service as R03
+    from app.sims.nlq.master_source_limit import resolve_chat_source_limit
     from app.sims.views.vendors import _prepare_vendor_display
 
     try:
         sig = inspect.signature(R03.search_vendors_full)
         accepted = set(sig.parameters.keys())
+        accepts_var_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in sig.parameters.values()
+        )
 
 
+        action_cap = None
         kw_args = {
             "top": 2000,
             "only_active": True,
@@ -1348,9 +1368,11 @@ def try_handle_vendors_nlq(
         # 넓은 조건은 우선 500건까지만 조회한다.
         if cost_apply_nm_kw or stock_apply_nm_kw:
             kw_args["top"] = 500
+            action_cap = 500
 
         if owner_kw and not any([ven_nm_kw, phone_kw, biz_kw, sm_kw, addr_kw]):
             kw_args["top"] = min(int(kw_args.get("top") or 1000), 500)
+            action_cap = 500
 
         if owner_kw:
             kw_args["owner_nm"] = owner_kw
@@ -1397,6 +1419,7 @@ def try_handle_vendors_nlq(
         # 채팅 NLQ에서는 우선 500건까지만 조회한다.
         if cost_apply_nm_kw or stock_apply_nm_kw:
             kw_args["top"] = 500
+            action_cap = 500
 
         if add_user_kw:
             kw_args["add_user_nm"] = add_user_kw
@@ -1429,7 +1452,23 @@ def try_handle_vendors_nlq(
             elif "ven_nm" in accepted:
                 kw_args["ven_nm"] = rel_kw
 
-        call_args = {k: v for k, v in kw_args.items() if k in accepted}
+        kw_args["top"] = resolve_chat_source_limit(
+            kw_args["top"],
+            action_cap=action_cap,
+        )
+
+        call_args = (
+            dict(kw_args)
+            if accepts_var_kwargs
+            else {k: v for k, v in kw_args.items() if k in accepted}
+        )
+
+        logger.info(
+            "[nlq.vendors] source-limit requested_top=%s effective_top=%s action_cap=%s",
+            2000,
+            call_args.get("top"),
+            action_cap,
+        )
 
         logger.info(
             "[nlq.vendors] extracted owner=%r ven_nm=%r sm=%r phone=%r biz=%r "
@@ -1444,6 +1483,11 @@ def try_handle_vendors_nlq(
 
         df_raw = R03.search_vendors_full(**call_args)
         logger.info("[nlq.vendors] rows=%s", 0 if df_raw is None else len(df_raw))
+        try:
+            source_limit = int(call_args.get("top") or 0)
+        except (TypeError, ValueError):
+            source_limit = 0
+        source_limit_hit = source_limit > 0 and (0 if df_raw is None else len(df_raw)) >= source_limit
 
         if df_raw is None or df_raw.empty:
             return _push_vendor_text_local(
@@ -1704,7 +1748,11 @@ def try_handle_vendors_nlq(
 
         summary_line = _vendor_summary_line(query_summary)
 
-        if show_n >= total:
+        summary_basis = "전체 조회결과 기준"
+        if source_limit_hit:
+            note = f"조회결과: **{total}건** (조회 상한 {source_limit}건 도달; 전체 건수 미확인)"
+            summary_basis = "조회 상한 내 결과 기준"
+        elif show_n >= total:
             note = f"조회결과: **{total}건** (전부 표시)"
         else:
             note = f"조회결과: **{total}건** (표시는 상위 {show_n}건) — 더 보려면 조건을 좁히거나 패널 필터를 사용하세요."
@@ -1745,7 +1793,11 @@ def try_handle_vendors_nlq(
             "records": df_show.to_dict(orient="records"),
 
 
-            "message": f"거래처 목록 {total:,}건",
+            "message": (
+                f"거래처 목록 {total:,}건 (조회 상한 도달: 전체 건수 미확인)"
+                if source_limit_hit
+                else f"거래처 목록 {total:,}건"
+            ),
             "meta": {
                 "nlq": True,
                 "master_nlq": True,
@@ -1760,6 +1812,8 @@ def try_handle_vendors_nlq(
                 "row_count_total": int(total),
                 "display_row_count": int(show_n),
                 "show_n": int(show_n),
+                "source_limit": source_limit,
+                "source_limit_hit": source_limit_hit,
                 "scope": vendor_scope,
                 "scope_label": vendor_scope_label,
                 "analysis_type": "vendor_master",
@@ -1768,7 +1822,7 @@ def try_handle_vendors_nlq(
                 "vendor_master_summary": vendor_master_summary,
                 "analysis_row_count": int(total),
                 "row_count_total_for_analysis": int(total),
-                "summary_basis": "전체 조회결과 기준",
+                "summary_basis": summary_basis,
                 "summary_md": note,
                 "source": "거래처마스터(Rddbc030)",
                 "ts": dt.datetime.now().isoformat(timespec="seconds"),
@@ -1778,6 +1832,11 @@ def try_handle_vendors_nlq(
         }
 
         push_sims_result_to_chat(result, "거래처 목록")
+        logger.info(
+            "[nlq.vendors] handler-complete handled=True rows=%s source_limit=%s",
+            total,
+            source_limit,
+        )
         session_state["__scroll_to_msg"] = (
             session_state.get("__sims_last_msg_id") or session_state.get("__scroll_to_msg")
         )

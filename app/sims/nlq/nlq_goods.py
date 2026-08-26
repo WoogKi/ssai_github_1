@@ -9,6 +9,7 @@ import uuid
 import pandas as pd
 
 from app.services.rddbc040_service import search_goods_full, get_goods_detail_full
+from app.sims.nlq.master_source_limit import resolve_chat_source_limit
 from app.ui.chat_middleware import push_sims_result_to_chat
 from app.services.utils import apply_labels
 from app.sims.views.master_advanced_filters import (
@@ -835,6 +836,11 @@ def _push_goods_result(
     df_display_all = _ensure_df(df_display)
 
     total = int(len(df_full))
+    try:
+        source_limit = int(params_out.get("TopN") or 0)
+    except (TypeError, ValueError):
+        source_limit = 0
+    source_limit_hit = source_limit > 0 and total >= source_limit
     display_limit = 500
     df_display_limited = df_display_all.head(display_limit).copy()
     display_count = int(len(df_display_limited))
@@ -850,6 +856,12 @@ def _push_goods_result(
     )
     llm_summary_md = str(goods_master_summary.get("llm_summary_md") or "")
 
+    result_message = f"{title} {total:,}건" if total > 0 else "해당 조회조건의 자료가 없습니다."
+    summary_basis = "전체 조회결과 기준"
+    if source_limit_hit:
+        result_message = f"{title} {total:,}건 (조회 상한 도달: 전체 건수 미확인)"
+        summary_basis = "조회 상한 내 결과 기준"
+
     result = {
         "final": True,
         "type": "table",
@@ -860,7 +872,7 @@ def _push_goods_result(
         "df_display": df_display_limited,
         "records": df_display_limited.to_dict(orient="records") if not df_display_limited.empty else [],
         "columns": list(df_display_limited.columns) if not df_display_limited.empty else [],
-        "message": f"{title} {total:,}건" if total > 0 else "해당 조회조건의 자료가 없습니다.",
+        "message": result_message,
         "meta": {
             "nlq": True,
             "master_nlq": True,
@@ -873,6 +885,8 @@ def _push_goods_result(
             "row_count_total": total,
             "display_row_count": display_count,
             "show_n": display_count,
+            "source_limit": source_limit,
+            "source_limit_hit": source_limit_hit,
 
             "source": source,
             "query_summary": condition_text,
@@ -885,9 +899,9 @@ def _push_goods_result(
             "goods_master_summary": goods_master_summary,
             "analysis_row_count": total,
             "row_count_total_for_analysis": total,
-            "summary_basis": "전체 조회결과 기준",
+            "summary_basis": summary_basis,
             "field_notes": (
-                "제품 마스터 분석은 전체 조회결과 기준 집계요약을 우선 근거로 답합니다. "
+                f"제품 마스터 분석은 {summary_basis} 집계요약을 우선 근거로 답합니다. "
                 "화면 표시는 일부 행으로 제한될 수 있습니다."
             ),
         },
@@ -1032,8 +1046,9 @@ def try_handle_goods_nlq(
 
         if 1 < len(keyword) <= 20:
 
+            top = resolve_chat_source_limit(2000)
             df = search_goods_full(
-                top=2000,
+                top=top,
                 keyword=keyword,
                 only_use=True,
                 with_count=False,
@@ -1046,7 +1061,7 @@ def try_handle_goods_nlq(
                 df = apply_labels(df, "rddbc040")
 
             df_display = _build_goods_display_df(df, detail=False)
-            params_out = _build_goods_params(keyword=keyword, only_use=True, top=2000)
+            params_out = _build_goods_params(keyword=keyword, only_use=True, top=top)
             query_summary = _build_goods_query_summary(keyword=keyword)
 
             if df_display.empty:
@@ -1180,19 +1195,24 @@ def try_handle_goods_nlq(
     if unit_price_kw or final_price_date_kw:
         only_use = False
 
+    action_cap = None
     if add_user_nm_kw or add_date_from or add_date_to:
         # 등록자/등록일자는 서비스 SQL 조건으로 전달한다.
         top = 2000
 
     elif group_name_kw or di_name_kw or physic_gu_name_kw:
-        # 제품그룹/구분/분류는 범위가 넓어서 NLQ에서는 우선 1000건까지만 표시한다.
+        # 제품그룹/구분/분류 wide filter의 기존 성능 보호 상한.
         top = 1000
+        action_cap = 1000
 
     elif mod_user_nm_kw or mod_date_from or mod_date_to:
-        # 수정자/수정일자는 조건 범위가 넓을 수 있으므로 속도 우선.
+        # 수정자/수정일자 wide filter의 기존 성능 보호 상한.
         top = 1000
+        action_cap = 1000
     else:
         top = 2000
+
+    top = resolve_chat_source_limit(top, action_cap=action_cap)
 
     params_out = _build_goods_params(
         physic_cd=physic_cd,

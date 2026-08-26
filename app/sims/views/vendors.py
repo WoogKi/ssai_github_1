@@ -32,18 +32,10 @@ from app.sims.views.master_advanced_filters import (
 log = logging.getLogger("ssai")
 
 
-def _master_max_rows(default: int = 30000) -> int:
-    """
-    마스터 조회 공통 상한.
-    새 env를 만들지 않고 기존 SIMS_PANEL_DISPLAY_MAX_ROWS /
-    SIMS_CHAT_DISPLAY_MAX_ROWS 값을 사용한다.
-    """
+def _panel_display_max_rows(default: int = 1000) -> int:
+    """패널 렌더링 행수만 결정한다. SQL source 상한에는 사용하지 않는다."""
     try:
-        raw = (
-            os.getenv("SIMS_PANEL_DISPLAY_MAX_ROWS")
-            or os.getenv("SIMS_CHAT_DISPLAY_MAX_ROWS")
-            or str(default)
-        )
+        raw = os.getenv("SIMS_PANEL_DISPLAY_MAX_ROWS") or str(default)
         v = int(str(raw or default).strip())
     except Exception:
         v = int(default)
@@ -693,7 +685,7 @@ def _post_filter_vendor_refs(
 # 거래처 기본 목록
 # ─────────────────────────
 def render_vendor_list() -> Dict[str, Any]:
-    master_max_rows = _master_max_rows()
+    panel_display_max_rows = _panel_display_max_rows()
     st.subheader("🏢 거래처 목록")
     st.caption("거래처그룹명/거래처종류명은 업무코드 기준 선택형 필터를 사용합니다.")
 
@@ -773,7 +765,7 @@ def render_vendor_list() -> Dict[str, Any]:
         with c11:
             only_active = st.checkbox("사용중만", value=True, key=f"__vendors_only_active__{ns}")
         with c12:
-            st.caption(f"조회상한: 최대 {master_max_rows:,}건")
+            st.caption(f"화면 표시: 최대 {panel_display_max_rows:,}건")
 
         
 #   고급조회
@@ -835,12 +827,12 @@ def render_vendor_list() -> Dict[str, Any]:
         "수정일자From": mod_date_from,
         "수정일자To": mod_date_to,
 
-        "조회상한": int(master_max_rows),
+        "화면표시상한": int(panel_display_max_rows),
     }
 
     try:
-        display_top = int(master_max_rows)
-        fetch_top = int(master_max_rows)
+        display_top = int(panel_display_max_rows)
+        fetch_top = 0
 
         df_raw = _search_vendors_service(
             top=fetch_top,
@@ -880,8 +872,7 @@ def render_vendor_list() -> Dict[str, Any]:
         total = int(len(df_raw))
 
         df_display_all = _prepare_vendor_display(df_raw)
-        # 화면 표시 제한은 chat/sims_panel 공통 표시 제한에서 처리한다.
-        df_display = df_display_all.copy()
+        df_display = df_display_all.head(display_top).copy()
 
         display_count = int(len(df_display))
 
