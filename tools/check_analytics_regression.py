@@ -727,7 +727,7 @@ def run_basic_checks() -> list[CheckResult]:
                             stretch_width_counts[node.func.attr] += 1
 
             expected_stretch_width_counts = {
-                "button": 43,
+                "button": 45,
                 "form_submit_button": 38,
                 "dataframe": 12,
                 "download_button": 5,
@@ -6647,8 +6647,10 @@ def run_basic_checks() -> list[CheckResult]:
                 and "focus({ preventScroll: true })" not in main_src
                 and 'composer_submission = st.chat_input(' in main_src
                 and 'accept_file="multiple" if can_upload_file else False' in main_src
+                # The root composer follows chat rendering so the STT slot can
+                # occupy the single region immediately above it.
                 and main_src.index('composer_submission = st.chat_input(')
-                < main_src.index('with st.container():')
+                > main_src.index('with st.container():')
             )
             has_chronological_render_merge = (
                 "def _build_room_render_messages" in main_src
@@ -16741,6 +16743,63 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
             and not parsed_residual
         )
         results.append(_ok("dashboard NLQ labelled condition boundaries", repr(parsed_conditions)) if parse_ok else _fail("dashboard NLQ labelled condition boundaries", f"conditions={parsed_conditions!r}, residual={parsed_residual!r}"))
+
+        terminal_punctuation_cases = (
+            "SIMS 일일점검",
+            "SIMS 일일점검.",
+            "SIMS 일일점검!",
+            "SIMS 일일점검?",
+            "SIMS 일일점검…",
+        )
+        terminal_punctuation_ok = all(
+            router._dashboard_nlq_residual(query) == ""
+            for query in terminal_punctuation_cases
+        )
+        results.append(
+            _ok("dashboard NLQ terminal punctuation leaves no supplier residual", repr(terminal_punctuation_cases))
+            if terminal_punctuation_ok
+            else _fail("dashboard NLQ terminal punctuation leaves no supplier residual", repr(terminal_punctuation_cases))
+        )
+
+        supplier_terminal_cases = (
+            ("SIMS 일일점검 제약사 한미.", "한미"),
+            ("SIMS 일일점검 제약사 한미!", "한미"),
+        )
+        supplier_terminal_ok = all(
+            router._extract_dashboard_nlq_conditions(query)[0].get("제약사") == expected_supplier
+            and not router._extract_dashboard_nlq_conditions(query)[1]
+            for query, expected_supplier in supplier_terminal_cases
+        )
+        results.append(
+            _ok("dashboard NLQ terminal punctuation preserves explicit supplier", repr(supplier_terminal_cases))
+            if supplier_terminal_ok
+            else _fail("dashboard NLQ terminal punctuation preserves explicit supplier", repr(supplier_terminal_cases))
+        )
+
+        plain_dashboard_params, plain_dashboard_notice = router._build_dashboard_nlq_params(
+            "SIMS 일일점검", session_state={}, logger=log
+        )
+        punctuated_dashboard_params, punctuated_dashboard_notice = router._build_dashboard_nlq_params(
+            "SIMS 일일점검.", session_state={}, logger=log
+        )
+        input_channel_scope_ok = (
+            plain_dashboard_notice is None
+            and punctuated_dashboard_notice is None
+            and plain_dashboard_params.get("product_supplier_scope_mode")
+            == punctuated_dashboard_params.get("product_supplier_scope_mode")
+            and plain_dashboard_params.get("manufacturer_codes")
+            == punctuated_dashboard_params.get("manufacturer_codes")
+            and plain_dashboard_params.get("supplier_scope_label")
+            == punctuated_dashboard_params.get("supplier_scope_label")
+        )
+        results.append(
+            _ok("dashboard NLQ text and auto-input equivalent supplier scope", repr(punctuated_dashboard_params))
+            if input_channel_scope_ok
+            else _fail(
+                "dashboard NLQ text and auto-input equivalent supplier scope",
+                f"plain={plain_dashboard_params!r}, punctuated={punctuated_dashboard_params!r}",
+            )
+        )
         for query, mode, supplier_count, manager_count in compound_cases:
             params, notice = router._build_dashboard_nlq_params(query, session_state={}, logger=log)
             actual_supplier_count = len(params.get("manufacturer_codes") or params.get("order_vendor_codes") or [])

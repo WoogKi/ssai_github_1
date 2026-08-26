@@ -4918,6 +4918,8 @@ def _dashboard_nlq_residual(text: str) -> str:
         residual,
     )
     residual = re.sub(r"\b(?:부터|까지|조회|보여줘|알려줘|실행)\b", " ", residual)
+    # 종결 문장부호만 제거한다. 남은 본문은 제약사/발주처 후보일 수 있다.
+    residual = re.sub(r"\s*[.!?…]+\s*$", " ", residual)
     return re.sub(r"\s+", " ", residual).strip(" ,:/-~")
 
 

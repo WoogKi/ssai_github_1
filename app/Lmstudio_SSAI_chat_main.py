@@ -6820,6 +6820,7 @@ def _current_company_chat_rooms(rooms: list[dict[str, Any]] | None = None) -> li
 def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_company_id: str) -> None:
     """Clear volatile chat state while retaining persisted user/company rooms."""
     ss = st.session_state
+    _clear_stt_pending_state(ss, reason="company_change")
     for key in (
         "current_room",
         "__queue_ai",
@@ -6856,6 +6857,24 @@ def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_com
         selected_company_id,
         len(ss.get("chat_rooms") or []),
     )
+
+
+def _clear_stt_pending_state(
+    session: dict[str, Any],
+    *,
+    reason: str,
+    keep_sent_token: bool = False,
+) -> None:
+    """Discard microphone preview state without retaining audio across scopes."""
+    pending = session.pop("__stt_pending", None)
+    session.pop("__stt_last_audio_token", None)
+    if not keep_sent_token:
+        session.pop("__stt_sent_token", None)
+    for key in list(session):
+        if str(key).startswith("__stt_preview_text_"):
+            session.pop(key, None)
+    if pending:
+        log.info("[stt.preview] action=clear reason=%s", reason)
 
 
 def _ensure_current_company_chat_scope() -> bool:
@@ -10750,6 +10769,7 @@ with st.sidebar:
     # ── (항상 보임) 핵심: 새 대화 + 목록 + 이름 변경 ────────────────
     def _new_room():
         # 사용자가 직접 누른 경우는 임시방이 아니라 정식 새 채팅방이다.
+        _clear_stt_pending_state(ss, reason="new_room")
         _clear_dashboard_lite_for_new_chat()
         _clear_chat_room_selector_request_state(ss)
         new_room = _select_pending_new_room(close_sims_state=True)
@@ -10916,6 +10936,7 @@ with st.sidebar:
         save_elapsed = time.perf_counter() - save_started
 
         ss.current_room = picked
+        _clear_stt_pending_state(ss, reason="room_change")
         filtered_room_ids = [
             str(room.get("id") or "")
             for room in rooms_filtered
@@ -12174,37 +12195,6 @@ DEFAULT_MODE = "Panel (A)"
 # =========================
 # 2) 채팅 렌더 + 파일/SIMS
 # =========================
-# Native chat_input is pinned by Streamlit and keeps the text composer and
-# file picker in one control without a separate, persistent upload panel.
-can_upload_file = require_permission("UPLOAD_FILE", show_error=False)
-composer_submission = st.chat_input(
-    "메시지를 입력하세요...",
-    key=f"__chat_composer_{int(st.session_state.get('__attachment_uploader_nonce', 0))}",
-    accept_file="multiple" if can_upload_file else False,
-    file_type=["pdf", "csv", "xlsx", "xls", "txt", "docx", "png", "jpg", "jpeg"],
-    disabled=st.session_state.get("__an_busy", False),
-)
-uploaded_files = []
-attachment_file_source = "chat_composer"
-if composer_submission is not None:
-    if isinstance(composer_submission, str):
-        composer_text = composer_submission.strip()
-    else:
-        composer_text = str(getattr(composer_submission, "text", "") or "").strip()
-        uploaded_files = list(getattr(composer_submission, "files", ()) or ())
-    if composer_text:
-        st.session_state["__sims_auto_user_input"] = composer_text
-    if uploaded_files:
-        log.info(
-            "[attachment.analysis] phase=composer_submit file_source=%s file_count=%s",
-            attachment_file_source,
-            len(uploaded_files),
-        )
-    elif composer_text:
-        # chat_input returns after the top-of-run input dispatcher. Queue one
-        # clean rerun so ordinary text keeps the former Enter-send behavior.
-        st.rerun()
-
 with st.container():
 
 
@@ -13419,6 +13409,124 @@ with st.container():
                 )
                 log.debug("[chat] stream_and_append_assistant finished")
 # =========================
+
+# Native chat_input remains the single root composer. The slot immediately
+# above it is reused for either STT progress or the resulting preview.
+stt_bottom_slot = st.empty()
+pending_stt = st.session_state.get("__stt_pending")
+if isinstance(pending_stt, dict):
+    current_scope_matches = (
+        str(pending_stt.get("room_id") or "") == str(st.session_state.get("current_room") or "")
+        and str(pending_stt.get("company_id") or "") == _selected_chat_company_id()
+    )
+    if not current_scope_matches:
+        _clear_stt_pending_state(st.session_state, reason="stale_scope")
+    else:
+        pending_token = str(pending_stt.get("token") or "")
+        preview_key = f"__stt_preview_text_{pending_token}"
+        with stt_bottom_slot.container():
+            st.caption("음성 인식 결과를 확인한 뒤 전송하세요.")
+            edited_transcript = st.text_area(
+                "음성 내용",
+                value=str(pending_stt.get("text") or ""),
+                key=preview_key,
+                height=96,
+            )
+            send_col, cancel_col = st.columns(2)
+            with send_col:
+                send_stt = st.button("음성 내용 전송", key=f"__stt_send_{pending_token}", width="stretch")
+            with cancel_col:
+                cancel_stt = st.button("취소", key=f"__stt_cancel_{pending_token}", width="stretch")
+        if cancel_stt:
+            _clear_stt_pending_state(st.session_state, reason="cancel")
+            st.rerun()
+        if send_stt:
+            text_to_send = str(edited_transcript or "").strip()
+            if not text_to_send:
+                with stt_bottom_slot.container():
+                    st.warning("전송할 음성 내용이 없습니다.")
+            elif pending_token == str(st.session_state.get("__stt_sent_token") or ""):
+                _clear_stt_pending_state(st.session_state, reason="duplicate_send")
+            else:
+                st.session_state["__stt_sent_token"] = pending_token
+                st.session_state["__sims_auto_user_input"] = text_to_send
+                _clear_stt_pending_state(
+                    st.session_state,
+                    reason="explicit_send",
+                    keep_sent_token=True,
+                )
+                log.info("[stt.preview] action=send")
+                st.rerun()
+
+can_upload_file = require_permission("UPLOAD_FILE", show_error=False)
+composer_submission = st.chat_input(
+    "메시지를 입력하세요...",
+    key=f"__chat_composer_{int(st.session_state.get('__attachment_uploader_nonce', 0))}",
+    accept_file="multiple" if can_upload_file else False,
+    file_type=["pdf", "csv", "xlsx", "xls", "txt", "docx", "png", "jpg", "jpeg"],
+    accept_audio=True,
+    audio_sample_rate=16000,
+    disabled=st.session_state.get("__an_busy", False),
+)
+uploaded_files = []
+recorded_audio = None
+attachment_file_source = "chat_composer"
+if composer_submission is not None:
+    if isinstance(composer_submission, str):
+        composer_text = composer_submission.strip()
+    else:
+        composer_text = str(getattr(composer_submission, "text", "") or "").strip()
+        uploaded_files = list(getattr(composer_submission, "files", ()) or ())
+        recorded_audio = getattr(composer_submission, "audio", None)
+    if composer_text:
+        st.session_state["__sims_auto_user_input"] = composer_text
+    if uploaded_files:
+        log.info(
+            "[attachment.analysis] phase=composer_submit file_source=%s file_count=%s",
+            attachment_file_source,
+            len(uploaded_files),
+        )
+    elif composer_text:
+        # chat_input returns after the top-of-run input dispatcher. Queue one
+        # clean rerun so ordinary text keeps the former Enter-send behavior.
+        st.rerun()
+
+if recorded_audio is not None:
+    audio_token = str(getattr(recorded_audio, "file_id", "") or "").strip()
+    if not audio_token:
+        audio_token = _new_ui_event_id("stt_audio")
+    if audio_token != str(st.session_state.get("__stt_last_audio_token") or ""):
+        try:
+            from app.services.stt_service import STTServiceError, transcribe_microphone_audio
+
+            _clear_stt_pending_state(st.session_state, reason="recording_replace")
+            stt_bottom_slot.empty()
+            with stt_bottom_slot.container():
+                with st.spinner("음성을 인식하고 있습니다..."):
+                    result = transcribe_microphone_audio(recorded_audio.getvalue())
+            st.session_state["__stt_pending"] = {
+                "token": audio_token,
+                "room_id": str(st.session_state.get("current_room") or ""),
+                "company_id": _selected_chat_company_id(),
+                "text": result.text,
+                "language": result.detected_language,
+                "segment_count": result.segment_count,
+                "elapsed_ms": result.elapsed_ms,
+            }
+            st.session_state["__stt_last_audio_token"] = audio_token
+            log.info(
+                "[stt.preview] action=ready elapsed_ms=%s language=%s segment_count=%s empty=%s",
+                result.elapsed_ms,
+                result.detected_language,
+                result.segment_count,
+                not bool(result.text),
+            )
+            st.rerun()
+        except STTServiceError as exc:
+            st.session_state["__stt_last_audio_token"] = audio_token
+            stt_bottom_slot.empty()
+            with stt_bottom_slot.container():
+                st.warning(str(exc))
 
 # =========================
 # 4) 파일 분석 → 요약 → 즉시 AI 요청 (항상 자동)
