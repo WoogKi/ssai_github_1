@@ -185,6 +185,7 @@ _COMMON_FILTER_DETAIL_WORDS = (
 
 _COMMON_FILTER_VALUE_SUFFIXES = (
     "상세하게보여주세요", "상세하게보여줘", "상세히보여주세요", "상세히보여줘",
+    "자세히보여주세요", "자세히보여줘",
     "상세표만들어줘", "상세표만들어", "목록으로보여줘", "목록보여줘",
     "리스트보여줘", "보여주세요", "보여줘요", "보여줘", "알려주세요", "알려줘",
     "조회해주세요", "조회해줘", "찾아주세요", "찾아줘", "검색해주세요", "검색해줘",
@@ -836,6 +837,17 @@ def _distinct_label_for_group(df: pd.DataFrame) -> tuple[str, str]:
     return "", "고유값수"
 
 
+def _common_group_ratio_label(*, distinct_label: str, is_distinct_basis: bool) -> str:
+    """공통 그룹 집계의 분자/분모 의미가 드러나는 비율 컬럼명."""
+    if not is_distinct_basis:
+        return "행수 비율"
+
+    basis_label = str(distinct_label or "고유값수").strip()
+    if basis_label.endswith("수") and len(basis_label) > 1:
+        basis_label = basis_label[:-1]
+    return f"전체 {basis_label} 대비 포함 비율"
+
+
 def _trend_sort_key(value: Any) -> int:
     order = {
         "증가": 1,
@@ -865,11 +877,19 @@ def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFram
         out[distinct_label] = g[distinct_col].nunique(dropna=True).values
         total_basis = max(int(work[distinct_col].nunique(dropna=True)), 1)
         ratio_basis = out[distinct_label]
+        ratio_label = _common_group_ratio_label(
+            distinct_label=distinct_label,
+            is_distinct_basis=True,
+        )
     else:
         out[distinct_label] = out["행수"]
         total_basis = max(int(len(work)), 1)
         ratio_basis = out["행수"]
-    out["비율"] = pd.to_numeric(ratio_basis, errors="coerce").fillna(0) / total_basis * 100
+        ratio_label = _common_group_ratio_label(
+            distinct_label=distinct_label,
+            is_distinct_basis=False,
+        )
+    out[ratio_label] = pd.to_numeric(ratio_basis, errors="coerce").fillna(0) / total_basis * 100
 
     sum_cols: list[str] = []
     for col in [str(c) for c in work.columns]:
@@ -899,7 +919,7 @@ def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFram
             out[progress_col] = out[group_col].map(progress.to_dict()).fillna(0).astype(float)
             break
 
-    front = ["순번", group_col, distinct_label, "행수", "비율"]
+    front = ["순번", group_col, distinct_label, "행수", ratio_label]
     preferred = [
         "총매출공급가액",
         "총매출세액",

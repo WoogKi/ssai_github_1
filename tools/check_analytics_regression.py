@@ -29,6 +29,7 @@ import io
 import importlib
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -4264,7 +4265,7 @@ def run_basic_checks() -> list[CheckResult]:
                 "현재표 문제점을 요약표로 만들어줘": "dataframe_table",
                 "현재표 주의사항을 표로 정리해줘": "dataframe_table",
                 "현재표 추세판정별 요약": "dataframe_table",
-                "현재표 제조사별 매출분석": "dataframe_table",
+                "현재표 제조사별 매출분석": "llm_analysis",
                 "현재표 제조사명별 요약": "dataframe_table",
             }
             intent_edge_mismatches = []
@@ -17149,7 +17150,9 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                 )
 
         analysis_cases = (
+            ("현재표 제조사별 재고수량 분석", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
             ("현재표 제조사별 재고수량 분석해줘", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
+            ("현재표 제품분류별 재고수량 분석", "product_class", "stock_quantity", [("순환기", 10), ("소화기", 3)]),
             ("현재표 제품분류별 재고수량 분석해줘", "product_class", "stock_quantity", [("순환기", 10), ("소화기", 3)]),
         )
         for query, expected_grouping, expected_metric, expected_pairs in analysis_cases:
@@ -17170,6 +17173,14 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                 or facts.get("metric") != expected_metric
                 or actual_pairs != expected_pairs
                 or facts.get("source_row_count") != len(source_df)
+                or not facts.get("metric_ratio_available")
+                or not math.isclose(float(facts.get("metric_ratio_total") or 0), 100.0, rel_tol=0.0, abs_tol=1e-9)
+                or not math.isclose(
+                    sum(float(row.get("비율") or 0) for row in facts.get("facts") or []),
+                    100.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
             ):
                 errors.append(f"{query}: interpretive_facts={facts!r}")
 
@@ -17216,6 +17227,14 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                 or facts.get("excluded_summary_row_count") != 1
                 or facts.get("metric_total") != sum(expected_values.values())
                 or facts.get("facts_value_total") != facts.get("metric_total")
+                or not facts.get("metric_ratio_available")
+                or not math.isclose(float(facts.get("metric_ratio_total") or 0), 100.0, rel_tol=0.0, abs_tol=1e-9)
+                or not math.isclose(
+                    sum(float(row.get("비율") or 0) for row in facts.get("facts") or []),
+                    100.0,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
                 or actual_values != expected_values
                 or "합계" in actual_values
             ):
@@ -17309,6 +17328,42 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
             errors.append("current-table llm analysis handoff still depends on deferred panel rendering")
 
         generic = importlib.import_module("app.ui.current_table_followups.generic")
+        generic_ratio_df = pd.DataFrame(
+            [
+                {"제품분류명": "기타", "제조사명": "제조사A", "제품명": "제품1"},
+                {"제품분류명": "기타", "제조사명": "제조사B", "제품명": "제품2"},
+                {"제품분류명": "내복제", "제조사명": "제조사A", "제품명": "제품3"},
+                {"제품분류명": "내복제", "제조사명": "제조사C", "제품명": "제품4"},
+            ]
+        )
+        generic_ratio = generic._build_common_group_summary(generic_ratio_df, "제품분류명")
+        generic_ratio_column = "전체 제조사 대비 포함 비율"
+        generic_ratio_values = pd.to_numeric(
+            generic_ratio.get(generic_ratio_column), errors="coerce"
+        ).tolist() if generic_ratio_column in generic_ratio.columns else []
+        if (
+            "비율" in generic_ratio.columns
+            or generic_ratio_column not in generic_ratio.columns
+            or not all(math.isclose(float(value), 66.66666666666666, rel_tol=0.0, abs_tol=1e-9) for value in generic_ratio_values)
+            or not math.isclose(sum(generic_ratio_values), 133.33333333333331, rel_tol=0.0, abs_tol=1e-9)
+        ):
+            errors.append(f"generic distinct ratio label/meaning={generic_ratio!r}")
+
+        generic_row_ratio_df = pd.DataFrame(
+            [{"제품분류명": "기타"}, {"제품분류명": "기타"}, {"제품분류명": "내복제"}]
+        )
+        generic_row_ratio = generic._build_common_group_summary(generic_row_ratio_df, "제품분류명")
+        if (
+            "행수 비율" not in generic_row_ratio.columns
+            or not math.isclose(
+                float(pd.to_numeric(generic_row_ratio["행수 비율"], errors="coerce").sum()),
+                100.0,
+                rel_tol=0.0,
+                abs_tol=1e-9,
+            )
+        ):
+            errors.append(f"generic row ratio label/meaning={generic_row_ratio!r}")
+
         if generic._find_common_column_filter(
             source_df, "현재표 부족제품수 top 10 보여줘"
         ) != ("", ""):
@@ -17318,6 +17373,24 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
         )
         if missing_filter != ("제조사명", "존재하지않는회사"):
             errors.append(f"missing-value filter intent was discarded={missing_filter!r}")
+        detail_phrase_df = pd.DataFrame(
+            [{"제품분류명": "기타", "제품코드": f"D{index:03d}"} for index in range(73)]
+            + [{"제품분류명": "내복제", "제품코드": "D999"}]
+        )
+        for detail_query in (
+            "현재표 제품분류명 기타 보여줘",
+            "현재표 제품분류명 기타 자세히 보여줘",
+            "현재표 제품분류명 기타 상세히 보여줘",
+        ):
+            detail_filter = generic._find_common_column_filter(detail_phrase_df, detail_query)
+            if detail_filter != ("제품분류명", "기타"):
+                errors.append(f"{detail_query}: detail filter={detail_filter!r}")
+                continue
+            detail_values = generic._series_compact_for_filter(
+                generic._first_series_for_column(detail_phrase_df, detail_filter[0])
+            )
+            if int(detail_values.str.contains(detail_filter[1], regex=False, na=False).sum()) != 73:
+                errors.append(f"{detail_query}: detail matched rows mismatch")
 
         for query, top_n, grouping, metric, group_col, metric_col, expected_pairs in cases:
             pushed: list[tuple[str, dict[str, Any]]] = []

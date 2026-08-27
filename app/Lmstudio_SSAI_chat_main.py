@@ -4476,6 +4476,8 @@ def _prepare_current_table_analysis_override(source_query: str) -> bool:
                 "fact_row_count": facts["fact_row_count"],
                 "metric_total": facts["metric_total"],
                 "facts_value_total": facts["facts_value_total"],
+                "metric_ratio_available": facts["metric_ratio_available"],
+                "metric_ratio_total": facts["metric_ratio_total"],
                 "facts_truncated": facts["facts_truncated"],
                 "facts_compacted": facts["facts_compacted"],
                 "summary_bucket_label": facts["summary_bucket_label"],
@@ -4502,6 +4504,8 @@ def _prepare_current_table_analysis_override(source_query: str) -> bool:
                     f"제외한 합계/소계/합성행수: {facts['excluded_summary_row_count']}\n"
                     f"집계 행수: {facts['fact_row_count']}\n"
                     f"전체 {facts['metric_label']} 합계: {facts['metric_total']}\n"
+                    "rows의 `비율`은 각 그룹의 행수나 고유 차원 수가 아니라, "
+                    "요청 지표 합계 대비 비율입니다. metric_ratio_available이 false이면 합계가 0이어서 비율을 설명하지 마세요.\n"
                     "`미지정`은 상세행에서만 집계 차원 값이 비어 있을 때의 값입니다.\n"
                     "rows의 kind=`summary_bucket` 및 label=`기타합산`은 실제 업무 entity가 아닌 압축 요약 버킷입니다.\n"
                     f"facts: {json.dumps(facts_payload, ensure_ascii=False, default=str)}"

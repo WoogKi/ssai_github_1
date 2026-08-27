@@ -169,6 +169,15 @@ def classify_current_table_followup_intent(query: str) -> str:
     if any(marker in intent_compact for marker in interpretive_analysis_markers):
         return "llm_analysis"
 
+    # A plain explicit-metric "분석" has the same user intent as "분석해줘":
+    # first create deterministic facts, then let the LLM interpret only those
+    # facts. It must not fall through to the legacy generic group-summary
+    # path, whose distinct-count ratio is unrelated to the requested metric.
+    # Metric-free analysis requests retain their existing deterministic summary
+    # contract (for example, "추세판정 분석").
+    if "분석" in intent_compact and _current_table_requested_metrics(text):
+        return "llm_analysis"
+
     current_table_summary_requests = ("요약", "집계", "분석", "매출")
     if (
         _requested_current_table_dimensions(text)
@@ -1139,10 +1148,28 @@ def build_current_table_interpretive_facts(
         ]
 
     metric_total = float(facts_df[metric_column].sum())
+    metric_ratio_available = not math.isclose(metric_total, 0.0, rel_tol=0.0, abs_tol=1e-12)
+    for row in limited_facts:
+        row["비율"] = (
+            float(row.get(metric_column) or 0) / metric_total * 100.0
+            if metric_ratio_available
+            else None
+        )
+    metric_ratio_total = (
+        float(sum(float(row.get("비율") or 0) for row in limited_facts))
+        if metric_ratio_available
+        else None
+    )
     facts_value_total = float(
         sum(float(row.get(metric_column) or 0) for row in limited_facts)
     )
-    if not math.isclose(metric_total, facts_value_total, rel_tol=0.0, abs_tol=1e-9):
+    if (
+        not math.isclose(metric_total, facts_value_total, rel_tol=0.0, abs_tol=1e-9)
+        or (
+            metric_ratio_available
+            and not math.isclose(float(metric_ratio_total or 0), 100.0, rel_tol=0.0, abs_tol=1e-9)
+        )
+    ):
         return {
             "status": "integrity_error",
             "capability": capability,
@@ -1167,6 +1194,8 @@ def build_current_table_interpretive_facts(
         "fact_row_count": int(len(facts_df)),
         "metric_total": metric_total,
         "facts_value_total": facts_value_total,
+        "metric_ratio_available": metric_ratio_available,
+        "metric_ratio_total": metric_ratio_total,
         "facts": limited_facts,
         "facts_truncated": facts_compacted,
         "facts_compacted": facts_compacted,
