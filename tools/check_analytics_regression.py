@@ -15014,6 +15014,55 @@ def _run_analytics_period_and_grouping_contract_checks() -> list[CheckResult]:
         ):
             raise AssertionError(f"analytics_manufacturer_filter={filter_action!r}/{filter_params!r}/{filter_policy!r}")
 
+        forecast_alias_cases = (
+            ("품목별 매출 예상", "", "", ""),
+            ("품목별 판매예상", "", "", ""),
+            ("품목별 판매예상 제약사 동제", "동제", "", "동제"),
+            ("품목별 판매예상 제약사 한미", "한미", "", "한미"),
+            ("품목별 판매예상 제품명 로자탐", "", "로자탐", ""),
+        )
+        for question, expected_maker, expected_product, expected_manufacturer_text in forecast_alias_cases:
+            action = router_mod._resolve_analytics_action(question)
+            prepared = router_mod._build_analytics_params(question, action)
+            intent = router_mod._analytics_intent_for_action(action, question)
+            manufacturer_text = router_mod._analytics_manufacturer_filter_text(question, prepared, intent)
+            actual_maker = str(prepared.get("maker_nm") or prepared.get("product_ven_nm") or "").strip()
+            actual_product = str(prepared.get("physic_nm") or "").strip()
+            if (
+                action != "품목별 매출 예상"
+                or actual_maker != expected_maker
+                or actual_product != expected_product
+                or manufacturer_text != expected_manufacturer_text
+            ):
+                raise AssertionError(
+                    "forecast_alias_manufacturer_boundary="
+                    f"{question!r}/{action!r}/{prepared!r}/manufacturer={manufacturer_text!r}"
+                )
+            resolution = router_mod._resolve_analytics_manufacturer_filter(
+                question,
+                prepared,
+                intent,
+                logging.getLogger("ssai.regression"),
+            )
+            resolved_params = dict(resolution.get("params") or {})
+            if resolution.get("status") != "not_needed":
+                raise AssertionError(
+                    "forecast_alias_manufacturer_resolver_called="
+                    f"{question!r}/{resolution!r}"
+                )
+            if expected_maker:
+                sql_params = dict(resolved_params)
+                sql_filters = sales_mod._build_filters(sql_params)
+                if (
+                    str(resolved_params.get("maker_cd") or resolved_params.get("product_ven_cd") or "").strip()
+                    or "Make_Ven.Rd03_Ven_Nm LIKE %(product_ven_nm_like)s" not in sql_filters
+                    or sql_params.get("product_ven_nm_like") != f"%{expected_maker}%"
+                ):
+                    raise AssertionError(
+                        "forecast_alias_explicit_manufacturer_like="
+                        f"{question!r}/{resolved_params!r}/{sql_filters!r}/{sql_params!r}"
+                    )
+
         trend_judge_cases = (
             ("품목별 매출 예상 2025년 감소 조회", "감소"),
             ("품목별 매출 예상 2025년 안정 조회", "안정"),

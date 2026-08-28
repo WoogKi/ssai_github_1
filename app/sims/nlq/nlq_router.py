@@ -1424,6 +1424,24 @@ def _strip_analytics_tail(value: Any) -> str:
     return s
 
 
+def _strip_analytics_action_phrases(value: Any, action: str) -> str:
+    """Remove registered phrases for one Analytics action without touching conditions."""
+    text = str(value or "")
+    canonical_action = str(action or "").strip()
+    phrases = {
+        str(phrase or "").strip()
+        for spec in _ANALYTICS_ACTION_SPECS
+        if str(spec.get("action") or "").strip() == canonical_action
+        for phrase in spec.get("phrases") or ()
+        if str(phrase or "").strip()
+    }
+    for phrase in sorted(phrases, key=lambda item: len(re.sub(r"\s+", "", item)), reverse=True):
+        tokens = [re.escape(token) for token in re.split(r"\s+", phrase) if token]
+        if tokens:
+            text = re.sub(r"\s*".join(tokens), " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 _ANALYTICS_GROUP_ACTIONS = {
     "제약사별 매출 추세 분석",
     "제약사별 매출 추세 분석 요약표",
@@ -2261,6 +2279,7 @@ def _analytics_manufacturer_filter_text(
 
     source = _resolve_analytics_stock_basis(text).get("text_without_stock_basis") or ""
     source = _strip_analytics_trend_judge_phrases(source)
+    source = _strip_analytics_action_phrases(source, "품목별 매출 예상")
     # An explicit product condition must never be repurposed as a
     # manufacturer condition merely because a product-grain forecast was
     # requested.
@@ -2287,6 +2306,23 @@ def _resolve_analytics_manufacturer_filter(
     """Resolve one product-forecast manufacturer filter from the shared vendor set."""
     out = dict(params or {})
     if any(str(out.get(key) or "").strip() for key in ("maker_cd", "product_ven_cd", "manufacturer_cd")):
+        return {"status": "not_needed", "params": out, "candidates": []}
+
+    # Explicitly labelled manufacturer names are already safe name predicates.
+    # Analytics services preserve them as Make_Ven.Rd03_Ven_Nm LIKE filters, so
+    # do not turn a multi-match name scope into a single-code candidate choice.
+    from app.services.io_nlq import _extract_io_compound_named_values
+
+    explicit_maker = str(_extract_io_compound_named_values(text).get("maker_nm") or "").strip()
+    named_maker = next(
+        (
+            str(out.get(key) or "").strip()
+            for key in ("maker_nm", "product_ven_nm", "manufacturer_nm")
+            if str(out.get(key) or "").strip()
+        ),
+        "",
+    )
+    if explicit_maker and named_maker:
         return {"status": "not_needed", "params": out, "candidates": []}
 
     search_text = _analytics_manufacturer_filter_text(text, out, intent)
