@@ -770,6 +770,8 @@ _ANALYTICS_ACTION_SPECS = (
         "phrases": (
             "품목별 매출 예상",
             "품목별 매출예상",
+            "품목별 판매 예상",
+            "품목별 판매예상",
             "매출 예상",
             "매출예상",
             "예상매출",
@@ -825,6 +827,8 @@ _ANALYTICS_TAIL_PATTERNS = (
     r"\s*품목별\s*매출추세.*$",
     r"\s*품목별\s*매출\s*예상.*$",
     r"\s*품목별\s*매출예상.*$",
+    r"\s*품목별\s*판매\s*예상.*$",
+    r"\s*품목별\s*판매예상.*$",
     r"\s*제약사별\s*매출\s*추세\s*분석\s*요약표.*$",
     r"\s*제약사별\s*매출추세\s*분석\s*요약표.*$",
     r"\s*제약사별\s*매출\s*추세\s*요약표.*$",
@@ -1036,6 +1040,41 @@ def _is_stock_shortage_explanation_request(txt: str) -> bool:
         return False
     query_markers = ("조회", "보여", "목록", "리스트", "현황", "품목", "제품", "이번달", "이번달")
     return not any(marker in compact for marker in query_markers)
+
+
+def _is_general_explanation_request(txt: str) -> bool:
+    """Keep workflow and calculation explanations out of master/NLQ lookup routes."""
+    compact = re.sub(r"\s+", "", str(txt or ""))
+    if not compact:
+        return False
+
+    explanation_markers = (
+        "어떻게",
+        "동작",
+        "구조",
+        "계산방식",
+        "계산방법",
+        "산정방식",
+        "산정방법",
+        "원리",
+        "얼마나알고",
+    )
+    if not any(marker in compact for marker in explanation_markers):
+        return False
+
+    # Explicit lookup commands remain master/transaction requests even when
+    # their entity names happen to include a workflow-related word.
+    lookup_markers = (
+        "조회",
+        "검색",
+        "목록",
+        "리스트",
+        "코드조회",
+        "코드목록",
+        "상위",
+        "top",
+    )
+    return not any(marker in compact.lower() for marker in lookup_markers)
 
 
 def _resolve_analytics_action(txt: str) -> str | None:
@@ -6559,6 +6598,9 @@ def try_handle_nlq(
     # Policy/criterion questions must remain on the explanatory route. They
     # are not a request to execute an inventory-shortage analytics action.
     if _is_stock_shortage_explanation_request(raw):
+        return False
+    if _is_general_explanation_request(raw):
+        logger.info("[nlq.router] general explanation question; defer to normal answer route")
         return False
 
     # A shared push boundary completes this record.  Starting here captures

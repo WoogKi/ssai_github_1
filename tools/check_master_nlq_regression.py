@@ -24,6 +24,7 @@ import logging
 import os
 import sys
 import traceback
+from unittest.mock import patch
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -260,6 +261,50 @@ def run_basic_checks() -> list[CheckResult]:
             results.append(_fail("goods 제품명 parser", "_extract_name_keyword 없음"))
     except Exception as e:
         results.append(_fail("goods 제품명 parser", f"{type(e).__name__}: {e}"))
+
+    # 시스템/업무 동작 설명은 loose master 검색을 거치지 않고 일반 답변 경로로 남아야 한다.
+    try:
+        router = importlib.import_module("app.sims.nlq.nlq_router")
+        goods = importlib.import_module("app.sims.nlq.nlq_goods")
+        vendors = importlib.import_module("app.sims.nlq.nlq_vendors")
+        explanation_cases = (
+            "지금 SIMS ERP 연결에 대해 얼마나 알고 있어?",
+            "ERP 연결 구조를 설명해줘",
+            "제품재고장은 어떻게 동작해?",
+            "현재고 계산 방식 알려줘",
+        )
+        with (
+            patch.object(goods, "try_handle_goods_nlq", return_value=True) as goods_handler,
+            patch.object(vendors, "try_handle_vendors_nlq", return_value=True) as vendor_handler,
+            patch.object(router, "_try_handle_io_nlq", return_value=True) as io_handler,
+        ):
+            handled = [
+                router.try_handle_nlq(
+                    question,
+                    room={},
+                    session_state={},
+                    make_ts=lambda: "fixture",
+                    next_seq=lambda: 1,
+                    logger=log,
+                )
+                for question in explanation_cases
+            ]
+        explanation_ok = (
+            not any(handled)
+            and goods_handler.call_count == 0
+            and vendor_handler.call_count == 0
+            and io_handler.call_count == 0
+        )
+        results.append(
+            _ok("general explanation bypasses loose master handlers", "normal answer route")
+            if explanation_ok
+            else _fail(
+                "general explanation bypasses loose master handlers",
+                f"handled={handled}, goods={goods_handler.call_count}, vendors={vendor_handler.call_count}, io={io_handler.call_count}",
+            )
+        )
+    except Exception as e:
+        results.append(_fail("general explanation bypasses loose master handlers", f"{type(e).__name__}: {e}"))
 
     # 거래처 loose name parser smoke check
     try:
