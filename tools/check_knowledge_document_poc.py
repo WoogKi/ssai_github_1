@@ -16,6 +16,8 @@ from app.services.knowledge_document_service import (  # noqa: E402
     APPROVAL_APPROVED,
     KnowledgeDocumentRepository,
     KnowledgeManagementDenied,
+    _knowledge_query_terms,
+    build_knowledge_chat_request_context,
     extract_text_artifact,
 )
 from app.services.knowledge_scope_policy import (  # noqa: E402
@@ -233,6 +235,59 @@ def test_lexical_normalization_and_all_terms() -> None:
         assert partial_false_positive.reason_code == "no_authorized_match"
     finally:
         shutil.rmtree(root)
+
+
+def test_technical_natural_language_query_preserves_authorization_boundary() -> None:
+    repo, root = _repo()
+    try:
+        document = _approved(
+            repo,
+            source_name="Rddbc120.txt",
+            source_key="erp-rddbc120",
+            content="# Rddbc120\n출고 입출고구분은 Rd12_Io_Gu 필드입니다.",
+            scope="GLOBAL",
+            knowledge_classification="ERP_DB_INTERNAL",
+        )
+        context = build_knowledge_chat_request_context(
+            user_id=8,
+            company_id=4,
+            permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ],
+            room_owner_user_id=8,
+            room_company_id=4,
+            technical_detail_mode=True,
+        )
+        allowed = repo.retrieve_for_chat(
+            query="Rddbc120의 출고 입출고구분 필드는 무엇인가?",
+            request_context=context,
+        )
+        assert allowed.reason_code == "ready"
+        assert {citation.document_id for citation in allowed.citations} == {document.document_id}
+
+        denied_context = build_knowledge_chat_request_context(
+            user_id=8,
+            company_id=4,
+            permission_codes=["RAG_USE"],
+            room_owner_user_id=8,
+            room_company_id=4,
+            technical_detail_mode=True,
+        )
+        denied = repo.retrieve_for_chat(
+            query="Rddbc120의 출고 입출고구분 필드는 무엇인가?",
+            request_context=denied_context,
+        )
+        assert denied.reason_code == "no_authorized_match"
+        assert denied.citations == ()
+    finally:
+        shutil.rmtree(root)
+
+
+def test_knowledge_query_term_normalizer_preserves_ambiguous_word_endings() -> None:
+    for term in ("효과", "허가", "경로"):
+        normalized, _ = _knowledge_query_terms(term)
+        assert normalized == (term,)
+
+    normalized, _ = _knowledge_query_terms("Rddbc120의 필드는 무엇인가?")
+    assert normalized == ("rddbc120",)
 
 
 def test_checked_manage_scope_contract() -> None:
@@ -506,7 +561,7 @@ def test_erp_db_read_gate_precedes_artifact_and_citation() -> None:
             query="INTERNAL-KEY",
             current_user_id=11,
             current_company_id=4,
-            permission_codes=["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ, KNOWLEDGE_ERP_DB_READ],
+            permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ],
             technical_detail_mode=True,
         )
         assert allowed.reason_code == "ready"
@@ -760,6 +815,8 @@ def main() -> None:
         test_truncated_context_never_emits_unrendered_citation,
         test_fail_closed_before_artifact_read,
         test_lexical_normalization_and_all_terms,
+        test_technical_natural_language_query_preserves_authorization_boundary,
+        test_knowledge_query_term_normalizer_preserves_ambiguous_word_endings,
         test_checked_manage_scope_contract,
         test_checked_deny_has_no_storage_side_effects,
         test_erp_db_read_gate_precedes_artifact_and_citation,

@@ -351,6 +351,58 @@ def _lexical_parts(value: str) -> tuple[tuple[str, ...], str]:
     return tokens, "".join(tokens)
 
 
+_KNOWLEDGE_QUERY_FILLER_TERMS = frozenset(
+    {
+        "무엇",
+        "무엇인가",
+        "무엇인가요",
+        "무슨",
+        "어떤",
+        "어떻게",
+        "필드",
+        "정보",
+        "내용",
+        "값",
+        "알려줘",
+        "알려주세요",
+        "설명해줘",
+        "설명해주세요",
+        "찾아줘",
+        "찾아주세요",
+        "보여줘",
+        "보여주세요",
+        "확인해줘",
+        "확인해주세요",
+    }
+)
+_KOREAN_QUERY_PARTICLES = (
+    "으로",
+    "에서",
+    "부터",
+    "까지",
+    "의",
+    "은",
+    "는",
+    "을",
+    "를",
+)
+
+
+def _knowledge_query_terms(value: str) -> tuple[tuple[str, ...], str]:
+    """Drop Korean question filler while preserving unmatched semantic tokens."""
+    tokens, compact = _lexical_parts(value)
+    normalized: list[str] = []
+    for token in tokens:
+        candidate = token
+        for particle in _KOREAN_QUERY_PARTICLES:
+            if candidate.endswith(particle) and len(candidate) > len(particle):
+                candidate = candidate[: -len(particle)]
+                break
+        if candidate and candidate not in _KNOWLEDGE_QUERY_FILLER_TERMS:
+            normalized.append(candidate)
+    return tuple(normalized), compact
+
+
 def _sectionize(text: str) -> tuple[dict[str, str], ...]:
     """Keep Markdown headings as provenance boundaries without parsing tables."""
     parts: list[dict[str, str]] = []
@@ -915,7 +967,7 @@ class KnowledgeDocumentRepository:
 
     @staticmethod
     def _score(query: str, source: DocumentSource, section: dict[str, str]) -> int:
-        query_terms, compact_query = _lexical_parts(query)
+        query_terms, compact_query = _knowledge_query_terms(query)
         if not query_terms:
             return 0
         haystack_tokens, compact_haystack = _lexical_parts(

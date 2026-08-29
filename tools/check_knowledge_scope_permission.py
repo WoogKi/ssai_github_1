@@ -84,9 +84,15 @@ def main() -> None:
     for role_code in ("SYSTEM_ADMIN", "SSART_MANAGER"):
         _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code]), False, "technical_detail_mode_required")
         _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code], technical_detail_mode=True), True, "global_active")
+    _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ], technical_detail_mode=True), True, "global_active")
+    _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ], technical_detail_mode=True), False, "missing_erp_db_read")
     for role_code in ("SSART_STAFF", "WHOLESALE_MANAGER", "WHOLESALE_STAFF"):
-        _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code], technical_detail_mode=True), False, "missing_project_source_read")
+        _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code], technical_detail_mode=True), False, "missing_erp_db_read")
     _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions["WHOLESALE_READONLY"]), False, "missing_rag_use")
+    erp_project_source = _document("GLOBAL", classification="ERP_DB_INTERNAL", source_kind="PROJECT_SOURCE")
+    _assert(can_read_document(document=erp_project_source, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ], technical_detail_mode=True), False, "missing_project_source_read")
+    _assert(can_read_document(document=erp_project_source, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ], technical_detail_mode=True), False, "missing_erp_db_read")
+    _assert(can_read_document(document=erp_project_source, current_user_id=11, current_company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ, KNOWLEDGE_ERP_DB_READ], technical_detail_mode=True), True, "global_active")
     company_erp = _document("COMPANY", company_id=4, classification="ERP_DB_INTERNAL")
     _assert(can_read_document(document=company_erp, current_user_id=11, current_company_id=4, permission_codes=role_permissions["SYSTEM_ADMIN"], technical_detail_mode=True), True, "company_match")
     _assert(can_read_document(document=company_erp, current_user_id=11, current_company_id=6, permission_codes=role_permissions["SYSTEM_ADMIN"], technical_detail_mode=True), False, "company_mismatch")

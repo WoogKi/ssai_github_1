@@ -191,18 +191,14 @@ def can_read_document(
     if source_kind_error is not None:
         return source_kind_error
     permissions = _permissions(permission_codes)
-    requires_technical_detail = (
-        source_kind == _SOURCE_KIND_PROJECT_SOURCE
-        or classification.reason_code == "erp_db_internal_classification"
-    )
+    requires_project_source_read = source_kind == _SOURCE_KIND_PROJECT_SOURCE
+    requires_erp_db_read = classification.reason_code == "erp_db_internal_classification"
+    requires_technical_detail = requires_project_source_read or requires_erp_db_read
     if requires_technical_detail and not technical_detail_mode:
         return KnowledgeAccessDecision(False, "technical_detail_mode_required")
-    if requires_technical_detail and KNOWLEDGE_PROJECT_SOURCE_READ not in permissions:
+    if requires_project_source_read and KNOWLEDGE_PROJECT_SOURCE_READ not in permissions:
         return KnowledgeAccessDecision(False, "missing_project_source_read")
-    if (
-        classification.reason_code == "erp_db_internal_classification"
-        and KNOWLEDGE_ERP_DB_READ not in permissions
-    ):
+    if requires_erp_db_read and KNOWLEDGE_ERP_DB_READ not in permissions:
         return KnowledgeAccessDecision(False, "missing_erp_db_read")
     return KnowledgeAccessDecision(True, allowed_reason)
 
