@@ -831,10 +831,9 @@ def _is_same_grouping_dimension(left: str, right: str) -> bool:
         return False
     if left_norm == right_norm:
         return True
-    return (
-        right_norm in _group_aliases(left)
-        and left_norm in _group_aliases(right)
-    )
+    left_aliases = {left_norm, *_group_aliases(left)}
+    right_aliases = {right_norm, *_group_aliases(right)}
+    return bool(left_aliases & right_aliases)
 
 
 def _distinct_label_for_group(df: pd.DataFrame, *, group_col: str) -> tuple[str, str]:

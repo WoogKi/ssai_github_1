@@ -17537,6 +17537,65 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
         ):
             errors.append(f"generic manufacturer count/ratio contract={generic_manufacturer!r}")
 
+        manufacturer_alias_df = pd.DataFrame(
+            [
+                {"제조사": "제조사A", "제조사명": "제조사A", "제약사": "제조사A", "제약사명": "제조사A", "제품코드": "P1"},
+                {"제조사": "제조사A", "제조사명": "제조사A", "제약사": "제조사A", "제약사명": "제조사A", "제품코드": "P2"},
+                {"제조사": "제조사B", "제조사명": "제조사B", "제약사": "제조사B", "제약사명": "제조사B", "제품코드": "P3"},
+            ]
+        )
+        expected_alias_counts = {"제조사A": 2, "제조사B": 1}
+        for group_column in ("제조사", "제조사명", "제약사", "제약사명"):
+            alias_summary = generic._build_common_group_summary(manufacturer_alias_df, group_column)
+            alias_counts = dict(
+                zip(
+                    alias_summary[group_column].astype(str),
+                    pd.to_numeric(alias_summary.get("제품수"), errors="coerce").fillna(-1).astype(int),
+                )
+            ) if "제품수" in alias_summary.columns else {}
+            alias_ratios = pd.to_numeric(
+                alias_summary.get(manufacturer_ratio_column), errors="coerce"
+            ).tolist() if manufacturer_ratio_column in alias_summary.columns else []
+            if (
+                not generic._is_same_grouping_dimension(group_column, "제조사명")
+                or "제조사수" in alias_summary.columns
+                or "제약사수" in alias_summary.columns
+                or alias_counts != expected_alias_counts
+                or not math.isclose(sum(alias_ratios), 100.0, rel_tol=0.0, abs_tol=1e-9)
+            ):
+                errors.append(f"generic manufacturer alias self-distinct contract={group_column}/{alias_summary!r}")
+
+        alias_phrase_outputs: list[pd.DataFrame] = []
+        for query in (
+            "현재표 제조사별 분석",
+            "현재표 제조사별 분석해줘",
+            "현재표 제조사별 분석해 줘",
+        ):
+            pushed_alias: list[dict[str, Any]] = []
+            handled_alias = dispatcher.handle_current_table_followup_by_action(
+                df=manufacturer_alias_df.copy(deep=True),
+                query=query,
+                top_n=20,
+                table_key="fixture-current-table-manufacturer-alias",
+                source_action="제품재고현황 조회",
+                helpers={
+                    "push_table": lambda **kwargs: pushed_alias.append(kwargs) or True,
+                    "push_notice": lambda **_kwargs: False,
+                },
+                log=log,
+                source_meta={"result_status": "success"},
+            )
+            result_alias = pushed_alias[0].get("df") if len(pushed_alias) == 1 else None
+            if not handled_alias or not isinstance(result_alias, pd.DataFrame):
+                errors.append(f"{query}: manufacturer alias deterministic route={handled_alias!r}/{pushed_alias!r}")
+                continue
+            alias_phrase_outputs.append(result_alias.reset_index(drop=True))
+        if alias_phrase_outputs and any(
+            not frame.equals(alias_phrase_outputs[0])
+            for frame in alias_phrase_outputs[1:]
+        ):
+            errors.append("manufacturer alias analysis phrase variants produced different tables")
+
         if generic._find_common_column_filter(
             source_df, "현재표 부족제품수 top 10 보여줘"
         ) != ("", ""):
