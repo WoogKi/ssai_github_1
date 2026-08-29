@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import tempfile
 import time
 import logging
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import pandas as pd
@@ -68,6 +74,10 @@ class FrequencySnapshotPlan:
     stock_codes: tuple[str, ...]
     erp_sql_call_count: int = 2
     analytics_write_plan: str = "draft manifest 1 + immutable payload 1; approval/publish 0"
+
+
+class SnapshotGenerationInProgressError(SnapshotContractError):
+    """Fail closed when an identical snapshot generation is already running."""
 
 
 @dataclass(frozen=True)
@@ -172,8 +182,51 @@ def frequency_snapshot_key(plan: FrequencySnapshotPlan) -> SnapshotKey:
     )
 
 
+@contextmanager
+def frequency_snapshot_generation_guard(
+    plan: FrequencySnapshotPlan,
+    *,
+    lock_root: Path | None = None,
+) -> Iterable[SnapshotKey]:
+    """Serialize one company/month/scope generation across local CLI processes.
+
+    A stale lock intentionally remains fail-closed for an operator to inspect;
+    this prevents a crashed run from silently overlapping a later retry.
+    """
+    key = frequency_snapshot_key(plan)
+    digest_input = "|".join(
+        (
+            key.company_id,
+            key.snapshot_type,
+            key.evaluation_month,
+            key.scope_fingerprint,
+            key.schema_version,
+            key.algorithm_version,
+        )
+    )
+    lock_name = f"frequency_snapshot_{hashlib.sha256(digest_input.encode('utf-8')).hexdigest()}.lock"
+    root = lock_root or Path(tempfile.gettempdir()) / "ssai_snapshot_generation_locks"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / lock_name
+    try:
+        descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise SnapshotGenerationInProgressError(
+            "snapshot generation is already in progress for the same company, evaluation month, and scope"
+        ) from exc
+    try:
+        os.write(descriptor, b"ssai snapshot generation lock\n")
+        yield key
+    finally:
+        os.close(descriptor)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 _FREQUENCY_READ_CACHE_TTL_SECONDS = 300.0
-_frequency_read_cache: dict[SnapshotKey, tuple[float, SnapshotReadResult]] = {}
+_frequency_read_cache: dict[tuple[SnapshotKey, str], tuple[float, SnapshotReadResult]] = {}
 
 
 def _company_snapshot_repository(company_id: int) -> SqlServerSnapshotRepository:
@@ -195,11 +248,31 @@ def _snapshot_exception_code(exc: Exception) -> str:
     return f"{type(exc).__name__}{':' + sqlstate if sqlstate else ''}"
 
 
+def _operating_as_of_date(value: Any) -> str:
+    """Normalize the Dashboard policy date used to exclude incomplete bases."""
+    text = str(value or "").strip()
+    if not text:
+        return date.today().strftime("%Y%m%d")
+    if len(text) != 8 or not text.isdecimal():
+        raise SnapshotContractError("snapshot operating as_of_date must be YYYYMMDD")
+    return text
+
+
+def _resolve_operating_key(repo: Any, requested_key: SnapshotKey, as_of_date: str) -> SnapshotKey | None:
+    resolver = getattr(repo, "resolve_latest_eligible_key", None)
+    if not callable(resolver):
+        # Test doubles that predate the operating-read contract retain their
+        # exact-key behavior; the production repository always implements it.
+        return requested_key
+    return resolver(requested_key, available_through=as_of_date)
+
+
 def read_approved_frequency_snapshot(
     *,
     company_id: Any,
     evaluation_month: Any,
     stock_codes: Sequence[Any] | None,
+    as_of_date: Any = None,
     repository: Any | None = None,
 ) -> SnapshotReadResult:
     """Read only the approved snapshot, with a short process-local cache.
@@ -217,13 +290,26 @@ def read_approved_frequency_snapshot(
     except SnapshotContractError as exc:
         return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
     key = frequency_snapshot_key(plan)
+    try:
+        as_of = _operating_as_of_date(as_of_date)
+    except SnapshotContractError as exc:
+        return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
+    try:
+        repo = repository or _company_snapshot_repository(int(plan.company_id))
+        operating_key = _resolve_operating_key(repo, key, as_of)
+    except Exception as exc:
+        reason_code = _snapshot_exception_code(exc)
+        return SnapshotReadResult(status=SNAPSHOT_STATUS_STALE, reason=f"snapshot operating lookup unavailable: {reason_code}")
+    if operating_key is None:
+        return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason="no approved snapshot has a completed basis")
+    cache_key = (key, as_of)
     now = time.monotonic()
-    cached = _frequency_read_cache.get(key)
+    cached = _frequency_read_cache.get(cache_key)
     cache_age_ms = int((now - cached[0]) * 1000) if cached else 0
     log.info(
         "[dashboard.snapshot.reader] stage=key_cache_lookup company_id=%s evaluation_month=%s stock_code_count=%s scope_fingerprint=%s schema_version=%s algorithm_version=%s cache_hit=%s cache_age_ms=%s cached_status=%s",
-        key.company_id,
-        key.evaluation_month,
+        operating_key.company_id,
+        operating_key.evaluation_month,
         len(plan.stock_codes),
         key.scope_fingerprint[:12],
         key.schema_version,
@@ -236,8 +322,7 @@ def read_approved_frequency_snapshot(
         return cached[1]
     started = time.perf_counter()
     try:
-        repo = repository or _company_snapshot_repository(int(plan.company_id))
-        result = repo.read(key)
+        result = repo.read(operating_key)
     except Exception as exc:
         reason_code = _snapshot_exception_code(exc)
         result = SnapshotReadResult(status=SNAPSHOT_STATUS_STALE, reason=f"snapshot read unavailable: {reason_code}")
@@ -252,13 +337,13 @@ def read_approved_frequency_snapshot(
             int((time.perf_counter() - started) * 1000),
         )
     if repository is None and result.status == "ready":
-        _frequency_read_cache[key] = (now, result)
+        _frequency_read_cache[cache_key] = (now, result)
     elif repository is None:
-        _frequency_read_cache.pop(key, None)
+        _frequency_read_cache.pop(cache_key, None)
     log.info(
         "[dashboard.snapshot.reader] stage=reader_total company_id=%s evaluation_month=%s stock_code_count=%s scope_fingerprint=%s status=%s generation_no=%s payload_bytes=%s reason_code=%s elapsed_ms=%s",
-        key.company_id,
-        key.evaluation_month,
+        operating_key.company_id,
+        operating_key.evaluation_month,
         len(plan.stock_codes),
         key.scope_fingerprint[:12],
         result.status,
@@ -277,6 +362,7 @@ def read_approved_frequency_projection(
     stock_codes: Sequence[Any] | None,
     product_codes: Sequence[Any] | None = None,
     frequency_grade: str = "",
+    as_of_date: Any = None,
     repository: Any | None = None,
 ) -> FrequencyProjectionReadResult:
     """Read only the approved derived product-frequency rows for one exact key.
@@ -292,15 +378,22 @@ def read_approved_frequency_projection(
             stock_codes=stock_codes,
         )
         key = frequency_snapshot_key(plan)
+        as_of = _operating_as_of_date(as_of_date)
     except SnapshotContractError as exc:
         return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
     repo = repository or _company_snapshot_repository(int(plan.company_id))
+    try:
+        operating_key = _resolve_operating_key(repo, key, as_of)
+    except Exception as exc:
+        return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason=_snapshot_exception_code(exc))
+    if operating_key is None:
+        return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_MISSING, reason="no approved snapshot has a completed basis")
     reader = getattr(repo, "read_frequency_projection", None)
     if not callable(reader):
         return FrequencyProjectionReadResult(status="legacy", reason="projection reader is unavailable")
     try:
         return reader(
-            key,
+            operating_key,
             product_codes=tuple(str(code or "").strip() for code in product_codes or () if str(code or "").strip()),
             frequency_grade=str(frequency_grade or "").strip(),
         )
@@ -788,7 +881,7 @@ def _aggregate_result(frame: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
     return rows, diagnostics
 
 
-def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None) -> dict[str, Any]:
+def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None) -> dict[str, Any]:
     actor = str(created_by or "").strip()
     if not actor:
         raise SnapshotContractError("created_by is required")
@@ -828,6 +921,28 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
     draft = publish_relational(relational_snapshot, created_by=actor, force=bool(force))
     draft_generation_no = int(draft.generation_no or 0)
     draft_inspection = repo.inspect_generation(key, draft_generation_no)
+    operating_read = repo.read(key)
+    if draft.no_op:
+        if (
+            draft_generation_no > 0
+            and draft_inspection.status == "ready"
+            and draft_inspection.manifest_status == "published"
+            and draft_inspection.approval_status == "approved"
+            and draft_inspection.generation_no == draft_generation_no
+            and draft_inspection.checksum.lower() == relational_snapshot.checksum.lower()
+            and draft_inspection.representation == RELATIONAL_FREQUENCY_REPRESENTATION
+            and draft_inspection.relational_snapshot is not None
+            and operating_read.status == "ready"
+            and operating_read.generation_no == draft_generation_no
+        ):
+            return {
+                "plan": plan,
+                "relational_snapshot": relational_snapshot,
+                "draft": draft,
+                "read_status": operating_read.status,
+                "draft_inspection_status": draft_inspection.status,
+            }
+        raise SnapshotContractError("identical snapshot already exists but is not an approved operating generation")
     if (
         draft_generation_no <= 0
         or draft_inspection.status != "unapproved"
@@ -839,7 +954,6 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
         or draft_inspection.relational_snapshot is None
     ):
         raise SnapshotContractError("draft generation exact inspection failed before manual approval")
-    operating_read = repo.read(key)
     if operating_read.status == "ready" and operating_read.generation_no == draft_generation_no:
         raise SnapshotContractError("draft generation was exposed through the operating read before manual approval")
     if operating_read.status not in {"ready", "unapproved"}:
@@ -851,3 +965,17 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
         "read_status": operating_read.status,
         "draft_inspection_status": draft_inspection.status,
     }
+
+
+def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None) -> dict[str, Any]:
+    """Generate one exact snapshot draft while preventing an overlapping run."""
+    with frequency_snapshot_generation_guard(plan):
+        return _generate_frequency_snapshot_draft_locked(
+            plan=plan,
+            created_by=created_by,
+            timeout_seconds=timeout_seconds,
+            query_executor=query_executor,
+            repository=repository,
+            force=force,
+            progress_reporter=progress_reporter,
+        )

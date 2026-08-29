@@ -163,8 +163,53 @@ def test_approval_without_preserved_draft_supersedes_published_generation() -> N
         "approved draft must become the published generation",
     )
 
+
+def test_expected_mismatch_blocks_approval_before_publish() -> None:
+    state = _State()
+    factory = lambda: _Connection(state)
+    repository = SqlServerSnapshotRepository(
+        reader_connection_factory=factory,
+        writer_connection_factory=factory,
+        payload_validator=_validator,
+    )
+    payload = _payload(company="1")
+    normal_event_count = int(payload["summary"]["normal_event_count"])
+    payload["source_diagnostics"] = {
+        "source_row_count": normal_event_count,
+        "normal_positive_accepted_row_count": normal_event_count,
+        "normal_positive_duplicate_row_count": 0,
+        "normal_positive_conflicting_row_count": 0,
+        "normal_positive_missing_key_row_count": 0,
+        "normal_positive_nonintegral_row_count": 0,
+        "normal_nonpositive_row_count": 0,
+        "return_positive_row_count": 0,
+        "return_nonpositive_row_count": 0,
+        "other_tcode_row_count": 0,
+    }
+    payload["checksum"] = calculate_payload_checksum(payload)
+    key = snapshot_key_from_payload(payload)
+    candidate = repository.publish(key, payload, created_by="fixture-generator")
+    args = _expected_args(payload, int(candidate.generation_no or 0), 0)
+    args.expected_product_count += 1
+
+    tool = _load_tool_module()
+    try:
+        tool.run_approval_workflow(args, repository)
+    except ValueError as exc:
+        _assert("approval expectation mismatch: product_count" in str(exc), "mismatch must name the failed expectation")
+    else:
+        raise AssertionError("expected mismatch must block approval")
+
+    inspection = repository.inspect_generation(key, int(candidate.generation_no or 0))
+    _assert(inspection.manifest_status == "draft", "mismatch must leave the draft unpublished")
+    _assert(inspection.approval_status == "pending", "mismatch must leave approval pending")
+
 def main() -> int:
-    tests = [test_approval_postcheck_completes_and_preserves_draft, test_approval_without_preserved_draft_supersedes_published_generation]
+    tests = [
+        test_approval_postcheck_completes_and_preserves_draft,
+        test_approval_without_preserved_draft_supersedes_published_generation,
+        test_expected_mismatch_blocks_approval_before_publish,
+    ]
     for test in tests:
         test()
     print(f"PASS: snapshot approval post-check tests={len(tests)}")

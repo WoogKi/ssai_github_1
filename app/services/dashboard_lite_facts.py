@@ -3580,6 +3580,7 @@ def build_dashboard_lite_facts(
             evaluation_month=service_params.get("evaluation_month"),
             stock_codes=stock_codes,
             product_codes=projection_product_codes,
+            as_of_date=service_params.get("policy_date"),
         )
         if active_projection_reader is not None
         else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
@@ -3600,6 +3601,7 @@ def build_dashboard_lite_facts(
             company_id=service_params.get("company_id"),
             evaluation_month=service_params.get("evaluation_month"),
             stock_codes=stock_codes,
+            as_of_date=service_params.get("policy_date"),
         )
     elif projection.status == "legacy":
         frequency_snapshot = frequency_snapshot_reader(

@@ -528,6 +528,19 @@ def _inventory_frequency_context(params: Dict[str, Any], date_to: str) -> tuple[
     return company_id, evaluation_month, ""
 
 
+def _frequency_snapshot_as_of_date(params: Mapping[str, Any]) -> str | None:
+    """Pass the operating policy date to the shared Snapshot reader when present.
+
+    The requested evaluation month is provenance only for operating reads: it
+    must not make a future completed-basis Snapshot eligible before policy_date.
+    """
+    for key in ("policy_date", "as_of_date", "today"):
+        digits = "".join(ch for ch in clean_text(params.get(key)) if ch.isdigit())
+        if len(digits) == 8:
+            return digits
+    return None
+
+
 def _resolve_frequency_snapshot_grade_product_scope(
     params: Dict[str, Any],
     *,
@@ -561,18 +574,22 @@ def _resolve_frequency_snapshot_grade_product_scope(
 
     profile_scope_resolver = profile_scope_resolver or resolve_dashboard_profile_stock_scope
     snapshot_reader = snapshot_reader or read_approved_frequency_snapshot
+    as_of_date = _frequency_snapshot_as_of_date(params)
     try:
         scope = profile_scope_resolver(company_id=company_id)
         active_projection_reader = projection_reader
         if active_projection_reader is None and snapshot_reader is read_approved_frequency_snapshot:
             active_projection_reader = read_approved_frequency_projection
+        projection_kwargs = {
+            "company_id": company_id,
+            "evaluation_month": evaluation_month,
+            "stock_codes": list(scope.stock_codes),
+            "frequency_grade": grade,
+        }
+        if active_projection_reader is read_approved_frequency_projection and as_of_date:
+            projection_kwargs["as_of_date"] = as_of_date
         projection = (
-            active_projection_reader(
-                company_id=company_id,
-                evaluation_month=evaluation_month,
-                stock_codes=list(scope.stock_codes),
-                frequency_grade=grade,
-            )
+            active_projection_reader(**projection_kwargs)
             if active_projection_reader is not None
             else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
         )
@@ -591,10 +608,15 @@ def _resolve_frequency_snapshot_grade_product_scope(
             )
         )
     elif projection.status == "legacy":
+        snapshot_kwargs = {
+            "company_id": company_id,
+            "evaluation_month": evaluation_month,
+            "stock_codes": list(scope.stock_codes),
+        }
+        if snapshot_reader is read_approved_frequency_snapshot and as_of_date:
+            snapshot_kwargs["as_of_date"] = as_of_date
         snapshot = snapshot_reader(
-            company_id=company_id,
-            evaluation_month=evaluation_month,
-            stock_codes=list(scope.stock_codes),
+            **snapshot_kwargs,
         )
         meta["snapshot_status"] = clean_text(snapshot.status)
         meta["snapshot_reason"] = clean_text(snapshot.reason)
@@ -672,13 +694,17 @@ def attach_dashboard_frequency_snapshot(
         active_projection_reader = projection_reader
         if active_projection_reader is None and snapshot_reader is read_approved_frequency_snapshot:
             active_projection_reader = read_approved_frequency_projection
+        as_of_date = _frequency_snapshot_as_of_date(params)
+        projection_kwargs = {
+            "company_id": company_id,
+            "evaluation_month": evaluation_month,
+            "stock_codes": list(scope.stock_codes),
+            "product_codes": requested_codes,
+        }
+        if active_projection_reader is read_approved_frequency_projection and as_of_date:
+            projection_kwargs["as_of_date"] = as_of_date
         projection = (
-            active_projection_reader(
-                company_id=company_id,
-                evaluation_month=evaluation_month,
-                stock_codes=list(scope.stock_codes),
-                product_codes=requested_codes,
-            )
+            active_projection_reader(**projection_kwargs)
             if active_projection_reader is not None
             else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
         )
@@ -689,11 +715,14 @@ def attach_dashboard_frequency_snapshot(
             snapshot_generation_no = projection.generation_no
             snapshot_checksum = projection.checksum
         elif projection.status == "legacy":
-            snapshot = snapshot_reader(
-                company_id=company_id,
-                evaluation_month=evaluation_month,
-                stock_codes=list(scope.stock_codes),
-            )
+            snapshot_kwargs = {
+                "company_id": company_id,
+                "evaluation_month": evaluation_month,
+                "stock_codes": list(scope.stock_codes),
+            }
+            if snapshot_reader is read_approved_frequency_snapshot and as_of_date:
+                snapshot_kwargs["as_of_date"] = as_of_date
+            snapshot = snapshot_reader(**snapshot_kwargs)
             frequency_rows = frequency_rows_for_product_subset(snapshot, requested_codes)
             snapshot_status = str(snapshot.status or "missing")
             snapshot_reason = str(snapshot.reason or "")

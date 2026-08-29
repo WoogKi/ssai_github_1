@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import gzip
 import os
 import sys
 from pathlib import Path
@@ -15,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     FREQUENCY_PROJECTION_GRADES,
+    build_relational_frequency_snapshot_from_aggregates,
     build_frequency_projection,
     build_frequency_snapshot_payload,
     snapshot_key_from_payload,
@@ -80,6 +80,7 @@ class _State:
         self.payloads: dict[int, dict[str, Any]] = {}
         self.frequency_products: dict[int, list[dict[str, Any]]] = {}
         self.frequency_projections: dict[int, list[dict[str, Any]]] = {}
+        self.sql_calls: list[str] = []
         self.next_id = 1
 
 
@@ -97,9 +98,26 @@ class _Cursor:
         return all(str(item[name]) == str(value) for name, value in zip(names, values))
 
     def execute(self, sql: str, *params: Any) -> "_Cursor":
+        self.state.sql_calls.append(sql)
         self.row = None
         self.rows = []
-        if "storage_representation" in sql and "FROM snapshot.manifest" in sql and "snapshot.read.published" not in sql and "snapshot.approve.load" not in sql and "snapshot.projection.manifest" not in sql:
+        if "snapshot.operating.resolve_latest" in sql:
+            candidates = [
+                item for item in self.state.manifests
+                if str(item["company_id"]) == str(params[0])
+                and str(item["snapshot_type"]) == str(params[1])
+                and str(item["scope_fingerprint"]) == str(params[2])
+                and str(item["schema_version"]) == str(params[3])
+                and str(item["algorithm_version"]) == str(params[4])
+                and item["status"] == "published"
+                and item["approval_status"] == "approved"
+                and str(item["basis_to"]) <= str(params[5])
+                and str(item.get("source_watermark_status") or "") in {"verified", "unverified"}
+            ]
+            if candidates:
+                item = max(candidates, key=lambda value: (value["basis_to"], value["evaluation_month"], value["generation_no"]))
+                self.row = (item["evaluation_month"],)
+        elif "storage_representation" in sql and "FROM snapshot.manifest" in sql and "snapshot.read.published" not in sql and "snapshot.approve.load" not in sql and "snapshot.projection.manifest" not in sql:
             rows = [
                 m for m in self.state.manifests
                 if self._matches(m, params) and m["status"] == "published" and m["approval_status"] == "approved"
@@ -194,7 +212,7 @@ class _Cursor:
                 self.row = (
                     item["manifest_id"], item["generation_no"], item["checksum"], item["approval_status"],
                     item["approved_at"], item["approved_by"], item["approval_reason"],
-                    gzip.compress(str(payload["payload_json"]).encode("utf-16le")),
+                    payload["payload_json"],
                     payload["storage_checksum"], payload["payload_size"],
                 )
         elif "snapshot.projection.manifest" in sql:
@@ -282,6 +300,111 @@ class _Connection:
         return None
 
 
+class _RelationalWriteCursor:
+    def __init__(self) -> None:
+        self.row: tuple[Any, ...] | None = None
+        self.executemany_sql: list[str] = []
+
+    def execute(self, sql: str, *_params: Any) -> "_RelationalWriteCursor":
+        self.row = (1,) if "snapshot.publish.relational.manifest" in sql else None
+        return self
+
+    def executemany(self, sql: str, params_seq: list[tuple[Any, ...]]) -> "_RelationalWriteCursor":
+        if not params_seq:
+            raise AssertionError("empty executemany must not be called")
+        self.executemany_sql.append(sql)
+        return self
+
+    def fetchone(self) -> tuple[Any, ...] | None:
+        return self.row
+
+
+class _RelationalWriteConnection:
+    def __init__(self) -> None:
+        self.cursor_instance = _RelationalWriteCursor()
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self) -> _RelationalWriteCursor:
+        return self.cursor_instance
+
+    def commit(self) -> None:
+        self.commits += 1
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def close(self) -> None:
+        return None
+
+
+def test_relational_empty_monthly_activity_is_a_valid_noop_write() -> None:
+    diagnostics = {
+        "diagnostic_contract_version": 2,
+        "source_row_count": 0,
+        "normal_positive_accepted_row_count": 0,
+        "normal_positive_duplicate_row_count": 0,
+        "normal_positive_conflicting_row_count": 0,
+        "normal_positive_missing_key_row_count": 0,
+        "normal_positive_nonintegral_row_count": 0,
+        "normal_nonpositive_row_count": 0,
+        "return_positive_row_count": 0,
+        "return_nonpositive_row_count": 0,
+        "other_tcode_row_count": 0,
+        "normal_positive_row_count": 0,
+        "distinct_normal_event_count": 0,
+        "conflicting_event_count": 0,
+        "ignored_product_event_count": 0,
+    }
+    snapshot = build_relational_frequency_snapshot_from_aggregates(
+        company_id=2,
+        evaluation_month="202609",
+        stock_codes=["00001"],
+        product_codes=["P1", "P2"],
+        monthly_rows=[],
+        source_diagnostics=diagnostics,
+    )
+    connection = _RelationalWriteConnection()
+    repository = SqlServerSnapshotRepository(
+        reader_connection_factory=lambda: connection,
+        writer_connection_factory=lambda: connection,
+    )
+    result = repository.publish_relational(snapshot, created_by="fixture")
+    _assert(result.status == "draft" and result.generation_no == 1, "empty monthly activity still saves a draft")
+    _assert(connection.commits == 1 and connection.rollbacks == 0, "empty monthly activity commits normally")
+    _assert(
+        not any("snapshot.frequency_monthly_activity" in sql for sql in connection.cursor_instance.executemany_sql),
+        "empty monthly activity must skip executemany",
+    )
+    _assert(
+        any("snapshot.frequency_product" in sql for sql in connection.cursor_instance.executemany_sql)
+        and any("snapshot.frequency_projection" in sql for sql in connection.cursor_instance.executemany_sql),
+        "product and projection relational rows remain stored",
+    )
+
+
+def test_latest_eligible_operating_key_excludes_future_basis_and_mismatches() -> None:
+    state = _State()
+    key = SnapshotKey("1", "dashboard_inventory_outbound_frequency", "202608", "a" * 64, "1.0", "outbound_frequency_v1")
+    common = {
+        "company_id": key.company_id, "snapshot_type": key.snapshot_type,
+        "scope_fingerprint": key.scope_fingerprint, "schema_version": key.schema_version,
+        "algorithm_version": key.algorithm_version, "status": "published",
+        "approval_status": "approved", "source_watermark_status": "unverified",
+    }
+    state.manifests.extend([
+        {**common, "manifest_id": 1, "evaluation_month": "202608", "basis_from": "20250501", "basis_to": "20250731", "generation_no": 1},
+        {**common, "manifest_id": 2, "evaluation_month": "202609", "basis_from": "20250601", "basis_to": "20260831", "generation_no": 1},
+        {**common, "manifest_id": 3, "evaluation_month": "202610", "basis_from": "20250701", "basis_to": "20260930", "generation_no": 1, "scope_fingerprint": "b" * 64},
+        {**common, "manifest_id": 4, "evaluation_month": "202609", "basis_from": "20250601", "basis_to": "20260831", "generation_no": 2, "approval_status": "pending"},
+    ])
+    repository = SqlServerSnapshotRepository(reader_connection_factory=lambda: _Connection(state), writer_connection_factory=lambda: _Connection(state))
+    august = repository.resolve_latest_eligible_key(key, available_through="20260829")
+    september = repository.resolve_latest_eligible_key(key, available_through="20260901")
+    _assert(august is not None and august.evaluation_month == "202608", "future basis must not be selected before it completes")
+    _assert(september is not None and september.evaluation_month == "202609", "completed future evaluation becomes the newest operating read")
+
+
 def test_repository_lifecycle_and_isolation() -> None:
     state = _State()
     factory = lambda: _Connection(state)
@@ -322,7 +445,13 @@ def test_repository_lifecycle_and_isolation() -> None:
     _assert(approved.status == SNAPSHOT_STATUS_READY and ready.usable, "approved generation is readable")
     _assert(
         ready.payload == first_payload,
-        "compressed published transport must restore the exact canonical payload before validation",
+        "plain NVARCHAR published transport must restore the exact canonical payload before validation",
+    )
+    published_read_sql = [sql for sql in state.sql_calls if "snapshot.read.published" in sql]
+    _assert(published_read_sql, "published legacy read SQL must execute")
+    _assert(
+        all("COMPRESS(" not in sql.upper() for sql in published_read_sql),
+        "published legacy read must remain compatible with SQL Server 2008 without COMPRESS",
     )
     inspected_ready = repository.inspect_generation(key, 1)
     _assert(
@@ -581,6 +710,8 @@ def test_analytics_connector_fail_closed() -> None:
 def main() -> int:
     tests = (
         test_repository_lifecycle_and_isolation,
+        test_relational_empty_monthly_activity_is_a_valid_noop_write,
+        test_latest_eligible_operating_key_excludes_future_basis_and_mismatches,
         test_migration_idempotency_and_rollback,
         test_analytics_connector_fail_closed,
     )

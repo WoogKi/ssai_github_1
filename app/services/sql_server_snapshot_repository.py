@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import gzip
 import json
 import logging
 import time
@@ -65,18 +64,6 @@ def _canonical_payload(payload: Mapping[str, Any]) -> tuple[str, bytes]:
 
 def _storage_checksum(payload_bytes: bytes) -> str:
     return hashlib.sha256(payload_bytes).hexdigest()
-
-
-def _decode_compressed_payload(value: Any) -> str:
-    """Decode SQL Server COMPRESS(VARBINARY(NVARCHAR)) without changing payload bytes."""
-    if isinstance(value, str):
-        # In-memory repository fixtures model the logical value, not SQL transport bytes.
-        return value
-    try:
-        utf16_bytes = gzip.decompress(bytes(value))
-        return utf16_bytes.decode("utf-16le")
-    except (OSError, TypeError, UnicodeDecodeError, ValueError) as exc:
-        raise ValueError("compressed snapshot payload cannot be decoded") from exc
 
 
 def _key_values(key: SnapshotKey) -> tuple[str, str, str, str, str, str]:
@@ -414,14 +401,19 @@ class SqlServerSnapshotRepository:
                 ],
             )
             monthly_columns = ("month", "product_code", "stock_code", "occurrence_count", "outbound_quantity", "outbound_day_count")
-            cursor.executemany(
-                """INSERT INTO snapshot.frequency_monthly_activity (manifest_id, month, product_code, stock_code, occurrence_count, outbound_quantity, outbound_day_count, row_checksum)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                [
-                    (manifest_id, *(row[column] for column in monthly_columns), relational_row_checksum("frequency_monthly_activity", monthly_columns, tuple(row[column] for column in monthly_columns)))
-                    for row in snapshot.monthly_activity
-                ],
-            )
+            monthly_values = [
+                (manifest_id, *(row[column] for column in monthly_columns), relational_row_checksum("frequency_monthly_activity", monthly_columns, tuple(row[column] for column in monthly_columns)))
+                for row in snapshot.monthly_activity
+            ]
+            # A valid product universe can have no positive outbound events.
+            # pyodbc rejects executemany([]), while the native relational
+            # contract represents that state with X-grade product rows only.
+            if monthly_values:
+                cursor.executemany(
+                    """INSERT INTO snapshot.frequency_monthly_activity (manifest_id, month, product_code, stock_code, occurrence_count, outbound_quantity, outbound_day_count, row_checksum)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    monthly_values,
+                )
             contract = snapshot.source_contract
             contract_columns = ("source_table", "io_gu_gcode", "normal_tcode_from", "normal_tcode_to", "event_key_fields", "positive_quantity_expression", "return_tcode_from", "return_tcode_to", "returns_are_netted", "flag_exclusion_fields", "non_exclusion_flag_fields", "universe_mode", "dashboard_product_filters", "include_rd04_del_flag_e", "fingerprint_contract_version", "fingerprint_mode")
             contract_values = (
@@ -989,6 +981,58 @@ class SqlServerSnapshotRepository:
             if conn is not None:
                 conn.close()
 
+    def resolve_latest_eligible_key(
+        self,
+        key: SnapshotKey,
+        *,
+        available_through: str,
+    ) -> SnapshotKey | None:
+        """Resolve the newest completed approved generation for an operating read.
+
+        ``evaluation_month`` remains part of immutable generation identity.  It
+        is intentionally omitted only from this selection predicate so a
+        Dashboard read can keep using the newest completed basis rather than a
+        pre-created future evaluation month.
+        """
+        as_of = str(available_through or "").strip()
+        if len(as_of) != 8 or not as_of.isdecimal():
+            raise ValueError("available_through must be YYYYMMDD")
+        conn = None
+        try:
+            conn = self._reader_connection_factory()
+            row = conn.cursor().execute(
+                """
+                /* snapshot.operating.resolve_latest */
+                SELECT TOP 1 m.evaluation_month
+                FROM snapshot.manifest AS m
+                WHERE m.company_id=? AND m.snapshot_type=?
+                  AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
+                  AND m.status='published' AND m.approval_status='approved'
+                  AND m.basis_to <= ?
+                  AND m.source_watermark_status IN ('verified', 'unverified')
+                ORDER BY m.basis_to DESC, m.evaluation_month DESC, m.generation_no DESC
+                """,
+                key.company_id,
+                key.snapshot_type,
+                key.scope_fingerprint,
+                key.schema_version,
+                key.algorithm_version,
+                as_of,
+            ).fetchone()
+            if not row:
+                return None
+            return SnapshotKey(
+                company_id=key.company_id,
+                snapshot_type=key.snapshot_type,
+                evaluation_month=str(row[0]),
+                scope_fingerprint=key.scope_fingerprint,
+                schema_version=key.schema_version,
+                algorithm_version=key.algorithm_version,
+            )
+        finally:
+            if conn is not None:
+                conn.close()
+
     def read(self, key: SnapshotKey) -> SnapshotReadResult:
         # Native generations have no snapshot.payload row. Keep the legacy JSON
         # transport isolated instead of treating a missing payload as unavailable.
@@ -1044,7 +1088,7 @@ class SqlServerSnapshotRepository:
                 /* snapshot.read.published */
                 SELECT TOP 1 m.manifest_id, m.generation_no, m.checksum,
                        m.approval_status, m.approved_at, m.approved_by, m.approval_reason,
-                       COMPRESS(CONVERT(VARBINARY(MAX), p.payload_json)) AS payload_compressed,
+                       p.payload_json,
                        p.storage_checksum, p.payload_size
                 FROM snapshot.manifest m
                 INNER JOIN snapshot.payload p ON p.manifest_id=m.manifest_id
@@ -1058,7 +1102,7 @@ class SqlServerSnapshotRepository:
             _log_read_stage(key, "published_sql_execute", elapsed_ms=int((time.perf_counter() - started) * 1000))
             started = time.perf_counter()
             row = statement.fetchone()
-            transport_payload_size = len(bytes(row[7])) if row and not isinstance(row[7], str) else 0
+            transport_payload_size = len(str(row[7]).encode("utf-8")) if row else 0
             _log_read_stage(
                 key,
                 "published_sql_fetch",
@@ -1070,7 +1114,7 @@ class SqlServerSnapshotRepository:
                 return _finish(self._unavailable_status(cursor, key))
             generation_no = int(row[1])
             started = time.perf_counter()
-            payload_json = _decode_compressed_payload(row[7])
+            payload_json = str(row[7])
             payload_bytes = payload_json.encode("utf-8")
             payload_size = len(payload_bytes)
             _log_read_stage(key, "payload_byte_conversion", elapsed_ms=int((time.perf_counter() - started) * 1000), generation_no=generation_no, payload_bytes=payload_size)

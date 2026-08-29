@@ -46,6 +46,7 @@ from app.services.ssai_snapshot_repository import (  # noqa: E402
 )
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
     DashboardProfileStockScope,
+    read_approved_frequency_projection,
     resolve_dashboard_profile_stock_scope,
 )
 from app.services import product_inventory_service  # noqa: E402
@@ -838,6 +839,95 @@ def test_product_inventory_frequency_filter_totals_and_summary() -> None:
     )
 
 
+def test_operating_projection_selects_only_completed_approved_basis() -> None:
+    class _Repository:
+        def __init__(self) -> None:
+            self.resolved: list[tuple[str, str]] = []
+            self.read_keys: list[SnapshotKey] = []
+
+        def resolve_latest_eligible_key(self, key: SnapshotKey, *, available_through: str) -> SnapshotKey | None:
+            self.resolved.append((key.evaluation_month, available_through))
+            if available_through == "20260829":
+                return key
+            if available_through == "20260901":
+                return SnapshotKey(
+                    company_id=key.company_id, snapshot_type=key.snapshot_type,
+                    evaluation_month="202609", scope_fingerprint=key.scope_fingerprint,
+                    schema_version=key.schema_version, algorithm_version=key.algorithm_version,
+                )
+            return None
+
+        def read_frequency_projection(self, key: SnapshotKey, **_kwargs: Any) -> FrequencyProjectionReadResult:
+            self.read_keys.append(key)
+            return FrequencyProjectionReadResult(status="ready", rows=())
+
+    repository = _Repository()
+    common = {"company_id": 1, "evaluation_month": "202608", "stock_codes": ["00001"], "repository": repository}
+    august = read_approved_frequency_projection(**common, as_of_date="20260829")
+    september = read_approved_frequency_projection(**common, as_of_date="20260901")
+    no_candidate = read_approved_frequency_projection(**common, as_of_date="20260830")
+    _assert(august.status == "ready" and september.status == "ready", "eligible approved projections must remain readable")
+    _assert([key.evaluation_month for key in repository.read_keys] == ["202608", "202609"], "operating read must use selected completed basis key")
+    _assert(no_candidate.status == SNAPSHOT_STATUS_MISSING and not no_candidate.usable, "no completed approved candidate must fail closed")
+
+
+def test_inventory_prefilters_pass_policy_date_to_shared_operating_reader() -> None:
+    """Current-stock and product-inventory must share Dashboard's as-of boundary."""
+    calls: list[dict[str, Any]] = []
+    original_projection_reader = product_inventory_service.read_approved_frequency_projection
+
+    def _projection_reader(**kwargs: Any) -> FrequencyProjectionReadResult:
+        calls.append(dict(kwargs))
+        return FrequencyProjectionReadResult(
+            status="ready",
+            rows=({"product_code": "A1", "frequency_grade": "A", "occurrence_count_3m": 8, "data_status": "ready"},),
+            generation_no=9,
+            checksum="b" * 64,
+        )
+
+    scope = lambda **_kwargs: DashboardProfileStockScope(6, ("00001",), "ready", "fixture")
+    product_inventory_service.read_approved_frequency_projection = _projection_reader
+    try:
+        current_params = {
+            "company_id": 6,
+            "evaluation_month": "202609",
+            "policy_date": "20260829",
+            "current_stock_query": True,
+            "frequency_grade": "A",
+        }
+        current_meta = product_inventory_service._apply_current_stock_frequency_a_snapshot_scope(
+            current_params,
+            product_inventory_service._settings(current_params),
+            date_from="20260901",
+            date_to="20260930",
+            profile_scope_resolver=scope,
+        )
+        product_params = {
+            "company_id": 6,
+            "evaluation_month": "202609",
+            "policy_date": "20260829",
+            "frequency_grade": "A",
+            "date_from": "20260901",
+            "date_to": "20260930",
+            "month_from": "202609",
+            "month_to": "202609",
+            "stock_cds": ["00001"],
+        }
+        product_meta = product_inventory_service._apply_product_inventory_frequency_snapshot_scope(
+            product_params,
+            product_inventory_service._settings(product_params),
+            date_to="20260930",
+            profile_scope_resolver=scope,
+        )
+    finally:
+        product_inventory_service.read_approved_frequency_projection = original_projection_reader
+
+    _assert(current_meta["applied"] and product_meta["applied"], "ready common projections must preserve both A code_in paths")
+    _assert(len(calls) == 2, "each prefilter must read one shared projection")
+    _assert(all(call["evaluation_month"] == "202609" for call in calls), "evaluation month remains Snapshot provenance identity")
+    _assert(all(call["as_of_date"] == "20260829" for call in calls), "policy date must prevent a future basis from early operating use")
+
+
 def main() -> int:
     tests = (
         test_tcode_and_event_contract,
@@ -853,6 +943,8 @@ def main() -> int:
         test_frequency_projection_integrity_contract,
         test_projection_consumer_attachment_equality,
         test_product_inventory_frequency_filter_totals_and_summary,
+        test_operating_projection_selects_only_completed_approved_basis,
+        test_inventory_prefilters_pass_policy_date_to_shared_operating_reader,
     )
     for test in tests:
         test()

@@ -77,6 +77,16 @@ def _verify_expected(payload: Mapping[str, Any], args: argparse.Namespace) -> di
         "accepted_normal": int(diagnostics.get("normal_positive_accepted_row_count") or 0)
         == int(summary.get("normal_event_count") or 0),
     }
+    if not all(checks.values()):
+        failed = ", ".join(key for key, value in checks.items() if not value)
+        raise ValueError(f"approval expectation mismatch: {failed}")
+    return {
+        "product_count": summary.get("product_count"),
+        "normal_event_count": summary.get("normal_event_count"),
+        "grade_counts": actual_grades,
+        "source_diagnostics": diagnostics,
+        "checks": checks,
+    }
 
 
 def _inspection_authority(inspection: Any) -> Mapping[str, Any] | None:
@@ -97,16 +107,6 @@ def _inspection_authority(inspection: Any) -> Mapping[str, Any] | None:
             "grade_counts": grade_counts,
         },
         "source_diagnostics": native.source_diagnostics,
-    }
-    if not all(checks.values()):
-        failed = ", ".join(key for key, value in checks.items() if not value)
-        raise ValueError(f"approval expectation mismatch: {failed}")
-    return {
-        "product_count": summary.get("product_count"),
-        "normal_event_count": summary.get("normal_event_count"),
-        "grade_counts": actual_grades,
-        "source_diagnostics": diagnostics,
-        "checks": checks,
     }
 
 
