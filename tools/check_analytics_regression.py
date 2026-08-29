@@ -17205,6 +17205,9 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
         analysis_cases = (
             ("현재표 제조사별 재고수량 분석", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
             ("현재표 제조사별 재고수량 분석해줘", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
+            ("현재표 제조사별 재고수량 분석해 줘", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
+            ("현재표 제조사별 재고수량 분석 부탁해", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
+            ("현재표 제조사별 재고수량 분석 좀 해줘", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
             ("현재표 제품분류별 재고수량 분석", "product_class", "stock_quantity", [("순환기", 10), ("소화기", 3)]),
             ("현재표 제품분류별 재고수량 분석해줘", "product_class", "stock_quantity", [("순환기", 10), ("소화기", 3)]),
         )
@@ -17236,6 +17239,87 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                 )
             ):
                 errors.append(f"{query}: interpretive_facts={facts!r}")
+
+        generic_analysis_queries = (
+            "현재표 제조사별 분석",
+            "현재표 제조사별 분석해줘",
+            "현재표 제조사별 분석해 줘",
+            "현재표 제조사별 분석 부탁해",
+            "현재표 제조사별 분석 좀 해줘",
+        )
+        generic_analysis_outputs: list[pd.DataFrame] = []
+        for query in generic_analysis_queries:
+            if dispatcher.classify_current_table_followup_intent(query) != "dataframe_table":
+                errors.append(f"{query}: dimension-only analysis must remain deterministic")
+                continue
+            pushed_generic: list[dict[str, Any]] = []
+            handled_generic = dispatcher.handle_current_table_followup_by_action(
+                df=source_df.copy(deep=True),
+                query=query,
+                top_n=20,
+                table_key="fixture-current-table",
+                source_action="제품재고현황 조회",
+                helpers={
+                    "push_table": lambda **kwargs: pushed_generic.append(kwargs) or True,
+                    "push_notice": lambda **_kwargs: False,
+                },
+                log=log,
+                source_meta={"result_status": "success"},
+            )
+            result_df = pushed_generic[0].get("df") if len(pushed_generic) == 1 else None
+            if not handled_generic or not isinstance(result_df, pd.DataFrame):
+                errors.append(f"{query}: generic deterministic route={handled_generic!r}/{pushed_generic!r}")
+                continue
+            generic_analysis_outputs.append(result_df.reset_index(drop=True))
+        if generic_analysis_outputs and any(
+            not frame.equals(generic_analysis_outputs[0])
+            for frame in generic_analysis_outputs[1:]
+        ):
+            errors.append("dimension-only analysis phrase variants produced different tables")
+
+        limited_source_meta = {
+            "result_status": "success",
+            "limit_hit": True,
+            "applied_download_limit_rows": 2,
+            "expected_rows": 3,
+        }
+        # The disclosure contract is valid only when the supplied current
+        # table is the actual capped result, not the full fixture source.
+        limited_source_df = source_df.head(2).copy(deep=True)
+        limited_facts = dispatcher.build_current_table_interpretive_facts(
+            df=limited_source_df.copy(deep=True),
+            query="현재표 제조사별 재고수량 분석",
+            source_action="제품재고현황 조회",
+            source_meta=limited_source_meta,
+        )
+        limited_pushes: list[dict[str, Any]] = []
+        limited_handled = dispatcher.handle_current_table_followup_by_action(
+            df=limited_source_df.copy(deep=True),
+            query="현재표 제조사별 분석",
+            top_n=20,
+            table_key="fixture-current-table-limit",
+            source_action="제품재고현황 조회",
+            helpers={
+                "push_table": lambda **kwargs: limited_pushes.append(kwargs) or True,
+                "push_notice": lambda **_kwargs: False,
+            },
+            log=log,
+            source_meta=limited_source_meta,
+        )
+        limited_extra_meta = dict(limited_pushes[0].get("extra_meta") or {}) if len(limited_pushes) == 1 else {}
+        limited_title = str(limited_pushes[0].get("title") or "") if len(limited_pushes) == 1 else ""
+        if (
+            limited_facts.get("analysis_scope") != "limited_source"
+            or limited_facts.get("analysis_scope_label") != "조회된 최대 2건 기준 (전체 예상 3건)"
+            or not limited_handled
+            or limited_extra_meta.get("analysis_scope") != "limited_source"
+            or limited_extra_meta.get("source_limit_rows") != 2
+            or limited_extra_meta.get("source_expected_rows") != 3
+            or "조회된 최대 2건 기준 (전체 예상 3건)" not in limited_title
+        ):
+            errors.append(
+                "current-table limited source must disclose the verified cap in facts and deterministic output"
+            )
 
         summary_row_source_df = pd.DataFrame(
             [
@@ -17349,20 +17433,25 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
             ):
                 errors.append(f"{query}: alias resolution={facts!r}")
 
-        missing_metric_query = "현재표 제조사별 존재하지않는수량 분석해줘"
-        missing_metric_facts = dispatcher.build_current_table_interpretive_facts(
-            df=alias_source_df.copy(deep=True),
-            query=missing_metric_query,
-            source_action="제품재고현황 조회",
-            source_meta={"result_status": "success"},
-        )
-        missing_metric_columns = list((missing_metric_facts.get("capability") or {}).get("missing_columns") or [])
-        if (
-            missing_metric_facts.get("status") != "column_unavailable"
-            or missing_metric_columns != ["존재하지않는수량"]
-            or "요청 컬럼" in missing_metric_columns
+        for missing_metric_query in (
+            "현재표 제조사별 존재하지않는수량 분석",
+            "현재표 제조사별 존재하지않는수량 분석해줘",
+            "현재표 제조사별 존재하지않는수량 분석해 줘",
         ):
-            errors.append(f"{missing_metric_query}: missing metric label={missing_metric_facts!r}")
+            missing_metric_facts = dispatcher.build_current_table_interpretive_facts(
+                df=alias_source_df.copy(deep=True),
+                query=missing_metric_query,
+                source_action="제품재고현황 조회",
+                source_meta={"result_status": "success"},
+            )
+            missing_metric_columns = list((missing_metric_facts.get("capability") or {}).get("missing_columns") or [])
+            if (
+                dispatcher.classify_current_table_followup_intent(missing_metric_query) != "llm_analysis"
+                or missing_metric_facts.get("status") != "column_unavailable"
+                or missing_metric_columns != ["존재하지않는수량"]
+                or "요청 컬럼" in missing_metric_columns
+            ):
+                errors.append(f"{missing_metric_query}: missing metric label={missing_metric_facts!r}")
 
         chat_main_source = (PROJECT_ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
         handoff_start = chat_main_source.find("elif is_current_table_forced_followup:")
@@ -17416,6 +17505,37 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
             )
         ):
             errors.append(f"generic row ratio label/meaning={generic_row_ratio!r}")
+
+        generic_manufacturer_df = pd.DataFrame(
+            [
+                {"제조사명": "제조사A", "제약사명": "제조사A", "제품코드": "P1"},
+                {"제조사명": "제조사A", "제약사명": "제조사A", "제품코드": "P2"},
+                {"제조사명": "제조사B", "제약사명": "제조사B", "제품코드": "P3"},
+            ]
+        )
+        generic_manufacturer = generic._build_common_group_summary(
+            generic_manufacturer_df,
+            "제조사명",
+        )
+        manufacturer_ratio_column = "전체 제품 대비 포함 비율"
+        manufacturer_ratio_values = pd.to_numeric(
+            generic_manufacturer.get(manufacturer_ratio_column), errors="coerce"
+        ).tolist() if manufacturer_ratio_column in generic_manufacturer.columns else []
+        expected_manufacturer_counts = {"제조사A": 2, "제조사B": 1}
+        actual_manufacturer_counts = dict(
+            zip(
+                generic_manufacturer.get("제조사명", pd.Series(dtype="object")).astype(str),
+                pd.to_numeric(generic_manufacturer.get("제품수"), errors="coerce").fillna(-1).astype(int),
+            )
+        ) if "제품수" in generic_manufacturer.columns else {}
+        if (
+            "제조사수" in generic_manufacturer.columns
+            or manufacturer_ratio_column not in generic_manufacturer.columns
+            or actual_manufacturer_counts != expected_manufacturer_counts
+            or not math.isclose(sum(manufacturer_ratio_values), 100.0, rel_tol=0.0, abs_tol=1e-9)
+            or not math.isclose(float(manufacturer_ratio_values[0]), 66.66666666666666, rel_tol=0.0, abs_tol=1e-9)
+        ):
+            errors.append(f"generic manufacturer count/ratio contract={generic_manufacturer!r}")
 
         if generic._find_common_column_filter(
             source_df, "현재표 부족제품수 top 10 보여줘"

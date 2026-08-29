@@ -823,7 +823,22 @@ def _is_sum_candidate_column(col: str) -> bool:
     return any(w in s for w in _COMMON_GROUP_SUM_INCLUDE)
 
 
-def _distinct_label_for_group(df: pd.DataFrame) -> tuple[str, str]:
+def _is_same_grouping_dimension(left: str, right: str) -> bool:
+    """Return whether two columns are aliases for the same grouping dimension."""
+    left_norm = _norm_col_name(left)
+    right_norm = _norm_col_name(right)
+    if not left_norm or not right_norm:
+        return False
+    if left_norm == right_norm:
+        return True
+    return (
+        right_norm in _group_aliases(left)
+        and left_norm in _group_aliases(right)
+    )
+
+
+def _distinct_label_for_group(df: pd.DataFrame, *, group_col: str) -> tuple[str, str]:
+    """Choose a non-grouping distinct dimension for a generic group summary."""
     for col, label in [
         ("제약사명", "제약사수"),
         ("제조사명", "제조사수"),
@@ -832,9 +847,9 @@ def _distinct_label_for_group(df: pd.DataFrame) -> tuple[str, str]:
         ("거래처명", "거래처수"),
         ("매입처명", "매입처수"),
     ]:
-        if col in df.columns:
+        if col in df.columns and not _is_same_grouping_dimension(group_col, col):
             return col, label
-    return "", "고유값수"
+    return "", ""
 
 
 def _common_group_ratio_label(*, distinct_label: str, is_distinct_basis: bool) -> str:
@@ -872,7 +887,7 @@ def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFram
     g = work.groupby(group_col, dropna=False)
     out = pd.DataFrame({group_col: g.size().index.astype(str), "행수": g.size().values})
 
-    distinct_col, distinct_label = _distinct_label_for_group(work)
+    distinct_col, distinct_label = _distinct_label_for_group(work, group_col=group_col)
     if distinct_col and distinct_col in work.columns:
         out[distinct_label] = g[distinct_col].nunique(dropna=True).values
         total_basis = max(int(work[distinct_col].nunique(dropna=True)), 1)
@@ -882,7 +897,6 @@ def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFram
             is_distinct_basis=True,
         )
     else:
-        out[distinct_label] = out["행수"]
         total_basis = max(int(len(work)), 1)
         ratio_basis = out["행수"]
         ratio_label = _common_group_ratio_label(
@@ -938,7 +952,9 @@ def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFram
         out["_sort"] = out[group_col].map(_trend_sort_key)
         out = out.sort_values(["_sort", group_col], ascending=[True, True]).drop(columns=["_sort"])
     else:
-        out = out.sort_values([distinct_label, "행수", group_col], ascending=[False, False, True])
+        sort_columns = [distinct_label, "행수", group_col] if distinct_col else ["행수", group_col]
+        sort_ascending = [False, False, True] if distinct_col else [False, True]
+        out = out.sort_values(sort_columns, ascending=sort_ascending)
     out = _add_seq_column(out)
     order = [c for c in front if c in out.columns] + [c for c in preferred if c in out.columns and c not in front]
     rest = [c for c in out.columns if c not in order]

@@ -155,27 +155,39 @@ def classify_current_table_followup_intent(query: str) -> str:
     if any(marker in intent_compact for marker in explicit_table_markers):
         return "dataframe_table"
 
-    # "분석해줘/의미가 뭐야/추세 설명"은 현재표의 숫자를 먼저 pandas로
-    # 확정한 뒤 LLM이 그 facts만 해석해야 한다. 명시적인 TOP/목록/조건
-    # 요청은 위의 deterministic table 계약을 계속 우선한다.
+    # Analysis wording is normalized by its semantic inputs, not by the
+    # command ending. TOP/list/filter requests above remain deterministic.
+    # An explicit metric needs deterministic facts plus LLM interpretation;
+    # a dimension-only analysis retains the existing deterministic summary.
+    if "분석" in intent_compact:
+        requested_metrics = _current_table_requested_metrics(text)
+        requested_dimensions = _requested_current_table_dimensions(text)
+        if requested_metrics:
+            return "llm_analysis"
+        if requested_dimensions:
+            # A dimension-only request remains the deterministic generic
+            # summary.  But an explicit unknown ``...수량/금액/...`` label
+            # must reach the interpretive capability check so it can return
+            # the existing exact missing-column notice.
+            _unknown_dimension, unknown_metric = _current_table_unresolved_request_labels(
+                text,
+                metrics=requested_metrics,
+                groupings=[key for key, _label, _aliases in requested_dimensions],
+            )
+            if unknown_metric:
+                return "llm_analysis"
+            return "dataframe_table"
+        return "llm_analysis"
+
+    # "의미가 뭐야/추세 설명"은 현재표의 숫자를 먼저 pandas로 확정한 뒤
+    # LLM이 그 facts만 해석해야 한다.
     interpretive_analysis_markers = (
-        "분석해",
-        "분석을해",
         "의미가",
         "의미를",
         "추세설명",
         "경향설명",
     )
     if any(marker in intent_compact for marker in interpretive_analysis_markers):
-        return "llm_analysis"
-
-    # A plain explicit-metric "분석" has the same user intent as "분석해줘":
-    # first create deterministic facts, then let the LLM interpret only those
-    # facts. It must not fall through to the legacy generic group-summary
-    # path, whose distinct-count ratio is unrelated to the requested metric.
-    # Metric-free analysis requests retain their existing deterministic summary
-    # contract (for example, "추세판정 분석").
-    if "분석" in intent_compact and _current_table_requested_metrics(text):
         return "llm_analysis"
 
     current_table_summary_requests = ("요약", "집계", "분석", "매출")
@@ -1035,6 +1047,50 @@ def _current_table_followup_capability(
     }
 
 
+def _current_table_source_limit_contract(
+    df: pd.DataFrame,
+    source_meta: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Expose a verified source cap without treating a capped table as complete."""
+    if not isinstance(source_meta, dict):
+        return {}
+
+    def _positive_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    expected_rows = _positive_int(
+        source_meta.get("expected_rows")
+        or source_meta.get("row_count_total_for_analysis")
+        or source_meta.get("analysis_row_count")
+    )
+    limit_rows = _positive_int(
+        source_meta.get("applied_download_limit_rows")
+        or source_meta.get("download_limit_rows")
+    )
+    prepared_rows = int(len(df))
+    limited = bool(
+        source_meta.get("limit_hit") is True
+        and limit_rows > 0
+        and prepared_rows == limit_rows
+        and expected_rows > prepared_rows
+    )
+    if not limited:
+        return {}
+
+    return {
+        "analysis_scope": "limited_source",
+        "analysis_scope_label": (
+            f"조회된 최대 {prepared_rows:,}건 기준 (전체 예상 {expected_rows:,}건)"
+        ),
+        "source_limit_hit": True,
+        "source_limit_rows": limit_rows,
+        "source_expected_rows": expected_rows,
+    }
+
+
 def build_current_table_interpretive_facts(
     *,
     df: pd.DataFrame,
@@ -1176,6 +1232,7 @@ def build_current_table_interpretive_facts(
             "facts": [],
             "available_columns": [str(column) for column in df.columns],
         }
+    source_limit_contract = _current_table_source_limit_contract(df, source_meta)
     return {
         "status": "success",
         "capability": capability,
@@ -1201,6 +1258,7 @@ def build_current_table_interpretive_facts(
         "facts_compacted": facts_compacted,
         "summary_bucket_label": "기타합산" if facts_compacted else "",
         "available_columns": [str(column) for column in df.columns],
+        **source_limit_contract,
     }
 
 
@@ -1485,6 +1543,7 @@ def handle_current_table_followup_by_action(
             (source_meta or {}).get("filter_value") or ""
         ).strip(),
     }
+    capability_meta.update(_current_table_source_limit_contract(df, source_meta))
 
     def _push_table_with_capability(**kwargs: Any) -> bool:
         extra_meta = dict(kwargs.pop("extra_meta", {}) or {})
@@ -1520,6 +1579,11 @@ def handle_current_table_followup_by_action(
         extra_meta.setdefault("issue_codes", [])
         for key, value in capability_meta.items():
             extra_meta.setdefault(key, value)
+        scope_label = str(extra_meta.get("analysis_scope_label") or "").strip()
+        if scope_label:
+            title = str(kwargs.get("title") or "").strip()
+            if title and scope_label not in title:
+                kwargs["title"] = f"{title} ({scope_label})"
         if filter_result["filter_column"]:
             kwargs["source_query"] = query
             title = str(kwargs.get("title") or "")
