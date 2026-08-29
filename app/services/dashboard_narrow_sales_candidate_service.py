@@ -6,6 +6,9 @@ remain on their existing representation rather than being silently coerced.
 """
 from __future__ import annotations
 
+import hashlib
+import logging
+import re
 import time
 from typing import Any, Dict
 
@@ -25,6 +28,10 @@ from app.services.analytics_sales_trend_service import (
     coalesce_params,
     query_to_df,
 )
+from app.services.product_supplier_scope_service import normalize_product_supplier_scope
+
+
+log = logging.getLogger("ssai.sims")
 
 
 def _where(clauses: list[str]) -> str:
@@ -53,6 +60,87 @@ def _dimension_values(params: Dict[str, Any], *keys: str) -> list[str]:
             if value and value not in values:
                 values.append(value)
     return values
+
+
+def _sql_fingerprint(sql: str) -> str:
+    """Return a stable diagnostic identifier without exposing SQL text."""
+    return hashlib.sha256(str(sql or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _history_month_to(evaluation_month: Any) -> str:
+    value = str(evaluation_month or "").strip()
+    if not re.fullmatch(r"\d{6}", value):
+        return ""
+    year, month = int(value[:4]), int(value[4:])
+    if not 1 <= month <= 12:
+        return ""
+    if month == 1:
+        return f"{year - 1:04d}12"
+    return f"{year:04d}{month - 1:02d}"
+
+
+def _safe_exception_code(exc: Exception) -> str:
+    """Keep only a SQLSTATE-like code or the exception class in request logs."""
+    for value in getattr(exc, "args", ()):
+        match = re.search(r"\[([A-Z0-9]{5})\]", str(value or ""))
+        if match:
+            return match.group(1)
+    return type(exc).__name__
+
+
+def _purchase_facts_observability_fields(
+    *,
+    prepared: Dict[str, Any],
+    sql: str,
+    request_id: str,
+    product_scope_count: int,
+    elapsed_ms: int,
+    returned_rows: int,
+    outcome: str,
+    exception_code: str = "",
+) -> dict[str, Any]:
+    """Build bounded diagnostic fields from existing request state only."""
+    supplier_scope = normalize_product_supplier_scope(prepared)
+    supplier_scope_count = sum(
+        len(supplier_scope[key])
+        for key in (
+            "manufacturer_codes",
+            "manufacturer_manager_codes",
+            "order_vendor_codes",
+            "purchase_manager_codes",
+        )
+    )
+    return {
+        "request_id": str(request_id or "unmeasured"),
+        "outcome": str(outcome or "unknown"),
+        "elapsed_ms": max(0, int(elapsed_ms)),
+        "sql_fingerprint": _sql_fingerprint(sql),
+        "source_mode": str(prepared.get("source_mode") or ""),
+        "evaluation_month": str(prepared.get("evaluation_month") or ""),
+        "history_month_from": str(prepared.get("dashboard_lite_history_month_from") or prepared.get("month_from") or ""),
+        "history_month_to": _history_month_to(prepared.get("evaluation_month")),
+        "product_group_count": len(_dimension_values(prepared, "dashboard_product_group_list", "product_group_list")),
+        "product_scope_count": max(0, int(product_scope_count)),
+        "supplier_scope_mode": str(supplier_scope["product_supplier_scope_mode"]),
+        "supplier_scope_count": supplier_scope_count,
+        "stock_scope_count": len(_dimension_values(prepared, "stock_cd_list")),
+        "returned_rows": max(0, int(returned_rows)),
+        "exception_code": str(exception_code or ""),
+    }
+
+
+def _log_purchase_facts_observability(**fields: Any) -> None:
+    """Emit only aggregate request metadata; never SQL, binds, or entity values."""
+    log.info(
+        "[dashboard.narrow_purchase_facts] request_id=%s outcome=%s elapsed_ms=%s sql_fingerprint=%s "
+        "source_mode=%s evaluation_month=%s history_month_from=%s history_month_to=%s "
+        "product_group_count=%s product_scope_count=%s supplier_scope_mode=%s supplier_scope_count=%s "
+        "stock_scope_count=%s returned_rows=%s exception_code=%s",
+        fields["request_id"], fields["outcome"], fields["elapsed_ms"], fields["sql_fingerprint"],
+        fields["source_mode"], fields["evaluation_month"], fields["history_month_from"], fields["history_month_to"],
+        fields["product_group_count"], fields["product_scope_count"], fields["supplier_scope_mode"], fields["supplier_scope_count"],
+        fields["stock_scope_count"], fields["returned_rows"], fields["exception_code"],
+    )
 
 
 def _supports_exact_product_group_scope(params: Dict[str, Any]) -> bool:
@@ -102,7 +190,7 @@ def _sales_cte(params: Dict[str, Any]) -> tuple[str, Dict[str, Any], dict[str, A
     product_scope_cte, product_scope_join, product_scope_applied = _product_scope_cte(
         params=prepared,
         bind=bind,
-        product_code_sql=_trim(f"M.{p}_Physic_Cd"),
+        product_code_sql=f"M.{p}_Physic_Cd",
     )
     cte_sections = []
     if product_scope_cte:
@@ -193,42 +281,36 @@ OPTION (RECOMPILE)
     relation = cte + "SELECT 기준월, 제품코드, 매입처코드 FROM NumericSales GROUP BY 기준월, 제품코드, 매입처코드 OPTION (RECOMPILE)"
     common, purchase_bind = _build_dashboard_monthly_common_predicates(meta["prepared"], spec, supplier_bind_prefix="narrow_purchase_supplier", stock_bind_prefix="narrow_purchase_stock_cd")
     purchase_bind = dict(purchase_bind)
-    sales_universe_common, sales_universe_bind = _build_dashboard_monthly_common_predicates(
-        meta["prepared"],
-        spec,
-        supplier_bind_prefix="narrow_purchase_supplier",
-        stock_bind_prefix="narrow_purchase_stock_cd",
-        table_alias="S",
-    )
-    purchase_bind.update(sales_universe_bind)
     purchase_sales_branch = _build_dashboard_sales_branch_predicates(
-        meta["prepared"], spec, purchase_bind, table_alias="S"
+        meta["prepared"], spec, purchase_bind, table_alias="M"
     )
     purchase_product_scope_cte, purchase_product_scope_join, _purchase_product_scope_applied = _product_scope_cte(
         params=meta["prepared"],
         bind=purchase_bind,
-        product_code_sql=_trim(f"S.{p}_Physic_Cd"),
+        product_code_sql=f"M.{p}_Physic_Cd",
     )
     purchase_bind.update({"narrow_history_month_from": str(meta["prepared"].get("dashboard_lite_history_month_from") or meta["prepared"]["month_from"]), "narrow_evaluation_month": str(meta["prepared"]["evaluation_month"])})
     in_qty = f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT) + CAST(ISNULL(M.{p}_In_Oquantity, 0) AS FLOAT)" if meta["source_mode"] == "monthly_real" else f"CAST(ISNULL(M.{p}_In_Quantity, 0) AS FLOAT)"
+    sales_row_predicate = " AND ".join(f"({clause})" for clause in purchase_sales_branch) or "1 = 0"
     purchase_ctes = []
     if purchase_product_scope_cte:
         purchase_ctes.append(purchase_product_scope_cte)
     purchase_ctes.extend((
-        f"""FilteredSalesProducts AS (
- SELECT DISTINCT {_trim(f'S.{p}_Physic_Cd')} AS 제품코드
- FROM {spec['table']} AS S WITH (NOLOCK)
+        f"""ScopedPurchaseRows AS (
+ SELECT LEFT(M.{p}_Stock_YyMm, 6) AS 기준월, {_trim(f'M.{p}_Physic_Cd')} AS 제품코드, {_trim(f'M.{p}_Ven_Cd')} AS 매입처코드,
+        {in_qty} AS 입고수량, CAST(ISNULL(M.{p}_In_Supply_Price, 0) AS FLOAT) AS 매입금액,
+        MAX(CASE WHEN {sales_row_predicate} THEN 1 ELSE 0 END) OVER (PARTITION BY {_trim(f'M.{p}_Physic_Cd')}) AS has_sales_product
+ FROM {spec['table']} AS M WITH (NOLOCK)
  {purchase_product_scope_join}
- WHERE 1 = 1 {_where(sales_universe_common)} {_where(purchase_sales_branch)}
+ WHERE 1 = 1 {_where(common)}
 )""",
         f"""PurchaseGrouped AS (
- SELECT LEFT(M.{p}_Stock_YyMm, 6) AS 기준월, {_trim(f'M.{p}_Physic_Cd')} AS 제품코드, {_trim(f'M.{p}_Ven_Cd')} AS 매입처코드,
-        SUM({in_qty}) AS 입고수량, SUM(CAST(ISNULL(M.{p}_In_Supply_Price, 0) AS FLOAT)) AS 매입금액,
-        SUM(CASE WHEN CAST(ISNULL(M.{p}_In_Supply_Price, 0) AS FLOAT) > 0 OR {in_qty} > 0 THEN 1 ELSE 0 END) AS 매입발생건수
- FROM {spec['table']} AS M WITH (NOLOCK)
- INNER JOIN FilteredSalesProducts AS FSP ON FSP.제품코드 = {_trim(f'M.{p}_Physic_Cd')}
- WHERE 1 = 1 {_where(common)}
- GROUP BY LEFT(M.{p}_Stock_YyMm, 6), M.{p}_Physic_Cd, M.{p}_Ven_Cd
+ SELECT 기준월, 제품코드, 매입처코드,
+        SUM(입고수량) AS 입고수량, SUM(매입금액) AS 매입금액,
+        SUM(CASE WHEN 매입금액 > 0 OR 입고수량 > 0 THEN 1 ELSE 0 END) AS 매입발생건수
+ FROM ScopedPurchaseRows
+ WHERE has_sales_product = 1
+ GROUP BY 기준월, 제품코드, 매입처코드
 )""",
     ))
     purchase = f"""
@@ -237,10 +319,31 @@ Classified AS (
  SELECT *, CASE WHEN 제품코드 = N'' THEN 'missing_product_code' WHEN 기준월 = N'' THEN 'missing_month'
    WHEN 기준월 NOT LIKE '[0-9][0-9][0-9][0-9][0-9][0-9]' THEN 'other_excluded'
    WHEN 기준월 < %(narrow_history_month_from)s OR 기준월 >= %(narrow_evaluation_month)s THEN 'other_excluded' ELSE 'classified' END AS classification FROM PurchaseGrouped
-), MonthTotals AS (SELECT 기준월, SUM(매입금액) AS 매입금액 FROM PurchaseGrouped WHERE 기준월 LIKE '[0-9][0-9][0-9][0-9][0-9][0-9]' GROUP BY 기준월)
-SELECT 'purchase_month_total' AS projection_kind, 기준월, 매입금액, 0 AS purchase_source_rows, 0 AS purchase_positive_rows, 0 AS purchase_nonpositive_rows, 0 AS purchase_unclassified_rows, 0 AS missing_product_code_rows, 0 AS missing_month_rows, 0 AS invalid_numeric_rows, 0 AS other_excluded_rows FROM MonthTotals
-UNION ALL
-SELECT 'purchase_diagnostics', N'', CAST(0 AS FLOAT), COUNT(*), SUM(CASE WHEN classification = 'classified' AND (매입금액 > 1e-9 OR 입고수량 > 1e-9) THEN 1 ELSE 0 END), SUM(CASE WHEN classification = 'classified' AND NOT (매입금액 > 1e-9 OR 입고수량 > 1e-9) THEN 1 ELSE 0 END), SUM(CASE WHEN classification <> 'classified' THEN 1 ELSE 0 END), SUM(CASE WHEN classification = 'missing_product_code' THEN 1 ELSE 0 END), SUM(CASE WHEN classification = 'missing_month' THEN 1 ELSE 0 END), CAST(0 AS BIGINT), SUM(CASE WHEN classification = 'other_excluded' THEN 1 ELSE 0 END) FROM Classified
+), PurchaseRollup AS (
+ SELECT 기준월, GROUPING(기준월) AS is_diagnostics,
+        SUM(매입금액) AS 매입금액, COUNT(*) AS purchase_source_rows,
+        SUM(CASE WHEN classification = 'classified' AND (매입금액 > 1e-9 OR 입고수량 > 1e-9) THEN 1 ELSE 0 END) AS purchase_positive_rows,
+        SUM(CASE WHEN classification = 'classified' AND NOT (매입금액 > 1e-9 OR 입고수량 > 1e-9) THEN 1 ELSE 0 END) AS purchase_nonpositive_rows,
+        SUM(CASE WHEN classification <> 'classified' THEN 1 ELSE 0 END) AS purchase_unclassified_rows,
+        SUM(CASE WHEN classification = 'missing_product_code' THEN 1 ELSE 0 END) AS missing_product_code_rows,
+        SUM(CASE WHEN classification = 'missing_month' THEN 1 ELSE 0 END) AS missing_month_rows,
+        SUM(CASE WHEN classification = 'other_excluded' THEN 1 ELSE 0 END) AS other_excluded_rows
+ FROM Classified
+ GROUP BY GROUPING SETS ((기준월), ())
+)
+SELECT CASE WHEN is_diagnostics = 1 THEN 'purchase_diagnostics' ELSE 'purchase_month_total' END AS projection_kind,
+       CASE WHEN is_diagnostics = 1 THEN N'' ELSE 기준월 END AS 기준월,
+       CASE WHEN is_diagnostics = 1 THEN CAST(0 AS FLOAT) ELSE 매입금액 END AS 매입금액,
+       CASE WHEN is_diagnostics = 1 THEN purchase_source_rows ELSE 0 END AS purchase_source_rows,
+       CASE WHEN is_diagnostics = 1 THEN purchase_positive_rows ELSE 0 END AS purchase_positive_rows,
+       CASE WHEN is_diagnostics = 1 THEN purchase_nonpositive_rows ELSE 0 END AS purchase_nonpositive_rows,
+       CASE WHEN is_diagnostics = 1 THEN purchase_unclassified_rows ELSE 0 END AS purchase_unclassified_rows,
+       CASE WHEN is_diagnostics = 1 THEN missing_product_code_rows ELSE 0 END AS missing_product_code_rows,
+       CASE WHEN is_diagnostics = 1 THEN missing_month_rows ELSE 0 END AS missing_month_rows,
+       CAST(0 AS BIGINT) AS invalid_numeric_rows,
+       CASE WHEN is_diagnostics = 1 THEN other_excluded_rows ELSE 0 END AS other_excluded_rows
+FROM PurchaseRollup
+WHERE is_diagnostics = 1 OR 기준월 LIKE '[0-9][0-9][0-9][0-9][0-9][0-9]'
 OPTION (RECOMPILE)
 """
     return {"product_month_sales": (product_month, bind), "product_identity": (product_identity, bind), "manufacturer_vendor_relation": (relation, bind), "purchase_facts": (purchase, purchase_bind)}, meta
@@ -290,16 +393,44 @@ def load_dashboard_narrow_sales_candidate(params: Dict[str, Any]) -> dict[str, A
     details: dict[str, dict[str, int]] = {}
     for name, (sql, bind) in queries.items():
         phase_started = time.perf_counter()
-        if measurement is not None:
-            with dashboard_measurement_phase(measurement, phase=f"narrow_{name}", source="sales", source_mode=meta["source_mode"]) as state:
+        try:
+            if measurement is not None:
+                with dashboard_measurement_phase(measurement, phase=f"narrow_{name}", source="sales", source_mode=meta["source_mode"]) as state:
+                    frame = query_to_df(sql, bind)
+                    frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+                    state["result_rows"] = len(frame); state["result_cols"] = len(frame.columns)
+            else:
                 frame = query_to_df(sql, bind)
                 frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
-                state["result_rows"] = len(frame); state["result_cols"] = len(frame.columns)
-        else:
-            frame = query_to_df(sql, bind)
-            frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+        except Exception as exc:
+            if name == "purchase_facts":
+                _log_purchase_facts_observability(
+                    **_purchase_facts_observability_fields(
+                        prepared=meta["prepared"],
+                        sql=sql,
+                        request_id="" if measurement is None else measurement.request_id,
+                        product_scope_count=len(frames.get("product_identity", pd.DataFrame())),
+                        elapsed_ms=int((time.perf_counter() - phase_started) * 1000),
+                        returned_rows=0,
+                        outcome="error",
+                        exception_code=_safe_exception_code(exc),
+                    )
+                )
+            raise
         frames[name] = frame
         details[name] = {"elapsed_ms": int((time.perf_counter() - phase_started) * 1000), "row_count": len(frame), "column_count": len(frame.columns), "pandas_deep_memory_bytes": int(frame.memory_usage(index=True, deep=True).sum())}
+        if name == "purchase_facts":
+            _log_purchase_facts_observability(
+                **_purchase_facts_observability_fields(
+                    prepared=meta["prepared"],
+                    sql=sql,
+                    request_id="" if measurement is None else measurement.request_id,
+                    product_scope_count=len(frames.get("product_identity", pd.DataFrame())),
+                    elapsed_ms=details[name]["elapsed_ms"],
+                    returned_rows=len(frame),
+                    outcome="ok",
+                )
+            )
     assembly_started = time.perf_counter()
     manufacturer_started = time.perf_counter()
     manufacturer = _manufacturer_month(frames["product_month_sales"].copy(), frames["product_identity"], frames["manufacturer_vendor_relation"])

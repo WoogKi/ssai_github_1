@@ -5,6 +5,7 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -28,6 +29,7 @@ from app.services.dashboard_lite_facts import (
     _dashboard_internal_source_params,
     normalize_dashboard_lite_params,
 )
+import app.services.dashboard_narrow_sales_candidate_service as narrow_candidate_service
 from app.services.dashboard_narrow_sales_candidate_service import (
     _manufacturer_month,
     _queries,
@@ -126,6 +128,51 @@ def main() -> int:
     assert "GROUPING SETS" not in queries["product_month_sales"][0].upper()
     assert "GROUPING SETS" not in queries["manufacturer_vendor_relation"][0].upper()
     assert "purchase_product_vendor" not in queries["purchase_facts"][0]
+    purchase_sql = queries["purchase_facts"][0]
+    assert "GROUP BY GROUPING SETS ((기준월), ())" in purchase_sql
+    assert "MonthTotals AS" not in purchase_sql
+    assert purchase_sql.count("PurchaseGrouped") == 2, "purchase aggregate must feed one rollup path"
+    assert "ScopedPurchaseRows AS" in purchase_sql
+    assert "FilteredSalesProducts AS" not in purchase_sql
+    assert "OVER (PARTITION BY" in purchase_sql
+    assert "S.Rd22_Physic_Cd" not in purchase_sql
+
+    observability_params = dict(params)
+    observability_params.update(
+        {
+            "dashboard_product_group_list": ["0013:group-secret-a", "0013:group-secret-b"],
+            "manufacturer_codes": ["vendor-secret"],
+            "stock_cd_list": ["stock-secret-a", "stock-secret-b"],
+        }
+    )
+    fields = narrow_candidate_service._purchase_facts_observability_fields(
+        prepared=observability_params,
+        sql=queries["purchase_facts"][0],
+        request_id="dashboard-observability-fixture",
+        product_scope_count=7142,
+        elapsed_ms=8314,
+        returned_rows=15,
+        outcome="ok",
+    )
+    assert fields["request_id"] == "dashboard-observability-fixture"
+    assert fields["product_group_count"] == 2
+    assert fields["product_scope_count"] == 7142
+    assert fields["supplier_scope_mode"] == "manufacturer"
+    assert fields["supplier_scope_count"] == 1
+    assert fields["stock_scope_count"] == 2
+    assert fields["returned_rows"] == 15
+    assert len(fields["sql_fingerprint"]) == 16
+    assert fields["history_month_from"]
+    assert fields["history_month_to"]
+    assert narrow_candidate_service._safe_exception_code(Exception("[HYT00] timeout")) == "HYT00"
+    with patch.object(narrow_candidate_service.log, "info") as info:
+        narrow_candidate_service._log_purchase_facts_observability(**fields)
+    template, *logged_values = info.call_args.args
+    rendered = template % tuple(logged_values)
+    assert "group-secret" not in rendered
+    assert "vendor-secret" not in rendered
+    assert "stock-secret" not in rendered
+    assert "SELECT" not in rendered.upper()
 
     sales = _sales_fixture()
     # The live product master join is product-code keyed.  Keep the positive

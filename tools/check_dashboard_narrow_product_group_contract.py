@@ -100,12 +100,21 @@ def main() -> int:
     assert meta["product_scope_applied"] is True
     for name in ("product_month_sales", "product_identity", "manufacturer_vendor_relation"):
         assert "FilteredProducts AS" in queries[name][0], name
+        assert "INNER JOIN FilteredProducts AS FP ON FP.제품코드 = M.Rd22_Physic_Cd" in queries[name][0], name
+        assert "FP.제품코드 = COALESCE(LTRIM(RTRIM(CONVERT(NVARCHAR" not in queries[name][0], name
     assert "FilteredProducts AS" in queries["purchase_facts"][0]
-    assert "FilteredSalesProducts AS" in queries["purchase_facts"][0]
-    assert "INNER JOIN FilteredSalesProducts" in queries["purchase_facts"][0]
+    assert "INNER JOIN FilteredProducts AS FP ON FP.제품코드 = M.Rd22_Physic_Cd" in queries["purchase_facts"][0]
+    assert "FP.제품코드 = COALESCE(LTRIM(RTRIM(CONVERT(NVARCHAR" not in queries["purchase_facts"][0]
+    assert "COALESCE(LTRIM(RTRIM(CONVERT(NVARCHAR(255), 제품코드))), N'') AS 제품코드" in queries["product_month_sales"][0]
+    assert "ScopedPurchaseRows AS" in queries["purchase_facts"][0]
+    assert "MAX(CASE WHEN" in queries["purchase_facts"][0]
+    assert "OVER (PARTITION BY" in queries["purchase_facts"][0]
+    assert "has_sales_product = 1" in queries["purchase_facts"][0]
+    assert "FilteredSalesProducts AS" not in queries["purchase_facts"][0]
     sales_universe_sql = queries["purchase_facts"][0].split("PurchaseGrouped AS", 1)[0]
-    assert "S.Rd22_Stock_YyMm" in sales_universe_sql
-    assert "M.Rd22_Stock_YyMm" not in sales_universe_sql
+    assert "M.Rd22_Stock_YyMm" in sales_universe_sql
+    assert "M.Rd22_Physic_Cd" in sales_universe_sql
+    assert "S.Rd22_Physic_Cd" not in sales_universe_sql
     print("PASS: narrow product-group scope matches legacy sales universe and purchase intersection fixture")
     return 0
 
