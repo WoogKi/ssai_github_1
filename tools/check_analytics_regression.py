@@ -15246,6 +15246,10 @@ def _run_analytics_grouping_guard_checks() -> list[CheckResult]:
 
         supported_cases = {
             "품목별 매출예상 조회": "품목별 매출 예상",
+            "품목별 매출 분석": "품목별 매출 추세 분석",
+            "품목별 매출분석": "품목별 매출 추세 분석",
+            "제품별 매출 분석": "품목별 매출 추세 분석",
+            "제품별 매출분석": "품목별 매출 추세 분석",
             "매출처별 매출예상 조회": "매출처별 매출 예상",
             "영업사원별 매출예상 조회": "영업사원별 매출 예상",
             "지역별 매출예상 조회": "지역별 매출 예상",
@@ -15258,8 +15262,17 @@ def _run_analytics_grouping_guard_checks() -> list[CheckResult]:
         }
         for question, expected_action in supported_cases.items():
             resolved = router_mod._resolve_analytics_action(question)
-            if resolved != expected_action or router_mod._analytics_grouping_guard(question, resolved) is not None:
+            candidate = router_mod.resolve_new_sims_nlq_candidate(question)
+            if (
+                resolved != expected_action
+                or candidate != {"route": "analytics", "action": expected_action}
+                or router_mod._analytics_grouping_guard(question, resolved) is not None
+            ):
                 raise AssertionError(f"supported_intent={question!r}/{resolved!r}")
+
+        io_candidate = router_mod.resolve_new_sims_nlq_candidate("출고명세 202501 조회")
+        if io_candidate != {"route": "io", "action": "출고명세 조회"}:
+            raise AssertionError(f"outbound_detail_route_regressed={io_candidate!r}")
 
         summary_intent_cases = {
             "품목별 매출추세요약 조회": ("sales_trend_summary", "product", "품목별 매출 추세 요약"),

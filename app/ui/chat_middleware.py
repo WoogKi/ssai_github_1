@@ -42,6 +42,9 @@ from app.ui.sims_analysis_profiles import (
     sanitize_sims_llm_dataframe,
 )
 from app.services.nlq_case_log_service import append_nlq_case_record
+from app.services.structured_response_contract import build_structured_response_envelope
+from app.services.structured_tool_routing import build_sims_internal_tool_route_decision
+from app.services.structured_presentation_poc import maybe_create_structured_presentation
 
 import datetime as dt
 import time
@@ -7669,6 +7672,56 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     # 뒤에 한 번만 확정한다. 인박스 전달 이후의 history 복원/Streamlit rerender는 제외한다.
     _log_io_delivery_stage("chat_delivery_start")
     _attach_sims_response_timing(payload, ss)
+    try:
+        tool_route_decision = build_sims_internal_tool_route_decision(payload)
+        structured_response = build_structured_response_envelope(
+            payload,
+            tool_route_decision=tool_route_decision,
+        )
+        log.debug(
+            "[structured.response] schema=%s route=%s result_status=%s source_call_count=%s table_key=%s source_table_key=%s",
+            structured_response["schema_version"],
+            structured_response["route"]["kind"],
+            structured_response["execution"]["result_status"],
+            structured_response["execution"]["source_call_count"],
+            structured_response["result"]["table"]["table_key"],
+            structured_response["result"]["table"]["source_table_key"],
+        )
+    except ValueError as exc:
+        # The derived trace must never prevent legacy chat delivery.
+        log.warning("[structured.response] trace_skipped error_type=%s", type(exc).__name__)
+    try:
+        presentation_overlay = maybe_create_structured_presentation(payload)
+        if presentation_overlay.get("status") != "skipped":
+            overlays = ss.setdefault("__structured_presentation_poc_overlays", {})
+            if isinstance(overlays, dict):
+                overlays[str(payload.get("id") or "")] = presentation_overlay
+            log.info(
+                "[structured.presentation_poc] status=%s reason_code=%s elapsed_ms=%s retry_count=%s tool_call_count=%s "
+                "failure_stage=%s exception_class=%s response_present=%s content_present=%s "
+                "json_parse_failed=%s schema_validation_failed=%s finish_reason=%s content_type=%s "
+                "content_length=%s content_starts_json_object=%s content_ends_json_object=%s content_has_code_fence=%s",
+                presentation_overlay.get("status"),
+                presentation_overlay.get("reason_code"),
+                presentation_overlay.get("elapsed_ms"),
+                presentation_overlay.get("retry_count"),
+                presentation_overlay.get("tool_call_count"),
+                presentation_overlay.get("failure_stage"),
+                presentation_overlay.get("exception_class"),
+                presentation_overlay.get("response_present"),
+                presentation_overlay.get("content_present"),
+                presentation_overlay.get("json_parse_failed"),
+                presentation_overlay.get("schema_validation_failed"),
+                presentation_overlay.get("finish_reason"),
+                presentation_overlay.get("content_type"),
+                presentation_overlay.get("content_length"),
+                presentation_overlay.get("content_starts_json_object"),
+                presentation_overlay.get("content_ends_json_object"),
+                presentation_overlay.get("content_has_code_fence"),
+            )
+    except Exception as exc:
+        # The optional presentation must never prevent deterministic chat delivery.
+        log.warning("[structured.presentation_poc] trace_skipped error_type=%s", type(exc).__name__)
     ss.setdefault("__chat_inbox", [])
     ss["__chat_inbox"].append(payload)
     drain_inbox_to_chat()
@@ -8847,6 +8900,29 @@ def _render_chat_item(item: Dict[str, Any], *, target=None) -> None:
         if force_target:
             st.session_state["__chat_render_force_target"] = False
 
+
+def _render_structured_presentation_poc(item: Dict[str, Any]) -> None:
+    """Render the session-only PoC overlay without reading or changing history data."""
+    message_id = str(item.get("id") or "").strip()
+    overlays = st.session_state.get("__structured_presentation_poc_overlays") or {}
+    overlay = overlays.get(message_id) if isinstance(overlays, dict) else None
+    if not isinstance(overlay, dict) or overlay.get("status") != "ready":
+        return
+    presentation = overlay.get("presentation")
+    if not isinstance(presentation, dict):
+        return
+    summary = str(presentation.get("summary") or "").strip()
+    key_points = presentation.get("key_points") or []
+    notices = presentation.get("notices") or []
+    if not summary:
+        return
+    with st.expander("AI 정리 (PoC)", expanded=False):
+        st.markdown(summary)
+        for point in key_points:
+            st.markdown(f"- {point}")
+        for notice in notices:
+            st.caption(str(notice))
+
 # SIMS 표 렌더링 캐시 관리: _get_sims_table_render_cache / _get_sims_table_render_cache_key / _clear_other_sims_table_render_cache
 # 목적: rerun 때마다 표 렌더링 준비/스타일링을 다시 수행하지 않도록, table_key 기준으로 최신 표 1개만 캐시한다.
 def _get_sims_table_render_cache() -> Dict[str, Any]:
@@ -9719,6 +9795,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 with st.expander("meta", expanded=False):
                     st.json(meta)
 
+        _render_structured_presentation_poc(item)
 
         if t == "table" and not isinstance(data, pd.DataFrame):
             # data가 DF로 안 들어오는 경우(meta에 저장된 records/columns)로 복구

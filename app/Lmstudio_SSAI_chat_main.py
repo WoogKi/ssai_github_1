@@ -286,6 +286,12 @@ from app.services.knowledge_document_service import (
     build_knowledge_chat_request_context,
 )
 from app.services.datetime_tool import resolve_datetime_question
+from app.services.structured_response_contract import build_structured_response_envelope
+from app.services.structured_tool_routing import (
+    build_datetime_tool_route_decision,
+    build_knowledge_rag_tool_route_decision,
+    build_web_latest_tool_route_decision,
+)
 from app.services.attachment_summary_policy import build_attachment_summary_plan
 from app.services.web_search_service import (
     build_web_search_prompt,
@@ -7966,7 +7972,37 @@ def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
     )
     repository = _knowledge_repository_for_chat()
     packet = repository.retrieve_for_chat(query=route.query, request_context=request_context)
+    try:
+        knowledge_decision = build_knowledge_rag_tool_route_decision(
+            technical_detail_mode=route.technical_detail_mode,
+            reason_code=packet.reason_code,
+        )
+    except ValueError as exc:
+        # A derived trace must never alter the existing Knowledge outcome.
+        log.warning("[structured.tool_route] trace_skipped error_type=%s", type(exc).__name__)
+        knowledge_decision = None
     if packet.reason_code != "ready" or not packet.text or not packet.citations:
+        if knowledge_decision is not None:
+            try:
+                knowledge_envelope = build_structured_response_envelope(
+                    {
+                        "type": KNOWLEDGE_ANSWER_MESSAGE_TYPE,
+                        "meta": {
+                            "message_type": KNOWLEDGE_ANSWER_MESSAGE_TYPE,
+                            "reason_code": packet.reason_code,
+                        },
+                    },
+                    tool_route_decision=knowledge_decision,
+                )
+                log.debug(
+                    "[structured.tool_route] kind=%s decision_mode=%s reason=%s citation_count=%s",
+                    knowledge_envelope["route"]["kind"],
+                    knowledge_envelope["route"]["decision_mode"],
+                    knowledge_envelope["execution"]["reason_code"],
+                    knowledge_envelope["evidence"]["citation_count"],
+                )
+            except ValueError as exc:
+                log.warning("[structured.tool_route] trace_skipped error_type=%s", type(exc).__name__)
         _sync_room_meta(room, materialize=True)
         save_chat_rooms()
         st.info("승인된 Knowledge에서 답변 근거를 찾지 못했습니다.")
@@ -7993,6 +8029,22 @@ def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
         log.warning("[knowledge.chat] answer_not_saved error_type=%s", type(exc).__name__)
         st.error("Knowledge 답변을 안전하게 생성하지 못했습니다.")
         return True
+    if knowledge_decision is not None:
+        try:
+            knowledge_envelope = build_structured_response_envelope(
+                message,
+                authorized_knowledge_evidence=True,
+                tool_route_decision=knowledge_decision,
+            )
+            log.debug(
+                "[structured.tool_route] kind=%s decision_mode=%s reason=%s citation_count=%s",
+                knowledge_envelope["route"]["kind"],
+                knowledge_envelope["route"]["decision_mode"],
+                knowledge_envelope["execution"]["reason_code"],
+                knowledge_envelope["evidence"]["citation_count"],
+            )
+        except ValueError as exc:
+            log.warning("[structured.tool_route] trace_skipped error_type=%s", type(exc).__name__)
     message["seq"] = _next_seq()
     room.setdefault("messages", []).append(message)
     _sync_room_meta(room, materialize=True)
@@ -8011,7 +8063,7 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
             "no_results": "외부 Web Search에서 확인 가능한 결과를 찾지 못했습니다.",
         }
         content = messages.get(response.reason_code, "외부 Web Search를 완료하지 못했습니다. 최신 사실을 확인하지 않았습니다.")
-        room.setdefault("messages", []).append({
+        message = {
             "id": str(uuid.uuid4()),
             "role": "assistant",
             "content": content,
@@ -8019,7 +8071,23 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
             "seq": _next_seq(),
             **_message_meta("web_search"),
             "meta": {"web_search": True, "status": response.status, "reason_code": response.reason_code},
-        })
+        }
+        try:
+            web_decision = build_web_latest_tool_route_decision(response)
+            if web_decision is not None:
+                web_envelope = build_structured_response_envelope(message, tool_route_decision=web_decision)
+                log.debug(
+                    "[structured.tool_route] kind=%s decision_mode=%s status=%s reason=%s source_count=%s",
+                    web_envelope["route"]["kind"],
+                    web_envelope["route"]["decision_mode"],
+                    web_envelope["execution"]["result_status"],
+                    web_envelope["execution"]["reason_code"],
+                    web_envelope["evidence"]["source_count"],
+                )
+        except ValueError as exc:
+            # A derived trace must never alter the existing Web Search outcome.
+            log.warning("[structured.tool_route] trace_skipped error_type=%s", type(exc).__name__)
+        room.setdefault("messages", []).append(message)
         _sync_room_meta(room, materialize=True)
         save_chat_rooms()
         st.error(content)
@@ -8040,7 +8108,7 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
         summary = "검색 결과를 LLM으로 요약하지 못했습니다. 아래 출처를 직접 확인해 주세요."
 
     content = render_web_search_answer(summary=summary, response=response)
-    room.setdefault("messages", []).append({
+    message = {
         "id": str(uuid.uuid4()),
         "role": "assistant",
         "content": content,
@@ -8058,7 +8126,23 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
                 for item in response.results
             ],
         },
-    })
+    }
+    try:
+        web_decision = build_web_latest_tool_route_decision(response)
+        if web_decision is not None:
+            web_envelope = build_structured_response_envelope(message, tool_route_decision=web_decision)
+            log.debug(
+                "[structured.tool_route] kind=%s decision_mode=%s status=%s reason=%s source_count=%s",
+                web_envelope["route"]["kind"],
+                web_envelope["route"]["decision_mode"],
+                web_envelope["execution"]["result_status"],
+                web_envelope["execution"]["reason_code"],
+                web_envelope["evidence"]["source_count"],
+            )
+    except ValueError as exc:
+        # A derived trace must never alter the existing Web Search outcome.
+        log.warning("[structured.tool_route] trace_skipped error_type=%s", type(exc).__name__)
+    room.setdefault("messages", []).append(message)
     _sync_room_meta(room, materialize=True)
     save_chat_rooms()
     with st.chat_message("assistant"):
@@ -11988,14 +12072,31 @@ if user_input and user_input.strip():
     })
 
     if datetime_answer is not None:
-        current_room.setdefault("messages", []).append({
+        datetime_message = {
             "id": str(uuid.uuid4()),
             "role": "assistant",
             "content": datetime_answer.text,
             "time": make_ts(),
             "seq": _next_seq(),
             **_message_meta("datetime_tool"),
-        })
+        }
+        try:
+            datetime_decision = build_datetime_tool_route_decision(datetime_answer)
+            datetime_envelope = build_structured_response_envelope(
+                datetime_message,
+                tool_route_decision=datetime_decision,
+            )
+            log.debug(
+                "[structured.tool_route] kind=%s decision_mode=%s action=%s source_call_count=%s",
+                datetime_envelope["route"]["kind"],
+                datetime_envelope["route"]["decision_mode"],
+                datetime_envelope["action"]["canonical"],
+                datetime_envelope["execution"]["source_call_count"],
+            )
+        except ValueError as exc:
+            # A derived trace must never alter the existing deterministic answer.
+            log.warning("[structured.tool_route] trace_skipped error_type=%s", type(exc).__name__)
+        current_room.setdefault("messages", []).append(datetime_message)
         _sync_room_meta(current_room, materialize=True)
         save_chat_rooms()
         log.info(

@@ -804,6 +804,10 @@ _ANALYTICS_ACTION_SPECS = (
         "phrases": (
             "품목별 매출 추세 분석",
             "품목별 매출추세 분석",
+            "품목별 매출 분석",
+            "품목별 매출분석",
+            "제품별 매출 분석",
+            "제품별 매출분석",
             "품목별 매출 추세",
             "품목별 매출추세",
             "매출 추세 분석",
@@ -819,6 +823,8 @@ _ANALYTICS_ACTION_SPECS = (
 
 
 _ANALYTICS_TAIL_PATTERNS = (
+    r"\s*제품별\s*매출\s*분석.*$",
+    r"\s*제품별\s*매출분석.*$",
     r"\s*품목별\s*매출\s*추세\s*요약표.*$",
     r"\s*품목별\s*매출추세\s*요약표.*$",
     r"\s*품목별\s*매출\s*추세\s*분석.*$",
@@ -1526,8 +1532,7 @@ def _cleanup_analytics_named_params(
         # value and hide a real label written after the action.
         from app.services.io_nlq import _extract_io_compound_named_values
 
-        action_pattern = re.escape(action).replace(r"\ ", r"\s*")
-        group_residual = re.sub(action_pattern, " ", str(text or ""), count=1)
+        group_residual = _strip_analytics_action_phrases(text, action)
         explicit_named = _extract_io_compound_named_values(group_residual)
         for key, value in explicit_named.items():
             if value:
@@ -1565,6 +1570,7 @@ def _clear_analytics_grouping_artifacts(params: Dict[str, Any], text: str) -> Di
     compact = re.sub(r"\s+", "", str(text or ""))
     grouping_fields = (
         ("품목별", ("physic_nm", "physic_cd")),
+        ("제품별", ("physic_nm", "physic_cd")),
         ("제약사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
         ("제조사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
         ("매출처별", ("ven_nm", "ven_cd")),
@@ -1628,6 +1634,43 @@ def _analytics_success_intent_validation(
         "intent_validation_status": "not_checked",
         "consistency_flags": [],
     }
+
+
+_ANALYTICS_TERMINAL_RESULT_STATUSES = frozenset({
+    "success",
+    "no_data",
+    "input_required",
+    "candidate_required",
+    "resolution_unavailable",
+    "unsupported",
+    "column_unavailable",
+    "timeout",
+    "error",
+})
+
+
+def _finalize_analytics_result_status(meta: Dict[str, Any]) -> str:
+    """Derive the terminal route status from a completed Analytics service result."""
+    explicit = str(meta.get("result_status") or "").strip()
+    if explicit in _ANALYTICS_TERMINAL_RESULT_STATUSES:
+        return explicit
+
+    execution = str(meta.get("execution_status") or "").strip()
+    if execution in _ANALYTICS_TERMINAL_RESULT_STATUSES and execution != "success":
+        return execution
+
+    for key in ("row_count_total", "row_count"):
+        value = meta.get(key)
+        if value in (None, "") or isinstance(value, bool):
+            continue
+        try:
+            return "success" if int(value) > 0 else "no_data"
+        except (TypeError, ValueError):
+            continue
+
+    # Missing terminal evidence is not presentation-eligible. Existing chat
+    # delivery remains untouched; only the derived status is fail-closed.
+    return "unknown"
 
 
 _ANALYTICS_TREND_JUDGE_PATTERNS = (
@@ -2634,6 +2677,8 @@ def _try_handle_analytics_nlq(
                 "row_count": 0,
                 "row_count_total": 0,
                 "period_policy": period_policy,
+                "result_status": "input_required",
+                "execution_status": "input_required",
             },
         }
         push_sims_result_to_chat(payload, action)
@@ -2671,6 +2716,8 @@ def _try_handle_analytics_nlq(
                 "condition": "",
                 "query_summary": "",
                 "period_policy": period_policy,
+                "result_status": "error",
+                "execution_status": "error",
             },
         }
 
@@ -2699,6 +2746,7 @@ def _try_handle_analytics_nlq(
     payload["params"] = effective_params
 
     meta = dict(payload.get("meta") or {})
+    final_result_status = _finalize_analytics_result_status(meta)
     intent_validation = _analytics_success_intent_validation(
         action=action,
         payload=payload,
@@ -2736,7 +2784,8 @@ def _try_handle_analytics_nlq(
         "requested_metric": analytics_intent["requested_metric"],
         "requested_grouping": analytics_intent["requested_grouping"],
         "resolved_action": action,
-        "execution_status": "success",
+        "execution_status": final_result_status,
+        "result_status": final_result_status,
         "condition_sources": analytics_condition_sources,
         **intent_validation,
     })
