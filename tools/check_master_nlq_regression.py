@@ -197,6 +197,55 @@ def run_basic_checks() -> list[CheckResult]:
     except Exception as e:
         results.append(_fail("vendor SQL unlimited top", f"{type(e).__name__}: {e}"))
 
+    try:
+        vendors = importlib.import_module("app.services.rddbc030_service")
+        base_from = str(getattr(vendors, "_base_from")() or "")
+        expected_native_joins = (
+            "AddU.Rd06_User_Cd = V.Rd03_Add_Cd",
+            "ModU.Rd06_User_Cd = V.Rd03_Mod_Cd",
+            "SalesMan.Rd06_User_Cd = V.Rd03_Sales_Man",
+            "Road1.Rd021_RoadCd = V.Rd03_RoadCd",
+            "Road1.Rd021_DongSeq = V.Rd03_DongSeq",
+            "CostApply.Rd03_Ven_Cd = V.Rd03_Cost_Apply_Cd",
+            "StockApply.Rd03_Ven_Cd = V.Rd03_Stock_Apply_Cd",
+            "UnifyVen.Rd03_Ven_Cd = V.Rd03_Unify_Ven_Cd",
+            "VenGroup.Rd01_Gcode = V.Rd03_Ven_Group_Gcode",
+            "VenGroup.Rd01_Tcode = V.Rd03_Ven_Group",
+        )
+        if all(join in base_from for join in expected_native_joins) and "LTRIM(RTRIM(" not in base_from:
+            results.append(_ok("vendor fixed-char native joins", "PK/FK join은 raw equality, 검색 정규화와 분리"))
+        else:
+            results.append(_fail("vendor fixed-char native joins", "master PK/FK join에 trim 함수 또는 raw equality 누락"))
+    except Exception as e:
+        results.append(_fail("vendor fixed-char native joins", f"{type(e).__name__}: {e}"))
+
+    try:
+        import inspect
+        import pandas as pd
+
+        view = importlib.import_module("app.sims.views.vendors")
+        char8 = view._format_vendor_char8_date_series(
+            pd.Series([" 20260830 ", "00000000", "2026/08/31", "invalid", None, "NaT"])
+        ).tolist()
+        stamped = view._format_vendor_datetime_series(
+            pd.Series(["2026-08-30 12:34:56", "invalid", None, "NaT"])
+        ).tolist()
+        safe_like = view._is_sql_like_pushdown_safe
+        render_src = inspect.getsource(view.render_vendor_list)
+        if (
+            char8 == ["2026-08-30", "", "2026-08-31", "", "", ""]
+            and stamped == ["2026-08-30 12:34:56", "invalid", "", ""]
+            and safe_like("한미")
+            and not safe_like("한미_%")
+            and "cost_apply_nm=_clean_text(cost_apply_nm) if _is_sql_like_pushdown_safe(cost_apply_nm) else \"\"" in render_src
+            and "stock_apply_nm=_clean_text(stock_apply_nm) if _is_sql_like_pushdown_safe(stock_apply_nm) else \"\"" in render_src
+        ):
+            results.append(_ok("vendor display vectorization and ref-name pushdown", "date/null display contract and SQL-safe pushdown boundary"))
+        else:
+            results.append(_fail("vendor display vectorization and ref-name pushdown", f"char8={char8!r}, stamped={stamped!r}"))
+    except Exception as e:
+        results.append(_fail("vendor display vectorization and ref-name pushdown", f"{type(e).__name__}: {e}"))
+
     # 조건 없는 거래처 master 목록도 top=0 경로에서 handler가 완료되어야 한다.
     try:
         import pandas as pd

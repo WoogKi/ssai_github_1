@@ -294,36 +294,90 @@ def _base_filters(params: Dict[str, Any]) -> str:
     return ("\n      AND " + "\n      AND ".join(clauses)) if clauses else ""
 
 
+def _detail_aggregate_ctes(params: Dict[str, Any]) -> str:
+    """Scope header aggregates to the requested inbound-date window.
+
+    Detail rows outside the window remain part of a matching transaction or tax
+    document aggregate.  Only the set of document keys is limited, which keeps
+    the displayed validation totals identical while avoiding full-history scans
+    for the normal date-bounded detail screen and NLQ paths.
+    """
+    date_clauses = make_date_filters("Key_Row.Rd11_In_YyMmDd", params)
+    date_where_sql = "\n      AND ".join(date_clauses)
+    if date_where_sql:
+        date_where_sql = "\n      AND " + date_where_sql
+
+    return f"""
+inbound_window AS (
+    SELECT
+        Key_Row.Rd11_Trans_YyMmDd,
+        Key_Row.Rd11_Ven_Cd,
+        Key_Row.Rd11_Trans_Seq,
+        Key_Row.Rd11_Tax_YyMmDd,
+        Key_Row.Rd11_Tax_Seq
+    FROM dbo.Rddbc110 AS Key_Row
+    WHERE 1 = 1
+      {date_where_sql}
+),
+trans_keys AS (
+    SELECT DISTINCT
+        Rd11_Trans_YyMmDd,
+        Rd11_Ven_Cd,
+        Rd11_Trans_Seq
+    FROM inbound_window
+    WHERE NULLIF(LTRIM(RTRIM(Rd11_Trans_Seq)), '') IS NOT NULL
+),
+tax_keys AS (
+    SELECT DISTINCT
+        Rd11_Tax_YyMmDd,
+        Rd11_Ven_Cd,
+        Rd11_Tax_Seq
+    FROM inbound_window
+    WHERE NULLIF(LTRIM(RTRIM(Rd11_Tax_Seq)), '') IS NOT NULL
+),
+trans_sum AS (
+    SELECT
+        Detail.Rd11_Trans_YyMmDd,
+        Detail.Rd11_Ven_Cd,
+        Detail.Rd11_Trans_Seq,
+        SUM(COALESCE(Detail.Rd11_Fin_Supply_Price, Detail.Rd11_Supply_Price, 0)) AS Sum_Fin_Supply_Price,
+        SUM(COALESCE(Detail.Rd11_Fin_Tax_Price, Detail.Rd11_Tax_Price, 0)) AS Sum_Fin_Tax_Price
+    FROM dbo.Rddbc110 AS Detail
+    INNER JOIN trans_keys AS Key_Row
+        ON Detail.Rd11_Trans_YyMmDd = Key_Row.Rd11_Trans_YyMmDd
+       AND Detail.Rd11_Ven_Cd = Key_Row.Rd11_Ven_Cd
+       AND Detail.Rd11_Trans_Seq = Key_Row.Rd11_Trans_Seq
+    WHERE NULLIF(LTRIM(RTRIM(Detail.Rd11_Trans_Seq)), '') IS NOT NULL
+    GROUP BY Detail.Rd11_Trans_YyMmDd, Detail.Rd11_Ven_Cd, Detail.Rd11_Trans_Seq
+),
+tax_sum AS (
+    SELECT
+        Detail.Rd11_Tax_YyMmDd,
+        Detail.Rd11_Ven_Cd,
+        Detail.Rd11_Tax_Seq,
+        SUM(COALESCE(Detail.Rd11_Fin_Supply_Price, Detail.Rd11_Supply_Price, 0)) AS Sum_Fin_Supply_Price,
+        SUM(COALESCE(Detail.Rd11_Fin_Tax_Price, Detail.Rd11_Tax_Price, 0)) AS Sum_Fin_Tax_Price
+    FROM dbo.Rddbc110 AS Detail
+    INNER JOIN tax_keys AS Key_Row
+        ON Detail.Rd11_Tax_YyMmDd = Key_Row.Rd11_Tax_YyMmDd
+       AND Detail.Rd11_Ven_Cd = Key_Row.Rd11_Ven_Cd
+       AND Detail.Rd11_Tax_Seq = Key_Row.Rd11_Tax_Seq
+    WHERE Detail.Rd11_Tax_Di = '1'
+      AND NULLIF(LTRIM(RTRIM(Detail.Rd11_Tax_Seq)), '') IS NOT NULL
+    GROUP BY Detail.Rd11_Tax_YyMmDd, Detail.Rd11_Ven_Cd, Detail.Rd11_Tax_Seq
+)
+""".strip()
+
+
 def get_rddbc110_df(params: Optional[Dict[str, Any]] = None):
     params = coalesce_params(params)
     params["top"] = _io_query_top(params, default=200)
 
     where_sql = _base_filters(params)
 
+    aggregate_ctes = _detail_aggregate_ctes(params)
     sql = f"""
-WITH trans_sum AS (
-    SELECT
-        Rd11_Trans_YyMmDd,
-        Rd11_Ven_Cd,
-        Rd11_Trans_Seq,
-        SUM(COALESCE(Rd11_Fin_Supply_Price, Rd11_Supply_Price, 0)) AS Sum_Fin_Supply_Price,
-        SUM(COALESCE(Rd11_Fin_Tax_Price, Rd11_Tax_Price, 0)) AS Sum_Fin_Tax_Price
-    FROM dbo.Rddbc110
-    WHERE NULLIF(LTRIM(RTRIM(Rd11_Trans_Seq)), '') IS NOT NULL
-    GROUP BY Rd11_Trans_YyMmDd, Rd11_Ven_Cd, Rd11_Trans_Seq
-),
-tax_sum AS (
-    SELECT
-        Rd11_Tax_YyMmDd,
-        Rd11_Ven_Cd,
-        Rd11_Tax_Seq,
-        SUM(COALESCE(Rd11_Fin_Supply_Price, Rd11_Supply_Price, 0)) AS Sum_Fin_Supply_Price,
-        SUM(COALESCE(Rd11_Fin_Tax_Price, Rd11_Tax_Price, 0)) AS Sum_Fin_Tax_Price
-    FROM dbo.Rddbc110
-    WHERE Rd11_Tax_Di = '1'
-      AND NULLIF(LTRIM(RTRIM(Rd11_Tax_Seq)), '') IS NOT NULL
-    GROUP BY Rd11_Tax_YyMmDd, Rd11_Ven_Cd, Rd11_Tax_Seq
-)
+WITH {aggregate_ctes}
 SELECT TOP (%(top)s)
     In_Put.Rd11_In_YyMmDd,
     In_Put.Rd11_Ven_Cd,
@@ -467,10 +521,15 @@ def get_rddbc110_result(params: Optional[Dict[str, Any]] = None):
             "data": "해당 자료가 없습니다.",
             "message": "해당 자료가 없습니다.",
             "final": True,
-            "meta": {"row_count": 0},
+            "meta": {
+                "row_count": 0,
+                "row_count_total": 0,
+                "result_status": "no_data",
+                "source_call_count": 1,
+            },
         }
 
-    return build_result_payload(
+    result = build_result_payload(
         table=TABLE,
         title="입고명세 조회",
         action="입고명세 조회",
@@ -478,6 +537,11 @@ def get_rddbc110_result(params: Optional[Dict[str, Any]] = None):
         df=df,
         message=f"입고명세 {row_count:,}건",
     )
+    meta = dict(result.get("meta") or {})
+    meta.setdefault("result_status", "success")
+    meta["source_call_count"] = 1
+    result["meta"] = meta
+    return result
 
 def get_rddbc110_export_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
     """
@@ -513,6 +577,46 @@ def get_rddbc110_export_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFr
         log.exception("get_rddbc110_export_df label/apply failed")
 
     return df
+
+
+def get_rddbc110_screen_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return the full inbound-detail frame used by the panel submission.
+
+    The panel replaces its initial display query with this same export frame for
+    current-table, download, and final display handling.  Starting from the
+    full frame avoids running the identical detail SQL twice for one submit.
+    """
+    qparams = coalesce_params(params)
+    df = get_rddbc110_export_df(qparams)
+    row_count = 0 if df is None else int(len(df))
+    if row_count == 0:
+        return {
+            "table": TABLE,
+            "title": "입고명세 조회",
+            "action": "입고명세 조회",
+            "params": qparams,
+            "data": "해당 자료가 없습니다.",
+            "message": "해당 자료가 없습니다.",
+            "final": True,
+            "meta": {"row_count": 0},
+        }
+
+    return {
+        "table": TABLE,
+        "title": "입고명세 조회",
+        "action": "입고명세 조회",
+        "params": qparams,
+        "df": df,
+        "df_display": df,
+        "columns": list(df.columns),
+        "final": True,
+        "meta": {
+            "row_count": row_count,
+            "row_count_total": row_count,
+            "_io_full_df_ready": True,
+        },
+        "message": f"입고명세 {row_count:,}건",
+    }
 
 
 def _analysis_records_from_section_df(df, section: str) -> list[dict]:

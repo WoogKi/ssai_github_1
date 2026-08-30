@@ -406,15 +406,19 @@ def _extract_natural_period(
             _NLQ_PERIOD_KIND_KEY: "rolling_1month",
         }
 
-    relative_day = re.search(r"(?:^|\s)(오늘|어제|당일|하루|최근\s*1\s*일)(?=\s|$)", raw)
+    relative_day = re.search(r"(?:^|\s)(오늘|어제|그저께|당일|하루|최근\s*1\s*일)(?=\s|$)", raw)
     if relative_day:
         token = relative_day.group(1)
-        target_day = current_day - timedelta(days=1) if token == "어제" else current_day
+        offset_days = {"어제": 1, "그저께": 2}.get(token, 0)
+        target_day = current_day - timedelta(days=offset_days)
         value = target_day.strftime("%Y%m%d")
         return {
             "date_from": value,
             "date_to": value,
-            _NLQ_PERIOD_KIND_KEY: "yesterday" if token == "어제" else "today",
+            _NLQ_PERIOD_KIND_KEY: {
+                "어제": "yesterday",
+                "그저께": "two_days_ago",
+            }.get(token, "today"),
         }
 
     relative_month = re.search(r"(이번|지난)\s*(?:달|월)", raw)
@@ -458,7 +462,7 @@ def _strip_nlq_period_expressions(text: str) -> str:
     out = str(text or "")
     patterns = (
         r"(?:최근\s*)?(?:한\s*달|1\s*개월)",
-        r"(?:오늘|어제|당일|하루|최근\s*1\s*일)",
+        r"(?:오늘|어제|그저께|당일|하루|최근\s*1\s*일)",
         r"(?:이번|지난)\s*(?:달|월)",
         r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
         r"(?<!\d)\d{1,2}\s*월(?!\s*\d)",
@@ -1775,6 +1779,31 @@ def _consume_io_action_text(text: str, action: str) -> str:
     return " ".join(retained_parts)
 
 
+_DOCUMENT_DIRECTION_RESIDUAL_TOKENS = frozenset({
+    "매입", "매입분", "매출", "매출분",
+})
+
+
+def _consume_document_query_syntax_residual(text: str, action: str) -> str:
+    """Remove document-only condition tokens before entity resolution.
+
+    Transaction statements and tax invoices use direction tokens as structured
+    conditions.  They are not candidate entity names after their action has
+    been resolved.  Keep this token-based and action-scoped so labelled names
+    containing those syllables remain untouched.
+    """
+    if action not in {"거래명세서 공통 조회", "세금계산서 공통 조회"}:
+        return text
+
+    retained_parts: list[str] = []
+    for part in text.split():
+        token = re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", part)
+        if token in _DOCUMENT_DIRECTION_RESIDUAL_TOKENS or token == "공통":
+            continue
+        retained_parts.append(part)
+    return " ".join(retained_parts)
+
+
 def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     """Return a conservative proper-noun candidate left after IO syntax removal.
 
@@ -1809,6 +1838,7 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     candidate = re.sub(r"(?:19|20)\d{6}|(?:19|20)\d{4}", " ", candidate)
     candidate = re.sub(r"(?:실\s*재고|장부\s*재고|실\s*수불|장부\s*수불)", " ", candidate)
     candidate = _ALL_STOCK_LOCATIONS_RE.sub(" ", candidate)
+    candidate = _consume_document_query_syntax_residual(candidate, action)
     candidate = re.sub(r"\s+", " ", candidate).strip(" ,:/-~")
     if not candidate or _looks_like_date_token(candidate):
         return ""
@@ -2460,6 +2490,17 @@ def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
         _extract_code_flex(text, "세금계산서순번", 1, 6)
         or _extract_code_flex(text, "세금계산서", 1, 6)
     )
+    parsed_month = clean_text(params.get("month_from"))
+    if (
+        re.fullmatch(r"(?:19|20)\d{4}", clean_text(trans_seq))
+        and clean_text(params.get("month_to")) == parsed_month == clean_text(trans_seq)
+    ):
+        trans_seq = None
+    if (
+        re.fullmatch(r"(?:19|20)\d{4}", clean_text(tax_seq))
+        and clean_text(params.get("month_to")) == parsed_month == clean_text(tax_seq)
+    ):
+        tax_seq = None
     trans_di = _extract_code(text, "거래명세서구분", 1)
     tax_di = _extract_code(text, "세금계산서구분", 1)
 

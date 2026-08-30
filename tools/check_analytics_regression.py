@@ -17202,6 +17202,97 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                     f"{query}: intent={intent!r} capability={capability!r}"
                 )
 
+        metric_alias_df = pd.DataFrame(
+            [
+                {"제품코드": "M1", "제품명": "지표1", "총출고수량": 30, "총출고할증수량": 3, "총매출액": 3000, "월평균매출": 1000, "현재재고수량": 9},
+                {"제품코드": "M2", "제품명": "지표2", "총출고수량": 10, "총출고할증수량": 1, "총매출액": 1000, "월평균매출": 500, "현재재고수량": 4},
+            ]
+        )
+        alias_metric_expectations = {
+            "현재표 총출고수량 TOP 2": "sales_quantity",
+            "현재표 총출고할증수량 TOP 2": "sales_bonus_quantity",
+            "현재표 총매출액 TOP 2": "sales",
+            "현재표 월평균매출 TOP 2": "sales",
+            "현재표 현재재고수량 TOP 2": "stock_quantity",
+        }
+        for query, expected_metric in alias_metric_expectations.items():
+            capability = dispatcher._current_table_followup_capability(
+                df=metric_alias_df,
+                query=query,
+                source_action="제약사별 매출 추세 분석 요약표",
+                kind="analytics_kpi",
+                source_meta={"result_metric": "sales"},
+            )
+            if (
+                capability.get("status") != "success"
+                or capability.get("requested_metric") != expected_metric
+                or not capability.get("metric_columns")
+            ):
+                errors.append(f"{query}: actual metric column capability={capability!r}")
+        top_alias_pushes: list[dict[str, Any]] = []
+        top_alias_handled = dispatcher.handle_current_table_followup_by_action(
+            df=metric_alias_df.copy(deep=True),
+            query="현재표 총출고수량 TOP 2",
+            top_n=2,
+            table_key="fixture-actual-metric-column",
+            source_action="제약사별 매출 추세 분석 요약표",
+            helpers={
+                "push_table": lambda **kwargs: top_alias_pushes.append(kwargs) or True,
+                "push_notice": lambda **_kwargs: False,
+            },
+            log=log,
+            source_meta={"result_metric": "sales"},
+        )
+        top_alias_df = top_alias_pushes[0].get("df") if top_alias_pushes else None
+        if (
+            not top_alias_handled
+            or not isinstance(top_alias_df, pd.DataFrame)
+            or "총출고수량" not in top_alias_df.columns
+            or len(top_alias_df) != 2
+        ):
+            errors.append(f"actual total-sales-quantity TOP must dispatch without a source query={top_alias_pushes!r}")
+        missing_metric_capability = dispatcher._current_table_followup_capability(
+            df=metric_alias_df.drop(columns=["총출고할증수량"]),
+            query="현재표 총출고할증수량 TOP 2",
+            source_action="제약사별 매출 추세 분석 요약표",
+            kind="analytics_kpi",
+            source_meta={"result_metric": "sales"},
+        )
+        if missing_metric_capability.get("status") != "column_unavailable":
+            errors.append(f"missing current-table metric must remain unavailable={missing_metric_capability!r}")
+
+        source_binding_pushes: list[dict[str, Any]] = []
+        source_binding_handled = dispatcher.handle_current_table_followup_by_action(
+            df=pd.DataFrame(
+                {
+                    "단가적용처명": ["적용처A", "적용처A", "적용처B"],
+                    "제품코드": ["C1", "C2", "C3"],
+                    "수량": [1, 2, 3],
+                }
+            ),
+            query="현재표 단가적용처별 집계해줘",
+            top_n=20,
+            table_key="fixture-full-source",
+            source_action="출고명세 조회",
+            helpers={
+                "push_table": lambda **kwargs: source_binding_pushes.append(kwargs) or True,
+                "push_notice": lambda **_kwargs: False,
+            },
+            log=log,
+            source_meta={"result_status": "success"},
+        )
+        source_binding_meta = (
+            dict(source_binding_pushes[0].get("extra_meta") or {}) if source_binding_pushes else {}
+        )
+        if (
+            not source_binding_handled
+            or len(source_binding_pushes) != 1
+            or source_binding_pushes[0].get("source_table_key") != "fixture-full-source"
+            or source_binding_pushes[0].get("source_rows") != 3
+            or source_binding_meta.get("source_action") != "출고명세 조회"
+        ):
+            errors.append(f"cost-apply grouping must preserve its original source binding={source_binding_pushes!r}")
+
         analysis_cases = (
             ("현재표 제조사별 재고수량 분석", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),
             ("현재표 제조사별 재고수량 분석해줘", "manufacturer", "stock_quantity", [("한미약품", 10), ("제조사B", 3)]),

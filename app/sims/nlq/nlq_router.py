@@ -1177,9 +1177,16 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return None
 
     action = str((parsed or {}).get("action") or "").strip()
-    if not action:
-        return None
-    return {"route": "io", "action": action}
+    if action:
+        return {"route": "io", "action": action}
+
+    # The chat entrypoint uses this non-executing candidate to keep a new
+    # vendor-master lookup from being mistaken for a current-table follow-up.
+    # Reuse the same boundary as the real vendors-first route so it never
+    # steals transaction/detail requests.
+    if _should_try_vendors_before_goods(normalized):
+        return {"route": "vendors", "action": "거래처 목록"}
+    return None
 
 
 def _last_day_yyyymm(yyyymm: str) -> str:
@@ -1514,6 +1521,18 @@ def _cleanup_analytics_named_params(
     # Group action words contain labels such as "제약사별".  They are not
     # manufacturer conditions, but a valid explicit manufacturer must survive.
     if action in _ANALYTICS_GROUP_ACTIONS:
+        # Remove the grouping action before reusing the labelled IO extractor.
+        # Otherwise its trailing "별" can be mistaken for a transaction-vendor
+        # value and hide a real label written after the action.
+        from app.services.io_nlq import _extract_io_compound_named_values
+
+        action_pattern = re.escape(action).replace(r"\ ", r"\s*")
+        group_residual = re.sub(action_pattern, " ", str(text or ""), count=1)
+        explicit_named = _extract_io_compound_named_values(group_residual)
+        for key, value in explicit_named.items():
+            if value:
+                out[key] = value
+
         maker = str(out.get("maker_nm") or "").strip()
         product_maker = str(out.get("product_ven_nm") or "").strip()
         explicit_maker = _explicit_manufacturer_before_group_action(text, action)
@@ -1548,6 +1567,8 @@ def _clear_analytics_grouping_artifacts(params: Dict[str, Any], text: str) -> Di
         ("품목별", ("physic_nm", "physic_cd")),
         ("제약사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
         ("제조사별", ("maker_nm", "maker_cd", "product_ven_nm", "product_ven_cd")),
+        ("매출처별", ("ven_nm", "ven_cd")),
+        ("거래처별", ("ven_nm", "ven_cd")),
         ("매입처별", ("buy_nm", "buy_cd")),
         ("영업사원별", ("sales_man", "sales_man_nm", "salesperson_cd", "salesperson_nm")),
     )
@@ -5500,6 +5521,31 @@ def _io_nlq_log_search_fields(action: str, params: Dict[str, Any]) -> list[str]:
     return [role for key, role in field_map.items() if str(params.get(key) or "").strip()]
 
 
+_IO_DETAIL_SOURCE_ACTIONS = frozenset(
+    {
+        "입고명세 조회",
+        "출고명세 조회",
+        "거래명세서 공통 조회",
+        "세금계산서 공통 조회",
+        "실재고월집계 조회",
+        "장부재고월집계 조회",
+    }
+)
+
+
+def _record_io_display_source_query_meta(meta: Dict[str, Any], action: str) -> None:
+    """Record the detail display SELECT once before a possible full-source SELECT."""
+    if str(action or "").strip() not in _IO_DETAIL_SOURCE_ACTIONS:
+        return
+    if int(meta.get("display_source_query_count") or 0) > 0:
+        return
+    # Some services already record the display query. Preserve that count rather
+    # than adding it again; older detail services are normalized here.
+    if int(meta.get("source_call_count") or 0) <= 0:
+        meta["source_call_count"] = 1
+    meta["display_source_query_count"] = 1
+
+
 def _try_handle_io_nlq(
     txt: str,
     *,
@@ -6023,8 +6069,7 @@ def _try_handle_io_nlq(
             meta = dict(payload.get("meta") or {})
             meta.setdefault("row_count", int(len(df)))
             meta.setdefault("row_count_total", int(len(df)))
-            if action in {"제품수불현황 조회", "제품재고현황 조회", "현재고 조회"}:
-                meta.setdefault("result_status", "success")
+            meta.setdefault("result_status", "success")
             payload["meta"] = meta
 
             return payload
@@ -6061,8 +6106,7 @@ def _try_handle_io_nlq(
         meta.setdefault("query_summary", query_summary)
         meta.setdefault("condition", query_summary)
         meta.setdefault("summary_md", msg)
-        if action in {"제품수불현황 조회", "제품재고현황 조회", "현재고 조회"}:
-            meta.setdefault("result_status", "no_data")
+        meta.setdefault("result_status", "no_data")
         payload["meta"] = meta
 
         return payload
@@ -6258,15 +6302,20 @@ def _try_handle_io_nlq(
             "condition_sources": condition_sources,
         }
     )
+    _record_io_display_source_query_meta(meta, action)
     payload["meta"] = meta
     
     delivery_started = time.perf_counter()
     try:
-        push_sims_result_to_chat(payload, action)
+        delivered_meta = push_sims_result_to_chat(payload, action)
     except Exception as exc:
         _trace("error", trace_action=action, trace_params=params, error=exc, source_stage="delivery")
         logger.exception("[nlq.router] push_sims_result_to_chat failed action=%r", action)
         return False
+
+    if isinstance(delivered_meta, dict):
+        meta = dict(delivered_meta)
+        payload["meta"] = meta
 
     _trace(
         "result",

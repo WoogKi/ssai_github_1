@@ -391,7 +391,16 @@ _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("supply_amount", "공급가액", ("공급가액",)),
     ("purchase_amount", "매입금액", ("매입금액", "입고금액")),
     ("transaction_amount", "거래금액", ("거래금액",)),
-    ("sales_quantity", "출고수량", ("출고수량", "매출수량")),
+    (
+        "sales_quantity",
+        "출고수량",
+        ("총출고수량", "출고수량", "총매출수량", "매출수량"),
+    ),
+    (
+        "sales_bonus_quantity",
+        "출고할증수량",
+        ("총출고할증수량", "출고할증수량", "매출할증수량"),
+    ),
     ("inbound_quantity", "입고수량", ("입고수량", "매입수량")),
     (
         "stock_quantity",
@@ -413,6 +422,7 @@ _CURRENT_TABLE_METRIC_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
             "매출공급가액",
             "매출금액",
             "매출액",
+            "월평균매출",
             "월시점 실제매출",
         ),
     ),
@@ -452,6 +462,9 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
         {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "sales_quantity": frozenset(
+        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+    ),
+    "sales_bonus_quantity": frozenset(
         {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "inbound_quantity": frozenset(
@@ -693,7 +706,9 @@ def _current_table_requested_metrics(query: str) -> list[str]:
         metrics.append("purchase_amount")
     elif "거래금액" in compact:
         metrics.append("transaction_amount")
-    elif any(term in compact for term in ("출고수량", "매출수량")):
+    elif any(term in compact for term in ("총출고할증수량", "출고할증수량", "매출할증수량")):
+        metrics.append("sales_bonus_quantity")
+    elif any(term in compact for term in ("총출고수량", "출고수량", "총매출수량", "매출수량")):
         metrics.append("sales_quantity")
     elif any(term in compact for term in ("입고수량", "매입수량")):
         metrics.append("inbound_quantity")

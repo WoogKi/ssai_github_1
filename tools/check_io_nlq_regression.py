@@ -288,6 +288,66 @@ def _parser_cases() -> list[ParserCase]:
             today=date(2026, 8, 26),
         ),
         ParserCase(
+            query="그저께 입고현황",
+            expected_action="입고명세 조회",
+            expected_params={"date_from": "20260828", "date_to": "20260828"},
+            forbidden_params=("nlq_unlabeled_name",),
+            today=date(2026, 8, 30),
+        ),
+        ParserCase(
+            query="거래명세서 공통 202501 매입분 조회",
+            expected_action="거래명세서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "trans_di": "1"},
+            forbidden_params=("trans_seq", "nlq_unlabeled_name"),
+        ),
+        ParserCase(
+            query="거래명세서 202501 매입 조회",
+            expected_action="거래명세서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "trans_di": "1"},
+            forbidden_params=("trans_seq", "nlq_unlabeled_name"),
+        ),
+        ParserCase(
+            query="거래명세서 202501 매출분 조회",
+            expected_action="거래명세서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "trans_di": "3"},
+            forbidden_params=("trans_seq", "nlq_unlabeled_name"),
+        ),
+        ParserCase(
+            query="세금계산서 공통 202501 매출 조회",
+            expected_action="세금계산서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "tax_di": "3"},
+            forbidden_params=("tax_seq", "nlq_unlabeled_name"),
+        ),
+        ParserCase(
+            query="세금계산서 202501 매입 조회",
+            expected_action="세금계산서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "tax_di": "1"},
+            forbidden_params=("tax_seq", "nlq_unlabeled_name"),
+        ),
+        ParserCase(
+            query="세금계산서 202501 매출분 조회",
+            expected_action="세금계산서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "tax_di": "3"},
+            forbidden_params=("tax_seq", "nlq_unlabeled_name"),
+        ),
+        ParserCase(
+            query="거래명세서 202501 거래처 한미 조회",
+            expected_action="거래명세서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "ven_nm": "한미"},
+            forbidden_params=("trans_seq",),
+        ),
+        ParserCase(
+            query="세금계산서 202501 거래처 한미 조회",
+            expected_action="세금계산서 공통 조회",
+            expected_params={"month_from": "202501", "month_to": "202501", "ven_nm": "한미"},
+            forbidden_params=("tax_seq",),
+        ),
+        ParserCase(
+            query="입고현황 20260828",
+            expected_action="입고명세 조회",
+            expected_params={"date_from": "20260828", "date_to": "20260828"},
+        ),
+        ParserCase(
             query="매입처 온라인팜 제품 낙소졸 입고현황",
             expected_action="입고명세 조회",
             expected_params={"ven_nm": "온라인팜", "physic_nm": "낙소졸"},
@@ -626,6 +686,95 @@ def run_vendor_master_business_intent_priority_checks() -> list[CheckResult]:
     return results
 
 
+def run_manual_routing_parser_status_contract_checks() -> list[CheckResult]:
+    """Cover the routing, parsing, and payload boundaries found by manual smoke."""
+    from unittest.mock import patch
+
+    from app.services import rddbc110_service
+    from app.sims.nlq import nlq_router, nlq_vendors
+    from app.ui import chat_middleware
+
+    results: list[CheckResult] = []
+
+    vendor_candidate = nlq_router.resolve_new_sims_nlq_candidate(
+        "거래처목록 거래처명 약국 조회"
+    )
+    results.append(
+        CheckResult(
+            "fresh vendor master query wins over current-table follow-up routing",
+            vendor_candidate == {"route": "vendors", "action": "거래처 목록"},
+            f"candidate={vendor_candidate!r}",
+        )
+    )
+
+    cost_apply_name = nlq_vendors._extract_cost_apply_name_keyword(
+        "거래처 단가적용처 단가 조회"
+    )
+    stock_apply_name = nlq_vendors._extract_stock_apply_name_keyword(
+        "거래처 재고적용처 재고 조회"
+    )
+    results.append(
+        CheckResult(
+            "labelled cost/stock apply names preserve their final syllable",
+            cost_apply_name == "단가" and stock_apply_name == "재고",
+            f"cost_apply_name={cost_apply_name!r}, stock_apply_name={stock_apply_name!r}",
+        )
+    )
+
+    plain = nlq_router._build_analytics_params("매출처별 매출 예상", "매출처별 매출 예상")
+    salesperson = nlq_router._build_analytics_params(
+        "매출처별 매출 예상 영업사원 fixture-salesperson",
+        "매출처별 매출 예상",
+    )
+    explicit_vendor = nlq_router._build_analytics_params(
+        "매출처별 매출 예상 거래처 fixture-vendor",
+        "매출처별 매출 예상",
+    )
+    results.append(
+        CheckResult(
+            "customer grouping aliases do not create a vendor filter",
+            not plain.get("ven_nm")
+            and not salesperson.get("ven_nm")
+            and salesperson.get("sales_man_nm") == "fixture-salesperson"
+            and explicit_vendor.get("ven_nm") == "fixture-vendor",
+            (
+                f"plain={plain!r}, salesperson={salesperson!r}, "
+                f"explicit_vendor={explicit_vendor!r}"
+            ),
+        )
+    )
+
+    with patch.object(rddbc110_service, "get_rddbc110_df", return_value=pd.DataFrame()):
+        no_data_payload = rddbc110_service.get_rddbc110_result({})
+    no_data_meta = dict(no_data_payload.get("meta") or {})
+    results.append(
+        CheckResult(
+            "inbound no-data payload records no_data and its executed source call",
+            no_data_meta.get("result_status") == "no_data"
+            and no_data_meta.get("source_call_count") == 1,
+            f"meta={no_data_meta!r}",
+        )
+    )
+
+    display_source_meta: dict[str, Any] = {}
+    nlq_router._record_io_display_source_query_meta(display_source_meta, "출고명세 조회")
+    full_source_meta = dict(display_source_meta)
+    chat_middleware._record_io_full_source_query_meta(full_source_meta)
+    results.append(
+        CheckResult(
+            "detail display and full-source queries share one source-call count contract",
+            display_source_meta == {"source_call_count": 1, "display_source_query_count": 1}
+            and full_source_meta == {
+                "source_call_count": 2,
+                "display_source_query_count": 1,
+                "full_source_query_count": 1,
+            },
+            f"display={display_source_meta!r}, full={full_source_meta!r}",
+        )
+    )
+    return results
+
+
 # ---------------------------------------------------------------------
 # Basic import checks
 # ---------------------------------------------------------------------
@@ -772,6 +921,35 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
                 f"generic document route remains unchanged: {query}",
                 str(parsed.get("action") or "") == expected_action,
                 f"parsed={parsed!r}",
+            )
+        )
+
+    document_condition_cases = (
+        ("거래명세서 공통 202501 매입분 조회", "거래명세서 공통 조회"),
+        ("거래명세서 202501 매입 조회", "거래명세서 공통 조회"),
+        ("거래명세서 202501 매출분 조회", "거래명세서 공통 조회"),
+        ("세금계산서 공통 202501 매출 조회", "세금계산서 공통 조회"),
+        ("세금계산서 202501 매입 조회", "세금계산서 공통 조회"),
+        ("세금계산서 202501 매출분 조회", "세금계산서 공통 조회"),
+    )
+    for query, expected_action in document_condition_cases:
+        parsed = io_nlq.resolve_io_nlq(query) or {}
+        params = dict(parsed.get("params") or {})
+        with patch.object(io_nlq, "_lookup_unlabeled_io_entity_candidates") as lookup:
+            resolved = io_nlq.resolve_unlabeled_io_entity_condition(
+                query,
+                action=str(parsed.get("action") or ""),
+                params=params,
+            )
+        residual = io_nlq._extract_unlabeled_entity_phrase(query, expected_action)
+        results.append(
+            CheckResult(
+                f"document month/direction tokens do not enter entity resolution: {query}",
+                str(parsed.get("action") or "") == expected_action
+                and not residual
+                and resolved.get("status") == "not_applicable"
+                and lookup.call_count == 0,
+                f"action={parsed.get('action')!r}, residual={residual!r}, result={resolved!r}",
             )
         )
 
@@ -1302,6 +1480,50 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
                 f"captured={bool(sql)}, pattern={sql_params.get('nlq_unlabeled_name_like')!r}",
             )
         )
+
+    inbound_ctes = rddbc110_service._detail_aggregate_ctes({
+        "date_from": "20260701",
+        "date_to": "20260731",
+    })
+    results.append(
+        CheckResult(
+            "inbound detail scopes validation aggregate keys by the requested inbound date window",
+            "Key_Row.Rd11_In_YyMmDd >= %(date_from)s" in inbound_ctes
+            and "Key_Row.Rd11_In_YyMmDd <= %(date_to)s" in inbound_ctes
+            and "INNER JOIN trans_keys AS Key_Row" in inbound_ctes
+            and "INNER JOIN tax_keys AS Key_Row" in inbound_ctes,
+            "date-window document keys drive both validation aggregates",
+        )
+    )
+    results.append(
+        CheckResult(
+            "inbound detail keeps all document-detail rows after key selection",
+            "Detail.Rd11_Trans_YyMmDd = Key_Row.Rd11_Trans_YyMmDd" in inbound_ctes
+            and "Detail.Rd11_Tax_YyMmDd = Key_Row.Rd11_Tax_YyMmDd" in inbound_ctes
+            and "Detail.Rd11_In_YyMmDd >= %(date_from)s" not in inbound_ctes,
+            "aggregate detail is joined by document key, not incorrectly truncated by inbound date",
+        )
+    )
+
+    screen_export_calls: list[dict[str, Any]] = []
+    original_inbound_export = rddbc110_service.get_rddbc110_export_df
+    try:
+        rddbc110_service.get_rddbc110_export_df = lambda params: (
+            screen_export_calls.append(dict(params or {}))
+            or pd.DataFrame({"Rd11_In_YyMmDd": ["20260701"]})
+        )
+        screen_payload = rddbc110_service.get_rddbc110_screen_result({"top": 1000})
+    finally:
+        rddbc110_service.get_rddbc110_export_df = original_inbound_export
+    results.append(
+        CheckResult(
+            "inbound panel screen result starts from one full export frame",
+            len(screen_export_calls) == 1
+            and bool((screen_payload.get("meta") or {}).get("_io_full_df_ready"))
+            and int((screen_payload.get("meta") or {}).get("row_count_total") or 0) == 1,
+            f"export_calls={len(screen_export_calls)}, meta={screen_payload.get('meta')!r}",
+        )
+    )
 
     inventory_source = inspect.getsource(product_inventory_service._apply_master_filters)
     results.append(
@@ -4180,7 +4402,8 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
             and outbound_query_meta.get("prepared_rows") == capped_rows
             and outbound_query_meta.get("expected_rows") == capped_expected_rows
             and outbound_query_meta.get("download_source_status") == "partial_limit"
-            and outbound_query_meta.get("source_call_count") == 0
+            and outbound_query_meta.get("source_call_count") == 1
+            and outbound_query_meta.get("full_source_query_count") == 1
             and outbound_query_provenance.get("download_source_status") == "partial_limit"
             and outbound_query_provenance.get("limit_hit") is True,
             f"meta={outbound_query_meta!r}, provenance={outbound_query_provenance!r}",
@@ -7202,6 +7425,12 @@ def main() -> int:
     failed += _print_results(
         "VENDOR MASTER / BUSINESS INTENT PRIORITY CHECKS",
         vendor_priority_results,
+    )
+
+    manual_contract_results = run_manual_routing_parser_status_contract_checks()
+    failed += _print_results(
+        "MANUAL ROUTING / PARSER / STATUS CONTRACT CHECKS",
+        manual_contract_results,
     )
 
     unlabeled_entity_results = run_unlabeled_io_entity_resolution_checks()

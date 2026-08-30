@@ -156,6 +156,11 @@ def _trim(expr: str) -> str:
     return f"LTRIM(RTRIM({expr}))"
 
 
+def _fixed_char_join_eq(left: str, right: str) -> str:
+    """Use native equality for verified fixed-char PK/FK master joins."""
+    return f"{left} = {right}"
+
+
 def _clean_text(value: Optional[str]) -> str:
     return str(value or "").strip()
 
@@ -269,8 +274,8 @@ def _run_df(action: str, sql: str, params: tuple):
 def _code_join(alias_name: str, g_expr: str, t_expr: str) -> str:
     return f"""
     LEFT JOIN {T010} AS {alias_name} WITH (NOLOCK)
-           ON {_trim(f'{alias_name}.{COL010_GCODE}')} = {_trim(g_expr)}
-          AND {_trim(f'{alias_name}.{COL010_TCODE}')} = {_trim(t_expr)}
+           ON {_fixed_char_join_eq(f'{alias_name}.{COL010_GCODE}', g_expr)}
+          AND {_fixed_char_join_eq(f'{alias_name}.{COL010_TCODE}', t_expr)}
     """
 
 
@@ -400,15 +405,15 @@ def _base_from() -> str:
     FROM {T} AS V WITH (NOLOCK)
 
     LEFT JOIN {T060} AS AddU WITH (NOLOCK)
-           ON {_trim(f'AddU.{COL060_USERCD}')} = {_trim(f'V.{COL_ADDCD}')}
+           ON {_fixed_char_join_eq(f'AddU.{COL060_USERCD}', f'V.{COL_ADDCD}')}
     LEFT JOIN {T060} AS ModU WITH (NOLOCK)
-           ON {_trim(f'ModU.{COL060_USERCD}')} = {_trim(f'V.{COL_MODCD}')}
+           ON {_fixed_char_join_eq(f'ModU.{COL060_USERCD}', f'V.{COL_MODCD}')}
     LEFT JOIN {T060} AS SalesMan WITH (NOLOCK)
-           ON {_trim(f'SalesMan.{COL060_USERCD}')} = {_trim(f'V.{COL_SALES_MAN}')}
+           ON {_fixed_char_join_eq(f'SalesMan.{COL060_USERCD}', f'V.{COL_SALES_MAN}')}
 
     LEFT JOIN {T021} AS Road1 WITH (NOLOCK)
-           ON {_trim(f'Road1.{COL021_ROAD_CD}')} = {_trim(f'V.{COL_ROAD_CD}')}
-          AND {_trim(f'Road1.{COL021_DONG_SEQ}')} = {_trim(f'V.{COL_DONG_SEQ}')}
+           ON {_fixed_char_join_eq(f'Road1.{COL021_ROAD_CD}', f'V.{COL_ROAD_CD}')}
+          AND {_fixed_char_join_eq(f'Road1.{COL021_DONG_SEQ}', f'V.{COL_DONG_SEQ}')}
 
     {_code_join("VenGroup", f"V.{COL_VEN_GROUP_G}", f"V.{COL_VEN_GROUP}")}
     {_code_join("VenKind", f"V.{COL_VEN_KIND_G}", f"V.{COL_VEN_KIND}")}
@@ -424,11 +429,11 @@ def _base_from() -> str:
     {_code_join("UdiSupplyCd", f"V.{COL_UDI_SUPPLY_CD_G}", f"V.{COL_UDI_SUPPLY_CD}")}
 
     LEFT JOIN {T} AS CostApply WITH (NOLOCK)
-           ON {_trim(f'CostApply.{COL_VEN_CD}')} = {_trim(f'V.{COL_COST_APPLY_CD}')}
+           ON {_fixed_char_join_eq(f'CostApply.{COL_VEN_CD}', f'V.{COL_COST_APPLY_CD}')}
     LEFT JOIN {T} AS StockApply WITH (NOLOCK)
-           ON {_trim(f'StockApply.{COL_VEN_CD}')} = {_trim(f'V.{COL_STOCK_APPLY_CD}')}
+           ON {_fixed_char_join_eq(f'StockApply.{COL_VEN_CD}', f'V.{COL_STOCK_APPLY_CD}')}
     LEFT JOIN {T} AS UnifyVen WITH (NOLOCK)
-           ON {_trim(f'UnifyVen.{COL_VEN_CD}')} = {_trim(f'V.{COL_UNIFY_VEN_CD}')}
+           ON {_fixed_char_join_eq(f'UnifyVen.{COL_VEN_CD}', f'V.{COL_UNIFY_VEN_CD}')}
     """
 
 

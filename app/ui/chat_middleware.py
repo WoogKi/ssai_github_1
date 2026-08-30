@@ -4567,6 +4567,16 @@ def _record_io_full_source_limit_meta(
         meta["download_source_status"] = source_status
     return source_status
 
+
+def _record_io_full_source_query_meta(meta: Dict[str, Any]) -> None:
+    """Count one actual export query without counting cache reuse as a source call."""
+    try:
+        current = int(meta.get("source_call_count") or 0)
+    except Exception:
+        current = 0
+    meta["source_call_count"] = current + 1
+    meta["full_source_query_count"] = int(meta.get("full_source_query_count") or 0) + 1
+
 def _download_source_context(
     item: Dict[str, Any],
     meta: Dict[str, Any],
@@ -4882,7 +4892,7 @@ def _get_full_download_df_for_sims_item(
         rows: int = 0,
         cache_used: bool = False,
     ) -> None:
-        if "출고명세" not in action:
+        if action not in export_actions and "검증" not in action:
             return
         params_for_log = item.get("params") or meta.get("params") or {}
         if not isinstance(params_for_log, dict):
@@ -4896,10 +4906,11 @@ def _get_full_download_df_for_sims_item(
             1 for key in condition_keys if str(params_for_log.get(key) or "").strip()
         )
         log.info(
-            "[io.detail.perf] action=%s stage=%s mode=full_source "
+            "[io.detail.perf] action=%s request_id=%s stage=%s mode=full_source "
             "condition_type_count=%s display_rows=%s result_rows=%s "
             "cache_used=%s elapsed_ms=%s source_call_count=%s",
             action,
+            str(meta.get("nlq_trace_request_id") or "")[:64],
             stage,
             condition_type_count,
             display_rows if "display_rows" in locals() else 0,
@@ -5104,6 +5115,7 @@ def _get_full_download_df_for_sims_item(
             return display_df
 
     params = _download_params_from_item(item, meta)
+    _log_io_detail_perf("full_source_prepare")
 
     # 검증 export는 화면표시 TOP 제한을 제거하고 전체 불일치 기준으로 재조회한다.
     if is_validation_action:
@@ -5148,46 +5160,65 @@ def _get_full_download_df_for_sims_item(
         if action == "입고명세 조회":
             from app.services.rddbc110_service import get_rddbc110_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc110_export_df(params)
 
         elif action == "출고명세 조회":
             from app.services.rddbc120_service import get_rddbc120_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc120_export_df(params)
 
         elif action == "거래명세서 공통 조회":
             from app.services.rddbc130_service import get_rddbc130_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc130_export_df(params)
 
         elif action == "세금계산서 공통 조회":
             from app.services.rddbc140_service import get_rddbc140_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc140_export_df(params)
 
         elif action == "실재고월집계 조회":
             from app.services.rddbc210_service import get_rddbc210_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc210_export_df(params)
 
         elif action == "장부재고월집계 조회":
             from app.services.rddbc220_service import get_rddbc220_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc220_export_df(params)
 
         elif is_in_validation_action:
             from app.services.rddbc110_service import get_rddbc110_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc110_export_df(params)
 
         elif is_out_validation_action:
             from app.services.rddbc120_service import get_rddbc120_export_df
 
+            _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc120_export_df(params)
 
 
         else:
             export_df = display_df
+
+        if action in {
+            "입고명세 조회", "출고명세 조회", "거래명세서 공통 조회", "세금계산서 공통 조회",
+            "실재고월집계 조회", "장부재고월집계 조회",
+        } or is_in_validation_action or is_out_validation_action:
+            _record_io_full_source_query_meta(meta)
+
+        _log_io_detail_perf(
+            "full_source_service_complete",
+            rows=int(len(export_df)) if isinstance(export_df, pd.DataFrame) else 0,
+        )
 
         if isinstance(export_df, pd.DataFrame) and not export_df.empty:
             _record_io_full_source_limit_meta(
@@ -7048,7 +7079,7 @@ def render_pending_chat_items(area, room: Optional[Dict[str, Any]] = None) -> No
             except Exception as exc:
                 log.warning("[chat.render.pending] item render failed error_type=%s", type(exc).__name__)
 
-def wssz(result: Any, action: Optional[str] = None) -> None:
+def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     """
     SIMS 최종 결과를 채팅 히스토리로 1회 푸시하고,
     LLM용 SIMS 컨텍스트(JSON)도 동시에 갱신한다.
@@ -7069,7 +7100,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
             payload = _normalize_result_for_chat(result)
     except Exception as exc:
         log.warning("[chat.sims.push] normalize result failed error_type=%s", type(exc).__name__)
-        return
+        return None
 
     # 2) 액션명/타이틀 보강
     meta = dict(payload.get("meta") or {})
@@ -7096,7 +7127,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
             current_company_id,
             bool(payload_db_name and current_db_name and payload_db_name != current_db_name),
         )
-        return
+        return None
 
     # 현재표 후속표는 부모 table_key를 provenance로 보존한다.
     # 후속 결과 자체는 현재표로 승격하지 않고, 다음 성공 신규조회 전까지
@@ -7120,7 +7151,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         room_id = get_current_chat_room_id()
         if not room_id:
             log.warning("[dashboard.chat_push] room_resolved=False pushed=False")
-            return
+            return None
         dashboard_meta = dict(payload.get("meta") or {})
         dashboard_meta["room_id"] = room_id
         dashboard_meta.setdefault("dashboard_event_id", str(payload.get("id") or ""))
@@ -7137,6 +7168,27 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
     if force_push:
         meta.setdefault("_push_nonce", str(uuid.uuid4()))
         payload["meta"] = meta
+
+    delivery_started = time.perf_counter()
+    io_detail_action = str(action_name or "").strip() in {
+        "입고명세 조회", "출고명세 조회", "거래명세서 공통 조회", "세금계산서 공통 조회",
+        "실재고월집계 조회", "장부재고월집계 조회",
+    }
+
+    def _log_io_delivery_stage(stage: str) -> None:
+        if not io_detail_action:
+            return
+        current_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        log.info(
+            "[io.detail.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s",
+            action_name,
+            str(current_meta.get("nlq_trace_request_id") or "")[:64],
+            stage,
+            int((time.perf_counter() - delivery_started) * 1000),
+            int(current_meta.get("source_call_count") or 0),
+        )
+
+    _log_io_delivery_stage("payload_normalized")
 
     # 3) LLM용 SIMS 컨텍스트 갱신
     try:
@@ -7294,6 +7346,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
 
     except Exception as exc:
         log.warning("[chat.sims.push] build context failed error_type=%s", type(exc).__name__)
+    _log_io_delivery_stage("context_ready")
 
     # 3.5) (옵션) 컨텍스트만 갱신하고 채팅 푸시는 생략
     # - NLQ(자연어 자동조회) 등에서 "표는 채팅버블로 별도 렌더"할 때,
@@ -7301,12 +7354,13 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
     # - __sims_silent_push 플래그가 True면, SIMS_CTX만 갱신하고 종료한다.
     if ss.pop("__sims_silent_push", False):
         log.debug("[chat.sims.silent_push] %s action=%s", _chat_runtime_log_kv(), action_name)
-        return
+        return dict(payload.get("meta") or {})
 
     # 3.55) SIMS 표를 채팅방 history에서 다시 렌더할 수 있도록 session_state에 보관
     # - 화면용 df_display는 sims_tables에 저장
     # - 다운로드용 전체 df는 sims_export_tables에 별도 저장
     # - 채팅방 history에는 table_key만 저장하고, 실제 DF는 session_state에 보관한다.
+    _log_io_delivery_stage("table_stash_start")
     try:
         if isinstance(payload, dict) and payload.get("type") == "table":
             df_full_for_export = payload.get("df")
@@ -7533,10 +7587,12 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
 
     except Exception as exc:
         log.warning("[chat.stash.export] table preparation failed error_type=%s", type(exc).__name__)
+    _log_io_delivery_stage("table_stash_complete")
 
 
     # 3.56) JSON 저장/재렌더 안전화 (DataFrame → meta records/columns)
     _ensure_table_json_safe(payload)
+    _log_io_delivery_stage("json_safe_complete")
 
     # 4) 중복 PUSH 방지 (NLQ는 동일 결과라도 표를 다시 띄울 수 있게 옵션 허용)
     meta = dict(payload.get("meta") or {})
@@ -7559,7 +7615,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
                     _chat_runtime_log_kv(),
                     sig[:8],
                 )
-                return
+                return dict(payload.get("meta") or {})
         except Exception:
             # 예외 시에는 기존 동작(중복 허용)으로 진행
             pass
@@ -7611,6 +7667,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
     # 5) 인박스에 넣고 drain
     # NLQ 응답시간은 전체 원본 준비, 현재표 승격, 다운로드 원본 stash가 끝난
     # 뒤에 한 번만 확정한다. 인박스 전달 이후의 history 복원/Streamlit rerender는 제외한다.
+    _log_io_delivery_stage("chat_delivery_start")
     _attach_sims_response_timing(payload, ss)
     ss.setdefault("__chat_inbox", [])
     ss["__chat_inbox"].append(payload)
@@ -7623,6 +7680,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
     except Exception:
         pass
     ss["__sims_push_count"] += 1
+    _log_io_delivery_stage("chat_delivery_complete")
 
     # ✅ 표 버블로 스크롤(메인에서 pop해서 실행)
     # 메인 렌더는 <div id="jump-{message_id}"> 앵커를 만들기 때문에
@@ -7697,6 +7755,7 @@ def wssz(result: Any, action: Optional[str] = None) -> None:
         sig[:8],
         ss["__sims_push_count"],
     )
+    return dict(payload.get("meta") or {})
 
 # 조회조건 텍스트 빌더: meta.query_summary > params 기반 텍스트 
 # (meta.query_summary이 있으면 우선 사용, 없으면 params에서 날짜/제품/거래처 등 주요 조건을 뽑아서 조합)   

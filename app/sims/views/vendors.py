@@ -113,6 +113,42 @@ def _norm_series(sr: pd.Series) -> pd.Series:
     )
 
 
+def _is_sql_like_pushdown_safe(value: Any) -> bool:
+    """Keep the screen's literal contains contract for SQL LIKE metacharacters."""
+    text = _clean_text(value)
+    return bool(text) and not any(token in text for token in ("%", "_", "["))
+
+
+def _normalize_vendor_display_series(series: pd.Series) -> pd.Series:
+    """Vectorized equivalent of the legacy per-cell display normalization."""
+    return (
+        series.fillna("")
+        .astype(str)
+        .replace({"None": "", "nan": "", "<NA>": "", "NaT": ""})
+        .str.strip()
+    )
+
+
+def _format_vendor_char8_date_series(series: pd.Series) -> pd.Series:
+    source = _normalize_vendor_display_series(series)
+    digits = source.str.replace(r"\D", "", regex=True)
+    sentinel = digits.isin(("", "0", "00000000", "19000101", "20010101", "99999999"))
+    candidate = digits.str.len().eq(8) & ~sentinel
+    parsed = pd.to_datetime(digits.where(candidate), format="%Y%m%d", errors="coerce")
+    result = source.mask(sentinel, "")
+    result.loc[candidate] = parsed.dt.strftime("%Y-%m-%d").fillna("")
+    return result
+
+
+def _format_vendor_datetime_series(series: pd.Series) -> pd.Series:
+    source = _normalize_vendor_display_series(series)
+    parsed = pd.to_datetime(source, errors="coerce")
+    result = source.copy()
+    valid = parsed.notna()
+    result.loc[valid] = parsed.loc[valid].dt.strftime("%Y-%m-%d %H:%M:%S")
+    return result
+
+
 def _pick_col(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
     for c in candidates:
         if c in df.columns:
@@ -212,7 +248,7 @@ def _search_vendors_service(**kwargs) -> pd.DataFrame:
 
 
 def _prepare_vendor_display(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = _ensure_df(df_raw).copy()
+    df = _ensure_df(df_raw)
     if df.empty:
         return df
 
@@ -311,46 +347,6 @@ def _prepare_vendor_display(df_raw: pd.DataFrame) -> pd.DataFrame:
     _rename_first(["Rd03_HP"], "담당자 핸드폰번호")
     _rename_first(["Rd03_CorpReg_Num"], "법인등록번호")
     _rename_first(["Rd03_Ven_Sm"], "거래처약어명")
-
-    def _safe_norm_cell(v: Any) -> str:
-        if v is None:
-            return ""
-        try:
-            if pd.isna(v):
-                return ""
-        except Exception:
-            pass
-        s = str(v).strip()
-        return "" if s in ("None", "nan", "<NA>", "NaT") else s
-
-    def _fmt_char8_date(v: Any) -> str:
-        s = _safe_norm_cell(v)
-        if not s:
-            return ""
-        digits = "".join(ch for ch in s if ch.isdigit())
-        if digits in ("", "0", "00000000", "19000101", "20010101", "99999999"):
-            return ""
-        if len(digits) == 8:
-            try:
-                dtv = pd.to_datetime(digits, format="%Y%m%d", errors="coerce")
-                if pd.isna(dtv):
-                    return ""
-                return dtv.strftime("%Y-%m-%d")
-            except Exception:
-                return s
-        return s
-
-    def _fmt_datetime(v: Any) -> str:
-        s = _safe_norm_cell(v)
-        if not s:
-            return ""
-        try:
-            dtv = pd.to_datetime(s, errors="coerce")
-            if pd.isna(dtv):
-                return s
-            return dtv.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return s
 
     # 등록자/수정자는 sample query 기준으로 "코드 + 이름" 구조
     if "등록자명" in df.columns:
@@ -473,15 +469,15 @@ def _prepare_vendor_display(df_raw: pd.DataFrame) -> pd.DataFrame:
     out = df[ordered_cols].copy() if ordered_cols else df.copy()
 
     for col in out.columns:
-        out[col] = out[col].map(_safe_norm_cell)
+        out[col] = _normalize_vendor_display_series(out[col])
 
     for col in ("등록일자", "수정일자"):
         if col in out.columns:
-            out[col] = out[col].map(_fmt_char8_date)
+            out[col] = _format_vendor_char8_date_series(out[col])
 
     for col in ("등록일시", "수정일시"):
         if col in out.columns:
-            out[col] = out[col].map(_fmt_datetime)
+            out[col] = _format_vendor_datetime_series(out[col])
 
     return out
 
@@ -851,6 +847,8 @@ def render_vendor_list() -> Dict[str, Any]:
             road_addr_kw=_clean_text(road_addr_kw),
             ven_group=ven_group,
             ven_kind=ven_kind,
+            cost_apply_nm=_clean_text(cost_apply_nm) if _is_sql_like_pushdown_safe(cost_apply_nm) else "",
+            stock_apply_nm=_clean_text(stock_apply_nm) if _is_sql_like_pushdown_safe(stock_apply_nm) else "",
 
             add_user_nm=_clean_text(add_user_nm),
             mod_user_nm=_clean_text(mod_user_nm),

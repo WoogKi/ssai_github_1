@@ -10,7 +10,7 @@ from datetime import date, datetime
 from app.db.mssql_client import read_df
 
 
-from app.services.rddbc110_service import get_rddbc110_result, get_rddbc110_export_df
+from app.services.rddbc110_service import get_rddbc110_export_df, get_rddbc110_screen_result
 from app.services.rddbc120_service import get_rddbc120_result, get_rddbc120_export_df
 
 from app.sims.views.rddbc_io_shared import (
@@ -135,7 +135,14 @@ def _attach_inout_full_df(
         is_in_validation = "검증" in str(title) and "입고" in str(title)
         is_out_validation = "검증" in str(title) and "출고" in str(title)
 
-        if title == "입고명세 조회" or is_in_validation:
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        preloaded_full_df = payload.get("df_display")
+        if not isinstance(preloaded_full_df, pd.DataFrame):
+            preloaded_full_df = payload.get("df")
+
+        if bool(meta.get("_io_full_df_ready")) and isinstance(preloaded_full_df, pd.DataFrame):
+            export_df = preloaded_full_df
+        elif title == "입고명세 조회" or is_in_validation:
             export_df = get_rddbc110_export_df(final_params)
         elif title == "출고명세 조회" or is_out_validation:
             export_df = get_rddbc120_export_df(final_params)
@@ -1089,7 +1096,7 @@ def view_rddbc110(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         io_kind="in",
         seq_keys=["in_seq", "trans_seq", "tax_seq"],
         alias_map=_IO110_LOCAL_FILTER_ALIAS_MAP,
-        service_fn=get_rddbc110_result,
+        service_fn=get_rddbc110_screen_result,
         params=params,
     )
 

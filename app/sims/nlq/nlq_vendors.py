@@ -70,7 +70,7 @@ def _extract_quoted_or_token(txt: str, label_patterns: str) -> str | None:
     """
     # 1) 포함/들어간/있는/인/같은
     m = re.search(
-        rf"{label_patterns}\s*(?:에|이|가|은|는)?\s*([^\s,?.!]+?)(?:이|가|을|를|은|는)?\s*(?:포함|들어간|있는|인|같은)",
+        rf"{label_patterns}(?:\s*(?:에|이|가|은|는)\s+)?\s*([^\s,?.!]+?)(?:이|가|을|를|은|는)?\s*(?:포함|들어간|있는|인|같은)",
         txt,
     )
     if m:
@@ -79,7 +79,7 @@ def _extract_quoted_or_token(txt: str, label_patterns: str) -> str | None:
 
     # 2) 비따옴표 일반형
     m = re.search(
-        rf"{label_patterns}\s*(?:에|이|가|은|는)?\s*([^\s,?.!]+)\s*(?:포함|들어간|있는|인|같은)",
+        rf"{label_patterns}(?:\s*(?:에|이|가|은|는)\s+)?\s*([^\s,?.!]+)\s*(?:포함|들어간|있는|인|같은)",
         txt,
     )
     if m:
@@ -92,11 +92,15 @@ def _extract_quoted_or_token(txt: str, label_patterns: str) -> str | None:
     #    - "수정자 홍길동 거래처 검색"
     #    - "단가적용처명 다라메 거래처 조회"
     m = re.search(
-        rf"{label_patterns}\s*(?:에|이|가|은|는)?\s*([^\s,?.!]+?)(?:이|가|을|를|은|는)?\s*(?:(?:거래처(?:명|코드)?|거래처목록|거래처\s*목록)\s*)?(?:조회|검색|찾아|찾아줘|찾아봐|보여줘|알려줘)?\s*$",
+        rf"{label_patterns}(?:\s*(?:에|이|가|은|는)\s+)?\s*([^\s,?.!]+)\s*(?:(?:거래처(?:명|코드)?|거래처목록|거래처\s*목록)\s*)?(?:조회|검색|찾아|찾아줘|찾아봐|보여줘|알려줘)?\s*$",
         txt,
     )
     if m:
-        v = _strip_tail_request_words(_strip_tail_josa(m.group(1) or ""))
+        # Label + value + request form has no unambiguous particle boundary.
+        # Removing a final syllable here corrupts ordinary values such as
+        # "단가", "허가", and "경로". Preserve the literal labelled token;
+        # the surrounding request verb is already outside this capture.
+        v = _strip_tail_request_words(_strip_wrapping_quotes(m.group(1) or ""))
         return v or None
 
     return None
