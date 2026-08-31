@@ -223,13 +223,42 @@ def _base_filters(params: Dict[str, str]) -> str:
     return ("\n      AND " + "\n      AND ".join(clauses)) if clauses else ""
 
 
+def _filtered_tax_scope_ctes(where_sql: str, *, include_top: bool) -> str:
+    """Build the Rddbc140 driving set before touching inbound/outbound detail."""
+    top_sql = "TOP (%(top)s)" if include_top else ""
+    return f"""
+FilteredBooks AS (
+    SELECT {top_sql} Tax_Books.*
+    FROM dbo.Rddbc140 AS Tax_Books
+    LEFT JOIN dbo.Rddbc060 AS Add_Cd
+        ON Tax_Books.Rd14_Add_Cd = Add_Cd.Rd06_User_Cd
+    LEFT JOIN dbo.Rddbc060 AS Mod_Cd
+        ON Tax_Books.Rd14_Mod_Cd = Mod_Cd.Rd06_User_Cd
+    LEFT JOIN dbo.Rddbc030 AS Ven_Cd
+        ON Tax_Books.Rd14_Ven_Cd = Ven_Cd.Rd03_Ven_Cd
+    WHERE 1 = 1
+    {where_sql}
+    ORDER BY Tax_Books.Rd14_Tax_YyMmDd DESC, Tax_Books.Rd14_Ven_Cd, Tax_Books.Rd14_Tax_Seq DESC
+),
+FilteredTaxKeys AS (
+    SELECT DISTINCT
+        Rd14_Tax_Di AS Tax_Di,
+        Rd14_Tax_YyMmDd AS Tax_YyMmDd,
+        Rd14_Ven_Cd AS Ven_Cd,
+        Rd14_Tax_Seq AS Tax_Seq
+    FROM FilteredBooks
+    WHERE Rd14_Tax_Di IN ('1', '3')
+)"""
+
+
 def get_rddbc140_df(params: Optional[Dict[str, str]] = None):
     params = coalesce_params(params)
     params["top"] = _tax_query_top(params, default=200)
     where_sql = _base_filters(params)
 
     sql = f"""
-WITH in_sum AS (
+WITH {_filtered_tax_scope_ctes(where_sql, include_top=True)},
+in_sum AS (
     SELECT
         Rd11_Tax_Di AS Tax_Di,
         Rd11_Tax_YyMmDd AS Tax_YyMmDd,
@@ -237,8 +266,12 @@ WITH in_sum AS (
         Rd11_Tax_Seq AS Tax_Seq,
         SUM(COALESCE(Rd11_Fin_Supply_Price, Rd11_Supply_Price, 0)) AS Sum_Supply,
         SUM(COALESCE(Rd11_Fin_Tax_Price, Rd11_Tax_Price, 0)) AS Sum_Tax
-    FROM dbo.Rddbc110
-    WHERE NULLIF(LTRIM(RTRIM(Rd11_Tax_Seq)), '') IS NOT NULL
+    FROM dbo.Rddbc110 AS In_Put
+    INNER JOIN FilteredTaxKeys AS Keys
+        ON In_Put.Rd11_Tax_Di = Keys.Tax_Di
+       AND In_Put.Rd11_Tax_YyMmDd = Keys.Tax_YyMmDd
+       AND In_Put.Rd11_Ven_Cd = Keys.Ven_Cd
+       AND In_Put.Rd11_Tax_Seq = Keys.Tax_Seq
     GROUP BY Rd11_Tax_Di, Rd11_Tax_YyMmDd, Rd11_Ven_Cd, Rd11_Tax_Seq
 ),
 out_sum AS (
@@ -249,8 +282,12 @@ out_sum AS (
         Rd12_Tax_Seq AS Tax_Seq,
         SUM(COALESCE(Rd12_Fin_Supply_Price, Rd12_Supply_Price, 0)) AS Sum_Supply,
         SUM(COALESCE(Rd12_Fin_Tax_Price, Rd12_Tax_Price, 0)) AS Sum_Tax
-    FROM dbo.Rddbc120
-    WHERE NULLIF(LTRIM(RTRIM(Rd12_Tax_Seq)), '') IS NOT NULL
+    FROM dbo.Rddbc120 AS Out_Put
+    INNER JOIN FilteredTaxKeys AS Keys
+        ON Out_Put.Rd12_Tax_Di = Keys.Tax_Di
+       AND Out_Put.Rd12_Tax_YyMmDd = Keys.Tax_YyMmDd
+       AND Out_Put.Rd12_Ven_Cd = Keys.Ven_Cd
+       AND Out_Put.Rd12_Tax_Seq = Keys.Tax_Seq
     GROUP BY Rd12_Tax_Di, Rd12_Tax_YyMmDd, Rd12_Ven_Cd, Rd12_Tax_Seq
 )
 SELECT TOP (%(top)s)
@@ -376,7 +413,7 @@ SELECT TOP (%(top)s)
     Tax_Books.Rd14_Tax_Sub_Di_Gcode,
     Tax_Books.Rd14_Tax_Sub_Di
 
-FROM dbo.Rddbc140 AS Tax_Books
+FROM FilteredBooks AS Tax_Books
 LEFT JOIN dbo.Rddbc060 AS Add_Cd
     ON Tax_Books.Rd14_Add_Cd = Add_Cd.Rd06_User_Cd
 LEFT JOIN dbo.Rddbc060 AS Mod_Cd
@@ -396,14 +433,13 @@ LEFT JOIN out_sum AS O
    AND Tax_Books.Rd14_Tax_YyMmDd   = O.Tax_YyMmDd
    AND Tax_Books.Rd14_Ven_Cd       = O.Ven_Cd
    AND Tax_Books.Rd14_Tax_Seq      = O.Tax_Seq
-WHERE 1 = 1
-{where_sql}
 ORDER BY Tax_Books.Rd14_Tax_YyMmDd DESC, Tax_Books.Rd14_Ven_Cd, Tax_Books.Rd14_Tax_Seq DESC
 """
     df = query_to_df(sql, params)
 
     if clean_text(params.get("only_mismatch")).upper() in {"Y", "1", "TRUE"}:
-        df = df[df["상세합계일치"].fillna("N") != "Y"]
+        # 상세 detail이 없는 header는 검증 결과에는 남기되 부적합으로 만들지 않는다.
+        df = df[df["상세합계일치"].eq("N")]
 
     return df
 
@@ -471,13 +507,86 @@ def get_rddbc140_export_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFr
 
     return df
 
-def get_rddbc140_analysis_summary(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+
+def summarize_rddbc140_df(source_df: Optional[pd.DataFrame]) -> Dict[str, Any]:
+    """Create the tax-invoice analysis summary from an already fetched full source."""
+    if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+        return {
+            "row_count_total": 0,
+            "row_count": 0,
+            "by_tax_type": [],
+            "top_vendors": [],
+            "by_match_status": [],
+        }
+
+    work = source_df.copy()
+
+    def _column(*names: str, default: Any = "") -> pd.Series:
+        for name in names:
+            if name in work.columns:
+                return work[name]
+        return pd.Series(default, index=work.index)
+
+    work["_tax_di"] = _column("Rd14_Tax_Di", "세금계산서구분").astype("string").fillna("").str.strip()
+    work["_tax_type"] = work["_tax_di"].map({"1": "매입", "2": "회계매입", "3": "매출", "4": "회계매출"}).fillna("기타")
+    work["_vendor"] = _column("거래처명").astype("string").fillna("(미지정)").str.strip().replace("", "(미지정)")
+    work["_match"] = _column("상세합계일치").astype("string").fillna("").str.strip()
+    work["_match_status"] = work["_match"].map({"Y": "상세합계 일치", "N": "상세합계 불일치"}).fillna("상세 없음")
+    for target, names in (
+        ("_supply", ("Rd14_Supply_Price", "공급가액")),
+        ("_tax", ("Rd14_Tax_Price", "세액")),
+        ("_amount", ("Rd14_Tot_Amt", "합계금액")),
+    ):
+        work[target] = pd.to_numeric(_column(*names, default=0), errors="coerce").fillna(0.0)
+
+    def _records(column: str, *, limit: int = 10) -> list[dict]:
+        grouped = (
+            work.groupby(column, dropna=False)
+            .agg(
+                row_count=("_amount", "size"),
+                supply_sum=("_supply", "sum"),
+                tax_sum=("_tax", "sum"),
+                amount_sum=("_amount", "sum"),
+                mismatch_count=("_match", lambda values: int(values.eq("N").sum())),
+                detail_missing_count=("_match", lambda values: int(values.eq("").sum())),
+                accounting_count=("_tax_di", lambda values: int(values.isin(("2", "4")).sum())),
+            )
+            .reset_index()
+            .rename(columns={column: "name"})
+            .sort_values(["amount_sum", "row_count"], ascending=[False, False], kind="stable")
+            .head(limit)
+        )
+        return grouped.to_dict(orient="records")
+
+    return {
+        "row_count_total": int(len(work)),
+        "row_count": int(len(work)),
+        "supply_sum": float(work["_supply"].sum()),
+        "tax_sum": float(work["_tax"].sum()),
+        "amount_sum": float(work["_amount"].sum()),
+        "mismatch_count": int(work["_match"].eq("N").sum()),
+        "detail_missing_count": int(work.loc[work["_tax_di"].isin(("1", "3")), "_match"].eq("").sum()),
+        "accounting_count": int(work["_tax_di"].isin(("2", "4")).sum()),
+        "vendor_count": int(_column("Rd14_Ven_Cd", "거래처코드").replace("", pd.NA).nunique(dropna=True)),
+        "by_tax_type": _records("_tax_type"),
+        "top_vendors": _records("_vendor"),
+        "by_match_status": _records("_match_status"),
+    }
+
+def get_rddbc140_analysis_summary(
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    source_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
     """
     세금계산서 공통 LLM 분석용 전체 집계.
 
     화면 조회 TOP 200과 분리한다.
     동일 조회조건 전체 기준으로 건수/금액/거래처별/구분별/상세합계 상태별 집계를 만든다.
     """
+    if isinstance(source_df, pd.DataFrame):
+        return summarize_rddbc140_df(source_df)
+
     qparams = coalesce_params(dict(params or {}))
     where_sql = _base_filters(qparams)
 
@@ -485,7 +594,8 @@ def get_rddbc140_analysis_summary(params: Optional[Dict[str, Any]] = None) -> Di
     mismatch_where = "WHERE detail_match = 'N'" if only_mismatch else ""
 
     sql = f"""
-WITH in_sum AS (
+WITH {_filtered_tax_scope_ctes(where_sql, include_top=False)},
+in_sum AS (
     SELECT
         Rd11_Tax_Di AS Tax_Di,
         Rd11_Tax_YyMmDd AS Tax_YyMmDd,
@@ -493,8 +603,12 @@ WITH in_sum AS (
         Rd11_Tax_Seq AS Tax_Seq,
         SUM(COALESCE(Rd11_Fin_Supply_Price, Rd11_Supply_Price, 0)) AS Sum_Supply,
         SUM(COALESCE(Rd11_Fin_Tax_Price, Rd11_Tax_Price, 0)) AS Sum_Tax
-    FROM dbo.Rddbc110
-    WHERE NULLIF(LTRIM(RTRIM(Rd11_Tax_Seq)), '') IS NOT NULL
+    FROM dbo.Rddbc110 AS In_Put
+    INNER JOIN FilteredTaxKeys AS Keys
+        ON In_Put.Rd11_Tax_Di = Keys.Tax_Di
+       AND In_Put.Rd11_Tax_YyMmDd = Keys.Tax_YyMmDd
+       AND In_Put.Rd11_Ven_Cd = Keys.Ven_Cd
+       AND In_Put.Rd11_Tax_Seq = Keys.Tax_Seq
     GROUP BY Rd11_Tax_Di, Rd11_Tax_YyMmDd, Rd11_Ven_Cd, Rd11_Tax_Seq
 ),
 out_sum AS (
@@ -505,8 +619,12 @@ out_sum AS (
         Rd12_Tax_Seq AS Tax_Seq,
         SUM(COALESCE(Rd12_Fin_Supply_Price, Rd12_Supply_Price, 0)) AS Sum_Supply,
         SUM(COALESCE(Rd12_Fin_Tax_Price, Rd12_Tax_Price, 0)) AS Sum_Tax
-    FROM dbo.Rddbc120
-    WHERE NULLIF(LTRIM(RTRIM(Rd12_Tax_Seq)), '') IS NOT NULL
+    FROM dbo.Rddbc120 AS Out_Put
+    INNER JOIN FilteredTaxKeys AS Keys
+        ON Out_Put.Rd12_Tax_Di = Keys.Tax_Di
+       AND Out_Put.Rd12_Tax_YyMmDd = Keys.Tax_YyMmDd
+       AND Out_Put.Rd12_Ven_Cd = Keys.Ven_Cd
+       AND Out_Put.Rd12_Tax_Seq = Keys.Tax_Seq
     GROUP BY Rd12_Tax_Di, Rd12_Tax_YyMmDd, Rd12_Ven_Cd, Rd12_Tax_Seq
 ),
 base AS (
@@ -569,7 +687,7 @@ base AS (
                 END
             ELSE '상세 없음'
         END AS detail_status_nm
-    FROM dbo.Rddbc140 AS Tax_Books
+    FROM FilteredBooks AS Tax_Books
     LEFT JOIN dbo.Rddbc060 AS Add_Cd
         ON Tax_Books.Rd14_Add_Cd = Add_Cd.Rd06_User_Cd
     LEFT JOIN dbo.Rddbc060 AS Mod_Cd
@@ -589,8 +707,6 @@ base AS (
        AND Tax_Books.Rd14_Tax_YyMmDd   = O.Tax_YyMmDd
        AND Tax_Books.Rd14_Ven_Cd       = O.Ven_Cd
        AND Tax_Books.Rd14_Tax_Seq      = O.Tax_Seq
-    WHERE 1 = 1
-    {where_sql}
 ),
 filtered AS (
     SELECT *
@@ -722,6 +838,3 @@ ORDER BY
         "top_vendors": _analysis_records_from_section_df(df, "top_vendors"),
         "by_match_status": _analysis_records_from_section_df(df, "by_match_status"),
     }
-
-
-

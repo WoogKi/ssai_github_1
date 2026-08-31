@@ -58,6 +58,7 @@ _TRANSACTION_SIGNAL_WORDS = (
     "전표",
     "집계",
     "검증",
+    "부적합",
     "수불",
     "재고",
 )
@@ -1795,10 +1796,27 @@ def _consume_document_query_syntax_residual(text: str, action: str) -> str:
     if action not in {"거래명세서 공통 조회", "세금계산서 공통 조회"}:
         return text
 
+    raw_tokens = [
+        re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", part)
+        for part in text.split()
+    ]
+    validation_requested = any(
+        re.fullmatch(r"(?:검증|부적합(?:자료)?|불일치|상세합계)(?:조회|확인)?", re.sub(r"\s+", "", token))
+        for token in raw_tokens
+    )
     retained_parts: list[str] = []
     for part in text.split():
         token = re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", part)
-        if token in _DOCUMENT_DIRECTION_RESIDUAL_TOKENS or token == "공통":
+        compact = re.sub(r"\s+", "", token)
+        is_validation_syntax = bool(
+            re.fullmatch(r"(?:검증|부적합(?:자료)?|불일치|상세합계)(?:조회|확인)?", compact)
+        )
+        if (
+            token in _DOCUMENT_DIRECTION_RESIDUAL_TOKENS
+            or token == "공통"
+            or is_validation_syntax
+            or (validation_requested and compact in {"전체", "전부", "모두"})
+        ):
             continue
         retained_parts.append(part)
     return " ".join(retained_parts)
@@ -2726,6 +2744,7 @@ _OUTBOUND_DETAIL_ACTIONS = {
     "출고↔거래명세서 검증",
     "출고↔세금계산서 검증",
 }
+_VALIDATION_DOCUMENT_ACTIONS = {"거래명세서 공통 조회", "세금계산서 공통 조회"}
 _IO_VALIDATION_EXPLANATION_WORDS = (
     "무슨뜻",
     "방법",
@@ -2760,6 +2779,15 @@ def is_io_validation_explanation_request(raw: str) -> bool:
     if not any(document in normalized for document in ("거래명세서", "세금계산서")):
         return False
     lowered = normalized.lower()
+    # "부적합자료" and "불일치 자료" are result requests, not help/RAG intent.
+    # Keep actual explanation terms authoritative so existing help questions remain outside IO execution.
+    if any(marker in normalized for marker in ("검증", "부적합", "불일치", "상세합계")):
+        return (
+            any(word in lowered for word in ("무슨뜻", "방법", "설명", "원인", "사용법", "왜", "이유"))
+            or "rag" in lowered
+            or "문서에서" in normalized
+            or "자료에서" in normalized
+        )
     return any(word in lowered for word in _IO_VALIDATION_EXPLANATION_WORDS)
 
 
@@ -2826,6 +2854,38 @@ def _apply_outbound_validation_intent(
     return result
 
 
+def _apply_transaction_document_validation_intent(
+    params: Dict[str, Any],
+    *,
+    action: str,
+    raw: str,
+) -> Dict[str, Any]:
+    """Attach validation only when a common-document user explicitly requests it."""
+    result = dict(params or {})
+    if action not in _VALIDATION_DOCUMENT_ACTIONS:
+        return result
+
+    for key in ("validation_requested", "only_mismatch", "validation_intent_source", "validation_scope"):
+        result.pop(key, None)
+
+    normalized = re.sub(r"\s+", "", _norm(raw))
+    if is_io_validation_explanation_request(normalized):
+        return result
+
+    validation_requested = any(token in normalized for token in ("검증", "부적합", "불일치", "상세합계"))
+    if not validation_requested:
+        return result
+
+    result["validation_requested"] = True
+    result["validation_intent_source"] = "user_text"
+    # A new deterministic NLQ has no current-table ownership. Its explicit
+    # validation contract is the full common-document condition set, not display TOP.
+    result["validation_scope"] = "full_range"
+    if "불일치" in normalized or "부적합" in normalized:
+        result["only_mismatch"] = "Y"
+    return result
+
+
 # 입출고/재고 NLQ 해석의 최상위 함수
 # 입출고/재고 관련 신호가 있는지 보고, 관련 신호가 있으면 extract_params()로 파싱한 뒤
 # 입출고/재고 NLQ 의도를 판정한다.
@@ -2857,6 +2917,11 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             action=action,
             raw=raw,
         )
+        fixed_params = _apply_transaction_document_validation_intent(
+            fixed_params,
+            action=action,
+            raw=raw,
+        )
         return {"action": action, "params": fixed_params}
 
     # 입고/출고/명세서/세금계산서 일자 기준 조회에서도
@@ -2880,7 +2945,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
         params = _apply_date_params_for_product_flow(params, raw)
 
     is_common_doc_query = "공통" in raw
-    is_check_query = ("불일치" in raw or "검증" in raw or "누락" in raw)
+    is_check_query = ("불일치" in raw or "검증" in raw or "부적합" in raw or "누락" in raw)
 
     if not is_common_doc_query and is_check_query:
         if ("입고" in raw or "매입" in raw) and "거래명세서" in raw:

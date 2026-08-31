@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Callable, Any, Dict
+import logging
 import re
 import uuid
 import datetime as dt
@@ -16,6 +17,9 @@ from app.services.ssai_analysis_profile_service import (
     normalize_business_code_pair,
 )
 from app.sims.nlq.action_inventory import ANALYTICS_INTENT_ACTIONS
+
+
+_log = logging.getLogger("ssai.sims.nlq_router")
 
 
 _DASHBOARD_NLQ_ACTION = "SIMS 일일점검"
@@ -368,7 +372,7 @@ def _is_explicit_io_nlq_phrase(txt: str) -> bool:
         return True
 
     # 검증 4종
-    has_check = any(k in t for k in ("불일치", "검증", "누락"))
+    has_check = any(k in t for k in ("불일치", "검증", "부적합", "누락"))
     has_side = any(k in t for k in ("입고", "매입", "출고", "매출"))
     has_doc = any(k in t for k in ("거래명세서", "세금계산서"))
 
@@ -4091,7 +4095,11 @@ def _get_trans_doc_full_summary(params: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
-def _get_tax_doc_full_summary(params: Dict[str, Any]) -> Dict[str, Any]:
+def _get_tax_doc_full_summary(
+    params: Dict[str, Any],
+    *,
+    source_df: Optional[pd.DataFrame] = None,
+) -> Dict[str, Any]:
     """
     세금계산서 공통 LLM 분석용 전체 집계 로딩.
     화면용 TOP 200 DataFrame이 아니라, 서비스의 전체 집계 SQL을 사용한다.
@@ -4099,7 +4107,7 @@ def _get_tax_doc_full_summary(params: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from app.services.rddbc140_service import get_rddbc140_analysis_summary
 
-        summary = get_rddbc140_analysis_summary(params)
+        summary = get_rddbc140_analysis_summary(params, source_df=source_df)
         return summary if isinstance(summary, dict) else {}
     except Exception:
         return {}
@@ -4578,7 +4586,31 @@ def _ensure_trans_doc_llm_summary(
 
     visible_summary_md = f"조회조건: {query_summary}"
 
-    full_summary = _get_trans_doc_full_summary(params)
+    validation_requested = str(params.get("validation_requested") or "").strip().lower() in {"y", "1", "true"}
+    if validation_requested:
+        # The validation payload already contains the complete full-range
+        # result. Re-querying the service here repeats base + both detail
+        # aggregates for the same user request.
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+        zero_series = pd.Series(0, index=df.index, dtype="float64")
+        supply = pd.to_numeric(df.get("공급가액", df.get("Rd13_Supply_Price", zero_series)), errors="coerce").fillna(0)
+        tax = pd.to_numeric(df.get("세액", df.get("Rd13_Tax_Price", zero_series)), errors="coerce").fillna(0)
+        total = pd.to_numeric(df.get("합계금액", df.get("Rd13_Tot_Amt", zero_series)), errors="coerce").fillna(0)
+        discount = pd.to_numeric(df.get("할인금액", df.get("Rd13_Dc_Amt", zero_series)), errors="coerce").fillna(0)
+        match = df.get("상세합계일치", pd.Series(pd.NA, index=df.index))
+        full_summary = {
+            "row_count_total": int(len(df)), "row_count": int(len(df)),
+            "supply_sum": float(supply.sum()), "tax_sum": float(tax.sum()),
+            "amount_sum": float(total.sum()), "dc_sum": float(discount.sum()),
+            "mismatch_count": int(match.eq("N").sum()),
+            "vendor_count": int(df.get("거래처코드", df.get("Rd13_Ven_Cd", pd.Series(dtype="object"))).nunique(dropna=True)),
+            "by_trans_type": [], "top_vendors": [], "by_match_status": [], "by_delivery": [],
+            "validation_performed": True,
+        }
+        _log.info("[io.detail.summary_perf] action=거래명세서 공통 조회 stage=validation_payload_reuse rows=%s", len(df))
+    else:
+        full_summary = _get_trans_doc_full_summary(params)
     row_count = int(_io_to_num(full_summary.get("row_count_total") or full_summary.get("row_count")))
 
     if row_count <= 0:
@@ -4601,7 +4633,8 @@ def _ensure_trans_doc_llm_summary(
     tax_sum = _io_to_num(full_summary.get("tax_sum"))
     amount_sum = _io_to_num(full_summary.get("amount_sum"))
     dc_sum = _io_to_num(full_summary.get("dc_sum"))
-    mismatch_count = int(_io_to_num(full_summary.get("mismatch_count")))
+    validation_performed = bool(full_summary.get("validation_performed"))
+    mismatch_count = int(_io_to_num(full_summary.get("mismatch_count"))) if validation_performed else None
     vendor_count = int(_io_to_num(full_summary.get("vendor_count")))
 
     detail_summary = dict(full_summary)
@@ -4611,13 +4644,18 @@ def _ensure_trans_doc_llm_summary(
     detail_summary["query_summary"] = query_summary
     detail_summary["summary_basis"] = "전체 조회조건 기준"
 
-    top_sections = "\n\n".join(
-        [
-            _doc_group_records_to_md("거래명세서 구분별", detail_summary.get("by_trans_type") or []),
-            _doc_group_records_to_md("거래처별 거래명세서", detail_summary.get("top_vendors") or []),
-            _doc_group_records_to_md("상세합계 일치여부별", detail_summary.get("by_match_status") or []),
-            _doc_group_records_to_md("배송구분별", detail_summary.get("by_delivery") or []),
-        ]
+    top_section_parts = [
+        _doc_group_records_to_md("거래명세서 구분별", detail_summary.get("by_trans_type") or []),
+        _doc_group_records_to_md("거래처별 거래명세서", detail_summary.get("top_vendors") or []),
+    ]
+    if validation_performed:
+        top_section_parts.append(_doc_group_records_to_md("상세합계 일치여부별", detail_summary.get("by_match_status") or []))
+    top_section_parts.append(_doc_group_records_to_md("배송구분별", detail_summary.get("by_delivery") or []))
+    top_sections = "\n\n".join(top_section_parts)
+    validation_summary_line = (
+        f"- 상세합계 불일치/상세없음 건수: **{mismatch_count:,}건**\n"
+        if validation_performed
+        else "- 상세합계 검증: **미검증**\n"
     )
 
     llm_summary_md = (
@@ -4630,12 +4668,17 @@ def _ensure_trans_doc_llm_summary(
         f"- 합계금액: **{_io_fmt_num(amount_sum)}**\n"
         f"- 할인금액합계: **{_io_fmt_num(dc_sum)}**\n"
         f"- 거래처수: **{vendor_count:,}개**\n"
-        f"- 상세합계 불일치/상세없음 건수: **{mismatch_count:,}건**\n\n"
+        f"{validation_summary_line}\n"
         f"{top_sections}\n\n"
         "### 답변 규칙\n"
         "- 화면표시건수와 조회건수가 다르면, 화면에는 일부만 표시되지만 분석은 전체 조회조건 기준이라고 설명한다.\n"
-        "- 거래명세서 구분별, 거래처별, 상세합계 일치여부별 집계를 실제 수치와 함께 요약한다.\n"
-        "- 내부 key 이름(by_trans_type, top_vendors 등)은 답변에 쓰지 않는다."
+        "- 거래명세서 구분별과 거래처별 집계를 실제 수치와 함께 요약한다.\n"
+        + (
+            "- 명시 검증 결과의 상세합계 일치여부별 집계를 실제 수치와 함께 요약한다.\n"
+            if validation_performed
+            else "- 상세합계 검증을 수행하지 않은 일반 조회이므로 일치 여부를 추정하지 않는다.\n"
+        )
+        + "- 내부 key 이름(by_trans_type, top_vendors 등)은 답변에 쓰지 않는다."
     )
 
     meta["summary_md"] = visible_summary_md
@@ -4652,7 +4695,11 @@ def _ensure_trans_doc_llm_summary(
     meta["amount_sum"] = float(amount_sum)
     meta["dc_sum"] = float(dc_sum)
     meta["vendor_count"] = int(vendor_count)
-    meta["mismatch_count"] = int(mismatch_count)
+    meta["validation_performed"] = validation_performed
+    if validation_performed:
+        meta["mismatch_count"] = int(mismatch_count)
+    else:
+        meta.pop("mismatch_count", None)
 
     payload["meta"] = meta
     payload.setdefault("message", "거래명세서 공통 조회 결과입니다.")
@@ -4681,7 +4728,22 @@ def _ensure_tax_doc_llm_summary(
 
     visible_summary_md = f"조회조건: {query_summary}"
 
-    full_summary = _get_tax_doc_full_summary(params)
+    full_source_df = payload.get("df_full")
+    if not isinstance(full_source_df, pd.DataFrame):
+        try:
+            from app.services.rddbc140_service import get_rddbc140_export_df
+
+            full_source_df = get_rddbc140_export_df(params)
+            if isinstance(full_source_df, pd.DataFrame):
+                # One full-range result serves summary, current-table promotion, and download.
+                payload["df_full"] = full_source_df
+                meta["source_call_count"] = int(meta.get("source_call_count") or 0) + 1
+                meta["full_source_query_count"] = int(meta.get("full_source_query_count") or 0) + 1
+                meta["tax_doc_full_source_prepared"] = True
+        except Exception:
+            full_source_df = None
+
+    full_summary = _get_tax_doc_full_summary(params, source_df=full_source_df)
     row_count = int(_io_to_num(full_summary.get("row_count_total") or full_summary.get("row_count")))
 
     if row_count <= 0:
@@ -4979,6 +5041,18 @@ def _ensure_io_summary_meta(
 
     payload["meta"] = meta
 
+    summary_started = time.perf_counter()
+    summary_action = action in {
+        "입고명세 조회", "출고명세 조회", "거래명세서 공통 조회",
+        "세금계산서 공통 조회", "실재고월집계 조회", "장부재고월집계 조회",
+    }
+    if summary_action:
+        _log.info(
+            "[io.detail.summary_perf] action=%s stage=summary_prepare_start display_rows=%s",
+            action,
+            int(meta.get("row_count") or 0),
+        )
+
     # 입고명세/출고명세는 LLM이 사용할 핵심 명세 요약을 추가한다.
     if action in {"입고명세 조회", "출고명세 조회"}:
         payload = _ensure_io_detail_llm_summary(
@@ -5015,15 +5089,6 @@ def _ensure_io_summary_meta(
             query_summary,
         )
 
-    if action == "세금계산서 공통 조회":
-        payload = _ensure_tax_doc_llm_summary(
-            payload,
-            action,
-            params,
-            query_summary,
-        )
-
-
     # 제품수불현황은 기존 보강 함수가 있으면 그대로 사용한다.
     if action == "제품수불현황 조회" and "_ensure_product_flow_llm_summary" in globals():
         payload = _ensure_product_flow_llm_summary(
@@ -5040,6 +5105,17 @@ def _ensure_io_summary_meta(
             action,
             params,
             query_summary,
+        )
+
+    if summary_action:
+        summary_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        _log.info(
+            "[io.detail.summary_perf] action=%s stage=summary_prepare_complete display_rows=%s "
+            "analysis_rows=%s elapsed_ms=%s",
+            action,
+            int(summary_meta.get("display_row_count") or summary_meta.get("row_count") or 0),
+            int(summary_meta.get("analysis_row_count") or summary_meta.get("row_count_total_for_analysis") or 0),
+            int((time.perf_counter() - summary_started) * 1000),
         )
 
     return payload
