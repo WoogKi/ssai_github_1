@@ -21,6 +21,7 @@ from app.services.structured_response_contract import (  # noqa: E402
 from app.services.structured_tool_routing import (  # noqa: E402
     build_datetime_tool_route_decision,
     build_knowledge_rag_tool_route_decision,
+    build_mcp_external_resource_tool_route_decision,
     build_sims_internal_tool_route_decision,
     build_web_latest_tool_route_decision,
     validate_tool_route_decision,
@@ -275,6 +276,52 @@ def check_web_runtime_trace_boundary() -> None:
         raise AssertionError("Web trace changed the persisted message shape")
 
 
+def check_mcp_tool_route_decision() -> None:
+    from app.services.mcp_adapter import McpResourceResponse
+
+    response = McpResourceResponse(
+        status="success",
+        reason_code="ready",
+        resource_id="official-recall-notice",
+        title="Mock notice",
+        source_uri="mock://official-recall-notice/test",
+        retrieved_at="2026-09-01T00:00:00+00:00",
+        text="bounded mock text",
+        physical_call_count=1,
+    )
+    payload = {
+        "type": "mcp_external_resource",
+        "content": "safe result",
+        "meta": {
+            "mcp_external_resource": True,
+            "result_status": "success",
+            "reason_code": "ready",
+            "mcp_resource": {
+                "resource_id": response.resource_id,
+                "title": response.title,
+                "source_uri": response.source_uri,
+                "retrieved_at": response.retrieved_at,
+            },
+            "mcp_physical_call_count": 1,
+            "mcp_retry_count": 0,
+        },
+    }
+    envelope = _assert_legacy_unchanged(
+        payload,
+        tool_route_decision=build_mcp_external_resource_tool_route_decision(response),
+    )
+    if (
+        envelope["route"]["kind"] != "mcp_external_resource"
+        or envelope["action"] != {"raw": "mcp_resource_read", "canonical": "mcp_resource_read"}
+        or envelope["evidence"]["kind"] != "mcp"
+        or envelope["evidence"]["source_count"] != 1
+        or envelope["execution"]["source_call_count"] is not None
+    ):
+        raise AssertionError("MCP trace contract changed SIMS/Web/Knowledge semantics")
+    if envelope["evidence"].get("citations") != []:
+        raise AssertionError("MCP resource was mapped as Knowledge evidence")
+
+
 def check_datetime_and_web() -> None:
     datetime_payload = {"type": "text", "action": "current_time", "message_type": "datetime_tool", "meta": {}}
     datetime_envelope = _assert_legacy_unchanged(datetime_payload)
@@ -421,6 +468,7 @@ def main() -> int:
     check_knowledge_runtime_trace_boundary()
     check_web_tool_route_decision()
     check_web_runtime_trace_boundary()
+    check_mcp_tool_route_decision()
     check_datetime_and_web()
     check_datetime_tool_route_decision()
     check_sims_internal_tool_route_decisions()
