@@ -18196,6 +18196,86 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
         ):
             errors.append(f"missing source metric status: pushed={pushed!r}")
 
+        customer_purchase_df = pd.DataFrame(
+            [
+                {"입고일자": "20260801", "제품명": "P1", "거래처명": "V1", "수량": 1, "공급가액": 100, "세액": 10},
+                {"입고일자": "20260802", "제품명": "P2", "거래처명": "V2", "수량": 2, "공급가액": 200, "세액": 20},
+            ]
+        )
+        customer_sales_df = pd.DataFrame(
+            [
+                {"출고일자": "20260801", "제품명": "P1", "거래처명": "V1", "수량": 1, "공급가액": 100, "세액": 10},
+                {"출고일자": "20260802", "제품명": "P2", "거래처명": "V2", "수량": 2, "공급가액": 200, "세액": 20},
+            ]
+        )
+        customer_trans_df = pd.DataFrame(
+            [
+                {"거래명세서일자": "20260801", "거래명세서구분": "매입", "거래처명": "V1", "공급가액": 100, "세액": 10, "합계금액": 110},
+                {"거래명세서일자": "20260802", "거래명세서구분": "매출", "거래처명": "V2", "공급가액": 200, "세액": 20, "합계금액": 220},
+            ]
+        )
+        customer_cases = (
+            ("입고명세 조회", "현재표 거래처별 매입금액 분석", customer_purchase_df, "purchase_amount", "매입금액"),
+            ("출고명세 조회", "현재표 거래처별 매출금액 분석", customer_sales_df, "sales", "매출금액"),
+            ("거래명세서 공통 조회", "현재표 거래처별 거래금액 분석", customer_trans_df, "transaction_amount", "거래금액"),
+            ("거래명세서 공통 조회", "현재표 거래처별 매입금액 분석", customer_trans_df, "purchase_amount", "거래금액"),
+            ("거래명세서 공통 조회", "현재표 거래처 별 입고금액 분석", customer_trans_df, "purchase_amount", "거래금액"),
+            ("거래명세서 공통 조회", "현재표 거래처별 입고금액 분석", customer_trans_df, "purchase_amount", "거래금액"),
+            ("거래명세서 공통 조회", "현재표 거래처별 거래금액 분석", customer_trans_df, "transaction_amount", "거래금액"),
+        )
+        for source_action, query, source_df, metric, amount_column in customer_cases:
+            handled, pushed = dispatch(source_action, query, source_df)
+            payload = pushed[0][1] if handled and len(pushed) == 1 and pushed[0][0] == "table" else {}
+            result_df = payload.get("df")
+            meta = dict(payload.get("extra_meta") or {})
+            if (
+                not handled
+                or not isinstance(result_df, pd.DataFrame)
+                or result_df.empty
+                or "거래처명" not in result_df.columns
+                or amount_column not in result_df.columns
+                or meta.get("requested_grouping") != "customer"
+                or meta.get("requested_metric") != metric
+                or meta.get("result_status") != "success"
+                or payload.get("source_table_key") != "fixture-source-contract"
+                or payload.get("source_rows") != len(source_df)
+            ):
+                errors.append(f"customer amount source contract: {query}: pushed={pushed!r}")
+
+        missing_customer_df = customer_purchase_df.drop(columns=["거래처명"])
+        handled, pushed = dispatch(
+            "입고명세 조회",
+            "현재표 거래처별 매입금액 분석",
+            missing_customer_df,
+        )
+        missing_customer_meta = dict(pushed[0][1].get("extra_meta") or {}) if pushed else {}
+        if (
+            not handled
+            or not pushed
+            or pushed[0][0] != "notice"
+            or missing_customer_meta.get("result_status") != "column_unavailable"
+            or pushed[0][1].get("source_table_key") != "fixture-source-contract"
+        ):
+            errors.append(f"missing customer column must remain unavailable: pushed={pushed!r}")
+
+        shortage_without_rate_df = pd.DataFrame(
+            [{"제품코드": "S1", "제품명": "부족품목", "부족등급": "부족", "부족예상수량": 3}]
+        )
+        handled, pushed = dispatch(
+            "품목별 재고부족현황",
+            "현재표 적용증감율 분석",
+            shortage_without_rate_df,
+        )
+        shortage_rate_meta = dict(pushed[0][1].get("extra_meta") or {}) if pushed else {}
+        if (
+            not handled
+            or not pushed
+            or pushed[0][0] != "notice"
+            or shortage_rate_meta.get("result_status") != "column_unavailable"
+            or shortage_rate_meta.get("source_call_count") != 0
+        ):
+            errors.append(f"missing shortage rate must remain unavailable: pushed={pushed!r}")
+
         invalid_month_df = pd.DataFrame(
             [{"입고일자": "날짜없음", "제품명": "P1", "거래처명": "V1", "수량": 1, "공급가액": 10, "세액": 1}]
         )

@@ -99,6 +99,17 @@ EXPECTED_GROUPINGS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+# The current-table dispatcher uses ``day`` as its canonical internal key for
+# the user-facing 일자/날짜/일별 dimension.  Older audit fixtures used
+# ``date`` for the same dimension, so normalize only audit comparison values.
+# ``weekday`` remains an independent grouping.
+GROUPING_CANONICAL_ALIASES = {
+    "date": "day",
+    "day": "day",
+    "weekday": "weekday",
+}
+
+
 CURRENT_TABLE_ANCHORS = ("현재표", "현재결과", "현재조회결과", "현재 표", "현재 결과")
 RANK_MARKERS = ("TOP", "top", "상위", "최고", "1위", "가장많은", "가장많이")
 DETAIL_MARKERS = ("상세", "목록", "리스트", "보여줘", "보여주세요")
@@ -213,20 +224,26 @@ def _expected_metric(question: str) -> str:
     return ""
 
 
+def _canonical_grouping(value: Any) -> str:
+    """Normalize audit-only grouping vocabulary to dispatcher canonical keys."""
+    normalized = _text(value)
+    return GROUPING_CANONICAL_ALIASES.get(normalized, normalized)
+
+
 def _expected_grouping(question: str) -> str:
     compact = _compact(question)
     for key, phrases in EXPECTED_GROUPINGS:
         if any(phrase in compact for phrase in phrases):
-            return key
+            return _canonical_grouping(key)
     if any(marker in compact for marker in ("분석", "집계", "요약")):
         dimension = _mentioned_dimension(question)
         if dimension:
-            return dimension
+            return _canonical_grouping(dimension)
     if any(marker in compact for marker in RANK_MARKERS) or re.search(r"가장.*많", compact):
         if "제품" in compact or "품목" in compact:
             return "product"
         if "일자" in compact or "날짜" in compact:
-            return "date"
+            return _canonical_grouping("date")
     return ""
 
 
@@ -576,7 +593,7 @@ def _actual_current_table(
         working_question, source_action, working_df, source_meta
     )
     metric = _text(intent.get("requested_metric"))
-    grouping = _text(intent.get("requested_grouping"))
+    grouping = _canonical_grouping(intent.get("requested_grouping"))
     operations: list[str] = []
     numeric_filter = generic._find_common_numeric_filter(working_df, working_question)
     text_filter = generic._find_common_column_filter(working_df, working_question)
@@ -592,7 +609,7 @@ def _actual_current_table(
         "거래명세서구분": "transaction_type",
     }
     if not grouping and group_col:
-        grouping = grouping_by_column.get(group_col, "")
+        grouping = _canonical_grouping(grouping_by_column.get(group_col, ""))
     if not metric and group_col:
         grouped = generic._build_common_group_summary(working_df, group_col)
         metric_col, _metric_label = generic._select_common_group_top_metric(grouped, working_question)
@@ -897,6 +914,24 @@ def _auditor_validation() -> list[dict[str, Any]]:
             "question": "제조사별 재고금액 최고", "preceding": "제품재고현황 조회",
             "action": "제품재고현황 조회", "kind": "current_table_followup",
             "grouping": "manufacturer", "operations": {"aggregate", "rank"},
+        },
+        {
+            "case": "date_alias_normalizes_to_day",
+            "question": "현재표 날짜별 거래금액", "preceding": "거래명세서 공통 조회",
+            "action": "거래명세서 공통 조회", "kind": "current_table_followup",
+            "grouping": "day", "operations": {"aggregate"}, "verify_actual": True,
+        },
+        {
+            "case": "daily_alias_normalizes_to_day",
+            "question": "현재표 일별 거래금액 TOP 10", "preceding": "거래명세서 공통 조회",
+            "action": "거래명세서 공통 조회", "kind": "current_table_followup",
+            "grouping": "day", "operations": {"aggregate", "rank"}, "verify_actual": True,
+        },
+        {
+            "case": "weekday_remains_distinct",
+            "question": "현재표 요일별 거래금액", "preceding": "거래명세서 공통 조회",
+            "action": "거래명세서 공통 조회", "kind": "current_table_followup",
+            "grouping": "weekday", "operations": {"aggregate"}, "verify_actual": True,
         },
         {
             "case": "all_stock_location_with_unlabeled",
