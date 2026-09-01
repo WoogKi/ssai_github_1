@@ -254,6 +254,8 @@ def _clean_text(value: Any) -> str:
 def _is_explicit_code_display_name(col: Any) -> bool:
     s = _clean_text(col)
     s_lower = s.lower()
+    if s in {"거래명세서구분", "Rd13_Trans_Di"}:
+        return True
     code_words = (
         "제품코드",
         "제조사코드",
@@ -271,6 +273,27 @@ def _is_explicit_code_display_name(col: Any) -> bool:
         "코드",
     )
     return any(w in s or w in s_lower for w in code_words)
+
+
+_INTEGER_IDENTIFIER_DISPLAY_NAMES = {
+    "거래명세서순번",
+    "세금계산서구분",
+    "세금계산서순번",
+    "전표순번",
+    "회계전표순번",
+    "배송순번",
+    "피킹출력순번",
+    "Rd13_Trans_Seq",
+    "Rd13_Slip_Seq",
+    "Rd13_Print_Seq",
+    "Rd13_Picking_PrinterSeq",
+    "Rd13_Delivery_PrinterSeq",
+    "Rd14_Tax_Di",
+    "Rd14_Tax_Seq",
+    "Rd14_Slip_Seq",
+    "Rd14_Print_Seq",
+    "Rd14_Move_Seq",
+}
 
 
 def _is_numeric_display_name(col: Any) -> bool:
@@ -563,6 +586,14 @@ def _is_code_like_col(col: Any) -> bool:
 def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
     s = _clean_text(col)
 
+    # Validation status is textual even when an all-empty export column is
+    # inferred as float by pandas.
+    if s == "상세합계일치":
+        return False
+
+    if s in _INTEGER_IDENTIFIER_DISPLAY_NAMES:
+        return True
+
     if _is_row_no_col(s):
         return True
 
@@ -717,6 +748,11 @@ def _numeric_display_kind(col: Any) -> str:
         return "int"
 
     if s == "명세서번호":
+        return "int"
+
+    # Transaction-document sequence identifiers are numeric display values,
+    # not amounts.  Keep their Excel/UI surface integer-formatted.
+    if s in _INTEGER_IDENTIFIER_DISPLAY_NAMES:
         return "int"
 
     if _is_stock_shortage_quantity_int_col(s):

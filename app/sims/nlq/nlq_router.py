@@ -514,6 +514,9 @@ def _should_try_vendors_before_goods(txt: str) -> bool:
         "SIMS", "sims",
     ))
     has_vendor_attr = any(k in t for k in _VENDOR_MASTER_ATTR_WORDS)
+    has_vendor_scope_axis = any(k in t for k in (
+        "매입처", "매출처", "제약사",
+    ))
     has_master_verb = any(k in t for k in (
         "조회", "검색", "목록", "마스터",
         "찾아", "찾아줘", "찾아봐", "보여줘", "알려줘",
@@ -527,6 +530,12 @@ def _should_try_vendors_before_goods(txt: str) -> bool:
 
     # 거래처 조회/목록/마스터/검색 + 속성어 조합은 vendors 우선
     if ("거래처" in t) and (has_vendor_attr or has_master_verb):
+        return True
+
+    # 거래처라는 명시 앵커가 없어도, 기존 거래처 master handler가
+    # 지원하는 매입처/매출처/제약사 축의 단순 목록 조회는 vendor로 보낸다.
+    # 제품/거래 신호는 위의 기존 guard가 계속 차단한다.
+    if has_vendor_scope_axis and has_master_verb and not has_product_signal:
         return True
 
     # SIMS 등록/존재 여부 확인 류도 vendors 우선

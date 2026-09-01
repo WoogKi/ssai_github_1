@@ -259,6 +259,7 @@ from app.ui.current_table_followups.action_dispatcher import (
     classify_current_table_followup_intent,
     current_table_analysis_query_matches,
     handle_current_table_followup_by_action,
+    is_explicit_current_trans_doc_validation_request,
     select_current_table_analysis_context,
 )
 from app.ui.sims_analysis_profiles import build_response_format_instruction
@@ -5293,6 +5294,7 @@ def _try_handle_current_table_dataframe_followup(
         "현재표" in compact
         or "현재조회결과" in compact
         or "현재결과" in compact
+        or "현재거래명세서" in compact
     ):
         return False
 
@@ -5310,6 +5312,17 @@ def _try_handle_current_table_dataframe_followup(
         or st.session_state.get("__sims_last_table_action")
         or ""
     ).strip()
+
+    # "현재 거래명세서 ..." is deliberately narrower than a generic current-table
+    # request.  It may use the in-memory transaction-document handler only when
+    # the bound source is actually a transaction-document result.
+    if "현재거래명세서" in compact and source_action_current != "거래명세서 공통 조회":
+        log.info(
+            "[current_table.route] stage=trans_doc_source_mismatch source_action=%s query=%r",
+            source_action_current or "none",
+            str(t or "")[:120],
+        )
+        return False
 
     is_analytics_kpi_source = source_action_current in _ANALYTICS_KPI_SOURCE_ACTIONS    
 
@@ -5440,6 +5453,24 @@ def _try_handle_current_table_dataframe_followup(
     df, table_key = _current_table_get_latest_df()
     if not isinstance(df, pd.DataFrame) or df.empty:
         return False
+
+    if is_explicit_current_trans_doc_validation_request(t):
+        try:
+            from app.services.rddbc130_service import validate_rddbc130_current_result_df
+
+            # The current table is the complete validation driving set. Do not
+            # call Rddbc130 again or widen this request to a period/full range.
+            df = validate_rddbc130_current_result_df(df)
+        except Exception as exc:
+            log.exception("[current_table.route] current transaction validation failed")
+            return _current_table_push_notice(
+                title="현재 거래명세서 검증 불가",
+                action="현재 거래명세서 검증 불가",
+                message="현재표 기준 상세합계 검증을 완료하지 못했습니다.",
+                query_summary="현재표 / 거래명세서 상세합계 검증 불가",
+                source_query=t,
+                extra_meta={"reason_code": "current_validation_unavailable", "exception_class": type(exc).__name__},
+            )
     source_meta: dict[str, Any] = {}
     provenance_store = st.session_state.get("__sims_export_table_provenance_by_key")
     if isinstance(provenance_store, dict):
@@ -12005,9 +12036,15 @@ if user_input and user_input.strip():
 
     # Strictly recognize standalone calendar/time questions after ordinary
     # keyboard correction, but before any SIMS/NLQ/current-table router.
+    explicit_current_trans_doc_validation = is_explicit_current_trans_doc_validation_request(user_input)
+
     datetime_answer = resolve_datetime_question(user_input)
     web_search_route = None
-    if datetime_answer is None and raw_knowledge_route is None:
+    if (
+        datetime_answer is None
+        and raw_knowledge_route is None
+        and not explicit_current_trans_doc_validation
+    ):
         web_search_route = parse_web_search_request(user_input)
 
     st.session_state["__did_user_input"] = True
@@ -12182,6 +12219,9 @@ if user_input and user_input.strip():
         "현재표" in compact_current
         or "현재조회결과" in compact_current
         or "현재조회자료" in compact_current
+        # 거래명세서라는 현재 source를 명시한 validation 표현도 동일한
+        # deterministic current-table entrance를 사용한다.
+        or "현재거래명세서" in compact_current
     )
     new_sims_candidate = None
     if not has_explicit_current_table_reference:

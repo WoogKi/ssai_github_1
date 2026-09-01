@@ -136,7 +136,9 @@ def _looks_vendor_master_query(text: str) -> bool:
     return any(w in t for w in _VENDOR_MASTER_ATTR_WORDS)
 
 def _norm(text: str) -> str:
-    return re.sub(r"\s+", " ", str(text or "")).strip()
+    normalized = re.sub(r"\s+", " ", str(text or "")).strip()
+    # 입고/매입 조회 action의 단일 빈출 오타만 action 판정 전에 보정한다.
+    return normalized.replace("메입", "매입")
 
 
 def _has_any(text: str, words: tuple[str, ...]) -> bool:

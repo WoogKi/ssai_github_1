@@ -933,7 +933,26 @@ _IO_TEXTISH_NAME_HINTS = [
 
 
 _IO_TEXT_IDENTIFIER_COLS = {"제조번호", "검수확인", "사업자번호", "전화번호", "우편번호"}
-_IO_INTEGER_IDENTIFIER_COLS = {"명세서번호"}
+_IO_INTEGER_IDENTIFIER_COLS = {
+    "명세서번호",
+    "거래명세서순번",
+    "세금계산서구분",
+    "세금계산서순번",
+    "전표순번",
+    "회계전표순번",
+    "배송순번",
+    "피킹출력순번",
+    "Rd13_Trans_Seq",
+    "Rd13_Slip_Seq",
+    "Rd13_Print_Seq",
+    "Rd13_Picking_PrinterSeq",
+    "Rd13_Delivery_PrinterSeq",
+    "Rd14_Tax_Di",
+    "Rd14_Tax_Seq",
+    "Rd14_Slip_Seq",
+    "Rd14_Print_Seq",
+    "Rd14_Move_Seq",
+}
 
 
 def _normalize_col_key(name: Any) -> str:

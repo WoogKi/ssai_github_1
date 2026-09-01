@@ -345,10 +345,10 @@ def handle_trans_doc_followup(
             source_query=t,
         )
 
-    # 1) 상세합계 불일치 목록
-    detail_match_requested = "상세합계" in compact and any(
-        w in compact for w in ("일치", "불일치", "차이", "안맞", "맞지않")
-    )
+    # 1) 이미 검증된 거래명세서 현재표는 DB를 다시 읽지 않고 원본 행을
+    #    그대로 검증 결과로 보여준다. ``불일치``는 그 결과 안에서만 필터한다.
+    validation_requested = any(token in compact for token in ("검증", "상세합계", "불일치"))
+    detail_match_requested = validation_requested
     if detail_match_requested:
         if not detail_match_col:
             return push_notice(
@@ -360,14 +360,18 @@ def handle_trans_doc_followup(
             )
 
         wants_mismatch = any(w in compact for w in ("불일치", "차이", "안맞", "맞지않"))
-        out = df[base_mask & semantic_boolean_mask(df[detail_match_col], not wants_mismatch)].copy()
+        out = (
+            df[base_mask & semantic_boolean_mask(df[detail_match_col], False)].copy()
+            if wants_mismatch
+            else df[base_mask].copy()
+        )
 
         if out.empty:
             return push_notice(
                 title="현재표 상세합계 조건 결과 없음",
                 action="현재표 상세합계 조건 결과 없음",
                 message="현재표에서 요청한 상세합계 일치 조건에 해당하는 행이 없습니다.",
-                query_summary=f"현재표 / 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} / 0건",
+                query_summary=f"현재표 / 거래명세서 상세합계 {'불일치' if wants_mismatch else '검증'} / 0건",
                 source_query=t,
                 extra_meta={"execution_status": "no_data", "result_status": "no_data"},
             )
@@ -381,10 +385,10 @@ def handle_trans_doc_followup(
         )
 
         return push_table(
-            title=f"현재표 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} 목록",
-            action=f"현재표 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} 목록",
+            title=f"현재표 거래명세서 상세합계 {'불일치' if wants_mismatch else '검증'} 목록",
+            action=f"현재표 거래명세서 상세합계 {'불일치' if wants_mismatch else '검증'} 목록",
             df=out,
-            query_summary=f"현재표 / 거래명세서 상세합계 {'불일치' if wants_mismatch else '일치'} 목록 / 전체 {len(df):,}건 기준",
+            query_summary=f"현재표 / 거래명세서 상세합계 {'불일치' if wants_mismatch else '검증'} 목록 / 전체 {len(df):,}건 기준",
             source_query=t,
             source_table_key=table_key,
             source_rows=len(df),

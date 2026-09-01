@@ -390,6 +390,7 @@ def handle_inventory_followup(
             work.groupby(group_cols, dropna=False)
             .agg(
                 재고수량=("_stock", "sum"),
+                재고금액=("_stock_amt", "sum"),
                 보험금액=("_ins_amt", "sum"),
             )
             .reset_index()
@@ -413,11 +414,14 @@ def handle_inventory_followup(
             query_summary = f"현재표 / 제품별 {metric_col} TOP {top_n} / 전체 {len(df):,}건 기준"
 
         out.insert(0, "순번", range(1, len(out) + 1))
-        top_columns = ["순번", "제품코드", "제품명", "규격", "제조사명", "재고수량", "보험금액"]
+        top_columns = ["순번", "제품코드", "제품명", "규격", "제조사명", "재고수량"]
+        if metric_col == "재고금액":
+            top_columns.append("재고금액")
+        top_columns.append("보험금액")
         out2 = out.head(limit).copy()
         for column in top_columns:
             if column not in out2.columns:
-                out2[column] = "" if column not in {"재고수량", "보험금액"} else 0
+                out2[column] = "" if column not in {"재고수량", "재고금액", "보험금액"} else 0
         out2 = out2[top_columns]
 
         log.info(

@@ -63,6 +63,29 @@ def normalize_current_table_action(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
 
 
+def is_explicit_current_trans_doc_validation_request(query: Any) -> bool:
+    """Identify a request to validate the currently referenced transaction table."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    return bool(
+        "현재거래명세서" in compact
+        and any(marker in compact for marker in ("검증", "상세합계", "불일치"))
+    )
+
+
+def is_bound_current_trans_doc_validation_request(
+    query: Any,
+    *,
+    source_action: Any,
+    current_table_present: bool,
+) -> bool:
+    """Identify explicit validation of the currently bound transaction table."""
+    if not current_table_present:
+        return False
+    if normalize_current_table_action(source_action) != "거래명세서 공통 조회":
+        return False
+    return is_explicit_current_trans_doc_validation_request(query)
+
+
 def _strip_current_table_referents(compact: str) -> str:
     """Remove words that only point at the current table before intent checks."""
     out = str(compact or "")
@@ -151,6 +174,11 @@ def classify_current_table_followup_intent(query: str) -> str:
         "불일치목록",
         "요약표",
         "집계표",
+        # Validation is a deterministic current-source operation. The caller
+        # still verifies that the stashed source action supports it.
+        "검증",
+        "상세합계",
+        "불일치",
     )
     if any(marker in intent_compact for marker in explicit_table_markers):
         return "dataframe_table"
@@ -374,6 +402,12 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
     ("month", "월", ("월별", "월기준"), ("월", "기준월")),
     ("weekday", "요일", ("요일별", "요일기준"), ("요일",)),
     ("day", "일자", ("일자별", "날짜별", "일별"), ("일자", "날짜")),
+    (
+        "customer",
+        "거래처",
+        ("거래처별", "거래처명별"),
+        ("거래처명", "거래처"),
+    ),
     ("product", "제품", ("제품별", "품목별"), ("제품명", "품목명", "상품명", "제품코드", "품목코드", "상품코드")),
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
     ("purchase_vendor", "매입처", ("매입처별", "매입처명별"), ("매입처명", "매입처", "매입처코드")),
@@ -456,10 +490,10 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
         {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "purchase_amount": frozenset(
-        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "weekday", "customer", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "transaction_amount": frozenset(
-        {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
+        {"month", "day", "weekday", "customer", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
     ),
     "sales_quantity": frozenset(
         {"month", "day", "weekday", "product", "manufacturer", "purchase_vendor", "order_vendor", "stock_location"}
@@ -499,6 +533,7 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
             "month",
             "day",
             "weekday",
+            "customer",
             "product",
             "manufacturer",
             "product_group",
@@ -541,16 +576,19 @@ _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = 
         "month": ("입고일자", "매입일자", "일자"),
         "day": ("입고일자", "매입일자", "일자"),
         "weekday": ("입고일자", "매입일자", "일자"),
+        "customer": ("거래처명", "매입처명", "입고처명"),
     },
     "sales_detail": {
         "month": ("출고일자", "매출일자", "일자"),
         "day": ("출고일자", "매출일자", "일자"),
         "weekday": ("출고일자", "매출일자", "일자"),
+        "customer": ("거래처명", "매출처명", "출고처명"),
     },
     "trans_doc": {
         "month": ("거래명세서일자", "거래일자", "일자"),
         "day": ("거래명세서일자", "거래일자", "일자"),
         "weekday": ("거래명세서일자", "거래일자", "일자"),
+        "customer": ("거래처명", "매입처명", "매출처명"),
     },
 }
 
@@ -702,7 +740,7 @@ def _current_table_requested_metrics(query: str) -> list[str]:
     metrics: list[str] = []
     if "공급가액" in compact:
         metrics.append("supply_amount")
-    elif "매입금액" in compact:
+    elif any(term in compact for term in ("매입금액", "입고금액")):
         metrics.append("purchase_amount")
     elif "거래금액" in compact:
         metrics.append("transaction_amount")
@@ -890,6 +928,8 @@ def _looks_like_formatted_amount(value: Any) -> bool:
 def _current_table_result_contract_error(
     df: Any,
     capability: dict[str, Any],
+    *,
+    source_kind: str = "",
 ) -> str:
     """Return a stable reason when a metric/grouping result cannot be delivered safely."""
     if not capability.get("requires_result_contract"):
@@ -905,7 +945,17 @@ def _current_table_result_contract_error(
     )
     if not _current_table_dimension_columns(df, dimension_aliases):
         return "result_grouping_missing"
-    if not _current_table_metric_columns(df, metric):
+    metric_columns = _current_table_metric_columns(df, metric)
+    # 거래명세서 공통 handler는 매입/입고 방향을 먼저 원본 행에서 필터한 뒤
+    # 기존 계약대로 결과 합계를 "거래금액" 열로 표시한다. 이 경우에는
+    # 표시 열이 거래금액이어도 요청한 매입/입고 금액의 결과 계약을 충족한다.
+    if (
+        not metric_columns
+        and source_kind == "trans_doc"
+        and metric == "purchase_amount"
+    ):
+        metric_columns = _current_table_metric_columns(df, "transaction_amount")
+    if not metric_columns:
         return "result_metric_missing"
 
     if grouping == "product":
@@ -1562,7 +1612,11 @@ def handle_current_table_followup_by_action(
 
     def _push_table_with_capability(**kwargs: Any) -> bool:
         extra_meta = dict(kwargs.pop("extra_meta", {}) or {})
-        contract_error = _current_table_result_contract_error(kwargs.get("df"), capability)
+        contract_error = _current_table_result_contract_error(
+            kwargs.get("df"),
+            capability,
+            source_kind=kind,
+        )
         if contract_error:
             return _push_notice_with_capability(
                 title="현재표 결과 계약 불일치",
@@ -1635,7 +1689,7 @@ def handle_current_table_followup_by_action(
 
     source_contract_priority = capability["status"] == "success" and ((
         kind in _CURRENT_TABLE_SOURCE_GROUPING_ALIASES
-        and capability["requested_grouping"] in {"month", "day", "weekday"}
+        and capability["requested_grouping"] in {"month", "day", "weekday", "customer"}
     ) or (
         bool(_requested_source_semantic_filter(kind, query))
     ))
@@ -1985,6 +2039,11 @@ def handle_current_table_followup_by_action(
             ),
             query_summary=f"현재표 / {label} 후속분석 오류 / 원본={source_action}",
             source_query=query,
+            extra_meta={
+                "execution_status": "routing_error",
+                "result_status": "routing_error",
+                "issue_codes": ["source_handler_error", type(e).__name__],
+            },
         )
 
     if handled:
@@ -2045,4 +2104,9 @@ def handle_current_table_followup_by_action(
         ),
         query_summary=f"현재표 / {label} 후속분석 미지원 / 원본={source_action}",
         source_query=query,
+        extra_meta={
+            "execution_status": "unsupported",
+            "result_status": "unsupported",
+            "issue_codes": ["source_handler_unavailable"],
+        },
     )
