@@ -35,6 +35,7 @@ import sys
 import io
 import re
 import json
+import math
 import uuid
 import time
 import html
@@ -9623,18 +9624,24 @@ def _json_sanitize(obj, _depth: int = 0):
     if _depth > 6:
         return str(obj)
 
-    # pandas DataFrame
+    # pandas values must be normalized before their datetime superclass check.
     try:
         import pandas as _pd
+        if obj is _pd.NaT:
+            return None
+        if isinstance(obj, _pd.Timestamp):
+            return obj.isoformat()
         if isinstance(obj, _pd.DataFrame):
             try:
-                return {
+                return _json_sanitize({
                     "__type__": "dataframe",
                     "columns": list(obj.columns),
                     "records": obj.to_dict(orient="records"),
-                }
+                }, _depth + 1)
             except Exception:
                 return {"__type__": "dataframe", "shape": [int(obj.shape[0]), int(obj.shape[1])]}
+        if isinstance(obj, _pd.Series):
+            return _json_sanitize(obj.tolist(), _depth + 1)
     except Exception:
         pass
 
@@ -9660,7 +9667,14 @@ def _json_sanitize(obj, _depth: int = 0):
     try:
         import numpy as _np
         if isinstance(obj, (_np.generic,)):
-            return obj.item()
+            return _json_sanitize(obj.item(), _depth + 1)
+    except Exception:
+        pass
+
+    # JSON must not retain IEEE NaN/Infinity tokens in persisted room payloads.
+    try:
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return None
     except Exception:
         pass
 
