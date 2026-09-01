@@ -143,7 +143,7 @@ def build(repo: KnowledgeDocumentRepository) -> dict[str, Any]:
     source_erp = _approve_source(
         repo,
         relative_path="app/services/sql_server_snapshot_repository.py",
-        symbol="_decode_compressed_payload",
+        symbol="_canonical_payload",
         commit=commit,
         version=1,
         classification="ERP_DB_INTERNAL",
@@ -200,8 +200,8 @@ def evaluate(repo: KnowledgeDocumentRepository) -> list[dict[str, Any]]:
         Case("korean_nlq_alias", "입출고 NLQ action 띄어쓰기 보정", ("PROJECT_SOURCE",), ("_normalize_io_action_spacing",)),
         Case("exact_symbol_still_works", "get_user_file_path", ("PROJECT_SOURCE",), ("get_user_file_path",)),
         Case("source_document_simultaneous", "current table source action", ("DOCUMENT", "PROJECT_SOURCE")),
-        Case("erp_allow", "decode compressed payload", ("PROJECT_SOURCE",), ("_decode_compressed_payload",), permissions=ERP_READ),
-        Case("erp_deny", "decode compressed payload", no_match=True),
+        Case("erp_allow", "canonical snapshot payload", ("PROJECT_SOURCE",), ("_canonical_payload",), permissions=ERP_READ),
+        Case("erp_deny", "canonical snapshot payload", no_match=True),
     )
     rows: list[dict[str, Any]] = []
     original = repo._read_artifact

@@ -101,7 +101,7 @@ SOURCES = (
     SourceSpec(
         "app/services/sql_server_snapshot_repository.py",
         "ERP_DB_INTERNAL",
-        ("_decode_compressed_payload", "SqlServerSnapshotRepository._validate_payload"),
+        ("_canonical_payload", "SqlServerSnapshotRepository._validate_payload"),
     ),
 )
 SCOPE_CONTROL_SOURCE = "evaluation_company_scope_control.py"
@@ -252,9 +252,9 @@ def evaluation_cases() -> tuple[EvalCase, ...]:
         EvalCase("scope_company_allow", "COMPANY-SCOPE-PROBE-4", ("make_safe_filename",), (SCOPE_CONTROL_SOURCE,)),
         EvalCase("scope_company_deny", "COMPANY-SCOPE-PROBE-4", excluded_sources=(SCOPE_CONTROL_SOURCE,), company_id=6, **no_match),
         EvalCase("rag_use_deny", "can_read_document", excluded_sources=("app_services_knowledge_scope_policy.py",), permissions=(), **no_match),
-        EvalCase("erp_decode_admin", "decode compressed payload", ("_decode_compressed_payload",), ("app_services_sql_server_snapshot_repository.py",), permissions=ERP_READ),
+        EvalCase("erp_canonical_payload_admin", "canonical snapshot payload", ("_canonical_payload",), ("app_services_sql_server_snapshot_repository.py",), permissions=ERP_READ),
         EvalCase("erp_validate_manager", "SqlServerSnapshotRepository validate payload", ("SqlServerSnapshotRepository._validate_payload",), ("app_services_sql_server_snapshot_repository.py",), permissions=ERP_READ),
-        EvalCase("erp_staff_deny", "decode compressed payload", excluded_sources=("app_services_sql_server_snapshot_repository.py",), **no_match),
+        EvalCase("erp_staff_deny", "canonical snapshot payload", excluded_sources=("app_services_sql_server_snapshot_repository.py",), **no_match),
         EvalCase("erp_wholesale_deny", "SqlServerSnapshotRepository validate payload", excluded_sources=("app_services_sql_server_snapshot_repository.py",), **no_match),
         EvalCase("unknown_function", "generate_embedding_index", **no_match),
         EvalCase("unrelated_feature", "직원 휴가 승인 절차", **no_match),
@@ -356,7 +356,7 @@ def evaluate_llm(packets: dict[str, ContextPacket], *, timeout_seconds: int) -> 
         ("read_gate_exact", "Knowledge 문서 read permission gate가 하는 일을 알려줘."),
         ("safe_filename_exact", "파일명을 안전하게 정리하는 source 함수의 역할을 설명해줘."),
         ("nlq_spacing_exact", "입출고 action 띄어쓰기 보정 함수가 처리하는 일을 알려줘."),
-        ("erp_decode_admin", "압축 snapshot payload를 처리하는 함수의 동작을 알려줘."),
+        ("erp_canonical_payload_admin", "snapshot payload를 정규화하는 함수의 동작을 알려줘."),
         ("unknown_function", "generate_embedding_index 함수가 하는 일을 알려줘."),
     )
     rows: list[dict[str, Any]] = []
