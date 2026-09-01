@@ -19,6 +19,7 @@ _ROUTE_KINDS = frozenset(
         "web_latest",
         "generic_llm",
         "attachment",
+        "mcp_external_resource",
     }
 )
 _DECISION_MODES = frozenset({"deterministic", "llm_summary", "llm_stream", "none"})
@@ -135,6 +136,25 @@ def build_web_latest_tool_route_decision(response: Any) -> ToolRouteDecision:
         action="web_search",
         canonical_action="web_search",
         safe_arguments={"period_kind": period_kind},
+        reason_code=reason,
+    )
+    decision.to_dict()
+    return decision
+
+
+def build_mcp_external_resource_tool_route_decision(response: Any) -> ToolRouteDecision:
+    """Record a completed MCP resource request; never execute it."""
+    status = _safe_text(getattr(response, "status", ""))
+    resource_id = _safe_text(getattr(response, "resource_id", ""))
+    reason = _safe_text(getattr(response, "reason_code", "")) or status
+    if not status or not resource_id or not reason:
+        raise ValueError("MCP tool route decision requires a completed response")
+    decision = ToolRouteDecision(
+        kind="mcp_external_resource",
+        decision_mode="deterministic",
+        action="mcp_resource_read",
+        canonical_action="mcp_resource_read",
+        safe_arguments={"resource_id": resource_id},
         reason_code=reason,
     )
     decision.to_dict()

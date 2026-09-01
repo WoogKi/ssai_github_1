@@ -292,7 +292,14 @@ from app.services.structured_response_contract import build_structured_response_
 from app.services.structured_tool_routing import (
     build_datetime_tool_route_decision,
     build_knowledge_rag_tool_route_decision,
+    build_mcp_external_resource_tool_route_decision,
     build_web_latest_tool_route_decision,
+)
+from app.services.mcp_adapter import (
+    MCP_EXTERNAL_RESOURCE_READ,
+    McpResourceResponse,
+    build_mcp_resource_transport,
+    run_mcp_resource_poc,
 )
 from app.services.attachment_summary_policy import build_attachment_summary_plan
 from app.services.web_search_service import (
@@ -305,6 +312,12 @@ from app.services.web_search_service import (
 from app.ui.knowledge_chat_adapter import (
     build_knowledge_prompt,
     parse_explicit_knowledge_request,
+)
+from app.ui.mcp_chat_adapter import (
+    build_mcp_chat_message,
+    build_mcp_resource_request,
+    mcp_poc_enabled,
+    parse_explicit_mcp_resource_request,
 )
 from app.ui.knowledge_chat_evidence import (
     KNOWLEDGE_ANSWER_MESSAGE_TYPE,
@@ -8086,6 +8099,55 @@ def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
     return True
 
 
+def _run_explicit_mcp_resource_chat(route, *, room: dict[str, Any]) -> bool:
+    """Run the explicit MCP PoC without touching existing route owners."""
+    feature_enabled = mcp_poc_enabled(os.environ)
+    permission_allowed = bool(require_permission(MCP_EXTERNAL_RESOURCE_READ, show_error=False))
+    request = build_mcp_resource_request(route)
+    response: McpResourceResponse = run_mcp_resource_poc(
+        request,
+        feature_enabled=feature_enabled,
+        permission_allowed=permission_allowed,
+        transport=build_mcp_resource_transport(os.environ),
+    )
+    message = build_mcp_chat_message(response)
+    message.update(
+        {
+            "id": str(uuid.uuid4()),
+            "role": "assistant",
+            "time": make_ts(),
+            "seq": _next_seq(),
+            **_message_meta("mcp_external_resource"),
+        }
+    )
+    try:
+        decision = build_mcp_external_resource_tool_route_decision(response)
+        envelope = build_structured_response_envelope(message, tool_route_decision=decision)
+        log.debug(
+            "[mcp.resource.trace] route=%s status=%s reason=%s physical_call_count=%s",
+            envelope["route"]["kind"],
+            envelope["execution"]["result_status"],
+            envelope["execution"]["reason_code"],
+            response.physical_call_count,
+        )
+    except ValueError as exc:
+        # Trace-only data must not alter the explicit MCP outcome.
+        log.warning("[mcp.resource.trace] skipped error_type=%s", type(exc).__name__)
+    room.setdefault("messages", []).append(message)
+    _sync_room_meta(room, materialize=True)
+    save_chat_rooms()
+    with st.chat_message("assistant"):
+        st.markdown(str(message["content"]))
+    log.info(
+        "[mcp.resource] status=%s reason=%s retry_count=%s physical_call_count=%s",
+        response.status,
+        response.reason_code,
+        response.retry_count,
+        response.physical_call_count,
+    )
+    return True
+
+
 def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
     """Handle one fresh external-information request before ordinary LLM fallback."""
     response = search_web(route)
@@ -12036,7 +12098,8 @@ if user_input and user_input.strip():
     # Explicit Knowledge commands own their command/query bytes. The normal
     # Korean/English keyboard correction stays on every ordinary Chat path.
     raw_knowledge_route = parse_explicit_knowledge_request(user_input)
-    if raw_knowledge_route is None:
+    raw_mcp_route = None if raw_knowledge_route is not None else parse_explicit_mcp_resource_request(user_input)
+    if raw_knowledge_route is None and raw_mcp_route is None:
         try:
             from app.sims.nlq.nlq_router import keyboard_fix
             fixed = keyboard_fix(user_input)
@@ -12045,18 +12108,21 @@ if user_input and user_input.strip():
                 user_input = fixed
         except Exception:
             pass
-    else:
+    elif raw_knowledge_route is not None:
         log.debug("[knowledge.chat] preserve_explicit_command technical_detail=%s", raw_knowledge_route.technical_detail_mode)
 
     # Strictly recognize standalone calendar/time questions after ordinary
     # keyboard correction, but before any SIMS/NLQ/current-table router.
     explicit_current_trans_doc_validation = is_explicit_current_trans_doc_validation_request(user_input)
 
-    datetime_answer = resolve_datetime_question(user_input)
+    datetime_answer = (
+        None if raw_mcp_route is not None else resolve_datetime_question(user_input)
+    )
     web_search_route = None
     if (
         datetime_answer is None
         and raw_knowledge_route is None
+        and raw_mcp_route is None
         and not explicit_current_trans_doc_validation
     ):
         web_search_route = parse_web_search_request(user_input)
@@ -12164,6 +12230,12 @@ if user_input and user_input.strip():
         save_chat_rooms()
         st.session_state["__queue_ai"] = True
         log.info("[knowledge.chat] explicit_command_queued technical_detail=%s", raw_knowledge_route.technical_detail_mode)
+        st.rerun()
+    if raw_mcp_route is not None:
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        st.session_state["__queue_ai"] = True
+        log.info("[mcp.resource] explicit_command_queued valid=%s resource_id=%s", raw_mcp_route.valid, raw_mcp_route.resource_id)
         st.rerun()
 #   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
     # ✅ (D) 컨텍스트 메타 질문은 NLQ/LLM 전에 즉답 처리 (삽입 위치 고정)
@@ -13719,9 +13791,10 @@ with st.container():
             if not msgs:
                 msgs = [{"role": "user", "content": "You are a helpful assistant."}]
 
-        # Explicit Knowledge commands are isolated from ordinary Chat/NLQ routing.
+        # Explicit Knowledge/MCP commands are isolated from ordinary Chat/NLQ routing.
         knowledge_route = parse_explicit_knowledge_request(last_user_text)
-        web_search_route = None if knowledge_route is not None else parse_web_search_request(last_user_text)
+        mcp_route = None if knowledge_route is not None else parse_explicit_mcp_resource_request(last_user_text)
+        web_search_route = None if knowledge_route is not None or mcp_route is not None else parse_web_search_request(last_user_text)
         image_followup_request = st.session_state.pop("__attachment_image_followup_request", None)
         image_followup_context_matches = (
             isinstance(image_followup_request, dict)
@@ -13733,6 +13806,8 @@ with st.container():
         with pending_area:
             if knowledge_route is not None:
                 _run_explicit_knowledge_chat(knowledge_route, room=current_room)
+            elif mcp_route is not None:
+                _run_explicit_mcp_resource_chat(mcp_route, room=current_room)
             elif web_search_route is not None:
                 _run_web_search_chat(web_search_route, room=current_room)
             elif isinstance(image_followup_request, dict):

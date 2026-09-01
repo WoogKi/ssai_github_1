@@ -24,6 +24,7 @@ _ROUTE_KINDS = frozenset(
         "web_latest",
         "generic_llm",
         "attachment",
+        "mcp_external_resource",
     }
 )
 _FORBIDDEN_KEY_TOKENS = frozenset(
@@ -160,6 +161,16 @@ def _safe_web_sources(raw: Any) -> list[dict[str, Any]]:
     return sources
 
 
+def _safe_mcp_resources(raw: Any) -> list[dict[str, Any]]:
+    row = _mapping(raw)
+    safe = {
+        key: row[key]
+        for key in ("resource_id", "title", "source_uri", "retrieved_at")
+        if key in row and _safe_scalar(row[key])
+    }
+    return [safe] if safe else []
+
+
 def build_structured_response_envelope(
     legacy: Mapping[str, Any] | None,
     *,
@@ -215,6 +226,9 @@ def build_structured_response_envelope(
     elif kind == "web_latest":
         sources = _safe_web_sources(meta.get("sources"))
         evidence.update({"kind": "web", "source_count": len(sources), "sources": sources})
+    elif kind == "mcp_external_resource":
+        resources = _safe_mcp_resources(meta.get("mcp_resource"))
+        evidence.update({"kind": "mcp", "source_count": len(resources), "sources": resources})
 
     envelope = {
         "schema_version": SCHEMA_VERSION,
@@ -290,7 +304,7 @@ def validate_structured_response_envelope(envelope: Mapping[str, Any] | None) ->
         raise ValueError("structured response route kind is invalid")
     if not isinstance(_mapping(value.get("execution")).get("source_call_count"), (int, float, type(None))):
         raise ValueError("structured response source call count is invalid")
-    if _mapping(value.get("evidence")).get("kind") not in {"none", "knowledge", "web"}:
+    if _mapping(value.get("evidence")).get("kind") not in {"none", "knowledge", "web", "mcp"}:
         raise ValueError("structured response evidence kind is invalid")
     _validate_json_safe(value)
 
