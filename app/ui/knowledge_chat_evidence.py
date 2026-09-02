@@ -167,3 +167,27 @@ def build_knowledge_answer_display(
         conflict_notices=decision.conflict_notices,
         reason_code="ready",
     )
+
+
+def build_knowledge_followup_packet(
+    *,
+    repository: KnowledgeDocumentRepository,
+    parent_message: dict[str, Any],
+    query: str,
+    request_context: KnowledgeChatRequestContext,
+    max_chars: int = 6000,
+) -> ContextPacket:
+    """Re-authorize one parent and retrieve only from its cited versions."""
+    try:
+        snapshot = _snapshot_from_message(parent_message)
+    except (KeyError, TypeError, ValueError):
+        return ContextPacket("", (), "invalid_evidence_snapshot", 0)
+    content = parent_message.get("content")
+    if not isinstance(content, str) or _answer_hash(content) != snapshot.answer_hash:
+        return ContextPacket("", (), "answer_snapshot_mismatch", 0)
+    return repository.retrieve_for_followup(
+        query=query,
+        parent_snapshot=snapshot,
+        request_context=request_context,
+        max_chars=max_chars,
+    )

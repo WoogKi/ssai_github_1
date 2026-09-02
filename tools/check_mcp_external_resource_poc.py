@@ -142,7 +142,8 @@ def check_runtime_boundary() -> None:
     if resolve_datetime_question(collision) is None:
         raise AssertionError("datetime collision fixture no longer exercises precedence")
     datetime_guard = (
-        "None if raw_mcp_route is not None else resolve_datetime_question(user_input)"
+        "None if raw_mcp_route is not None or sims_help_route is not None "
+        "else resolve_datetime_question(user_input)"
     )
     if datetime_guard not in source:
         raise AssertionError("explicit MCP command is not protected from datetime routing")

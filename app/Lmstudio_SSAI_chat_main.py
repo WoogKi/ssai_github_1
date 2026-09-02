@@ -310,8 +310,14 @@ from app.services.web_search_service import (
 )
 
 from app.ui.knowledge_chat_adapter import (
+    build_knowledge_followup_queue_request,
     build_knowledge_prompt,
+    parse_knowledge_followup_queue_request,
     parse_explicit_knowledge_request,
+)
+from app.ui.sims_help_adapter import (
+    build_sims_help_text,
+    parse_sims_help_request,
 )
 from app.ui.mcp_chat_adapter import (
     build_mcp_chat_message,
@@ -323,6 +329,7 @@ from app.ui.knowledge_chat_evidence import (
     KNOWLEDGE_ANSWER_MESSAGE_TYPE,
     build_knowledge_answer_display,
     build_knowledge_answer_message,
+    build_knowledge_followup_packet,
 )
 
 from app.services.ssai_storage_service import (
@@ -7055,6 +7062,7 @@ def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_com
         "__attachment_image_followup_candidates",
         "__attachment_image_followup_target_id",
         "__attachment_image_followup_request",
+        "__knowledge_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
         "__chat_room_nav_request",
@@ -7986,7 +7994,42 @@ def _knowledge_repository_for_chat() -> KnowledgeDocumentRepository:
     return KnowledgeDocumentRepository(source_repo_root=_ROOT)
 
 
-def _render_knowledge_answer_message(message: dict[str, Any], *, room: dict[str, Any]) -> bool:
+def _knowledge_message_technical_detail_mode(message: object) -> bool:
+    if not isinstance(message, dict):
+        return False
+    payload = message.get("knowledge_evidence")
+    return bool(payload.get("technical_detail_mode")) if isinstance(payload, dict) else False
+
+
+def _queue_knowledge_followup(*, room: dict[str, Any], parent_message_id: str, query: str) -> None:
+    request = build_knowledge_followup_queue_request(
+        query=query,
+        parent_message_id=parent_message_id,
+        room_id=room.get("id"),
+    )
+    room.setdefault("messages", []).append(
+        {
+            "id": str(uuid.uuid4()),
+            "role": "user",
+            "content": request["query"],
+            "time": make_ts(),
+            "seq": _next_seq(),
+            **_message_meta("knowledge_followup"),
+        }
+    )
+    _sync_room_meta(room, materialize=True)
+    save_chat_rooms()
+    st.session_state["__knowledge_followup_request"] = request
+    st.session_state["__queue_ai"] = True
+    log.info("[knowledge.followup] queued parent_message_id=%s", parent_message_id)
+
+
+def _render_knowledge_answer_message(
+    message: dict[str, Any],
+    *,
+    room: dict[str, Any],
+    allow_followup: bool = False,
+) -> bool:
     """Use the same re-authorization/display boundary for live and history."""
     payload = message.get("knowledge_evidence") if isinstance(message, dict) else None
     technical_detail_mode = bool(payload.get("technical_detail_mode")) if isinstance(payload, dict) else False
@@ -8006,20 +8049,61 @@ def _render_knowledge_answer_message(message: dict[str, Any], *, room: dict[str,
         st.caption("근거: " + " · ".join(citation.label for citation in display.citations))
         for notice in display.conflict_notices:
             st.info(notice.message)
+        if allow_followup:
+            message_id = str(message.get("id") or "").strip()
+            with st.form(key=f"__knowledge_followup_form_{message_id}", clear_on_submit=True):
+                followup_query = st.text_input("후속 질문", key=f"__knowledge_followup_text_{message_id}")
+                submitted = st.form_submit_button("질문 보내기")
+            if submitted and followup_query.strip():
+                _queue_knowledge_followup(
+                    room=room,
+                    parent_message_id=message_id,
+                    query=followup_query,
+                )
+                st.rerun()
     return True
 
 
-def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
-    """Handle one explicit /knowledge request without changing ordinary chat routing."""
-    request_context = _knowledge_request_context_for_room(
-        room,
-        technical_detail_mode=route.technical_detail_mode,
-    )
+def _latest_authorized_knowledge_parent_id(
+    *,
+    room: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> str:
+    """Return only the newest Knowledge answer that is visible right now."""
     repository = _knowledge_repository_for_chat()
-    packet = repository.retrieve_for_chat(query=route.query, request_context=request_context)
+    for message in reversed(messages):
+        if (
+            not isinstance(message, dict)
+            or str(message.get("type") or "").strip().lower() != KNOWLEDGE_ANSWER_MESSAGE_TYPE
+        ):
+            continue
+        display = build_knowledge_answer_display(
+            repository=repository,
+            message=message,
+            request_context=_knowledge_request_context_for_room(
+                room,
+                technical_detail_mode=_knowledge_message_technical_detail_mode(message),
+            ),
+        )
+        if display.visible:
+            return str(message.get("id") or "").strip()
+    return ""
+
+
+def _complete_knowledge_chat(
+    *,
+    query: str,
+    technical_detail_mode: bool,
+    packet,
+    request_context,
+    repository: KnowledgeDocumentRepository,
+    room: dict[str, Any],
+    log_kind: str,
+) -> bool:
+    """Complete an already-authorized explicit or follow-up Knowledge request."""
     try:
         knowledge_decision = build_knowledge_rag_tool_route_decision(
-            technical_detail_mode=route.technical_detail_mode,
+            technical_detail_mode=technical_detail_mode,
             reason_code=packet.reason_code,
         )
     except ValueError as exc:
@@ -8051,11 +8135,11 @@ def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
         _sync_room_meta(room, materialize=True)
         save_chat_rooms()
         st.info("승인된 Knowledge에서 답변 근거를 찾지 못했습니다.")
-        log.info("[knowledge.chat] result=no_match reason=%s", packet.reason_code)
+        log.info("[%s] result=no_match reason=%s", log_kind, packet.reason_code)
         return True
     try:
         response = call_chat_protected(
-            messages=build_knowledge_prompt(query=route.query, packet=packet),
+            messages=build_knowledge_prompt(query=query, packet=packet),
             model=EXPECTED_LM_MODEL or st.session_state.get("selected_model") or "",
             temperature=0.2,
             stream=False,
@@ -8094,8 +8178,101 @@ def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
     room.setdefault("messages", []).append(message)
     _sync_room_meta(room, materialize=True)
     save_chat_rooms()
-    _render_knowledge_answer_message(message, room=room)
-    log.info("[knowledge.chat] result=stored citations=%s technical_detail=%s", len(packet.citations), route.technical_detail_mode)
+    _render_knowledge_answer_message(message, room=room, allow_followup=True)
+    log.info(
+        "[%s] result=stored citations=%s technical_detail=%s",
+        log_kind,
+        len(packet.citations),
+        technical_detail_mode,
+    )
+    return True
+
+
+def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
+    """Handle one explicit /knowledge request without changing ordinary chat routing."""
+    request_context = _knowledge_request_context_for_room(
+        room,
+        technical_detail_mode=route.technical_detail_mode,
+    )
+    repository = _knowledge_repository_for_chat()
+    packet = repository.retrieve_for_chat(query=route.query, request_context=request_context)
+    return _complete_knowledge_chat(
+        query=route.query,
+        technical_detail_mode=route.technical_detail_mode,
+        packet=packet,
+        request_context=request_context,
+        repository=repository,
+        room=room,
+        log_kind="knowledge.chat",
+    )
+
+
+def _run_knowledge_followup_chat(route, *, room: dict[str, Any]) -> bool:
+    """Run one queued follow-up against its re-authorized parent evidence only."""
+    parent = next(
+        (
+            message
+            for message in reversed(room.get("messages") or [])
+            if isinstance(message, dict)
+            and str(message.get("id") or "") == route.parent_message_id
+            and str(message.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE
+        ),
+        None,
+    )
+    if parent is None:
+        st.info("후속 질문의 승인된 Knowledge 근거를 확인할 수 없습니다.")
+        log.info("[knowledge.followup] result=denied reason=parent_message_missing")
+        return True
+    technical_detail_mode = _knowledge_message_technical_detail_mode(parent)
+    request_context = _knowledge_request_context_for_room(
+        room,
+        technical_detail_mode=technical_detail_mode,
+    )
+    repository = _knowledge_repository_for_chat()
+    packet = build_knowledge_followup_packet(
+        repository=repository,
+        parent_message=parent,
+        query=route.query,
+        request_context=request_context,
+    )
+    return _complete_knowledge_chat(
+        query=route.query,
+        technical_detail_mode=technical_detail_mode,
+        packet=packet,
+        request_context=request_context,
+        repository=repository,
+        room=room,
+        log_kind="knowledge.followup",
+    )
+
+
+def _run_sims_help_chat(route, *, room: dict[str, Any]) -> bool:
+    """Return deterministic, permission-filtered SIMS help without external calls."""
+    del route
+    company = get_selected_company() or {}
+    knowledge_availability = _knowledge_repository_for_chat().get_help_example_queries(
+        current_user_id=getattr(get_current_user(), "user_id", None),
+        current_company_id=company.get("company_id") if isinstance(company, dict) else None,
+        permission_codes=get_current_permissions(),
+    )
+    message = {
+        "id": str(uuid.uuid4()),
+        "role": "assistant",
+        "type": "sims_help",
+        "content": build_sims_help_text(
+            get_current_permissions(),
+            knowledge_availability=knowledge_availability,
+        ),
+        "time": make_ts(),
+        "seq": _next_seq(),
+        **_message_meta("sims_help"),
+    }
+    room.setdefault("messages", []).append(message)
+    _sync_room_meta(room, materialize=True)
+    save_chat_rooms()
+    with st.chat_message("assistant"):
+        st.markdown(str(message["content"]))
+    log.info("[sims.help] result=stored llm_call_count=0")
     return True
 
 
@@ -9663,6 +9840,7 @@ def _reset_chat_session_when_user_changed() -> None:
         "__attachment_image_followup_candidates",
         "__attachment_image_followup_target_id",
         "__attachment_image_followup_request",
+        "__knowledge_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
     ]:
@@ -12099,7 +12277,12 @@ if user_input and user_input.strip():
     # Korean/English keyboard correction stays on every ordinary Chat path.
     raw_knowledge_route = parse_explicit_knowledge_request(user_input)
     raw_mcp_route = None if raw_knowledge_route is not None else parse_explicit_mcp_resource_request(user_input)
-    if raw_knowledge_route is None and raw_mcp_route is None:
+    sims_help_route = (
+        None
+        if raw_knowledge_route is not None or raw_mcp_route is not None
+        else parse_sims_help_request(user_input)
+    )
+    if raw_knowledge_route is None and raw_mcp_route is None and sims_help_route is None:
         try:
             from app.sims.nlq.nlq_router import keyboard_fix
             fixed = keyboard_fix(user_input)
@@ -12116,13 +12299,14 @@ if user_input and user_input.strip():
     explicit_current_trans_doc_validation = is_explicit_current_trans_doc_validation_request(user_input)
 
     datetime_answer = (
-        None if raw_mcp_route is not None else resolve_datetime_question(user_input)
+        None if raw_mcp_route is not None or sims_help_route is not None else resolve_datetime_question(user_input)
     )
     web_search_route = None
     if (
         datetime_answer is None
         and raw_knowledge_route is None
         and raw_mcp_route is None
+        and sims_help_route is None
         and not explicit_current_trans_doc_validation
     ):
         web_search_route = parse_web_search_request(user_input)
@@ -12236,6 +12420,9 @@ if user_input and user_input.strip():
         save_chat_rooms()
         st.session_state["__queue_ai"] = True
         log.info("[mcp.resource] explicit_command_queued valid=%s resource_id=%s", raw_mcp_route.valid, raw_mcp_route.resource_id)
+        st.rerun()
+    if sims_help_route is not None:
+        _run_sims_help_chat(sims_help_route, room=current_room)
         st.rerun()
 #   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
     # ✅ (D) 컨텍스트 메타 질문은 NLQ/LLM 전에 즉답 처리 (삽입 위치 고정)
@@ -12767,12 +12954,23 @@ with st.container():
     _render_list_started = time.perf_counter()
     merged_msgs = _build_room_render_messages(current_room)
     _script_perf_add("render_list", time.perf_counter() - _render_list_started)
+    knowledge_followup_parent_id = _latest_authorized_knowledge_parent_id(
+        room=current_room,
+        messages=merged_msgs,
+    )
 
     def _render_message(m: dict) -> bool:
         meta = (m.get("meta") or {})
 
         if str(m.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE:
-            return _render_knowledge_answer_message(m, room=current_room)
+            return _render_knowledge_answer_message(
+                m,
+                room=current_room,
+                allow_followup=(
+                    bool(knowledge_followup_parent_id)
+                    and str(m.get("id") or "") == knowledge_followup_parent_id
+                ),
+            )
 
         if str(meta.get("message_type") or "") == "file_analysis_result":
             detail = m.get("attachment_analysis_detail") or {}
@@ -13791,10 +13989,29 @@ with st.container():
             if not msgs:
                 msgs = [{"role": "user", "content": "You are a helpful assistant."}]
 
+        # A UI-created Knowledge follow-up owns this turn before every ordinary
+        # route. Invalid queue state fails closed and is never reinterpreted.
+        raw_knowledge_followup = st.session_state.pop("__knowledge_followup_request", None)
+        knowledge_followup_route = parse_knowledge_followup_queue_request(
+            raw_knowledge_followup,
+            current_room_id=current_room.get("id"),
+            last_user_text=last_user_text,
+        )
         # Explicit Knowledge/MCP commands are isolated from ordinary Chat/NLQ routing.
-        knowledge_route = parse_explicit_knowledge_request(last_user_text)
-        mcp_route = None if knowledge_route is not None else parse_explicit_mcp_resource_request(last_user_text)
-        web_search_route = None if knowledge_route is not None or mcp_route is not None else parse_web_search_request(last_user_text)
+        knowledge_route = (
+            None if raw_knowledge_followup is not None
+            else parse_explicit_knowledge_request(last_user_text)
+        )
+        mcp_route = (
+            None
+            if raw_knowledge_followup is not None or knowledge_route is not None
+            else parse_explicit_mcp_resource_request(last_user_text)
+        )
+        web_search_route = (
+            None
+            if raw_knowledge_followup is not None or knowledge_route is not None or mcp_route is not None
+            else parse_web_search_request(last_user_text)
+        )
         image_followup_request = st.session_state.pop("__attachment_image_followup_request", None)
         image_followup_context_matches = (
             isinstance(image_followup_request, dict)
@@ -13804,7 +14021,13 @@ with st.container():
             )
         )
         with pending_area:
-            if knowledge_route is not None:
+            if raw_knowledge_followup is not None:
+                if knowledge_followup_route is None:
+                    st.info("후속 질문 요청을 안전하게 확인하지 못했습니다.")
+                    log.info("[knowledge.followup] result=denied reason=invalid_queue_request")
+                else:
+                    _run_knowledge_followup_chat(knowledge_followup_route, room=current_room)
+            elif knowledge_route is not None:
                 _run_explicit_knowledge_chat(knowledge_route, room=current_room)
             elif mcp_route is not None:
                 _run_explicit_mcp_resource_chat(mcp_route, room=current_room)

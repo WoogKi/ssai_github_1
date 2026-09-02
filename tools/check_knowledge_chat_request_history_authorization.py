@@ -19,6 +19,7 @@ from app.services.knowledge_document_service import (
 from app.ui.knowledge_chat_evidence import (
     build_knowledge_answer_display,
     build_knowledge_answer_message,
+    build_knowledge_followup_packet,
 )
 
 RAG = ("RAG_USE",)
@@ -58,9 +59,9 @@ def source(symbol, phrase, commit):
     )
 
 
-def context(perms=RAG, company=4, room_user=11, room_company=None, detail=False):
+def context(perms=RAG, company=4, user=11, room_user=11, room_company=None, detail=False):
     return build_knowledge_chat_request_context(
-        user_id=11, company_id=company, permission_codes=perms,
+        user_id=user, company_id=company, permission_codes=perms,
         room_owner_user_id=room_user,
         room_company_id=company if room_company is None else room_company,
         technical_detail_mode=detail,
@@ -96,7 +97,14 @@ def main():
         ).stdout.strip()
         repo = Probe(root / "manifest", source_repo)
         approve(repo, source_name="official.md", source_key="official", scope="GLOBAL",
-                content="# 공식\nOFFICIAL-77 공식 문서 답변")
+                content="# 공식\nOFFICIAL-77 공식 문서 답변\nFOLLOWUP-SHARED 허용된 후속 근거")
+        outside = approve(
+            repo,
+            source_name="outside.md",
+            source_key="outside",
+            scope="GLOBAL",
+            content="# 외부\nFOLLOWUP-SHARED FOLLOWUP-OUTSIDE 범위 밖 근거",
+        )
         tech_text, tech_hash = source("technical_rule", "TECH-77", commit)
         approve(repo, source_name="technical_rule.py",
                 source_key="project-source:app/services/technical_rule.py#technical_rule",
@@ -191,6 +199,41 @@ def main():
                                                request_context=context(perms=())))
         hidden(build_knowledge_answer_display(repository=repo, message=message,
                                                request_context=context(room_company=6)))
+
+        followup = build_knowledge_followup_packet(
+            repository=repo,
+            parent_message=message,
+            query="FOLLOWUP-SHARED",
+            request_context=regular,
+        )
+        assert followup.reason_code == "ready"
+        assert {citation.document_id for citation in followup.citations} == {
+            official.citations[0].document_id
+        }
+        assert outside.document_id not in {citation.document_id for citation in followup.citations}
+        repo.reset_reads()
+        no_match = build_knowledge_followup_packet(
+            repository=repo,
+            parent_message=message,
+            query="FOLLOWUP-OUTSIDE",
+            request_context=regular,
+        )
+        assert no_match.reason_code == "no_authorized_match" and not no_match.citations
+        assert outside.content_hash not in repo.read_hashes
+        for denied_context in (
+            context(company=6),
+            context(user=12, room_user=12),
+            context(room_company=6),
+            context(perms=()),
+        ):
+            repo.reset_reads()
+            denied = build_knowledge_followup_packet(
+                repository=repo,
+                parent_message=message,
+                query="FOLLOWUP-SHARED",
+                request_context=denied_context,
+            )
+            assert denied.reason_code != "ready" and repo.reads == 0
         citationless = dict(message)
         citationless["knowledge_evidence"] = dict(message["knowledge_evidence"])
         citationless["knowledge_evidence"]["citations"] = []
@@ -205,12 +248,35 @@ def main():
             repository=repo, message=source_message, request_context=context(TECH, detail=True)
         )
         assert source_live.visible
+        source_followup = build_knowledge_followup_packet(
+            repository=repo,
+            parent_message=source_message,
+            query="TECH-77",
+            request_context=context(TECH, detail=True),
+        )
+        assert source_followup.reason_code == "ready"
+        repo.reset_reads()
+        denied_source_followup = build_knowledge_followup_packet(
+            repository=repo,
+            parent_message=source_message,
+            query="TECH-77",
+            request_context=regular,
+        )
+        assert denied_source_followup.reason_code != "ready" and repo.reads == 0
         (source_repo / "app" / "services" / "technical_rule.py").write_text(
             "def technical_rule():\n    return 'changed'", encoding="utf-8"
         )
         hidden(build_knowledge_answer_display(
             repository=repo, message=source_message, request_context=context(TECH, detail=True)
         ))
+        repo.reset_reads()
+        stale_followup = build_knowledge_followup_packet(
+            repository=repo,
+            parent_message=source_message,
+            query="TECH-77",
+            request_context=context(TECH, detail=True),
+        )
+        assert stale_followup.reason_code == "evidence_project_source_stale" and repo.reads == 0
         (source_repo / "app" / "services" / "technical_rule.py").write_text(
             "def technical_rule():\n    return 'TECH-77'", encoding="utf-8"
         )
@@ -236,7 +302,24 @@ def main():
         hidden(build_knowledge_answer_display(
             repository=repo, message=source_message, request_context=context(TECH, detail=True)
         ))
-        print("RESULT OK tests=28")
+
+        approve(
+            repo,
+            source_name="official-v2.md",
+            source_key="official",
+            scope="GLOBAL",
+            version=2,
+            content="# 공식 v2\nOFFICIAL-77 새 승인본",
+        )
+        repo.reset_reads()
+        superseded = build_knowledge_followup_packet(
+            repository=repo,
+            parent_message=message,
+            query="FOLLOWUP-SHARED",
+            request_context=regular,
+        )
+        assert superseded.reason_code == "evidence_document_mismatch" and repo.reads == 0
+        print("RESULT OK tests=43")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

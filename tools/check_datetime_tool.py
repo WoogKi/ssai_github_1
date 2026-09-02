@@ -43,7 +43,7 @@ def main() -> None:
     assert week_range(year_end.date(), offset_weeks=-1).start.isoformat() == "2025-12-22"
     source = (ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
     assert "resolve_datetime_question" in source
-    datetime_route = "None if raw_mcp_route is not None else resolve_datetime_question(user_input)"
+    datetime_route = "None if raw_mcp_route is not None or sims_help_route is not None else resolve_datetime_question(user_input)"
     assert datetime_route in source
     assert source.index(datetime_route) < source.index("is_sims_result_followup =")
     assert "[datetime.tool] result=stored" in source

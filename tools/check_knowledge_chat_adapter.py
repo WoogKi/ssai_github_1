@@ -10,7 +10,9 @@ sys.path.insert(0, str(ROOT))
 
 from app.services.knowledge_document_service import ContextPacket
 from app.ui.knowledge_chat_adapter import (
+    build_knowledge_followup_queue_request,
     build_knowledge_prompt,
+    parse_knowledge_followup_queue_request,
     parse_explicit_knowledge_request,
 )
 
@@ -22,6 +24,29 @@ def main() -> None:
     assert technical and technical.query == "storage helper" and technical.technical_detail_mode
     for value in ("/knowledge", "/knowledge-tech", "/knowledgeful 질문", "일반 질문", None):
         assert parse_explicit_knowledge_request(value) is None
+
+    queued = build_knowledge_followup_queue_request(
+        query="그 근거의 예외는?",
+        parent_message_id="knowledge-1",
+        room_id="room-4",
+    )
+    followup = parse_knowledge_followup_queue_request(
+        queued,
+        current_room_id="room-4",
+        last_user_text="그 근거의 예외는?",
+    )
+    assert followup and followup.parent_message_id == "knowledge-1"
+    assert parse_knowledge_followup_queue_request(
+        queued, current_room_id="room-6", last_user_text="그 근거의 예외는?"
+    ) is None
+    assert parse_knowledge_followup_queue_request(
+        queued, current_room_id="room-4", last_user_text="다른 질문"
+    ) is None
+    assert parse_knowledge_followup_queue_request(
+        {**queued, "extra": "unsafe"},
+        current_room_id="room-4",
+        last_user_text="그 근거의 예외는?",
+    ) is None
 
     raw_cases = (
         ("/knowledge K-SMOKE-GENERAL-20260822", "K-SMOKE-GENERAL-20260822", False),
@@ -77,13 +102,17 @@ def main() -> None:
     assert main_source.index("explicit_command_queued") < main_source.index("current_table_followup_input = _normalize_current_table_followup_input(user_input)")
     assert main_source.index("explicit_command_queued") < main_source.index("resolve_new_sims_nlq_candidate(user_input)")
     assert "_run_explicit_knowledge_chat(knowledge_route, room=current_room)" in main_source
+    assert "_run_knowledge_followup_chat(knowledge_followup_route, room=current_room)" in main_source
+    assert "raw_knowledge_followup is not None" in main_source
+    assert main_source.index("if raw_knowledge_followup is not None:") < main_source.index("elif knowledge_route is not None:")
     assert "build_knowledge_answer_message(" in main_source
-    assert "_render_knowledge_answer_message(m, room=current_room)" in main_source
+    assert "return _render_knowledge_answer_message(" in main_source
+    assert "allow_followup=(" in main_source
     assert "generic raw-message search surface" in main_source
     assert "room compaction" in main_source
     service_source = (ROOT / "app" / "services" / "knowledge_document_service.py").read_text(encoding="utf-8")
     assert "Never read a stale" in service_source and "_project_source_is_current(source)" in service_source
-    print("RESULT OK tests=26")
+    print("RESULT OK tests=34")
 
 
 if __name__ == "__main__":

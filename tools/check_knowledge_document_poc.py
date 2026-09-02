@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 from app.services.knowledge_document_service import (  # noqa: E402
     APPROVAL_APPROVED,
+    KnowledgeEvidenceSnapshot,
     KnowledgeDocumentRepository,
     KnowledgeManagementDenied,
     _knowledge_query_terms,
@@ -277,6 +278,177 @@ def test_technical_natural_language_query_preserves_authorization_boundary() -> 
         )
         assert denied.reason_code == "no_authorized_match"
         assert denied.citations == ()
+    finally:
+        shutil.rmtree(root)
+
+
+def test_technical_detail_wrapper_normalization_is_narrow_and_fail_closed() -> None:
+    repo, root = _repo()
+    try:
+        document = _approved(
+            repo,
+            source_name="Rddbc110.txt",
+            source_key="erp-rddbc110",
+            content="# Rddbc110\n입고 상세 테이블입니다. Rd11_Io_Gu 필드를 사용합니다.",
+            scope="GLOBAL",
+            knowledge_classification="ERP_DB_INTERNAL",
+        )
+        technical_context = build_knowledge_chat_request_context(
+            user_id=8,
+            company_id=4,
+            permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ],
+            room_owner_user_id=8,
+            room_company_id=4,
+            technical_detail_mode=True,
+        )
+        wrapped = repo.retrieve_for_chat(
+            query="Rddbc110 관련 기술 내용을 알려줘",
+            request_context=technical_context,
+        )
+        assert wrapped.reason_code == "ready"
+        assert {citation.document_id for citation in wrapped.citations} == {document.document_id}
+
+        direct = repo.retrieve_for_chat(query="Rddbc110", request_context=technical_context)
+        assert direct.reason_code == "ready"
+
+        terms, _ = _knowledge_query_terms(
+            "Rddbc110 Rd11_Io_Gu 관련 기술 내용을 알려줘",
+            technical_detail_mode=True,
+        )
+        assert terms == ("rddbc110", "rd11", "io", "gu")
+        wrapper_only, _ = _knowledge_query_terms("기술", technical_detail_mode=True)
+        assert wrapper_only == ("기술",)
+
+        missing = repo.retrieve_for_chat(
+            query="Rddbc999 관련 기술 내용을 알려줘",
+            request_context=technical_context,
+        )
+        assert missing.reason_code == "no_authorized_match"
+
+        general = repo.retrieve(
+            query="Rddbc110 관련 기술 내용을 알려줘",
+            current_user_id=8,
+            current_company_id=4,
+            permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ],
+            technical_detail_mode=False,
+        )
+        assert general.reason_code == "no_authorized_match"
+
+        denied_context = build_knowledge_chat_request_context(
+            user_id=8,
+            company_id=4,
+            permission_codes=["RAG_USE"],
+            room_owner_user_id=8,
+            room_company_id=4,
+            technical_detail_mode=True,
+        )
+        denied = repo.retrieve_for_chat(query="Rddbc110", request_context=denied_context)
+        assert denied.reason_code == "no_authorized_match" and denied.citations == ()
+    finally:
+        shutil.rmtree(root)
+
+
+def test_citation_bound_table_layout_followup_is_scoped_and_fail_closed() -> None:
+    root = Path(tempfile.mkdtemp(prefix="knowledge-followup-table-layout-"))
+    repo = _ProbeRepository(root)
+    try:
+        table = _approved(
+            repo,
+            source_name="Rddbc110.txt",
+            source_key="erp-rddbc110",
+            content=(
+                "CREATE TABLE [dbo].[Rddbc110](\n"
+                "    [Rd11_In_YyMmDd] [char](8) NOT NULL,\n"
+                "    [Rd11_Ven_Cd] [char](5) NOT NULL,\n"
+                "    [Rd11_Io_Gu] [char](6) NOT NULL,\n"
+                "    [Rd11_Quantity] [decimal](18, 0) NOT NULL,\n"
+                "    [Rd11_Supply_Price] [decimal](18, 0) NOT NULL,\n"
+                "    [Rd11_Tax_Price] [decimal](18, 0) NOT NULL\n"
+                ")"
+            ),
+            scope="GLOBAL",
+            knowledge_classification="ERP_DB_INTERNAL",
+        )
+        outside = _approved(
+            repo,
+            source_name="outside.txt",
+            source_key="erp-outside",
+            content="CREATE TABLE [dbo].[Rddbc999]([Outside_Field] [char](8) NOT NULL)",
+            scope="GLOBAL",
+            knowledge_classification="ERP_DB_INTERNAL",
+        )
+        context = build_knowledge_chat_request_context(
+            user_id=8,
+            company_id=4,
+            permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ],
+            room_owner_user_id=8,
+            room_company_id=4,
+            technical_detail_mode=True,
+        )
+        parent = repo.retrieve_for_chat(query="Rddbc110", request_context=context)
+        assert parent.reason_code == "ready" and {item.document_id for item in parent.citations} == {table.document_id}
+        snapshot = KnowledgeEvidenceSnapshot(
+            user_id=8,
+            company_id=4,
+            room_owner_user_id=8,
+            room_company_id=4,
+            technical_detail_mode=True,
+            answer_hash="fixture",
+            citations=parent.citations,
+            conflict_notices=(),
+        )
+        for query in (
+            "필드명 알려줘",
+            "컬럼 알려줘",
+            "항목 알려줘",
+            "입고구분 알려줘",
+            "입고 관련 필드 알려줘",
+            "수량 관련 필드 알려줘",
+            "금액 관련 필드 알려줘",
+            "수량과 금액 관련 필드만 알려줘",
+            "날짜 필드 알려줘",
+            "거래처 관련 필드 알려줘",
+        ):
+            packet = repo.retrieve_for_followup(
+                query=query,
+                parent_snapshot=snapshot,
+                request_context=context,
+            )
+            assert packet.reason_code == "ready" and packet.citations
+            assert {item.document_id for item in packet.citations} == {table.document_id}
+            assert {item.version for item in packet.citations} == {table.version}
+            assert len(packet.text) < 6000
+
+        repo.reset_counts()
+        unknown = repo.retrieve_for_followup(
+            query="Rddbc999 필드명 알려줘",
+            parent_snapshot=snapshot,
+            request_context=context,
+        )
+        assert unknown.reason_code == "no_authorized_match" and unknown.citations == ()
+        assert outside.content_hash not in repo.artifact_read_hashes
+
+        for denied_context in (
+            build_knowledge_chat_request_context(
+                user_id=8, company_id=4, permission_codes=["RAG_USE"],
+                room_owner_user_id=8, room_company_id=4, technical_detail_mode=True,
+            ),
+            build_knowledge_chat_request_context(
+                user_id=8, company_id=6, permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ],
+                room_owner_user_id=8, room_company_id=4, technical_detail_mode=True,
+            ),
+            build_knowledge_chat_request_context(
+                user_id=9, company_id=4, permission_codes=["RAG_USE", KNOWLEDGE_ERP_DB_READ],
+                room_owner_user_id=9, room_company_id=4, technical_detail_mode=True,
+            ),
+        ):
+            repo.reset_counts()
+            denied = repo.retrieve_for_followup(
+                query="필드명 알려줘",
+                parent_snapshot=snapshot,
+                request_context=denied_context,
+            )
+            assert denied.reason_code != "ready" and repo.artifact_reads == 0
     finally:
         shutil.rmtree(root)
 
@@ -816,6 +988,8 @@ def main() -> None:
         test_fail_closed_before_artifact_read,
         test_lexical_normalization_and_all_terms,
         test_technical_natural_language_query_preserves_authorization_boundary,
+        test_technical_detail_wrapper_normalization_is_narrow_and_fail_closed,
+        test_citation_bound_table_layout_followup_is_scoped_and_fail_closed,
         test_knowledge_query_term_normalizer_preserves_ambiguous_word_endings,
         test_checked_manage_scope_contract,
         test_checked_deny_has_no_storage_side_effects,

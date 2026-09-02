@@ -7,7 +7,7 @@ retrieved; a user's chat attachment remains a chat attachment.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -375,6 +375,11 @@ _KNOWLEDGE_QUERY_FILLER_TERMS = frozenset(
         "확인해주세요",
     }
 )
+
+# These terms are useful only as a natural-language wrapper around a concrete
+# technical identifier.  Keep them out of ordinary Knowledge retrieval, where
+# "기술" can remain meaningful user wording.
+_TECHNICAL_DETAIL_QUERY_WRAPPER_TERMS = frozenset({"관련", "기술"})
 _KOREAN_QUERY_PARTICLES = (
     "으로",
     "에서",
@@ -388,8 +393,12 @@ _KOREAN_QUERY_PARTICLES = (
 )
 
 
-def _knowledge_query_terms(value: str) -> tuple[tuple[str, ...], str]:
-    """Drop Korean question filler while preserving unmatched semantic tokens."""
+def _knowledge_query_terms(
+    value: str,
+    *,
+    technical_detail_mode: bool = False,
+) -> tuple[tuple[str, ...], str]:
+    """Drop only mode-appropriate Korean question wrapper terms."""
     tokens, compact = _lexical_parts(value)
     normalized: list[str] = []
     for token in tokens:
@@ -400,7 +409,116 @@ def _knowledge_query_terms(value: str) -> tuple[tuple[str, ...], str]:
                 break
         if candidate and candidate not in _KNOWLEDGE_QUERY_FILLER_TERMS:
             normalized.append(candidate)
+    if technical_detail_mode:
+        semantic_terms = [
+            term for term in normalized
+            if term not in _TECHNICAL_DETAIL_QUERY_WRAPPER_TERMS
+        ]
+        # Do not turn a wrapper-only technical query into an empty, broad
+        # retrieval. It must retain its existing fail-closed behavior.
+        if semantic_terms:
+            normalized = semantic_terms
     return tuple(normalized), compact
+
+
+@dataclass(frozen=True)
+class _TableLayoutFollowupIntent:
+    include_all_fields: bool
+    categories: tuple[str, ...]
+
+
+_TABLE_LAYOUT_GENERIC_TERMS = frozenset({"필드", "필드명", "컬럼", "항목"})
+_TABLE_LAYOUT_QUERY_CATEGORIES = {
+    "입고구분": "inbound_type",
+    "입고": "inbound",
+    "수량": "quantity",
+    "금액": "amount",
+    "날짜": "date",
+    "일자": "date",
+    "거래처": "vendor",
+}
+_TABLE_LAYOUT_FIELD_TOKENS = {
+    "inbound_type": frozenset({"io", "gu"}),
+    "inbound": frozenset({"in"}),
+    "quantity": frozenset({"quantity"}),
+    "amount": frozenset({"price", "cost", "amount"}),
+    "date": frozenset({"date", "yymmdd", "time"}),
+    "vendor": frozenset({"ven", "vendor", "customer"}),
+}
+_TABLE_LAYOUT_PARTICLES = ("으로", "에서", "부터", "까지", "과", "와", "만", "의", "은", "는", "을", "를")
+_TABLE_LAYOUT_FIELD_LINE = re.compile(
+    r"^\s*\[(?P<name>[A-Za-z0-9_]+)\]\s+\[(?P<data_type>[A-Za-z0-9]+)\]"
+)
+
+
+def _table_layout_followup_intent(value: str) -> _TableLayoutFollowupIntent | None:
+    """Recognize only a small, citation-bound table-layout vocabulary."""
+    terms, _ = _knowledge_query_terms(value, technical_detail_mode=True)
+    normalized_terms: list[str] = []
+    for term in terms:
+        candidate = term
+        for particle in _TABLE_LAYOUT_PARTICLES:
+            if candidate.endswith(particle) and len(candidate) > len(particle):
+                candidate = candidate[: -len(particle)]
+                break
+        if candidate:
+            normalized_terms.append(candidate)
+    if not normalized_terms:
+        return None
+
+    include_all_fields = False
+    categories: list[str] = []
+    for term in normalized_terms:
+        if term in _TABLE_LAYOUT_GENERIC_TERMS:
+            include_all_fields = True
+            continue
+        category = _TABLE_LAYOUT_QUERY_CATEGORIES.get(term)
+        if category is None:
+            # A concrete but unknown identifier must retain the normal
+            # fail-closed lexical path; never replace it with a field list.
+            return None
+        if category not in categories:
+            categories.append(category)
+    if not include_all_fields and not categories:
+        return None
+    return _TableLayoutFollowupIntent(include_all_fields, tuple(categories))
+
+
+def _table_layout_field_lines(section: Mapping[str, str]) -> tuple[tuple[str, str], ...]:
+    """Extract SQL DDL field declarations without treating arbitrary text as a table."""
+    text = str(section.get("text") or "")
+    if "create table" not in text.casefold():
+        return ()
+    fields: list[tuple[str, str]] = []
+    for raw_line in text.splitlines():
+        match = _TABLE_LAYOUT_FIELD_LINE.match(raw_line)
+        if match is not None:
+            fields.append((match.group("name"), raw_line.strip().rstrip(",")))
+    return tuple(fields)
+
+
+def _table_layout_field_matches(name: str, categories: tuple[str, ...]) -> bool:
+    if not categories:
+        return True
+    tokens, _ = _lexical_parts(name.replace("_", " "))
+    token_set = frozenset(tokens)
+    for category in categories:
+        expected = _TABLE_LAYOUT_FIELD_TOKENS[category]
+        if category == "amount":
+            if token_set & expected:
+                return True
+        elif category == "date":
+            if token_set & expected:
+                return True
+        elif category == "vendor":
+            if token_set & expected:
+                return True
+        elif category == "quantity":
+            if any(token.endswith("quantity") or token == "qty" for token in token_set):
+                return True
+        elif expected.issubset(token_set):
+            return True
+    return False
 
 
 def _sectionize(text: str) -> tuple[dict[str, str], ...]:
@@ -582,6 +700,80 @@ class KnowledgeDocumentRepository:
             ).returncode == 0
         except (OSError, subprocess.SubprocessError, UnicodeError):
             return False
+
+    @staticmethod
+    def _help_query_for_source(source: DocumentSource) -> str:
+        """Return only a metadata-backed query that the lexical path can match."""
+        if source.search_aliases:
+            return source.search_aliases[0]
+        source_stem = Path(source.source_name).stem.strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{2,80}", source_stem):
+            return source_stem
+        return ""
+
+    def get_help_example_queries(
+        self,
+        *,
+        current_user_id: int | None,
+        current_company_id: int | None,
+        permission_codes: Iterable[str] | None,
+    ) -> dict[str, str]:
+        """Return authorized, active help examples using manifest metadata only."""
+        examples = {
+            "general": "",
+            "erp_technical": "",
+            "project_source_technical": "",
+        }
+        try:
+            sources = self._read_manifest()
+        except ValueError:
+            return examples
+        sources.sort(
+            key=lambda source: (
+                Path(source.source_name).stem.casefold() != "rddbc110",
+                source.source_name.casefold(),
+                source.document_id,
+            )
+        )
+        for source in sources:
+            if source.status != DOCUMENT_ACTIVE or source.approval_status != APPROVAL_APPROVED:
+                continue
+            query = self._help_query_for_source(source)
+            if not query:
+                continue
+            if (
+                source.knowledge_classification == KnowledgeClassification.GENERAL
+                and not examples["general"]
+            ):
+                decision = can_read_document(
+                    document=source.policy_document(),
+                    current_user_id=current_user_id,
+                    current_company_id=current_company_id,
+                    permission_codes=permission_codes,
+                )
+                if decision.allowed:
+                    examples["general"] = query
+                continue
+            if source.source_kind == SOURCE_KIND_PROJECT_SOURCE:
+                if not self._project_source_is_current(source):
+                    continue
+                example_key = "project_source_technical"
+            elif source.knowledge_classification == KnowledgeClassification.ERP_DB_INTERNAL:
+                example_key = "erp_technical"
+            else:
+                continue
+            if examples[example_key]:
+                continue
+            decision = can_read_document(
+                document=source.policy_document(),
+                current_user_id=current_user_id,
+                current_company_id=current_company_id,
+                permission_codes=permission_codes,
+                technical_detail_mode=True,
+            )
+            if decision.allowed:
+                examples[example_key] = query
+        return examples
 
     @property
     def manifest_path(self) -> Path:
@@ -966,8 +1158,17 @@ class KnowledgeDocumentRepository:
         return artifact
 
     @staticmethod
-    def _score(query: str, source: DocumentSource, section: dict[str, str]) -> int:
-        query_terms, compact_query = _knowledge_query_terms(query)
+    def _score(
+        query: str,
+        source: DocumentSource,
+        section: dict[str, str],
+        *,
+        technical_detail_mode: bool = False,
+    ) -> int:
+        query_terms, compact_query = _knowledge_query_terms(
+            query,
+            technical_detail_mode=technical_detail_mode,
+        )
         if not query_terms:
             return 0
         haystack_tokens, compact_haystack = _lexical_parts(
@@ -1011,6 +1212,125 @@ class KnowledgeDocumentRepository:
             permission_codes=request_context.permission_codes,
             max_chars=max_chars,
             technical_detail_mode=request_context.technical_detail_mode,
+        )
+
+    def retrieve_for_followup(
+        self,
+        *,
+        query: str,
+        parent_snapshot: KnowledgeEvidenceSnapshot,
+        request_context: KnowledgeChatRequestContext,
+        max_chars: int = 6000,
+    ) -> ContextPacket:
+        """Retrieve only inside one currently authorized parent evidence scope."""
+        if not isinstance(query, str) or not query.strip():
+            return ContextPacket("", (), "invalid_followup_query", 0)
+        decision = self.authorize_evidence_snapshot(
+            snapshot=parent_snapshot,
+            request_context=request_context,
+        )
+        if not decision.allowed:
+            return ContextPacket("", (), decision.reason_code, 0)
+        document_versions = frozenset(
+            (citation.document_id, citation.version)
+            for citation in decision.citations
+        )
+        if not document_versions:
+            return ContextPacket("", (), "evidence_missing_citations", 0)
+        table_layout_packet = self._retrieve_table_layout_followup(
+            query=query,
+            citations=decision.citations,
+            document_versions=document_versions,
+            max_chars=max_chars,
+            technical_detail_mode=parent_snapshot.technical_detail_mode,
+        )
+        if table_layout_packet is not None:
+            return table_layout_packet
+        return self.retrieve(
+            query=query,
+            current_user_id=request_context.user_id,
+            current_company_id=request_context.company_id,
+            permission_codes=request_context.permission_codes,
+            max_chars=max_chars,
+            technical_detail_mode=parent_snapshot.technical_detail_mode,
+            _document_version_allowlist=document_versions,
+        )
+
+    def _retrieve_table_layout_followup(
+        self,
+        *,
+        query: str,
+        citations: tuple[ContextCitation, ...],
+        document_versions: frozenset[tuple[str, int]],
+        max_chars: int,
+        technical_detail_mode: bool,
+    ) -> ContextPacket | None:
+        """Build bounded field context only inside an authorized technical parent."""
+        if not technical_detail_mode:
+            return None
+        intent = _table_layout_followup_intent(query)
+        if intent is None:
+            return None
+        documents = {source.document_id: source for source in self._read_manifest()}
+        groups: list[tuple[ContextCitation, tuple[str, ...]]] = []
+        matched_field_count = 0
+        seen_document_ids: set[str] = set()
+        for parent_citation in citations:
+            if parent_citation.document_id in seen_document_ids:
+                continue
+            seen_document_ids.add(parent_citation.document_id)
+            source = documents.get(parent_citation.document_id)
+            if source is None or (source.document_id, source.version) not in document_versions:
+                continue
+            artifact = self._read_artifact(source.content_hash)
+            for raw_section in artifact.sections:
+                section = dict(raw_section)
+                fields = _table_layout_field_lines(section)
+                if not fields:
+                    continue
+                selected = tuple(
+                    line for name, line in fields
+                    if (
+                        _table_layout_field_matches(name, intent.categories)
+                        if intent.categories else intent.include_all_fields
+                    )
+                )
+                if not selected:
+                    continue
+                citation = replace(
+                    parent_citation,
+                    section_id=str(section["section_id"]),
+                    section_title=str(section["title"]),
+                )
+                groups.append((citation, selected))
+                matched_field_count += len(selected)
+        if not groups:
+            return None
+
+        chunks: list[str] = []
+        result_citations: list[ContextCitation] = []
+        total = 0
+        for citation, fields in groups:
+            header = f"{citation.label}\n요청 범위와 일치한 표 필드:\n"
+            rendered_lines: list[str] = []
+            for field in fields:
+                proposed = header + "\n".join((*rendered_lines, field))
+                if total + len(proposed) + 2 > max_chars:
+                    break
+                rendered_lines.append(field)
+            if not rendered_lines:
+                continue
+            rendered = header + "\n".join(rendered_lines)
+            chunks.append(rendered)
+            result_citations.append(citation)
+            total += len(rendered) + 2
+        if not chunks:
+            return None
+        return ContextPacket(
+            text="\n\n".join(chunks),
+            citations=tuple(result_citations),
+            reason_code="ready",
+            candidate_count=matched_field_count,
         )
 
     def authorize_evidence_snapshot(
@@ -1110,6 +1430,7 @@ class KnowledgeDocumentRepository:
         permission_codes: Iterable[str] | None,
         max_chars: int = 6000,
         technical_detail_mode: bool = False,
+        _document_version_allowlist: frozenset[tuple[str, int]] | None = None,
     ) -> ContextPacket:
         """Read artifact bytes only after approved status and scope/permission approval."""
         if max_chars <= 0:
@@ -1117,6 +1438,11 @@ class KnowledgeDocumentRepository:
         candidates: list[tuple[int, DocumentSource, dict[str, str]]] = []
         for source in self._read_manifest():
             if source.approval_status != APPROVAL_APPROVED:
+                continue
+            if (
+                _document_version_allowlist is not None
+                and (source.document_id, source.version) not in _document_version_allowlist
+            ):
                 continue
             decision = can_read_document(
                 document=source.policy_document(),
@@ -1142,7 +1468,12 @@ class KnowledgeDocumentRepository:
                 section["_source_content_hash"] = artifact.source_content_hash
                 section["_extractor_kind"] = artifact.extractor_kind
                 section["_extractor_version"] = str(artifact.extractor_version)
-                score = self._score(query, source, section)
+                score = self._score(
+                    query,
+                    source,
+                    section,
+                    technical_detail_mode=technical_detail_mode,
+                )
                 if score:
                     candidates.append((score, source, section))
         candidates.sort(key=lambda row: (-row[0], row[1].source_name, row[2]["section_id"]))

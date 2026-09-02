@@ -174,16 +174,26 @@ def check_knowledge_tool_route_decision() -> None:
 
 def check_knowledge_runtime_trace_boundary() -> None:
     source = (ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
-    start = source.index("def _run_explicit_knowledge_chat(")
-    end = source.index("\ndef _run_web_search_chat(", start)
-    block = source[start:end]
-    retrieve = block.index("repository.retrieve_for_chat(")
-    decision = block.index("build_knowledge_rag_tool_route_decision(")
-    ready_boundary = block.index("build_knowledge_answer_message(")
-    authorized_envelope = block.index("authorized_knowledge_evidence=True")
-    if not (retrieve < decision < ready_boundary < authorized_envelope):
+    complete_start = source.index("def _complete_knowledge_chat(")
+    complete_end = source.index("\ndef _run_explicit_knowledge_chat(", complete_start)
+    complete = source[complete_start:complete_end]
+    decision = complete.index("build_knowledge_rag_tool_route_decision(")
+    ready_boundary = complete.index("build_knowledge_answer_message(")
+    authorized_envelope = complete.index("authorized_knowledge_evidence=True")
+    if not (decision < ready_boundary < authorized_envelope):
         raise AssertionError("Knowledge trace crossed the authorization/evidence boundary")
-    if "message[\"structured_response\"]" in block or "knowledge_evidence\"][\"structured" in block:
+    explicit_start = complete_end + 1
+    explicit_end = source.index("\ndef _run_knowledge_followup_chat(", explicit_start)
+    explicit = source[explicit_start:explicit_end]
+    followup_start = explicit_end + 1
+    followup_end = source.index("\ndef _run_explicit_mcp_resource_chat(", followup_start)
+    followup = source[followup_start:followup_end]
+    if explicit.index("repository.retrieve_for_chat(") > explicit.index("_complete_knowledge_chat("):
+        raise AssertionError("explicit Knowledge trace ran before retrieval")
+    if followup.index("build_knowledge_followup_packet(") > followup.index("_complete_knowledge_chat("):
+        raise AssertionError("follow-up Knowledge trace ran before retrieval")
+    combined = complete + explicit + followup
+    if "message[\"structured_response\"]" in combined or "knowledge_evidence\"][\"structured" in combined:
         raise AssertionError("Knowledge trace changed the persisted message shape")
 
 

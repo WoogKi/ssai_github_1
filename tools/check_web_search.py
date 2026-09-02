@@ -104,7 +104,7 @@ def main() -> None:
     assert no_result.status == "no_match" and no_result.reason_code == "no_results"
 
     main_source = (ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
-    datetime_route = "None if raw_mcp_route is not None else resolve_datetime_question(user_input)"
+    datetime_route = "None if raw_mcp_route is not None or sims_help_route is not None else resolve_datetime_question(user_input)"
     assert main_source.index(datetime_route) < main_source.index("web_search_route = parse_web_search_request(user_input)")
     assert main_source.index("if web_search_route is not None:") < main_source.index("handled = try_handle_nlq(")
     assert "_run_web_search_chat(web_search_route, room=current_room)" in main_source

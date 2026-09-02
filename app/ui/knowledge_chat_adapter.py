@@ -22,6 +22,50 @@ class KnowledgeChatRoute:
     technical_detail_mode: bool
 
 
+@dataclass(frozen=True)
+class KnowledgeFollowupRoute:
+    query: str
+    parent_message_id: str
+    room_id: str
+
+
+def build_knowledge_followup_queue_request(
+    *,
+    query: object,
+    parent_message_id: object,
+    room_id: object,
+) -> dict[str, str]:
+    """Build the small JSON-safe request owned by the dedicated UI queue."""
+    values = {
+        "query": str(query or "").strip(),
+        "parent_message_id": str(parent_message_id or "").strip(),
+        "room_id": str(room_id or "").strip(),
+    }
+    if not all(values.values()):
+        raise ValueError("Knowledge follow-up queue fields must be non-empty")
+    return values
+
+
+def parse_knowledge_followup_queue_request(
+    value: object,
+    *,
+    current_room_id: object,
+    last_user_text: object,
+) -> KnowledgeFollowupRoute | None:
+    """Accept only the exact room/query tuple produced by the follow-up UI."""
+    if not isinstance(value, dict) or set(value) != {"query", "parent_message_id", "room_id"}:
+        return None
+    try:
+        request = build_knowledge_followup_queue_request(**value)
+    except (TypeError, ValueError):
+        return None
+    if request["room_id"] != str(current_room_id or "").strip():
+        return None
+    if request["query"] != str(last_user_text or "").strip():
+        return None
+    return KnowledgeFollowupRoute(**request)
+
+
 def parse_explicit_knowledge_request(value: object) -> KnowledgeChatRoute | None:
     """Route only explicit commands; ordinary Chat/NLQ input remains untouched."""
     if not isinstance(value, str):
