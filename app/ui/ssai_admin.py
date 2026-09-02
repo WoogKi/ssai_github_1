@@ -21,6 +21,7 @@ from app.services.ssai_auth_service import connect_ssai_db
 from app.services.ssai_user_admin_service import (
     approve_user,
     change_company_user_role,
+    get_managed_user_knowledge_permissions,
     get_manageable_companies,
     get_user_company_roles,
     list_active_companies,
@@ -887,6 +888,70 @@ def _render_pending_user_card(
                 "회원 사용자는 이후 SIMS 비밀번호로 로그인합니다."
             )
 
+def _render_knowledge_effective_permission_box(
+    *,
+    selected_user: dict[str, Any],
+    target_company_id: int,
+    current_user: Any,
+    allow_all_companies: bool,
+) -> None:
+    """관리자에게 선택 사용자/회사 조합의 Knowledge 실효 권한을 읽기 전용으로 표시한다."""
+    target_login_id = str(selected_user.get("login_id") or "").strip()
+    manager_user_id = getattr(current_user, "user_id", None)
+
+    if not target_login_id or manager_user_id is None or target_company_id <= 0:
+        st.error("Knowledge 실효 권한 조회 대상 정보를 확인할 수 없습니다.")
+        return
+
+    with st.expander("Knowledge 실효 권한", expanded=False):
+        st.caption(
+            "선택 사용자와 회원사 ERP DB 기준의 활성 역할 및 실효 권한입니다. "
+            "개별 권한은 이 화면에서 변경하지 않습니다."
+        )
+        try:
+            result = get_managed_user_knowledge_permissions(
+                manager_user_id=int(manager_user_id),
+                target_login_id=target_login_id,
+                company_id=int(target_company_id),
+                allow_all_companies=allow_all_companies,
+            )
+        except Exception as exc:
+            log.exception(
+                "[admin.knowledge_permissions] readback failed target=%s company_id=%s",
+                target_login_id,
+                target_company_id,
+            )
+            st.error(f"Knowledge 실효 권한을 조회하지 못했습니다: {type(exc).__name__}")
+            return
+
+        roles = result.get("roles") or []
+        role_text = ", ".join(
+            f"{row.get('role_code')} ({row.get('role_name')})"
+            for row in roles
+            if row.get("role_code")
+        )
+        st.write(f"현재 역할: {role_text or '활성 역할 없음'}")
+
+        import pandas as pd
+
+        permission_rows = [
+            {
+                "permission_code": row.get("permission_code"),
+                "effective": "허용" if row.get("allowed") else "미허용",
+            }
+            for row in result.get("effective_permissions") or []
+        ]
+        st.dataframe(pd.DataFrame(permission_rows), width="stretch", hide_index=True)
+
+        if st.button(
+            "실효 권한 다시 확인",
+            width="stretch",
+            key=f"__admin_knowledge_permission_refresh_{target_company_id}_{_safe_key(target_login_id)}",
+        ):
+            _admin_keep_company_user_tab()
+            st.rerun()
+
+
 def _render_user_policy_update_box(
     *,
     selected_user: dict[str, Any],
@@ -1640,6 +1705,13 @@ def render_company_user_management_page() -> None:
             except Exception as e:
                 log.exception("[admin.company_users] revoke failed target=%s", target_login_id)
                 st.error(f"승인 취소 중 오류가 발생했습니다: {type(e).__name__}: {e}")
+
+    _render_knowledge_effective_permission_box(
+        selected_user=selected_user,
+        target_company_id=target_company_id,
+        current_user=current_user,
+        allow_all_companies=allow_all_companies,
+    )
 
     _render_user_policy_update_box(
         selected_user=selected_user,

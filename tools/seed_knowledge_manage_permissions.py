@@ -18,6 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.services.ssai_auth_service import connect_ssai_db  # noqa: E402
+from app.services.knowledge_role_policy import (  # noqa: E402
+    PREDEFINED_KNOWLEDGE_ROLE_CODES,
+    role_codes_granted,
+)
 
 
 QUERY_TIMEOUT_SECONDS = 10
@@ -42,30 +46,11 @@ PERMISSIONS: dict[str, dict[str, str]] = {
 }
 
 EXPECTED_GRANTS: dict[str, tuple[str, ...]] = {
-    "KNOWLEDGE_GLOBAL_MANAGE": ("SYSTEM_ADMIN",),
-    "KNOWLEDGE_COMPANY_MANAGE": (
-        "SYSTEM_ADMIN",
-        "SSART_MANAGER",
-        "WHOLESALE_MANAGER",
-    ),
-    "KNOWLEDGE_ERP_DB_READ": (
-        "SYSTEM_ADMIN",
-        "SSART_MANAGER",
-    ),
-    "KNOWLEDGE_PROJECT_SOURCE_READ": (
-        "SYSTEM_ADMIN",
-        "SSART_MANAGER",
-    ),
+    permission_code: role_codes_granted(permission_code)
+    for permission_code in PERMISSIONS
 }
 
-REQUIRED_ROLE_CODES = (
-    "SYSTEM_ADMIN",
-    "SSART_MANAGER",
-    "SSART_STAFF",
-    "WHOLESALE_MANAGER",
-    "WHOLESALE_STAFF",
-    "WHOLESALE_READONLY",
-)
+REQUIRED_ROLE_CODES = PREDEFINED_KNOWLEDGE_ROLE_CODES
 
 
 class SeedConflict(RuntimeError):

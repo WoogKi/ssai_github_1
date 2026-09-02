@@ -16,6 +16,7 @@ from app.services.knowledge_scope_policy import (  # noqa: E402
     can_manage_document,
     can_read_document,
 )
+from app.services.knowledge_role_policy import KNOWLEDGE_ROLE_PERMISSION_MATRIX  # noqa: E402
 
 
 def _document(
@@ -73,14 +74,7 @@ def main() -> None:
     _assert(can_read_document(document=_document("GLOBAL"), current_user_id=11, current_company_id=4, permission_codes=rag, technical_detail_mode="true"), False, "invalid_technical_detail_mode")
 
     erp_document = _document("GLOBAL", classification="ERP_DB_INTERNAL")
-    role_permissions = {
-        "SYSTEM_ADMIN": ["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ, KNOWLEDGE_ERP_DB_READ],
-        "SSART_MANAGER": ["RAG_USE", KNOWLEDGE_PROJECT_SOURCE_READ, KNOWLEDGE_ERP_DB_READ],
-        "SSART_STAFF": ["RAG_USE"],
-        "WHOLESALE_MANAGER": ["RAG_USE"],
-        "WHOLESALE_STAFF": ["RAG_USE"],
-        "WHOLESALE_READONLY": [],
-    }
+    role_permissions = KNOWLEDGE_ROLE_PERMISSION_MATRIX
     for role_code in ("SYSTEM_ADMIN", "SSART_MANAGER"):
         _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code]), False, "technical_detail_mode_required")
         _assert(can_read_document(document=erp_document, current_user_id=11, current_company_id=4, permission_codes=role_permissions[role_code], technical_detail_mode=True), True, "global_active")

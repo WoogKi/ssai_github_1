@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.services.knowledge_document_service import KnowledgeDocumentRepository
+from app.services.knowledge_role_policy import KNOWLEDGE_ROLE_PERMISSION_MATRIX
 from project_source_knowledge_cli import (
     PlanValidationError,
     apply_plan,
@@ -21,14 +22,7 @@ from project_source_knowledge_cli import (
 )
 
 
-ROLE_PERMISSIONS = {
-    "SYSTEM_ADMIN": ("RAG_USE", "KNOWLEDGE_GLOBAL_MANAGE", "KNOWLEDGE_COMPANY_MANAGE", "KNOWLEDGE_PROJECT_SOURCE_READ", "KNOWLEDGE_ERP_DB_READ"),
-    "SSART_MANAGER": ("RAG_USE", "KNOWLEDGE_COMPANY_MANAGE", "KNOWLEDGE_PROJECT_SOURCE_READ", "KNOWLEDGE_ERP_DB_READ"),
-    "SSART_STAFF": ("RAG_USE",),
-    "WHOLESALE_MANAGER": ("RAG_USE", "KNOWLEDGE_COMPANY_MANAGE"),
-    "WHOLESALE_STAFF": ("RAG_USE",),
-    "WHOLESALE_READONLY": (),
-}
+ROLE_PERMISSIONS = KNOWLEDGE_ROLE_PERMISSION_MATRIX
 
 
 def _write(path: Path, value: str) -> None:

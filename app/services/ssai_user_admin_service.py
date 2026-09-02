@@ -13,7 +13,7 @@ from typing import Any
 
 import pyodbc
 
-from app.services.ssai_auth_service import connect_ssai_db
+from app.services.ssai_auth_service import connect_ssai_db, get_user_permissions
 from app.services.ssai_audit_service import safe_log_audit_event
 from app.services.ssai_storage_service import ensure_user_storage_dirs
 
@@ -1692,6 +1692,102 @@ def _assert_user_belongs_to_company(
         raise PermissionError(
             f"대상 사용자가 해당 회사에 연결되어 있지 않습니다. user_id={user_id}, company_id={company_id}"
         )
+
+
+KNOWLEDGE_EFFECTIVE_PERMISSION_CODES = (
+    "RAG_USE",
+    "KNOWLEDGE_PROJECT_SOURCE_READ",
+    "KNOWLEDGE_ERP_DB_READ",
+    "KNOWLEDGE_GLOBAL_MANAGE",
+    "KNOWLEDGE_COMPANY_MANAGE",
+)
+
+
+def get_managed_user_knowledge_permissions(
+    *,
+    manager_user_id: int,
+    target_login_id: str,
+    company_id: int,
+    allow_all_companies: bool = False,
+) -> dict[str, Any]:
+    """관리 가능한 회사 범위 안에서 대상 사용자의 Knowledge 실효 권한만 조회한다.
+
+    역할 변경과 별개인 read-only readback 용도다. 대상 사용자/회사 소속과
+    관리자 회사 범위를 먼저 확인해 다른 회사의 권한이 섞여 보이지 않게 한다.
+    """
+    normalized_login_id = str(target_login_id or "").strip()
+    normalized_company_id = int(company_id or 0)
+
+    if not normalized_login_id:
+        raise ValueError("대상 로그인 ID가 필요합니다.")
+    if normalized_company_id <= 0:
+        raise ValueError("유효한 회사 ID가 필요합니다.")
+
+    with connect_ssai_db() as conn:
+        _assert_manager_can_manage_company(
+            conn,
+            manager_user_id=int(manager_user_id),
+            company_id=normalized_company_id,
+            allow_all_companies=allow_all_companies,
+        )
+        target_user = _get_user_by_id_or_login(
+            conn,
+            target_login_id=normalized_login_id,
+        )
+        target_user_id = int(target_user["user_id"])
+        _assert_user_belongs_to_company(
+            conn,
+            user_id=target_user_id,
+            company_id=normalized_company_id,
+        )
+
+        active_roles = _fetch_all_dicts(
+            conn,
+            """
+            SELECT
+                r.role_code,
+                r.role_name
+            FROM dbo.SSAI_USER_ROLES ur
+            JOIN dbo.SSAI_ROLES r
+                ON r.role_id = ur.role_id
+            WHERE ur.user_id = ?
+              AND ur.is_active = 1
+              AND r.is_active = 1
+              AND (
+                    ur.company_id IS NULL
+                    OR ur.company_id = ?
+                  )
+            ORDER BY r.role_code
+            """,
+            (target_user_id, normalized_company_id),
+        )
+        effective_permission_codes = set(
+            get_user_permissions(
+                conn,
+                user_id=target_user_id,
+                company_id=normalized_company_id,
+            )
+        )
+
+    return {
+        "target_login_id": str(target_user.get("login_id") or normalized_login_id),
+        "target_user_id": target_user_id,
+        "company_id": normalized_company_id,
+        "roles": [
+            {
+                "role_code": str(role.get("role_code") or ""),
+                "role_name": str(role.get("role_name") or ""),
+            }
+            for role in active_roles
+        ],
+        "effective_permissions": [
+            {
+                "permission_code": permission_code,
+                "allowed": permission_code in effective_permission_codes,
+            }
+            for permission_code in KNOWLEDGE_EFFECTIVE_PERMISSION_CODES
+        ],
+    }
 
 
 def _grade_for_wholesale_role(role_code: str) -> str:
