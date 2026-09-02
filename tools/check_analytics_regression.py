@@ -728,9 +728,9 @@ def run_basic_checks() -> list[CheckResult]:
                             stretch_width_counts[node.func.attr] += 1
 
             expected_stretch_width_counts = {
-                "button": 45,
+                "button": 46,
                 "form_submit_button": 38,
-                "dataframe": 12,
+                "dataframe": 13,
                 "download_button": 5,
             }
             if deprecated_width_calls or dict(stretch_width_counts) != expected_stretch_width_counts:
