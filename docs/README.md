@@ -8,8 +8,7 @@
 
 ## 현재 공식 문서
 
-- 마스터 로드맵: [SIMS AI Platform Master Roadmap v2.3](00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.3_20260809.md)
-- 예상 일정: [SIMS AI Platform 예상 일정 v1.2](00_roadmap/SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.2_20260809.md)
+- 통합 로드맵·일정: [SIMS AI Platform Roadmap 2026-09-03](00_roadmap/SIMS_AI_PLATFORM_ROADMAP_20260903.md)
 - 공통 운영: [SIMS AI 공통 운영 Runbook](03_runbook/RUNBOOK_SIMSAI.md)
 - 2호기 운영: [SIMS AI 2호기 운영 점검 Runbook](03_runbook/RUNBOOK_2HO_OPERATION_CHECK.md)
 - LM Studio 확장 설계: [LM Studio Intelligence Extension Plan](02_design/LM_STUDIO_INTELLIGENCE_EXTENSION_PLAN.md)
@@ -18,7 +17,7 @@
 - 공식 테스트 결과: [6c83962 NLQ·Dashboard·현재고 테스트 결과](04_test_results/TEST_RESULT_6C83962_NLQ_DASHBOARD_STOCK_20260809.md)
 
 공식 문서의 운영 기준선은 `feat/dashboard-stock-extension-20260727` 브랜치의
-`6c83962` 커밋이다. 문서에 별도 기준 커밋이 적혀 있으면 해당 문서는 그 시점의
+`ad609f71206081c26a551e57ca216b5fcb31f5b3` 커밋이다. 문서에 별도 기준 커밋이 적혀 있으면 해당 문서는 그 시점의
 역사자료로 해석한다.
 
 ## 공식 폴더 구조
@@ -33,9 +32,9 @@ docs/
   90_archive/       구버전, 완료 계획, 임시 문서, 대체된 문서
 ```
 
-현재 기존 문서가 루트, `archive/`, 생성물 폴더 등에 분산되어 있다. 위 구조는
-새 공식 기준이며, 기존 보관 후보의 실제 이동은 별도 문서 정리 작업에서 수행한다.
-이번 개정에서는 파일을 이동하지 않는다.
+일부 기존 문서는 루트, `archive/`, 생성물 폴더 등에 남아 있다. 공식 기준에서
+대체된 로드맵과 예상 일정은 `90_archive/roadmap_versions/`에 보관하며, 나머지
+보관 후보는 링크와 역사적 의미를 확인한 뒤 별도 문서 정리 작업에서 이동한다.
 
 ## Source Of Truth
 
