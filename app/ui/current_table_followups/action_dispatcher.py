@@ -815,10 +815,63 @@ def _is_sales_trend_current_table(source_action: str) -> bool:
     return "매출추세" in re.sub(r"\s+", "", str(source_action or ""))
 
 
+def _current_table_trans_doc_direction(query: str) -> str:
+    """Return an explicit transaction-document direction without guessing one."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    wants_purchase = any(term in compact for term in ("매입", "입고"))
+    wants_sales = any(term in compact for term in ("매출", "출고"))
+    if wants_purchase == wants_sales:
+        return ""
+    return "purchase" if wants_purchase else "sales"
+
+
+def _current_table_trans_doc_direction_mask(
+    df: pd.DataFrame,
+    query: str,
+) -> tuple[pd.Series, str]:
+    """Scope a transaction-document header fact to an explicit buy/sell direction."""
+    direction = _current_table_trans_doc_direction(query)
+    if not direction:
+        return pd.Series(True, index=df.index, dtype="bool"), ""
+
+    type_column = _resolve_current_table_column(
+        df,
+        ("거래명세서구분명", "거래명세서구분", "Rd13_Trans_Di"),
+    )
+    if not type_column:
+        return pd.Series(False, index=df.index, dtype="bool"), ""
+
+    type_text = df[type_column].astype("string").fillna("").str.strip()
+    if direction == "purchase":
+        return (
+            type_text.str.contains("매입|입고", regex=True, na=False)
+            | type_text.isin(("1", "1.0")),
+            type_column,
+        )
+    return (
+        type_text.str.contains("매출|출고", regex=True, na=False)
+        | type_text.isin(("3", "3.0")),
+        type_column,
+    )
+
+
+def _current_table_metric_label_for_query(metric: str, source_action: str, query: str) -> str:
+    """Keep the canonical transaction amount while naming an explicit direction honestly."""
+    source_compact = re.sub(r"\s+", "", str(source_action or ""))
+    if metric == "transaction_amount" and "거래명세서" in source_compact:
+        direction = _current_table_trans_doc_direction(query)
+        if direction == "purchase":
+            return "매입금액"
+        if direction == "sales":
+            return "매출금액"
+    return _current_table_metric_label(metric)
+
+
 def _current_table_source_metric_hint(
     source_action: str,
     df: pd.DataFrame | None = None,
     source_meta: dict[str, Any] | None = None,
+    query: str = "",
 ) -> str:
     """Infer a metric only from an unambiguous source action and real metric column."""
     if isinstance(source_meta, dict):
@@ -836,9 +889,23 @@ def _current_table_source_metric_hint(
         candidate = "forecast_sales"
     elif "매출추세" in compact or ("현재표" in compact and "매출" in compact):
         candidate = "sales"
+    elif "거래명세서" in compact:
+        query_compact = re.sub(r"\s+", "", str(query or ""))
+        requested_groupings = [key for key, _label, _aliases in _requested_current_table_dimensions(query)]
+        _unknown_dimension, unknown_metric = _current_table_unresolved_request_labels(
+            query,
+            metrics=[],
+            groupings=requested_groupings,
+        )
+        # 거래명세서 header의 합계금액은 방향을 지정하지 않은 기본 집계에서만
+        # 공식 거래금액이다. 명시하지 않은 수수료/비용 등은 대체하지 않는다.
+        if unknown_metric or not any(marker in query_compact for marker in ("집계", "요약", "분석", "TOP", "top", "상위")):
+            return ""
+        candidate = "transaction_amount"
     else:
         return ""
-    if df is not None and not _current_table_metric_columns(df, candidate):
+    metric_source_kind = "trans_doc" if "거래명세서" in compact else ""
+    if df is not None and not _current_table_metric_columns(df, candidate, metric_source_kind):
         return ""
     return candidate
 
@@ -862,7 +929,18 @@ def _current_table_followup_intent(
 ) -> dict[str, Any]:
     requested_dimensions = _requested_current_table_dimensions(query)
     metrics = _current_table_requested_metrics(query)
-    source_metric = _current_table_source_metric_hint(source_action, df, source_meta)
+    source_is_trans_doc = "거래명세서" in re.sub(r"\s+", "", str(source_action or ""))
+    # 거래명세서 공통은 매입/매출 별도의 금액 컬럼을 만들지 않는다. 명시적인
+    # 매출/출고 금액은 header의 공식 합계금액을 거래명세서구분으로 좁힌다.
+    # 다른 source의 전역 sales metric 해석에는 영향을 주지 않는다.
+    compact_query = re.sub(r"\s+", "", str(query or ""))
+    if (
+        source_is_trans_doc
+        and _current_table_trans_doc_direction(query) == "sales"
+        and any(term in compact_query for term in ("매출금액", "출고금액"))
+    ):
+        metrics = ["transaction_amount"]
+    source_metric = _current_table_source_metric_hint(source_action, df, source_meta, query)
     if not metrics and source_metric and (
         _is_product_top_request(query) or len(requested_dimensions) == 1
     ):
@@ -876,7 +954,7 @@ def _current_table_followup_intent(
             groupings.append(inferred_grouping)
     unresolved_dimension = ""
     unresolved_metric = ""
-    if classify_current_table_followup_intent(query) == "llm_analysis":
+    if classify_current_table_followup_intent(query) == "llm_analysis" or (source_is_trans_doc and not metrics):
         unresolved_dimension, unresolved_metric = _current_table_unresolved_request_labels(
             query,
             metrics=metrics,
@@ -1015,6 +1093,15 @@ def _current_table_followup_capability(
             available_columns.extend(semantic_columns)
         else:
             missing_columns.append("상세합계일치")
+    if kind == "trans_doc" and _current_table_trans_doc_direction(query):
+        type_column = _resolve_current_table_column(
+            df,
+            ("거래명세서구분명", "거래명세서구분", "Rd13_Trans_Di"),
+        )
+        if type_column:
+            available_columns.append(type_column)
+        else:
+            missing_columns.append("거래명세서구분")
     base = {
         "requested_metrics": metrics,
         "requested_groupings": groupings,
@@ -1227,6 +1314,8 @@ def build_current_table_interpretive_facts(
     if kind == "inventory":
         product_column = _resolve_current_table_column(df, ("제품명", "품목명", "상품명"))
         detail_mask = inventory_detail_row_mask(df, product_column=product_column)
+    elif kind == "trans_doc":
+        detail_mask, _type_column = _current_table_trans_doc_direction_mask(df, query)
 
     detail_df = df.loc[detail_mask]
     work = pd.DataFrame(
@@ -1307,7 +1396,7 @@ def build_current_table_interpretive_facts(
             group_column,
         ),
         "metric": metric,
-        "metric_label": _current_table_metric_label(metric) or metric_column,
+        "metric_label": _current_table_metric_label_for_query(metric, source_action, query) or metric_column,
         "group_column": group_column,
         "metric_column": metric_column,
         "input_row_count": int(len(df)),

@@ -355,6 +355,82 @@ def run_basic_checks() -> list[CheckResult]:
     except Exception as e:
         results.append(_fail("general explanation bypasses loose master handlers", f"{type(e).__name__}: {e}"))
 
+    # 명시 업무코드 intent는 입출고 라벨과 충돌해도 IO보다 먼저 codes로 간다.
+    try:
+        router = importlib.import_module("app.sims.nlq.nlq_router")
+        codes = importlib.import_module("app.sims.nlq.nlq_codes")
+        calls: list[str] = []
+
+        def _codes_handler(text, **_kwargs):
+            calls.append(f"codes:{text}")
+            return True
+
+        with (
+            patch.object(codes, "try_handle_codes_nlq", side_effect=_codes_handler),
+            patch.object(router, "_try_handle_io_nlq", side_effect=lambda text, **_kwargs: calls.append(f"io:{text}") or True),
+        ):
+            code_handled = [
+                router.try_handle_nlq(
+                    question,
+                    room={},
+                    session_state={},
+                    make_ts=lambda: "fixture",
+                    next_seq=lambda: 1,
+                    logger=log,
+                )
+                for question in ("업무코드 입출고구분 조회", "업무코드 코드종류 입출고구분 조회")
+            ]
+            outbound_handled = [
+                router.try_handle_nlq(
+                    question,
+                    room={},
+                    session_state={},
+                    make_ts=lambda: "fixture",
+                    next_seq=lambda: 1,
+                    logger=log,
+                )
+                for question in ("출고명세 조회", "오늘 출고내역")
+            ]
+        code_precedence_ok = (
+            all(code_handled)
+            and all(outbound_handled)
+            and calls[:2] == [
+                "codes:업무코드 입출고구분 조회",
+                "codes:업무코드 코드종류 입출고구분 조회",
+            ]
+            and calls[2:] == ["io:출고명세 조회", "io:오늘 출고내역"]
+        )
+        results.append(
+            _ok("explicit business-code intent precedes IO", "codes before IO; outbound stays IO")
+            if code_precedence_ok
+            else _fail("explicit business-code intent precedes IO", repr(calls))
+        )
+    except Exception as e:
+        results.append(_fail("explicit business-code intent precedes IO", f"{type(e).__name__}: {e}"))
+
+    # Entry candidate is a route hint only; the final handler action is carried
+    # by codes payload metadata and must not be misreported as an IO action.
+    try:
+        router = importlib.import_module("app.sims.nlq.nlq_router")
+        codes = importlib.import_module("app.sims.nlq.nlq_codes")
+        candidates = [
+            router.resolve_new_sims_nlq_candidate(question)
+            for question in ("업무코드 입출고구분 조회", "업무코드 코드종류 입출고구분 조회")
+        ]
+        source = Path(codes.__file__).read_text(encoding="utf-8")
+        candidate_trace_ok = (
+            all(candidate == {"route": "master", "action": "업무코드 조회"} for candidate in candidates)
+            and '"route": "master"' in source
+            and '"canonical_action": action' in source
+        )
+        results.append(
+            _ok("business-code candidate and final trace boundary", "candidate=master; codes payload owns final action")
+            if candidate_trace_ok
+            else _fail("business-code candidate and final trace boundary", f"candidates={candidates!r}")
+        )
+    except Exception as e:
+        results.append(_fail("business-code candidate and final trace boundary", f"{type(e).__name__}: {e}"))
+
     # 거래처 loose name parser smoke check
     try:
         vmod = importlib.import_module("app.sims.nlq.nlq_vendors")

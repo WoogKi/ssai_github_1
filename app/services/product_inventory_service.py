@@ -467,7 +467,7 @@ _DISPLAY_NUMERIC_COLS_260 = {
     "입고수량", "입고단가", "입고DC율", "입고금액",
     "출고수량", "출고단가", "출고DC율", "출고금액",
     "재고수량", "재고단가", "재고DC율", "재고금액",
-    "현보험약가", "보험금액", "3개월 출고발생수",
+    "현보험약가", "보험금액", "3개월 출고발생수", "출고횟수",
 }
 
 _FREQUENCY_GRADE_COLUMN = "출고빈도등급"
@@ -2976,6 +2976,18 @@ _CURRENT_STOCK_DISPLAY_COLUMNS = [
 ]
 
 
+def _current_stock_display_columns(grp: pd.DataFrame) -> list[str]:
+    """Keep the generic current-stock table contract unless frequency was requested."""
+    columns = list(_CURRENT_STOCK_DISPLAY_COLUMNS)
+    if {
+        _FREQUENCY_GRADE_COLUMN,
+        _FREQUENCY_COUNT_COLUMN,
+    }.issubset(grp.columns):
+        product_code_index = columns.index("제품코드") + 1
+        columns[product_code_index:product_code_index] = ["출고빈도", "출고횟수"]
+    return columns
+
+
 def _build_current_stock_table_frames(
     grp: pd.DataFrame,
     cfg: Dict[str, Any],
@@ -3015,6 +3027,12 @@ def _build_current_stock_table_frames(
     work["재고수량"] = _to_num(work["stock_qty"])
     work["현보험약가"] = _to_num(work["curr_insu_unit"]).round(2)
     work["보험금액"] = _round_money(work["insu_amt"])
+    if _FREQUENCY_GRADE_COLUMN in work.columns:
+        work["출고빈도"] = work[_FREQUENCY_GRADE_COLUMN].fillna("").astype(str).str.strip()
+    if _FREQUENCY_COUNT_COLUMN in work.columns:
+        work["출고횟수"] = pd.to_numeric(work[_FREQUENCY_COUNT_COLUMN], errors="coerce")
+
+    display_columns = _current_stock_display_columns(work)
 
     product_key_columns = ["제품코드", "제품명", "규격"]
     work["_현재고제품키"] = (
@@ -3034,15 +3052,15 @@ def _build_current_stock_table_frames(
     display_parts: list[pd.DataFrame] = []
     source_parts: list[pd.DataFrame] = []
     for _, product_rows in work.groupby("_현재고제품키", sort=False, dropna=False):
-        source_details = product_rows[_CURRENT_STOCK_DISPLAY_COLUMNS].copy()
+        source_details = product_rows[display_columns].copy()
         source_parts.append(source_details)
         details = source_details.copy()
         if len(details) > 1:
-            sequence_column = _CURRENT_STOCK_DISPLAY_COLUMNS[0]
-            location_name_column = _CURRENT_STOCK_DISPLAY_COLUMNS[4]
-            location_code_column = _CURRENT_STOCK_DISPLAY_COLUMNS[15]
+            sequence_column = "순번"
+            location_name_column = "재고위치명"
+            location_code_column = "재고위치코드"
             repeated_text_columns = [
-                column for column in _CURRENT_STOCK_DISPLAY_COLUMNS
+                column for column in display_columns
                 if column not in _DISPLAY_NUMERIC_COLS_260
                 and column not in {sequence_column, location_name_column, location_code_column}
             ]
@@ -3055,19 +3073,19 @@ def _build_current_stock_table_frames(
             continue
 
         first = source_details.iloc[0]
-        source_subtotal = {column: first.get(column, "") for column in _CURRENT_STOCK_DISPLAY_COLUMNS}
+        source_subtotal = {column: first.get(column, "") for column in display_columns}
         source_subtotal["재고위치코드"] = ""
         source_subtotal["재고위치명"] = "제품 합계"
         source_subtotal["재고수량"] = float(pd.to_numeric(product_rows["재고수량"], errors="coerce").fillna(0).sum())
         source_subtotal["보험금액"] = float(pd.to_numeric(product_rows["보험금액"], errors="coerce").fillna(0).sum())
-        source_parts.append(pd.DataFrame([source_subtotal], columns=_CURRENT_STOCK_DISPLAY_COLUMNS))
-        subtotal = {column: "" for column in _CURRENT_STOCK_DISPLAY_COLUMNS}
+        source_parts.append(pd.DataFrame([source_subtotal], columns=display_columns))
+        subtotal = {column: "" for column in display_columns}
         # 제품 합계는 위치별 상세를 닫는 행이다. 화면용 copy에서만
         # 제품정보를 반복하지 않고 위치명과 집계 수치만 남긴다.
         subtotal["재고위치명"] = "제품 합계"
         subtotal["재고수량"] = float(pd.to_numeric(product_rows["재고수량"], errors="coerce").fillna(0).sum())
         subtotal["보험금액"] = float(pd.to_numeric(product_rows["보험금액"], errors="coerce").fillna(0).sum())
-        display_parts.append(pd.DataFrame([subtotal], columns=_CURRENT_STOCK_DISPLAY_COLUMNS))
+        display_parts.append(pd.DataFrame([subtotal], columns=display_columns))
 
     out = _finalize_display_df_260(pd.concat(display_parts, ignore_index=True))
     source_out = _finalize_display_df_260(pd.concat(source_parts, ignore_index=True))
@@ -3127,8 +3145,16 @@ def _filter_current_stock_frequency_rows(
         params=params,
         date_to=date_to,
     )
-    attached = filter_product_inventory_frequency_rows(attached, selected)
-    return grp.loc[attached.index].copy(), meta
+    selected_rows = filter_product_inventory_frequency_rows(attached, selected)
+    out = grp.loc[selected_rows.index].copy()
+    # The current-stock frame owns display/full/export provenance. Keep the
+    # snapshot values on that frame instead of leaving them on the filter-only
+    # helper frame.
+    out[_FREQUENCY_GRADE_COLUMN] = selected_rows[_FREQUENCY_GRADE_COLUMN]
+    out[_FREQUENCY_COUNT_COLUMN] = pd.to_numeric(
+        selected_rows[_FREQUENCY_COUNT_COLUMN], errors="coerce"
+    ).astype("Int64")
+    return out, meta
 
 # -----------------------------------------------------------------------------
 # 외부 공개 함수

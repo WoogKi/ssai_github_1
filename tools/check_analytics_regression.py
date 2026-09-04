@@ -1262,7 +1262,8 @@ def run_basic_checks() -> list[CheckResult]:
             for required in (
                 "resolve_new_sims_nlq_candidate(user_input)",
                 "not is_new_sims_nlq",
-                "route=new_sims_nlq reason=parsed_action",
+                "[chat.route.candidate] route=%s candidate_action=%s",
+                "reason=executed_handler resolved_action=%s",
                 "query_execution_failed",
             ):
                 if required not in main_src:
@@ -18219,6 +18220,7 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
             ("출고명세 조회", "현재표 거래처별 매출금액 분석", customer_sales_df, "sales", "매출금액"),
             ("거래명세서 공통 조회", "현재표 거래처별 거래금액 분석", customer_trans_df, "transaction_amount", "거래금액"),
             ("거래명세서 공통 조회", "현재표 거래처별 매입금액 분석", customer_trans_df, "purchase_amount", "거래금액"),
+            ("거래명세서 공통 조회", "현재표 거래처별 매출금액 분석", customer_trans_df, "transaction_amount", "거래금액"),
             ("거래명세서 공통 조회", "현재표 거래처 별 입고금액 분석", customer_trans_df, "purchase_amount", "거래금액"),
             ("거래명세서 공통 조회", "현재표 거래처별 입고금액 분석", customer_trans_df, "purchase_amount", "거래금액"),
             ("거래명세서 공통 조회", "현재표 거래처별 거래금액 분석", customer_trans_df, "transaction_amount", "거래금액"),
@@ -18241,6 +18243,103 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
                 or payload.get("source_rows") != len(source_df)
             ):
                 errors.append(f"customer amount source contract: {query}: pushed={pushed!r}")
+
+        trans_analysis_df = pd.DataFrame(
+            [
+                {"거래명세서구분": "매입", "거래처명": "V1", "합계금액": 110},
+                {"거래명세서구분": "매출", "거래처명": "V1", "합계금액": 220},
+                {"거래명세서구분": "3", "거래처명": "V2", "합계금액": 330},
+                {"거래명세서구분": "1", "거래처명": "V3", "합계금액": 440},
+            ]
+        )
+        facts_common = dispatcher.build_current_table_interpretive_facts(
+            df=trans_analysis_df,
+            query="현재표 거래처별 거래금액 분석",
+            source_action="거래명세서 공통 조회",
+            source_meta={"source_table_key": "fixture-full-source"},
+        )
+        facts_purchase = dispatcher.build_current_table_interpretive_facts(
+            df=trans_analysis_df,
+            query="현재표 거래처별 매입금액 분석",
+            source_action="거래명세서 공통 조회",
+            source_meta={"source_table_key": "fixture-full-source"},
+        )
+        facts_sales = dispatcher.build_current_table_interpretive_facts(
+            df=trans_analysis_df,
+            query="현재표 거래처별 매출금액 분석",
+            source_action="거래명세서 공통 조회",
+            source_meta={"source_table_key": "fixture-full-source"},
+        )
+        if (
+            facts_common.get("status") != "success"
+            or facts_common.get("metric") != "transaction_amount"
+            or facts_common.get("input_row_count") != 4
+            or facts_common.get("source_row_count") != 4
+            or facts_common.get("metric_total") != 1100.0
+            or facts_purchase.get("status") != "success"
+            or facts_purchase.get("metric_label") != "매입금액"
+            or facts_purchase.get("source_row_count") != 2
+            or facts_purchase.get("metric_total") != 550.0
+            or facts_sales.get("status") != "success"
+            or facts_sales.get("metric") != "transaction_amount"
+            or facts_sales.get("metric_label") != "매출금액"
+            or facts_sales.get("source_row_count") != 2
+            or facts_sales.get("metric_total") != 550.0
+        ):
+            errors.append(
+                "trans-doc full-source interpretive facts contract: "
+                f"common={facts_common!r} purchase={facts_purchase!r} sales={facts_sales!r}"
+            )
+
+        trans_without_direction_df = trans_analysis_df.drop(columns=["거래명세서구분"])
+        direction_missing = dispatcher.build_current_table_interpretive_facts(
+            df=trans_without_direction_df,
+            query="현재표 거래처별 매출금액 분석",
+            source_action="거래명세서 공통 조회",
+        )
+        if (
+            direction_missing.get("status") != "column_unavailable"
+            or "거래명세서구분" not in list(
+                (direction_missing.get("capability") or {}).get("missing_columns") or []
+            )
+        ):
+            errors.append(f"trans-doc sales direction must fail closed: {direction_missing!r}")
+
+        handled, pushed = dispatch(
+            "거래명세서 공통 조회",
+            "현재표 거래처별 집계",
+            customer_trans_df,
+        )
+        generic_payload = pushed[0][1] if handled and len(pushed) == 1 and pushed[0][0] == "table" else {}
+        generic_result = generic_payload.get("df")
+        generic_meta = dict(generic_payload.get("extra_meta") or {})
+        if (
+            not handled
+            or not isinstance(generic_result, pd.DataFrame)
+            or generic_result.empty
+            or "거래처명" not in generic_result.columns
+            or "거래금액" not in generic_result.columns
+            or generic_meta.get("requested_metric") != "transaction_amount"
+            or generic_meta.get("requested_grouping") != "customer"
+            or generic_payload.get("source_table_key") != "fixture-source-contract"
+            or generic_payload.get("source_rows") != len(customer_trans_df)
+        ):
+            errors.append(f"trans-doc vendor generic default contract: pushed={pushed!r}")
+
+        handled, pushed = dispatch(
+            "거래명세서 공통 조회",
+            "현재표 거래처별 수수료금액 집계",
+            customer_trans_df,
+        )
+        unknown_metric_meta = dict(pushed[0][1].get("extra_meta") or {}) if pushed else {}
+        if (
+            not handled
+            or not pushed
+            or pushed[0][0] != "notice"
+            or unknown_metric_meta.get("result_status") != "column_unavailable"
+            or "수수료금액" not in list(unknown_metric_meta.get("missing_columns") or [])
+        ):
+            errors.append(f"trans-doc unknown metric must remain unavailable: pushed={pushed!r}")
 
         missing_customer_df = customer_purchase_df.drop(columns=["거래처명"])
         handled, pushed = dispatch(

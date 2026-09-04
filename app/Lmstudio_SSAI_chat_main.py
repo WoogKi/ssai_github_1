@@ -251,6 +251,10 @@ except Exception:
 #    render_sims_main,
 #)
 from app.ui.chat_middleware import wire_chat_context,render_sims_chat_item
+from app.ui.chat_message_controls import (
+    render_chat_message_controls,
+    reset_chat_message_control_registry,
+)
 from app.ui.chat_bridge import get_sims_context_text, get_sims_context_data  # ✅ SIMS 컨텍스트 주입용
 from app.db.mssql_client import health_check
 
@@ -308,6 +312,16 @@ from app.services.web_search_service import (
     render_web_search_answer,
     search_web,
 )
+
+
+def _render_assistant_message_controls(message: dict[str, Any], *, room: dict[str, Any]) -> bool:
+    company = get_selected_company() or {}
+    return render_chat_message_controls(
+        message,
+        room=room,
+        current_user=get_current_user(),
+        current_company_id=company.get("company_id") if isinstance(company, dict) else None,
+    )
 
 from app.ui.knowledge_chat_adapter import (
     build_knowledge_followup_queue_request,
@@ -8179,6 +8193,7 @@ def _complete_knowledge_chat(
     _sync_room_meta(room, materialize=True)
     save_chat_rooms()
     _render_knowledge_answer_message(message, room=room, allow_followup=True)
+    _render_assistant_message_controls(message, room=room)
     log.info(
         "[%s] result=stored citations=%s technical_detail=%s",
         log_kind,
@@ -8272,6 +8287,7 @@ def _run_sims_help_chat(route, *, room: dict[str, Any]) -> bool:
     save_chat_rooms()
     with st.chat_message("assistant"):
         st.markdown(str(message["content"]))
+    _render_assistant_message_controls(message, room=room)
     log.info("[sims.help] result=stored llm_call_count=0")
     return True
 
@@ -8315,6 +8331,7 @@ def _run_explicit_mcp_resource_chat(route, *, room: dict[str, Any]) -> bool:
     save_chat_rooms()
     with st.chat_message("assistant"):
         st.markdown(str(message["content"]))
+    _render_assistant_message_controls(message, room=room)
     log.info(
         "[mcp.resource] status=%s reason=%s retry_count=%s physical_call_count=%s",
         response.status,
@@ -8362,6 +8379,7 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
         _sync_room_meta(room, materialize=True)
         save_chat_rooms()
         st.error(content)
+        _render_assistant_message_controls(message, room=room)
         log.info("[web.search] result=%s reason=%s", response.status, response.reason_code)
         return True
 
@@ -8418,6 +8436,7 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
     save_chat_rooms()
     with st.chat_message("assistant"):
         st.markdown(content)
+    _render_assistant_message_controls(message, room=room)
     log.info("[web.search] result=stored sources=%s", len(response.results))
     return True
 
@@ -8877,6 +8896,13 @@ _CHAT_PARTITION_META_ALLOW_KEYS = {
     "summary",
     "query_summary",
     "condition_summary",
+    # Feedback review needs these immutable delivery facts after compact
+    # history restoration. None contains a prompt or a table body.
+    "route",
+    "route_kind",
+    "result_status",
+    "request_id",
+    "nlq_trace_request_id",
     "params",
     "nlq",
     # Immutable completion facts must survive compact history restoration.
@@ -10673,14 +10699,15 @@ def stream_and_append_assistant(
         with st.chat_message("assistant"):
             st.markdown(final_text)
             st.caption(assistant_time)
-        room.setdefault("messages", []).append({
+        assistant_message = {
             "id": str(uuid.uuid4()),
             "seq": _next_seq(),
             "role": "assistant",
             "content": final_text,
             "time": assistant_time,
             **_message_meta("chat"),
-        })
+        }
+        room.setdefault("messages", []).append(assistant_message)
         _sync_room_meta(room, materialize=True)
         room.setdefault(history_channel, []).append({
             "id": str(uuid.uuid4()),
@@ -10691,6 +10718,7 @@ def stream_and_append_assistant(
             **_message_meta("chat"),
         })
         save_chat_rooms()
+        _render_assistant_message_controls(assistant_message, room=room)
         return final_text
 
     with st.chat_message("assistant"):
@@ -10817,14 +10845,15 @@ def stream_and_append_assistant(
         _clear_wait_notice()
 
     # ✅ 기존 정렬/앵커/중복제거 로직과 100% 호환되게 저장
-    room.setdefault("messages", []).append({
+    assistant_message = {
         "id": str(uuid.uuid4()),
         "seq": _next_seq(),
         "role": "assistant",
         "content": final_text,
         "time": assistant_time or make_ts(),
         **_message_meta("chat"),
-    })
+    }
+    room.setdefault("messages", []).append(assistant_message)
     _sync_room_meta(room, materialize=True)
 
     log.info(
@@ -10845,6 +10874,7 @@ def stream_and_append_assistant(
     })
 
     save_chat_rooms()
+    _render_assistant_message_controls(assistant_message, room=room)
 
     return final_text
 
@@ -10852,6 +10882,7 @@ def stream_and_append_assistant(
 # 세션 초기화
 # =========================
 _reset_chat_session_when_user_changed()
+reset_chat_message_control_registry(st.session_state)
 
 if "chat_rooms" not in st.session_state:
     _chat_rooms_load_started = time.perf_counter()
@@ -12554,9 +12585,33 @@ if user_input and user_input.strip():
         and _looks_like_implicit_analytics_current_followup(user_input)
     )
 
+    def _latest_executed_sims_route() -> dict[str, str]:
+        """Read the just-delivered deterministic result, never its route hint."""
+        for channel in ("messages", "history", "sims_messages", "gen_messages"):
+            items = current_room.get(channel) or []
+            if not isinstance(items, list):
+                continue
+            for item in reversed(items):
+                if not isinstance(item, dict):
+                    continue
+                meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                if not bool(meta.get("nlq")):
+                    continue
+                action = str(item.get("action") or meta.get("canonical_action") or meta.get("action") or "").strip()
+                if not action:
+                    continue
+                route = str(meta.get("route") or ("master" if meta.get("master_nlq") else "")).strip()
+                return {
+                    "route": route,
+                    "action": action,
+                    "result_status": str(meta.get("result_status") or "success").strip(),
+                }
+        return {}
+
     if is_new_sims_nlq:
         log.info(
-            "[chat.route.decision] route=new_sims_nlq reason=parsed_action resolved_action=%s current_table_present=%s",
+            "[chat.route.candidate] route=%s candidate_action=%s current_table_present=%s",
+            new_sims_route or "new_sims_nlq",
             new_sims_action,
             _has_current_table_source_df(),
         )
@@ -12711,6 +12766,15 @@ if user_input and user_input.strip():
                 next_seq=_next_seq,
                 logger=log,
             )
+            if is_new_sims_nlq and handled:
+                executed_route = _latest_executed_sims_route()
+                log.info(
+                    "[chat.route.decision] route=%s reason=executed_handler resolved_action=%s result_status=%s current_table_present=%s",
+                    executed_route.get("route") or new_sims_route or "new_sims_nlq",
+                    executed_route.get("action") or new_sims_action,
+                    executed_route.get("result_status") or "success",
+                    _has_current_table_source_df(),
+                )
             if is_new_sims_nlq and not handled:
                 log.info(
                     "[chat.route.decision] route=new_sims_nlq reason=execution_failed resolved_action=%s current_table_present=%s",
@@ -13261,6 +13325,7 @@ with st.container():
         st.markdown(f"<div id='jump-{anchor_core}'></div>", unsafe_allow_html=True)
 
         if _render_message(m):
+            _render_assistant_message_controls(m, room=current_room)
             continue
 
         role = m.get("role") if m.get("role") in ("user","assistant") else "assistant"
@@ -13271,6 +13336,8 @@ with st.container():
             st.markdown(content)
             if ts:
                 st.caption(ts)
+        if role == "assistant":
+            _render_assistant_message_controls(m, room=current_room)
 
     try:
         stats = st.session_state.get("__ui_rerun_perf_stats") or {}

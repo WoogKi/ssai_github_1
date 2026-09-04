@@ -1128,6 +1128,18 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
             )
         )
 
+    for query in ("오늘 출고내역", "오늘 출고 내역", "오늘 출고명세 조회"):
+        parsed_compact = io_nlq.resolve_io_nlq(query, today=date(2026, 8, 11)) or {}
+        compact_action = str(parsed_compact.get("action") or "")
+        residual = io_nlq._extract_unlabeled_entity_phrase(query, compact_action)
+        results.append(
+            CheckResult(
+                f"outbound action spelling is consumed before entity resolution: {query}",
+                compact_action == "출고명세 조회" and not residual,
+                f"action={compact_action!r}, residual={residual!r}",
+            )
+        )
+
     labelled_boundary_cases = (
         ("입고명세조회 매입처 온라인팜 제품 팔팔정", "온라인팜", "팔팔정"),
         ("입고명세조회 제품 팔팔정 매입처 온라인팜", "온라인팜", "팔팔정"),
@@ -7334,8 +7346,15 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
         try:
             def _ready_frequency(frame, **_kwargs):
                 out = frame.copy()
-                out["출고빈도등급"] = ["A", "A", "B"]
-                out["3개월 출고발생수"] = pd.Series([4, 4, 2], index=out.index, dtype="Int64")
+                product_codes = out["제품코드"].astype(str)
+                out["출고빈도등급"] = product_codes.map(
+                    {"00001": "A", "00002": "B"}
+                ).fillna("빈도자료 부족")
+                out["3개월 출고발생수"] = pd.Series(
+                    product_codes.map({"00001": 4, "00002": 2}),
+                    index=out.index,
+                    dtype="Int64",
+                )
                 return out, {"frequency_snapshot_status": "ready", "frequency_additional_erp_source_call_count": 0}
 
             inventory_service.attach_dashboard_frequency_snapshot = _ready_frequency
@@ -7347,6 +7366,8 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
             ready_frequency_ok = (
                 list(filtered_frequency.index) == [0, 1]
                 and filtered_frequency["physic_cd"].tolist() == ["00001", "00001"]
+                and filtered_frequency["출고빈도등급"].tolist() == ["A", "A"]
+                and filtered_frequency["3개월 출고발생수"].tolist() == [4, 4]
                 and frequency_meta.get("frequency_snapshot_status") == "ready"
                 and frequency_meta.get("frequency_additional_erp_source_call_count") == 0
             )
@@ -7377,6 +7398,30 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                 _ok("current stock frequency filter fails closed for unavailable snapshot", "A returns no rows")
                 if missing_frequency_ok
                 else _fail("current stock frequency filter fails closed for unavailable snapshot", repr({"rows": missing_frequency.to_dict("records"), "meta": missing_meta}))
+            )
+
+            inventory_service.attach_dashboard_frequency_snapshot = _ready_frequency
+            frequency_current_stock = current_stock_frame.copy()
+            filtered_current_stock, _ = inventory_service._filter_current_stock_frequency_rows(
+                frequency_current_stock,
+                params={"frequency_grade": "A"},
+                date_to="20260831",
+            )
+            frequency_display, frequency_source, _ = inventory_service._build_current_stock_table_frames(
+                filtered_current_stock,
+                {"group_basis": "stock", "current_stock_query": True},
+            )
+            current_stock_frequency_columns_ok = (
+                list(frequency_display.columns)[1:3] == ["제품코드", "출고빈도"]
+                and "출고횟수" in frequency_display.columns
+                and list(frequency_source.columns) == list(frequency_display.columns)
+                and frequency_display.loc[frequency_display["제품코드"] == "00001", "출고빈도"].eq("A").all()
+                and frequency_display.loc[frequency_display["제품코드"] == "00001", "출고횟수"].eq(4).all()
+            )
+            results.append(
+                _ok("current stock frequency preserves display/full columns", "출고빈도/출고횟수")
+                if current_stock_frequency_columns_ok
+                else _fail("current stock frequency preserves display/full columns", repr(frequency_display.to_dict("records")))
             )
         finally:
             inventory_service.attach_dashboard_frequency_snapshot = original_attach_frequency

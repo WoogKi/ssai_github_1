@@ -15,6 +15,7 @@ from app.utils.env_config import config_path, read_project_env_file
 STORAGE_AREAS = {
     "uploads",
     "downloads",
+    "feedback",
     "reports",
     "temp",
     "logs",
@@ -173,6 +174,7 @@ def ensure_user_storage_dirs(
         user_3/
           uploads/
           downloads/
+          feedback/
           reports/
           temp/
           logs/

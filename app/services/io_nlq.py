@@ -1721,6 +1721,14 @@ def _action_consumed_aliases(action: str) -> tuple[str, ...]:
         phrases.update(_PRODUCT_INVENTORY_WORDS)
     elif normalized_action == "현재고 조회":
         phrases.update(_CURRENT_STOCK_WORDS)
+    elif normalized_action in {"입고명세 조회", "출고명세 조회"}:
+        # Detail actions accept their registered transaction nouns with or
+        # without a space.  They are action syntax, never an unlabeled entity.
+        roots = ("입고", "매입") if normalized_action.startswith("입고") else ("출고", "매출")
+        for root in roots:
+            for signal in (*_TRANSACTION_SIGNAL_WORDS, *_MASTER_QUERY_WORDS):
+                phrases.add(f"{root}{signal}")
+                phrases.add(f"{root} {signal}")
     return tuple(sorted((phrase for phrase in phrases if phrase), key=len, reverse=True))
 
 

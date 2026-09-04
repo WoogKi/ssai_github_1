@@ -440,6 +440,8 @@ def handle_trans_doc_followup(
                 "공급가액",
                 "세액",
                 "분석",
+                "집계",
+                "요약",
                 "TOP",
                 "top",
                 "상위",

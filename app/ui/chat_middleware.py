@@ -6241,16 +6241,6 @@ REFERENCE_TABLE_ACTIONS = {
     "제품재고장",
 }
 
-DRILLDOWN_TABLE_KEEP_DEFAULT = 5
-
-
-def _get_drilldown_table_keep_limit() -> int:
-    try:
-        return max(1, int(os.getenv("SIMS_DRILLDOWN_TABLE_KEEP", str(DRILLDOWN_TABLE_KEEP_DEFAULT))))
-    except Exception:
-        return DRILLDOWN_TABLE_KEEP_DEFAULT
-
-
 def _sims_table_role_from_action(action_name: Any, meta: Optional[Dict[str, Any]] = None) -> str:
     """
     SIMS 표를 기준표(reference) / 보조조회표(drilldown)로 구분한다.
@@ -6555,9 +6545,9 @@ def _render_old_sims_table_placeholder(
 
 
 # SIMS 표 history 유지 정책 함수
-# - 기준표는 계속 유지한다 (사용자가 보면서 판단해야 하므로)
-# - 보조조회표는 최근 N개만 유지한다 (화면에 너무 많은 표가 남아 있으면 렌더링이 느려지므로)
-# - 일반 LLM 답변/사용자 메시지는 유지한다 (표가 아니므로 렌더링 부담이 적음)
+# - current-table은 최신 표만 가리킨다.
+# - 반면 room/history의 assistant 결과는 사용자가 다시 읽을 수 있어야 한다.
+# - 표 렌더링 비용은 기존 history placeholder 정책으로 제어한다.
 def _prune_old_sims_table_history(
     new_table_key: Optional[str] = None,
     new_item: Optional[Dict[str, Any]] = None,
@@ -6566,34 +6556,12 @@ def _prune_old_sims_table_history(
     """
     SIMS 표 history 유지 정책.
 
-    기존 정책:
-      - 최신 SIMS 표 1개만 유지
-
-    변경 정책:
-      - 기준표(reference)는 유지
-      - 보조조회표(drilldown)는 최근 N개만 유지
-      - 일반 LLM 답변/사용자 메시지는 유지
-      - session_state["sims_tables"]에서는 실제로 화면에 남는 table_key만 유지
-
-    이유:
-      - 사용자는 재고부족/재고장 같은 기준표를 보면서
-        제품수불/제품코드/거래처코드를 이어서 조회해야 한다.
-      - 하지만 모든 보조표를 무제한 유지하면 rerun 렌더링이 느려진다.
+    현재표 교체와 history 보존은 서로 다른 계약이다. 새 표가 들어와도
+    이전 assistant table message/table_key를 삭제하지 않는다. 이전 표는
+    `_should_full_render_sims_table()`의 placeholder/명시적 재표시 경로로
+    렌더 비용을 제한한다.
     """
     ss = st.session_state
-    keep_limit = _get_drilldown_table_keep_limit()
-
-    # 새로 추가될 표가 보조표라면, 기존 보조표는 keep_limit - 1개만 남겨서
-    # append 후 전체 보조표가 keep_limit개가 되게 한다.
-    new_is_drilldown = False
-    try:
-        if isinstance(new_item, dict) and _is_sims_table_history_item(new_item):
-            new_is_drilldown = _sims_table_role_from_item(new_item) != "reference"
-    except Exception:
-        new_is_drilldown = False
-
-    existing_drilldown_keep = max(keep_limit - 1, 0) if new_is_drilldown else keep_limit
-
     keep_table_keys: set[str] = set()
     if new_table_key:
         keep_table_keys.add(str(new_table_key))
@@ -6797,8 +6765,11 @@ def _prune_old_sims_table_history(
             else:
                 drilldown_items.append(x)
 
-        # 보조표는 최근 N개 유지
-        keep_drilldown = drilldown_items[-existing_drilldown_keep:] if existing_drilldown_keep > 0 else []
+        # Canonical room/history is an audit trail as well as a render source.
+        # A drilldown retention limit must not remove an earlier assistant
+        # answer merely because a new current-table result was created. The
+        # renderer keeps old tables lightweight until a user reopens one.
+        keep_drilldown = drilldown_items
         keep_drilldown_ids = {id(x) for x in keep_drilldown}
 
         for x in keep_drilldown:
@@ -6881,8 +6852,7 @@ def _prune_old_sims_table_history(
 
     try:
         log.debug(
-            "[chat] prune sims tables policy reference+drilldown keep_limit=%s keep_keys=%s",
-            keep_limit,
+            "[chat] preserve SIMS table history; current-table pointer stays latest keep_keys=%s",
             len(keep_table_keys),
         )
     except Exception:
@@ -7027,6 +6997,12 @@ def drain_inbox_to_chat(room: Optional[Dict[str, Any]] = None) -> None:
 
                 if not exists:
                     room_obj["history"].append(safe_item)
+                canonical_exists = any(
+                    isinstance(x, dict) and x.get("id") == safe_id
+                    for x in room_obj.get("messages", [])
+                )
+                if safe_id and not canonical_exists:
+                    room_obj.setdefault("messages", []).append(safe_item)
         except Exception as exc:
             log.warning("[chat.drain] persist history failed error_type=%s", type(exc).__name__)
 
@@ -7079,6 +7055,20 @@ def render_pending_chat_items(area, room: Optional[Dict[str, Any]] = None) -> No
         for item in pending:
             try:
                 _render_chat_item(item, target=area)
+                room_obj = room or _get_current_room_from_session()
+                if isinstance(room_obj, dict):
+                    from app.ui.chat_message_controls import render_chat_message_controls
+                    from app.ui.ssai_login import get_current_user, get_selected_company
+
+                    company = get_selected_company() or {}
+                    render_chat_message_controls(
+                        item,
+                        room=room_obj,
+                        current_user=get_current_user(),
+                        current_company_id=(
+                            company.get("company_id") if isinstance(company, dict) else None
+                        ),
+                    )
             except Exception as exc:
                 log.warning("[chat.render.pending] item render failed error_type=%s", type(exc).__name__)
 

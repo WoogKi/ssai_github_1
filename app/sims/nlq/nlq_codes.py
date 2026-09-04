@@ -714,6 +714,8 @@ def _push_codes_result(
     meta = {
         "nlq": True,
         "master_nlq": True,
+        "route": "master",
+        "canonical_action": action,
         "domain": "codes",
         "source": source,
         "nlq_query": txt,
@@ -775,6 +777,8 @@ def _push_codes_text(
     meta = {
         "nlq": True,
         "master_nlq": True,
+        "route": "master",
+        "canonical_action": action,
         "domain": "codes",
         "source": source,
         "nlq_query": txt,

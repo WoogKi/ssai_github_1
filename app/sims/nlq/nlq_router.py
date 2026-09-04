@@ -1162,6 +1162,18 @@ def _looks_like_analytics_nlq(txt: str) -> bool:
     return _resolve_analytics_action(txt) is not None or _classify_analytics_metric_grouping(txt) is not None
 
 
+_CODES_MASTER_INTENT_WORDS = (
+    "업무코드", "코드마스터", "그룹코드", "상세코드", "항목코드",
+    "코드종류", "코드종류명", "코드명", "한글명",
+)
+
+
+def _is_explicit_codes_master_intent(txt: str) -> bool:
+    """Return whether an explicit business-code request owns route precedence."""
+    normalized = keyboard_fix(str(txt or "").strip())
+    return bool(normalized) and any(word in normalized for word in _CODES_MASTER_INTENT_WORDS)
+
+
 def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     """Resolve a new SIMS action without executing a service or DB query.
 
@@ -1172,6 +1184,12 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     normalized = keyboard_fix(str(txt or "").strip())
     if not normalized:
         return None
+
+    # Mirror the deterministic codes-first boundary used at execution time.
+    # The final code action is chosen only by the handler; this candidate is
+    # intentionally a route hint, not a completed-action audit record.
+    if _is_explicit_codes_master_intent(normalized):
+        return {"route": "master", "action": "업무코드 조회"}
 
     dashboard_action = _resolve_dashboard_nlq_action(normalized)
     if dashboard_action:
@@ -6979,6 +6997,25 @@ def try_handle_nlq(
     except Exception:
         logger.exception("[nlq.router] failed in codes-category-first routing")
 
+    # An explicit business-code anchor owns its label even when the label
+    # contains IO vocabulary, for example "업무코드 입출고구분 조회".
+    # The code-master handler already rejects product/vendor/user code domains.
+    try:
+        if _is_explicit_codes_master_intent(txt):
+            from app.sims.nlq.nlq_codes import try_handle_codes_nlq
+
+            if try_handle_codes_nlq(
+                txt,
+                room=room,
+                session_state=session_state,
+                make_ts=make_ts,
+                next_seq=next_seq,
+                logger=logger,
+            ):
+                return True
+    except Exception:
+        logger.exception("[nlq.router] explicit code-master routing failed")
+
     # 2-1) Dashboard deterministic NLQ.  It owns its facts and never falls
     # through to Analytics/IO/LLM routing once the canonical phrase matches.
     try:
@@ -7170,16 +7207,7 @@ def try_handle_nlq(
 
     # 5) 업무코드 명시 의도면 codes를 users보다 먼저 태운다.
     try:
-        if any(
-            k in txt
-            for k in (
-                "업무코드", "그룹코드", "상세코드", "항목코드",
-                "코드종류", "코드종류명", "코드명",
-                "한글명", "영문명", "영문이름", "약칭",
-                "기타", "기타1", "기타2", "기타3", "설명", "비고", "메모",
-                "수정자", "수정자명", "변경자", "수정일자", "수정일", "변경일자", "변경일",
-            )
-        ):
+        if _is_explicit_codes_master_intent(txt):
             from app.sims.nlq.nlq_codes import try_handle_codes_nlq
             if try_handle_codes_nlq(
                 txt,
