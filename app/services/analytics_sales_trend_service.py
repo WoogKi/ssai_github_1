@@ -79,6 +79,7 @@ SALES_TREND_PUBLIC_COLUMNS = [
     "매출공급가액",
     "매출세액",
     "매출합계",
+    "매출반품금액",
     "집계건수",
     "매입처수",
     "분석자료원",
@@ -1380,6 +1381,15 @@ SELECT
         END
     ) AS [매출합계],
 
+    SUM(
+        CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
+        THEN ABS(
+            COALESCE(M.{p}_Out_Supply_Price, 0)
+            + COALESCE(M.{p}_Out_Tax_Price, 0)
+        )
+        ELSE 0 END
+    ) AS [매출반품금액],
+
     COUNT(*) AS [집계건수],
     COUNT(DISTINCT M.{p}_Ven_Cd) AS [매입처수],
     '{spec["title"]}' AS [분석자료원]
@@ -1469,6 +1479,7 @@ OPTION (RECOMPILE)
         "매출공급가액",
         "매출세액",
         "매출합계",
+        "매출반품금액",
         "집계건수",
         "매입처수",
         "분석자료원",
@@ -1579,7 +1590,7 @@ def build_dashboard_sales_purchase_grains(
         "제품분류Gcode", "제품분류코드", "제품분류명", "매입처코드", "매입처명",
         "재고적용처코드", "재고적용처명", "분석자료원",
     )
-    sales_numeric_columns = ("출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수")
+    sales_numeric_columns = ("출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수")
     for column in sales_text_columns:
         sales_source[column] = _dashboard_text_column(sales_source, column)
     for column in sales_numeric_columns:
@@ -1765,7 +1776,7 @@ def build_dashboard_narrow_sales_purchase_bundle(
         )
 
     sales_metric_columns = [
-        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수",
     ]
     product_month_sales_df = legacy.sales_product_month_df.merge(
         product_identity_df.loc[:, [identity_key, *identity_columns]],
@@ -1783,7 +1794,7 @@ def build_dashboard_narrow_sales_purchase_bundle(
     ).map(_dashboard_normalized_manufacturer)
     if manufacturer_source.empty:
         manufacturer_month_df = pd.DataFrame(columns=[
-            "제약사명", "기준월", "매출공급가액", "매출세액", "매출합계", "집계건수", "제품수", "매입처수",
+            "제약사명", "기준월", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수", "제품수", "매입처수",
         ])
     else:
         manufacturer_month_df = (
@@ -1792,6 +1803,7 @@ def build_dashboard_narrow_sales_purchase_bundle(
                 매출공급가액=("매출공급가액", "sum"),
                 매출세액=("매출세액", "sum"),
                 매출합계=("매출합계", "sum"),
+                매출반품금액=("매출반품금액", "sum"),
                 집계건수=("집계건수", "sum"),
                 제품수=("제품코드", "nunique"),
                 매입처수=("매입처수", "sum"),
@@ -1818,12 +1830,12 @@ def build_dashboard_narrow_sales_purchase_bundle(
         )
 
     sales_month_total_df = (
-        product_month_sales_df.groupby("기준월", dropna=False, as_index=False)["매출합계"]
+        product_month_sales_df.groupby("기준월", dropna=False, as_index=False)[["매출합계", "매출반품금액"]]
         .sum()
         .sort_values("기준월", kind="stable")
         .reset_index(drop=True)
         if not product_month_sales_df.empty
-        else pd.DataFrame(columns=["기준월", "매출합계"])
+        else pd.DataFrame(columns=["기준월", "매출합계", "매출반품금액"])
     )
     purchase_month_total_df = (
         legacy.purchase_product_month_df.groupby("기준월", dropna=False, as_index=False)["매입금액"]
@@ -1922,7 +1934,7 @@ def build_dashboard_narrow_bundle_from_projections(
     ]
     sales_columns = [
         "projection_kind", "기준월", identity_key, "제품코드", "제약사명",
-        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수",
         "제품수", "매입처수",
     ]
     purchase_columns = ["projection_kind", "기준월", "매입금액", *_DASHBOARD_PURCHASE_DIAGNOSTIC_COLUMNS]
@@ -1943,13 +1955,16 @@ def build_dashboard_narrow_bundle_from_projections(
     product_month = sales.loc[sales["projection_kind"].eq("product_month_sales")].drop(columns=["projection_kind", "제약사명", "제품수", "매입처수"])
     product_month = product_month.reindex(columns=[
         "기준월", "제품코드", identity_key,
-        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수",
     ])
     manufacturer_month = sales.loc[sales["projection_kind"].eq("manufacturer_month")].drop(columns=["projection_kind", identity_key, "제품코드", "출고수량", "출고할증수량"])
     manufacturer_month = manufacturer_month.reindex(columns=[
-        "제약사명", "기준월", "매출공급가액", "매출세액", "매출합계", "집계건수", "제품수", "매입처수",
+        "제약사명", "기준월", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수", "제품수", "매입처수",
     ])
-    sales_month_total = sales.loc[sales["projection_kind"].eq("sales_month_total"), ["기준월", "매출합계"]].copy()
+    sales_month_total = sales.loc[
+        sales["projection_kind"].eq("sales_month_total"),
+        ["기준월", "매출합계", "매출반품금액"],
+    ].copy()
     if len(product_month) + len(manufacturer_month) + len(sales_month_total) != len(sales):
         raise ValueError("dashboard narrow sales_facts has unknown projection_kind")
 
@@ -1965,7 +1980,7 @@ def build_dashboard_narrow_bundle_from_projections(
         "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명",
         "제품그룹Gcode", "제품그룹코드", "제품그룹명", "제품구분Gcode", "제품구분코드", "제품구분명",
         "제품분류Gcode", "제품분류코드", "제품분류명", "출고수량", "출고할증수량",
-        "매출공급가액", "매출세액", "매출합계", "집계건수", "매입처코드", "분석자료원",
+        "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수", "매입처코드", "분석자료원",
     )
     return DashboardNarrowSalesPurchaseBundle(
         product_identity_df=identity,
@@ -2066,6 +2081,7 @@ SELECT
     SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Supply_Price, 0) ELSE COALESCE(M.{p}_Out_Supply_Price, 0) END) AS [매출공급가액],
     SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Tax_Price, 0) ELSE COALESCE(M.{p}_Out_Tax_Price, 0) END) AS [매출세액],
     SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * (COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) ELSE (COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) END) AS [매출합계],
+    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN ABS(COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) ELSE 0 END) AS [매출반품금액],
     COUNT(*) AS [집계건수],
     COUNT(DISTINCT M.{p}_Ven_Cd) AS [매입처수],
     CAST(0 AS FLOAT) AS [입고수량],
@@ -2090,6 +2106,7 @@ SELECT
     CAST(0 AS FLOAT) AS [매출공급가액],
     CAST(0 AS FLOAT) AS [매출세액],
     CAST(0 AS FLOAT) AS [매출합계],
+    CAST(0 AS FLOAT) AS [매출반품금액],
     CAST(0 AS INT) AS [집계건수],
     CAST(0 AS INT) AS [매입처수],
     SUM({in_qty_expr}) AS [입고수량],
@@ -2193,7 +2210,7 @@ OPTION (RECOMPILE)
         "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명",
         "제품그룹Gcode", "제품그룹코드", "제품그룹명", "제품구분Gcode", "제품구분코드", "제품구분명",
         "제품분류Gcode", "제품분류코드", "제품분류명", "매입처코드", "매입처명", "재고적용처코드", "재고적용처명",
-        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수", "매입처수", "분석자료원",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수", "매입처수", "분석자료원",
     ]
     t_final_column_build = time.perf_counter()
     merged = merged.reindex(columns=final_cols, fill_value="")
@@ -2419,6 +2436,15 @@ SELECT
             )
         END
     ) AS 매출합계,
+
+    SUM(
+        CASE WHEN LEFT({a}.{p}_Io_Gu, 1) = '6'
+        THEN ABS(
+            COALESCE({a}.{p}_Out_Supply_Price, 0)
+            + COALESCE({a}.{p}_Out_Tax_Price, 0)
+        )
+        ELSE 0 END
+    ) AS 매출반품금액,
 
     COUNT(*) AS 집계건수,
     COUNT(DISTINCT {a}.{p}_Ven_Cd) AS 매입처수,
@@ -2940,6 +2966,15 @@ SELECT
             )
         END
     ) AS 매출합계,
+
+    SUM(
+        CASE WHEN LEFT(Out_Put.Rd12_Io_Gu, 1) = '6'
+        THEN ABS(
+            COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0)
+            + COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0)
+        )
+        ELSE 0 END
+    ) AS 매출반품금액,
 
     COUNT(*) AS 출고건수,
     COUNT(DISTINCT Out_Put.Rd12_Ven_Cd) AS 거래처수

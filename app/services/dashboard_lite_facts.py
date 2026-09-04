@@ -1007,6 +1007,28 @@ def _monthly_sales_actuals_from_source(df: pd.DataFrame | None) -> list[dict[str
     ]
 
 
+def _monthly_sales_returns_from_source(df: pd.DataFrame | None) -> list[dict[str, Any]]:
+    """Return sales-return magnitudes from the already-loaded sales source."""
+    if not isinstance(df, pd.DataFrame) or df.empty or "기준월" not in df.columns:
+        return []
+    if "매출반품금액" not in df.columns:
+        return []
+    work = df.loc[:, ["기준월", "매출반품금액"]].copy()
+    work["기준월"] = work["기준월"].map(_normalize_yyyymm)
+    work["매출반품금액"] = pd.to_numeric(work["매출반품금액"], errors="coerce").fillna(0)
+    if work["매출반품금액"].lt(0).any():
+        raise ValueError("Dashboard sales-return magnitude must be non-negative")
+    grouped = work[work["기준월"].ne("")].groupby("기준월", as_index=False)["매출반품금액"].sum()
+    return [
+        {
+            "period": f"{str(row['기준월'])[:4]}-{str(row['기준월'])[4:6]}",
+            "period_sort": str(row["기준월"]),
+            "magnitude": float(row["매출반품금액"]),
+        }
+        for _, row in grouped.sort_values("기준월", kind="stable").iterrows()
+    ]
+
+
 def _chart_period(value: Any) -> tuple[str, str]:
     """Return the display month and its stable YYYYMM ordering value."""
     yyyymm = _normalize_yyyymm(value)
@@ -1468,6 +1490,7 @@ def _build_sales_facts(
     payload: Mapping[str, Any] | None,
     *,
     history_actuals: list[dict[str, Any]] | None = None,
+    history_sales_returns: list[dict[str, Any]] | None = None,
     evaluation_month: Any = None,
     policy_date: Any = None,
     sales_source_mode: str = "",
@@ -1664,6 +1687,37 @@ def _build_sales_facts(
                     "partial_period": True,
                     "forecast_basis": "당월 예상",
                     "forecast_status": "당월 예상",
+                }
+            )
+
+    return_by_period: dict[str, float] = {}
+    for item in history_sales_returns or []:
+        period_sort = str(item.get("period_sort") or "")
+        if not period_sort:
+            continue
+        magnitude = float(item.get("magnitude") or 0.0)
+        if magnitude < 0:
+            raise ValueError("Dashboard sales-return magnitude must be non-negative")
+        return_by_period[period_sort] = magnitude
+    actual_periods = {
+        (str(row.get("period") or ""), str(row.get("period_sort") or ""))
+        for row in chart_rows
+        if str(row.get("kind") or "") in {"완료월 실제", "당월 현재(부분월)"}
+    }
+    if return_by_period:
+        for period, period_sort in sorted(actual_periods, key=lambda item: item[1]):
+            magnitude = return_by_period.get(period_sort, 0.0)
+            chart_rows.append(
+                {
+                    "period": period,
+                    "period_sort": period_sort,
+                    "value": -magnitude,
+                    "return_magnitude": magnitude,
+                    "kind": "매출반품",
+                    "partial_period": period_sort == evaluation_yyyymm and not evaluation_completed,
+                    "forecast_basis": "출고반품 별도 집계",
+                    "forecast_status": "반품",
+                    "aggregation_contract": "출고반품은 순매출과 별도로 양수 magnitude를 보존하고 차트에 음수로 표시",
                 }
             )
     chart_rows.sort(key=lambda row: (str(row.get("period_sort") or ""), str(row.get("kind") or "")))
@@ -3259,6 +3313,7 @@ def build_dashboard_lite_facts(
     existing_support_sales_df: pd.DataFrame | None = None
     visible_sales_df: pd.DataFrame | None = None
     source_monthly_actuals: list[dict[str, Any]] = []
+    source_monthly_sales_returns: list[dict[str, Any]] = []
     demand_surge_history: dict[str, Any] = {}
     filter_diagnostics: list[dict[str, Any]] = []
     product_filter_elapsed_ms = 0
@@ -3382,9 +3437,13 @@ def build_dashboard_lite_facts(
             existing_support_sales_df = expanded_sales_source_df
             visible_sales_df = expanded_sales_source_df
         range_slice_elapsed_ms = int((time.perf_counter() - t_ranges) * 1000)
-        source_monthly_actuals = _monthly_sales_actuals_from_source(
-            narrow_sales_bundle.sales_month_total_df if narrow_sales_bundle is not None else existing_support_sales_df
+        source_monthly_frame = (
+            narrow_sales_bundle.sales_month_total_df
+            if narrow_sales_bundle is not None
+            else existing_support_sales_df
         )
+        source_monthly_actuals = _monthly_sales_actuals_from_source(source_monthly_frame)
+        source_monthly_sales_returns = _monthly_sales_returns_from_source(source_monthly_frame)
         t_history = time.perf_counter()
         demand_surge_history = _build_demand_surge_history_by_product(
             expanded_sales_source_df,
@@ -3537,6 +3596,7 @@ def build_dashboard_lite_facts(
     sales = _build_sales_facts(
         manufacturer_summary_payload,
         history_actuals=source_monthly_actuals,
+        history_sales_returns=source_monthly_sales_returns,
         evaluation_month=service_params.get("evaluation_month"),
         policy_date=service_params.get("policy_date"),
         sales_source_mode=str(source_params.get("source_mode") or ""),

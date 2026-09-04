@@ -5205,7 +5205,9 @@ def _dashboard_nlq_text_payload(
     params: Dict[str, Any],
     question: str,
     source_call_count: int = 0,
+    reason_code: str = "",
 ) -> Dict[str, Any]:
+    normalized_reason = str(reason_code or "").strip()
     return {
         "final": True, "type": "text", "title": _DASHBOARD_NLQ_ACTION,
         "action": _DASHBOARD_NLQ_ACTION, "params": dict(params),
@@ -5213,7 +5215,8 @@ def _dashboard_nlq_text_payload(
         "meta": {
             "nlq": True, "nlq_query": question, "result_status": status,
             "row_count": 0, "row_count_total": 0, "source_call_count": int(source_call_count or 0),
-            "tableless_result": True, "notice_codes": [status],
+            "tableless_result": True, "notice_codes": [normalized_reason or status],
+            **({"reason_code": normalized_reason} if normalized_reason else {}),
             "_force_push": True, "_nlq_nonce": str(uuid.uuid4()),
         },
     }
@@ -5441,7 +5444,24 @@ def _build_dashboard_nlq_params(
             len(params.get(manager_key) or []),
         )
 
-    normalized = normalize_dashboard_lite_params(params)
+    try:
+        normalized = normalize_dashboard_lite_params(params)
+    except ValueError as exc:
+        if str(exc) != "Dashboard Lite 시작월이 종료월보다 늦습니다.":
+            raise
+        logger.info(
+            "[dashboard.nlq.validation] result_status=validation_error "
+            "reason_code=start_month_after_end_month source_call_count=0 facts_called=False"
+        )
+        return {}, _dashboard_nlq_text_payload(
+            "시작월이 종료월보다 늦습니다. 조회기간을 확인해 주세요. "
+            "예: 202509 ~ 202510처럼 시작월이 종료월보다 같거나 이전이어야 합니다.",
+            status="validation_error",
+            reason_code="start_month_after_end_month",
+            params=params,
+            question=text,
+            source_call_count=0,
+        )
     logger.info(
         "[dashboard.nlq.params] explicit_period=%s supplier_mode=%s supplier_mode_explicit=%s supplier_mode_defaulted=%s supplier_count=%s manager_count=%s "
         "supplier_query_present=%s manager_query_present=%s profile_found=%s",

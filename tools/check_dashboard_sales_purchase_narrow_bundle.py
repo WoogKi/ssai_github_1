@@ -23,6 +23,7 @@ from app.services.dashboard_lite_facts import (
     _build_demand_surge_history_by_product,
     _build_visual_phase2_summary,
     _monthly_sales_actuals_from_source,
+    _monthly_sales_returns_from_source,
 )
 
 
@@ -37,15 +38,15 @@ PARAMS = {
 
 def _sales_fixture() -> pd.DataFrame:
     rows = [
-        ("202501", "P1", "제품1", "규격1", "M1", "제조사1", "V2", "10", "1", "100", "10", "110", "1"),
-        ("202501", "P1", "제품1", "규격1", "M1", "제조사1", "V1", "5", "0", "50", "5", "55", "1"),
-        ("202502", "P1", "제품1", "규격1", "M1", "제조사1", "V1", "25", "2", "250", "25", "275", "2"),
-        ("202502", "P2", "제품2", "규격2", "M1", "제조사1", "V3", "8", "0", "80", "8", "88", "1"),
-        ("202503", "P2", "제품2", "규격2", "M2", "제조사2", "V4", "-2", "0", "-20", "-2", "-22", "1"),
+        ("202501", "P1", "제품1", "규격1", "M1", "제조사1", "V2", "10", "1", "100", "10", "110", "0", "1"),
+        ("202501", "P1", "제품1", "규격1", "M1", "제조사1", "V1", "5", "0", "50", "5", "55", "0", "1"),
+        ("202502", "P1", "제품1", "규격1", "M1", "제조사1", "V1", "25", "2", "250", "25", "275", "0", "2"),
+        ("202502", "P2", "제품2", "규격2", "M1", "제조사1", "V3", "8", "0", "80", "8", "88", "0", "1"),
+        ("202503", "P2", "제품2", "규격2", "M2", "제조사2", "V4", "-2", "0", "-20", "-2", "-22", "22", "1"),
     ]
     return pd.DataFrame(rows, columns=[
         "기준월", "제품코드", "제품명", "규격", "제조사코드", "제조사명", "매입처코드",
-        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수",
     ])
 
 
@@ -70,7 +71,7 @@ def _projection_frames(bundle: object) -> tuple[pd.DataFrame, pd.DataFrame, pd.D
     identity = bundle.product_identity_df.copy()
     sales_columns = [
         "projection_kind", "기준월", "__dashboard_product_identity_id", "제품코드", "제약사명",
-        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수", "제품수", "매입처수",
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수", "제품수", "매입처수",
     ]
     product_month = bundle.product_month_sales_df.copy()
     product_month["projection_kind"] = "product_month_sales"
@@ -150,6 +151,7 @@ def main() -> int:
     raw_month_total = _monthly_sales_actuals_from_source(sales)
     narrow_month_total = _monthly_sales_actuals_from_source(bundle.sales_month_total_df)
     assert raw_month_total == narrow_month_total
+    assert _monthly_sales_returns_from_source(sales) == _monthly_sales_returns_from_source(bundle.sales_month_total_df)
 
     visual_rows = [{"stock_cover_status": "ready", "주요매입처상태": "assigned"}]
     raw_visual, raw_trend = _build_visual_phase2_summary(visual_rows, purchase, evaluation_remaining_days=1)
@@ -173,7 +175,7 @@ def main() -> int:
     }
     assert bundle.purchase_diagnostics == expected_diagnostics
     assert list(bundle.purchase_month_total_df.columns) == ["기준월", "매입금액"]
-    assert list(bundle.sales_month_total_df.columns) == ["기준월", "매출합계"]
+    assert list(bundle.sales_month_total_df.columns) == ["기준월", "매출합계", "매출반품금액"]
     print("PASS: dashboard narrow typed sales/purchase bundle equality gate")
     return 0
 

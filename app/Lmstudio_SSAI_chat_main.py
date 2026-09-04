@@ -13555,7 +13555,7 @@ with st.container():
                     panel_active
                     or ((run_flag or inner_submit) and not already_rendered_this_run)
                 )
-                if st.session_state.get("__ui_rerun_reason_current") == "chat_room_change":
+                if st.session_state.get("__ui_rerun_reason_current") in {"chat_room_change", "download_prepare"}:
                     should_render = False
 
                 if should_render:

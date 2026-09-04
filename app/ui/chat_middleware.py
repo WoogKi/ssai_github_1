@@ -7298,6 +7298,7 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                     preserve_resolution_guidance = bool(terminal_statuses & {
                         "unsupported",
                         "routing_error",
+                        "validation_error",
                         "candidate_required",
                         "resolution_unavailable",
                         "not_found",

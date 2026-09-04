@@ -945,6 +945,7 @@ def _inject_dashboard_lite_styles_once() -> None:
         .dashboard-lite-sales-chart-legend-actual { background: linear-gradient(180deg, #4f83ff, #2563eb); }
         .dashboard-lite-sales-chart-legend-forecast { background: linear-gradient(180deg, #2dd4c7, #0fa9a3); }
         .dashboard-lite-sales-chart-legend-judgement { background: linear-gradient(180deg, #ff9a4d, #f97316); }
+        .dashboard-lite-sales-chart-legend-return { background: linear-gradient(180deg, #fb7185, #dc2626); }
         @media (max-width: 1100px) {
             .dashboard-lite-sales-brief-row {
                 grid-template-columns: 1fr;
@@ -1413,8 +1414,8 @@ def _render_sales_brief(facts: dict[str, Any]) -> None:
     )
 
 
-def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart | None:
-    """Build grouped actual, month-end forecast, and eligible current-day bars."""
+def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart | alt.VConcatChart | None:
+    """Build grouped net-sales, return, forecast, and eligible current-day bars."""
     rows = (facts.get("sales") or {}).get("chart_rows") or []
     if not rows:
         return None
@@ -1443,7 +1444,11 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     amount_unit = _facts_amount_display_unit(facts)
     divisor, unit_label = _amount_display_spec(amount_unit, pd.to_numeric(df["value"], errors="coerce").abs().max())
     df["display_value"] = pd.to_numeric(df["value"], errors="coerce") / divisor
-    actual_df = df[~df["kind"].astype(str).str.contains("예상", na=False)].copy()
+    return_df = df[df["kind"].eq("매출반품")].copy()
+    actual_df = df[
+        ~df["kind"].astype(str).str.contains("예상", na=False)
+        & ~df["kind"].eq("매출반품")
+    ].copy()
     forecast_df = df[df["kind"].astype(str).str.contains("예상", na=False)].copy()
     actual_df["series"] = "실제매출"
     actual_df["value_kind"] = actual_df["kind"].map(
@@ -1453,6 +1458,38 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     forecast_df["value_kind"] = forecast_df["kind"].map(
         {"완료월 사전예상": "완료월 사전예상", "당월 예상": "당월 월말 예상"}
     ).fillna("예상매출")
+    actual_sales_by_period = (
+        actual_df.assign(_actual_sales=pd.to_numeric(actual_df["value"], errors="coerce"))
+        .groupby("period_sort", dropna=False)["_actual_sales"]
+        .sum()
+        .to_dict()
+    )
+    return_df["series"] = "매출반품"
+    # Align each lower return bar with the upper actual-sales slot, without
+    # using the return series itself as an out-of-domain grouped offset.
+    return_df["return_anchor"] = "실제매출"
+    return_df["value_kind"] = "매출반품"
+    return_df["return_magnitude"] = pd.to_numeric(
+        return_df.get("return_magnitude", return_df.get("value", 0)), errors="coerce"
+    ).fillna(0)
+    if return_df["return_magnitude"].lt(0).any():
+        raise ValueError("Dashboard sales-return magnitude must be non-negative")
+    return_df["value"] = -return_df["return_magnitude"]
+    return_df["display_value"] = -return_df["return_magnitude"] / divisor
+    return_df["return_display_magnitude"] = return_df["return_magnitude"] / divisor
+    return_df["actual_sales"] = pd.to_numeric(
+        return_df["period_sort"].map(actual_sales_by_period), errors="coerce"
+    )
+    return_df["return_rate_pct"] = None
+    valid_return_rate = return_df["actual_sales"].notna() & return_df["actual_sales"].ne(0)
+    return_df.loc[valid_return_rate, "return_rate_pct"] = (
+        return_df.loc[valid_return_rate, "return_magnitude"]
+        / return_df.loc[valid_return_rate, "actual_sales"].abs()
+        * 100.0
+    )
+    return_df["return_rate_label"] = return_df["return_rate_pct"].map(
+        lambda value: f"{float(value):.1f}%" if pd.notna(value) else ""
+    )
     forecast_df = forecast_df[pd.to_numeric(forecast_df["value"], errors="coerce").notna()].copy()
     tooltip = [
         alt.Tooltip("display_period:N", title="기준월"),
@@ -1468,15 +1505,18 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     df["amount_display_unit"] = unit_label
     actual_df["amount_display_unit"] = unit_label
     forecast_df["amount_display_unit"] = unit_label
+    return_df["amount_display_unit"] = unit_label
     actual_df["month_status"] = actual_df["kind"].map(
         {"완료월 실제": "완료월", "당월 현재(부분월)": "평가월"}
     ).fillna("실제")
     forecast_df["month_status"] = forecast_df["kind"].map(
         {"완료월 사전예상": "완료월", "당월 예상": "평가월"}
     ).fillna("예상")
+    return_df["month_status"] = "반품"
     visualization = (facts.get("sales") or {}).get("visualization") or {}
     state = _sales_presentation_state(facts)
     current_day_series = f"{state['judgement_basis']} 예상매출"
+    has_sales_returns = bool(return_df["return_magnitude"].gt(0).any())
     display_frames = [actual_df, forecast_df]
     if state["expected_to_date_chart_visible"]:
         marker_period = str(visualization.get("evaluation_month") or "")
@@ -1496,13 +1536,13 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
         }]))
     display_df = pd.concat(display_frames, ignore_index=True, sort=False)
     cluster_order = ["실제매출", "월말 예상매출", current_day_series]
-    legend_order = ["실제매출", "월말 예상매출", current_day_series]
+    legend_order = list(cluster_order)
     x_encoding = alt.X(
         "display_period:N",
         title=None,
         sort=period_order,
         scale=alt.Scale(paddingInner=0.42, paddingOuter=0.10),
-        axis=alt.Axis(labelAngle=0, labelPadding=10, labelFontSize=13),
+        axis=None if has_sales_returns else alt.Axis(labelAngle=0, labelPadding=10, labelFontSize=13),
     )
     x_offset = alt.XOffset(
         "series:N",
@@ -1524,6 +1564,7 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     )
     gradient_specs = {
         "실제매출": (["#1d4ed8", "#75a6ff", "#3f7cf4", "#1745b8"], "#1745b8"),
+        "매출반품": (["#be123c", "#fb7185", "#f43f5e", "#b91c1c"], "#b91c1c"),
         "월말 예상매출": (["#0b8f8a", "#63e0d7", "#25c4bb", "#087b77"], "#087b77"),
         current_day_series: (["#dc5a0c", "#ffb06f", "#ff8738", "#c94b05"], "#c94b05"),
     }
@@ -1546,43 +1587,180 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
                 alt.GradientStop(offset=1, color=gradient_colors[3]),
             ],
         )
+        mark_kwargs = {
+            "color": gradient,
+            "opacity": 0.96,
+            "stroke": border_color,
+            "strokeWidth": 0.8,
+        }
+        mark_kwargs.update({"cornerRadiusTopLeft": 5, "cornerRadiusTopRight": 5})
+        series_tooltip = tooltip
         bar_layers.append(
-            alt.Chart(series_frame).mark_bar(
-                color=gradient,
-                opacity=0.96,
-                cornerRadiusTopLeft=5,
-                cornerRadiusTopRight=5,
-                stroke=border_color,
-                strokeWidth=0.8,
-            ).encode(
+            alt.Chart(series_frame).mark_bar(**mark_kwargs).encode(
                 x=x_encoding,
                 xOffset=x_offset,
                 y=y_encoding,
-                tooltip=tooltip,
+                tooltip=series_tooltip,
             )
         )
     bars = alt.layer(*bar_layers)
     if not state["expected_to_date_chart_visible"]:
-        return bars.properties(
+        positive_chart: alt.Chart | alt.LayerChart = bars
+    else:
+        label_df = display_df[display_df["series"] == current_day_series]
+        labels = alt.Chart(label_df).mark_text(
+            dy=-10,
+            align="center",
+            baseline="bottom",
+            color="#9a3412",
+            fontSize=11,
+            fontWeight=600,
+        ).encode(
+            x=x_encoding,
+            xOffset=x_offset,
+            y=y_encoding,
+            text=alt.Text("display_value:Q", format=",.0f"),
+        )
+        positive_chart = alt.layer(bars, labels).resolve_scale(y="shared")
+
+    if not has_sales_returns:
+        return positive_chart.properties(
             height=370,
             padding={"left": 8, "right": 16, "top": 18, "bottom": 24},
         )
-    label_df = display_df[display_df["series"] == current_day_series]
-    labels = alt.Chart(label_df).mark_text(
-        dy=-10,
-        align="center",
-        baseline="bottom",
-        color="#9a3412",
-        fontSize=11,
-        fontWeight=600,
-    ).encode(
-        x=x_encoding,
-        xOffset=x_offset,
-        y=y_encoding,
-        text=alt.Text("display_value:Q", format=",.0f"),
+
+    # Keep the raw negative return coordinate and shared zero semantics, but
+    # dedicate a compact lower panel to returns. This prevents small returns
+    # from disappearing beside substantially larger sales without altering a
+    # fact value, tooltip, or the top sales/forecast scale.
+    return_domain_max = float(return_df["return_display_magnitude"].max() or 0.0) * 1.08
+    if return_domain_max <= 0:
+        return_domain_max = 1.0
+    return_df["return_label_placement"] = ""
+    has_return_rate_label = return_df["return_rate_label"].ne("") & return_df["return_magnitude"].gt(0)
+    return_df.loc[
+        has_return_rate_label & (return_df["return_display_magnitude"].abs() / return_domain_max >= 0.18),
+        "return_label_placement",
+    ] = "inside"
+    return_df.loc[
+        has_return_rate_label & return_df["return_label_placement"].eq(""),
+        "return_label_placement",
+    ] = "outside"
+    # Keep the label coordinate in the bar's own signed coordinate system.
+    # The label datasets below replace their local display_value with this
+    # coordinate so the text and bar layers share the same encoded y field.
+    return_df["label_y"] = return_df["display_value"] / 2.0
+    return_df.loc[return_df["return_label_placement"].eq("outside"), "label_y"] = (
+        return_df.loc[return_df["return_label_placement"].eq("outside"), "display_value"]
+        - return_domain_max * 0.045
     )
-    return alt.layer(bars, labels).resolve_scale(y="shared").properties(
-        height=370,
+    inside_label_df = return_df.loc[return_df["return_label_placement"].eq("inside")].copy()
+    outside_label_df = return_df.loc[return_df["return_label_placement"].eq("outside")].copy()
+    inside_label_df["display_value"] = inside_label_df["label_y"]
+    outside_label_df["display_value"] = outside_label_df["label_y"]
+    return_x_encoding = alt.X(
+        "display_period:N",
+        title=None,
+        sort=period_order,
+        bandPosition=0.5,
+        scale=alt.Scale(paddingInner=0.42, paddingOuter=0.10),
+        axis=alt.Axis(labelAngle=0, labelPadding=10, labelFontSize=13),
+    )
+    return_x_offset = alt.XOffset(
+        "return_anchor:N",
+        sort=cluster_order,
+        bandPosition=0.5,
+        scale=alt.Scale(domain=cluster_order, paddingInner=0.03, paddingOuter=0.02),
+    )
+    return_y_encoding = alt.Y(
+        "display_value:Q",
+        title=f"매출반품 ({unit_label})",
+        scale=alt.Scale(domain=[-return_domain_max, 0.0], nice=False),
+        axis=alt.Axis(
+            grid=True,
+            gridColor="#fee2e2",
+            gridOpacity=0.9,
+            labelExpr="format(datum.value, ',.0f')",
+            labelFontSize=11,
+            titleFontSize=12,
+            titlePadding=12,
+        ),
+    )
+    return_tooltip = [
+        alt.Tooltip("display_period:N", title="기준월"),
+        alt.Tooltip("value_kind:N", title="값 종류"),
+        alt.Tooltip("return_display_magnitude:Q", title=f"반품 ({unit_label})", format=",.0f"),
+        alt.Tooltip("return_magnitude:Q", title="반품 금액(원)", format=",.0f"),
+        alt.Tooltip("return_rate_pct:Q", title="실제매출 대비 반품률(%)", format=".1f"),
+        alt.Tooltip("amount_display_unit:N", title="표시 단위"),
+    ]
+    return_gradient = alt.Gradient(
+        gradient="linear",
+        x1=0,
+        y1=0,
+        x2=1,
+        y2=0,
+        stops=[
+            alt.GradientStop(offset=0, color="#be123c"),
+            alt.GradientStop(offset=0.34, color="#fb7185"),
+            alt.GradientStop(offset=0.66, color="#f43f5e"),
+            alt.GradientStop(offset=1, color="#b91c1c"),
+        ],
+    )
+    return_bars = alt.Chart(return_df).mark_bar(
+        color=return_gradient,
+        opacity=0.96,
+        cornerRadiusBottomLeft=5,
+        cornerRadiusBottomRight=5,
+        stroke="#b91c1c",
+        strokeWidth=0.8,
+    ).encode(
+        x=return_x_encoding,
+        xOffset=return_x_offset,
+        y=return_y_encoding,
+        tooltip=return_tooltip,
+    )
+    return_rate_labels_inside = alt.Chart(inside_label_df).mark_text(
+        color="#111827",
+        fontSize=12,
+        fontWeight=700,
+        align="center",
+        baseline="middle",
+    ).encode(
+        x=return_x_encoding,
+        xOffset=return_x_offset,
+        y=return_y_encoding,
+        text=alt.Text("return_rate_label:N"),
+    )
+    return_rate_labels_outside = alt.Chart(outside_label_df).mark_text(
+        color="#111827",
+        fontSize=11,
+        fontWeight=700,
+        align="center",
+        baseline="middle",
+    ).encode(
+        x=return_x_encoding,
+        xOffset=return_x_offset,
+        y=return_y_encoding,
+        text=alt.Text("return_rate_label:N"),
+    )
+    zero_rule = alt.Chart(pd.DataFrame({"display_value": [0.0]})).mark_rule(
+        color="#9ca3af",
+        strokeWidth=1.0,
+    ).encode(y=return_y_encoding)
+    return_chart = alt.layer(
+        return_bars,
+        zero_rule,
+        return_rate_labels_inside,
+        return_rate_labels_outside,
+    # The filtered label layers must keep the exact categorical x and grouped
+    # actual-sales offset scale of the return bars.
+    ).resolve_scale(x="shared", y="shared").properties(height=118)
+    return alt.vconcat(
+        positive_chart.properties(height=292),
+        return_chart,
+        spacing=0,
+    ).resolve_scale(x="shared", y="independent").properties(
         padding={"left": 8, "right": 16, "top": 18, "bottom": 24},
     )
 
@@ -1600,9 +1778,10 @@ def _render_sales_chart(facts: dict[str, Any]) -> None:
     )
     st.markdown(
         "<div class=\"dashboard-lite-sales-chart-header\">"
-        "<div class=\"dashboard-lite-sales-chart-title\">월별 실제매출·예상매출</div>"
+        "<div class=\"dashboard-lite-sales-chart-title\">월별 실제매출·예상매출·매출반품</div>"
         "<div class=\"dashboard-lite-sales-chart-legend\">"
         "<span class=\"dashboard-lite-sales-chart-legend-item\"><span class=\"dashboard-lite-sales-chart-legend-swatch dashboard-lite-sales-chart-legend-actual\"></span>실제매출</span>"
+        "<span class=\"dashboard-lite-sales-chart-legend-item\"><span class=\"dashboard-lite-sales-chart-legend-swatch dashboard-lite-sales-chart-legend-return\"></span>매출반품</span>"
         "<span class=\"dashboard-lite-sales-chart-legend-item\"><span class=\"dashboard-lite-sales-chart-legend-swatch dashboard-lite-sales-chart-legend-forecast\"></span>월말 예상매출</span>"
         + judgement_legend
         + "</div></div>",

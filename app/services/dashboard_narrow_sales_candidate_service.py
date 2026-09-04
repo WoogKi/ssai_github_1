@@ -215,7 +215,8 @@ def _sales_cte(params: Dict[str, Any]) -> tuple[str, Dict[str, Any], dict[str, A
            CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * COALESCE({p}_Out_Oquantity, 0) ELSE COALESCE({p}_Out_Oquantity, 0) END AS 출고할증수량,
            CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * COALESCE({p}_Out_Supply_Price, 0) ELSE COALESCE({p}_Out_Supply_Price, 0) END AS 매출공급가액,
            CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * COALESCE({p}_Out_Tax_Price, 0) ELSE COALESCE({p}_Out_Tax_Price, 0) END AS 매출세액,
-           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * (COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0)) ELSE COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0) END AS 매출합계
+           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * (COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0)) ELSE COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0) END AS 매출합계,
+           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN ABS(COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0)) ELSE 0 END AS 매출반품금액
     FROM SalesRows
 )""",
     ))
@@ -258,7 +259,8 @@ def _queries(params: Dict[str, Any]) -> tuple[dict[str, tuple[str, Dict[str, Any
     identity = _identity_key(fields)
     product_month = cte + """
 SELECT 기준월, 제품코드, SUM(출고수량) AS 출고수량, SUM(출고할증수량) AS 출고할증수량,
-       SUM(매출공급가액) AS 매출공급가액, SUM(매출세액) AS 매출세액, SUM(매출합계) AS 매출합계, COUNT(*) AS 집계건수
+       SUM(매출공급가액) AS 매출공급가액, SUM(매출세액) AS 매출세액, SUM(매출합계) AS 매출합계,
+       SUM(매출반품금액) AS 매출반품금액, COUNT(*) AS 집계건수
 FROM NumericSales GROUP BY 기준월, 제품코드 OPTION (RECOMPILE)
 """
     product_identity = cte + f"""
@@ -358,10 +360,10 @@ def _manufacturer_month(product: pd.DataFrame, identity: pd.DataFrame, relation:
     product = product.merge(identity_map.loc[:, ["제품코드", "제약사명"]], on="제품코드", how="left", validate="many_to_one")
     if product["제약사명"].isna().any():
         raise ValueError("Dashboard narrow candidate product identity is incomplete")
-    numeric = ["매출공급가액", "매출세액", "매출합계", "집계건수"]
+    numeric = ["매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수"]
     for col in numeric:
         product[col] = pd.to_numeric(product[col], errors="coerce").fillna(0)
-    monetary = product.groupby(["제약사명", "기준월"], dropna=False, as_index=False).agg(매출공급가액=("매출공급가액", "sum"), 매출세액=("매출세액", "sum"), 매출합계=("매출합계", "sum"), 집계건수=("집계건수", "sum"), 제품수=("제품코드", "nunique"))
+    monetary = product.groupby(["제약사명", "기준월"], dropna=False, as_index=False).agg(매출공급가액=("매출공급가액", "sum"), 매출세액=("매출세액", "sum"), 매출합계=("매출합계", "sum"), 매출반품금액=("매출반품금액", "sum"), 집계건수=("집계건수", "sum"), 제품수=("제품코드", "nunique"))
     relation = relation.drop_duplicates().merge(identity_map.loc[:, ["제품코드", "제약사명"]], on="제품코드", how="left", validate="many_to_one")
     if relation["제약사명"].isna().any():
         raise ValueError("Dashboard narrow candidate vendor relation identity is incomplete")
@@ -375,12 +377,12 @@ def _sales_facts(product: pd.DataFrame, identity: pd.DataFrame, manufacturer: pd
         raise ValueError("Dashboard narrow candidate product-month identity is incomplete")
     product["projection_kind"] = "product_month_sales"; product["제약사명"] = ""; product["제품수"] = 0; product["매입처수"] = 0
     manufacturer["projection_kind"] = "manufacturer_month"; manufacturer["__dashboard_product_identity_id"] = ""; manufacturer["제품코드"] = ""; manufacturer["출고수량"] = 0; manufacturer["출고할증수량"] = 0
-    totals = product.groupby("기준월", dropna=False, as_index=False)["매출합계"].sum(); totals["projection_kind"] = "sales_month_total"
+    totals = product.groupby("기준월", dropna=False, as_index=False)[["매출합계", "매출반품금액"]].sum(); totals["projection_kind"] = "sales_month_total"
     for col in ("__dashboard_product_identity_id", "제품코드", "제약사명"):
         totals[col] = ""
     for col in ("출고수량", "출고할증수량", "매출공급가액", "매출세액", "집계건수", "제품수", "매입처수"):
         totals[col] = 0
-    columns = ["projection_kind", "기준월", "__dashboard_product_identity_id", "제품코드", "제약사명", "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "집계건수", "제품수", "매입처수"]
+    columns = ["projection_kind", "기준월", "__dashboard_product_identity_id", "제품코드", "제약사명", "출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액", "집계건수", "제품수", "매입처수"]
     return pd.concat([product.reindex(columns=columns), manufacturer.reindex(columns=columns), totals.reindex(columns=columns)], ignore_index=True)
 
 

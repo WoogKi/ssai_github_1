@@ -56,6 +56,20 @@ def main() -> int:
     if state.get("__sims_current_table_source_key") != "sims_codes_b":
         failures.append("current-table pointer changed")
 
+    download_state = {
+        "__ui_rerun_reason_current": "download_prepare",
+        "__sims_table_render_path": "history",
+        "__sims_download_prepare_table_key": "sims_stock_a",
+        "__sims_current_table_source_key": "sims_codes_b",
+    }
+    with patch.object(chat.st, "session_state", download_state):
+        if not chat._should_full_render_sims_table(first, first["meta"]):
+            failures.append("download_prepare did not reuse the canonical history table")
+
+    main_source = (PROJECT_ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+    if 'in {"chat_room_change", "download_prepare"}' not in main_source:
+        failures.append("download_prepare still renders the SIMS panel and can re-push a result")
+
     if failures:
         print("RESULT: FAIL")
         for failure in failures:

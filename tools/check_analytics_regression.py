@@ -6615,7 +6615,7 @@ def run_basic_checks() -> list[CheckResult]:
             has_no_open_assignment = '"__sims_open",\n            "__sims_open_ui"' not in main_src and 'ss["__sims_open"] = False' not in main_src
             room_switch_block = main_src[main_src.find("if picked and picked != ss.current_room:"):main_src.find("cur_name = id_to_name.get", main_src.find("if picked and picked != ss.current_room:"))]
             has_no_direct_close_in_room_switch = "_close_sims_panel_for_room_change()" not in room_switch_block
-            has_render_block = 'if st.session_state.get("__ui_rerun_reason_current") == "chat_room_change":' in main_src and "should_render = False" in main_src
+            has_render_block = 'in {"chat_room_change", "download_prepare"}' in main_src and "should_render = False" in main_src
             has_room_reason = '"chat_room_change"' in main_src
             has_switch_total = 'switch_total = float(stats.get("event_to_main_elapsed") or 0.0) + float(stats.get("history_elapsed") or 0.0)' in main_src
             has_switch_event_id = '"__chat_room_switch_event_id"' in main_src and "event_id=%s" in room_switch_block
@@ -16709,6 +16709,27 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
         period_ok = period_notice is None and period_params.get("month_from") == "202501" and period_params.get("month_to") == "202512" and period_params.get("evaluation_month") == "202601"
         results.append(_ok("dashboard NLQ explicit period", repr(period_params)) if period_ok else _fail("dashboard NLQ explicit period", repr(period_params)))
 
+        for query, expected_from, expected_to in (
+            ("SIMS 일일점검 202509부터 202509까지", "202509", "202509"),
+            ("SIMS 일일점검 202509부터 202510까지", "202509", "202510"),
+        ):
+            ordered_period_params, ordered_period_notice = router._build_dashboard_nlq_params(
+                query, session_state={}, logger=log
+            )
+            ordered_period_ok = (
+                ordered_period_notice is None
+                and ordered_period_params.get("month_from") == expected_from
+                and ordered_period_params.get("month_to") == expected_to
+            )
+            results.append(
+                _ok(f"dashboard NLQ valid period order: {query}", repr(ordered_period_params))
+                if ordered_period_ok
+                else _fail(
+                    f"dashboard NLQ valid period order: {query}",
+                    f"notice={ordered_period_notice!r}, params={ordered_period_params!r}",
+                )
+            )
+
         scope_params, scope_notice = router._build_dashboard_nlq_params(
             "SIMS 일일점검 장부재고 재고위치 00002 제품그룹 0013:G2 제품구분 0004:D2 "
             "제품분류 0031:C2 거래처그룹 0019:V2 거래처종류 0009:K2 입출고구분 0012:590",
@@ -17050,6 +17071,54 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
             if no_data_ok else _fail("dashboard NLQ empty facts returns no_data", repr(pushed))
         )
         dashboard_view.build_dashboard_lite_facts = _facts_fixture
+
+        class _ValidationLogger:
+            def __init__(self) -> None:
+                self.info_calls: list[tuple[Any, ...]] = []
+                self.exception_calls: list[tuple[Any, ...]] = []
+
+            def info(self, *args: Any, **_kwargs: Any) -> None:
+                self.info_calls.append(args)
+
+            def exception(self, *args: Any, **_kwargs: Any) -> None:
+                self.exception_calls.append(args)
+
+        validation_logger = _ValidationLogger()
+        validation_state = {"__sims_current_table_source_key": "fixture-current-source"}
+        pushed.clear()
+        facts_calls.clear()
+        handled = router._try_handle_dashboard_nlq(
+            "SIMS 일일점검 202510부터 202509까지",
+            room={"id": "room-fixture"},
+            session_state=validation_state,
+            logger=validation_logger,
+        )
+        validation_payload = pushed[0] if pushed else {}
+        validation_meta = dict(validation_payload.get("meta") or {})
+        validation_ok = (
+            handled is True
+            and len(pushed) == 1
+            and not facts_calls
+            and validation_meta.get("result_status") == "validation_error"
+            and validation_meta.get("reason_code") == "start_month_after_end_month"
+            and validation_meta.get("source_call_count") == 0
+            and validation_meta.get("tableless_result") is True
+            and "시작월이 종료월보다 늦습니다" in str(validation_payload.get("message") or "")
+            and validation_state.get("__sims_current_table_source_key") == "fixture-current-source"
+            and not validation_logger.exception_calls
+        )
+        results.append(
+            _ok(
+                "dashboard NLQ reversed period returns validation_error",
+                "tableless validation payload, source_call_count=0, no exception traceback",
+            )
+            if validation_ok
+            else _fail(
+                "dashboard NLQ reversed period returns validation_error",
+                f"handled={handled}, facts_calls={facts_calls!r}, payload={validation_payload!r}, "
+                f"state={validation_state!r}, exception_calls={validation_logger.exception_calls!r}",
+            )
+        )
 
         for query, expected_mode, expected_supplier, expected_manager_key in (
             ("오늘의 경영점검 한미", "manufacturer", ["10047"], "manufacturer_manager_codes"),
