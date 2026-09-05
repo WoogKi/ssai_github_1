@@ -17680,6 +17680,44 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
         ):
             errors.append(f"generic row ratio label/meaning={generic_row_ratio!r}")
 
+        frequency_group_df = pd.DataFrame(
+            [
+                {"출고빈도": "A", "제품코드": "P1", "재고수량": 10, "보험금액": 100},
+                {"출고빈도": " A ", "제품코드": "P2", "재고수량": 20, "보험금액": 200},
+                {"출고빈도": "X", "제품코드": "P3", "재고수량": 30, "보험금액": 300},
+                {"출고빈도": "", "제품코드": "P4", "재고수량": 40, "보험금액": 400},
+                {"출고빈도": None, "제품코드": "P5", "재고수량": 50, "보험금액": 500},
+                {"출고빈도": float("nan"), "제품코드": "P6", "재고수량": 60, "보험금액": 600},
+                {"출고빈도": "빈도자료 부족", "제품코드": "P7", "재고수량": 70, "보험금액": 700},
+                {"출고빈도": "INVALID", "제품코드": "P8", "재고수량": 80, "보험금액": 800},
+            ]
+        )
+        frequency_group = generic._build_common_group_summary(frequency_group_df, "출고빈도")
+        frequency_rows = frequency_group.set_index("출고빈도").to_dict("index")
+        if (
+            generic._find_common_group_column(
+                frequency_group_df,
+                "현재표 출고빈도별 집계",
+            ) != "출고빈도"
+            or set(frequency_rows) != {"A", "X"}
+            or frequency_rows["A"].get("행수") != 2
+            or frequency_rows["A"].get("제품수") != 2
+            or frequency_rows["A"].get("재고수량") != 30
+            or frequency_rows["A"].get("보험금액") != 300
+            or frequency_rows["X"].get("행수") != 1
+            or frequency_rows["X"].get("재고수량") != 30
+            or frequency_rows["X"].get("보험금액") != 300
+            or "(미지정)" in frequency_rows
+        ):
+            errors.append(f"current-table frequency grouping valid-grade contract={frequency_group!r}")
+
+        unspecified_group = generic._build_common_group_summary(
+            pd.DataFrame([{"제품분류명": None}, {"제품분류명": "기타"}]),
+            "제품분류명",
+        )
+        if set(unspecified_group["제품분류명"].astype(str)) != {"(미지정)", "기타"}:
+            errors.append(f"non-frequency unspecified grouping contract changed={unspecified_group!r}")
+
         generic_manufacturer_df = pd.DataFrame(
             [
                 {"제조사명": "제조사A", "제약사명": "제조사A", "제품코드": "P1"},

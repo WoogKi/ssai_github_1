@@ -7358,6 +7358,52 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                 return out, {"frequency_snapshot_status": "ready", "frequency_additional_erp_source_call_count": 0}
 
             inventory_service.attach_dashboard_frequency_snapshot = _ready_frequency
+            baseline_display, baseline_source, baseline_stock_meta = (
+                inventory_service._build_current_stock_table_frames(
+                    current_stock_frame,
+                    {"group_basis": "stock", "current_stock_query": True},
+                )
+            )
+            for query_params in (
+                {},
+                {"maker_nm": "삼진제약"},
+                {"physic_nm": "글레존정"},
+            ):
+                general_frequency, general_meta = inventory_service._filter_current_stock_frequency_rows(
+                    current_stock_frame,
+                    params=query_params,
+                    date_to="20260831",
+                )
+                general_display, general_source, general_stock_meta = inventory_service._build_current_stock_table_frames(
+                    general_frequency,
+                    {"group_basis": "stock", "current_stock_query": True},
+                )
+                general_frequency_ok = (
+                    list(general_frequency.index) == list(current_stock_frame.index)
+                    and general_frequency["stock_qty"].tolist() == current_stock_frame["stock_qty"].tolist()
+                    and len(general_display) == len(baseline_display)
+                    and len(general_source) == len(baseline_source)
+                    and general_stock_meta["detail_count"] == baseline_stock_meta["detail_count"]
+                    and general_stock_meta["sum_stock_qty"] == baseline_stock_meta["sum_stock_qty"]
+                    and general_stock_meta["sum_insu_amt"] == baseline_stock_meta["sum_insu_amt"]
+                    and general_meta.get("frequency_additional_erp_source_call_count") == 0
+                    and list(general_display.columns)[1:4] == ["제품코드", "출고빈도", "출고횟수"]
+                    and list(general_source.columns) == list(general_display.columns)
+                    and general_display.loc[general_display["제품코드"] == "00001", "출고빈도"].eq("A").all()
+                    and general_display.loc[general_display["제품코드"] == "00001", "출고횟수"].eq(4).all()
+                )
+                results.append(
+                    _ok(
+                        f"current stock always displays frequency columns: {query_params or 'all'}",
+                        "all rows retained; snapshot projection adds 출고빈도/출고횟수",
+                    )
+                    if general_frequency_ok
+                    else _fail(
+                        f"current stock always displays frequency columns: {query_params or 'all'}",
+                        repr({"rows": general_display.to_dict("records"), "meta": general_meta}),
+                    )
+                )
+
             filtered_frequency, frequency_meta = inventory_service._filter_current_stock_frequency_rows(
                 frequency_fixture,
                 params={"frequency_grade": "A"},

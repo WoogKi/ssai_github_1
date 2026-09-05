@@ -2977,7 +2977,7 @@ _CURRENT_STOCK_DISPLAY_COLUMNS = [
 
 
 def _current_stock_display_columns(grp: pd.DataFrame) -> list[str]:
-    """Keep the generic current-stock table contract unless frequency was requested."""
+    """Add frequency columns when the shared snapshot projection is attached."""
     columns = list(_CURRENT_STOCK_DISPLAY_COLUMNS)
     if {
         _FREQUENCY_GRADE_COLUMN,
@@ -3134,9 +3134,9 @@ def _filter_current_stock_frequency_rows(
     params: Dict[str, Any],
     date_to: str,
 ) -> tuple[pd.DataFrame, Dict[str, Any]]:
-    """Filter current-stock facts with the same approved snapshot boundary."""
+    """Attach approved frequency facts and apply a grade filter only when requested."""
     selected = _normalize_product_inventory_frequency_filter(params.get("frequency_grade"))
-    if not selected or grp is None or grp.empty:
+    if grp is None or grp.empty:
         return grp, {}
 
     frequency_frame = pd.DataFrame({"제품코드": grp["physic_cd"]}, index=grp.index)

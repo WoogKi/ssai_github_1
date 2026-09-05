@@ -9,6 +9,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from app.services.dashboard_inventory_frequency_snapshot import FREQUENCY_PROJECTION_GRADES
+
 
 def _compact(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "").strip())
@@ -879,6 +881,9 @@ def _trend_sort_key(value: Any) -> int:
 
 def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     work = df.copy()
+    if _norm_col_name(group_col) in {"출고빈도", "출고빈도등급"}:
+        grade_values = work[group_col].fillna("").astype(str).str.strip()
+        work = work.loc[grade_values.isin(FREQUENCY_PROJECTION_GRADES)].copy()
     work[group_col] = work[group_col].map(_clean_group_value)
     if group_col == "추세판정":
         work[group_col] = work[group_col].replace({"(미지정)": "자료부족", "": "자료부족"})

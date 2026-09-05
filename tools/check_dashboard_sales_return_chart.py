@@ -8,6 +8,7 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+from streamlit.elements.vega_charts import _prepare_vega_lite_spec
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -294,6 +295,9 @@ def main() -> int:
         ))
 
     spec = _build_sales_bar_chart({"sales": with_returns}).to_dict()
+    assert spec.get("autosize") == {"contains": "padding", "resize": True, "type": "fit-x"}
+    streamlit_spec = _prepare_vega_lite_spec(dict(spec), use_container_width=True)
+    assert streamlit_spec.get("autosize") == spec.get("autosize")
     rendered_returns = [row for row in _dataset_rows(spec) if row.get("series") == "매출반품"]
     assert any(row.get("display_value") == -25.0 and row.get("return_magnitude") == 25.0 for row in rendered_returns)
     assert any(row.get("display_value") == -20.0 and row.get("return_magnitude") == 20.0 for row in rendered_returns)
@@ -394,6 +398,19 @@ def main() -> int:
     alignment_offset = (alignment_return_bar.get("encoding") or {}).get("xOffset") or {}
     assert alignment_offset.get("field") == "return_anchor"
     assert alignment_offset.get("scale") == (alignment_top_bar.get("encoding") or {}).get("xOffset", {}).get("scale")
+
+    for boundary_rows in (alignment_rows[:6], alignment_rows):
+        boundary_spec = _build_sales_bar_chart({"sales": {"chart_rows": boundary_rows}}).to_dict()
+        assert boundary_spec.get("autosize") == {"contains": "padding", "resize": True, "type": "fit-x"}
+        boundary_panels = boundary_spec.get("vconcat") or []
+        assert len(boundary_panels) == 2
+        boundary_top_bar = _first_bar_layer(boundary_panels[0])
+        boundary_return_bar = (boundary_panels[1].get("layer") or [{}])[0]
+        boundary_top_x = (boundary_top_bar.get("encoding") or {}).get("x") or {}
+        boundary_return_x = (boundary_return_bar.get("encoding") or {}).get("x") or {}
+        assert boundary_top_x.get("sort") == boundary_return_x.get("sort")
+        assert (boundary_top_x.get("scale") or {}).get("paddingOuter") == 0.10
+        assert (boundary_return_x.get("scale") or {}).get("paddingOuter") == 0.10
     invalid_chart_sales = dict(with_returns)
     invalid_chart_sales["chart_rows"] = [
         dict(row, return_magnitude=-1.0)

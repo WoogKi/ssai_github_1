@@ -1761,6 +1761,7 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
         return_chart,
         spacing=0,
     ).resolve_scale(x="shared", y="independent").properties(
+        autosize=alt.AutoSizeParams(type="fit-x", contains="padding", resize=True),
         padding={"left": 8, "right": 16, "top": 18, "bottom": 24},
     )
 
