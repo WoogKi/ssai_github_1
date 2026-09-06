@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import hashlib
 import os
 import re
@@ -74,6 +75,16 @@ class FrequencySnapshotPlan:
     stock_codes: tuple[str, ...]
     erp_sql_call_count: int = 2
     analytics_write_plan: str = "draft manifest 1 + immutable payload 1; approval/publish 0"
+
+
+@dataclass(frozen=True)
+class FrequencyMonthSourcePlan:
+    company_id: int
+    basis_month: str
+    basis_from: str
+    basis_to: str
+    stock_codes: tuple[str, ...]
+    erp_sql_call_count: int = 1
 
 
 class SnapshotGenerationInProgressError(SnapshotContractError):
@@ -166,6 +177,34 @@ def build_frequency_snapshot_plan(*, company_id: Any, evaluation_month: Any, sto
         basis_from=basis.basis_from,
         basis_to=basis.basis_to,
         basis_months=basis.months,
+        stock_codes=normalize_stock_scope(stock_codes),
+    )
+
+
+def build_frequency_month_source_plan(
+    *,
+    company_id: Any,
+    basis_month: Any,
+    stock_codes: Sequence[Any] | None,
+) -> FrequencyMonthSourcePlan:
+    """Build one completed-month source boundary without changing Snapshot identity."""
+    try:
+        normalized_company = int(company_id)
+    except (TypeError, ValueError) as exc:
+        raise SnapshotContractError("company_id must be an existing numeric company id") from exc
+    month = str(basis_month or "").strip()
+    if normalized_company <= 0 or len(month) != 6 or not month.isdigit():
+        raise SnapshotContractError("monthly frequency source plan is invalid")
+    year = int(month[:4])
+    month_number = int(month[4:])
+    if year < 1900 or not 1 <= month_number <= 12:
+        raise SnapshotContractError("monthly frequency source plan is invalid")
+    month_end = calendar.monthrange(year, month_number)[1]
+    return FrequencyMonthSourcePlan(
+        company_id=normalized_company,
+        basis_month=month,
+        basis_from=f"{month}01",
+        basis_to=f"{month}{month_end:02d}",
         stock_codes=normalize_stock_scope(stock_codes),
     )
 
@@ -548,7 +587,9 @@ SELECT * FROM EmptyAcceptedSummary
 ORDER BY row_kind, [month], product_code, stock_code
 """.strip()
 
-def outbound_base_rows_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+def outbound_base_rows_sql(
+    plan: FrequencySnapshotPlan | FrequencyMonthSourcePlan,
+) -> tuple[str, dict[str, Any]]:
     """Build the shared Rddbc120 source for aggregate and read-only profiling."""
     binds: dict[str, Any] = {"basis_from": plan.basis_from, "basis_to": plan.basis_to}
     stock_clause = ""
@@ -577,12 +618,16 @@ WHERE O.Rd12_Out_YyMmDd >= :basis_from AND O.Rd12_Out_YyMmDd <= :basis_to
     return base, binds
 
 
-def outbound_monthly_aggregate_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+def outbound_monthly_aggregate_sql(
+    plan: FrequencySnapshotPlan | FrequencyMonthSourcePlan,
+) -> tuple[str, dict[str, Any]]:
     base, binds = outbound_base_rows_sql(plan)
     return _aggregate_sql(base), binds
 
 
-def outbound_event_grain_stream_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+def outbound_event_grain_stream_sql(
+    plan: FrequencySnapshotPlan | FrequencyMonthSourcePlan,
+) -> tuple[str, dict[str, Any]]:
     """Return event-grain rows plus one base-diagnostics row for bounded local rollup."""
     base_rows_sql, binds = outbound_base_rows_sql(plan)
     io_tcode_number = sql_safe_int("io_tcode")

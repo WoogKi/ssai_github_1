@@ -299,10 +299,243 @@ GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_source_diagnostics TO [ssai_s
 """
 
 
+MIGRATION_004_SQL = """
+CREATE TABLE snapshot.frequency_month_manifest (
+    manifest_id BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_snapshot_frequency_month_manifest PRIMARY KEY,
+    company_id NVARCHAR(128) NOT NULL,
+    basis_month CHAR(6) NOT NULL,
+    basis_from CHAR(8) NOT NULL,
+    basis_to CHAR(8) NOT NULL,
+    scope_fingerprint CHAR(64) NOT NULL,
+    product_universe_fingerprint CHAR(64) NOT NULL,
+    product_count BIGINT NOT NULL,
+    schema_version NVARCHAR(32) NOT NULL,
+    algorithm_version NVARCHAR(64) NOT NULL,
+    generation_no INT NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    approval_status VARCHAR(20) NOT NULL,
+    source_watermark NVARCHAR(256) NULL,
+    source_watermark_status VARCHAR(24) NOT NULL,
+    source_fingerprint CHAR(64) NOT NULL,
+    source_row_count BIGINT NOT NULL,
+    event_count BIGINT NOT NULL,
+    fact_count BIGINT NOT NULL,
+    lifecycle_count BIGINT NOT NULL,
+    checksum CHAR(64) NOT NULL,
+    created_at DATETIME2(3) NOT NULL CONSTRAINT DF_snapshot_frequency_month_manifest_created_at DEFAULT SYSUTCDATETIME(),
+    created_by NVARCHAR(128) NOT NULL,
+    approved_at DATETIME2(3) NULL,
+    approved_by NVARCHAR(128) NULL,
+    approval_reason NVARCHAR(500) NULL,
+    published_at DATETIME2(3) NULL,
+    superseded_at DATETIME2(3) NULL,
+    CONSTRAINT UQ_snapshot_frequency_month_manifest_generation UNIQUE (
+        company_id, basis_month, scope_fingerprint, schema_version, algorithm_version, generation_no
+    ),
+    CONSTRAINT CK_snapshot_frequency_month_manifest_status CHECK (
+        status IN ('draft','published','superseded','invalidated','failed')
+    ),
+    CONSTRAINT CK_snapshot_frequency_month_manifest_approval CHECK (
+        approval_status IN ('pending','approved','rejected')
+    ),
+    CONSTRAINT CK_snapshot_frequency_month_manifest_counts CHECK (
+        generation_no > 0 AND product_count >= 0 AND source_row_count >= 0
+        AND event_count >= 0 AND fact_count >= 0 AND lifecycle_count >= 0
+    )
+);
+
+CREATE UNIQUE INDEX UX_snapshot_frequency_month_one_published
+ON snapshot.frequency_month_manifest (
+    company_id, basis_month, scope_fingerprint, schema_version, algorithm_version
+)
+WHERE status = 'published';
+
+CREATE INDEX IX_snapshot_frequency_month_manifest_lookup
+ON snapshot.frequency_month_manifest (
+    company_id, basis_month, scope_fingerprint, schema_version, algorithm_version,
+    status, generation_no DESC
+)
+INCLUDE (manifest_id, approval_status, checksum, approved_at, source_fingerprint);
+
+CREATE TABLE snapshot.frequency_month_scope_stock (
+    manifest_id BIGINT NOT NULL,
+    stock_code NVARCHAR(128) NOT NULL,
+    CONSTRAINT PK_snapshot_frequency_month_scope_stock PRIMARY KEY (manifest_id, stock_code),
+    CONSTRAINT FK_snapshot_frequency_month_scope_stock_manifest FOREIGN KEY (manifest_id)
+        REFERENCES snapshot.frequency_month_manifest(manifest_id)
+);
+
+CREATE TABLE snapshot.frequency_month_fact (
+    manifest_id BIGINT NOT NULL,
+    product_code NVARCHAR(128) NOT NULL,
+    stock_code NVARCHAR(128) NOT NULL,
+    occurrence_count BIGINT NOT NULL,
+    outbound_quantity BIGINT NOT NULL,
+    outbound_day_count BIGINT NOT NULL,
+    row_checksum CHAR(64) NOT NULL,
+    CONSTRAINT PK_snapshot_frequency_month_fact PRIMARY KEY (manifest_id, product_code, stock_code),
+    CONSTRAINT FK_snapshot_frequency_month_fact_manifest FOREIGN KEY (manifest_id)
+        REFERENCES snapshot.frequency_month_manifest(manifest_id),
+    CONSTRAINT CK_snapshot_frequency_month_fact_values CHECK (
+        occurrence_count > 0 AND outbound_quantity > 0
+        AND outbound_day_count > 0 AND outbound_day_count <= occurrence_count
+    )
+);
+
+CREATE TABLE snapshot.frequency_month_source_diagnostics (
+    manifest_id BIGINT NOT NULL CONSTRAINT PK_snapshot_frequency_month_source_diagnostics PRIMARY KEY,
+    diagnostic_contract_version INT NOT NULL,
+    source_row_count BIGINT NOT NULL,
+    normal_positive_accepted_row_count BIGINT NOT NULL,
+    normal_positive_duplicate_row_count BIGINT NOT NULL,
+    normal_positive_conflicting_row_count BIGINT NOT NULL,
+    normal_positive_missing_key_row_count BIGINT NOT NULL,
+    normal_positive_nonintegral_row_count BIGINT NOT NULL,
+    normal_nonpositive_row_count BIGINT NOT NULL,
+    return_positive_row_count BIGINT NOT NULL,
+    return_nonpositive_row_count BIGINT NOT NULL,
+    other_tcode_row_count BIGINT NOT NULL,
+    normal_positive_row_count BIGINT NOT NULL,
+    distinct_normal_event_count BIGINT NOT NULL,
+    conflicting_event_count BIGINT NOT NULL,
+    ignored_product_event_count BIGINT NOT NULL,
+    row_checksum CHAR(64) NOT NULL,
+    CONSTRAINT FK_snapshot_frequency_month_diagnostics_manifest FOREIGN KEY (manifest_id)
+        REFERENCES snapshot.frequency_month_manifest(manifest_id)
+);
+
+CREATE TABLE snapshot.frequency_month_lifecycle (
+    manifest_id BIGINT NOT NULL,
+    product_code NVARCHAR(128) NOT NULL,
+    product_registered_date CHAR(8) NULL,
+    first_normal_inbound_date CHAR(8) NULL,
+    first_normal_inbound_month CHAR(6) NULL,
+    first_outbound_date CHAR(8) NULL,
+    lifecycle_status VARCHAR(24) NOT NULL,
+    row_checksum CHAR(64) NOT NULL,
+    CONSTRAINT PK_snapshot_frequency_month_lifecycle PRIMARY KEY (manifest_id, product_code),
+    CONSTRAINT FK_snapshot_frequency_month_lifecycle_manifest FOREIGN KEY (manifest_id)
+        REFERENCES snapshot.frequency_month_manifest(manifest_id),
+    CONSTRAINT CK_snapshot_frequency_month_lifecycle_status CHECK (
+        lifecycle_status IN ('verified','insufficient','invalid')
+    )
+);
+
+CREATE INDEX IX_snapshot_frequency_month_fact_product
+ON snapshot.frequency_month_fact (manifest_id, product_code, stock_code);
+CREATE INDEX IX_snapshot_frequency_month_lifecycle_inbound
+ON snapshot.frequency_month_lifecycle (manifest_id, first_normal_inbound_month, product_code);
+
+GRANT SELECT ON OBJECT::snapshot.frequency_month_manifest TO [ssai_snapshot_reader];
+GRANT SELECT ON OBJECT::snapshot.frequency_month_scope_stock TO [ssai_snapshot_reader];
+GRANT SELECT ON OBJECT::snapshot.frequency_month_fact TO [ssai_snapshot_reader];
+GRANT SELECT ON OBJECT::snapshot.frequency_month_source_diagnostics TO [ssai_snapshot_reader];
+GRANT SELECT ON OBJECT::snapshot.frequency_month_lifecycle TO [ssai_snapshot_reader];
+GRANT SELECT, INSERT, UPDATE ON OBJECT::snapshot.frequency_month_manifest TO [ssai_snapshot_writer];
+GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_month_scope_stock TO [ssai_snapshot_writer];
+GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_month_fact TO [ssai_snapshot_writer];
+GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_month_source_diagnostics TO [ssai_snapshot_writer];
+GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_month_lifecycle TO [ssai_snapshot_writer];
+"""
+
+
+MIGRATION_005_SQL = """
+CREATE TABLE snapshot.frequency_lifecycle_manifest (
+    manifest_id BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_snapshot_frequency_lifecycle_manifest PRIMARY KEY,
+    company_id NVARCHAR(128) NOT NULL,
+    scope_fingerprint CHAR(64) NOT NULL,
+    product_universe_fingerprint CHAR(64) NOT NULL,
+    product_count BIGINT NOT NULL,
+    schema_version NVARCHAR(32) NOT NULL,
+    algorithm_version NVARCHAR(64) NOT NULL,
+    generation_no INT NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    approval_status VARCHAR(20) NOT NULL,
+    source_watermark NVARCHAR(256) NULL,
+    source_watermark_status VARCHAR(24) NOT NULL,
+    source_fingerprint CHAR(64) NOT NULL,
+    review_required_count BIGINT NOT NULL,
+    insufficient_count BIGINT NOT NULL,
+    checksum CHAR(64) NOT NULL,
+    created_at DATETIME2(3) NOT NULL CONSTRAINT DF_snapshot_frequency_lifecycle_manifest_created_at DEFAULT SYSUTCDATETIME(),
+    created_by NVARCHAR(128) NOT NULL,
+    approved_at DATETIME2(3) NULL,
+    approved_by NVARCHAR(128) NULL,
+    approval_reason NVARCHAR(500) NULL,
+    published_at DATETIME2(3) NULL,
+    superseded_at DATETIME2(3) NULL,
+    CONSTRAINT UQ_snapshot_frequency_lifecycle_generation UNIQUE (
+        company_id, scope_fingerprint, schema_version, algorithm_version, generation_no
+    ),
+    CONSTRAINT CK_snapshot_frequency_lifecycle_status CHECK (
+        status IN ('draft','published','superseded','invalidated','failed')
+    ),
+    CONSTRAINT CK_snapshot_frequency_lifecycle_approval CHECK (
+        approval_status IN ('pending','approved','rejected')
+    ),
+    CONSTRAINT CK_snapshot_frequency_lifecycle_counts CHECK (
+        generation_no > 0 AND product_count >= 0 AND review_required_count >= 0 AND insufficient_count >= 0
+    )
+);
+
+CREATE UNIQUE INDEX UX_snapshot_frequency_lifecycle_one_published
+ON snapshot.frequency_lifecycle_manifest (company_id, scope_fingerprint, schema_version, algorithm_version)
+WHERE status='published';
+
+CREATE TABLE snapshot.frequency_lifecycle_scope_stock (
+    manifest_id BIGINT NOT NULL,
+    stock_code NVARCHAR(128) NOT NULL,
+    CONSTRAINT PK_snapshot_frequency_lifecycle_scope_stock PRIMARY KEY (manifest_id, stock_code),
+    CONSTRAINT FK_snapshot_frequency_lifecycle_scope_manifest FOREIGN KEY (manifest_id)
+        REFERENCES snapshot.frequency_lifecycle_manifest(manifest_id)
+);
+
+CREATE TABLE snapshot.frequency_lifecycle_product (
+    manifest_id BIGINT NOT NULL,
+    product_code NVARCHAR(128) NOT NULL,
+    product_registered_date CHAR(8) NULL,
+    first_normal_inbound_date CHAR(8) NULL,
+    first_normal_inbound_month CHAR(6) NULL,
+    first_outbound_date CHAR(8) NULL,
+    registered_after_inbound BIT NOT NULL,
+    outbound_before_inbound BIT NOT NULL,
+    long_registration_to_inbound_gap BIT NOT NULL,
+    registration_to_inbound_days INT NULL,
+    review_required BIT NOT NULL,
+    quality_status VARCHAR(24) NOT NULL,
+    row_checksum CHAR(64) NOT NULL,
+    CONSTRAINT PK_snapshot_frequency_lifecycle_product PRIMARY KEY (manifest_id, product_code),
+    CONSTRAINT FK_snapshot_frequency_lifecycle_product_manifest FOREIGN KEY (manifest_id)
+        REFERENCES snapshot.frequency_lifecycle_manifest(manifest_id),
+    CONSTRAINT CK_snapshot_frequency_lifecycle_quality CHECK (
+        quality_status IN ('ready','review_required','insufficient','invalid')
+    )
+);
+
+CREATE INDEX IX_snapshot_frequency_lifecycle_product_review
+ON snapshot.frequency_lifecycle_product (manifest_id, review_required, quality_status, product_code)
+INCLUDE (first_normal_inbound_month, registration_to_inbound_days);
+
+ALTER TABLE snapshot.frequency_month_manifest ADD lifecycle_manifest_id BIGINT NULL;
+ALTER TABLE snapshot.frequency_month_manifest ADD lifecycle_authority_checksum CHAR(64) NULL;
+ALTER TABLE snapshot.frequency_month_manifest ADD CONSTRAINT FK_snapshot_frequency_month_lifecycle_authority
+    FOREIGN KEY (lifecycle_manifest_id) REFERENCES snapshot.frequency_lifecycle_manifest(manifest_id);
+
+GRANT SELECT ON OBJECT::snapshot.frequency_lifecycle_manifest TO [ssai_snapshot_reader];
+GRANT SELECT ON OBJECT::snapshot.frequency_lifecycle_scope_stock TO [ssai_snapshot_reader];
+GRANT SELECT ON OBJECT::snapshot.frequency_lifecycle_product TO [ssai_snapshot_reader];
+GRANT SELECT, INSERT, UPDATE ON OBJECT::snapshot.frequency_lifecycle_manifest TO [ssai_snapshot_writer];
+GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_lifecycle_scope_stock TO [ssai_snapshot_writer];
+GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_lifecycle_product TO [ssai_snapshot_writer];
+"""
+
+
 MIGRATIONS = (
     SnapshotMigration("001_snapshot_manifest_payload", MIGRATION_001_SQL),
     SnapshotMigration("002_snapshot_frequency_projection", MIGRATION_002_SQL),
     SnapshotMigration("003_snapshot_relational_frequency_authority", MIGRATION_003_SQL),
+    SnapshotMigration("004_monthly_frequency_materialization", MIGRATION_004_SQL),
+    SnapshotMigration("005_frequency_lifecycle_authority", MIGRATION_005_SQL),
 )
 
 
