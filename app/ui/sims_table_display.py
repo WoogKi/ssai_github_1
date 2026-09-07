@@ -48,6 +48,7 @@ def resolve_sims_table_mode(
     *,
     action: Any = "",
     render_path: str = "chat",
+    meta: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     rows = int(len(df)) if isinstance(df, pd.DataFrame) else 0
     cols = int(len(df.columns)) if isinstance(df, pd.DataFrame) else 0
@@ -69,8 +70,18 @@ def resolve_sims_table_mode(
         threshold = int(raw_value)
     except Exception:
         threshold = 6000
-    mode = "fast" if threshold > 0 and cells >= threshold else "small"
-    reason = "cells>=threshold" if mode == "fast" else "cells<threshold"
+    semantic_max_rows = 0
+    if isinstance(meta, dict) and bool(meta.get("registered_erp_table")):
+        try:
+            semantic_max_rows = max(0, int(meta.get("semantic_styled_max_rows") or 0))
+        except Exception:
+            semantic_max_rows = 0
+    if semantic_max_rows and rows <= semantic_max_rows:
+        mode = "small"
+        reason = "registered_erp_semantic_rows"
+    else:
+        mode = "fast" if threshold > 0 and cells >= threshold else "small"
+        reason = "cells>=threshold" if mode == "fast" else "cells<threshold"
     return {
         "action": str(action or ""),
         "render_path": path or "chat",
@@ -85,8 +96,14 @@ def resolve_sims_table_mode(
     }
 
 
-def log_sims_table_mode(df: pd.DataFrame, *, action: Any = "", render_path: str = "chat") -> Dict[str, Any]:
-    info = resolve_sims_table_mode(df, action=action, render_path=render_path)
+def log_sims_table_mode(
+    df: pd.DataFrame,
+    *,
+    action: Any = "",
+    render_path: str = "chat",
+    meta: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    info = resolve_sims_table_mode(df, action=action, render_path=render_path, meta=meta)
     log.info(
         "[sims.table_mode] action=%s render_path=%s rows=%s cols=%s cells=%s env_key=%s env_value=%s resolved_threshold=%s mode=%s reason=%s",
         info["action"],
@@ -101,6 +118,38 @@ def log_sims_table_mode(df: pd.DataFrame, *, action: Any = "", render_path: str 
         info["reason"],
     )
     return info
+
+
+def compose_sims_semantic_styler(
+    df: pd.DataFrame,
+    *,
+    formatters: Dict[str, Any] | None = None,
+    alignment_styles: pd.DataFrame | None = None,
+    negative_styles: pd.DataFrame | None = None,
+    band_size: int = 5,
+):
+    """Compose restrained cell styles without changing table values or dtypes."""
+    work = df.copy()
+    styler = work.style.format(formatters or {}, na_rep="")
+    if alignment_styles is not None:
+        styler = styler.apply(lambda _: alignment_styles, axis=None)
+    if negative_styles is not None:
+        styler = styler.apply(lambda _: negative_styles, axis=None)
+    if band_size > 0:
+        banding = pd.DataFrame("", index=work.index, columns=work.columns)
+        for row_position in range(len(work)):
+            if (row_position // band_size) % 2 == 1:
+                banding.iloc[row_position, :] = "background-color: #fafafa;"
+        styler = styler.apply(lambda _: banding, axis=None)
+    return styler.set_properties(**{"white-space": "nowrap"}).set_table_styles(
+        [
+            {
+                "selector": "tbody tr:hover td",
+                "props": [("background-color", "#f3f6fa")],
+            }
+        ],
+        overwrite=False,
+    )
 
 
 def log_sims_table_render(
@@ -254,7 +303,14 @@ def _clean_text(value: Any) -> str:
 def _is_explicit_code_display_name(col: Any) -> bool:
     s = _clean_text(col)
     s_lower = s.lower()
-    if s in {"거래명세서구분", "Rd13_Trans_Di"}:
+    if s in {
+        "거래명세서구분",
+        "Rd13_Trans_Di",
+        "단가적용거래처",
+        "재고위치",
+        "등록자",
+        "수정자",
+    }:
         return True
     code_words = (
         "제품코드",

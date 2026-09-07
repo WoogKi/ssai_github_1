@@ -491,6 +491,13 @@ def get_nlq_period_action_class(action: str) -> str:
                 return "inventory_movement"
             if spec.handler_target.endswith("rddbc210_service.get_rddbc210_result") or spec.handler_target.endswith("rddbc220_service.get_rddbc220_result"):
                 return "inventory_snapshot"
+            if spec.handler_kind == "erp_table":
+                from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+                registered = get_action_spec(spec.canonical_action)
+                if registered:
+                    return registered[1].nlq_period_policy
+                return "list_detail"
             if spec.handler_kind == "io_service":
                 return "list_detail"
     except Exception:
@@ -621,6 +628,13 @@ def apply_nlq_default_period_policy(
         return out, policy
 
     if explicit_period_present:
+        return out, policy
+
+    if action_class == "explicit_only":
+        policy.update({
+            "default_policy": "explicit_only",
+            "policy_reason": "registered_action_explicit_period_only",
+        })
         return out, policy
 
     current_day = _policy_today(out, today)
@@ -2903,6 +2917,12 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
     raw = _norm(text)
     if not raw:
         return None
+
+    from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
+
+    registered = resolve_registered_erp_table_nlq(raw, today=today)
+    if isinstance(registered, dict):
+        return registered
 
     # Explanation/help questions must continue to the normal answer or RAG
     # route.  They are not structured requests for an outbound DB result.

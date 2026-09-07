@@ -65,6 +65,7 @@ def _panel_sidebar() -> Dict[str, str]:
     # ------------------------------------------------------------------
     business_group_options = [
         "마스터관리",
+        "재고관리",
         "입출고/명세서/재고",
         "분석/KPI",
     ]
@@ -98,6 +99,25 @@ def _panel_sidebar() -> Dict[str, str]:
             "제품코드 목록",
             "제품코드 상세",
         ],
+    }
+
+    # 신규 ERP table feature는 기존 마스터 메뉴를 유지한 채 명시된 위치에만 병합한다.
+    from app.sims.meta.erp_table_feature_registry import menu_actions, menu_targets
+
+    for target in master_target_options:
+        registered_actions = menu_actions(
+            business_group="마스터관리",
+            target=target,
+        )
+        target_actions = master_action_options_map.setdefault(target, [])
+        for registered_action in registered_actions:
+            if registered_action not in target_actions:
+                target_actions.append(registered_action)
+
+    inventory_target_options = list(menu_targets(business_group="재고관리"))
+    inventory_action_options_map = {
+        target: list(menu_actions(business_group="재고관리", target=target))
+        for target in inventory_target_options
     }
 
     io_action_group_map = {
@@ -201,6 +221,11 @@ def _panel_sidebar() -> Dict[str, str]:
 
         if cat in master_target_options:
             return "마스터관리"
+        for actions in inventory_action_options_map.values():
+            if action in actions:
+                return "재고관리"
+        if cat in inventory_target_options:
+            return "재고관리"
         if cat == "입출고/명세서/재고":
             return "입출고/명세서/재고"
         if cat == "분석/KPI":
@@ -263,6 +288,39 @@ def _panel_sidebar() -> Dict[str, str]:
             action_key = f"__sims_action_master_{master_key_map.get(category, 'default')}"
 
             default_action = current_action if current_action in action_options else (action_options[0] if action_options else "")
+            _ensure_select_value(action_key, action_options, default_action)
+
+            action = st.selectbox(
+                "작업선택",
+                action_options,
+                key=action_key,
+            )
+
+        elif business_group == "재고관리":
+            default_target = (
+                current_category
+                if current_category in inventory_target_options
+                else (inventory_target_options[0] if inventory_target_options else "")
+            )
+            _ensure_select_value(
+                "__sims_inventory_target",
+                inventory_target_options,
+                default_target,
+            )
+
+            category = st.selectbox(
+                "관리대상",
+                inventory_target_options,
+                key="__sims_inventory_target",
+            )
+
+            action_options = inventory_action_options_map.get(category) or []
+            action_key = "__sims_action_inventory_registered"
+            default_action = (
+                current_action
+                if current_action in action_options
+                else (action_options[0] if action_options else "")
+            )
             _ensure_select_value(action_key, action_options, default_action)
 
             action = st.selectbox(

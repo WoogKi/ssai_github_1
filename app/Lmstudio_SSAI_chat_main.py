@@ -7737,11 +7737,15 @@ def _push_panel_result_to_current_chat(
 
                 payload = dict(stored_payload)
                 meta = dict(payload.get("meta") or {})
+                # Panel bridge idempotency is owned by _panel_source_sig.  A
+                # force nonce would turn the same rerun payload into a new
+                # assistant message and bypass chat-level duplicate checks.
+                meta.pop("_force_push", None)
+                meta.pop("_push_nonce", None)
 
                 meta.update(
                     {
                         "panel_push": True,
-                        "_force_push": True,
                         "_panel_run_seq": run_seq or ss.get("__sims_run_seq"),
                         "row_count": 0,
                         "row_count_total": 0,
@@ -7847,9 +7851,13 @@ def _push_panel_result_to_current_chat(
         payload = {}
         meta = {}
 
+    # Explicit panel submissions already have a unique panel source signature;
+    # reruns of that submission must retain the same chat identity.
+    meta.pop("_force_push", None)
+    meta.pop("_push_nonce", None)
+
     meta.update({
         "panel_push": True,
-        "_force_push": True,
         "_panel_run_seq": run_seq or ss.get("__sims_run_seq"),
         "_panel_table_key": table_key,
         "table_key": table_key,

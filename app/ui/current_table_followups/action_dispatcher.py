@@ -1770,6 +1770,12 @@ def handle_current_table_followup_by_action(
 
     dispatch_helpers = dict(helpers)
     dispatch_helpers["_requested_grouping"] = capability["requested_grouping"]
+    source_table_name = str((source_meta or {}).get("source_table") or "").strip().lower()
+    if source_table_name == "rddbc070" or "계약단가" in str(source_action or ""):
+        # Contract-price columns have no safe implicit sum metric. Literal
+        # grouping remains a row/distinct-count operation unless the source
+        # later declares an explicit aggregation contract.
+        dispatch_helpers["_common_group_count_only"] = True
     dispatch_helpers["push_table"] = _push_table_with_capability
     dispatch_helpers["push_notice"] = _push_notice_with_capability
     handlers = _known_action_handlers()
@@ -1850,6 +1856,67 @@ def handle_current_table_followup_by_action(
         except Exception:
             try:
                 log.exception("[chat.followup_table] inventory product stock TOP handler failed")
+            except Exception:
+                pass
+
+    # Generic/master tables may expose dimensions that are intentionally not
+    # part of the global metric/dimension vocabulary.  Let exact existing
+    # columns handle literal group/filter/TOP before an unsupported notice,
+    # while retaining fail-closed behavior for unknown or canonical metrics.
+    normalized_columns = {
+        re.sub(r"\s+", "", str(column))
+        for column in df.columns
+    }
+    unresolved_metric_like = any(
+        re.search(r"(?:금액|가액|단가|수량|비율|율|건수)$", re.sub(r"\s+", "", str(label)))
+        and re.sub(r"\s+", "", str(label)) not in normalized_columns
+        for label in capability.get("missing_columns", [])
+    )
+    group_metric_tail = ""
+    group_metric_match = re.search(
+        r"별(.+?)(?:집계|분석|현황|요약|조회|보여)",
+        normalized_query,
+    )
+    if group_metric_match:
+        group_metric_tail = str(group_metric_match.group(1) or "").strip()
+    if (
+        group_metric_tail
+        and re.search(r"(?:금액|가액|단가|수량|비율|율|건수)$", group_metric_tail)
+        and group_metric_tail not in normalized_columns
+    ):
+        unresolved_metric_like = True
+    literal_precedence = (
+        kind == "generic"
+        and capability["status"] in {"unsupported", "column_unavailable"}
+        and not capability.get("requested_metrics")
+        and "multiple_metric_or_grouping_unsupported" not in capability.get("issue_codes", [])
+        and not unresolved_metric_like
+    )
+    if literal_precedence:
+        try:
+            if handle_common_column_group_followup(
+                df=df,
+                query=query,
+                top_n=top_n,
+                table_key=table_key,
+                source_action=source_action,
+                helpers=dispatch_helpers,
+                log=log,
+            ):
+                return True
+            if handle_common_column_filter_followup(
+                df=df,
+                query=query,
+                top_n=top_n,
+                table_key=table_key,
+                source_action=source_action,
+                helpers=dispatch_helpers,
+                log=log,
+            ):
+                return True
+        except Exception:
+            try:
+                log.exception("[chat.followup_table] exact literal precedence failed kind=%s", kind)
             except Exception:
                 pass
 

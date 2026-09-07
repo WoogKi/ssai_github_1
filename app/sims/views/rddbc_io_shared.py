@@ -10,6 +10,8 @@ from pandas.api.types import is_datetime64_any_dtype, is_numeric_dtype
 
 import streamlit as st
 
+from app.ui.sims_table_display import compose_sims_semantic_styler
+
 from app.services import rddbc010_service as C01
 from app.services.rddbc_io_common import query_to_df
 from app.services.rddbc040_service import search_goods_full
@@ -932,7 +934,10 @@ _IO_TEXTISH_NAME_HINTS = [
 ]
 
 
-_IO_TEXT_IDENTIFIER_COLS = {"제조번호", "검수확인", "사업자번호", "전화번호", "우편번호"}
+_IO_TEXT_IDENTIFIER_COLS = {
+    "제조번호", "검수확인", "사업자번호", "전화번호", "우편번호",
+    "단가적용거래처", "재고위치", "등록자", "수정자",
+}
 _IO_INTEGER_IDENTIFIER_COLS = {
     "명세서번호",
     "거래명세서순번",
@@ -1359,13 +1364,13 @@ def _build_io_display_styler(
 ):
     work = _prepare_io_display_df(df, add_row_no=add_row_no)
 
-    styler = work.style.format(_build_io_format_map(work), na_rep="")
-    styler = styler.apply(lambda _: _build_io_alignment_df(work), axis=None)
-    styler = styler.apply(lambda _: _build_io_negative_df(work), axis=None)
-    styler = styler.apply(lambda _: _build_io_banding_df(work, band_size=band_size), axis=None)
-    styler = styler.set_properties(**{"white-space": "nowrap"})
-
-    return styler
+    return compose_sims_semantic_styler(
+        work,
+        formatters=_build_io_format_map(work),
+        alignment_styles=_build_io_alignment_df(work),
+        negative_styles=_build_io_negative_df(work),
+        band_size=band_size,
+    )
 
 
 def _render_io_dataframe(

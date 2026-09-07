@@ -352,6 +352,14 @@ def _is_explicit_io_nlq_phrase(txt: str) -> bool:
     if not t:
         return False
 
+    try:
+        from app.sims.meta.erp_table_feature_registry import match_action_in_text
+
+        if match_action_in_text(t):
+            return True
+    except Exception:
+        pass
+
     explicit_actions = (
         "입고명세",
         "출고명세",
@@ -5707,8 +5715,15 @@ _IO_DETAIL_SOURCE_ACTIONS = frozenset(
 
 def _record_io_display_source_query_meta(meta: Dict[str, Any], action: str) -> None:
     """Record the detail display SELECT once before a possible full-source SELECT."""
-    if str(action or "").strip() not in _IO_DETAIL_SOURCE_ACTIONS:
-        return
+    normalized_action = str(action or "").strip()
+    if normalized_action not in _IO_DETAIL_SOURCE_ACTIONS:
+        try:
+            from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+            if not get_action_spec(normalized_action):
+                return
+        except Exception:
+            return
     if int(meta.get("display_source_query_count") or 0) > 0:
         return
     # Some services already record the display query. Preserve that count rather
@@ -5716,6 +5731,47 @@ def _record_io_display_source_query_meta(meta: Dict[str, Any], action: str) -> N
     if int(meta.get("source_call_count") or 0) <= 0:
         meta["source_call_count"] = 1
     meta["display_source_query_count"] = 1
+
+
+def _io_payload_df(value: Any) -> pd.DataFrame | None:
+    if value is None:
+        return None
+    if isinstance(value, pd.DataFrame):
+        return value
+    if isinstance(value, list):
+        try:
+            return pd.DataFrame(value)
+        except Exception:
+            return None
+    if isinstance(value, dict):
+        for key in ("df", "df_display", "table", "records", "rows", "data"):
+            nested = value.get(key)
+            if isinstance(nested, pd.DataFrame):
+                return nested
+            if isinstance(nested, list):
+                try:
+                    return pd.DataFrame(nested)
+                except Exception:
+                    pass
+        try:
+            return pd.DataFrame(value)
+        except Exception:
+            return None
+    return None
+
+
+def _io_payload_table_frames(payload: Dict[str, Any]) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """Preserve a full query frame independently from its bounded display projection."""
+    full_df = _io_payload_df(payload.get("df"))
+    display_df = _io_payload_df(payload.get("df_display"))
+    if not isinstance(full_df, pd.DataFrame):
+        for key in ("table", "records", "data"):
+            full_df = _io_payload_df(payload.get(key))
+            if isinstance(full_df, pd.DataFrame):
+                break
+    if not isinstance(display_df, pd.DataFrame):
+        display_df = full_df
+    return full_df, display_df
 
 
 def _try_handle_io_nlq(
@@ -5910,6 +5966,13 @@ def _try_handle_io_nlq(
 
     _trace("parsed", trace_action=action, trace_params=params)
 
+    try:
+        from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+        registered_filter_contract = get_action_spec(action) is not None
+    except Exception:
+        registered_filter_contract = False
+
     # Label-free proper nouns are never assigned to a condition by wording
     # alone.  The IO master relationships must identify exactly one semantic
     # target; otherwise retain the existing candidate-table result contract.
@@ -5921,7 +5984,15 @@ def _try_handle_io_nlq(
             for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm")
         )
     )
-    if current_stock_frequency_only:
+    if registered_filter_contract:
+        # Registry-backed parsers own their filter metadata. Reinterpreting the
+        # action text as an unlabeled ERP entity blocks valid unfiltered lists.
+        entity_resolution = {
+            "status": "resolved",
+            "params": params,
+            "resolved_kind": "registered_filters",
+        }
+    elif current_stock_frequency_only:
         # An explicitly labelled grade is already a complete local filter.
         # Do not reinterpret its grade token as a product/manufacturer name.
         entity_resolution = {"status": "resolved", "params": params, "resolved_kind": "frequency_only"}
@@ -6172,41 +6243,6 @@ def _try_handle_io_nlq(
 # - df_display / df / table / records / data 필드 중에서 DataFrame으로 해석 가능한 것을 찾아서 df/df_display로 보정
 # - DataFrame이 없으면 text payload로 보정
     def _normalize_payload(payload, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        def _to_df(obj) -> pd.DataFrame | None:
-            if obj is None:
-                return None
-
-            if isinstance(obj, pd.DataFrame):
-                return obj
-
-            if isinstance(obj, list):
-                try:
-                    return pd.DataFrame(obj)
-                except Exception:
-                    return None
-
-            if isinstance(obj, dict):
-                # dict 안에 실제 표가 한 번 더 들어 있는 경우 방어
-                for k in ("df_display", "df", "table", "records", "rows", "data"):
-                    v = obj.get(k)
-                    if isinstance(v, pd.DataFrame):
-                        return v
-                    if isinstance(v, list):
-                        try:
-                            return pd.DataFrame(v)
-                        except Exception:
-                            pass
-
-                # 컬럼 dict 형태 방어
-                try:
-                    df = pd.DataFrame(obj)
-                    if isinstance(df, pd.DataFrame):
-                        return df
-                except Exception:
-                    return None
-
-            return None
-
         if isinstance(payload, pd.DataFrame):
             return _wrap_df_payload(payload, action, params)
 
@@ -6225,22 +6261,23 @@ def _try_handle_io_nlq(
         payload.setdefault("action", action)
         payload.setdefault("params", params)
 
-        df = None
-        for key in ("df_display", "df", "table", "records", "data"):
-            df = _to_df(payload.get(key))
-            if isinstance(df, pd.DataFrame):
-                break
+        full_df, display_df = _io_payload_table_frames(payload)
 
-        if isinstance(df, pd.DataFrame) and not df.empty:
+        table_df = full_df if isinstance(full_df, pd.DataFrame) else display_df
+        if isinstance(table_df, pd.DataFrame) and not table_df.empty:
+            if not isinstance(full_df, pd.DataFrame):
+                full_df = table_df
+            if not isinstance(display_df, pd.DataFrame):
+                display_df = table_df
             payload["type"] = "table"
-            payload["df"] = df
-            payload["df_display"] = df
-            payload["records"] = df.to_dict(orient="records")
-            payload["columns"] = list(df.columns)
+            payload["df"] = full_df
+            payload["df_display"] = display_df
+            payload["records"] = display_df.to_dict(orient="records")
+            payload["columns"] = list(display_df.columns)
 
             meta = dict(payload.get("meta") or {})
-            meta.setdefault("row_count", int(len(df)))
-            meta.setdefault("row_count_total", int(len(df)))
+            meta.setdefault("row_count", int(len(display_df)))
+            meta.setdefault("row_count_total", int(len(full_df)))
             meta.setdefault("result_status", "success")
             payload["meta"] = meta
 
@@ -6337,6 +6374,12 @@ def _try_handle_io_nlq(
             ["get_product_inventory_result"],
         ),
     }
+
+    from app.sims.meta.erp_table_feature_registry import iter_action_specs
+
+    for _feature, _action_spec in iter_action_specs():
+        _module_name, _function_name = _action_spec.service_function.rsplit(".", 1)
+        service_specs[_action_spec.action] = (_module_name, [_function_name])
 
     payload = None
     detail_perf_started = time.perf_counter() if action == "출고명세 조회" else 0.0

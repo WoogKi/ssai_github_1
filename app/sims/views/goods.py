@@ -12,13 +12,11 @@ import streamlit as st
 from app.services.rddbc040_service import search_goods_full, get_goods_detail_full
 from app.services.utils import apply_labels
 
-from app.db.mssql_client import read_df
-
 from app.sims.views.master_advanced_filters import (
-    render_master_audit_filter,
     build_master_query_condition,
     build_master_llm_summary,
 )
+from app.sims.views.product_master_filters import render_product_master_filters
 
 log = logging.getLogger("ssai")
 
@@ -443,90 +441,18 @@ def view_goods_list(widget_ns: str = "0") -> Dict[str, Any]:
     st.subheader("제품코드(040) 목록")
     st.caption("제약사명/제품그룹명/구분명/제품분류명은 업무코드 기준 선택형 필터를 사용합니다.")
 
-    @st.cache_data(ttl=600, show_spinner=False)
-    def _load_code_name_options(gcode: str) -> list[str]:
-        sql = """
-SELECT DISTINCT LTRIM(RTRIM(Rd01_Hnm)) AS code_name
-FROM dbo.Rddbc010 WITH (NOLOCK)
-WHERE Rd01_Gcode = ?
-  AND ISNULL(Rd01_Hnm, '') <> ''
-ORDER BY LTRIM(RTRIM(Rd01_Hnm))
-""".strip()
-        try:
-            df_code = read_df(sql, (gcode,))
-        except Exception:
-            log.exception("[view.goods] code option load failed gcode=%s", gcode)
-            return ["전체"]
-
-        if df_code is None or df_code.empty or "code_name" not in df_code.columns:
-            return ["전체"]
-
-        vals: list[str] = []
-        seen: set[str] = set()
-        for v in df_code["code_name"].tolist():
-            s = str(v or "").strip()
-            if not s or s in seen:
-                continue
-            seen.add(s)
-            vals.append(s)
-
-        return ["전체"] + vals
-
-    group_options = _load_code_name_options("0013")
-    di_options = _load_code_name_options("0004")
-    class_options = _load_code_name_options("0028")
-
     with st.form(
         f"goods_list_form_{widget_ns}",
         clear_on_submit=False,
         enter_to_submit=False,
     ):
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            physic_cd = st.text_input("제품코드(정확)", value="")
-        with c2:
-            keyword = st.text_input("키워드(제품명/제품코드/보험코드)", value="")
-        with c3:
-            insu_cd = st.text_input("보험코드(정확)", value="")
-
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            ven_nm_kw = st.text_input("제약사명 포함", value="")
-        with c5:
-            barcode = st.text_input("바코드(정확, 1~5)", value="")
-        with c6:
-            unit_price_kw = st.text_input("단가(정확 또는 범위)", value="")
-
-        c7, c8, c9 = st.columns(3)
-        with c7:
-            group_name_sel = st.selectbox("제품그룹명", options=group_options, index=0, key=f"goods_group_name_{widget_ns}")
-        with c8:
-            di_name_sel = st.selectbox("구분명", options=di_options, index=0, key=f"goods_di_name_{widget_ns}")
-        with c9:
-            physic_gu_name_sel = st.selectbox("제품분류명", options=class_options, index=0, key=f"goods_physic_gu_name_{widget_ns}")
-
-        c10, c11, c12 = st.columns(3)
-        with c10:
-            final_price_date_kw = st.text_input("최종단가변경일자(YYYYMMDD 또는 범위)", value="")
-        with c11:
-            only_use = st.checkbox("사용(Use_Gu=0)만", value=True)
-        with c12:
-            st.caption(f"화면 표시: 최대 {panel_display_max_rows:,}건")
-
-        audit_filter = render_master_audit_filter(
+        product_filters = render_product_master_filters(
             prefix="goods",
             ns=widget_ns,
-            expanded=False,
+            only_use_default=True,
+            display_caption=f"화면 표시: 최대 {panel_display_max_rows:,}건",
         )
-
-        add_user_nm = audit_filter["add_user_nm"]
-        add_date_from = audit_filter["add_date_from"]
-        add_date_to = audit_filter["add_date_to"]
-        mod_user_nm = audit_filter["mod_user_nm"]
-        mod_date_from = audit_filter["mod_date_from"]
-        mod_date_to = audit_filter["mod_date_to"]
-
         submitted = st.form_submit_button("조회", type="primary")
 
     log.info("[view.goods] submitted=%s", submitted)
@@ -540,19 +466,23 @@ ORDER BY LTRIM(RTRIM(Rd01_Hnm))
             "data": "[조회] 버튼을 눌러 실행하세요.",
         }
 
-    physic_cd = str(physic_cd or "").strip()
-    keyword = str(keyword or "").strip()
-    insu_cd = str(insu_cd or "").strip()
-    barcode = str(barcode or "").strip()
-    ven_nm_kw = str(ven_nm_kw or "").strip()
-    unit_price_kw = str(unit_price_kw or "").strip()
-    final_price_date_kw = str(final_price_date_kw or "").strip()
-
-    group_name_kw = "" if str(group_name_sel or "").strip() == "전체" else str(group_name_sel or "").strip()
-    di_name_kw = "" if str(di_name_sel or "").strip() == "전체" else str(di_name_sel or "").strip()
-    physic_gu_name_kw = "" if str(physic_gu_name_sel or "").strip() == "전체" else str(physic_gu_name_sel or "").strip()
-
-    only_use = bool(only_use)
+    physic_cd = product_filters["physic_cd"]
+    keyword = product_filters["product_keyword"]
+    insu_cd = product_filters["insu_cd"]
+    barcode = product_filters["barcode"]
+    ven_nm_kw = product_filters["maker_nm"]
+    group_name_kw = product_filters["product_group_nm"]
+    di_name_kw = product_filters["product_di_nm"]
+    physic_gu_name_kw = product_filters["product_class_nm"]
+    unit_price_kw = product_filters["product_unit_price"]
+    final_price_date_kw = product_filters["product_final_price_date"]
+    only_use = product_filters["product_only_use"]
+    add_user_nm = product_filters["product_add_user_nm"]
+    add_date_from = product_filters["product_add_date_from"]
+    add_date_to = product_filters["product_add_date_to"]
+    mod_user_nm = product_filters["product_mod_user_nm"]
+    mod_date_from = product_filters["product_mod_date_from"]
+    mod_date_to = product_filters["product_mod_date_to"]
     display_top = int(panel_display_max_rows)
     fetch_top = 0
 

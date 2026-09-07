@@ -6,12 +6,10 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
-from datetime import datetime, timedelta
 
 import logging
 import time
 import pandas as pd
-import re
 
 try:
     import streamlit as st  # type: ignore
@@ -22,6 +20,7 @@ from app.db.mssql_client import read_df, log_sql
 from app.db.schema_map import SCHEMA as S
 from app.db.schema_utils import al as _al_shared
 from app.db.sql_utils import sql_safe_int
+from app.services.product_master_filter_contract import append_product_master_filter_clauses
 
 log = logging.getLogger("ssai")
 
@@ -123,51 +122,6 @@ def _norm_params(params):
     if isinstance(params, list):
         return tuple(params) if params else None
     return params
-
-def _digits_only(value: Optional[str]) -> str:
-    return "".join(ch for ch in str(value or "") if ch.isdigit())
-
-
-def _last_day_of_month(yyyymm: str) -> str:
-    first = datetime.strptime(yyyymm + "01", "%Y%m%d")
-    if first.month == 12:
-        next_first = first.replace(year=first.year + 1, month=1, day=1)
-    else:
-        next_first = first.replace(month=first.month + 1, day=1)
-    return (next_first - timedelta(days=1)).strftime("%Y%m%d")
-
-
-def _norm_date_from(value: Optional[str]) -> str:
-    digits = _digits_only(value)
-    if len(digits) == 8:
-        return digits
-    if len(digits) == 6:
-        return digits + "01"
-    return ""
-
-
-def _norm_date_to(value: Optional[str]) -> str:
-    digits = _digits_only(value)
-    if len(digits) == 8:
-        return digits
-    if len(digits) == 6:
-        return _last_day_of_month(digits)
-    return ""
-
-def _parse_num_range(value: Optional[str]) -> Tuple[Optional[float], Optional[float]]:
-    s = str(value or "").replace(",", "").strip()
-    if not s:
-        return None, None
-
-    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s*(?:~|-)\s*([0-9]+(?:\.[0-9]+)?)$", s)
-    if m:
-        return float(m.group(1)), float(m.group(2))
-
-    try:
-        v = float(s)
-        return v, v
-    except Exception:
-        return None, None
 
 def _build_from_join() -> Tuple[str, Dict[str, str]]:
     """
@@ -347,99 +301,48 @@ CROSS APPLY (
 
     from_join_calc = f"{from_join}\n{calc_apply}"
 
-    if only_use:
-        where.append(f"a.{col_use} = ?")
-        params.append("0")
-
-    if physic_cd:
-        where.append(f"a.{col_physic_cd} = ?")
-        params.append(physic_cd)
-
-    if insu_cd:
-        if len(insu_cd) >= 10:
-            where.append(f"a.{col_insu_cd} = ?")
-            params.append(insu_cd)
-        else:
-            where.append(f"a.{col_insu_cd} LIKE ?")
-            params.append(f"%{insu_cd}%")
-
-    if barcode:
-        where.append(
-            f"(a.{col_bar1} = ? OR a.{col_bar2} = ? OR a.{col_bar3} = ? OR a.{col_bar4} = ? OR a.{col_bar5} = ?)"
-        )
-        params.extend([barcode, barcode, barcode, barcode, barcode])
-
-    if ven_nm_kw:
-        where.append(f"{extra['ven_nm']} LIKE ?")
-        params.append(f"%{ven_nm_kw}%")
-
-    if group_name_kw:
-        where.append(f"{extra['group_name']} LIKE ?")
-        params.append(f"%{group_name_kw}%")
-
-    if di_name_kw:
-        where.append(f"{extra['di_name']} LIKE ?")
-        params.append(f"%{di_name_kw}%")
-
-    if physic_gu_name_kw:
-        where.append(f"{extra['physic_gu_name']} LIKE ?")
-        params.append(f"%{physic_gu_name_kw}%")
-
-    if add_user_nm_kw:
-        where.append(f"{extra['add_user_nm']} LIKE ?")
-        params.append(f"%{add_user_nm_kw}%")
-
-    norm_add_from = _norm_date_from(add_date_from)
-    if norm_add_from:
-        where.append(f"a.{col_add_date} >= ?")
-        params.append(norm_add_from)
-
-    norm_add_to = _norm_date_to(add_date_to)
-    if norm_add_to:
-        where.append(f"a.{col_add_date} <= ?")
-        params.append(norm_add_to)
-
-    if mod_user_nm_kw:
-        where.append(f"{extra['mod_user_nm']} LIKE ?")
-        params.append(f"%{mod_user_nm_kw}%")
-
-    norm_mod_from = _norm_date_from(mod_date_from)
-    if norm_mod_from:
-        where.append(f"a.{col_mod_date} >= ?")
-        params.append(norm_mod_from)
-
-    norm_mod_to = _norm_date_to(mod_date_to)
-    if norm_mod_to:
-        where.append(f"a.{col_mod_date} <= ?")
-        params.append(norm_mod_to)
-
-    if unit_price_kw:
-        price_from, price_to = _parse_num_range(unit_price_kw)
-        if price_from is not None:
-            where.append("calc.unit_price >= ?")
-            params.append(price_from)
-        if price_to is not None:
-            where.append("calc.unit_price <= ?")
-            params.append(price_to)
-
-    if final_price_date_kw:
-        parts = re.split(r"\s*(?:~|-)\s*", final_price_date_kw, maxsplit=1)
-        raw_from = parts[0] if parts else ""
-        raw_to = parts[1] if len(parts) > 1 else raw_from
-
-        norm_final_from = _norm_date_from(raw_from)
-        norm_final_to = _norm_date_to(raw_to)
-
-        if norm_final_from:
-            where.append("calc.final_price_date >= ?")
-            params.append(norm_final_from)
-        if norm_final_to:
-            where.append("calc.final_price_date <= ?")
-            params.append(norm_final_to)
-
-    if keyword:
-        where.append(f"(a.{col_nm} LIKE ? OR a.{col_physic_cd} LIKE ? OR a.{col_insu_cd} LIKE ?)")
-        params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+    append_product_master_filter_clauses(
+        where,
+        params,
+        {
+            "physic_cd": physic_cd,
+            "product_keyword": keyword,
+            "insu_cd": insu_cd,
+            "barcode": barcode,
+            "maker_nm": ven_nm_kw,
+            "product_group_nm": group_name_kw,
+            "product_di_nm": di_name_kw,
+            "product_class_nm": physic_gu_name_kw,
+            "product_add_user_nm": add_user_nm_kw,
+            "product_add_date_from": add_date_from,
+            "product_add_date_to": add_date_to,
+            "product_mod_user_nm": mod_user_nm_kw,
+            "product_mod_date_from": mod_date_from,
+            "product_mod_date_to": mod_date_to,
+            "product_unit_price": unit_price_kw,
+            "product_final_price_date": final_price_date_kw,
+            "product_only_use": only_use,
+        },
+        expressions={
+            "use_gu": f"a.{col_use}",
+            "physic_cd": f"a.{col_physic_cd}",
+            "insu_cd": f"a.{col_insu_cd}",
+            "barcodes": tuple(
+                f"a.{column}" for column in (col_bar1, col_bar2, col_bar3, col_bar4, col_bar5)
+            ),
+            "maker_nm": extra["ven_nm"],
+            "product_group_nm": extra["group_name"],
+            "product_di_nm": extra["di_name"],
+            "product_class_nm": extra["physic_gu_name"],
+            "product_add_user_nm": extra["add_user_nm"],
+            "product_add_date": f"a.{col_add_date}",
+            "product_mod_user_nm": extra["mod_user_nm"],
+            "product_mod_date": f"a.{col_mod_date}",
+            "product_unit_price": "calc.unit_price",
+            "product_final_price_date": "calc.final_price_date",
+            "keyword": (f"a.{col_nm}", f"a.{col_physic_cd}", f"a.{col_insu_cd}"),
+        },
+    )
 
     where_sql = "WHERE " + " AND ".join(where)
 

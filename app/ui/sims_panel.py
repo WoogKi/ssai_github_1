@@ -238,18 +238,19 @@ def _normalize_zero_like_df(df: pd.DataFrame) -> pd.DataFrame:
             )
     return out
 
-def _is_large_table_for_fast_render(df: pd.DataFrame) -> bool:
+def _is_large_table_for_fast_render(
+    df: pd.DataFrame,
+    meta: Dict[str, Any] | None = None,
+) -> bool:
     """Styler 대신 빠른 st.dataframe 렌더를 쓸지 판단."""
     if df is None or df.empty:
         return False
 
-    try:
-        cells = int(len(df)) * int(len(df.columns))
-    except Exception:
-        return False
-
-    threshold = int(os.getenv("SIMS_FAST_TABLE_CELL_THRESHOLD", "6000"))
-    return cells >= threshold
+    return resolve_sims_table_mode(
+        df,
+        render_path="panel",
+        meta=meta,
+    ).get("mode") == "fast"
 
 
 def _is_fast_numeric_column(df: pd.DataFrame, col: str) -> bool:
@@ -1187,6 +1188,7 @@ from app.ui.chat_middleware import (
 from app.ui.sims_table_display import (
     build_sims_table_display_config,
     normalize_display_df_for_streamlit,
+    resolve_sims_table_mode,
 )
 
 from app.ui.ssai_login import require_permission
@@ -1263,6 +1265,14 @@ _CATEGORIES: Dict[str, Dict[str, Any]] = {
         }
     },
 }
+
+from app.sims.meta.erp_table_feature_registry import iter_action_specs, resolve_dotted_callable
+
+for _feature, _action_spec in iter_action_specs():
+    _category = _CATEGORIES.setdefault(_feature.category, {"actions": {}})
+    _category.setdefault("actions", {})[_action_spec.action] = resolve_dotted_callable(
+        _action_spec.view_function
+    )
 
 # ==========================================================
 # 🧩 상태/초기화 유틸
@@ -1346,7 +1356,7 @@ def _clear_widget_keys_for(action: str, form_id: int) -> None:
         log.exception("[panel.main] clear widget keys failed")     
 
 def _current_action_payload_key(action: str) -> Optional[str]:
-    return {
+    payload_key = {
         "입고명세 조회": "__io110_last_payload",
         "출고명세 조회": "__io120_last_payload",
         "거래명세서 공통 조회": "__io130_last_payload",
@@ -1362,6 +1372,12 @@ def _current_action_payload_key(action: str) -> Optional[str]:
         "제품재고현황 조회": "__io260_last_payload",
         "제품재고현황": "__io260_last_payload",
     }.get(str(action or "").strip())
+    if payload_key:
+        return payload_key
+    from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+    registered = get_action_spec(action)
+    return registered[1].payload_key if registered else None
 
 
 def _clear_current_action_payload(action: str) -> None:
@@ -1540,6 +1556,18 @@ def _panel_action_key(category: str, action: str) -> str:
     return f"{str(category or '').strip()}::{str(action or '').strip()}"
 
 
+def _panel_payload_action(payload: Mapping[str, Any], fallback: str = "") -> str:
+    """Keep a completed payload bound to the action that produced its table."""
+    meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    return str(
+        payload.get("action")
+        or meta.get("action")
+        or fallback
+        or payload.get("title")
+        or ""
+    ).strip()
+
+
 def _remember_panel_final_payload(payload: Dict[str, Any], category: str, action: str) -> None:
     """
     패널 최종 조회 결과를 세션에 보관한다.
@@ -1557,9 +1585,10 @@ def _remember_panel_final_payload(payload: Dict[str, Any], category: str, action
 
         _panel_stamp_payload_company(payload)
 
-        key = _panel_action_key(category, action)
+        canonical_action = _panel_payload_action(payload, action)
+        key = _panel_action_key(category, canonical_action)
         st.session_state["__sims_panel_last_final_action"] = key
-        st.session_state["__sims_panel_last_final_payload"] = payload
+        st.session_state["__sims_panel_last_final_payload"] = dict(payload)
     except Exception:
         log.exception("[panel] remember last final payload failed")
 
@@ -1636,16 +1665,21 @@ def _store_panel_final_payload_for_chat(payload: Dict[str, Any], action: str) ->
         if not isinstance(payload, dict):
             return
 
+        payload = dict(payload)
+        payload["meta"] = dict(payload.get("meta") or {})
+        canonical_action = _panel_payload_action(payload, action)
+        payload["action"] = canonical_action
+        payload["meta"]["action"] = canonical_action
         _panel_stamp_payload_company(payload)
         try:
             meta = payload.setdefault("meta", {})
             if isinstance(meta, dict):
-                meta["_panel_source_sig"] = _make_panel_source_sig(action, payload)
+                meta["_panel_source_sig"] = _make_panel_source_sig(canonical_action, payload)
         except Exception:
             pass
 
         st.session_state["__sims_last_final_payload_for_chat"] = payload
-        st.session_state["__sims_last_final_payload_for_chat_action"] = str(action or payload.get("action") or "")
+        st.session_state["__sims_last_final_payload_for_chat_action"] = canonical_action
     except Exception:
         log.exception("[panel] store final payload for chat failed")
 
@@ -1656,6 +1690,20 @@ def _panel_chat_push_already_consumed(panel_source_sig: str) -> bool:
         return bool(sig and st.session_state.get("__sims_panel_chat_pushed_source_sig") == sig)
     except Exception:
         return False
+
+
+def _panel_bounded_source_limit_hit(meta: Mapping[str, Any], loaded_rows: int) -> bool:
+    try:
+        limit_rows = int(meta.get("full_source_limit_rows") or 0)
+    except (TypeError, ValueError):
+        limit_rows = 0
+    truncated = meta.get("full_source_truncated")
+    return bool(
+        meta.get("full_source_limit_hit") is True
+        and limit_rows > 0
+        and int(loaded_rows or 0) >= limit_rows
+        and truncated not in (False, None, "", "false", "False")
+    )
 
 
 def _render_panel_chat_only_done(payload: Dict[str, Any], action: str) -> None:
@@ -1702,7 +1750,13 @@ def _render_panel_chat_only_done(payload: Dict[str, Any], action: str) -> None:
         loaded_rows = 0
         display_rows = 0
 
-    if db_total_rows and loaded_rows and db_total_rows > loaded_rows:
+    meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    if loaded_rows and _panel_bounded_source_limit_hit(meta, loaded_rows):
+        st.success(
+            f"조회 완료: {loaded_rows:,}건 조회 · 안전 한도 도달 · 전체 건수 미확인. "
+            f"채팅창에는 {display_rows:,}건 표시했습니다."
+        )
+    elif db_total_rows and loaded_rows and db_total_rows > loaded_rows:
         st.success(
             f"조회 완료: 조건 전체 {db_total_rows:,}건 중 {loaded_rows:,}건을 조회했습니다. "
             f"채팅창에는 {display_rows:,}건 표시했습니다. "
@@ -1853,7 +1907,9 @@ def _render_compact_panel_result_placeholder(
     display_cols = int(len(df_disp.columns)) if isinstance(df_disp, pd.DataFrame) else 0
     full_cols = int(len(df_full.columns)) if isinstance(df_full, pd.DataFrame) else display_cols
 
-    if full_rows > display_rows:
+    if _panel_bounded_source_limit_hit(meta, full_rows):
+        count_text = f"{full_rows:,}건 조회(안전 한도 도달 · 전체 건수 미확인), 화면 {display_rows:,}건"
+    elif full_rows > display_rows:
         count_text = f"전체 {full_rows:,}건 중 화면 {display_rows:,}건"
     else:
         count_text = f"{display_rows:,}건"
@@ -2190,7 +2246,12 @@ def _render_panel_result_count_caption(payload: Dict[str, Any], df_disp: pd.Data
     except Exception:
         limit = 0
 
-    if full_count > display_count:
+    if _panel_bounded_source_limit_hit(meta, full_count):
+        st.caption(
+            f"조회결과: {full_count:,}건 조회 · 안전 한도 도달 · 전체 건수 미확인"
+            + (f" · 화면 {display_count:,}건 표시" if display_count < full_count else "")
+        )
+    elif full_count > display_count:
         st.caption(
             f"조회결과: 전체 {full_count:,}건 중 화면 {display_count:,}건 표시"
             + (f" / 화면 조회건수 {limit:,}건" if limit > 0 else "")
@@ -2261,7 +2322,12 @@ def _render_panel_result_compact_header(payload: Dict[str, Any], action: str, ti
         query_summary = " / ".join(parts)
 
     full_rows, display_rows, expected_rows = _panel_result_header_rows(payload, df_disp)
-    if expected_rows and full_rows and expected_rows > full_rows:
+    bounded_limit_hit = _panel_bounded_source_limit_hit(meta, full_rows)
+    if bounded_limit_hit:
+        line1 = f"결과: {full_rows:,}건 조회 · 안전 한도 도달 · 전체 건수 미확인"
+        if display_rows and display_rows < full_rows:
+            line1 += f" · 표 데이터 {display_rows:,}건"
+    elif expected_rows and full_rows and expected_rows > full_rows:
         line1 = f"결과: 조건 전체 {expected_rows:,}건 · 조회 {full_rows:,}건"
         if display_rows and display_rows < full_rows:
             line1 += f" · 표 데이터 {display_rows:,}건"
@@ -2286,7 +2352,7 @@ def _render_panel_result_compact_header(payload: Dict[str, Any], action: str, ti
         ("조회명", title or action),
         ("조회시각", meta.get("created_at") or meta.get("timestamp") or meta.get("ts") or payload.get("time")),
         ("전체 조회조건", query_summary),
-        ("전체 결과 행수", f"{full_rows:,}건" if full_rows else ""),
+        ("조회된 결과 행수" if bounded_limit_hit else "전체 결과 행수", f"{full_rows:,}건" if full_rows else ""),
         ("표시 행수", f"{display_rows:,}건" if display_rows else ""),
         ("다운로드 행수", f"{int(meta.get('download_row_count') or full_rows):,}건" if (meta.get("download_row_count") or full_rows) else ""),
         ("현재표 후속질문", "가능" if meta.get("table_key") else ""),
@@ -2355,13 +2421,7 @@ def _stash_panel_table_for_current_followup(
             full_rows = int(len(df_full)) if isinstance(df_full, pd.DataFrame) else 0
             expected_rows = _expected_analysis_row_count(meta, max(display_rows, full_rows))
 
-            action_for_export = str(
-                action
-                or payload.get("action")
-                or meta.get("action")
-                or payload.get("title")
-                or ""
-            ).strip()
+            action_for_export = _panel_payload_action(payload, action)
 
             is_validation_action = "검증" in action_for_export
 
@@ -2386,13 +2446,7 @@ def _stash_panel_table_for_current_followup(
                 and isinstance(df_disp, pd.DataFrame)
                 and not df_disp.empty
             ):
-                action_for_export = str(
-                    action
-                    or payload.get("action")
-                    or meta.get("action")
-                    or payload.get("title")
-                    or ""
-                ).strip()
+                action_for_export = _panel_payload_action(payload, action)
 
                 item_for_export = {
                     "action": action_for_export,
@@ -2476,7 +2530,7 @@ def _stash_panel_table_for_current_followup(
         ss["__sims_export_tables_by_key"][table_key] = df_full
 
         ss["__sims_last_table_key"] = table_key
-        ss["__sims_last_table_action"] = str(action or payload.get("action") or payload.get("title") or "")
+        ss["__sims_last_table_action"] = _panel_payload_action(payload, action)
         ss["__sims_current_table_source_key"] = table_key
         ss["__sims_current_table_source_action"] = ss["__sims_last_table_action"]
 
@@ -3732,8 +3786,17 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                         True,
                     )
 
+                    from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+                    table_value = view_df
+                    if get_action_spec(action):
+                        table_value = _build_io_display_styler(
+                            view_df,
+                            add_row_no=False,
+                            band_size=5,
+                        )
                     st.dataframe(
-                        view_df,
+                        table_value,
                         width="stretch",
                         hide_index=True,
                         height=table_height,
@@ -3991,9 +4054,9 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                 if is_sales_trend_payload:
                     _render_simple_analysis_header(payload)
 
-                    table_mode_info = {"mode": "fast" if _is_large_table_for_fast_render(view_df) else "small"}
+                    table_mode_info = {"mode": "fast" if _is_large_table_for_fast_render(view_df, meta) else "small"}
                     try:
-                        table_mode_info = log_sims_table_mode(view_df, action=action, render_path="panel")
+                        table_mode_info = log_sims_table_mode(view_df, action=action, render_path="panel", meta=meta)
                     except Exception:
                         log.debug("[sims.table_mode] panel log failed", exc_info=True)
                     if str(table_mode_info.get("mode") or "") == "fast":
@@ -4053,7 +4116,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                                 column_config=column_config if column_config else None,
                             )
                 else:
-                    if _is_large_table_for_fast_render(view_df):
+                    if _is_large_table_for_fast_render(view_df, meta):
                         st.caption("빠른 표 모드: 큰 표는 속도를 위해 셀 색상/굵은 글씨 서식을 생략합니다.")
                         _render_fast_dataframe(
                             view_df,
@@ -4062,8 +4125,17 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                             meta=meta,
                         )
                     else:
+                        from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+                        table_value = view_df
+                        if get_action_spec(action):
+                            table_value = _build_io_display_styler(
+                                view_df,
+                                add_row_no=False,
+                                band_size=5,
+                            )
                         st.dataframe(
-                            view_df,
+                            table_value,
                             width=table_width,
                             hide_index=True,
                             height=420,

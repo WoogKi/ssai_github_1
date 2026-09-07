@@ -27,6 +27,11 @@ from app.sims.views.rddbc_io_flow_views import (
 from app.sims.views.rddbc_io_inventory_views import (
     view_product_inventory,
 )
+from app.sims.views.rddbc_io_contract_views import (
+    view_rddbc070_history,
+    view_rddbc070_current,
+)
+from app.sims.views.rddbc_io_stock_cost_views import view_rddbc230
 
 __all__ = [
     "view_rddbc040",
@@ -42,4 +47,7 @@ __all__ = [
     "view_rddbc120_tax_check",
     "view_product_flow",
     "view_product_inventory",
+    "view_rddbc070_history",
+    "view_rddbc070_current",
+    "view_rddbc230",
 ]

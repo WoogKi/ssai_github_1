@@ -137,6 +137,15 @@ def get_required_permission(
     if action_text in ACTION_PERMISSION_MAP:
         return ACTION_PERMISSION_MAP[action_text]
 
+    try:
+        from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+        registered = get_action_spec(action_text)
+        if registered:
+            return registered[0].required_permission
+    except Exception:
+        pass
+
     if category_text in CATEGORY_PERMISSION_MAP:
         return CATEGORY_PERMISSION_MAP[category_text]
 

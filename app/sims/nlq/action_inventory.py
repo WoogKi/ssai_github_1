@@ -127,6 +127,24 @@ CANONICAL_ACTIONS: tuple[CanonicalAction, ...] = (
 )
 
 
+def _registered_erp_table_actions() -> tuple[CanonicalAction, ...]:
+    from app.sims.meta.erp_table_feature_registry import iter_action_specs
+
+    return tuple(
+        _spec(
+            action_spec.action,
+            feature.category,
+            nlq_aliases=action_spec.aliases,
+            handler_kind="erp_table",
+            handler_target=action_spec.service_function,
+        )
+        for feature, action_spec in iter_action_specs()
+    )
+
+
+CANONICAL_ACTIONS = CANONICAL_ACTIONS + _registered_erp_table_actions()
+
+
 IO_VIEW_FALLBACK_TARGETS = {
     "입고명세 조회": "view_rddbc110",
     "출고명세 조회": "view_rddbc120",
@@ -141,6 +159,11 @@ IO_VIEW_FALLBACK_TARGETS = {
     "제품수불현황 조회": "view_product_flow",
     "제품재고현황 조회": "view_product_inventory",
 }
+
+from app.sims.meta.erp_table_feature_registry import iter_action_specs
+
+for _feature, _action in iter_action_specs():
+    IO_VIEW_FALLBACK_TARGETS[_action.action] = _action.view_function.rsplit(".", 1)[-1]
 
 
 def implemented_actions() -> tuple[CanonicalAction, ...]:

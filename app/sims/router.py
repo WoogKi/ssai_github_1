@@ -52,6 +52,11 @@ def run_sims_action(action: str):
     a = _canon_action(action)
     log.info("[router] in: %r -> canon: %r", action, a)
     try:
+        from app.sims.meta.erp_table_feature_registry import get_action_spec, resolve_dotted_callable
+
+        registered = get_action_spec(a)
+        if registered:
+            return resolve_dotted_callable(registered[1].view_function)()
         # Dashboard
         if a == "월별 매출":
             return dashboard.render_monthly_sales()

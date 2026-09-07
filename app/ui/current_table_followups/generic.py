@@ -879,7 +879,12 @@ def _trend_sort_key(value: Any) -> int:
     return order.get(str(value or "").strip(), 99)
 
 
-def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+def _build_common_group_summary(
+    df: pd.DataFrame,
+    group_col: str,
+    *,
+    include_numeric_sums: bool = True,
+) -> pd.DataFrame:
     work = df.copy()
     if _norm_col_name(group_col) in {"출고빈도", "출고빈도등급"}:
         grade_values = work[group_col].fillna("").astype(str).str.strip()
@@ -910,24 +915,25 @@ def _build_common_group_summary(df: pd.DataFrame, group_col: str) -> pd.DataFram
     out[ratio_label] = pd.to_numeric(ratio_basis, errors="coerce").fillna(0) / total_basis * 100
 
     sum_cols: list[str] = []
-    for col in [str(c) for c in work.columns]:
-        if col == group_col or col in out.columns or col in _COMMON_FILTER_SKIP_COLUMNS:
-            continue
-        if not _is_sum_candidate_column(col):
-            continue
-        nums = _to_numeric_for_common_filter(work[col])
-        if nums.notna().sum() <= 0:
-            continue
-        work[f"__sum_{len(sum_cols)}"] = nums
-        out[col] = g[f"__sum_{len(sum_cols)}"].sum().values
-        sum_cols.append(col)
+    if include_numeric_sums:
+        for col in [str(c) for c in work.columns]:
+            if col == group_col or col in out.columns or col in _COMMON_FILTER_SKIP_COLUMNS:
+                continue
+            if not _is_sum_candidate_column(col):
+                continue
+            nums = _to_numeric_for_common_filter(work[col])
+            if nums.notna().sum() <= 0:
+                continue
+            work[f"__sum_{len(sum_cols)}"] = nums
+            out[col] = g[f"__sum_{len(sum_cols)}"].sum().values
+            sum_cols.append(col)
 
     progress_pairs = [
         ("당월 현재매출", "당월 예상매출", "당월 진척률"),
         ("평가월 매출", "평가월 예상매출", "평가월 진척률"),
         ("월시점 실제매출", "월시점 예상매출", "월시점 달성률"),
     ]
-    for actual_col, expected_col, progress_col in progress_pairs:
+    for actual_col, expected_col, progress_col in (progress_pairs if include_numeric_sums else ()):
         if actual_col in work.columns and expected_col in work.columns:
             work["__actual_for_progress"] = _to_numeric_for_common_filter(work[actual_col])
             work["__expected_for_progress"] = _to_numeric_for_common_filter(work[expected_col])
@@ -1116,7 +1122,24 @@ def handle_common_column_group_followup(
     if not callable(push_table):
         return False
 
-    out = _build_common_group_summary(df, group_col)
+    count_only = bool(helpers.get("_common_group_count_only"))
+    if count_only:
+        compact = _compact(t)
+        for column in [str(c) for c in df.columns]:
+            if column == group_col or not _is_sum_candidate_column(column):
+                continue
+            if _norm_col_name(column) not in compact:
+                continue
+            if _to_numeric_for_common_filter(df[column]).notna().any():
+                # The source does not define a default aggregation for price
+                # columns.  An explicit price metric must stay fail-closed.
+                return False
+
+    out = _build_common_group_summary(
+        df,
+        group_col,
+        include_numeric_sums=not count_only,
+    )
     has_top, rank_limit = _common_rank_limit(t, top_n)
     metric_col = ""
     metric_label = ""

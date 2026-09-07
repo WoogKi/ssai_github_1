@@ -27,6 +27,7 @@ from app.sims.nlq.action_inventory import (  # noqa: E402
 )
 from app.services.io_nlq import get_nlq_period_action_class, resolve_io_nlq  # noqa: E402
 from app.sims.nlq.nlq_router import resolve_new_sims_nlq_candidate  # noqa: E402
+from app.sims.meta.erp_table_feature_registry import iter_action_specs  # noqa: E402
 
 
 def _fail(message: str) -> None:
@@ -70,6 +71,8 @@ def _literal_categories() -> dict[str, list[str]]:
                 _fail(f"{category_key.value}: action label이 문자열 literal이 아닙니다.")
             labels.append(action_key.value)
         categories[category_key.value] = labels
+    for feature, action in iter_action_specs():
+        categories.setdefault(feature.category, []).append(action.action)
     return categories
 
 
@@ -86,10 +89,11 @@ def _check_panel_inventory() -> None:
     panel_labels = [label for labels in panel_categories.values() for label in labels]
     inventory_labels = list(all_panel_labels())
 
-    if len(panel_labels) != 39:
-        _fail(f"panel label 수가 예상과 다릅니다: {len(panel_labels)} != 39")
-    if len(CANONICAL_ACTIONS) != 35:
-        _fail(f"canonical action 수가 예상과 다릅니다: {len(CANONICAL_ACTIONS)} != 35")
+    registered_count = len(iter_action_specs())
+    if len(panel_labels) != 39 + registered_count:
+        _fail(f"panel label 수가 예상과 다릅니다: {len(panel_labels)} != {39 + registered_count}")
+    if len(CANONICAL_ACTIONS) != 35 + registered_count:
+        _fail(f"canonical action 수가 예상과 다릅니다: {len(CANONICAL_ACTIONS)} != {35 + registered_count}")
     if len(set(panel_labels)) != len(panel_labels):
         _fail("panel action label에 중복이 있습니다.")
     if len(set(inventory_labels)) != len(inventory_labels):
@@ -124,7 +128,8 @@ def _check_statuses() -> None:
         for spec in CANONICAL_ACTIONS
         if spec.implementation_status not in {IMPLEMENTED, DASHBOARD_ONLY}
     ]
-    if len(implemented) != 34 or len(dashboard_only) != 1 or other:
+    expected_implemented = 34 + len(iter_action_specs())
+    if len(implemented) != expected_implemented or len(dashboard_only) != 1 or other:
         _fail(
             "implementation status count 불일치: "
             f"implemented={len(implemented)}, dashboard_only={len(dashboard_only)}, other={len(other)}"
@@ -151,7 +156,7 @@ def _check_handler_coverage() -> None:
     io_specs = {
         spec.canonical_action
         for spec in CANONICAL_ACTIONS
-        if spec.handler_kind == "io_service"
+        if spec.handler_kind in {"io_service", "erp_table"}
     }
     if set(IO_VIEW_FALLBACK_TARGETS) != io_specs:
         _fail("IO fallback action set이 canonical IO action set과 다릅니다.")
@@ -219,6 +224,11 @@ def _check_period_policy_classification() -> None:
         actual = get_nlq_period_action_class(spec.canonical_action)
         if spec.handler_kind == "analytics":
             wanted = "aggregate_analysis"
+        elif spec.handler_kind == "erp_table":
+            from app.sims.meta.erp_table_feature_registry import get_action_spec
+
+            registered = get_action_spec(spec.canonical_action)
+            wanted = registered[1].nlq_period_policy if registered else "list_detail"
         elif spec.handler_kind in {"io_service", "io_alias"}:
             wanted = expected.get(spec.canonical_action, "list_detail")
         else:
@@ -254,7 +264,8 @@ def main() -> int:
     print(
         "RESULT: OK "
         f"(canonical_actions={len(CANONICAL_ACTIONS)}, panel_labels={len(all_panel_labels())}, "
-        "implemented=34, dashboard_only=1, aliases=6)"
+        f"implemented={len([spec for spec in CANONICAL_ACTIONS if spec.implementation_status == IMPLEMENTED])}, "
+        "dashboard_only=1, aliases=6)"
     )
     return 0
 

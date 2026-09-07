@@ -31,6 +31,7 @@ from app.ui.sims_table_display import (
     normalize_display_df_for_streamlit,
     is_sims_numeric_display_col,
     prepare_sims_table_display_df,
+    resolve_sims_table_mode,
     resolve_sims_excel_number_format,
     resolve_sims_numeric_display_kind,
 )
@@ -684,18 +685,19 @@ def _apply_chat_analysis_grade_style(styler, df: pd.DataFrame):
 
 # 채팅 표에서 Styler 대신 빠른 st.dataframe 렌더를 쓸지 판단하는 함수
 # - 셀 수가 너무 많으면 Styler 렌더링이 너무 느려질 수 있으므로, cell 수 기준으로 빠른 렌더링 여부를 판단한다.
-def _chat_is_large_table_for_fast_render(df: pd.DataFrame) -> bool:
+def _chat_is_large_table_for_fast_render(
+    df: pd.DataFrame,
+    meta: Dict[str, Any] | None = None,
+) -> bool:
     """채팅 표에서 Styler 대신 빠른 st.dataframe 렌더를 쓸지 판단."""
     if df is None or df.empty:
         return False
 
-    try:
-        cells = int(len(df)) * int(len(df.columns))
-    except Exception:
-        return False
-
-    threshold = int(os.getenv("SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD", os.getenv("SIMS_FAST_TABLE_CELL_THRESHOLD", "6000")))
-    return cells >= threshold
+    return resolve_sims_table_mode(
+        df,
+        render_path="chat",
+        meta=meta,
+    ).get("mode") == "fast"
 
 
 def _chat_is_current_followup_fast_table(df: pd.DataFrame, meta: Dict[str, Any] | None = None) -> bool:
@@ -1034,7 +1036,12 @@ def _render_chat_fast_dataframe(
     display_limit = _chat_display_max_rows()
     render_truncated = bool(display_limit > 0 and full_rows > display_rows)
 
-    if render_truncated:
+    if render_truncated and _sims_bounded_source_limit_hit(meta or {}, full_rows):
+        st.caption(
+            f"조회된 {full_rows:,}건 중 처음 {display_rows:,}건만 화면에 표시합니다. "
+            "안전 한도에 도달해 전체 건수는 확인되지 않았습니다."
+        )
+    elif render_truncated:
         st.caption(
             f"전체 {full_rows:,}건 중 처음 {display_rows:,}건만 화면에 표시합니다. "
             "전체 자료는 Excel 또는 CSV 다운로드를 이용하세요."
@@ -4580,6 +4587,22 @@ def _record_io_full_source_query_meta(meta: Dict[str, Any]) -> None:
     meta["source_call_count"] = current + 1
     meta["full_source_query_count"] = int(meta.get("full_source_query_count") or 0) + 1
 
+
+def _canonical_sims_action(
+    item: Dict[str, Any],
+    meta: Dict[str, Any],
+    requested_action: Any = "",
+) -> str:
+    """Prefer the action embedded by the producer over a later UI selection."""
+    return str(
+        item.get("action")
+        or meta.get("action")
+        or requested_action
+        or item.get("title")
+        or ""
+    ).strip()
+
+
 def _download_source_context(
     item: Dict[str, Any],
     meta: Dict[str, Any],
@@ -4603,7 +4626,7 @@ def _download_source_context(
             item.get("_ssai_company_id"), item.get("company_id"), runtime.get("company_id"),
         ),
         "room_id": _first(meta.get("room_id"), item.get("room_id"), runtime.get("room_id")),
-        "action": _first(meta.get("action"), item.get("action"), item.get("title")),
+        "action": _canonical_sims_action(item, meta),
         "table_key": _first(table_key, meta.get("download_table_key"), meta.get("table_key"), item.get("table_key")),
         "event_id": _first(meta.get("dashboard_event_id"), item.get("id")),
     }
@@ -4639,7 +4662,19 @@ def _stash_sims_export_provenance(
     provenance["rows"] = int(len(export_df))
     try:
         st.session_state.setdefault("__sims_export_table_provenance_by_key", {})
-        st.session_state["__sims_export_table_provenance_by_key"][table_key] = provenance
+        store = st.session_state["__sims_export_table_provenance_by_key"]
+        existing = store.get(table_key) if isinstance(store, dict) else None
+        existing_action = str((existing or {}).get("action") or "").strip()
+        new_action = str(provenance.get("action") or "").strip()
+        if existing_action and new_action and existing_action != new_action:
+            log.warning(
+                "[chat.download.provenance] action overwrite blocked table_key=%s existing=%s requested=%s",
+                table_key,
+                existing_action,
+                new_action,
+            )
+            return
+        store[table_key] = provenance
     except Exception:
         log.warning("[chat.download.provenance] export provenance cache failed")
 
@@ -4874,7 +4909,28 @@ def _get_full_download_df_for_sims_item(
     if not isinstance(display_df, pd.DataFrame) or display_df.empty:
         return display_df
 
-    action = str(item.get("action") or meta.get("action") or item.get("title") or "").strip()
+    action = _canonical_sims_action(item, meta)
+    table_key_for_action = str(meta.get("table_key") or item.get("table_key") or "").strip()
+    provenance_store = st.session_state.get("__sims_export_table_provenance_by_key")
+    provenance = (
+        provenance_store.get(table_key_for_action)
+        if table_key_for_action and isinstance(provenance_store, dict)
+        else None
+    )
+    source_action = str((provenance or {}).get("action") or "").strip()
+    if source_action and action and source_action != action:
+        log.warning(
+            "[chat.download.source] action mismatch corrected table_key=%s payload=%s source=%s",
+            table_key_for_action,
+            action,
+            source_action,
+        )
+        action = source_action
+        item = dict(item)
+        item["action"] = source_action
+        meta = dict(meta)
+        meta["action"] = source_action
+        item["meta"] = meta
     detail_perf_started = time.perf_counter()
     applied_download_limit_rows = 0
     if action == "출고명세 조회":
@@ -4931,6 +4987,16 @@ def _get_full_download_df_for_sims_item(
         "실재고월집계 조회",
         "장부재고월집계 조회",
     }
+    registered_export = None
+    try:
+        from app.sims.meta.erp_table_feature_registry import get_action_spec, resolve_dotted_callable
+
+        registered_action = get_action_spec(action)
+        if registered_action:
+            export_actions.add(action)
+            registered_export = resolve_dotted_callable(registered_action[1].export_function)
+    except Exception:
+        registered_export = None
 
     is_in_validation_action = "검증" in action and "입고" in action
     is_out_validation_action = "검증" in action and "출고" in action
@@ -5196,6 +5262,10 @@ def _get_full_download_df_for_sims_item(
             _log_io_detail_perf("full_source_service_start")
             export_df = get_rddbc220_export_df(params)
 
+        elif callable(registered_export):
+            _log_io_detail_perf("full_source_service_start")
+            export_df = registered_export(params)
+
         elif is_in_validation_action:
             from app.services.rddbc110_service import get_rddbc110_export_df
 
@@ -5215,7 +5285,7 @@ def _get_full_download_df_for_sims_item(
         if action in {
             "입고명세 조회", "출고명세 조회", "거래명세서 공통 조회", "세금계산서 공통 조회",
             "실재고월집계 조회", "장부재고월집계 조회",
-        } or is_in_validation_action or is_out_validation_action:
+        } or callable(registered_export) or is_in_validation_action or is_out_validation_action:
             _record_io_full_source_query_meta(meta)
 
         _log_io_detail_perf(
@@ -7097,15 +7167,17 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
 
     # 2) 액션명/타이틀 보강
     meta = dict(payload.get("meta") or {})
-    if action:
-        meta["action"] = action
-    action_name = (
-        action
-        or meta.get("action")
-        or payload.get("title")
-        or "SIMS"
-    )
-    meta.setdefault("action", action_name)
+    payload_action = _canonical_sims_action(payload, meta)
+    action_name = _canonical_sims_action(payload, meta, action) or "SIMS"
+    if payload_action and action and payload_action != str(action).strip():
+        log.warning(
+            "[chat.sims.push] action override blocked table_key=%s payload=%s requested=%s",
+            str(meta.get("table_key") or "").strip(),
+            payload_action,
+            str(action).strip(),
+        )
+    payload["action"] = action_name
+    meta["action"] = action_name
     meta.setdefault("table_role", _sims_table_role_from_action(action_name, meta))
     payload["meta"] = meta
 
@@ -8505,7 +8577,7 @@ def _chat_is_io_summary_action(action_name: str) -> bool:
         key in action
         for key in [
             "입고명세", "출고명세", "거래명세서", "세금계산서",
-            "월집계", "제품수불", "제품재고", "검증",
+            "월집계", "제품수불", "제품재고", "계약단가", "검증",
         ]
     )
 
@@ -9147,6 +9219,20 @@ def _summary_condition_text_for_cleanup(
     return str(caption_cond_text or "").strip()
 
 
+def _sims_bounded_source_limit_hit(meta: Dict[str, Any], loaded_rows: int) -> bool:
+    try:
+        limit_rows = int(meta.get("full_source_limit_rows") or 0)
+    except (TypeError, ValueError):
+        limit_rows = 0
+    truncated = meta.get("full_source_truncated")
+    return bool(
+        meta.get("full_source_limit_hit") is True
+        and limit_rows > 0
+        and int(loaded_rows or 0) >= limit_rows
+        and truncated not in (False, None, "", "false", "False")
+    )
+
+
 def _build_sims_result_header_view(
     item: Dict[str, Any],
     meta: Dict[str, Any],
@@ -9172,8 +9258,13 @@ def _build_sims_result_header_view(
     query_summary, full_condition = _sims_query_summary_for_header(item, safe_meta)
 
     status_suffix = " · 표시 데이터 만료" if expired else ""
+    bounded_limit_hit = _sims_bounded_source_limit_hit(safe_meta, full_rows)
     if str(safe_meta.get("entity_resolution_status") or "") == "resolution_unavailable":
         line1 = "조회 조건 확인 필요"
+    elif bounded_limit_hit:
+        line1 = f"결과: {full_rows:,}건 조회 · 안전 한도 도달 · 전체 건수 미확인"
+        if display_rows and display_rows < full_rows:
+            line1 += f" · 표 데이터 {display_rows:,}건"
     elif expected_rows and full_rows and expected_rows > full_rows:
         line1 = f"결과: 조건 전체 {expected_rows:,}건 · 조회 {full_rows:,}건"
         if display_rows and display_rows < full_rows:
@@ -9226,7 +9317,11 @@ def _build_sims_result_header_view(
     if expected_rows and expected_rows != full_rows:
         _sims_detail_add(details, "조건 전체 행수", f"{expected_rows:,}건")
     if full_rows:
-        _sims_detail_add(details, "전체 결과 행수", f"{full_rows:,}건")
+        _sims_detail_add(
+            details,
+            "조회된 결과 행수" if bounded_limit_hit else "전체 결과 행수",
+            f"{full_rows:,}건",
+        )
     if display_rows:
         _sims_detail_add(details, "표시 행수", f"{display_rows:,}건")
     if download_rows:
@@ -10040,17 +10135,17 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                 return
 
-            is_io_table = any(
+            is_io_table = bool(meta.get("registered_erp_table")) or any(
                 k in action_name
                 for k in (
                     "입고", "출고", "거래명세서", "세금계산서",
-                    "실재고", "장부재고", "제품수불현황", "제품재고현황", "검증",
+                    "실재고", "장부재고", "제품수불현황", "제품재고현황", "계약단가", "검증",
                 )
             )
 
             if is_io_table:
                 try:
-                    if (is_nlq_table or is_stock_io_table) and _chat_is_large_table_for_fast_render(data):
+                    if (is_nlq_table or is_stock_io_table) and _chat_is_large_table_for_fast_render(data, meta):
                         if is_stock_io_table:
                             _chat_log_stock_table_render(
                                 action_name=action_name,
@@ -10197,9 +10292,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                         table_render_path = str(st.session_state.get("__sims_table_render_path") or "chat")
                         current_followup_fast = _chat_is_current_followup_fast_table(render_df, meta)
-                        table_mode_info = {"mode": "fast" if (current_followup_fast or _chat_is_large_table_for_fast_render(render_df)) else "small"}
+                        table_mode_info = {"mode": "fast" if (current_followup_fast or _chat_is_large_table_for_fast_render(render_df, meta)) else "small"}
                         try:
-                            table_mode_info = log_sims_table_mode(render_df, action=action_name, render_path=table_render_path)
+                            table_mode_info = log_sims_table_mode(render_df, action=action_name, render_path=table_render_path, meta=meta)
                         except Exception:
                             log.debug("[sims.table_mode] chat log failed", exc_info=True)
                         is_large_analysis_table = current_followup_fast or str(table_mode_info.get("mode") or "") == "fast"
@@ -10311,7 +10406,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
                 else:
                     try:
-                        if is_nlq_table and _chat_is_large_table_for_fast_render(view_df):
+                        if is_nlq_table and _chat_is_large_table_for_fast_render(view_df, meta):
                             _chat_log_nlq_table_render(
                                 action_name=action_name,
                                 table_key=nlq_table_key,
@@ -10469,24 +10564,38 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     expected_rows=expected_rows,
                 )
 
+                bounded_download = _sims_bounded_source_limit_hit(meta, download_rows)
                 if (
                     download_source_status == "full"
                     and str(locals().get("file_generation_status") or "") == "deferred"
                 ):
-                    st.caption(
-                        f"전체 {download_rows:,}건의 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누르면 생성합니다. "
-                        f"현재 화면에는 {display_rows_for_download:,}건이 표시됩니다."
-                    )
+                    if bounded_download:
+                        st.caption(
+                            f"조회된 {download_rows:,}건의 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누르면 생성합니다. "
+                            "안전 한도에 도달해 전체 건수는 확인되지 않았습니다. "
+                            f"현재 화면에는 {display_rows_for_download:,}건이 표시됩니다."
+                        )
+                    else:
+                        st.caption(
+                            f"전체 {download_rows:,}건의 CSV/EXCEL 파일은 [Excel 다운로드 준비]를 누르면 생성합니다. "
+                            f"현재 화면에는 {display_rows_for_download:,}건이 표시됩니다."
+                        )
                 elif download_source_status == "partial_limit":
                     st.caption(
                         f"CSV/EXCEL 다운로드 기준: 준비된 원본 {download_rows:,}건 "
                         f"(전체 예상 {expected_rows:,}건)"
                     )
                 elif download_rows > display_rows_for_download:
-                    st.caption(
-                        f"CSV/EXCEL 다운로드 기준: 전체 조회조건 {download_rows:,}건 "
-                        f"(화면 표시 {display_rows_for_download:,}건)"
-                    )
+                    if bounded_download:
+                        st.caption(
+                            f"CSV/EXCEL 다운로드 기준: 조회된 {download_rows:,}건 "
+                            f"(안전 한도 도달 · 전체 건수 미확인 · 화면 표시 {display_rows_for_download:,}건)"
+                        )
+                    else:
+                        st.caption(
+                            f"CSV/EXCEL 다운로드 기준: 전체 조회조건 {download_rows:,}건 "
+                            f"(화면 표시 {display_rows_for_download:,}건)"
+                        )
                 elif expected_rows > download_rows:
                     st.caption(
                         f"CSV/EXCEL 다운로드 기준: {download_rows:,}건 "

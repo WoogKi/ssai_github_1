@@ -82,6 +82,13 @@ ACTIONS_REQUIRE_BUTTON = {
     "제품재고현황 조회",
 }
 
+from app.sims.meta.erp_table_feature_registry import iter_action_specs
+
+for _feature, _action in iter_action_specs():
+    ACTIONS_BY_CATEGORY.setdefault(_feature.category, [])
+    if _action.action not in ACTIONS_BY_CATEGORY[_feature.category]:
+        ACTIONS_BY_CATEGORY[_feature.category].append(_action.action)
+    ACTIONS_REQUIRE_BUTTON.add(_action.action)
+
 def requires_button(action: str) -> bool:
     return action in ACTIONS_REQUIRE_BUTTON
-
