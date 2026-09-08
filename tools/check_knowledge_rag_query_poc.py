@@ -53,7 +53,7 @@ class RetrievalCase:
 
 class _LegacyKeywordRepository(KnowledgeDocumentRepository):
     @staticmethod
-    def _score(query: str, source: Any, section: dict[str, str]) -> int:
+    def _score(query: str, source: Any, section: dict[str, str], **_: Any) -> int:
         terms = [term for term in re.split(r"\s+", query.casefold().strip()) if term]
         haystack = " ".join((source.source_name, source.source_key, section["title"], section["text"])).casefold()
         return sum(haystack.count(term) for term in terms)

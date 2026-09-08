@@ -30,6 +30,11 @@ PRODUCT_DI_SEMANTIC_GROUP_TERMS: dict[str, str] = {
     "OTC": "non_insurance",
 }
 
+PRODUCT_DI_SEMANTIC_NAME_PATTERNS: dict[str, tuple[str, ...]] = {
+    "insurance": ("보험", "보험(%", "%(보험)"),
+    "non_insurance": ("비보험", "비보험(%"),
+}
+
 
 def extract_product_di_semantic_group(text: Any) -> str:
     """Resolve an explicit upper product group without changing name-LIKE filters."""
@@ -46,6 +51,23 @@ def extract_product_di_semantic_group(text: Any) -> str:
         ):
             return group
     return ""
+
+
+def classify_product_di_business_semantic(product_di_cd: Any, product_di_nm: Any) -> str:
+    """Classify a company-owned product code by its authoritative code-master name."""
+    code = _text(product_di_cd)
+    name = _text(product_di_nm)
+    if not code or not name:
+        return ""
+    for semantic_group in ("non_insurance", "insurance"):
+        for pattern in PRODUCT_DI_SEMANTIC_NAME_PATTERNS[semantic_group]:
+            if (
+                (pattern.startswith("%") and name.endswith(pattern[1:]))
+                or (pattern.endswith("%") and name.startswith(pattern[:-1]))
+                or ("%" not in pattern and name == pattern)
+            ):
+                return semantic_group
+    return "other"
 
 
 def build_product_master_enrichment_sql(
@@ -199,15 +221,17 @@ def append_product_master_filter_clauses(
     add_like("product_group_nm", "product_group_nm")
     add_like("product_di_nm", "product_di_nm")
     semantic_group = values["product_di_semantic_group"]
-    product_di_cd = _text(expressions.get("product_di_cd"))
-    if semantic_group and product_di_cd:
-        numeric_product_di = (
-            "CASE WHEN LTRIM(RTRIM(ISNULL(" + product_di_cd + ", ''))) <> '' "
-            "AND LTRIM(RTRIM(ISNULL(" + product_di_cd + ", ''))) NOT LIKE '%[^0-9]%' "
-            "THEN CAST(LTRIM(RTRIM(" + product_di_cd + ")) AS INT) END"
+    product_di_nm = _text(expressions.get("product_di_nm"))
+    if semantic_group and product_di_nm:
+        normalized_name = f"LTRIM(RTRIM(ISNULL({product_di_nm}, '')))"
+        patterns = PRODUCT_DI_SEMANTIC_NAME_PATTERNS[semantic_group]
+        clauses.append(
+            "(" + " OR ".join(
+                f"{normalized_name} {'LIKE' if '%' in pattern else '='} ?"
+                for pattern in patterns
+            ) + ")"
         )
-        clauses.append(f"{numeric_product_di} {'<' if semantic_group == 'insurance' else '>='} ?")
-        bind_values.append(5)
+        bind_values.extend(patterns)
     add_like("product_class_nm", "product_class_nm")
     add_like("product_add_user_nm", "product_add_user_nm")
     add_like("product_mod_user_nm", "product_mod_user_nm")

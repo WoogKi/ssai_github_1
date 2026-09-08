@@ -19,6 +19,7 @@ from app.services.erp_table_query_service import (
 from app.services.product_master_filter_contract import (
     append_product_master_filter_clauses,
     build_product_master_enrichment_sql,
+    classify_product_di_business_semantic,
     normalize_product_master_filters,
 )
 
@@ -56,18 +57,6 @@ _GARBAGE_CANDIDATE_SQL: tuple[str, ...] = (
     "AND C.Rd07_Out_Amt = 0 AND C.Rd07_Out_Ramt = 0 AND C.Rd07_Out_Oamt = 0"
     ")",
 )
-
-PRODUCT_TYPE_LABELS: dict[str, str] = {
-    "1": "일반약(보험)",
-    "2": "수입약(보험)",
-    "3": "전문약(보험)",
-    "5": "일반비보험",
-    "6": "수입약",
-    "7": "소모품",
-    "8": "원료약품",
-}
-INSURANCE_PRODUCT_TYPES = frozenset({"1", "2", "3"})
-NON_INSURANCE_PRODUCT_TYPES = frozenset({"5", "6", "7", "8"})
 
 _CONTRACT_PRICE_COLUMN = {
     ("inbound", "real"): "실입고단가",
@@ -188,6 +177,7 @@ def resolve_contract_price(
     direction: str,
     price_basis: str,
     product_type: Any,
+    product_type_name: Any = None,
     transaction_insurance_price: Any = None,
     last_purchase_price: Any = None,
 ) -> dict[str, Any]:
@@ -215,7 +205,10 @@ def resolve_contract_price(
         }
 
     product_type_code = _clean(product_type)
-    if product_type_code in INSURANCE_PRODUCT_TYPES:
+    product_type_semantic = classify_product_di_business_semantic(
+        product_type_code, product_type_name
+    )
+    if product_type_semantic == "insurance":
         if transaction_insurance_price is None:
             return {"status": "input_required", "amount": None, "source": "insurance_as_of"}
         insurance_price = _nonnegative_decimal(
@@ -231,7 +224,7 @@ def resolve_contract_price(
             "product_type": product_type_code,
         }
 
-    if product_type_code in NON_INSURANCE_PRODUCT_TYPES:
+    if product_type_semantic == "non_insurance":
         if last_purchase_price is None:
             return {"status": "input_required", "amount": None, "source": "last_purchase"}
         last_price = _nonnegative_decimal(last_purchase_price, field="최종 매입단가")

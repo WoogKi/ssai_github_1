@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import re
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from app.sims.meta.erp_table_feature_registry import filter_labels, match_action_in_text
+from app.services.business_calendar_service import kst_today
+from app.services.io_nlq import (
+    extract_nlq_natural_period,
+    nlq_period_to_date_range,
+    strip_nlq_period_expressions,
+)
 from app.services.product_master_filter_contract import extract_product_di_semantic_group
 
 
 _ACTION_WORDS = (
+    "최근 발주내역 조회", "최근 발주 조회", "발주내역 조회", "발주 내역 조회", "오늘 발주 조회", "이번주 발주 조회",
+    "입고중 발주 조회", "미입고 발주 조회", "발주조회", "발주 조회",
+    "발주상태",
+    "입고예정 제품 조회", "오늘 입고예정 조회", "미입고 예정 조회", "입고중 제품 조회",
+    "입고예정조회", "입고예정 조회", "입고예정", "입고 예정",
     "제품별 최종 매입단가 조회", "최종 매입단가 조회", "최종매입단가조회",
     "최종 매입가 조회", "최종매입가조회", "최종 매입가", "최종매입가",
     "실입고단가 조회", "실입고단가조회", "장부입고단가 조회", "장부입고단가조회",
@@ -21,7 +32,8 @@ _ACTION_WORDS = (
     "단가 계약 조회", "과거 계약단가", "과거계약단가", "계약단가", "계약 단가", "단가계약",
 )
 _VALUE_BOUNDARY = (
-    r"(?=\s+(?:매입처(?:코드|명)?|재고위치(?:코드)?|재고적용처(?:코드|명)?|재고적용코드|"
+    r"(?=\s+(?:발주처(?:코드|명)?|발주거래처(?:코드|명)?|예상매출처(?:코드|명)?|실납처(?:코드|명)?|"
+    r"매입처(?:코드|명)?|재고위치(?:코드|명)?|재고적용처(?:코드|명)?|재고적용코드|"
     r"단가적용거래처(?:코드|명)?|단가적용처(?:코드|명)?|단가적용코드|거래처(?:코드|명)?|"
     r"제품(?:코드|명|키워드|그룹명?|구분명?|분류명?|단가|등록자|수정자)?|"
     r"품목(?:코드|명|키워드)?|보험코드|바코드|제약사명?|제조사|키워드|"
@@ -162,11 +174,17 @@ def _resolve_rddbc230_nlq(
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
     labels = lambda key: filter_labels(feature, key)
 
-    for key in ("physic_cd", "buy_cd", "stock_cd", "stock_apply_cd", "cost_apply_cd"):
+    params.update(_extract_registered_roles(raw, feature, (
+        ("buy_cd", "buy_nm"),
+        ("stock_cd", "stock_nm"),
+        ("stock_apply_cd", "stock_apply_nm"),
+        ("cost_apply_cd", "cost_apply_nm"),
+    )))
+    for key in ("physic_cd",):
         value = _extract_code(raw, labels(key))
         if value:
             params[key] = value
-    for key in ("physic_nm", "buy_nm", "stock_nm", "stock_apply_nm", "cost_apply_nm"):
+    for key in ("physic_nm",):
         value = _extract_name(raw, labels(key))
         if value:
             params[key] = value
@@ -218,6 +236,134 @@ def _resolve_rddbc230_nlq(
     return {"action": action_spec.action, "params": params}
 
 
+def _extract_registered_roles(
+    raw: str,
+    feature: Any,
+    roles: tuple[tuple[str, str], ...],
+) -> dict[str, str]:
+    """Extract role-specific codes/names from registry labels without collapsing roles."""
+    params: dict[str, str] = {}
+    for code_key, name_key in roles:
+        code = _extract_code(raw, filter_labels(feature, code_key))
+        name = _extract_name(raw, filter_labels(feature, name_key))
+        if not code and re.fullmatch(r"[A-Za-z0-9]{1,15}", name):
+            code, name = name, ""
+        if code:
+            params[code_key] = code
+        if name and name != code:
+            params[name_key] = name
+    return params
+
+
+def _extract_name_before_label(raw: str, labels: tuple[str, ...]) -> str:
+    """Extract the subject in ``value + label + action`` wording."""
+    if not labels:
+        return ""
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    match = re.search(rf"(?:^|\s)([^\s]+)\s+(?:{label_pattern})(?=\s|$)", raw)
+    return _clean(match.group(1)) if match else ""
+
+
+def _extract_unlabeled_order_vendor(
+    raw: str,
+    *,
+    feature: Any,
+) -> str:
+    """Return only a residual business entity after registry syntax is consumed."""
+    candidate = strip_nlq_period_expressions(raw)
+    for word in sorted(_ACTION_WORDS, key=len, reverse=True):
+        candidate = candidate.replace(word, " ")
+    for spec in feature.filters:
+        for label in sorted((spec.label, *spec.aliases), key=len, reverse=True):
+            candidate = candidate.replace(label, " ")
+    candidate = re.sub(r"\b(?:입고중|입고완료|미입고|발주|조회|검색|확인|보여줘|알려줘)\b", " ", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    return candidate if re.fullmatch(r"[0-9A-Za-z가-힣().&·_-]+", candidate) else ""
+
+
+def _has_explicit_order_residual_owner(params: Mapping[str, Any]) -> bool:
+    """Whether an explicit entity already owns the remaining NLQ value."""
+    return any(
+        _clean(params.get(key))
+        for key in (
+            "physic_cd", "physic_nm", "product_keyword", "insu_cd", "barcode",
+            "maker_nm", "product_group_nm", "product_class_nm", "product_di_nm",
+            "order_vendor_cd", "cost_apply_cd", "cost_apply_nm",
+            "stock_apply_cd", "stock_apply_nm", "stock_cd", "stock_nm",
+            "expected_vendor_cd", "expected_vendor_nm", "real_vendor_cd", "real_vendor_nm",
+        )
+    )
+
+
+def _resolve_order_nlq(
+    raw: str,
+    feature: Any,
+    action_spec: Any,
+    *,
+    today: date,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
+    params.update(_extract_registered_roles(raw, feature, (
+        ("order_vendor_cd", "order_vendor_nm"),
+        ("cost_apply_cd", "cost_apply_nm"),
+        ("stock_apply_cd", "stock_apply_nm"),
+        ("stock_cd", "stock_nm"),
+        ("expected_vendor_cd", "expected_vendor_nm"),
+        ("real_vendor_cd", "real_vendor_nm"),
+    )))
+
+    for key in ("physic_cd", "insu_cd", "barcode"):
+        value = _extract_code(raw, filter_labels(feature, key))
+        if value:
+            params[key] = value
+    for key in ("physic_nm", "product_keyword", "maker_nm", "product_group_nm", "product_class_nm"):
+        value = _extract_name(raw, filter_labels(feature, key))
+        if value:
+            params[key] = value
+    if not params.get("physic_nm"):
+        physic_nm = _extract_name_before_label(raw, filter_labels(feature, "physic_nm"))
+        if physic_nm:
+            params["physic_nm"] = physic_nm
+
+    product_di_nm = _extract_name(raw, filter_labels(feature, "product_di_nm"))
+    semantic_group = "" if product_di_nm else extract_product_di_semantic_group(raw)
+    if product_di_nm:
+        params["product_di_nm"] = product_di_nm
+    if semantic_group:
+        params["product_di_semantic_group"] = semantic_group
+
+    if "입고중" in raw:
+        params["status_code"] = "2"
+    elif "입고완료" in raw:
+        params["status_code"] = "3"
+    if "미입고" in raw:
+        params["has_outstanding"] = True
+
+    if action_spec.mode == "order":
+        if "이번주" in raw:
+            params["date_from"] = (today - timedelta(days=today.weekday())).strftime("%Y%m%d")
+            params["date_to"] = today.strftime("%Y%m%d")
+        else:
+            explicit_from, explicit_to = _extract_date_range(raw, filter_labels(feature, "date_from"))
+            if explicit_from:
+                params["date_from"], params["date_to"] = explicit_from, explicit_to
+            else:
+                params.update(nlq_period_to_date_range(extract_nlq_natural_period(raw, today=today)))
+
+    if (
+        not params.get("order_vendor_nm")
+        and not _has_explicit_order_residual_owner(params)
+    ):
+        order_vendor_nm = _extract_unlabeled_order_vendor(raw, feature=feature)
+        if order_vendor_nm:
+            params["order_vendor_nm"] = order_vendor_nm
+
+    top_match = re.search(r"(?:TOP|조회건수)\s*(\d{1,6})", raw, flags=re.IGNORECASE)
+    if top_match:
+        params["display_top"] = int(top_match.group(1))
+    return {"action": action_spec.action, "params": params}
+
+
 def resolve_registered_erp_table_nlq(
     text: str,
     *,
@@ -230,14 +376,15 @@ def resolve_registered_erp_table_nlq(
     raw = re.sub(r"\s+", " ", _clean(text))
     if feature.table_key == "rddbc230":
         return _resolve_rddbc230_nlq(raw, feature, action_spec)
+    if feature.table_key == "rddbc170_rddbc180":
+        return _resolve_order_nlq(raw, feature, action_spec, today=today or kst_today())
     if feature.table_key != "rddbc070":
         return None
 
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
 
     labels = lambda key: filter_labels(feature, key)
-    ven_cd = _extract_code(raw, labels("ven_cd"))
-    ven_nm = _extract_name(raw, labels("ven_nm"))
+    params.update(_extract_registered_roles(raw, feature, (("ven_cd", "ven_nm"),)))
     physic_cd = _extract_code(raw, labels("physic_cd"))
     physic_nm = _extract_name(raw, labels("physic_nm"))
     product_di_nm = _extract_name(raw, labels("product_di_nm"))
@@ -257,10 +404,6 @@ def resolve_registered_erp_table_nlq(
             explicit_labels=explicit_labels,
         )
 
-    if ven_cd:
-        params["ven_cd"] = ven_cd
-    if ven_nm and ven_nm != ven_cd:
-        params["ven_nm"] = ven_nm
     if physic_cd:
         params["physic_cd"] = physic_cd
     if physic_nm and physic_nm != physic_cd:

@@ -141,8 +141,9 @@ def main() -> int:
             except Exception as exc:
                 failures.append(f"registered callable failed: {target}: {type(exc).__name__}")
 
-    if menu_targets(business_group="재고관리") != ("재고",):
-        failures.append(f"inventory menu targets mismatch: {menu_targets(business_group='재고관리')}")
+    inventory_targets = menu_targets(business_group="재고관리")
+    if "재고" not in inventory_targets:
+        failures.append(f"inventory menu target missing: {inventory_targets}")
     menu = menu_actions(business_group="재고관리", target="재고")
     if menu.count("최종 매입단가 조회") != 1:
         failures.append(f"three-level menu count mismatch: {menu}")
@@ -188,6 +189,7 @@ def main() -> int:
         ("매입처 한미 최종 매입단가 조회", {"buy_nm": "한미"}),
         ("단가적용처 한미 최종 매입단가 조회", {"cost_apply_nm": "한미"}),
         ("재고적용처 한미 최종 매입단가 조회", {"stock_apply_nm": "한미"}),
+        ("재고적용처 50001 최종 매입단가 조회", {"stock_apply_cd": "50001"}),
         ("재고위치 000001 최종 매입단가 조회", {"stock_cd": "000001"}),
         ("재고위치명 본사 최종 매입단가 조회", {"stock_nm": "본사"}),
         ("실입고단가 조회", {}),

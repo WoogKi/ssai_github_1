@@ -332,6 +332,8 @@ def _is_explicit_code_display_name(col: Any) -> bool:
 
 
 _INTEGER_IDENTIFIER_DISPLAY_NAMES = {
+    "발주순번",
+    "상세순번",
     "거래명세서순번",
     "세금계산서구분",
     "세금계산서순번",

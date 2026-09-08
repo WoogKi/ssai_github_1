@@ -383,7 +383,7 @@ def _last_day_from_yyyymm(yyyymm: str) -> str:
 _NLQ_PERIOD_KIND_KEY = "_nlq_period_kind"
 
 
-def _extract_natural_period(
+def extract_nlq_natural_period(
     text: str,
     *,
     today: date | None = None,
@@ -450,6 +450,29 @@ def _extract_natural_period(
     return {}
 
 
+def nlq_period_to_date_range(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand a parsed calendar month to the date range used by detail services."""
+    out = dict(params or {})
+    if clean_text(out.get("date_from")) or clean_text(out.get("date_to")):
+        return out
+    month_from = clean_text(out.get("month_from"))
+    month_to = clean_text(out.get("month_to"))
+    if month_from:
+        out["date_from"] = f"{month_from[:6]}01"
+    if month_to:
+        out["date_to"] = _last_day_from_yyyymm(month_to[:6])
+    return out
+
+
+def _extract_natural_period(
+    text: str,
+    *,
+    today: date | None = None,
+) -> Dict[str, str]:
+    """Backward-compatible internal alias for the shared period parser."""
+    return extract_nlq_natural_period(text, today=today)
+
+
 def _classify_parsed_period(params: Dict[str, Any]) -> str:
     if clean_text(params.get("date_from")) or clean_text(params.get("date_to")):
         return "explicit_period"
@@ -460,7 +483,7 @@ def _classify_parsed_period(params: Dict[str, Any]) -> str:
     return ""
 
 
-def _strip_nlq_period_expressions(text: str) -> str:
+def strip_nlq_period_expressions(text: str) -> str:
     """Remove period syntax before extracting an unlabeled business entity."""
     out = str(text or "")
     patterns = (
@@ -473,6 +496,11 @@ def _strip_nlq_period_expressions(text: str) -> str:
     for pattern in patterns:
         out = re.sub(pattern, " ", out)
     return out
+
+
+def _strip_nlq_period_expressions(text: str) -> str:
+    """Backward-compatible internal alias for period syntax consumption."""
+    return strip_nlq_period_expressions(text)
 
 
 def get_nlq_period_action_class(action: str) -> str:
@@ -527,18 +555,22 @@ _NLQ_EXPLICIT_CONDITION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("product_category", (
         "product_group_cd", "product_group_nm", "product_di", "product_di_list",
         "dashboard_product_di_list", "product_class", "product_class_list",
-        "dashboard_product_class_list",
+        "dashboard_product_class_list", "product_di_nm", "product_di_semantic_group",
     )),
     ("manufacturer", ("maker_cd", "maker_nm", "product_ven_cd", "product_ven_nm")),
     ("vendor", (
         "ven_cd", "ven_nm", "buy_cd", "buy_nm", "sale_cd", "sale_nm",
         "order_cd", "order_nm", "real_ven_cd", "real_ven_nm",
+        "order_vendor_cd", "order_vendor_nm", "cost_apply_cd", "cost_apply_nm",
+        "stock_apply_cd", "stock_apply_nm", "expected_vendor_cd", "expected_vendor_nm",
+        "real_vendor_cd", "real_vendor_nm",
     )),
     ("stock", ("stock_cd", "stock_cds", "stock_cd_list", "stock_nm")),
     ("outbound_frequency", ("frequency_grade",)),
     ("salesperson", ("sales_man", "sales_man_nm", "salesperson_cd", "salesperson_nm")),
     ("region", ("region_cd", "region_nm")),
     ("io_type", ("io_gu", "io_gu_list", "io_gu_prefix")),
+    ("status", ("status_code", "has_outstanding")),
 )
 
 

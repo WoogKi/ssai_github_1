@@ -209,6 +209,25 @@ def _check_product_flow_inventory_aliases() -> None:
             _fail(f"new NLQ route action mismatch: {query} -> {routed}")
 
 
+def _check_expected_inbound_alias_precedence() -> None:
+    cases = (
+        ("입고예정", ""),
+        ("입고 예정", ""),
+        ("전문약 입고예정", "insurance"),
+        ("일반약 입고예정", "non_insurance"),
+    )
+    for query, semantic_group in cases:
+        parsed = resolve_io_nlq(query)
+        if not isinstance(parsed, dict) or parsed.get("action") != "입고예정조회":
+            _fail(f"expected-inbound alias precedence mismatch: {query} -> {parsed}")
+        if semantic_group and parsed.get("params", {}).get("product_di_semantic_group") != semantic_group:
+            _fail(f"expected-inbound semantic group mismatch: {query} -> {parsed}")
+    for query in ("입고명세 조회", "오늘 입고명세 조회"):
+        parsed = resolve_io_nlq(query)
+        if not isinstance(parsed, dict) or parsed.get("action") != "입고명세 조회":
+            _fail(f"R110 inbound-detail precedence mismatch: {query} -> {parsed}")
+
+
 def _check_period_policy_classification() -> None:
     """Every implemented canonical action belongs to one NLQ period class."""
     expected = {
@@ -246,6 +265,7 @@ def main() -> int:
         ("handler and IO fallback callable coverage", _check_handler_coverage),
         ("analytics metric/grouping matrix coverage", _check_analytics_intent_matrix),
         ("product flow / inventory parser aliases", _check_product_flow_inventory_aliases),
+        ("expected-inbound alias / R110 precedence", _check_expected_inbound_alias_precedence),
         ("canonical NLQ period policy classification", _check_period_policy_classification),
     )
     failures: list[str] = []

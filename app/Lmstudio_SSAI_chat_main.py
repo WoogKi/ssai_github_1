@@ -166,6 +166,7 @@ def _script_perf_mark(name: str) -> None:
 
 
 import pandas as pd
+from app.services.nlq_input_guard import looks_like_attachment_followup
 from app.sims.nlq.nlq_router import resolve_new_sims_nlq_candidate, try_handle_nlq
 
 from app.ui.sims_entry import (
@@ -2779,13 +2780,15 @@ def _attachment_image_data_url(file: Any) -> str:
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
-def _looks_like_attachment_image_followup(question: str) -> bool:
-    text = str(question or "").strip()
-    if not text:
-        return False
-    visual_reference = r"(?:이|그|첨부)?\s*(?:사진|이미지|화면|그림|캡처|스크린샷)"
-    visual_detail = r"(?:작업자.*(?:어디|무엇)|물건.*(?:이동|흐름)|상부.*하부.*구조|중요한\s*부분.*(?:설명|알려)|무엇을\s*뜻|어떻게\s*다른)"
-    return bool(re.search(visual_reference, text, flags=re.IGNORECASE) or re.search(visual_detail, text, flags=re.IGNORECASE))
+def _looks_like_attachment_image_followup(
+    question: str,
+    *,
+    has_active_image_reference: bool = False,
+) -> bool:
+    return looks_like_attachment_followup(
+        question,
+        has_active_image_reference=has_active_image_reference,
+    )
 
 
 def _set_attachment_image_followup_candidates(*, room: dict[str, Any], candidates: list[dict[str, Any]]) -> None:
@@ -12489,7 +12492,12 @@ if user_input and user_input.strip():
         )
         st.rerun()
 
-    if _looks_like_attachment_image_followup(user_input):
+    if _looks_like_attachment_image_followup(
+        user_input,
+        has_active_image_reference=(
+            _resolve_attachment_image_followup_reference(current_room) is not None
+        ),
+    ):
         st.session_state["__attachment_image_followup_request"] = {
             **_attachment_reanalysis_context(current_room),
         }

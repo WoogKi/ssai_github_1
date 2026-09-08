@@ -59,6 +59,7 @@ _EXTERNAL_FRESHNESS_MARKERS = ("뉴스", "소식", "최신", "최근", "현재",
 _INTERNAL_OR_ERP_MARKERS = (
     "입고",
     "출고",
+    "발주",
     "재고",
     "제품수불",
     "현재표",

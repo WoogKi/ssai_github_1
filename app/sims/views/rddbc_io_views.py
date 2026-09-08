@@ -32,6 +32,10 @@ from app.sims.views.rddbc_io_contract_views import (
     view_rddbc070_current,
 )
 from app.sims.views.rddbc_io_stock_cost_views import view_rddbc230
+from app.sims.views.rddbc_io_order_views import (
+    view_expected_inbound_query,
+    view_order_query,
+)
 
 __all__ = [
     "view_rddbc040",
@@ -50,4 +54,6 @@ __all__ = [
     "view_rddbc070_history",
     "view_rddbc070_current",
     "view_rddbc230",
+    "view_order_query",
+    "view_expected_inbound_query",
 ]

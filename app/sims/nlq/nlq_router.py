@@ -12,6 +12,7 @@ import time
 
 import importlib
 import pandas as pd
+from app.services.nlq_input_guard import looks_like_pasted_formatted_content
 from app.services.ssai_analysis_profile_service import (
     normalize_business_code,
     normalize_business_code_pair,
@@ -1191,6 +1192,8 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     """
     normalized = keyboard_fix(str(txt or "").strip())
     if not normalized:
+        return None
+    if looks_like_pasted_formatted_content(normalized):
         return None
 
     # Mirror the deterministic codes-first boundary used at execution time.
@@ -6894,6 +6897,9 @@ def try_handle_nlq(
     """
     raw = (user_text or "").strip()
     if not raw:
+        return False
+    if looks_like_pasted_formatted_content(raw):
+        logger.info("[nlq.router] pasted formatted content; defer to normal answer route")
         return False
     # Policy/criterion questions must remain on the explanatory route. They
     # are not a request to execute an inventory-shortage analytics action.

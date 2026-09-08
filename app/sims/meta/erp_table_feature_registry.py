@@ -202,7 +202,73 @@ RDDBC230 = ErpTableFeatureSpec(
 )
 
 
-ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230)
+RDDBC170_RDDBC180 = ErpTableFeatureSpec(
+    table_key="rddbc170_rddbc180",
+    source_table="dbo.Rddbc180",
+    category="발주",
+    required_permission="IO_READ",
+    primary_key=(
+        "Rd18_Or_YyMmDd", "Rd18_OrVen_Cd", "Rd18_Or_Seq", "Rd18_Orsub_Seq",
+    ),
+    filters=(
+        ErpFilterSpec("date_from", "발주일자 시작", "Rd17_Or_YyMmDd", "date", ("발주일자",)),
+        ErpFilterSpec("date_to", "발주일자 종료", "Rd17_Or_YyMmDd", "date", ("발주일자",)),
+        ErpFilterSpec("due_date_from", "납기일자 시작", "Rd17_Put_YyMmDd", "date", ("납기일자",)),
+        ErpFilterSpec("due_date_to", "납기일자 종료", "Rd17_Put_YyMmDd", "date", ("납기일자",)),
+        ErpFilterSpec("order_vendor_cd", "발주처코드", "Rd18_OrVen_Cd", "code", ("발주거래처코드",)),
+        ErpFilterSpec("order_vendor_nm", "발주처명", "Rd03_Ven_Nm", "text", ("발주처", "발주거래처명", "발주거래처")),
+        ErpFilterSpec("physic_cd", "제품코드", "Rd18_Physic_Cd", "code", ("품목코드",)),
+        ErpFilterSpec("physic_nm", "제품명", "Rd04_Physic_Nm", "text", ("제품", "품목명", "품목")),
+        ErpFilterSpec("product_keyword", "제품 키워드", "Rd04_Physic_Nm/Rd04_Physic_Cd/Rd04_Insu_Cd", "text", ("제품키워드", "품목키워드", "키워드")),
+        ErpFilterSpec("insu_cd", "보험코드", "Rd04_Insu_Cd", "code", ("보험코드",)),
+        ErpFilterSpec("barcode", "바코드", "Rd04_Bar_Code1..5", "code", ("바코드",)),
+        ErpFilterSpec("maker_nm", "제약사명", "Rd03_Ven_Nm", "text", ("제약사", "제조사")),
+        ErpFilterSpec("product_group_nm", "제품그룹명", "Rd01_Hnm", "text", ("제품그룹",)),
+        ErpFilterSpec("product_di_nm", "제품구분명", "Rd01_Hnm", "text", ("제품구분", "구분명")),
+        ErpFilterSpec("product_di_semantic_group", "상위 제품구분", "Rd04_Physic_Di", "semantic_group", ("전문약", "전문제품", "전문의약품", "보험약", "보험제품", "ETC", "일반약", "일반제품", "일반의약품", "비보험약", "비보험제품", "OTC")),
+        ErpFilterSpec("product_class_nm", "제품분류명", "Rd01_Hnm", "text", ("제품분류",)),
+        ErpFilterSpec("status_code", "발주상태", "Rd18_Or_Di", "code", ("발주상태코드",)),
+        ErpFilterSpec("cost_apply_cd", "단가적용처코드", "Rd18_Cost_Apply_Cd", "code", ("단가적용코드",)),
+        ErpFilterSpec("cost_apply_nm", "단가적용처명", "Rd03_Ven_Nm", "text", ("단가적용처",)),
+        ErpFilterSpec("stock_apply_cd", "재고적용처코드", "Rd18_Stock_Apply_Cd", "code", ("재고적용코드",)),
+        ErpFilterSpec("stock_apply_nm", "재고적용처명", "Rd03_Ven_Nm", "text", ("재고적용처",)),
+        ErpFilterSpec("stock_cd", "재고위치코드", "Rd18_Stock_Cd", "code", ("재고위치",)),
+        ErpFilterSpec("stock_nm", "재고위치명", "Rd01_Hnm", "text", ("재고위치명",)),
+        ErpFilterSpec("expected_vendor_cd", "예상매출처코드", "Rd18_Pro_Ven_Cd", "code"),
+        ErpFilterSpec("expected_vendor_nm", "예상매출처명", "Rd03_Ven_Nm", "text", ("예상매출처",)),
+        ErpFilterSpec("real_vendor_cd", "실납처코드", "Rd18_Real_Ven_Cd", "code"),
+        ErpFilterSpec("real_vendor_nm", "실납처명", "Rd03_Ven_Nm", "text", ("실납처",)),
+        ErpFilterSpec("has_outstanding", "미입고 존재", "calculated outstanding quantity", "bool", ("미입고",)),
+    ),
+    actions=(
+        ErpTableActionSpec(
+            action="발주조회",
+            aliases=("발주 조회", "발주내역 조회", "발주 내역 조회", "최근 발주내역 조회", "최근 발주 조회", "오늘 발주 조회", "이번주 발주 조회", "입고중 발주 조회", "미입고 발주 조회", "발주상태"),
+            mode="order",
+            service_function="app.services.rddbc170_rddbc180_order_service.get_order_result",
+            export_function="app.services.rddbc170_rddbc180_order_service.get_order_export_df",
+            view_function="app.sims.views.rddbc_io_views.view_order_query",
+            payload_key="__io170_order_last_payload",
+        ),
+        ErpTableActionSpec(
+            action="입고예정조회",
+            aliases=(
+                "입고예정", "입고 예정", "입고예정 조회", "입고예정 제품 조회",
+                "오늘 입고예정 조회", "미입고 예정 조회", "입고중 제품 조회",
+            ),
+            mode="expected",
+            service_function="app.services.rddbc170_rddbc180_order_service.get_expected_inbound_result",
+            export_function="app.services.rddbc170_rddbc180_order_service.get_expected_inbound_export_df",
+            view_function="app.sims.views.rddbc_io_views.view_expected_inbound_query",
+            payload_key="__io180_expected_last_payload",
+        ),
+    ),
+    menu_business_group="재고관리",
+    menu_target="발주",
+)
+
+
+ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230, RDDBC170_RDDBC180)
 
 
 def iter_action_specs() -> tuple[tuple[ErpTableFeatureSpec, ErpTableActionSpec], ...]:

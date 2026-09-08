@@ -507,7 +507,12 @@ ORDER BY In_Put.Rd11_In_YyMmDd , In_Put.Rd11_Ven_Cd, In_Put.Rd11_In_Seq
 # 조회 결과에는 입고명세의 상세 정보뿐만 아니라, 거래명세서 및 세금계산서와의 금액 일치 여부도 포함되어 있습니다.  
 def get_rddbc110_result(params: Optional[Dict[str, Any]] = None):
     params = coalesce_params(params)
-    df = get_rddbc110_df(params)
+    display_top = _io_query_top(dict(params), default=200)
+    source_top = _io_export_top()
+    query_params = dict(params)
+    query_params["top"] = source_top
+    query_params["_max_top"] = source_top
+    df = get_rddbc110_df(query_params)
 
     row_count = 0 if df is None else int(len(df))
     log.info("DBG get_rddbc110_result rows=%s", row_count)
@@ -537,8 +542,20 @@ def get_rddbc110_result(params: Optional[Dict[str, Any]] = None):
         df=df,
         message=f"입고명세 {row_count:,}건",
     )
+    full_df = result.get("df_display")
+    if isinstance(full_df, pd.DataFrame):
+        result["df"] = full_df
+        result["df_display"] = full_df.head(display_top).copy()
+        result["records"] = result["df_display"].to_dict(orient="records")
     meta = dict(result.get("meta") or {})
     meta.setdefault("result_status", "success")
+    meta["row_count"] = min(row_count, display_top)
+    meta["row_count_total"] = row_count
+    meta["display_top"] = display_top
+    meta["source_top"] = source_top
+    meta["source_limit_hit"] = bool(row_count >= source_top)
+    meta["full_source_bounded"] = bool(row_count >= source_top)
+    meta["_io_full_df_ready"] = True
     meta["source_call_count"] = 1
     result["meta"] = meta
     return result
@@ -586,37 +603,7 @@ def get_rddbc110_screen_result(params: Optional[Dict[str, Any]] = None) -> Dict[
     current-table, download, and final display handling.  Starting from the
     full frame avoids running the identical detail SQL twice for one submit.
     """
-    qparams = coalesce_params(params)
-    df = get_rddbc110_export_df(qparams)
-    row_count = 0 if df is None else int(len(df))
-    if row_count == 0:
-        return {
-            "table": TABLE,
-            "title": "입고명세 조회",
-            "action": "입고명세 조회",
-            "params": qparams,
-            "data": "해당 자료가 없습니다.",
-            "message": "해당 자료가 없습니다.",
-            "final": True,
-            "meta": {"row_count": 0},
-        }
-
-    return {
-        "table": TABLE,
-        "title": "입고명세 조회",
-        "action": "입고명세 조회",
-        "params": qparams,
-        "df": df,
-        "df_display": df,
-        "columns": list(df.columns),
-        "final": True,
-        "meta": {
-            "row_count": row_count,
-            "row_count_total": row_count,
-            "_io_full_df_ready": True,
-        },
-        "message": f"입고명세 {row_count:,}건",
-    }
+    return get_rddbc110_result(params)
 
 
 def _analysis_records_from_section_df(df, section: str) -> list[dict]:

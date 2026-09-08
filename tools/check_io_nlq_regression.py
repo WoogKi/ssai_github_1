@@ -1128,6 +1128,39 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
             )
         )
 
+    expected_inbound_cases = (
+        ("입고예정", ""),
+        ("입고 예정", ""),
+        ("전문약 입고예정", "insurance"),
+        ("일반약 입고예정", "non_insurance"),
+        ("ETC 입고예정", "insurance"),
+        ("OTC 입고예정", "non_insurance"),
+    )
+    for query, expected_semantic_group in expected_inbound_cases:
+        parsed_expected = io_nlq.resolve_io_nlq(query) or {}
+        parsed_params = dict(parsed_expected.get("params") or {})
+        results.append(
+            CheckResult(
+                f"expected-inbound alias owns inbound-detail precedence: {query}",
+                parsed_expected.get("action") == "입고예정조회"
+                and (
+                    not expected_semantic_group
+                    or parsed_params.get("product_di_semantic_group") == expected_semantic_group
+                ),
+                f"parsed={parsed_expected!r}",
+            )
+        )
+
+    for query in ("입고명세 조회", "오늘 입고명세 조회"):
+        parsed_inbound_detail = io_nlq.resolve_io_nlq(query) or {}
+        results.append(
+            CheckResult(
+                f"explicit R110 inbound-detail route remains unchanged: {query}",
+                parsed_inbound_detail.get("action") == "입고명세 조회",
+                f"parsed={parsed_inbound_detail!r}",
+            )
+        )
+
     for query in ("오늘 출고내역", "오늘 출고 내역", "오늘 출고명세 조회"):
         parsed_compact = io_nlq.resolve_io_nlq(query, today=date(2026, 8, 11)) or {}
         compact_action = str(parsed_compact.get("action") or "")
@@ -1440,6 +1473,7 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
     )
 
     from app.services import rddbc110_service, product_inventory_service
+    from app.ui import chat_middleware
 
     for service_name, filter_builder in (
         ("inbound", rddbc110_service._base_filters),
@@ -1517,23 +1551,96 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
         )
     )
 
-    screen_export_calls: list[dict[str, Any]] = []
-    original_inbound_export = rddbc110_service.get_rddbc110_export_df
+    screen_query_calls: list[dict[str, Any]] = []
+    original_inbound_query = rddbc110_service.get_rddbc110_df
     try:
-        rddbc110_service.get_rddbc110_export_df = lambda params: (
-            screen_export_calls.append(dict(params or {}))
-            or pd.DataFrame({"Rd11_In_YyMmDd": ["20260701"]})
+        rddbc110_service.get_rddbc110_df = lambda params: (
+            screen_query_calls.append(dict(params or {}))
+            or pd.DataFrame({"Rd11_In_YyMmDd": ["20260701", "20260702"]})
         )
-        screen_payload = rddbc110_service.get_rddbc110_screen_result({"top": 1000})
+        screen_payload = rddbc110_service.get_rddbc110_screen_result({"top": 1})
     finally:
-        rddbc110_service.get_rddbc110_export_df = original_inbound_export
+        rddbc110_service.get_rddbc110_df = original_inbound_query
     results.append(
         CheckResult(
-            "inbound panel screen result starts from one full export frame",
-            len(screen_export_calls) == 1
+            "inbound result queries one full source and slices display",
+            len(screen_query_calls) == 1
             and bool((screen_payload.get("meta") or {}).get("_io_full_df_ready"))
-            and int((screen_payload.get("meta") or {}).get("row_count_total") or 0) == 1,
-            f"export_calls={len(screen_export_calls)}, meta={screen_payload.get('meta')!r}",
+            and int((screen_payload.get("meta") or {}).get("row_count_total") or 0) == 2
+            and len(screen_payload.get("df")) == 2
+            and len(screen_payload.get("df_display")) == 1
+            and int((screen_payload.get("meta") or {}).get("source_call_count") or 0) == 1,
+            f"query_calls={len(screen_query_calls)}, meta={screen_payload.get('meta')!r}",
+        )
+    )
+
+    from app.services.nlq_input_guard import (
+        looks_like_attachment_followup,
+        looks_like_pasted_formatted_content,
+    )
+    from app.sims.nlq import nlq_router as input_guard_router
+
+    pasted_answer = "\n".join(
+        ["### 분석 결과", "| 구분 | 내용 |", "| --- | --- |"]
+        + [f"| 항목 {idx} | 입고 자료 설명 |" for idx in range(30)]
+    )
+    results.append(
+        CheckResult(
+            "formatted answer input is not treated as a fresh ERP NLQ",
+            looks_like_pasted_formatted_content(pasted_answer)
+            and input_guard_router.resolve_new_sims_nlq_candidate(pasted_answer) is None,
+            "shared structured-content guard",
+        )
+    )
+    results.append(
+        CheckResult(
+            "attachment extraction and active-image follow-up own routing precedence",
+            looks_like_attachment_followup(
+                "처방전에서 요양기관코드와 제품코드를 추출해줘"
+            )
+            and looks_like_attachment_followup(
+                "제품코드도 알려줘", has_active_image_reference=True
+            )
+            and not looks_like_attachment_followup(
+                "제품코드 목록 조회", has_active_image_reference=False
+            ),
+            "shared attachment-intent guard",
+        )
+    )
+
+    full_inbound = screen_payload.get("df")
+    display_inbound = screen_payload.get("df_display")
+    inbound_item = {
+        **screen_payload,
+        "action": "입고명세 조회",
+        "table_key": "inbound-one-source-fixture",
+    }
+    inbound_meta = {
+        **dict(screen_payload.get("meta") or {}),
+        "action": "입고명세 조회",
+        "table_key": "inbound-one-source-fixture",
+    }
+    with (
+        patch.object(chat_middleware.st, "session_state", {}),
+        patch.object(
+            rddbc110_service,
+            "get_rddbc110_export_df",
+            side_effect=AssertionError("R110 full source must be reused"),
+        ),
+    ):
+        reused_inbound = chat_middleware._get_full_download_df_for_sims_item(
+            inbound_item,
+            inbound_meta,
+            display_inbound,
+        )
+    results.append(
+        CheckResult(
+            "inbound current-table/export reuses the first full source without service recall",
+            isinstance(full_inbound, pd.DataFrame)
+            and isinstance(reused_inbound, pd.DataFrame)
+            and reused_inbound.equals(full_inbound)
+            and int(inbound_meta.get("source_call_count") or 0) == 1,
+            f"rows={len(reused_inbound)}, meta={inbound_meta!r}",
         )
     )
 

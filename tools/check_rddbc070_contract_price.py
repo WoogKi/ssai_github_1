@@ -245,6 +245,7 @@ def main() -> int:
         ("제품명 우루사 계약단가", "최종 계약단가 조회", {"physic_nm": "우루사"}),
         ("단가적용처 한미 계약단가 조회", "최종 계약단가 조회", {"ven_nm": "한미"}),
         ("단가적용처명 한미 계약단가 조회", "최종 계약단가 조회", {"ven_nm": "한미"}),
+        ("단가적용처 50002 계약단가 조회", "최종 계약단가 조회", {"ven_cd": "50002"}),
         ("단가적용거래처 한미 계약단가 조회", "최종 계약단가 조회", {"ven_nm": "한미"}),
         ("단가적용거래처명 한미 계약단가 조회", "최종 계약단가 조회", {"ven_nm": "한미"}),
         ("계약단가 이력 조회 거래처명 동제 제품명 우루사", "계약단가 이력 조회", {"ven_nm": "동제", "physic_nm": "우루사"}),
@@ -503,11 +504,11 @@ def main() -> int:
     if meta.get("zero_price_contract") != "partial_zero_preserved_selected_price_zero_no_revive":
         failures.append(f"partial-zero trace contract mismatch: {meta}")
 
-    semantic_cases = (
-        ("insurance", " < ?"),
-        ("non_insurance", " >= ?"),
-    )
-    for semantic_group, expected_operator in semantic_cases:
+    semantic_cases = {
+        "insurance": ("보험", "보험(%", "%(보험)"),
+        "non_insurance": ("비보험", "비보험(%"),
+    }
+    for semantic_group, expected_values in semantic_cases.items():
         captured.clear()
         with patch.object(service, "execute_bound_select", side_effect=_capture):
             service.get_rddbc070_current_result(
@@ -515,12 +516,10 @@ def main() -> int:
             )
         semantic_sql, semantic_values = captured[0]
         if (
-            "P.Rd04_Physic_Di" not in semantic_sql
-            or "LTRIM(RTRIM(ISNULL(P.Rd04_Physic_Di, ''))) AS [제품구분코드]" not in semantic_sql
-            or "NOT LIKE '%[^0-9]%'" not in semantic_sql
-            or "THEN CAST" not in semantic_sql
-            or expected_operator not in semantic_sql
-            or 5 not in semantic_values
+            "LTRIM(RTRIM(ISNULL(P.Rd04_Physic_Di, ''))) AS [제품구분코드]" not in semantic_sql
+            or "LTRIM(RTRIM(ISNULL(PD.Rd01_Hnm, '')))" not in semantic_sql
+            or any(value not in semantic_values for value in expected_values)
+            or any(token in semantic_sql for token in ("NOT LIKE '%[^0-9]%'", "THEN CAST", " < ?", " >= ?"))
         ):
             failures.append(
                 f"product-di semantic group SQL contract mismatch: {semantic_group}: "
@@ -667,6 +666,7 @@ def main() -> int:
         direction="inbound",
         price_basis="real",
         product_type="1",
+        product_type_name="보험(일반)",
         transaction_insurance_price=2000,
         last_purchase_price=1500,
     )
@@ -696,18 +696,20 @@ def main() -> int:
         direction="inbound",
         price_basis="real",
         product_type="1",
+        product_type_name="보험(일반)",
         transaction_insurance_price=2000,
         last_purchase_price=1500,
     )
     if partial_terminated.get("status") != "terminated" or partial_terminated.get("amount") is not None:
         failures.append(f"selected partial-zero price revived by fallback: {partial_terminated}")
 
-    for product_type in ("1", "2", "3"):
+    for product_type, product_type_name in (("01", "보험(일반)"), ("A", "보험(전문)"), ("B", "의료기기(보험)")):
         inbound_fallback = service.resolve_contract_price(
             contract_row=None,
             direction="inbound",
             price_basis="real",
             product_type=product_type,
+            product_type_name=product_type_name,
             transaction_insurance_price=1000,
         )
         outbound_fallback = service.resolve_contract_price(
@@ -715,6 +717,7 @@ def main() -> int:
             direction="outbound",
             price_basis="real",
             product_type=product_type,
+            product_type_name=product_type_name,
             transaction_insurance_price=1000,
         )
         if inbound_fallback.get("amount") != 950.0 or outbound_fallback.get("amount") != 1000.0:
@@ -724,14 +727,16 @@ def main() -> int:
         direction="inbound",
         price_basis="real",
         product_type="1",
+        product_type_name="보험(일반)",
     ).get("status") != "input_required":
         failures.append("insurance fallback used current/unknown insurance price")
-    for product_type in ("5", "6", "7", "8"):
+    for product_type, product_type_name in (("05", "비보험(일반)"), ("A", "비보험(전문)")):
         non_insurance = service.resolve_contract_price(
             contract_row=None,
             direction="outbound",
             price_basis="real",
             product_type=product_type,
+            product_type_name=product_type_name,
             last_purchase_price=730,
         )
         if non_insurance.get("amount") != 730.0 or non_insurance.get("source") != "last_purchase":
@@ -741,6 +746,7 @@ def main() -> int:
         direction="inbound",
         price_basis="real",
         product_type="4",
+        product_type_name="의료기기",
         transaction_insurance_price=1000,
         last_purchase_price=700,
     ).get("status") != "unsupported_product_type":
