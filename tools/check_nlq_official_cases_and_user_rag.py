@@ -44,6 +44,21 @@ CASES = (
     ("종근당 전문약 입고예정 조회", "입고예정조회", {"order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}, "PASS"),
 )
 
+EXPECTED_SECTION_COUNTS = {
+    "계약단가": 4,
+    "최종 매입단가": 4,
+    "발주 조회": 9,
+    "입고예정 조회": 4,
+}
+
+HELP_QUERIES = (
+    "계약단가는 어떻게 물어보면 돼?",
+    "발주 조회 질문 예시 보여줘",
+    "입고예정 조회 방법 알려줘",
+    "단가적용처로 조회할 수 있어?",
+    "SIMS AI에서 어떤 질문을 할 수 있어?",
+)
+
 
 def main() -> None:
     frame = pd.read_excel(DEFAULT_CASEBOOK, sheet_name="NLQ 사례", dtype=str).fillna("")
@@ -70,11 +85,21 @@ def main() -> None:
 
     content = DEFAULT_OUTPUT.read_text(encoding="utf-8")
     assert content.startswith("# SIMS AI 업무질문 사용 예시")
-    for heading in ("계약단가 조회", "최종 매입단가 조회", "발주 조회", "입고예정 조회"):
+    for heading, expected_count in EXPECTED_SECTION_COUNTS.items():
         assert f"## {heading}" in content
+        section = content.split(f"## {heading}", 1)[1].split("\n## ", 1)[0]
+        assert "### 사용할 수 있는 주요 조건" in section
+        assert "### 여러 조건으로 조회하기" in section
+        assert "### 질문 예시" in section
+        assert "### 비슷한 조회와의 차이" in section
+        assert section.count("- `") == expected_count
     for question, _action, _params, status in CASES:
         assert (question in content) is (status == "PASS")
-    forbidden = re.compile(r"R(?:ddbc)?(?:070|230|170|180)|Rd\d+_|\bSQL\b|parser|registry|source_call_count", re.IGNORECASE)
+    forbidden = re.compile(
+        r"\bNLQ\b|\baction\b|canonical|parser|registry|source_call_count|"
+        r"R(?:ddbc)?(?:070|230|170|180)|Rd\d+_|\bDB\b|\bSQL\b",
+        re.IGNORECASE,
+    )
     assert not forbidden.search(content)
 
     plan = validate_plan(DEFAULT_OUTPUT.with_suffix(".knowledge.json"))
@@ -90,7 +115,7 @@ def main() -> None:
         )
         assert applied[0]["status"] == "ACTIVE"
         repository = KnowledgeDocumentRepository(root=manifest_root)
-        for query in ("일반의약품 계약단가 조회", "OTC 최종 매입가 조회", "종근당 전문약 발주 조회", "입고 예정 조회"):
+        for query in HELP_QUERIES:
             packet = repository.retrieve(
                 query=query,
                 current_user_id=1,
@@ -99,7 +124,14 @@ def main() -> None:
             )
             assert packet.reason_code == "ready" and packet.citations
 
-    print(json.dumps({"gate": "PASS", "official_total": len(frame), "new_cases": len(CASES), "focused": observed}, ensure_ascii=False))
+    print(json.dumps({
+        "gate": "PASS",
+        "official_total": len(frame),
+        "new_cases": len(CASES),
+        "focused": observed,
+        "section_examples": EXPECTED_SECTION_COUNTS,
+        "help_queries": len(HELP_QUERIES),
+    }, ensure_ascii=False))
 
 
 if __name__ == "__main__":
