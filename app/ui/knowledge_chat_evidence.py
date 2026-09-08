@@ -29,12 +29,40 @@ class KnowledgeAnswerDisplay:
     visible: bool
     content: str = ""
     citations: tuple[ContextCitation, ...] = ()
+    citation_labels: tuple[str, ...] = ()
     conflict_notices: tuple[ContextConflictNotice, ...] = ()
     reason_code: str = "knowledge_answer_hidden"
 
 
 def _answer_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def build_knowledge_citation_labels(
+    citations: tuple[ContextCitation, ...],
+    *,
+    display_limit: int | None = None,
+) -> tuple[str, ...]:
+    """Keep full evidence while optionally condensing user-facing provenance."""
+    if display_limit is None:
+        return tuple(citation.label for citation in citations)
+    if (
+        isinstance(display_limit, bool)
+        or not isinstance(display_limit, int)
+        or not 1 <= display_limit <= 3
+    ):
+        raise ValueError("Knowledge citation display limit is invalid")
+    labels: list[str] = []
+    seen: set[tuple[str, int]] = set()
+    for citation in citations:
+        identity = (citation.document_id, citation.version)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        labels.append(f"{citation.source_name} v{citation.version}")
+        if len(labels) >= display_limit:
+            break
+    return tuple(labels)
 
 
 def build_knowledge_answer_message(
@@ -45,6 +73,7 @@ def build_knowledge_answer_message(
     request_context: KnowledgeChatRequestContext,
     message_id: str,
     timestamp: str,
+    citation_display_limit: int | None = None,
 ) -> dict[str, Any]:
     """Build the only persisted shape for a future Knowledge chat answer."""
     decision = authorize_knowledge_chat_request(request_context)
@@ -72,6 +101,14 @@ def build_knowledge_answer_message(
     )
     if not evidence.allowed:
         raise PermissionError(f"Knowledge evidence denied: {evidence.reason_code}")
+    meta = {
+        "kind": KNOWLEDGE_ANSWER_MESSAGE_TYPE,
+        "user_id": request_context.user_id,
+        "company_id": request_context.company_id,
+    }
+    if citation_display_limit is not None:
+        build_knowledge_citation_labels(packet.citations, display_limit=citation_display_limit)
+        meta["knowledge_citation_display_limit"] = citation_display_limit
     return {
         "id": str(message_id or "").strip(),
         "role": "assistant",
@@ -79,11 +116,7 @@ def build_knowledge_answer_message(
         "content": answer,
         "time": str(timestamp or "").strip(),
         "knowledge_evidence": snapshot.to_dict(),
-        "meta": {
-            "kind": KNOWLEDGE_ANSWER_MESSAGE_TYPE,
-            "user_id": request_context.user_id,
-            "company_id": request_context.company_id,
-        },
+        "meta": meta,
     }
 
 
@@ -160,10 +193,20 @@ def build_knowledge_answer_display(
     )
     if not decision.allowed:
         return KnowledgeAnswerDisplay(False, reason_code=decision.reason_code)
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    display_limit = meta.get("knowledge_citation_display_limit")
+    try:
+        citation_labels = build_knowledge_citation_labels(
+            decision.citations,
+            display_limit=display_limit,
+        )
+    except ValueError:
+        return KnowledgeAnswerDisplay(False, reason_code="invalid_citation_display_limit")
     return KnowledgeAnswerDisplay(
         True,
         content=content,
         citations=decision.citations,
+        citation_labels=citation_labels,
         conflict_notices=decision.conflict_notices,
         reason_code="ready",
     )

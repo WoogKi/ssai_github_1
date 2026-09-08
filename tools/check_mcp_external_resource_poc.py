@@ -141,11 +141,16 @@ def check_runtime_boundary() -> None:
         raise AssertionError("datetime collision fixture is not a valid MCP command")
     if resolve_datetime_question(collision) is None:
         raise AssertionError("datetime collision fixture no longer exercises precedence")
-    datetime_guard = (
-        "None if raw_mcp_route is not None or sims_help_route is not None "
-        "else resolve_datetime_question(user_input)"
-    )
-    if datetime_guard not in source:
+    datetime_start = source.index("datetime_answer = (")
+    datetime_block = source[datetime_start:source.index("web_search_route = None", datetime_start)]
+    if not all(
+        token in datetime_block
+        for token in (
+            "raw_mcp_route is not None",
+            "business_help_knowledge_route is not None",
+            "resolve_datetime_question(user_input)",
+        )
+    ):
         raise AssertionError("explicit MCP command is not protected from datetime routing")
     if resolve_datetime_question("현재 시간") is None:
         raise AssertionError("ordinary datetime routing contract changed")

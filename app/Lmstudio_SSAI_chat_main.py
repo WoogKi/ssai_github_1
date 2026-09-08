@@ -327,12 +327,9 @@ def _render_assistant_message_controls(message: dict[str, Any], *, room: dict[st
 from app.ui.knowledge_chat_adapter import (
     build_knowledge_followup_queue_request,
     build_knowledge_prompt,
+    parse_business_help_knowledge_request,
     parse_knowledge_followup_queue_request,
     parse_explicit_knowledge_request,
-)
-from app.ui.sims_help_adapter import (
-    build_sims_help_text,
-    parse_sims_help_request,
 )
 from app.ui.mcp_chat_adapter import (
     build_mcp_chat_message,
@@ -344,6 +341,7 @@ from app.ui.knowledge_chat_evidence import (
     KNOWLEDGE_ANSWER_MESSAGE_TYPE,
     build_knowledge_answer_display,
     build_knowledge_answer_message,
+    build_knowledge_citation_labels,
     build_knowledge_followup_packet,
 )
 
@@ -1475,7 +1473,7 @@ def _check_sims_action_permission(selected: dict | None) -> bool:
         return True
 
     st.error(
-        f"이 SIMS 작업을 실행할 권한이 없습니다.\n\n"
+        f"이 SSAI 작업을 실행할 권한이 없습니다.\n\n"
         f"- 카테고리: {category or '-'}\n"
         f"- 작업: {action or '-'}\n"
         f"- 필요 권한: {permission} ({describe_permission(permission)})"
@@ -3654,6 +3652,8 @@ def is_sims_result_followup_question(text: str) -> bool:
         "현재 컨텍스트",
         "sims 결과",
         "SIMS 결과",
+        "ssai 결과",
+        "SSAI 결과",
         "주요수치",
         "주요 수치",
         "확인할점",
@@ -4579,7 +4579,7 @@ def _push_no_current_table_notice(source_query: str) -> bool:
     return _current_table_push_notice(
         title="현재표 후속분석 불가",
         action="현재표 후속분석 불가",
-        message="현재표가 없습니다. 먼저 SIMS 조회를 실행한 뒤 다시 질문해 주세요.",
+        message="현재표가 없습니다. 먼저 SSAI 조회를 실행한 뒤 다시 질문해 주세요.",
         query_summary="현재표 / 후속분석 불가 / 현재표 원본 없음",
         source_query=str(source_query or ""),
     )
@@ -7588,7 +7588,7 @@ def _ensure_sims_panel_room_title(room: dict[str, Any], action: str) -> None:
     if not isinstance(room, dict):
         return
 
-    action_text = _room_title_text_from_message(str(action or "SIMS 조회"), limit=36) or "SIMS 조회"
+    action_text = _room_title_text_from_message(str(action or "SSAI 조회"), limit=36) or "SSAI 조회"
     new_name = f"{make_ts()[:16]} {action_text}"
 
     if room.get("auto_created") is True and not _room_has_any_messages(room):
@@ -7666,7 +7666,7 @@ def _push_panel_result_to_current_chat(
         or ss.get("__sims_last_table_action")
         or ss.get("__sims_current_table_source_action")
         or selected_for_render.get("action")
-        or "SIMS 조회"
+        or "SSAI 조회"
     ).strip()
 
     table_key = str(
@@ -7756,7 +7756,7 @@ def _push_panel_result_to_current_chat(
                         "download_row_count": 0,
                         "column_count": 0,
                         "empty_result": True,
-                        "source": "SIMS 패널",
+                        "source": "SSAI 패널",
                         "hide_meta_expander": str(os.getenv("SSAI_DEBUG_META", "false")).strip().lower()
                         not in {"1", "true", "yes", "y", "on"},
                     }
@@ -7869,7 +7869,7 @@ def _push_panel_result_to_current_chat(
         "display_row_count": int(len(df_display)),
         "download_row_count": int(len(df_full)),
         "column_count": int(len(df_display.columns)),
-        "source": "SIMS 패널",
+        "source": "SSAI 패널",
         "hide_meta_expander": str(os.getenv("SSAI_DEBUG_META", "false")).strip().lower()
         not in {"1", "true", "yes", "y", "on"},
     })
@@ -8071,7 +8071,7 @@ def _render_knowledge_answer_message(
         return True
     with st.chat_message("assistant"):
         st.markdown(display.content)
-        st.caption("근거: " + " · ".join(citation.label for citation in display.citations))
+        st.caption("근거: " + " · ".join(display.citation_labels))
         for notice in display.conflict_notices:
             st.info(notice.message)
         if allow_followup:
@@ -8124,6 +8124,7 @@ def _complete_knowledge_chat(
     repository: KnowledgeDocumentRepository,
     room: dict[str, Any],
     log_kind: str,
+    citation_display_limit: int | None = None,
 ) -> bool:
     """Complete an already-authorized explicit or follow-up Knowledge request."""
     try:
@@ -8178,6 +8179,7 @@ def _complete_knowledge_chat(
             request_context=request_context,
             message_id=str(uuid.uuid4()),
             timestamp=make_ts(),
+            citation_display_limit=citation_display_limit,
         )
     except Exception as exc:
         log.warning("[knowledge.chat] answer_not_saved error_type=%s", type(exc).__name__)
@@ -8205,10 +8207,17 @@ def _complete_knowledge_chat(
     save_chat_rooms()
     _render_knowledge_answer_message(message, room=room, allow_followup=True)
     _render_assistant_message_controls(message, room=room)
+    display_citation_count = len(
+        build_knowledge_citation_labels(
+            packet.citations,
+            display_limit=citation_display_limit,
+        )
+    )
     log.info(
-        "[%s] result=stored citations=%s technical_detail=%s",
+        "[%s] result=stored evidence_citations=%s display_citations=%s technical_detail=%s",
         log_kind,
         len(packet.citations),
+        display_citation_count,
         technical_detail_mode,
     )
     return True
@@ -8216,12 +8225,44 @@ def _complete_knowledge_chat(
 
 def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
     """Handle one explicit /knowledge request without changing ordinary chat routing."""
+    return _run_knowledge_chat_route(
+        route,
+        room=room,
+        log_kind="knowledge.chat",
+        fall_through_on_no_match=False,
+    )
+
+
+def _run_business_help_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
+    """Use authorized help evidence, or return control to ordinary Chat."""
+    return _run_knowledge_chat_route(
+        route,
+        room=room,
+        log_kind="knowledge.business_help",
+        fall_through_on_no_match=True,
+    )
+
+
+def _run_knowledge_chat_route(
+    route,
+    *,
+    room: dict[str, Any],
+    log_kind: str,
+    fall_through_on_no_match: bool,
+) -> bool:
+    """Retrieve once through the shared authorization and completion boundary."""
     request_context = _knowledge_request_context_for_room(
         room,
         technical_detail_mode=route.technical_detail_mode,
     )
     repository = _knowledge_repository_for_chat()
-    packet = repository.retrieve_for_chat(query=route.query, request_context=request_context)
+    retrieval_query = str(getattr(route, "retrieval_query", "") or route.query).strip()
+    packet = repository.retrieve_for_chat(query=retrieval_query, request_context=request_context)
+    if fall_through_on_no_match and (
+        packet.reason_code != "ready" or not packet.text or not packet.citations
+    ):
+        log.info("[%s] result=fall_through reason=%s", log_kind, packet.reason_code)
+        return False
     return _complete_knowledge_chat(
         query=route.query,
         technical_detail_mode=route.technical_detail_mode,
@@ -8229,7 +8270,8 @@ def _run_explicit_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
         request_context=request_context,
         repository=repository,
         room=room,
-        log_kind="knowledge.chat",
+        log_kind=log_kind,
+        citation_display_limit=3 if fall_through_on_no_match else None,
     )
 
 
@@ -8261,6 +8303,8 @@ def _run_knowledge_followup_chat(route, *, room: dict[str, Any]) -> bool:
         query=route.query,
         request_context=request_context,
     )
+    parent_meta = parent.get("meta") if isinstance(parent.get("meta"), dict) else {}
+    citation_display_limit = parent_meta.get("knowledge_citation_display_limit")
     return _complete_knowledge_chat(
         query=route.query,
         technical_detail_mode=technical_detail_mode,
@@ -8269,38 +8313,8 @@ def _run_knowledge_followup_chat(route, *, room: dict[str, Any]) -> bool:
         repository=repository,
         room=room,
         log_kind="knowledge.followup",
+        citation_display_limit=citation_display_limit,
     )
-
-
-def _run_sims_help_chat(route, *, room: dict[str, Any]) -> bool:
-    """Return deterministic, permission-filtered SIMS help without external calls."""
-    del route
-    company = get_selected_company() or {}
-    knowledge_availability = _knowledge_repository_for_chat().get_help_example_queries(
-        current_user_id=getattr(get_current_user(), "user_id", None),
-        current_company_id=company.get("company_id") if isinstance(company, dict) else None,
-        permission_codes=get_current_permissions(),
-    )
-    message = {
-        "id": str(uuid.uuid4()),
-        "role": "assistant",
-        "type": "sims_help",
-        "content": build_sims_help_text(
-            get_current_permissions(),
-            knowledge_availability=knowledge_availability,
-        ),
-        "time": make_ts(),
-        "seq": _next_seq(),
-        **_message_meta("sims_help"),
-    }
-    room.setdefault("messages", []).append(message)
-    _sync_room_meta(room, materialize=True)
-    save_chat_rooms()
-    with st.chat_message("assistant"):
-        st.markdown(str(message["content"]))
-    _render_assistant_message_controls(message, room=room)
-    log.info("[sims.help] result=stored llm_call_count=0")
-    return True
 
 
 def _run_explicit_mcp_resource_chat(route, *, room: dict[str, Any]) -> bool:
@@ -11027,7 +11041,7 @@ def _render_sims_sidebar_fragment() -> None:
     - 기존 채팅 표, 특히 974 x 97 styled table 재렌더링 방지
     - 실제 [SIMS 실행] 버튼을 누를 때만 전체 앱 rerun
     """
-    st.markdown("### 🧩 SIMS 모드")
+    st.markdown("### 🧩 SSAI 모드")
 
     # 조회 결과를 채팅창으로 보낸 뒤에도 SIMS 패널은 열린 상태를 유지한다.
     # 이전 v2 자동 닫기 플래그가 남아 있어도 토글을 끄지 않고 플래그만 소비한다.
@@ -11045,7 +11059,7 @@ def _render_sims_sidebar_fragment() -> None:
     st.session_state.setdefault("__sims_q", "")
     st.session_state.setdefault("__sims_run", False)
 
-    sims_panel_open = st.toggle("SIMS 패널 열기", key="__sims_open")
+    sims_panel_open = st.toggle("SSAI 패널 열기", key="__sims_open")
 
     if not sims_panel_open:
         # fragment 안의 토글만 rerun되면 메인 영역의 기존 패널이 화면에 남을 수 있다.
@@ -11075,7 +11089,7 @@ def _render_sims_sidebar_fragment() -> None:
 
         return
 
-    with st.expander("SIMS 옵션", expanded=True):
+    with st.expander("SSAI 옵션", expanded=True):
         st.text_input("쿼리/키워드", key="__sims_q", label_visibility="collapsed")
 
         sims_mode_selector(key="__sims_mode")
@@ -11095,13 +11109,13 @@ def _render_sims_sidebar_fragment() -> None:
             # 실제 실행은 [SIMS 실행] 버튼이 담당한다.
             st.session_state["__sims_selected"] = new_selected
             st.session_state["__sims_selected_snapshot"] = dict(new_selected)
-            st.caption("선택됨. ‘SIMS 작업 열기’를 눌러 선택한 화면/폼을 여세요.")
+            st.caption("선택됨. ‘SSAI 작업 열기’를 눌러 선택한 화면/폼을 여세요.")
         else:
             st.session_state.pop("__sims_selected", None)
             st.session_state["__sims_selected_snapshot"] = {}
 
         clicked = st.button(
-            "SIMS 작업 열기",
+            "SSAI 작업 열기",
             width="stretch",
             type="primary",
             key="__sims_run_btn",
@@ -11155,7 +11169,7 @@ def _render_sims_sidebar_fragment() -> None:
                 st.session_state["__sims_run_seq"],
                 st.session_state.get("__sims_selected"),
             )
-            st.toast("🧩 SIMS 작업 화면을 엽니다.")
+            st.toast("🧩 SSAI 작업 화면을 엽니다.")
 
             # 실제 조회/메인 결과 렌더링은 전체 앱 rerun이 필요하다.
             st.rerun()
@@ -11163,7 +11177,7 @@ def _render_sims_sidebar_fragment() -> None:
         def _sims_reset() -> None:
             st.session_state["__sims_reset_requested"] = True
             log.info("[sims.reset] requested=True (from sidebar fragment)")
-            st.toast("SIMS 옵션이 초기화되었습니다.", icon="🧹")
+            st.toast("SSAI 옵션이 초기화되었습니다.", icon="🧹")
 
             # 옵션 초기화는 메인 상태까지 정리해야 하므로 전체 앱 rerun.
             st.rerun()
@@ -12153,10 +12167,10 @@ with st.sidebar:
                 )
 
             # ---- 4) 최근 SIMS 컨텍스트 요약 ----
-            with st.expander("4️⃣ 최근 SIMS 컨텍스트 요약", expanded=False):
+            with st.expander("4️⃣ 최근 SSAI 컨텍스트 요약", expanded=False):
                 ctx_info = _extract_recent_sims_context()
                 if not ctx_info:
-                    st.info("SIMS 컨텍스트 관련 session_state 키를 찾지 못했습니다.")
+                    st.info("SSAI 컨텍스트 관련 session_state 키를 찾지 못했습니다.")
                 else:
                     key = ctx_info["key"]
                     value = ctx_info["value"]
@@ -12315,16 +12329,22 @@ if user_input and user_input.strip():
     user_input = user_input.strip()
 
     st.session_state.pop("__sims_flash", None)
-    # Explicit Knowledge commands own their command/query bytes. The normal
-    # Korean/English keyboard correction stays on every ordinary Chat path.
+    # Knowledge-owned requests keep their query bytes. The normal Korean/English
+    # keyboard correction stays on every ordinary Chat path.
     raw_knowledge_route = parse_explicit_knowledge_request(user_input)
-    raw_mcp_route = None if raw_knowledge_route is not None else parse_explicit_mcp_resource_request(user_input)
-    sims_help_route = (
-        None
-        if raw_knowledge_route is not None or raw_mcp_route is not None
-        else parse_sims_help_request(user_input)
+    business_help_knowledge_route = (
+        None if raw_knowledge_route is not None else parse_business_help_knowledge_request(user_input)
     )
-    if raw_knowledge_route is None and raw_mcp_route is None and sims_help_route is None:
+    raw_mcp_route = (
+        None
+        if raw_knowledge_route is not None or business_help_knowledge_route is not None
+        else parse_explicit_mcp_resource_request(user_input)
+    )
+    if (
+        raw_knowledge_route is None
+        and business_help_knowledge_route is None
+        and raw_mcp_route is None
+    ):
         try:
             from app.sims.nlq.nlq_router import keyboard_fix
             fixed = keyboard_fix(user_input)
@@ -12341,14 +12361,16 @@ if user_input and user_input.strip():
     explicit_current_trans_doc_validation = is_explicit_current_trans_doc_validation_request(user_input)
 
     datetime_answer = (
-        None if raw_mcp_route is not None or sims_help_route is not None else resolve_datetime_question(user_input)
+        None
+        if business_help_knowledge_route is not None or raw_mcp_route is not None
+        else resolve_datetime_question(user_input)
     )
     web_search_route = None
     if (
         datetime_answer is None
         and raw_knowledge_route is None
+        and business_help_knowledge_route is None
         and raw_mcp_route is None
-        and sims_help_route is None
         and not explicit_current_trans_doc_validation
     ):
         web_search_route = parse_web_search_request(user_input)
@@ -12457,14 +12479,17 @@ if user_input and user_input.strip():
         st.session_state["__queue_ai"] = True
         log.info("[knowledge.chat] explicit_command_queued technical_detail=%s", raw_knowledge_route.technical_detail_mode)
         st.rerun()
+    if business_help_knowledge_route is not None:
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        st.session_state["__queue_ai"] = True
+        log.info("[knowledge.business_help] auto_help_queued")
+        st.rerun()
     if raw_mcp_route is not None:
         _sync_room_meta(current_room, materialize=True)
         save_chat_rooms()
         st.session_state["__queue_ai"] = True
         log.info("[mcp.resource] explicit_command_queued valid=%s resource_id=%s", raw_mcp_route.valid, raw_mcp_route.resource_id)
-        st.rerun()
-    if sims_help_route is not None:
-        _run_sims_help_chat(sims_help_route, room=current_room)
         st.rerun()
 #   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
     # ✅ (D) 컨텍스트 메타 질문은 NLQ/LLM 전에 즉답 처리 (삽입 위치 고정)
@@ -13104,7 +13129,7 @@ with st.container():
                 m.get("title")
                 or m.get("content")
                 or meta.get("action")
-                or "SIMS 결과"
+                or "SSAI 결과"
             )
 
             # 저장된 SIMS 표도 chat_middleware의 기존 렌더러로 다시 그린다.
@@ -13519,7 +13544,7 @@ with st.container():
         _open = _user_sims_open
         if _open:
             st.markdown('<a id="__sims_result"></a>', unsafe_allow_html=True)
-            st.markdown("## 🧩 SIMS 결과")
+            st.markdown("## 🧩 SSAI 결과")
 
 #           st.caption("SIMS 관련 질문에 답변이 도착하면 이 영역에 결과가 표시됩니다.")
  
@@ -13795,7 +13820,7 @@ with st.container():
                         st.session_state["__sims_panel_active"] = True
                 else:
                     if not has_selection:
-                        st.caption("좌측 ‘SIMS 옵션’에서 카테고리/작업을 선택한 뒤 ‘SIMS 작업 열기’를 눌러주세요.")
+                        st.caption("좌측 ‘SSAI 옵션’에서 카테고리/작업을 선택한 뒤 ‘SSAI 작업 열기’를 눌러주세요.")
 
             else:
                 # Hub(B): 메인에서 허브 UI를 항상 렌더
@@ -13866,7 +13891,7 @@ with st.container():
                     st.session_state.pop("__sims_flash", None)
                 else:
                     _df = (st.session_state.get("sims_tables") or {}).get(_flash.get("table_key"))
-                    title = _flash.get("title", "SIMS 결과(임시)")
+                    title = _flash.get("title", "SSAI 결과(임시)")
 
                     # ▶▶ 여기에서 파일명 준비 ( _flash 가 확실히 존재하는 시점 )
                     def _slug_name(s: str) -> str:
@@ -13935,7 +13960,7 @@ with st.container():
                                 except Exception:
                                     st.caption("⚠️ Excel 엔진(xlsxwriter/openpyxl)이 없어 CSV만 제공합니다.")
                     else:
-                        st.info("SIMS 임시 결과 표 데이터가 세션에서 만료되었습니다.")
+                        st.info("SSAI 임시 결과 표 데이터가 세션에서 만료되었습니다.")
 
                     # 수동 닫기 버튼(항상 제공)
                     if st.button("닫기", key="__sims_flash_close"):
@@ -14085,14 +14110,28 @@ with st.container():
             None if raw_knowledge_followup is not None
             else parse_explicit_knowledge_request(last_user_text)
         )
-        mcp_route = (
+        business_help_knowledge_route = (
             None
             if raw_knowledge_followup is not None or knowledge_route is not None
+            else parse_business_help_knowledge_request(last_user_text)
+        )
+        mcp_route = (
+            None
+            if (
+                raw_knowledge_followup is not None
+                or knowledge_route is not None
+                or business_help_knowledge_route is not None
+            )
             else parse_explicit_mcp_resource_request(last_user_text)
         )
         web_search_route = (
             None
-            if raw_knowledge_followup is not None or knowledge_route is not None or mcp_route is not None
+            if (
+                raw_knowledge_followup is not None
+                or knowledge_route is not None
+                or business_help_knowledge_route is not None
+                or mcp_route is not None
+            )
             else parse_web_search_request(last_user_text)
         )
         image_followup_request = st.session_state.pop("__attachment_image_followup_request", None)
@@ -14112,6 +14151,17 @@ with st.container():
                     _run_knowledge_followup_chat(knowledge_followup_route, room=current_room)
             elif knowledge_route is not None:
                 _run_explicit_knowledge_chat(knowledge_route, room=current_room)
+            elif business_help_knowledge_route is not None:
+                if not _run_business_help_knowledge_chat(
+                    business_help_knowledge_route,
+                    room=current_room,
+                ):
+                    stream_and_append_assistant(
+                        messages_for_ai=msgs,
+                        room=current_room,
+                        temperature=0.2,
+                        history_channel=("sims_messages" if use_sims_hist else "gen_messages"),
+                    )
             elif mcp_route is not None:
                 _run_explicit_mcp_resource_chat(mcp_route, room=current_room)
             elif web_search_route is not None:

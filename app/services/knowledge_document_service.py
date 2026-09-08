@@ -392,6 +392,11 @@ _KOREAN_QUERY_PARTICLES = (
     "를",
 )
 
+_KNOWLEDGE_FOLLOWUP_FILLER_TERMS = frozenset(
+    {"그럼", "그러면", "다른", "들어줘", "들어주세요"}
+)
+_KNOWLEDGE_FOLLOWUP_TERM_ALIASES = {"예도": "예", "사례도": "사례", "예시도": "예시"}
+
 
 def _knowledge_query_terms(
     value: str,
@@ -419,6 +424,17 @@ def _knowledge_query_terms(
         if semantic_terms:
             normalized = semantic_terms
     return tuple(normalized), compact
+
+
+def _knowledge_followup_retrieval_query(value: str) -> str:
+    """Remove conversational wrappers only inside authorized parent evidence."""
+    terms, _ = _knowledge_query_terms(value)
+    normalized = tuple(
+        _KNOWLEDGE_FOLLOWUP_TERM_ALIASES.get(term, term)
+        for term in terms
+        if term not in _KNOWLEDGE_FOLLOWUP_FILLER_TERMS
+    )
+    return " ".join(normalized)
 
 
 @dataclass(frozen=True)
@@ -1246,8 +1262,11 @@ class KnowledgeDocumentRepository:
         )
         if table_layout_packet is not None:
             return table_layout_packet
+        retrieval_query = _knowledge_followup_retrieval_query(query)
+        if not retrieval_query:
+            return ContextPacket("", (), "invalid_followup_query", 0)
         return self.retrieve(
-            query=query,
+            query=retrieval_query,
             current_user_id=request_context.user_id,
             current_company_id=request_context.company_id,
             permission_codes=request_context.permission_codes,

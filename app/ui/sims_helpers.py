@@ -28,7 +28,7 @@ def _append_markdown_fallback(df: pd.DataFrame, title: str) -> None:
     """
     if not isinstance(df, pd.DataFrame):
         return
-    md = f"**{title}** — SIMS 결과가 JSON 데이터 컨테이너로 LLM에 전달되었습니다."
+    md = f"**{title}** — SSAI 결과가 분석 데이터로 전달되었습니다."
 
     for k in _CHAT_KEYS:
         lst = st.session_state.get(k)
@@ -45,7 +45,7 @@ def _append_markdown_fallback(df: pd.DataFrame, title: str) -> None:
     inbox.append({"role": "assistant", "content": md})
     st.session_state["__chat_has_new"] = True
 
-def push_sims_table_message(df, title: str = "SIMS 조회 결과"):
+def push_sims_table_message(df, title: str = "SSAI 조회 결과"):
     """
     표(DataFrame)를 세션에 저장하고, 채팅 메시지(assistant)로 '표 버블'을 추가.
     - st.session_state["sims_tables"][key] = df
@@ -117,5 +117,5 @@ def push_sims_table_message(df, title: str = "SIMS 조회 결과"):
 
 # ── 옵션 A에서는 캡처 컨텍스트를 사용하지 않으므로 no-op으로 둡니다.
 @contextmanager
-def sims_capture_context(default_title: str = "SIMS 조회 결과"):
+def sims_capture_context(default_title: str = "SSAI 조회 결과"):
     yield

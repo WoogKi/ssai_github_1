@@ -94,7 +94,7 @@ def push_sims_result_to_chat(result: Any, action: str | None = None) -> None:
     norm = _normalize_result_for_chat(result)
 
     # 미리보기 마크다운 생성
-    title = (norm.get("title") if isinstance(norm, dict) else None) or (action or "SIMS 결과")
+    title = (norm.get("title") if isinstance(norm, dict) else None) or (action or "SSAI 결과")
     lines = [f"### 📊 {title}"]
     msg = (norm.get("message") if isinstance(norm, dict) else None) \
           or (norm.get("status") if isinstance(norm, dict) else None) \

@@ -121,7 +121,7 @@ def _slug(s: str) -> str:
     return s or "x"
 
 def render():
-    st.subheader("🧩 SIMS Hub", divider="gray")
+    st.subheader("🧩 SSAI Hub", divider="gray")
 
     # ⚙️ 초기화 및 자동 실행 방지
     if "__sims_initialized" not in st.session_state:

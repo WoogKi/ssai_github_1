@@ -30,7 +30,7 @@ def sims_mode_selector(key: str = "__sims_mode") -> str:
             DEFAULT_MODE if str(DEFAULT_MODE).startswith("Panel") else "Hub (B)"
         )
 
-    st.markdown("### SIMS 모드")
+    st.markdown("### SSAI 모드")
     current = st.session_state.get(key, "Panel (A)")
     idx = 0 if str(current).startswith("Panel") else 1
     mode: str = st.radio(
@@ -58,7 +58,7 @@ def _panel_sidebar() -> Dict[str, str]:
 
     내부 라우팅은 기존 category/action 구조를 유지한다.
     """
-    st.markdown("### SIMS 옵션")
+    st.markdown("### SSAI 옵션")
 
     # ------------------------------------------------------------------
     # 선택 옵션 정의

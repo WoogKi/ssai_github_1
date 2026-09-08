@@ -2169,7 +2169,7 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
         or ("records" in result and "columns" in result)
     ):
         payload = dict(result)  # 원본 보존
-        title = payload.get("title") or payload.get("action") or "SIMS 결과"
+        title = payload.get("title") or payload.get("action") or "SSAI 결과"
 
         df_disp = payload.get("df_display")
         df_full = payload.get("df")
@@ -2248,7 +2248,7 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
     if isinstance(result, dict) and "data" in result:
         payload = dict(result)
         payload.setdefault("type", "object")
-        payload.setdefault("title", payload.get("action") or "SIMS 결과")
+        payload.setdefault("title", payload.get("action") or "SSAI 결과")
         payload.setdefault("meta", {})
         return payload
 
@@ -5598,12 +5598,12 @@ def _build_sims_detail_analysis_prompt(
     download_rows: int,
     expected_rows: int,
 ) -> str:
-    action_name = str(action_name or "SIMS 조회 결과").strip()
+    action_name = str(action_name or "SSAI 조회 결과").strip()
 
 
     if "제품수불현황" in action_name or "제품수불" in action_name:
         return f"""
-현재 SIMS 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
+현재 SSAI 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
 
 중요 원칙:
 - 화면 표시 {display_rows:,}건은 일부일 수 있고, 전체 분석 기준은 {expected_rows:,}건이다.
@@ -5628,7 +5628,7 @@ def _build_sims_detail_analysis_prompt(
 
     if "실재고월집계" in action_name or "장부재고월집계" in action_name or "월집계" in action_name:
         return f"""
-현재 SIMS 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
+현재 SSAI 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
 
 중요 원칙:
 - 화면 표시 {display_rows:,}건은 일부일 수 있고, 전체 분석 기준은 {expected_rows:,}건이다.
@@ -5656,7 +5656,7 @@ def _build_sims_detail_analysis_prompt(
 
     if "제품재고현황" in action_name or "제품재고" in action_name:
         return f"""
-현재 SIMS 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
+현재 SSAI 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
 
 중요 원칙:
 - 화면 표시 {display_rows:,}건은 일부일 수 있고, 전체 분석 기준은 {expected_rows:,}건이다.
@@ -5674,7 +5674,7 @@ def _build_sims_detail_analysis_prompt(
 
     if "검증" in action_name:
         return f"""
-현재 SIMS 조회 결과 [{action_name}]를 전체 조회조건 기준으로 검증 분석해줘.
+현재 SSAI 조회 결과 [{action_name}]를 전체 조회조건 기준으로 검증 분석해줘.
 
 중요 원칙:
 - 화면 표시 {display_rows:,}건은 일부일 수 있고, 전체 분석 기준은 {expected_rows:,}건이다.
@@ -5704,7 +5704,7 @@ def _build_sims_detail_analysis_prompt(
 
     if "세금계산서" in action_name:
         return f"""
-현재 SIMS 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
+현재 SSAI 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
 
 중요 원칙:
 - 화면 표시 {display_rows:,}건은 일부일 수 있고, 전체 분석 기준은 {expected_rows:,}건이다.
@@ -5729,7 +5729,7 @@ def _build_sims_detail_analysis_prompt(
 
     if "거래명세서" in action_name:
         return f"""
-현재 SIMS 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
+현재 SSAI 조회 결과 [{action_name}]를 전체 조회조건 기준으로 분석해줘.
 
 중요 원칙:
 - 화면 표시 {display_rows:,}건은 일부일 수 있고, 전체 분석 기준은 {expected_rows:,}건이다.
@@ -6537,7 +6537,7 @@ def _render_old_sims_table_placeholder(
     이전 SIMS 표는 rerun 때마다 무거운 dataframe을 다시 그리지 않고
     요약만 표시한다.
     """
-    action_name = str(item.get("action") or meta.get("action") or item.get("title") or "SIMS 결과").strip()
+    action_name = str(item.get("action") or meta.get("action") or item.get("title") or "SSAI 결과").strip()
 
     try:
         row_count = int(
@@ -6984,7 +6984,7 @@ def drain_inbox_to_chat(room: Optional[Dict[str, Any]] = None) -> None:
                 meta.pop("columns", None)
 
                 safe["meta"] = meta
-                safe.setdefault("content", safe.get("title") or f"📊 {meta.get('action') or 'SIMS 결과'}")
+                safe.setdefault("content", safe.get("title") or f"📊 {meta.get('action') or 'SSAI 결과'}")
 
                 for k in ("data", "df", "df_display", "records", "columns"):
                     safe.pop(k, None)
@@ -8620,7 +8620,7 @@ def _build_chat_fallback_summary_md(
         row_display = len(data)
 
     lines: list[str] = []
-    title = str(action_name or item.get("title") or "SIMS 조회").strip() or "SIMS 조회"
+    title = str(action_name or item.get("title") or "SSAI 조회").strip() or "SSAI 조회"
     lines.append(f"{title} 집계 요약")
     lines.append("")
     lines.append("분석 기준: 조회된 전체 결과 기준")
@@ -9251,8 +9251,8 @@ def _build_sims_result_header_view(
         or safe_meta.get("action")
         or title
         or item.get("title")
-        or "SIMS 결과"
-    ).strip() or "SIMS 결과"
+        or "SSAI 결과"
+    ).strip() or "SSAI 결과"
     full_rows, display_rows, expected_rows = _sims_table_meta_row_count(safe_meta, data)
     download_rows = _safe_int_for_download(safe_meta.get("download_row_count") or full_rows, full_rows)
     query_summary, full_condition = _sims_query_summary_for_header(item, safe_meta)
@@ -9473,8 +9473,8 @@ def _render_expired_sims_table_fallback(item: Dict[str, Any], meta: Dict[str, An
         or meta.get("action")
         or item.get("title")
         or item.get("content")
-        or "SIMS 결과"
-    ).strip() or "SIMS 결과"
+        or "SSAI 결과"
+    ).strip() or "SSAI 결과"
     cond_text = _build_query_condition_text(item)
     if not cond_text:
         query_summary = str(meta.get("query_summary") or "").strip()
@@ -10682,7 +10682,7 @@ def render_sims_context_controls() -> None:
         or "0"
     )
 
-    with st.expander("SIMS 컨텍스트", expanded=False):
+    with st.expander("SSAI 컨텍스트", expanded=False):
         st.caption("최근 푸시 상태")
         st.write({"push_count": ss.get("__sims_push_count", 0)})
 
@@ -10704,7 +10704,7 @@ def render_sims_context_controls() -> None:
             key=f"__sims_ctx_reset_btn::{ns}",
         ):
             _clear_sims_only()
-            st.success("SIMS 컨텍스트만 초기화했습니다.")
+            st.success("SSAI 컨텍스트만 초기화했습니다.")
             
 # ---------------------------------------------------------------------
 # SSOT 호환: 외부(sims_panel/chat_bridge)에서 기대하는 이름을

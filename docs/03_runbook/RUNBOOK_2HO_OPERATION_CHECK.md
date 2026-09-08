@@ -1,12 +1,12 @@
 ---
-title: "SIMS AI 2호기 운영 점검 Runbook"
+title: "SSAI 2호기 운영 점검 Runbook"
 date: "2026-08-09"
 version: "v1.0"
 status: "official"
 baseline_commit: "6c83962bc1b079fe440d56a313de536cf9490651"
 ---
 
-# SIMS AI 2호기 운영 점검 Runbook
+# SSAI 2호기 운영 점검 Runbook
 
 ## 1. 고정 운영 정보
 
@@ -22,7 +22,7 @@ baseline_commit: "6c83962bc1b079fe440d56a313de536cf9490651"
 | wrapper | `D:\SSAI_DATA\tools\run_streamlit_2ho_rotating.ps1` |
 | inner cmd | `D:\SSAI_DATA\tools\run_streamlit_2ho_inner.cmd` |
 
-공통 배포 순서는 [SIMS AI 공통 운영 Runbook](RUNBOOK_SIMSAI.md)을 따른다.
+공통 배포 순서는 [SSAI 공통 운영 Runbook](RUNBOOK_SIMSAI.md)을 따른다.
 
 ## 2. 실제 process 구조와 발견사항
 

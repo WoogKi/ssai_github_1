@@ -5492,7 +5492,7 @@ def run_basic_checks() -> list[CheckResult]:
         try:
             main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
             no_source_checks = {
-                "simple_notice": "현재표가 없습니다. 먼저 SIMS 조회를 실행한 뒤 다시 질문해 주세요." in main_src,
+                "simple_notice": "현재표가 없습니다. 먼저 SSAI 조회를 실행한 뒤 다시 질문해 주세요." in main_src,
                 "source_probe": "def _has_current_table_source_df" in main_src,
                 "immediate_notice": "no current source; notice pushed immediately" in main_src,
                 "no_deferred": "st.session_state.pop(\"__deferred_current_table_followup\", None)" in main_src,

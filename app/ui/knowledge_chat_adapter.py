@@ -1,25 +1,68 @@
-"""Thin, explicit Knowledge Chat routing helpers.
+"""Thin Knowledge Chat routing helpers.
 
 This module does not call an LLM or access Streamlit session state.  The main
-chat owns lifecycle and persistence; the adapter only recognizes an explicit
-request and builds a bounded, evidence-only prompt.
+chat owns lifecycle and persistence; the adapter only recognizes an authorized
+request shape and builds a bounded, evidence-only prompt.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 from app.services.knowledge_document_service import ContextPacket
 
 
 _DOCUMENT_PREFIX = "/knowledge"
 _TECHNICAL_PREFIX = "/knowledge-tech"
+_BUSINESS_HELP_RETRIEVAL_CONTEXT = "업무질문 도움말"
+
+_BUSINESS_HELP_TOPICS = (
+    "ssai",
+    "sims",
+    "업무",
+    "질문",
+    "계약단가",
+    "최종매입단가",
+    "발주",
+    "입고예정",
+    "단가적용처",
+    "재고적용처",
+    "전문약",
+    "일반약",
+    "etc",
+    "otc",
+)
+_BUSINESS_HELP_CUES = (
+    "어떻게물어",
+    "어떻게질문",
+    "어떻게조회",
+    "어떻게사용",
+    "물어보면",
+    "질문예시",
+    "조회예시",
+    "조회방법",
+    "사용방법",
+    "어떤질문",
+    "어떤업무",
+    "조회할수있",
+    "조회하는방법",
+    "조회하려면",
+    "뭘물어볼수있",
+    "관련프롬프트",
+    "프롬프트알려",
+    "사용법",
+)
+_BUSINESS_HELP_TOPIC_OPTIONAL_CUES = (
+    "질문예시",
+)
 
 
 @dataclass(frozen=True)
 class KnowledgeChatRoute:
     query: str
     technical_detail_mode: bool
+    retrieval_query: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,6 +126,26 @@ def parse_explicit_knowledge_request(value: object) -> KnowledgeChatRoute | None
         query = text[len(prefix):].strip()
         return KnowledgeChatRoute(query=query, technical_detail_mode=technical_detail_mode) if query else None
     return None
+
+
+def parse_business_help_knowledge_request(value: object) -> KnowledgeChatRoute | None:
+    """Recognize business-question usage intent without consuming data queries."""
+    if not isinstance(value, str):
+        return None
+    query = value.strip()
+    if not query or query.startswith("/"):
+        return None
+    compact = re.sub(r"\s+", "", query).casefold()
+    has_topic = any(topic in compact for topic in _BUSINESS_HELP_TOPICS)
+    has_help_cue = any(cue in compact for cue in _BUSINESS_HELP_CUES)
+    has_topic_optional_cue = any(cue in compact for cue in _BUSINESS_HELP_TOPIC_OPTIONAL_CUES)
+    if not ((has_topic and has_help_cue) or has_topic_optional_cue):
+        return None
+    return KnowledgeChatRoute(
+        query=query,
+        technical_detail_mode=False,
+        retrieval_query=_BUSINESS_HELP_RETRIEVAL_CONTEXT,
+    )
 
 
 def build_knowledge_prompt(*, query: str, packet: ContextPacket) -> list[dict[str, str]]:

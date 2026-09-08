@@ -1,5 +1,5 @@
 ---
-title: "SIMS AI 공통 운영 Runbook"
+title: "SSAI 공통 운영 Runbook"
 date: "2026-08-09"
 version: "v1.0"
 status: "official"
@@ -7,7 +7,7 @@ baseline_branch: "feat/dashboard-stock-extension-20260727"
 baseline_commit: "6c83962bc1b079fe440d56a313de536cf9490651"
 ---
 
-# SIMS AI 공통 운영 Runbook
+# SSAI 공통 운영 Runbook
 
 ## 1. 목적과 적용 범위
 

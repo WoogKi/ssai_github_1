@@ -611,7 +611,7 @@ def _try_answer_ctx_meta_question(
         pack = None
 
     if not isinstance(pack, dict) or not pack:
-        msg = "현재 SIMS 컨텍스트가 없습니다. 먼저 SIMS 조회(예: 거래처 목록)를 실행해 주세요."
+        msg = "현재 SSAI 조회 결과가 없습니다. 먼저 SSAI 조회(예: 거래처 목록)를 실행해 주세요."
         room.setdefault("messages", []).append({
             "id": str(uuid.uuid4()),
             "role": "assistant",

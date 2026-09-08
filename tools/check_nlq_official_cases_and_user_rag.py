@@ -15,7 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.services.erp_table_nlq import resolve_registered_erp_table_nlq  # noqa: E402
-from app.services.knowledge_document_service import KnowledgeDocumentRepository  # noqa: E402
+from app.services.knowledge_document_service import (  # noqa: E402
+    KnowledgeDocumentRepository,
+    build_knowledge_chat_request_context,
+)
+from app.ui.knowledge_chat_adapter import parse_business_help_knowledge_request  # noqa: E402
+from app.ui.knowledge_chat_evidence import (  # noqa: E402
+    build_knowledge_answer_display,
+    build_knowledge_answer_message,
+    build_knowledge_followup_packet,
+)
 from tools.build_nlq_user_rag_guide import DEFAULT_CASEBOOK, DEFAULT_OUTPUT  # noqa: E402
 from tools.knowledge_document_manage_cli import apply_plan, validate_plan  # noqa: E402
 
@@ -53,10 +62,22 @@ EXPECTED_SECTION_COUNTS = {
 
 HELP_QUERIES = (
     "계약단가는 어떻게 물어보면 돼?",
+    "계약단가 조회 예시 보여줘",
+    "최종 매입단가는 어떻게 조회해?",
     "발주 조회 질문 예시 보여줘",
     "입고예정 조회 방법 알려줘",
+    "입고예정은 어떻게 물어봐?",
     "단가적용처로 조회할 수 있어?",
+    "재고적용처로 조회하는 방법 알려줘",
+    "전문약만 조회하려면 어떻게 해?",
+    "SSAI에서 어떤 질문을 할 수 있어?",
     "SIMS AI에서 어떤 질문을 할 수 있어?",
+    "SSAI에서 뭘 물어볼 수 있어?",
+    "SIMS에서 뭘 물어볼 수 있어?",
+    "질문 예시 알려줘",
+    "SSAI 사용법 알려줘",
+    "SIMS 사용법 알려줘",
+    "어떤 업무를 조회할 수 있어?",
 )
 
 
@@ -84,7 +105,8 @@ def main() -> None:
         observed[expected_status] += 1
 
     content = DEFAULT_OUTPUT.read_text(encoding="utf-8")
-    assert content.startswith("# SIMS AI 업무질문 사용 예시")
+    assert content.startswith("# SSAI 업무질문 사용 예시")
+    assert "SIMS AI에서는" not in content and "SIMS AI에서 어떤 질문" not in content
     for heading, expected_count in EXPECTED_SECTION_COUNTS.items():
         assert f"## {heading}" in content
         section = content.split(f"## {heading}", 1)[1].split("\n## ", 1)[0]
@@ -104,6 +126,8 @@ def main() -> None:
 
     plan = validate_plan(DEFAULT_OUTPUT.with_suffix(".knowledge.json"))
     assert len(plan) == 1 and plan[0].scope == "GLOBAL" and plan[0].knowledge_classification == "GENERAL"
+    assert plan[0].source_key == "document:sims-ai-business-question-examples"
+    assert plan[0].source_name == "SSAI_업무질문_사용_예시.md" and plan[0].version == 2
     with tempfile.TemporaryDirectory(prefix="nlq-user-rag-") as temp:
         manifest_root = Path(temp) / "manifest"
         applied = apply_plan(
@@ -115,14 +139,75 @@ def main() -> None:
         )
         assert applied[0]["status"] == "ACTIVE"
         repository = KnowledgeDocumentRepository(root=manifest_root)
+        request_context = build_knowledge_chat_request_context(
+            user_id=1,
+            company_id=4,
+            permission_codes=("RAG_USE",),
+            room_owner_user_id=1,
+            room_company_id=4,
+            technical_detail_mode=False,
+        )
         for query in HELP_QUERIES:
+            route = parse_business_help_knowledge_request(query)
+            assert route and route.query == query and not route.technical_detail_mode
             packet = repository.retrieve(
-                query=query,
+                query=route.retrieval_query,
                 current_user_id=1,
                 current_company_id=4,
                 permission_codes=("RAG_USE",),
             )
-            assert packet.reason_code == "ready" and packet.citations
+            assert packet.reason_code == "ready" and packet.citations, (
+                query,
+                packet.reason_code,
+                packet.candidate_count,
+            )
+
+        for query in (
+            "SSAI에서 어떤 질문을 할 수 있어?",
+            "SIMS AI에서 어떤 질문을 할 수 있어?",
+            "계약단가는 어떻게 물어보면 돼?",
+        ):
+            route = parse_business_help_knowledge_request(query)
+            assert route is not None
+            packet = repository.retrieve_for_chat(
+                query=route.retrieval_query,
+                request_context=request_context,
+            )
+            assert len(packet.citations) == 21
+            message = build_knowledge_answer_message(
+                repository=repository,
+                answer="승인된 업무질문 도움말 답변",
+                packet=packet,
+                request_context=request_context,
+                message_id="business-help",
+                timestamp="2026-09-08T12:00:00+09:00",
+                citation_display_limit=3,
+            )
+            display = build_knowledge_answer_display(
+                repository=repository,
+                message=message,
+                request_context=request_context,
+            )
+            assert display.visible and len(display.citation_labels) == 1
+            assert len(display.citations) == len(packet.citations)
+            assert len(message["knowledge_evidence"]["citations"]) == len(packet.citations)
+            for followup_query in (
+                "예를 들어줘",
+                "다른 예도 보여줘",
+                "그럼 발주는?",
+                "계약단가는?",
+            ):
+                followup = build_knowledge_followup_packet(
+                    repository=repository,
+                    parent_message=message,
+                    query=followup_query,
+                    request_context=request_context,
+                )
+                assert followup.reason_code == "ready" and followup.citations, (
+                    query,
+                    followup_query,
+                    followup.reason_code,
+                )
 
     print(json.dumps({
         "gate": "PASS",
@@ -131,6 +216,8 @@ def main() -> None:
         "focused": observed,
         "section_examples": EXPECTED_SECTION_COUNTS,
         "help_queries": len(HELP_QUERIES),
+        "business_help_followups": 12,
+        "citation_display_max": 3,
     }, ensure_ascii=False))
 
 

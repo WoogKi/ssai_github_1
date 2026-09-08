@@ -193,6 +193,7 @@ def main():
         live = build_knowledge_answer_display(repository=repo, message=message, request_context=regular)
         history = build_knowledge_answer_display(repository=repo, message=message, request_context=regular)
         assert live == history and live.visible
+        assert live.citation_labels == tuple(citation.label for citation in live.citations)
         hidden(build_knowledge_answer_display(repository=repo, message=message,
                                                request_context=context(company=6)))
         hidden(build_knowledge_answer_display(repository=repo, message=message,

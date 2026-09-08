@@ -1953,7 +1953,7 @@ def _render_compact_panel_result_placeholder(
             )
         except Exception:
             prompt = (
-                f"현재 SIMS 패널 조회 결과({title})를 전체 조회조건 기준으로 분석해줘. "
+                f"현재 SSAI 패널 조회 결과({title})를 전체 조회조건 기준으로 분석해줘. "
                 "핵심 요약, 주요 수치, 주의/확인할 점, 다음 조회 제안 순서로 정리해줘. "
                 "내부 영문 key 이름은 답변에 노출하지 마라."
             )
@@ -4406,7 +4406,7 @@ def _run_panel_llm_analysis_from_button(prompt: str, key_suffix: str) -> None:
 
     payload = _get_panel_last_final_payload(category, action)
     if not isinstance(payload, dict):
-        st.warning("현재 SIMS 조회 결과를 LLM 분석 컨텍스트로 준비하지 못했습니다. 조회를 다시 실행한 뒤 눌러 주세요.")
+        st.warning("현재 SSAI 조회 결과를 분석 자료로 준비하지 못했습니다. 조회를 다시 실행한 뒤 눌러 주세요.")
         return
 
     meta = payload.get("meta") or {}
@@ -4442,7 +4442,7 @@ def _run_panel_llm_analysis_from_button(prompt: str, key_suffix: str) -> None:
                 ss[k] = before_state[k]
 
     if not ok_ctx:
-        st.warning("현재 SIMS 조회 결과를 LLM 분석 컨텍스트로 준비하지 못했습니다. 조회를 다시 실행한 뒤 눌러 주세요.")
+        st.warning("현재 SSAI 조회 결과를 분석 자료로 준비하지 못했습니다. 조회를 다시 실행한 뒤 눌러 주세요.")
         return
 
     cache = ss.get("__sims_analysis_ctx_by_table_key") or {}
@@ -4750,7 +4750,7 @@ def _render_downloads(
     except Exception:
         log.exception("[panel] build detail analysis prompt failed")
         prompt = (
-            f"현재 SIMS 패널 조회 결과({base})를 전체 조회조건 기준으로 분석해줘. "
+            f"현재 SSAI 패널 조회 결과({base})를 전체 조회조건 기준으로 분석해줘. "
             "핵심 요약, 주요 수치, 주의/확인할 점, 다음 조회 제안 순서로 정리해줘. "
             "내부 영문 key 이름은 답변에 노출하지 마라."
         )

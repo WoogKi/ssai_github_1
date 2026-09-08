@@ -1,4 +1,4 @@
-"""Build the user-facing SIMS NLQ guide from the official Excel casebook."""
+"""Build the user-facing SSAI business-question guide from the official casebook."""
 from __future__ import annotations
 
 import argparse
@@ -73,9 +73,9 @@ def build(casebook: Path, output: Path) -> tuple[Path, Path, dict[str, int]]:
         raise ValueError(f"official casebook columns missing: {sorted(required - set(frame.columns))}")
 
     lines = [
-        "# SIMS AI 업무질문 사용 예시",
+        "# SSAI 업무질문 사용 예시",
         "",
-        "SIMS AI에서 어떤 질문을 할 수 있는지, 어떤 업무를 조회할 수 있는지 안내하는 도움말입니다.",
+        "SSAI에서 어떤 질문을 할 수 있는지, 어떤 업무를 조회할 수 있는지 안내하는 도움말입니다.",
         "아래 문장을 그대로 입력하거나 제품, 제약사, 발주처, 적용처와 날짜를 바꾸어 질문할 수 있습니다.",
         "조건은 한 가지만 사용해도 되고, 필요한 조건을 한 문장에 여러 개 함께 적어도 됩니다.",
         "",
@@ -124,18 +124,18 @@ def build(casebook: Path, output: Path) -> tuple[Path, Path, dict[str, int]]:
     plan = output.with_suffix(".knowledge.json")
     plan.write_text(json.dumps({"items": [{
         "source_kind": "DOCUMENT",
-        "source_name": output.name,
+        "source_name": "SSAI_업무질문_사용_예시.md",
         "source_key": "document:sims-ai-business-question-examples",
         "content_file": output.name,
         "scope": "GLOBAL",
         "company_id": None,
         "user_id": None,
-        "version": 1,
+        "version": 2,
         "knowledge_classification": "GENERAL",
         "search_aliases": [
-            "SIMS AI에서 어떤 질문을 할 수 있어",
+            "SSAI에서 어떤 질문을 할 수 있어",
             "어떤 업무를 조회할 수 있어",
-            "SIMS AI 질문 예시",
+            "SSAI 질문 예시",
             "업무질문 도움말",
             "계약단가 조회 예시",
             "계약단가는 어떻게 물어보면 돼",
@@ -148,6 +148,10 @@ def build(casebook: Path, output: Path) -> tuple[Path, Path, dict[str, int]]:
             "단가적용처로 조회하는 방법",
             "재고적용처로 조회하는 방법",
             "전문약만 조회하는 방법",
+            "SIMS AI에서 어떤 질문을 할 수 있어",
+            "SIMS에서 뭘 물어볼 수 있어",
+            "SIMS 관련 프롬프트 알려줘",
+            "SIMS 사용법 알려줘",
         ],
     }]}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return output, plan, counts
