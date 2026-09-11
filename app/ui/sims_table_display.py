@@ -71,14 +71,18 @@ def resolve_sims_table_mode(
     except Exception:
         threshold = 6000
     semantic_max_rows = 0
-    if isinstance(meta, dict) and bool(meta.get("registered_erp_table")):
+    if isinstance(meta, dict):
         try:
             semantic_max_rows = max(0, int(meta.get("semantic_styled_max_rows") or 0))
         except Exception:
             semantic_max_rows = 0
     if semantic_max_rows and rows <= semantic_max_rows:
         mode = "small"
-        reason = "registered_erp_semantic_rows"
+        reason = (
+            "registered_erp_semantic_rows"
+            if bool((meta or {}).get("registered_erp_table"))
+            else "semantic_rows"
+        )
     else:
         mode = "fast" if threshold > 0 and cells >= threshold else "small"
         reason = "cells>=threshold" if mode == "fast" else "cells<threshold"
@@ -942,6 +946,22 @@ def resolve_sims_excel_number_format(col: Any) -> str:
     if kind == "percent2":
         return "0.00\\%"
     return "#,##0.##"
+
+
+def apply_sims_export_projection(df: pd.DataFrame) -> pd.DataFrame:
+    """Apply a service-declared user export projection without mutating full source."""
+    if not isinstance(df, pd.DataFrame):
+        return df
+    attrs = dict(getattr(df, "attrs", {}) or {})
+    columns = attrs.get("sims_export_columns")
+    if not isinstance(columns, (list, tuple)) or not columns:
+        return df
+    selected = [column for column in columns if column in df.columns]
+    if not selected:
+        return df
+    out = df.loc[:, selected].copy()
+    out.attrs.update(attrs)
+    return out
 
 
 def _normalize_product_inventory_display_values(df: pd.DataFrame, action_name: str) -> pd.DataFrame:

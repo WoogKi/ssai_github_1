@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, Mapping, MutableMapping
+from typing import Any, Callable, Mapping, MutableMapping
 
 from app.services.ssai_auth_service import connect_ssai_db
 
@@ -141,6 +141,57 @@ def normalize_company_default_conditions(profile: Mapping[str, Any] | None) -> d
         elif value is not None:
             normalized[key] = value
     return normalized
+
+
+def resolve_company_default_stock_scope(
+    *,
+    company_id: int,
+    selected_codes: Any,
+    explicit_full: bool = False,
+    profile_loader: Callable[..., DashboardProfileLoadResult] | None = None,
+) -> dict[str, Any]:
+    """Classify a selected stock scope against the stored company Default."""
+    selected_values = selected_codes if isinstance(selected_codes, (list, tuple, set)) else [selected_codes]
+    selected = tuple(sorted({
+        normalize_business_code(value.rsplit(":", 1)[-1])
+        for value in selected_values
+        if isinstance(value, str) and normalize_business_code(value.rsplit(":", 1)[-1])
+    }))
+    if explicit_full:
+        return {
+            "status": "ready",
+            "is_full_default_scope": True,
+            "scope_source": "explicit_full",
+            "selected_count": len(selected),
+            "default_count": 0,
+        }
+
+    loader = profile_loader or load_dashboard_profile_checked
+    result = loader(company_id=int(company_id))
+    if result.status != "ready" or not isinstance(result.profile, Mapping):
+        return {
+            "status": result.status or "unavailable",
+            "is_full_default_scope": False,
+            "scope_source": "fail_closed",
+            "selected_count": len(selected),
+            "default_count": 0,
+            "reason_code": result.reason_code,
+        }
+    defaults = normalize_company_default_conditions(result.profile)
+    default_values = defaults.get("stock_cd_list") or []
+    default_codes = tuple(sorted({
+        normalize_business_code(value.rsplit(":", 1)[-1])
+        for value in default_values
+        if isinstance(value, str) and normalize_business_code(value.rsplit(":", 1)[-1])
+    }))
+    is_match = bool(default_codes) and selected == default_codes
+    return {
+        "status": "ready",
+        "is_full_default_scope": is_match,
+        "scope_source": "company_default" if is_match else "custom_subset",
+        "selected_count": len(selected),
+        "default_count": len(default_codes),
+    }
 
 
 def normalize_analytics_multi_code_filter(

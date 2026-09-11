@@ -807,6 +807,12 @@ _ANALYTICS_ACTION_SPECS = (
             "품목별 매출추세 요약표",
             "품목별 매출 추세요약표",
             "품목별 매출추세요약표",
+            "품목별 추세분석 요약표",
+            "품목별 추세 분석 요약표",
+            "품목별 추세분석 요약",
+            "품목별 추세 분석 요약",
+            "품목별추세분석요약표",
+            "품목별추세분석요약",
             "품목별 추세 요약표",
             "품목별 추세요약표",
             "품목별추세요약표",
@@ -826,6 +832,9 @@ _ANALYTICS_ACTION_SPECS = (
         "phrases": (
             "품목별 매출 추세 분석",
             "품목별 매출추세 분석",
+            "품목별 추세 분석",
+            "품목별 추세분석",
+            "품목별추세분석",
             "품목별 매출 분석",
             "품목별 매출분석",
             "제품별 매출 분석",
@@ -847,8 +856,14 @@ _ANALYTICS_ACTION_SPECS = (
 _ANALYTICS_TAIL_PATTERNS = (
     r"\s*제품별\s*매출\s*분석.*$",
     r"\s*제품별\s*매출분석.*$",
+    r"\s*품목별\s*추세\s*분석\s*요약표.*$",
+    r"\s*품목별\s*추세분석\s*요약표.*$",
+    r"\s*품목별\s*추세\s*분석\s*요약.*$",
+    r"\s*품목별\s*추세분석\s*요약.*$",
     r"\s*품목별\s*매출\s*추세\s*요약표.*$",
     r"\s*품목별\s*매출추세\s*요약표.*$",
+    r"\s*품목별\s*추세\s*분석.*$",
+    r"\s*품목별\s*추세분석.*$",
     r"\s*품목별\s*매출\s*추세\s*분석.*$",
     r"\s*품목별\s*매출추세\s*분석.*$",
     r"\s*품목별\s*매출\s*추세.*$",
@@ -932,15 +947,6 @@ def _classify_analytics_metric_grouping(txt: str) -> Dict[str, str] | None:
     if not compact:
         return None
 
-    if "매출예상" in compact or "예상매출" in compact:
-        metric = "sales_forecast"
-    elif "매출추세" in compact:
-        metric = "sales_trend_summary" if "요약" in compact else "sales_trend"
-    elif "재고" in compact and "부족" in compact:
-        metric = "stock_shortage"
-    else:
-        return None
-
     grouping = ""
     grouping_label = ""
     # A requested product grain wins over a manufacturer role used as a
@@ -961,16 +967,33 @@ def _classify_analytics_metric_grouping(txt: str) -> Dict[str, str] | None:
                 grouping = candidate_grouping
                 grouping_label = candidate_label
                 break
-        # "제약사 한미 매출예상" is a manufacturer-grain request even
-        # without the suffix "별".  The actual name remains a filter only
-        # when the user explicitly requested product grain above.
-        if (
-            not grouping
-            and metric == "sales_forecast"
-            and ("제약사" in compact or "제조사" in compact)
-        ):
-            grouping = "manufacturer"
-            grouping_label = "제약사" if "제약사" in compact else "제조사"
+    # Product/manufacturer trend actions share one axis x detail/summary
+    # contract.  Once an explicit supported axis owns the phrase, ``매출`` may
+    # be omitted without losing that axis to a broader fallback route.
+    grouped_trend_shorthand = (
+        "추세" in compact
+        and grouping in {"product", "manufacturer"}
+        and not any(domain in compact for domain in ("입고", "출고", "재고", "발주"))
+    )
+    if "매출예상" in compact or "예상매출" in compact:
+        metric = "sales_forecast"
+    elif "매출추세" in compact or grouped_trend_shorthand:
+        metric = "sales_trend_summary" if "요약" in compact else "sales_trend"
+    elif "재고" in compact and "부족" in compact:
+        metric = "stock_shortage"
+    else:
+        return None
+
+    # "제약사 한미 매출예상" is a manufacturer-grain request even
+    # without the suffix "별".  The actual name remains a filter only when
+    # the user explicitly requested product grain above.
+    if (
+        not grouping
+        and metric == "sales_forecast"
+        and ("제약사" in compact or "제조사" in compact)
+    ):
+        grouping = "manufacturer"
+        grouping_label = "제약사" if "제약사" in compact else "제조사"
 
     matrix_grouping = grouping
     requested_label = f"{grouping_label}별 {_ANALYTICS_METRIC_LABELS[metric]}" if grouping_label else ""
@@ -1050,12 +1073,64 @@ def _analytics_grouping_guard_payload(
             "intent_validation_status": "fail",
             "consistency_flags": [guard["consistency_flag"]],
             "result_status": guard_status,
+            "source_call_count": 0,
             "llm_explanation_used": False,
             "llm_explanation_status": "disabled",
             "row_count": 0,
             "row_count_total": 0,
         },
     }
+
+
+def _unsupported_analytics_metric_guard(txt: str) -> Dict[str, str] | None:
+    """Block explicit analytical rankings that have no registered calculation."""
+    compact = re.sub(r"\s+", "", str(txt or ""))
+    if not compact or any(marker in compact for marker in ("현재표", "현재조회결과", "현재결과")):
+        return None
+
+    ranking_requested = any(marker in compact.lower() for marker in ("top", "상위", "하위", "가장", "순위"))
+    product_axis = any(marker in compact for marker in ("제품", "품목", "제품군", "품목군"))
+
+    grouping_only_manufacturer = (
+        any(marker in compact for marker in ("제조사별", "제약사별"))
+        and any(marker in compact for marker in ("집계", "분석", "요약"))
+        # Do not preempt an existing domain expression such as "제약사별 입고추세".
+        and not any(marker in compact for marker in ("매출", "입고", "출고", "재고", "추세"))
+    )
+    if grouping_only_manufacturer:
+        return {
+            "requested_metric": "",
+            "requested_grouping": "manufacturer",
+            "requested_action_label": "제조사별 집계",
+            "resolved_action": "",
+            "guard_status": "unsupported",
+            "consistency_flag": "unregistered_analytics_metric",
+        }
+
+    if ranking_requested and product_axis and "재고회전율" in compact:
+        return {
+            "requested_metric": "inventory_turnover",
+            "requested_grouping": "product_group" if any(marker in compact for marker in ("제품군", "품목군")) else "product",
+            "requested_action_label": "재고회전율 순위",
+            "resolved_action": "",
+            "guard_status": "unsupported",
+            "consistency_flag": "unregistered_analytics_metric",
+        }
+
+    has_month_comparison = any(marker in compact for marker in ("지난달", "전월")) and "대비" in compact
+    has_sales_change = "매출" in compact and any(
+        marker in compact for marker in ("상승", "하락", "증가", "감소", "증감", "오른", "내린")
+    )
+    if ranking_requested and has_month_comparison and has_sales_change:
+        return {
+            "requested_metric": "month_over_month_sales_change",
+            "requested_grouping": "product",
+            "requested_action_label": "전월 대비 품목별 매출 증감 순위",
+            "resolved_action": "",
+            "guard_status": "unsupported",
+            "consistency_flag": "unregistered_analytics_metric",
+        }
+    return None
 
 
 def _is_stock_shortage_explanation_request(txt: str) -> bool:
@@ -1070,11 +1145,29 @@ def _is_stock_shortage_explanation_request(txt: str) -> bool:
     return not any(marker in compact for marker in query_markers)
 
 
+def is_general_writing_request(txt: str) -> bool:
+    """Classify standalone document-writing requests before ERP routing."""
+    compact = re.sub(r"\s+", "", str(txt or ""))
+    if not compact:
+        return False
+    writing_subjects = ("이메일", "메일", "안내문", "소개문", "초안", "문안")
+    writing_verbs = ("작성", "만들어", "써줘", "작성해", "만들어줘")
+    return any(marker in compact for marker in writing_subjects) and any(
+        marker in compact for marker in writing_verbs
+    )
+
+
 def _is_general_explanation_request(txt: str) -> bool:
     """Keep workflow and calculation explanations out of master/NLQ lookup routes."""
     compact = re.sub(r"\s+", "", str(txt or ""))
     if not compact:
         return False
+
+    # Writing requests can include master words such as 거래처 or 제품, but
+    # they are not ERP lookup requests. Keep this semantic boundary shared so
+    # document-writing prompts do not become master query candidates.
+    if is_general_writing_request(compact):
+        return True
 
     explanation_markers = (
         "어떻게",
@@ -1131,13 +1224,18 @@ def _resolve_analytics_action(txt: str) -> str | None:
     # inbound/outbound/order question could be replaced by a product analysis.
     trend_judge = _extract_analytics_trend_judge(t)
     allows_sales_data_shortage = trend_judge == "자료부족" and "매출" in compact_t
-    if ("추세" in compact_t and "매출" not in compact_t) or (
+    explicit_intent = _classify_analytics_metric_grouping(t)
+    grouped_sales_trend_shorthand = bool(
+        explicit_intent
+        and explicit_intent.get("requested_metric") in {"sales_trend", "sales_trend_summary"}
+        and explicit_intent.get("requested_grouping") in {"product", "manufacturer"}
+    )
+    if ("추세" in compact_t and "매출" not in compact_t and not grouped_sales_trend_shorthand) or (
         "부족" in compact_t
         and "재고" not in compact_t
         and not allows_sales_data_shortage
     ):
         return None
-    explicit_intent = _classify_analytics_metric_grouping(t)
     if explicit_intent and explicit_intent["requested_grouping"]:
         supported_action = ANALYTICS_INTENT_ACTIONS.get(
             (explicit_intent["requested_metric"], explicit_intent["matrix_grouping"])
@@ -1195,6 +1293,8 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return None
     if looks_like_pasted_formatted_content(normalized):
         return None
+    if _is_general_explanation_request(normalized):
+        return None
 
     # Mirror the deterministic codes-first boundary used at execution time.
     # The final code action is chosen only by the handler; this candidate is
@@ -1207,6 +1307,9 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return {"route": "dashboard", "action": dashboard_action}
 
     analytics_action = _resolve_analytics_action(normalized)
+    unsupported_metric = _unsupported_analytics_metric_guard(normalized)
+    if unsupported_metric and not analytics_action:
+        return {"route": "analytics", "action": "analytics_metric_unsupported"}
     analytics_guard = _analytics_grouping_guard(normalized, analytics_action)
     if analytics_guard:
         return {"route": "analytics", "action": f"analytics_grouping_{analytics_guard['guard_status']}"}
@@ -2223,6 +2326,7 @@ def _apply_company_default_to_analytics_nlq(
             out["stock_cd_list"] = values
             out["stock_cds"] = values
             out["stock_cd"] = values[0] if len(values) == 1 else ""
+            out["_stock_scope_is_full_selection"] = bool(normalized["is_full_selection"])
             if normalized["is_full_selection"]:
                 adapter_sources = adapter.get("sources")
                 if isinstance(adapter_sources, dict):
@@ -2292,6 +2396,7 @@ def _apply_company_default_to_analytics_nlq(
     if "stock_cd_list" in clear_keys:
         for key in ("stock_cd_list", "stock_cds", "stock_cd", "stock_nm", "stock_nm_list"):
             out[key] = [] if key in {"stock_cd_list", "stock_cds", "stock_nm_list"} else ""
+        out["_stock_scope_is_full_selection"] = True
     if "product_di_list" in clear_keys:
         for key in ("product_di_list", "dashboard_product_di_list", "product_di", "product_di_nm", "product_di_nm_list"):
             out[key] = [] if key.endswith("_list") else ""
@@ -2370,12 +2475,23 @@ def _analytics_manufacturer_filter_text(
     text: str,
     params: Dict[str, Any],
     intent: Dict[str, str],
+    *,
+    action: str = "",
 ) -> str:
-    """Return one manufacturer search phrase for a product-forecast request."""
-    if (
-        intent.get("requested_metric") != "sales_forecast"
-        or intent.get("requested_grouping") != "product"
-    ):
+    """Return one unresolved manufacturer phrase for a product-grain Analytics request."""
+    if intent.get("requested_grouping") != "product":
+        return ""
+
+    resolved_action = str(action or ANALYTICS_INTENT_ACTIONS.get(
+        (str(intent.get("requested_metric") or ""), "product"),
+        "",
+    )).strip()
+    if resolved_action not in {
+        "품목별 매출 추세 분석",
+        "품목별 매출 추세 요약표",
+        "품목별 매출 예상",
+        "품목별 재고부족현황",
+    }:
         return ""
 
     for key in ("maker_nm", "product_ven_nm", "manufacturer_nm"):
@@ -2385,20 +2501,28 @@ def _analytics_manufacturer_filter_text(
 
     source = _resolve_analytics_stock_basis(text).get("text_without_stock_basis") or ""
     source = _strip_analytics_trend_judge_phrases(source)
-    source = _strip_analytics_action_phrases(source, "품목별 매출 예상")
+    source = _strip_analytics_action_phrases(source, resolved_action)
     # An explicit product condition must never be repurposed as a
     # manufacturer condition merely because a product-grain forecast was
     # requested.
     if re.search(r"(?:제품명|품목명|상품명|제품)\s+[^\s]+", source):
         return ""
 
-    residual = re.sub(r"\d{4}[./-]?\d{1,2}[./-]?\d{0,2}|\d{4}년", " ", source)
+    residual = re.sub(
+        r"\d{4}[./-]?\d{1,2}[./-]?\d{0,2}|\d{4}년|\d{1,2}월",
+        " ",
+        source,
+    )
     residual = re.sub(
         r"제약사|제조사|품목별|제품별|매출\s*예상|예상\s*매출|"
-        r"월\s*집계|조회|검색|보여줘|알려줘|해줘",
+        r"매출\s*추세(?:\s*요약표)?|재고\s*부족\s*현황|"
+        r"월\s*집계|오늘|어제|금일|전일|최근|기준|조회|검색|보여줘|알려줘|해줘",
         " ",
         residual,
     )
+    from app.services.product_master_filter_contract import PRODUCT_DI_SEMANTIC_GROUP_TERMS
+    for term in PRODUCT_DI_SEMANTIC_GROUP_TERMS:
+        residual = re.sub(rf"(?:^|\s){re.escape(term)}(?=\s|$)", " ", residual, flags=re.IGNORECASE)
     tokens = re.findall(r"[가-힣A-Za-z][가-힣A-Za-z0-9_-]*", residual)
     return tokens[0] if len(tokens) == 1 else ""
 
@@ -2409,9 +2533,28 @@ def _resolve_analytics_manufacturer_filter(
     intent: Dict[str, str],
     logger,
 ) -> Dict[str, Any]:
-    """Resolve one product-forecast manufacturer filter from the shared vendor set."""
+    """Resolve one product-grain Analytics manufacturer filter from the shared vendor set."""
     out = dict(params or {})
     if any(str(out.get(key) or "").strip() for key in ("maker_cd", "product_ven_cd", "manufacturer_cd")):
+        return {"status": "not_needed", "params": out, "candidates": []}
+
+    # A labelled product, vendor, stock location, or product-category filter
+    # owns the residual phrase.  Only a genuinely unlabelled product-grain
+    # question may ask the common vendor resolver to infer a manufacturer.
+    if any(
+        str(out.get(key) or "").strip()
+        for key in (
+            "physic_cd", "physic_nm",
+            "ven_cd", "ven_nm", "buy_cd", "buy_nm", "order_cd", "order_nm",
+            "real_ven_cd", "real_ven_nm", "cost_apply_cd", "cost_apply_nm",
+            "stock_apply_cd", "stock_apply_nm", "stock_cd", "stock_nm",
+            "product_group", "product_group_nm", "product_di", "product_di_nm",
+            "product_di_semantic_group", "product_class", "product_class_nm",
+        )
+    ) or any(out.get(key) for key in (
+        "stock_cds", "stock_cd_list", "product_di_list", "product_class_list",
+        "dashboard_product_di_list", "dashboard_product_class_list",
+    )):
         return {"status": "not_needed", "params": out, "candidates": []}
 
     # Explicitly labelled manufacturer names are already safe name predicates.
@@ -2619,6 +2762,25 @@ def _try_handle_analytics_nlq(
         return False
 
     action = _resolve_analytics_action(t)
+    unsupported_metric = _unsupported_analytics_metric_guard(t)
+    if unsupported_metric and not action:
+        try:
+            from app.ui.chat_middleware import push_sims_result_to_chat
+        except Exception:
+            logger.exception("[nlq.router] failed to import chat_middleware")
+            return False
+        payload = _analytics_grouping_guard_payload(text=t, guard=unsupported_metric)
+        try:
+            push_sims_result_to_chat(payload, str(payload["action"]))
+        except Exception:
+            logger.exception("[nlq.router] push unsupported analytics metric failed")
+            return False
+        logger.info(
+            "[nlq.router] analytics metric blocked requested_metric=%s requested_grouping=%s",
+            unsupported_metric["requested_metric"],
+            unsupported_metric["requested_grouping"],
+        )
+        return True
     if not action:
         return False
 
@@ -3027,6 +3189,7 @@ def _period_policy_summary_label(period_policy: Dict[str, Any] | None) -> str:
         return f"최근 1개월 자동적용({condition_labels.get(str(names[0]), '명시 조건')})"
     return {
         "completed_6months": "직전 완료 6개월 자동적용",
+        "current_evaluation_completed_6months": "평가일 현재 / 수요 직전 완료 6개월 자동적용",
         "today": "오늘 자동적용(추가 조건 없음)",
         "recent_1day": "최근 1일 자동적용(추가 조건 없음)",
         "recent_7days": "최근 7일 자동적용(단일 제품 수불)",
@@ -5046,7 +5209,15 @@ def _ensure_io_summary_meta(
         query_summary = f"{query_summary} / {unlabeled_summary}"
 
     policy_label = _period_policy_summary_label(period_policy)
-    if query_summary and policy_label and policy_label not in query_summary:
+    # Calendar-scoped services have already rendered their authoritative date
+    # set. Do not append the generic NLQ period label from pre-service params.
+    if (
+        query_summary
+        and policy_label
+        and not meta.get("business_dates")
+        and not meta.get("expected_inbound_period_kind")
+        and policy_label not in query_summary
+    ):
         query_summary = f"{query_summary} / {policy_label}"
     elif not query_summary:
         query_summary = _build_io_query_summary(
@@ -5965,6 +6136,7 @@ def _try_handle_io_nlq(
     params = dict(parsed.get("params") or {})
     if not action:
         return False
+    registered_residual_entity = str(params.pop("_registered_unlabeled_entity", "") or "").strip()
     parsed_condition_keys = set(params)
 
     _trace("parsed", trace_action=action, trace_params=params)
@@ -5987,7 +6159,14 @@ def _try_handle_io_nlq(
             for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm")
         )
     )
-    if registered_filter_contract:
+    if registered_filter_contract and registered_residual_entity:
+        entity_resolution = resolve_unlabeled_io_entity_condition(
+            txt_for_io,
+            action=action,
+            params=params,
+            residual_phrase=registered_residual_entity,
+        )
+    elif registered_filter_contract:
         # Registry-backed parsers own their filter metadata. Reinterpreting the
         # action text as an unlabeled ERP entity blocks valid unfiltered lists.
         entity_resolution = {
@@ -6180,6 +6359,10 @@ def _try_handle_io_nlq(
         action,
         condition_sources=condition_sources,
     )
+    if action == "입고예정조회":
+        # Keep the generic IO date default distinct from a period explicitly
+        # supplied by the user; the service owns the Calendar date set.
+        params["_expected_inbound_auto_period"] = bool(period_policy.get("auto_applied"))
     if action == "제품재고현황 조회":
         params = _apply_product_inventory_defaults(
             params,
@@ -6452,6 +6635,25 @@ def _try_handle_io_nlq(
         except Exception as exc:
             _trace("error", trace_action=action, trace_params=params, error=exc, source_stage="display")
             logger.exception("[nlq.router] io service failed action=%r module=%r", action, module_name)
+            payload = {
+                "final": True,
+                "type": "text",
+                "title": action,
+                "action": action,
+                "params": dict(params),
+                "data": f"{action}를 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                "message": f"{action}를 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                "meta": {
+                    "result_status": "query_error",
+                    "execution_status": "query_error",
+                    "row_count": 0,
+                    "row_count_total": 0,
+                    "source_call_count": 0,
+                    "source_call_attempt_count": 1,
+                    "tableless_result": True,
+                    "notice_codes": ["query_error"],
+                },
+            }
 
     if payload is None:
         if action == "현재고 조회":

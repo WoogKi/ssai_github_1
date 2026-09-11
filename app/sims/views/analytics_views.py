@@ -24,6 +24,7 @@ from app.services.analytics_sales_trend_service import (
     get_sales_trend_summary_result,
     get_sales_forecast_result,
     get_stock_shortage_result,
+    normalize_stock_shortage_time_axis,
 )
 from app.services.analytics_manufacturer_sales_trend_service import (
     get_manufacturer_sales_trend_result,
@@ -53,7 +54,6 @@ SHORTAGE_GRADE_OPTIONS = [
     "전체",
     "재고없음",
     "1개월내 부족",
-    "2개월내 부족주의",
     "2개월내 부족",
     "3개월내 부족주의",
     "3개월내 부족",
@@ -290,6 +290,7 @@ def _normalize_analytics_multi_code_params(
         if field == "stock_cd_list":
             out["stock_cds"] = list(effective_codes)
             out["stock_cd"] = effective_codes[0] if len(effective_codes) == 1 else ""
+            out["_stock_scope_is_full_selection"] = bool(normalized["is_full_selection"])
         else:
             if pair_present:
                 out[pair_key] = list(normalized["effective_pairs"])
@@ -2679,16 +2680,24 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
                 key=f"__analytics_stock_shortage_source__{ns}",
             )
         with c2:
-            date_from = _render_date_input_with_week(
-                "시작일자",
-                _default_start_date(),
-                f"__analytics_stock_shortage_date_from__{ns}",
-            )
-        with c3:
             date_to = _render_date_input_with_week(
-                "종료일자",
+                "평가일",
                 _default_end_date(),
                 f"__analytics_stock_shortage_date_to__{ns}",
+            )
+        with c3:
+            axis_preview = normalize_stock_shortage_time_axis({"date_to": _date_to_yyyymmdd(date_to)})
+            st.text_input(
+                "수요분석기간",
+                value=(
+                    f"{axis_preview['_shortage_analysis_date_from']} ~ "
+                    f"{axis_preview['_shortage_analysis_date_to']}"
+                ),
+                disabled=True,
+                key=(
+                    f"__analytics_stock_shortage_analysis_period__{ns}::"
+                    f"{axis_preview['_shortage_evaluation_date']}"
+                ),
             )
         with c4:
             shortage_grade = st.selectbox(
@@ -2769,16 +2778,12 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         "실재고": "real",
     }.get(stock_label, "book")
 
-    date_from_text = _date_to_yyyymmdd(date_from)
     date_to_text = _date_to_yyyymmdd(date_to)
 
-    params = {
+    params = normalize_stock_shortage_time_axis({
         "source_mode": source_mode,
         "stock_mode": stock_mode,
-        "date_from": date_from_text,
         "date_to": date_to_text,
-        "month_from": _date_to_yyyymm(date_from),
-        "month_to": _date_to_yyyymm(date_to),
         "physic_cd": _clean_text(physic_cd),
         "physic_nm": _clean_text(physic_nm),
         "product_ven_nm": _clean_text(product_ven_nm),
@@ -2801,7 +2806,7 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         "sales_man_nm": _clean_text(sales_man_nm),
         "shortage_grade": "" if shortage_grade == "전체" else shortage_grade,
         "top": int(top),
-    }
+    })
     params = _attach_analytics_default_code_pairs(params, action_key="stock_shortage", ns=ns)
     params = _normalize_analytics_multi_code_params(params, action_key="stock_shortage")
     params = _attach_analytics_company_io(params, default_adapter)

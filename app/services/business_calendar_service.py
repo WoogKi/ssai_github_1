@@ -1,10 +1,18 @@
-"""Shared KST business-calendar helpers backed by ERP holiday overrides."""
+"""Shared KST business-calendar helpers.
+
+The legacy SQL helpers below remain temporarily backed by ERP holiday
+overrides.  New Python consumers use the SSAI common-calendar authority and
+receive an explicit unavailable status when its schema or annual load is not
+ready; they must never fall back to weekday-only calculations silently.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from typing import Mapping
+from typing import Any, Callable, Mapping
+
+from app.services.ssai_business_calendar_repository import CalendarAuthorityRead, load_official_holidays
 
 
 KST = timezone(timedelta(hours=9))
@@ -16,6 +24,85 @@ def kst_today() -> date:
 
 def _yyyymmdd(value: date) -> str:
     return value.strftime("%Y%m%d")
+
+
+@dataclass(frozen=True)
+class BusinessDayResult:
+    status: str
+    is_business_day: bool | None = None
+    reason_code: str = ""
+    authority: str = "ssai_common_calendar"
+
+
+@dataclass(frozen=True)
+class RecentBusinessDaysResult:
+    status: str
+    dates: tuple[str, ...] = ()
+    reason_code: str = ""
+    authority: str = "ssai_common_calendar"
+
+
+CalendarLoader = Callable[..., CalendarAuthorityRead]
+
+
+def _official_calendar(
+    *,
+    start_date: date,
+    end_date: date,
+    calendar_loader: CalendarLoader,
+) -> CalendarAuthorityRead:
+    return calendar_loader(start_date=start_date, end_date=end_date)
+
+
+def is_business_day(
+    target_date: date,
+    *,
+    calendar_loader: CalendarLoader = load_official_holidays,
+) -> BusinessDayResult:
+    """Determine one Korean business day from the loaded common authority."""
+    authority = _official_calendar(start_date=target_date, end_date=target_date, calendar_loader=calendar_loader)
+    if authority.status != "ready":
+        return BusinessDayResult(status="unavailable", reason_code=authority.reason_code, authority=authority.authority)
+    value = target_date.weekday() < 5 and _yyyymmdd(target_date) not in authority.holiday_dates
+    return BusinessDayResult(status="ready", is_business_day=value, authority=authority.authority)
+
+
+def recent_business_days(
+    *,
+    base_date: date | None = None,
+    count: int = 4,
+    include_base: bool = True,
+    calendar_loader: CalendarLoader = load_official_holidays,
+    lookback_days: int = 62,
+) -> RecentBusinessDaysResult:
+    """Resolve recent KST business days from persisted official holidays only.
+
+    ``lookback_days`` is a bounded authority window, not a weekday fallback.
+    If it cannot yield the requested number of days, callers receive an
+    explicit unavailable result.
+    """
+    required = max(1, int(count))
+    anchor = base_date or kst_today()
+    start = anchor if include_base else anchor - timedelta(days=1)
+    window = max(required + 14, int(lookback_days))
+    lower = start - timedelta(days=window - 1)
+    authority = _official_calendar(start_date=lower, end_date=start, calendar_loader=calendar_loader)
+    if authority.status != "ready":
+        return RecentBusinessDaysResult(status="unavailable", reason_code=authority.reason_code, authority=authority.authority)
+    dates: list[str] = []
+    cursor = start
+    while cursor >= lower and len(dates) < required:
+        key = _yyyymmdd(cursor)
+        if cursor.weekday() < 5 and key not in authority.holiday_dates:
+            dates.append(key)
+        cursor -= timedelta(days=1)
+    if len(dates) != required:
+        return RecentBusinessDaysResult(
+            status="unavailable",
+            reason_code="calendar_lookback_insufficient",
+            authority=authority.authority,
+        )
+    return RecentBusinessDaysResult(status="ready", dates=tuple(dates), authority=authority.authority)
 
 
 def recent_business_dates(

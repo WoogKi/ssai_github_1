@@ -1204,6 +1204,18 @@ def run_basic_checks() -> list[CheckResult]:
             tests = [
                 ("품목별 매출 추세 2025년 조회", "품목별 매출 추세 분석"),
                 ("품목별 매출 추세 요약표 2025년 조회", "품목별 매출 추세 요약표"),
+                ("품목별 추세분석", "품목별 매출 추세 분석"),
+                ("품목별 매출 추세 분석", "품목별 매출 추세 분석"),
+                ("품목별 추세분석 요약", "품목별 매출 추세 요약표"),
+                ("품목별 추세 분석 요약", "품목별 매출 추세 요약표"),
+                ("품목별 매출 추세 요약", "품목별 매출 추세 요약표"),
+                ("품목별 매출 추세 요약표", "품목별 매출 추세 요약표"),
+                ("제약사별 추세", "제약사별 매출 추세 분석"),
+                ("제약사별 추세분석", "제약사별 매출 추세 분석"),
+                ("제약사별 추세분석 요약", "제약사별 매출 추세 분석 요약표"),
+                ("제약사별 추세 분석 요약", "제약사별 매출 추세 분석 요약표"),
+                ("제조사별 추세", "제약사별 매출 추세 분석"),
+                ("제조사별 추세분석 요약", "제약사별 매출 추세 분석 요약표"),
                 ("품목별 매출 예상 2025년 조회", "품목별 매출 예상"),
                 ("품목별 판매예상", "품목별 매출 예상"),
                 ("품목별 판매예상 제약사 동제 제품명 로자탐", "품목별 매출 예상"),
@@ -1229,7 +1241,18 @@ def run_basic_checks() -> list[CheckResult]:
         else:
             candidate_cases = [
                 ("품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
+                ("품목별 추세분석", "analytics", "품목별 매출 추세 분석"),
+                ("품목별 추세분석 요약", "analytics", "품목별 매출 추세 요약표"),
+                ("품목별 추세 분석 요약", "analytics", "품목별 매출 추세 요약표"),
+                ("품목별 매출 추세 요약", "analytics", "품목별 매출 추세 요약표"),
+                ("품목별 매출 추세 요약표", "analytics", "품목별 매출 추세 요약표"),
                 ("한미제약 품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
+                ("제조사 삼진 품목별 매출 추세", "analytics", "품목별 매출 추세 분석"),
+                ("제약사별 매출 추세", "analytics", "제약사별 매출 추세 분석"),
+                ("제약사별 추세분석", "analytics", "제약사별 매출 추세 분석"),
+                ("제약사별 추세분석 요약", "analytics", "제약사별 매출 추세 분석 요약표"),
+                ("제조사별 추세", "analytics", "제약사별 매출 추세 분석"),
+                ("제조사별 추세분석 요약", "analytics", "제약사별 매출 추세 분석 요약표"),
                 ("정상출고만 품목별 매출 추세분석", "analytics", "품목별 매출 추세 분석"),
                 ("품목별 판매예상", "analytics", "품목별 매출 예상"),
                 ("품목별 판매예상 제약사 동제 제품명 로자탐", "analytics", "품목별 매출 예상"),
@@ -1354,6 +1377,27 @@ def run_basic_checks() -> list[CheckResult]:
             },
             raw_df=raw_df,
         )
+        detail_grain_df = mod._add_trend_columns(raw_df)
+        if (
+            not detail_grain_df["제품코드"].duplicated().any()
+            or summary_df["제품코드"].duplicated().any()
+            or len(summary_df) != 1
+        ):
+            results.append(
+                _fail(
+                    "sales trend detail/summary grain contract",
+                    f"detail_rows={len(detail_grain_df)}, summary_rows={len(summary_df)}, "
+                    f"detail_product_duplicates={detail_grain_df['제품코드'].duplicated().sum()}, "
+                    f"summary_product_duplicates={summary_df['제품코드'].duplicated().sum()}",
+                )
+            )
+        else:
+            results.append(
+                _ok(
+                    "sales trend detail/summary grain contract",
+                    "detail retains product-month rows; summary remains one row per product",
+                )
+            )
         row = summary_df.iloc[0].to_dict()
 
         expected = {
@@ -14935,13 +14979,19 @@ def _run_analytics_period_and_grouping_contract_checks() -> list[CheckResult]:
                 f"aggregate_action_coverage={set(analytics_actions)!r}/{inventory_analytics_actions!r}"
             )
         expected_period = ("20260201", "20260731")
+        current_inventory_actions = {"품목별 재고부족현황", "매입처별 재고부족 현황"}
         for action in analytics_actions:
             resolved, policy = io_mod.apply_nlq_default_period_policy(
                 {"policy_date": "20260803"}, action, today=as_of
             )
             actual_period = (resolved.get("date_from"), resolved.get("date_to"))
+            action_expected_period = (
+                ("20260201", "20260803")
+                if action in current_inventory_actions
+                else expected_period
+            )
             if (
-                actual_period != expected_period
+                actual_period != action_expected_period
                 or policy.get("default_policy") == "none"
                 or not policy.get("auto_applied")
                 or policy.get("explicit_period_present")
@@ -14951,10 +15001,16 @@ def _run_analytics_period_and_grouping_contract_checks() -> list[CheckResult]:
             explicit, explicit_policy = io_mod.apply_nlq_default_period_policy(
                 {"date_from": "20260710", "date_to": "20260720"}, action, today=as_of
             )
+            explicit_expected = (
+                ("20260101", "20260720")
+                if action in current_inventory_actions
+                else ("20260710", "20260720")
+            )
             if (
-                (explicit.get("date_from"), explicit.get("date_to")) != ("20260710", "20260720")
+                (explicit.get("date_from"), explicit.get("date_to")) != explicit_expected
                 or not explicit_policy.get("explicit_period_present")
-                or explicit_policy.get("auto_applied")
+                or bool(explicit_policy.get("auto_applied"))
+                != (action in current_inventory_actions)
             ):
                 raise AssertionError(f"analytics_explicit_period={action!r}/{explicit!r}/{explicit_policy!r}")
 
@@ -15063,6 +15119,71 @@ def _run_analytics_period_and_grouping_contract_checks() -> list[CheckResult]:
                         "forecast_alias_explicit_manufacturer_like="
                         f"{question!r}/{resolved_params!r}/{sql_filters!r}/{sql_params!r}"
                     )
+
+        supplier_scope_mod = importlib.import_module("app.services.product_supplier_scope_service")
+        old_common_vendor_resolver = supplier_scope_mod.resolve_common_vendor_candidates
+        try:
+            supplier_scope_mod.resolve_common_vendor_candidates = lambda name: (
+                [{
+                    "entity_code": "11090",
+                    "canonical_name": "종근당",
+                    "entity_role": "manufacturer",
+                    "role_source": "fixture",
+                }]
+                if str(name).strip() == "종근당" else []
+            )
+            for question in (
+                "종근당 품목별 재고부족현황",
+                "오늘 기준 종근당 품목별 재고부족현황",
+            ):
+                action = router_mod._resolve_analytics_action(question)
+                prepared = router_mod._build_analytics_params(question, action)
+                intent = router_mod._analytics_intent_for_action(action, question)
+                manufacturer_text = router_mod._analytics_manufacturer_filter_text(question, prepared, intent)
+                resolved = router_mod._resolve_analytics_manufacturer_filter(
+                    question, prepared, intent, logging.getLogger("ssai.regression"),
+                )
+                resolved_params = dict(resolved.get("params") or {})
+                if (
+                    action != "품목별 재고부족현황"
+                    or manufacturer_text != "종근당"
+                    or resolved.get("status") != "resolved"
+                    or resolved_params.get("maker_cd") != "11090"
+                    or resolved_params.get("product_ven_cd") != "11090"
+                    or resolved_params.get("maker_nm") != "종근당"
+                ):
+                    raise AssertionError(
+                        "analytics_unlabeled_manufacturer_shortage="
+                        f"{question!r}/{action!r}/{prepared!r}/{manufacturer_text!r}/{resolved!r}"
+                    )
+
+            explicit_question = "제조사 종근당 품목별 재고부족현황"
+            explicit_action = router_mod._resolve_analytics_action(explicit_question)
+            explicit_params = router_mod._build_analytics_params(explicit_question, explicit_action)
+            explicit_resolution = router_mod._resolve_analytics_manufacturer_filter(
+                explicit_question,
+                explicit_params,
+                router_mod._analytics_intent_for_action(explicit_action, explicit_question),
+                logging.getLogger("ssai.regression"),
+            )
+            product_question = "제품 아라바정 품목별 재고부족현황"
+            product_action = router_mod._resolve_analytics_action(product_question)
+            product_params = router_mod._build_analytics_params(product_question, product_action)
+            if (
+                explicit_resolution.get("status") != "not_needed"
+                or explicit_params.get("maker_nm") != "종근당"
+                or router_mod._analytics_manufacturer_filter_text(
+                    product_question,
+                    product_params,
+                    router_mod._analytics_intent_for_action(product_action, product_question),
+                )
+            ):
+                raise AssertionError(
+                    "analytics_manufacturer_role_boundary="
+                    f"explicit={explicit_resolution!r}/{explicit_params!r} product={product_params!r}"
+                )
+        finally:
+            supplier_scope_mod.resolve_common_vendor_candidates = old_common_vendor_resolver
 
         trend_judge_cases = (
             ("품목별 매출 예상 2025년 감소 조회", "감소"),

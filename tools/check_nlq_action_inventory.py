@@ -242,7 +242,11 @@ def _check_period_policy_classification() -> None:
             continue
         actual = get_nlq_period_action_class(spec.canonical_action)
         if spec.handler_kind == "analytics":
-            wanted = "aggregate_analysis"
+            wanted = (
+                "current_inventory_analysis"
+                if spec.canonical_action in {"품목별 재고부족현황", "매입처별 재고부족 현황"}
+                else "aggregate_analysis"
+            )
         elif spec.handler_kind == "erp_table":
             from app.sims.meta.erp_table_feature_registry import get_action_spec
 

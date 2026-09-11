@@ -24,6 +24,7 @@ from app.sims.views.rddbc_io_shared import (
 )
 
 from app.ui.sims_table_display import (
+    apply_sims_export_projection,
     build_sims_table_display_config,
     log_sims_display_fields,
     log_sims_table_mode,
@@ -5854,6 +5855,7 @@ def _render_sims_result_actions_lazy(
 
         return
 
+    download_df = apply_sims_export_projection(download_df)
     threshold_rows = _get_sims_download_lazy_threshold_rows()
     row_count = int(len(download_df))
     col_count = int(len(download_df.columns))
@@ -7369,6 +7371,7 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                     }
                     preserve_resolution_guidance = bool(terminal_statuses & {
                         "unsupported",
+                        "query_error",
                         "routing_error",
                         "validation_error",
                         "candidate_required",
@@ -10355,8 +10358,12 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                                 column_config_count=len(column_config or {}),
                             )
                             try:
+                                styled_view = _build_io_display_styler(
+                                    view_df, add_row_no=False, band_size=5
+                                )
+                                styled_view = _apply_chat_analysis_grade_style(styled_view, view_df)
                                 st.dataframe(
-                                    view_df,
+                                    styled_view,
                                     width="stretch",
                                     hide_index=True,
                                     height=table_height,

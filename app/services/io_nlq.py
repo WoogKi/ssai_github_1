@@ -402,6 +402,30 @@ def extract_nlq_natural_period(
     else:
         current_day = today
 
+    # A user-written absolute date range must win over list-detail defaults.
+    # "YYYYMMDD 이후" is open-ended through the current policy day, not a
+    # same-day lookup and not a rolling-month hint.
+    open_started = re.search(
+        r"((?:19|20)\d{2}(?:\s*[-./]\s*\d{1,2}){2}|(?:19|20)\d{6})\s*(?:이후|부터)",
+        raw,
+    )
+    if open_started:
+        started = _extract_date_range(open_started.group(1)).get("date_from", "")
+        if started:
+            return {
+                "date_from": started,
+                "date_to": current_day.strftime("%Y%m%d"),
+                _NLQ_PERIOD_KIND_KEY: "explicit_period",
+            }
+
+    absolute_period = _extract_date_range(raw)
+    if absolute_period.get("date_from"):
+        return {
+            "date_from": absolute_period["date_from"],
+            "date_to": absolute_period.get("date_to") or absolute_period["date_from"],
+            _NLQ_PERIOD_KIND_KEY: "explicit_period",
+        }
+
     if re.search(r"(?:최근\s*)?(?:한\s*달|1\s*개월)", raw):
         return {
             "date_from": (current_day - timedelta(days=30)).strftime("%Y%m%d"),
@@ -512,6 +536,8 @@ def get_nlq_period_action_class(action: str) -> str:
             if spec.canonical_action != str(action or "").strip():
                 continue
             if spec.handler_kind == "analytics":
+                if spec.canonical_action in {"품목별 재고부족현황", "매입처별 재고부족 현황"}:
+                    return "current_inventory_analysis"
                 return "aggregate_analysis"
             if spec.handler_target.endswith("product_flow_service.get_product_flow_result"):
                 return "single_entity_history"
@@ -659,7 +685,7 @@ def apply_nlq_default_period_policy(
         })
         return out, policy
 
-    if explicit_period_present:
+    if explicit_period_present and action_class != "current_inventory_analysis":
         return out, policy
 
     if action_class == "explicit_only":
@@ -670,7 +696,27 @@ def apply_nlq_default_period_policy(
         return out, policy
 
     current_day = _policy_today(out, today)
-    if action_class == "aggregate_analysis":
+    if action_class == "current_inventory_analysis":
+        evaluation_day = current_day
+        explicit_evaluation = clean_text(out.get("date_to") or out.get("date_from"))
+        if explicit_evaluation and re.fullmatch(r"\d{8}", explicit_evaluation):
+            try:
+                evaluation_day = date(
+                    int(explicit_evaluation[:4]),
+                    int(explicit_evaluation[4:6]),
+                    int(explicit_evaluation[6:8]),
+                )
+            except ValueError:
+                evaluation_day = current_day
+        completed_month_end = evaluation_day.replace(day=1) - timedelta(days=1)
+        date_from = _subtract_months(completed_month_end.replace(day=1), 5)
+        date_to = evaluation_day
+        out["_shortage_evaluation_date"] = evaluation_day.strftime("%Y%m%d")
+        out["_shortage_analysis_date_from"] = date_from.strftime("%Y%m%d")
+        out["_shortage_analysis_date_to"] = completed_month_end.strftime("%Y%m%d")
+        default_policy = "current_evaluation_completed_6months"
+        policy_reason = "stock_shortage_current_evaluation"
+    elif action_class == "aggregate_analysis":
         completed_month_end = current_day.replace(day=1) - timedelta(days=1)
         date_from = _subtract_months(completed_month_end.replace(day=1), 5)
         date_to = completed_month_end
@@ -700,7 +746,7 @@ def apply_nlq_default_period_policy(
         return out, policy
 
     out["date_from"] = date_from.strftime("%Y%m%d")
-    out["date_to"] = date_to.strftime("%Y%m%d") if action_class == "aggregate_analysis" else current_day.strftime("%Y%m%d")
+    out["date_to"] = date_to.strftime("%Y%m%d") if action_class in {"aggregate_analysis", "current_inventory_analysis"} else current_day.strftime("%Y%m%d")
     out["month_from"] = date_from.strftime("%Y%m")
     out["month_to"] = out["date_to"][:6]
     out.pop("_default_date_applied", None)
@@ -1182,6 +1228,22 @@ _NAME_STOP_WORDS = (
     "부족",
 )
 
+_MANUFACTURER_GROUPING_LABELS = frozenset(("제조사", "제조사명", "제약사", "제약사명"))
+_GROUPING_SUFFIX_FOLLOWING_WORDS = (
+    "매출", "추세", "집계", "분석", "조회", "예상", "재고", "부족", "현황",
+    "기준", "목록", "TOP", "top", "상위",
+)
+
+
+def _named_filter_label_pattern(label: str) -> str:
+    """Match a role label without treating its grouping suffix as a name."""
+    pattern = re.escape(label)
+    if label not in _MANUFACTURER_GROUPING_LABELS:
+        return pattern
+
+    following = "|".join(_GROUPING_SUFFIX_FOLLOWING_WORDS)
+    return rf"{pattern}(?!\s*별(?:로)?(?=\s*(?:{following}|$)))"
+
 def _looks_like_date_token(value: str) -> bool:
     """
     제품명/거래처명 같은 명칭 추출 중 날짜/월/연도 토큰을 만나면
@@ -1454,7 +1516,7 @@ def _extract_named_text(text: str, labels: tuple[str, ...]) -> Optional[str]:
     - 실제 값은 _trim_named_value()에서 액션어/날짜/불필요어를 제거한다.
     """
     labels_sorted = sorted(labels, key=len, reverse=True)
-    labels_pat = "|".join(re.escape(x) for x in labels_sorted)
+    labels_pat = "|".join(_named_filter_label_pattern(x) for x in labels_sorted)
 
     patterns = [
         rf"(?:{labels_pat})\s*[:=]?\s*([^\n,]+)",
@@ -1502,7 +1564,7 @@ def _extract_io_compound_named_values(text: str) -> dict[str, str]:
     def label_pattern(label: str) -> str:
         if label == "제품":
             return r"제품(?!그룹명|그룹|구분명|구분|분류명|분류|코드|명)"
-        return re.escape(label)
+        return _named_filter_label_pattern(label)
 
     all_labels = tuple(label for _, labels in label_specs for label in labels) + (
         "출고빈도등급", "출고빈도구분", "출고빈도",
@@ -2090,6 +2152,7 @@ def resolve_unlabeled_io_entity_condition(
     *,
     action: str,
     params: Optional[Dict[str, Any]] = None,
+    residual_phrase: str = "",
 ) -> Dict[str, Any]:
     """Prepare the common name-search contract without overriding labels.
 
@@ -2098,7 +2161,7 @@ def resolve_unlabeled_io_entity_condition(
     contract and therefore decides how it is presented to the user.
     """
     out = dict(params or {})
-    phrase = _extract_unlabeled_entity_phrase(text, action)
+    phrase = clean_text(residual_phrase) or _extract_unlabeled_entity_phrase(text, action)
 
     # Detail and inventory lists are multi-result searches.  A bare token may
     # have been tentatively placed in ``physic_nm`` by the generic parser (for
@@ -2224,13 +2287,21 @@ def resolve_unlabeled_io_entity_condition(
     kind = next(iter(kinds))
     if kind == "transaction_vendor":
         candidate = candidates[0]
-        out["ven_cd"] = clean_text(candidate.get("match_code"))
-        out["ven_nm_display"] = phrase
+        if action in {"발주조회", "입고예정조회"}:
+            out["order_vendor_cd"] = clean_text(candidate.get("match_code"))
+            out["order_vendor_nm"] = phrase
+            out["order_vendor_nm_display"] = phrase
+        else:
+            out["ven_cd"] = clean_text(candidate.get("match_code"))
+            out["ven_nm_display"] = phrase
     elif kind == "manufacturer":
-        candidate = candidates[0]
-        out["product_ven_cd"] = clean_text(candidate.get("match_code"))
-        out["maker_nm_display"] = phrase
-        out["product_ven_nm_display"] = phrase
+        if action in {"발주조회", "입고예정조회"}:
+            out["maker_nm"] = phrase
+        else:
+            candidate = candidates[0]
+            out["product_ven_cd"] = clean_text(candidate.get("match_code"))
+            out["maker_nm_display"] = phrase
+            out["product_ven_nm_display"] = phrase
     elif kind == "product":
         out["physic_nm"] = phrase
     else:

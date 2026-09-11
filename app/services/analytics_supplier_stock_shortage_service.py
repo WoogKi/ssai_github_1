@@ -20,6 +20,7 @@ from app.services.analytics_sales_trend_service import (
     _normalize_analytics_numeric_columns,
     _parse_yyyymm,
     _resolve_period_source_policy,
+    normalize_stock_shortage_time_axis,
     _stock_current_cutoff_month,
     _stock_current_monthly_spec,
     _stock_shortage_source_labels,
@@ -654,7 +655,10 @@ def _meta_from_frames(summary: pd.DataFrame, detail: pd.DataFrame, product_base:
 
 
 def get_supplier_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    params = _apply_period_source_policy_params(_apply_month_or_date_params(coalesce_params(params)))
+    # Keep the supplier aggregation on the same current-state axis as the
+    # product shortage source it allocates. The allocation grain remains local.
+    params = normalize_stock_shortage_time_axis(coalesce_params(params))
+    params = _apply_period_source_policy_params(_apply_month_or_date_params(params))
     t0 = time.perf_counter()
     stock_mode = str(params.get("stock_mode") or "real").strip()
     stock_spec = _stock_current_monthly_spec(stock_mode)
@@ -736,7 +740,8 @@ def get_supplier_stock_shortage_df(params: Optional[Dict[str, Any]] = None) -> p
 
 
 def get_supplier_stock_shortage_result(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    params = _apply_month_or_date_params(coalesce_params(params))
+    params = normalize_stock_shortage_time_axis(coalesce_params(params))
+    params = _apply_month_or_date_params(params)
     df = get_supplier_stock_shortage_df(params)
     row_count = int(len(df)) if isinstance(df, pd.DataFrame) else 0
     attrs = {

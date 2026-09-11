@@ -167,7 +167,11 @@ def _script_perf_mark(name: str) -> None:
 
 import pandas as pd
 from app.services.nlq_input_guard import looks_like_attachment_followup
-from app.sims.nlq.nlq_router import resolve_new_sims_nlq_candidate, try_handle_nlq
+from app.sims.nlq.nlq_router import (
+    is_general_writing_request,
+    resolve_new_sims_nlq_candidate,
+    try_handle_nlq,
+)
 
 from app.ui.sims_entry import (
     sims_mode_selector,
@@ -3094,7 +3098,18 @@ def _build_room_render_messages(room: dict) -> list[dict]:
     return [item for _, _, item in deduped]
 
 
-def _build_current_room_compact_context(limit_chars: int = 5000) -> str:
+def _is_sims_owned_history_message(message: dict) -> bool:
+    """Use persisted result provenance, never business words in ordinary prose."""
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    return bool(
+        message.get("action") or meta.get("action")
+        or message.get("table_key") or meta.get("table_key")
+        or meta.get("nlq") or meta.get("panel_push") or meta.get("current_table_followup")
+        or message.get("type") == "sims_result"
+    )
+
+
+def _build_current_room_compact_context(limit_chars: int = 5000, *, include_sims: bool = True) -> str:
     """Build a small room-local context for ordinary chat without table payloads."""
     try:
         rid = str(st.session_state.get("current_room") or "")
@@ -3109,6 +3124,8 @@ def _build_current_room_compact_context(limit_chars: int = 5000) -> str:
         lines: list[str] = []
         for msg in _build_room_render_messages(room)[-18:]:
             if not isinstance(msg, dict):
+                continue
+            if not include_sims and _is_sims_owned_history_message(msg):
                 continue
             # A Knowledge answer is not ordinary-chat history. Its evidence is
             # rendered only after a current authorization check, and must never
@@ -5798,10 +5815,51 @@ def _try_handle_current_table_dataframe_followup(
             display_limit=500,
         )
 
+def _has_explicit_sims_context_reference(text: str) -> bool:
+    """Whether a writing request explicitly asks to use the current SIMS result."""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if not compact:
+        return False
+    direct_targets = ("현재표", "현재조회결과", "현재결과", "현재데이터")
+    if any(target in compact for target in direct_targets):
+        return True
+    contextual_targets = ("위결과", "이결과", "이자료", "위자료", "방금표", "위표", "이표", "방금조회한자료")
+    contextual_links = ("참고", "기반", "바탕", "토대로", "활용", "가지고", "이용", "으로", "자료로", "결과로")
+    return any(target in compact for target in contextual_targets) and any(
+        link in compact for link in contextual_links
+    )
+
+
+def _is_explicit_current_table_writing_request(text: str) -> bool:
+    """Keep explicit current-table document writing on the LLM context route."""
+    return bool(
+        is_general_writing_request(text)
+        and _has_explicit_sims_context_reference(text)
+    )
+
+
+def _should_dispatch_current_table_followup(
+    text: str,
+    *,
+    explicit_reference: bool,
+    implicit_analytics: bool,
+) -> bool:
+    """Reserve the dataframe dispatcher for analysis/table ownership only."""
+    return bool(
+        (explicit_reference or implicit_analytics)
+        and not _is_explicit_current_table_writing_request(text)
+    )
+
+
 def is_sims_related_question(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
+
+    # A generic document-writing request must start clean.  SIMS context is
+    # attached only when the user explicitly asks to use a current result.
+    if is_general_writing_request(t):
+        return _has_explicit_sims_context_reference(t)
 
     # 최신 SIMS 조회 결과에 대한 후속 분석/요약 질문도
     # LLM에는 SIMS_JSON을 붙여야 하므로 SIMS 관련 질문으로 본다.
@@ -6201,6 +6259,7 @@ def build_messages_with_system(
     """
     # ✅ 질문이 SIMS 관련이면 SIMS 시스템프롬프트, 아니면 일반 시스템프롬프트
     attach_sims = is_sims_related_question(user_text or "")
+    independent_writing = is_general_writing_request(user_text or "") and not attach_sims
     base_system = system_prompt or (BASE_SYSTEM_PROMPT if attach_sims else GENERAL_SYSTEM_PROMPT)
 
     msgs: list[dict] = [{"role": "system", "content": base_system}]
@@ -6251,6 +6310,9 @@ def build_messages_with_system(
 
         if not any(w in compact for w in ("현재표", "현재조회결과", "현재결과")):
             return False
+
+        if _is_explicit_current_table_writing_request(q):
+            return True
 
         return any(
             w in compact
@@ -6939,7 +7001,7 @@ def build_messages_with_system(
 
     if not attach_sims:
         t_ctx = time.perf_counter()
-        compact_room_ctx = _build_current_room_compact_context()
+        compact_room_ctx = _build_current_room_compact_context(include_sims=not independent_writing)
         try:
             _script_perf_add("chat_context", time.perf_counter() - t_ctx)
         except Exception:
@@ -6961,8 +7023,10 @@ def build_messages_with_system(
     for m in reversed(history_msgs):
         if m.get("role") not in ("user", "assistant"):
             continue
+        if independent_writing and _is_sims_owned_history_message(m):
+            continue
         txt = (m.get("content", "") or "")
-        if not attach_sims and sims_noise.search(txt):
+        if not attach_sims and not independent_writing and sims_noise.search(txt):
             continue
         txt = _clip_for_model(txt)  # 각 메시지 자체가 너무 길면 컷
         if used + len(txt) > HISTORY_CHAR_BUDGET:
@@ -12619,11 +12683,22 @@ if user_input and user_input.strip():
         )
     )
 
-    is_current_table_forced_followup = has_explicit_current_table_reference
+    is_explicit_current_table_writing = _is_explicit_current_table_writing_request(
+        current_table_followup_input
+    )
+    is_current_table_forced_followup = (
+        has_explicit_current_table_reference
+        and not is_explicit_current_table_writing
+    )
 
     is_implicit_analytics_current_followup = (
         not is_new_sims_nlq
         and _looks_like_implicit_analytics_current_followup(user_input)
+    )
+    is_current_table_dispatch_candidate = _should_dispatch_current_table_followup(
+        current_table_followup_input,
+        explicit_reference=has_explicit_current_table_reference,
+        implicit_analytics=is_implicit_analytics_current_followup,
     )
 
     def _latest_executed_sims_route() -> dict[str, str]:
@@ -12671,35 +12746,36 @@ if user_input and user_input.strip():
         or is_current_table_forced_followup
         or is_implicit_analytics_current_followup
     ):
-        if is_current_table_forced_followup or is_implicit_analytics_current_followup:
+        if is_current_table_dispatch_candidate:
             st.session_state["__sims_current_table_followup_case_query"] = str(user_input or "").strip()
         # 1) 현재표 후속 "표 생성" 요청은 LLM으로 보내지 말고 실제 pandas 표를 만든다.
         # 예:
         # - 현재표 거래처명 대학약국 상세표 만들어줘
         # - 현재표 제품별 매출 TOP 20 표로 만들어줘
         # - 현재표 거래처별 매출 TOP 20 표로 만들어줘
-        if (is_current_table_forced_followup or is_implicit_analytics_current_followup) and not _has_current_table_source_df():
-            st.session_state.pop("__deferred_current_table_followup", None)
-            st.session_state["__sims_panel_active"] = False
-            st.session_state["__sims_force_open"] = False
-            st.session_state["__sims_run_flag"] = False
-            st.session_state["__sims_inner_submit"] = False
-            handled = _push_no_current_table_notice(current_table_followup_input)
-            log.info(
-                "[chat.followup_table] no current source; notice pushed immediately query=%r",
-                str(current_table_followup_input or "")[:80],
-            )
-        else:
-            try:
-                handled = _try_handle_current_table_dataframe_followup(
-                    current_table_followup_input,
-                    room=current_room,
-                    make_ts=make_ts,
-                    next_seq=_next_seq,
+        if is_current_table_forced_followup or is_implicit_analytics_current_followup:
+            if not _has_current_table_source_df():
+                st.session_state.pop("__deferred_current_table_followup", None)
+                st.session_state["__sims_panel_active"] = False
+                st.session_state["__sims_force_open"] = False
+                st.session_state["__sims_run_flag"] = False
+                st.session_state["__sims_inner_submit"] = False
+                handled = _push_no_current_table_notice(current_table_followup_input)
+                log.info(
+                    "[chat.followup_table] no current source; notice pushed immediately query=%r",
+                    str(current_table_followup_input or "")[:80],
                 )
-            except Exception:
-                log.exception("[chat.followup_table] handler failed")
-                handled = False
+            else:
+                try:
+                    handled = _try_handle_current_table_dataframe_followup(
+                        current_table_followup_input,
+                        room=current_room,
+                        make_ts=make_ts,
+                        next_seq=_next_seq,
+                    )
+                except Exception:
+                    log.exception("[chat.followup_table] handler failed")
+                    handled = False
 
         if handled:
             log.debug("[chat.followup_table] handled → skip LLM/NLQ, content=%r", user_input[:80])
@@ -13842,10 +13918,8 @@ with st.container():
                     if st.session_state.get("__sims_was_final"):
                         st.session_state["__sims_rendered"] = True
 
-            # 컨텍스트 안내(있으면 노출)
-            note = st.session_state.get("__sims_context_note")
-            if note:
-                st.info("🧠 " + note)
+            # Chat result notes belong to their chat messages. Panel inputs
+            # and restored results are owned by the panel view/payload only.
 
     # 등급에 따른 감추기 KWG
     if _can_show_admin_diagnostics_sidebar():

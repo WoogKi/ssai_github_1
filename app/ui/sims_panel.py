@@ -1186,6 +1186,7 @@ from app.ui.chat_middleware import (
     _sims_clicked_llm_context_mismatch,
 )
 from app.ui.sims_table_display import (
+    apply_sims_export_projection,
     build_sims_table_display_config,
     normalize_display_df_for_streamlit,
     resolve_sims_table_mode,
@@ -4709,6 +4710,8 @@ def _render_downloads(
 
     except Exception:
         log.exception("[panel.download] use session full df failed")
+
+    download_df = apply_sims_export_projection(download_df)
 
     display_rows = int(len(display_df)) if isinstance(display_df, pd.DataFrame) else 0
     download_rows = int(len(download_df)) if isinstance(download_df, pd.DataFrame) else 0

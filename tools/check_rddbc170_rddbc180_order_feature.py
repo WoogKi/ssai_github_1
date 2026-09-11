@@ -37,13 +37,18 @@ def _fixture() -> pd.DataFrame:
 def main() -> int:
     failures: list[str] = []
     from app.services import rddbc170_rddbc180_order_service as service
-    from app.services.business_calendar_service import recent_business_dates
+    from app.services.business_calendar_service import RecentBusinessDaysResult
     from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
-    from app.services.io_nlq import apply_nlq_default_period_policy, resolve_io_nlq
+    from app.services.io_nlq import (
+        apply_nlq_default_period_policy,
+        resolve_io_nlq,
+        resolve_unlabeled_io_entity_condition,
+    )
     from app.services.ssai_permission_policy import get_required_permission
     from app.sims.meta.erp_table_feature_registry import (
         get_action_spec, menu_actions, registry_completeness_errors, resolve_dotted_callable,
     )
+    from app.sims.nlq.nlq_router import _ensure_io_summary_meta, _try_handle_io_nlq
     from app.sims.views.rddbc_io_order_views import _merge_filter_params
     from app.sims.views.rddbc_io_shared import _maybe_to_numeric
     from app.ui.sims_table_display import _numeric_display_kind
@@ -71,16 +76,7 @@ def main() -> int:
         failures.append(f"menu mismatch: {menu}")
 
     monday = date(2026, 9, 7)
-    business_dates = recent_business_dates(today=monday, count=4)
-    if business_dates != ("20260907", "20260904", "20260903", "20260902"):
-        failures.append(f"today plus three prior business-day boundary failed: {business_dates}")
-    override = recent_business_dates(
-        today=monday,
-        count=4,
-        overrides={"20260904": "holiday", "20260905": "work"},
-    )
-    if override != ("20260907", "20260905", "20260903", "20260902"):
-        failures.append(f"holiday/work override failed: {override}")
+    business_dates = ("20260907", "20260904", "20260903", "20260902")
 
     merged_filters = _merge_filter_params(
         {"maker_nm": "삼진"},
@@ -130,13 +126,16 @@ def main() -> int:
         ("입고 예정", "입고예정조회", {}),
         ("입고예정 조회", "입고예정조회", {}),
         ("입고 예정 조회", "입고예정조회", {}),
+        ("입고예정자료 조회", "입고예정조회", {}),
+        ("입고예정자료조회", "입고예정조회", {}),
+        ("입고예정 자료 조회", "입고예정조회", {}),
         ("전문약 입고예정", "입고예정조회", {"product_di_semantic_group": "insurance"}),
         ("일반약 입고예정", "입고예정조회", {"product_di_semantic_group": "non_insurance"}),
         ("ETC 입고예정", "입고예정조회", {"product_di_semantic_group": "insurance"}),
         ("OTC 입고예정", "입고예정조회", {"product_di_semantic_group": "non_insurance"}),
         ("전문의약품 입고예정", "입고예정조회", {"product_di_semantic_group": "insurance"}),
         ("일반의약품 입고예정", "입고예정조회", {"product_di_semantic_group": "non_insurance"}),
-        ("삼진 입고예정 조회", "입고예정조회", {"order_vendor_nm": "삼진"}),
+        ("삼진 입고예정 조회", "입고예정조회", {}),
         ("입고중 제품 조회", "입고예정조회", {"status_code": "2"}),
     )
     for text, expected_action, expected_params in nlq_cases:
@@ -145,13 +144,102 @@ def main() -> int:
             failures.append(f"NLQ action mismatch: {text!r} -> {parsed}")
             continue
         for key, value in expected_params.items():
-            if parsed.get("params", {}).get(key) != value:
+            resolved_value = parsed.get("params", {}).get(key)
+            if key == "order_vendor_nm" and not resolved_value:
+                resolved_value = parsed.get("params", {}).get("_registered_unlabeled_entity")
+            if resolved_value != value:
                 failures.append(f"NLQ filter mismatch: {text!r}/{key} -> {parsed}")
         if text in {
             "어제 발주 조회", "입고중 발주조회", "발주상태 입고중 조회",
             "단가적용처 50002 발주 조회", "재고적용처 50001 발주 조회",
+            "입고예정", "입고 예정", "입고예정 조회", "입고 예정 조회",
+            "입고예정자료 조회", "입고예정자료조회", "입고예정 자료 조회",
         } and parsed.get("params", {}).get("order_vendor_nm"):
             failures.append(f"consumed syntax leaked into order vendor: {text!r} -> {parsed}")
+
+    expected_period_cases = (
+        (
+            "발주자료에서 미입고 수량을 기준으로 20260101이후 발주처별 입고예정자료 조회가 가능할까?",
+            {"date_from": "20260101", "date_to": "20260907", "has_outstanding": True},
+        ),
+        (
+            "입고예정 조회시 조회조건을 발주기간 : 2026-01-01~2026-09-09 발주상태 발주, 입고중 인건 조회해줘",
+            {"date_from": "20260101", "date_to": "20260909", "status_codes": ("1", "2")},
+        ),
+        ("발주상태 발주 입고예정 조회", {"status_codes": ("1",), "status_code": "1"}),
+        ("입고중 입고예정 조회", {"status_codes": ("2",), "status_code": "2"}),
+    )
+    for text, expected_params in expected_period_cases:
+        parsed = resolve_registered_erp_table_nlq(text, today=monday) or {}
+        resolved_params = dict(parsed.get("params") or {})
+        if parsed.get("action") != "입고예정조회":
+            failures.append(f"expected-inbound action mismatch: {text!r} -> {parsed}")
+        for key, value in expected_params.items():
+            if resolved_params.get(key) != value:
+                failures.append(f"expected-inbound period/status mismatch: {text!r}/{key} -> {parsed}")
+        if resolved_params.get("order_vendor_nm") or resolved_params.get("_registered_unlabeled_entity"):
+            failures.append(f"expected-inbound structural residual became a vendor: {text!r} -> {parsed}")
+
+    vendor_candidate = [{"match_type": "transaction_vendor", "match_code": "00001", "match_value": "하나제약"}]
+    product_candidate = [{"match_type": "product", "match_code": "07886", "match_value": "아리바정"}]
+    with patch("app.services.io_nlq._lookup_unlabeled_io_entity_candidates", return_value=vendor_candidate):
+        vendor_resolution = resolve_unlabeled_io_entity_condition(
+            "하나제약 입고예정 조회",
+            action="입고예정조회",
+            params={"mode": "expected"},
+            residual_phrase="하나제약",
+        )
+    with patch("app.services.io_nlq._lookup_unlabeled_io_entity_candidates", return_value=product_candidate):
+        product_resolution = resolve_unlabeled_io_entity_condition(
+            "아리바정 입고예정 조회",
+            action="입고예정조회",
+            params={"mode": "expected"},
+            residual_phrase="아리바정",
+        )
+    if (
+        vendor_resolution.get("params", {}).get("order_vendor_cd") != "00001"
+        or vendor_resolution.get("params", {}).get("order_vendor_nm") != "하나제약"
+    ):
+        failures.append(f"unlabelled expected-inbound vendor role changed: {vendor_resolution}")
+    if product_resolution.get("params", {}).get("physic_nm") != "아리바정" or product_resolution.get("params", {}).get("order_vendor_nm"):
+        failures.append(f"unlabelled expected-inbound product became a vendor: {product_resolution}")
+
+    for text in ("입고예정", "입고예정 조회", "입고예정자료 조회", "입고예정자료조회", "입고예정 자료 조회"):
+        parsed = resolve_registered_erp_table_nlq(text, today=monday) or {}
+        clean_params = {
+            key: value
+            for key, value in dict(parsed.get("params") or {}).items()
+            if key != "_registered_unlabeled_entity"
+        }
+        period_params, period_policy = apply_nlq_default_period_policy(
+            clean_params,
+            "입고예정조회",
+            today=monday,
+        )
+        if (
+            period_policy.get("default_policy") != "today"
+            or period_params.get("date_from") != "20260907"
+            or period_params.get("date_to") != "20260907"
+        ):
+            failures.append(f"expected-inbound no-condition period changed: {text!r}/{period_params}/{period_policy}")
+
+    with patch.object(service, "recent_business_days", return_value=RecentBusinessDaysResult(status="ready", dates=business_dates)):
+        auto_expected = service.normalize_order_params(
+            {
+                "date_from": "20260907",
+                "date_to": "20260907",
+                "_expected_inbound_auto_period": True,
+            },
+            mode="expected",
+        )
+        explicit_expected = service.normalize_order_params(
+            {"date_from": "20260101", "date_to": "20260907"},
+            mode="expected",
+        )
+    if auto_expected.get("_expected_inbound_explicit_period") or tuple(auto_expected.get("_business_dates") or ()) != business_dates:
+        failures.append(f"auto-applied expected-inbound period became explicit: {auto_expected}")
+    if not explicit_expected.get("_expected_inbound_explicit_period") or explicit_expected.get("date_from") != "20260101":
+        failures.append(f"explicit expected-inbound period regressed: {explicit_expected}")
 
     for text in ("입고명세 조회", "오늘 입고명세 조회"):
         parsed = resolve_io_nlq(text, today=monday)
@@ -194,7 +282,8 @@ def main() -> int:
             source = source[(source["발주수량"] + source["할증수량"]) >= 0]
         return source.reset_index(drop=True)
 
-    with patch.dict("os.environ", {"SIMS_CHAT_DISPLAY_MAX_ROWS": "300", "SIMS_IO_QUERY_MAX_ROWS": "100000"}), patch.object(service, "execute_bound_select", side_effect=fake_select):
+    ready_calendar = RecentBusinessDaysResult(status="ready", dates=business_dates)
+    with patch.dict("os.environ", {"SIMS_CHAT_DISPLAY_MAX_ROWS": "300", "SIMS_IO_QUERY_MAX_ROWS": "100000"}), patch.object(service, "recent_business_days", return_value=ready_calendar), patch.object(service, "execute_bound_select", side_effect=fake_select):
         order = service.get_order_result({"date_from": "20260901", "date_to": "20260907", "_display_context": "chat"})
         expected = service.get_expected_inbound_result({"_today": "20260907", "_display_context": "chat"})
     if len(captured) != 2:
@@ -220,8 +309,59 @@ def main() -> int:
             failures.append(f"order result column contract changed: {tuple(df.columns[:len(expected_prefix)]) if isinstance(df, pd.DataFrame) else ()}")
     if expected.get("meta", {}).get("business_day_count") != 4:
         failures.append("expected-inbound business-day provenance is not four dates")
-    if "오늘 + 직전 3영업일" not in str(expected.get("meta", {}).get("summary_md") or ""):
-        failures.append("expected-inbound summary does not describe the four-date contract")
+    if expected.get("meta", {}).get("business_calendar_authority") != "ssai_common_calendar":
+        failures.append("expected-inbound does not identify the SSAI Calendar authority")
+    expected_scope = "기준일 2026-09-07 / 오늘 포함 최근 4영업일: 2026-09-02, 2026-09-03, 2026-09-04, 2026-09-07"
+    expected_meta = expected.get("meta", {})
+    if expected_meta.get("business_dates") != business_dates:
+        failures.append(f"expected-inbound business-date provenance changed: {expected_meta}")
+    if expected_scope not in str(expected_meta.get("query_summary") or ""):
+        failures.append("expected-inbound query summary does not use the authoritative four-date scope")
+    if "기준월" in str(expected_meta.get("query_summary") or ""):
+        failures.append("expected-inbound query summary leaked a generic basis month")
+
+    with patch.object(service, "recent_business_days", return_value=ready_calendar), patch.object(service, "execute_bound_select", return_value=_fixture().iloc[:1].copy()):
+        expected_with_conditions = service._result(
+            {
+                "_today": "20260907",
+                "_business_dates": business_dates,
+                "order_vendor_nm": "삼진",
+                "physic_nm": "테스트",
+            },
+            mode="expected",
+            title="입고예정조회",
+        )
+    expected_with_conditions = _ensure_io_summary_meta(
+        expected_with_conditions,
+        "입고예정조회",
+        {
+            "date_from": "20260907",
+            "date_to": "20260907",
+            "month_from": "202609",
+            "month_to": "202609",
+            "order_vendor_nm": "삼진",
+            "physic_nm": "테스트",
+        },
+        {"default_policy": "today", "auto_applied": True},
+    )
+    condition_summary = str(expected_with_conditions.get("meta", {}).get("query_summary") or "")
+    if expected_scope not in condition_summary or "발주처 삼진" not in condition_summary or "제품 테스트" not in condition_summary:
+        failures.append(f"expected-inbound condition summary lost Calendar/vendor/product scope: {condition_summary}")
+    if "기간 2026-09-07" in condition_summary or "기준월 2026-09" in condition_summary or "오늘 자동적용" in condition_summary:
+        failures.append(f"expected-inbound condition summary leaked generic period metadata: {condition_summary}")
+
+    with patch.object(service, "recent_business_days", return_value=ready_calendar), patch.object(service, "execute_bound_select", return_value=pd.DataFrame()):
+        expected_empty = service.get_expected_inbound_result(
+            {"_today": "20260907", "order_vendor_nm": "삼진", "physic_nm": "테스트"}
+        )
+    empty_summary = str(expected_empty.get("meta", {}).get("query_summary") or "")
+    if (
+        expected_empty.get("meta", {}).get("result_status") != "no_data"
+        or expected_scope not in empty_summary
+        or "발주처 삼진" not in empty_summary
+        or "제품 테스트" not in empty_summary
+    ):
+        failures.append(f"expected-inbound empty result lost Calendar query summary: {expected_empty.get('meta')}")
 
     pushed: list[dict] = []
     calls_before_followup = len(captured)
@@ -247,6 +387,33 @@ def main() -> int:
     if len(captured) != calls_before_followup:
         failures.append("current-table follow-up re-queried the DB source")
 
+    expected_pushed: list[dict] = []
+    expected_calls_before_followup = len(captured)
+    expected_handled = handle_current_table_followup_by_action(
+        df=expected.get("df"),
+        query="현재표 발주일자별 보여줘 TOP 1",
+        top_n=1,
+        table_key="sims_expected_inbound_gate",
+        source_action="입고예정조회",
+        helpers={
+            "find_col": lambda df, exact=(), include_any=(), exclude_any=(): next(
+                (column for column in df.columns if column in exact or (any(token in str(column) for token in include_any) and not any(token in str(column) for token in exclude_any))),
+                "",
+            ),
+            "push_table": lambda **kwargs: expected_pushed.append(kwargs) or True,
+            "push_notice": lambda **_kwargs: True,
+        },
+        log=logging.getLogger("expected-inbound.gate"),
+        source_meta=expected.get("meta"),
+    )
+    if not expected_handled or not expected_pushed or len(expected_pushed[-1].get("df", [])) != 1:
+        failures.append("expected-inbound current-table source reuse failed")
+    if len(captured) != expected_calls_before_followup:
+        failures.append("expected-inbound current-table follow-up re-queried the DB source")
+    restored_meta = dict(expected.get("meta") or {})
+    if expected_scope not in str(restored_meta.get("query_summary") or ""):
+        failures.append("expected-inbound restored metadata lost the Calendar query summary")
+
     order_sql = " ".join(captured[0][0].split()) if captured else ""
     expected_sql = " ".join(captured[1][0].split()) if len(captured) > 1 else ""
     required = (
@@ -267,15 +434,79 @@ def main() -> int:
     forbidden = ("DISTINCT", "GROUP BY", "ROW_NUMBER(", "RD17_IO_GU <> '190'", "GREATEST(", "ABS(")
     if any(token in order_sql.upper() for token in forbidden):
         failures.append("grain/filter/clamp contract violated")
-    if "D.Rd18_Or_Di IN ('1', '2')" not in expected_sql or "RecentBusinessDates" not in expected_sql:
+    if "D.Rd18_Or_Di IN ('1', '2')" not in expected_sql or "H.Rd17_Or_YyMmDd IN (?,?,?,?)" not in expected_sql:
         failures.append("expected-inbound status/business-day filter missing")
-    if "SELECT TOP 4 C.business_date" not in expected_sql:
-        failures.append("expected-inbound SQL does not select today plus three prior business days")
+    if captured and list(captured[1][1][:4]) != list(business_dates):
+        failures.append("expected-inbound SQL did not bind the SSAI Calendar date set")
     expected_where = expected_sql.rsplit("WHERE", 1)[-1]
     if "Rd17_Put_YyMmDd" in expected_where:
         failures.append("due date controls expected-inbound membership")
-    if "dbo.WB_Holiday" not in expected_sql or len(captured[1][1]) < 21:
-        failures.append("calendar authority/bound parameters missing")
+    if "dbo.WB_Holiday" in expected_sql:
+        failures.append("ERP expected-inbound SQL still references dbo.WB_Holiday")
+
+    explicit_calls: list[tuple[str, list[object]]] = []
+    with patch.object(service, "execute_bound_select", side_effect=lambda sql, params: explicit_calls.append((sql, list(params))) or _fixture().iloc[:1].copy()):
+        explicit_expected = service.get_expected_inbound_result({
+            "date_from": "20260101", "date_to": "20260909", "status_codes": ("1", "2"),
+        })
+    explicit_meta = explicit_expected.get("meta", {})
+    explicit_sql = " ".join(explicit_calls[0][0].split()) if explicit_calls else ""
+    explicit_params = explicit_calls[0][1] if explicit_calls else []
+    if (
+        explicit_meta.get("expected_inbound_period_kind") != "explicit_order_period"
+        or explicit_meta.get("business_day_count") != 0
+        or "발주기간 2026-01-01 ~ 2026-09-09" not in str(explicit_meta.get("query_summary") or "")
+        or "H.Rd17_Or_YyMmDd >= ?" not in explicit_sql
+        or "H.Rd17_Or_YyMmDd <= ?" not in explicit_sql
+        or "H.Rd17_Or_YyMmDd IN (?,?,?,?)" in explicit_sql
+        or explicit_params[:4] != ["1", "2", "20260101", "20260909"]
+    ):
+        failures.append(f"explicit expected-inbound period/status SQL contract failed: {explicit_meta}/{explicit_sql}/{explicit_params}")
+
+    error_pushes: list[dict] = []
+    with patch.object(service, "get_expected_inbound_result", side_effect=RuntimeError("fixture database failure")), patch("app.ui.chat_middleware.push_sims_result_to_chat", side_effect=lambda payload, _action: error_pushes.append(payload) or (payload.get("meta") or {})):
+        error_handled = _try_handle_io_nlq(
+            "입고예정자료 조회",
+            room={}, session_state={}, make_ts=lambda: "2026-09-07T00:00:00+09:00", next_seq=lambda: 1,
+            logger=logging.getLogger("expected-inbound.error.gate"),
+        )
+    error_payload = error_pushes[-1] if error_pushes else {}
+    error_meta = dict(error_payload.get("meta") or {})
+    error_text = str(error_payload.get("message") or error_payload.get("data") or "")
+    if (
+        not error_handled
+        or error_meta.get("result_status") != "query_error"
+        or "자료가 없습니다" in error_text
+        or any(token in error_text.lower() for token in ("sql", "traceback", "fixture database failure"))
+    ):
+        failures.append(f"expected-inbound query-error boundary failed: {error_payload}")
+
+    calendar_cases = {
+        "weekday": ("20260907", "20260904", "20260903", "20260902"),
+        "holiday": ("20260915", "20260911", "20260910", "20260909"),
+        "substitute_holiday": ("20261002", "20260930", "20260929", "20260928"),
+        "weekend": ("20260911", "20260910", "20260909", "20260908"),
+    }
+    for label, dates in calendar_cases.items():
+        local_calls: list[tuple[str, list[object]]] = []
+        def local_select(sql: str, params) -> pd.DataFrame:
+            local_calls.append((sql, list(params)))
+            return _fixture().iloc[:1].copy()
+        with patch.object(service, "recent_business_days", return_value=RecentBusinessDaysResult(status="ready", dates=dates)), patch.object(service, "execute_bound_select", side_effect=local_select):
+            service.get_order_df({"_today": "20260907"}, mode="expected")
+        if len(local_calls) != 1 or list(local_calls[0][1][:4]) != list(dates) or "dbo.WB_Holiday" in local_calls[0][0]:
+            failures.append(f"{label} calendar dates were not bound once into ERP SQL")
+
+    unavailable_calls: list[tuple[str, list[object]]] = []
+    with patch.object(service, "recent_business_days", return_value=RecentBusinessDaysResult(status="unavailable", reason_code="calendar_year_not_loaded")), patch.object(service, "execute_bound_select", side_effect=lambda sql, params: unavailable_calls.append((sql, list(params)))):
+        try:
+            service.get_order_df({"_today": "20260907"}, mode="expected")
+        except service.BusinessCalendarUnavailableError:
+            pass
+        else:
+            failures.append("unavailable Calendar did not fail closed")
+    if unavailable_calls:
+        failures.append("unavailable Calendar executed an ERP source query")
 
     if failures:
         print("R170/R180 focused gate: FAIL")

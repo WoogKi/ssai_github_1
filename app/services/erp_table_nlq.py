@@ -21,6 +21,8 @@ _ACTION_WORDS = (
     "입고중 발주 조회", "미입고 발주 조회", "발주조회", "발주 조회",
     "발주상태",
     "입고예정 제품 조회", "오늘 입고예정 조회", "미입고 예정 조회", "입고중 제품 조회",
+    "입고예정 자료 조회", "입고 예정 자료 조회", "입고예정 자료", "입고 예정 자료",
+    "입고예정자료 조회", "입고예정자료조회",
     "입고예정조회", "입고예정 조회", "입고예정", "입고 예정",
     "제품별 최종 매입단가 조회", "최종 매입단가 조회", "최종매입단가조회",
     "최종 매입가 조회", "최종매입가조회", "최종 매입가", "최종매입가",
@@ -66,7 +68,7 @@ def _extract_code(text: str, labels: tuple[str, ...]) -> str:
 
 def _extract_name(text: str, labels: tuple[str, ...]) -> str:
     generic_labels = {
-        "거래처", "매입처", "재고적용처", "단가적용처", "단가적용거래처",
+        "거래처", "매입처", "발주처", "재고적용처", "단가적용처", "단가적용거래처",
         "제품", "품목",
     }
     label_pattern = "|".join(
@@ -268,10 +270,12 @@ def _extract_unlabeled_order_vendor(
     raw: str,
     *,
     feature: Any,
+    action_spec: Any,
 ) -> str:
     """Return only a residual business entity after registry syntax is consumed."""
     candidate = strip_nlq_period_expressions(raw)
-    for word in sorted(_ACTION_WORDS, key=len, reverse=True):
+    action_words = (*_ACTION_WORDS, action_spec.action, *action_spec.aliases)
+    for word in sorted(dict.fromkeys(action_words), key=len, reverse=True):
         candidate = candidate.replace(word, " ")
     for spec in feature.filters:
         for label in sorted((spec.label, *spec.aliases), key=len, reverse=True):
@@ -293,6 +297,23 @@ def _has_explicit_order_residual_owner(params: Mapping[str, Any]) -> bool:
             "expected_vendor_cd", "expected_vendor_nm", "real_vendor_cd", "real_vendor_nm",
         )
     )
+
+
+def _extract_order_status_codes(raw: str) -> tuple[str, ...]:
+    """Read order-status terms without treating ordinary '발주자료' text as status 1."""
+    labeled = re.search(
+        r"발주상태(?:코드)?\s*[:=]?\s*([^\n]*?)(?=\s*(?:조회|검색|확인|보여줘|알려줘|인건|$))",
+        raw,
+    )
+    source = labeled.group(1) if labeled else raw
+    mapping = (("발주", "1"), ("입고중", "2"), ("입고완료", "3"))
+    if labeled:
+        return tuple(code for label, code in mapping if label in source)
+    if "입고완료" in source:
+        return ("3",)
+    if "입고중" in source:
+        return ("2",)
+    return ()
 
 
 def _resolve_order_nlq(
@@ -332,10 +353,11 @@ def _resolve_order_nlq(
     if semantic_group:
         params["product_di_semantic_group"] = semantic_group
 
-    if "입고중" in raw:
-        params["status_code"] = "2"
-    elif "입고완료" in raw:
-        params["status_code"] = "3"
+    status_codes = _extract_order_status_codes(raw)
+    if status_codes:
+        params["status_codes"] = status_codes
+        if len(status_codes) == 1:
+            params["status_code"] = status_codes[0]
     if "미입고" in raw:
         params["has_outstanding"] = True
 
@@ -349,14 +371,26 @@ def _resolve_order_nlq(
                 params["date_from"], params["date_to"] = explicit_from, explicit_to
             else:
                 params.update(nlq_period_to_date_range(extract_nlq_natural_period(raw, today=today)))
+    else:
+        # Expected inbound keeps the Business Calendar default for ordinary
+        # questions. Only an absolute user-written order period replaces it.
+        period = extract_nlq_natural_period(raw, today=today)
+        if str(period.get("_nlq_period_kind") or "") == "explicit_period":
+            params.update(nlq_period_to_date_range(period))
 
     if (
         not params.get("order_vendor_nm")
         and not _has_explicit_order_residual_owner(params)
     ):
-        order_vendor_nm = _extract_unlabeled_order_vendor(raw, feature=feature)
-        if order_vendor_nm:
-            params["order_vendor_nm"] = order_vendor_nm
+        residual_entity = _extract_unlabeled_order_vendor(
+            raw,
+            feature=feature,
+            action_spec=action_spec,
+        )
+        if residual_entity:
+            # Registered actions defer unlabelled role selection to the common
+            # entity resolver. A residual token is not automatically a vendor.
+            params["_registered_unlabeled_entity"] = residual_entity
 
     top_match = re.search(r"(?:TOP|조회건수)\s*(\d{1,6})", raw, flags=re.IGNORECASE)
     if top_match:

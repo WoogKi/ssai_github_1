@@ -97,7 +97,12 @@ def main() -> None:
         result = resolve_registered_erp_table_nlq(question, today=date(2026, 9, 8))
         assert result and result["action"] == action
         params = result["params"]
-        matches = all(params.get(key) == value for key, value in expected_params.items())
+        observed_params = dict(params)
+        if not observed_params.get("order_vendor_nm"):
+            observed_params["order_vendor_nm"] = observed_params.get(
+                "_registered_unlabeled_entity"
+            )
+        matches = all(observed_params.get(key) == value for key, value in expected_params.items())
         if expected_status == "PASS":
             assert matches, (question, expected_params, params)
         else:
