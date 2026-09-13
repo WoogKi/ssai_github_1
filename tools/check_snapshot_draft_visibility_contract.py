@@ -18,16 +18,22 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (
     generate_frequency_snapshot_draft,
 )
 from app.services.dashboard_inventory_frequency_snapshot import (
-    RELATIONAL_FREQUENCY_REPRESENTATION,
+    EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
     RelationalFrequencySnapshot,
 )
 from app.services.sql_server_snapshot_repository import SnapshotGenerationInspection
 from app.services.ssai_snapshot_repository import SnapshotPublishResult, SnapshotReadResult
+from app.services.product_classification_contract import ClassificationStatus
+from app.services.ssai_product_classification_repository import ProductClassificationAuthorityRead
 
 
 def _assert(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
+
+
+def _classification_authority(**_kwargs: Any) -> ProductClassificationAuthorityRead:
+    return ProductClassificationAuthorityRead(status=ClassificationStatus.READY)
 
 
 class _PublishedPlusDraftRepository:
@@ -78,7 +84,7 @@ class _PublishedPlusDraftRepository:
             status="ready" if self.no_op else "unapproved",
             manifest_status="published" if self.no_op else "draft",
             approval_status="approved" if self.no_op else "pending",
-            representation=RELATIONAL_FREQUENCY_REPRESENTATION,
+            representation=EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
             relational_snapshot=self.relational_snapshot,
             manifest_id=22,
             generation_no=2,
@@ -116,25 +122,28 @@ def _diagnostics() -> dict[str, int]:
     }
 
 
+def _generation_frames() -> tuple[pd.DataFrame, pd.DataFrame]:
+    lifecycle = pd.DataFrame({
+        "product_code": ["P1", "P2"],
+        "first_normal_inbound_month": ["202501", None],
+        "current_stock_present": [1, 0],
+        "basis_inbound_present": [0, 1],
+    })
+    empty_diagnostics = {key: None for key in _diagnostics()}
+    stream = pd.DataFrame([
+        {"row_kind": "event", "outbound_date": "20251001", "vendor_code": "00007", "product_code": "P1", "stock_code": "00001", "outbound_quantity": 2, "paid_quantity": 2, "mapping_count": 1, "exact_duplicate_row_count": 0, **empty_diagnostics},
+        {"row_kind": "event", "outbound_date": "20251002", "vendor_code": "00007", "product_code": "P1", "stock_code": "00001", "outbound_quantity": 1, "paid_quantity": 1, "mapping_count": 1, "exact_duplicate_row_count": 0, **empty_diagnostics},
+        {"row_kind": "diagnostics", "outbound_date": "", "vendor_code": "", "product_code": "", "stock_code": "", "outbound_quantity": None, "mapping_count": None, "exact_duplicate_row_count": None, **_diagnostics()},
+    ])
+    return lifecycle, stream
+
+
 def test_published_operating_read_and_new_draft_are_distinct() -> None:
     plan = build_frequency_snapshot_plan(company_id=4, evaluation_month="202601", stock_codes=["00001"])
-    aggregate = pd.DataFrame(
-        [
-            {
-                "row_kind": "monthly", "month": "202510", "product_code": "P1", "stock_code": "00001",
-                "occurrence_count": 2, "outbound_quantity": 3, "outbound_day_count": 2,
-                **_diagnostics(),
-            },
-            {
-                "row_kind": "summary", "month": "", "product_code": "", "stock_code": "",
-                "occurrence_count": 0, "outbound_quantity": 0, "outbound_day_count": 0,
-                **_diagnostics(),
-            },
-        ]
-    )
+    lifecycle, stream = _generation_frames()
 
     def query(_company_id: int, sql: str, _params: Any, _timeout: int) -> pd.DataFrame:
-        return pd.DataFrame({"product_code": ["P1", "P2"]}) if "Rddbc040" in sql else aggregate.copy()
+        return lifecycle.copy() if "FirstInbound" in sql else stream.copy()
 
     repository = _PublishedPlusDraftRepository()
     result = generate_frequency_snapshot_draft(
@@ -142,11 +151,12 @@ def test_published_operating_read_and_new_draft_are_distinct() -> None:
         created_by="fixture",
         query_executor=query,
         repository=repository,
+        classification_authority_loader=_classification_authority,
     )
     _assert(result["draft"].generation_no == 2, "draft generation must remain generation 2")
     _assert(result["draft_inspection_status"] == "unapproved", "exact generation inspect must expose the draft for approval")
     _assert(repository.last_inspection is not None, "draft workflow must inspect the exact generation")
-    _assert(repository.last_inspection.representation == RELATIONAL_FREQUENCY_REPRESENTATION, "draft inspect must preserve relational representation")
+    _assert(repository.last_inspection.representation == EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION, "draft inspect must preserve v2 relational representation")
     _assert(repository.last_inspection.relational_snapshot is not None, "draft inspect must return relational authority")
     _assert(result["read_status"] == "ready", "operating read must retain published generation 1")
     _assert(repository.inspect_calls == 1 and repository.read_calls == 1, "exact inspect and operating read each run once")
@@ -154,29 +164,17 @@ def test_published_operating_read_and_new_draft_are_distinct() -> None:
 
 def test_identical_approved_generation_is_noop_not_a_new_draft_error() -> None:
     plan = build_frequency_snapshot_plan(company_id=4, evaluation_month="202601", stock_codes=["00001"])
-    aggregate = pd.DataFrame(
-        [
-            {
-                "row_kind": "monthly", "month": "202510", "product_code": "P1", "stock_code": "00001",
-                "occurrence_count": 2, "outbound_quantity": 3, "outbound_day_count": 2,
-                **_diagnostics(),
-            },
-            {
-                "row_kind": "summary", "month": "", "product_code": "", "stock_code": "",
-                "occurrence_count": 0, "outbound_quantity": 0, "outbound_day_count": 0,
-                **_diagnostics(),
-            },
-        ]
-    )
+    lifecycle, stream = _generation_frames()
 
     def query(_company_id: int, sql: str, _params: Any, _timeout: int) -> pd.DataFrame:
-        return pd.DataFrame({"product_code": ["P1", "P2"]}) if "Rddbc040" in sql else aggregate.copy()
+        return lifecycle.copy() if "FirstInbound" in sql else stream.copy()
 
     result = generate_frequency_snapshot_draft(
         plan=plan,
         created_by="fixture",
         query_executor=query,
         repository=_PublishedPlusDraftRepository(no_op=True),
+        classification_authority_loader=_classification_authority,
     )
     _assert(result["draft"].no_op, "identical approved generation must remain a repository no-op")
     _assert(result["read_status"] == "ready" and result["draft_inspection_status"] == "ready", "approved no-op remains the operating generation")

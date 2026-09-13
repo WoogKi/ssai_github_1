@@ -232,11 +232,21 @@ def _attach_approved_outbound_characteristics(
         out["출고빈도등급"] = ""
         out["출고횟수"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
 
-    # The approved product projection does not persist exact distinct dates or
-    # vendors. Keep these unknown instead of summing stock-level day counts or
-    # issuing a live detail fallback.
-    out["출고일수"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
-    out["출고거래처수"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    available = ["출고빈도등급", "출고횟수"]
+    unavailable: list[str] = []
+    for source_column, target_column in (
+        ("outbound_day_count_3m", "출고일수"),
+        ("outbound_customer_count_3m", "출고거래처수"),
+    ):
+        if not projection.empty and source_column in projection.columns:
+            value_map = projection.set_index("product_code")[source_column]
+            out[target_column] = pd.to_numeric(product_codes.map(value_map), errors="coerce").astype("Int64")
+            available.append(target_column)
+        else:
+            # v1 approved generations remain valid but cannot authorize these
+            # product-level distinct statistics.
+            out[target_column] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+            unavailable.append(target_column)
     out.attrs.update({
         "outbound_characteristics_snapshot_status": status,
         "outbound_characteristics_snapshot_reason": reason,
@@ -244,8 +254,8 @@ def _attach_approved_outbound_characteristics(
         "outbound_characteristics_snapshot_checksum": clean_text(getattr(result, "checksum", "")),
         "outbound_characteristics_stock_scope": list(_analytics_stock_scope(params)),
         "outbound_characteristics_evaluation_month": clean_text(policy.get("evaluation_month")),
-        "outbound_characteristics_available": ["출고빈도등급", "출고횟수"],
-        "outbound_characteristics_unavailable": ["출고일수", "출고거래처수"],
+        "outbound_characteristics_available": available,
+        "outbound_characteristics_unavailable": unavailable,
         "outbound_characteristics_additional_erp_call_count": 0,
     })
     return out

@@ -220,6 +220,32 @@ def is_sensitive_llm_column(column: Any, *, profile_id: str = "") -> bool:
     return any(token in compact for token in _SENSITIVE_TOKENS)
 
 
+def snapshot_grade_analysis_contract(action: str = "", columns: Iterable[Any] = ()) -> str:
+    """Shared interpretation contract for product rows and their grouped results."""
+    labels = {_clean_text(col) for col in columns}
+    relevant = {"출고빈도등급", "손익등급", "기여도등급", "추정단위손익", "추정기여금액"}
+    if action != "제품정보 조회" and not labels.intersection(relevant) and not any(label in action for label in relevant):
+        return ""
+    return (
+        "\n[Snapshot 제품통계 해석 계약]\n"
+        "- 출고빈도 A~E는 정상 출고 발생횟수 기준 상대등급이며 A에서 E로 갈수록 낮다. "
+        "E는 낮은 출고빈도이며 높은 빈도가 아니다. 단순 제품수 비중으로 빈도 수준을 뒤집지 마라.\n"
+        "- F는 선택 재고범위의 최초 정상 입고월 M0~M2 신규품목(3개월 이내 최초 입고 품목), "
+        "M3부터 A~E/X 평가. X는 관찰기간 이후 최근 완료 3개월 정상 출고 없음. "
+        "자료 부족은 X/E나 손실을 뜻하지 않는다.\n"
+        "- 손익등급과 기여도등급은 서로 독립적인 대상제품 내 상대등급 A~E이며 A가 상위, E가 하위다. "
+        "출고빈도등급과도 독립이며 등급만으로 확정 흑자/적자를 판단하지 마라.\n"
+        "- 집계표에서 그룹 컬럼은 분류 기준, 수량·추정기여금액 등은 그 그룹의 측정값이다. "
+        "손익등급별 추정기여금액 합계가 가장 큰 그룹은 '추정기여금액 합계가 가장 큰 손익등급 그룹'이다. "
+        "이를 '최대 기여 등급'으로 재분류하거나 기여도등급으로 바꾸어 표현하지 마라. "
+        "그룹 합계의 순위는 개별 제품의 등급 순위와 다르다.\n"
+        "- 추정단위손익=평균매출단가-평균매입단가, 추정손익률=추정단위손익/평균매출단가, "
+        "추정기여금액=추정단위손익×3개월출고수량. 모두 관리용 추정치이며 실제 매출액이나 회계 확정손익이 아니다.\n"
+        "- LLM 분석 버튼은 클릭한 표의 원자료/집계 결과만 분석한다. 집계표를 제품 원본으로 간주하거나 "
+        "없는 매출·마진 지표를 제안하지 마라.\n"
+    )
+
+
 def contains_sensitive_llm_text(value: Any) -> bool:
     """Return True when a free-text condition appears to contain sensitive values."""
     text = _clean_text(value)
@@ -331,6 +357,10 @@ def build_sims_analysis_profile(
 
     if bool(meta.get("current_table_followup")) or action_name.startswith("현재표"):
         profile_id, purpose, focus = _current_followup_profile(action_name)
+    elif action_name == "제품정보 조회":
+        profile_id = "snapshot_product_information"
+        purpose = "승인된 제품 통계의 출고빈도·수명주기·관리용 추정손익·추정기여 확인 (실제 매출 분석 아님)"
+        focus = ["전체 제품수와 등급 분포", "신규품목 F와 무출고 X 구분", "가격자료의 기준월과 자료 부족", "추정단위손익·추정손익률", "추정기여금액 (매출액 아님)", "샘플을 전체로 일반화 금지"]
     elif _action_contains(action_name, "제품수불현황", "제품수불") or analysis_type == "product_flow":
         profile_id = "product_flow"
         purpose = "제품별 입고·출고·재고 변동과 수불금액 확인"

@@ -113,10 +113,31 @@ class _Cursor:
                 and item["approval_status"] == "approved"
                 and str(item["basis_to"]) <= str(params[5])
                 and str(item.get("source_watermark_status") or "") in {"verified", "unverified"}
+                and (
+                    "profile_fingerprint=?" not in sql
+                    or str(item.get("profile_fingerprint") or "") == str(params[6])
+                )
             ]
             if candidates:
                 item = max(candidates, key=lambda value: (value["basis_to"], value["evaluation_month"], value["generation_no"]))
                 self.row = (item["evaluation_month"],)
+        elif "SELECT scope_fingerprint, evaluation_month, schema_version, algorithm_version" in sql:
+            matched = [
+                item for item in self.state.manifests
+                if str(item["company_id"]) == str(params[0])
+                and str(item["snapshot_type"]) == str(params[1])
+                and item["status"] == "published"
+                and item["approval_status"] == "approved"
+            ]
+            include_profile = "profile_fingerprint" in sql
+            self.rows = [
+                (
+                    item["scope_fingerprint"], item["evaluation_month"],
+                    item["schema_version"], item["algorithm_version"],
+                    *([item.get("profile_fingerprint")] if include_profile else []),
+                )
+                for item in matched
+            ]
         elif "storage_representation" in sql and "FROM snapshot.manifest" in sql and "snapshot.read.published" not in sql and "snapshot.approve.load" not in sql and "snapshot.projection.manifest" not in sql:
             rows = [
                 m for m in self.state.manifests
@@ -404,6 +425,37 @@ def test_latest_eligible_operating_key_excludes_future_basis_and_mismatches() ->
     _assert(august is not None and august.evaluation_month == "202608", "future basis must not be selected before it completes")
     _assert(september is not None and september.evaluation_month == "202609", "completed future evaluation becomes the newest operating read")
 
+    profile = "c" * 64
+    v2_key = SnapshotKey(
+        key.company_id, key.snapshot_type, "202609", key.scope_fingerprint,
+        "2.0", "outbound_frequency_v2", profile,
+    )
+    state.manifests.extend([
+        {
+            **common, "manifest_id": 5, "evaluation_month": "202609",
+            "basis_from": "20250601", "basis_to": "20260831", "generation_no": 1,
+            "schema_version": "2.0", "algorithm_version": "outbound_frequency_v2",
+            "profile_fingerprint": "d" * 64,
+        },
+        {
+            **common, "manifest_id": 6, "evaluation_month": "202609",
+            "basis_from": "20250601", "basis_to": "20260831", "generation_no": 2,
+            "schema_version": "2.0", "algorithm_version": "outbound_frequency_v2",
+            "profile_fingerprint": profile,
+        },
+    ])
+    resolved = repository.resolve_latest_eligible_key(v2_key, available_through="20260901")
+    _assert(resolved == v2_key, "operating resolver lost or ignored the v2 profile fingerprint")
+    state.manifests[-1]["approval_status"] = "pending"
+    _assert(
+        repository.resolve_latest_eligible_key(v2_key, available_through="20260901") is None,
+        "operating resolver accepted a differently-profiled v2 generation",
+    )
+    _assert(
+        repository.classify_frequency_resolution(v2_key) == "profile_mismatch",
+        "repository did not classify the saved-profile mismatch",
+    )
+
 
 def test_repository_lifecycle_and_isolation() -> None:
     state = _State()
@@ -568,6 +620,7 @@ class _MigrationCursor:
         self.row: tuple[Any, ...] | None = None
 
     def execute(self, sql: str, *params: Any) -> "_MigrationCursor":
+        self.conn.sql_calls.append(sql)
         self.row = None
         if "SET ANSI_NULLS ON" in sql:
             if not self.conn.ignore_session_set:
@@ -598,6 +651,7 @@ class _MigrationConnection:
         self.session_values = (1, 1, 1, 0, 1, 1, 0)
         self.commits = 0
         self.rollbacks = 0
+        self.sql_calls: list[str] = []
 
     def cursor(self) -> _MigrationCursor:
         return _MigrationCursor(self)
@@ -616,6 +670,38 @@ def test_migration_idempotency_and_rollback() -> None:
     _assert(first["applied"] == [migration.migration_id for migration in MIGRATIONS], "first migrations apply")
     _assert(second["skipped"] == [migration.migration_id for migration in MIGRATIONS], "second migrations are no-op")
     _assert(first["session_options"]["ARITHABORT"] == 1, "migration session enables ARITHABORT")
+
+    after_005 = _MigrationConnection()
+    after_005.ledger.update({migration.migration_id: migration.checksum for migration in MIGRATIONS[:5]})
+    after_005_result = apply_snapshot_migrations(after_005, applied_by="fixture")
+    _assert(
+        after_005_result["skipped"] == [migration.migration_id for migration in MIGRATIONS[:5]]
+        and after_005_result["applied"] == [
+            "006_frequency_product_lifecycle_extension",
+            "007_snapshot_profile_fingerprint",
+            "008_frequency_product_statistics_extension",
+        ],
+        "001-005 authority must apply migrations 006 and 007 in order",
+    )
+    _assert(
+        any("EXEC(N'" in sql and "CK_snapshot_frequency_product_extended_counts" in sql for sql in after_005.sql_calls),
+        "migration 006 must retain its post-ADD SQL Server compile boundary",
+    )
+
+    after_003 = _MigrationConnection()
+    after_003.ledger.update({migration.migration_id: migration.checksum for migration in MIGRATIONS[:3]})
+    remaining = apply_snapshot_migrations(after_003, applied_by="fixture")
+    _assert(
+        remaining["skipped"] == [migration.migration_id for migration in MIGRATIONS[:3]]
+        and remaining["applied"] == [
+            "004_monthly_frequency_materialization",
+            "005_frequency_lifecycle_authority",
+            "006_frequency_product_lifecycle_extension",
+            "007_snapshot_profile_fingerprint",
+            "008_frequency_product_statistics_extension",
+        ],
+        "001-003 authority must apply 004 through 007 in order",
+    )
 
     bad_session_conn = _MigrationConnection(ignore_session_set=True)
     try:

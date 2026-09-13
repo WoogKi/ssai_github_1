@@ -17,7 +17,12 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (  # noq
     generate_frequency_snapshot_draft,
     resolve_dashboard_profile_stock_scope,
 )
-from app.services.dashboard_inventory_frequency_snapshot import SnapshotContractError  # noqa: E402
+from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
+    EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+    PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    PRODUCT_STATISTICS_SCHEMA_VERSION,
+    SnapshotContractError,
+)
 
 
 def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, scope_source: str) -> dict[str, Any]:
@@ -25,6 +30,8 @@ def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, sco
         "mode": "apply" if apply else "dry-run",
         "company_id": plan.company_id,
         "evaluation_month": plan.evaluation_month,
+        "schema_version": PRODUCT_STATISTICS_SCHEMA_VERSION,
+        "algorithm_version": PRODUCT_STATISTICS_ALGORITHM_VERSION,
         "basis_months": list(plan.basis_months),
         "basis_from": plan.basis_from,
         "basis_to": plan.basis_to,
@@ -34,9 +41,21 @@ def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, sco
             "stock_codes": list(plan.stock_codes),
             "source": scope_source,
         },
+        "product_scope": {
+            "profile_fingerprint": plan.profile_fingerprint,
+            "product_group_count": len(plan.product_group_codes),
+            "product_di_count": len(plan.product_di_codes),
+            "product_class_count": len(plan.product_class_codes),
+            "io_gu_count": len(plan.io_gu_codes),
+            "stock_mode": plan.stock_mode,
+            "universe": "current stock OR basis normal inbound OR basis normal outbound",
+        },
         "erp_read_plan": {
             "sql_call_count": plan.erp_sql_call_count,
-            "queries": ["Rddbc040 product universe", "Rddbc120 bounded event stream + Python monthly aggregation"],
+            "queries": [
+                "profile-scoped Rddbc040 + current stock + scope-bound Rddbc110 lifecycle/inbound/purchase-price projections",
+                "profile-scoped Rddbc120 bounded event stream + frequency/return/sales-price projections",
+            ],
             "timeout_seconds_each": timeout_seconds,
             "retry_count": 0,
         },
@@ -72,6 +91,11 @@ def main() -> int:
             company_id=args.company_id,
             evaluation_month=args.evaluation_month,
             stock_codes=resolved_scope.stock_codes,
+            product_group_codes=resolved_scope.product_group_codes,
+            product_di_codes=resolved_scope.product_di_codes,
+            product_class_codes=resolved_scope.product_class_codes,
+            io_gu_codes=resolved_scope.io_gu_codes,
+            stock_mode=resolved_scope.stock_mode,
         )
     except SnapshotContractError as exc:
         print(json.dumps({
@@ -116,7 +140,9 @@ def main() -> int:
         output.update(
             {
                 "ok": True,
-                "representation": "relational_frequency_v1",
+                "representation": EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+                "schema_version": relational_snapshot.key.schema_version,
+                "algorithm_version": relational_snapshot.key.algorithm_version,
                 "product_count": relational_snapshot.item_count,
                 "normal_event_count": sum(int(row["occurrence_count"]) for row in relational_snapshot.monthly_activity),
                 "ignored_product_event_count": relational_snapshot.source_diagnostics.get("ignored_product_event_count"),

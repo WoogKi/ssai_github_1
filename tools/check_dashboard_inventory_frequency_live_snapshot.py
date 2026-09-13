@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
+    EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
     SnapshotContractError,
     build_frequency_snapshot_payload,
     build_frequency_snapshot_payload_from_aggregates,
@@ -287,7 +288,7 @@ class _DraftRepository:
             status="unapproved",
             manifest_status="draft",
             approval_status="pending",
-            representation="relational_frequency_v1",
+            representation=EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
             relational_snapshot=snapshot,
             generation_no=7,
             checksum=str(snapshot.checksum),
@@ -298,17 +299,24 @@ class _DraftRepository:
 
 def test_generation_boundary() -> None:
     plan = build_frequency_snapshot_plan(company_id=4, evaluation_month="202601", stock_codes=["00001"])
-    aggregate = pd.DataFrame(
+    event_stream = pd.DataFrame(
         [
             {
-                "row_kind": "monthly", "month": "202510", "product_code": "P1", "stock_code": "00001",
-                "occurrence_count": 2, "outbound_quantity": 3, "outbound_day_count": 2,
-                **_diagnostics(2),
+                "row_kind": "event", "outbound_date": "20251001", "vendor_code": "00007",
+                "product_code": "P1", "stock_code": "00001", "outbound_quantity": 2,
+                "mapping_count": 1, "exact_duplicate_row_count": 0,
+                **{key: None for key in _diagnostics(2)},
             },
             {
-                "row_kind": "summary", "month": "", "product_code": "", "stock_code": "",
-                "occurrence_count": 0, "outbound_quantity": 0, "outbound_day_count": 0,
-                **_diagnostics(2),
+                "row_kind": "event", "outbound_date": "20251002", "vendor_code": "00007",
+                "product_code": "P1", "stock_code": "00001", "outbound_quantity": 1,
+                "mapping_count": 1, "exact_duplicate_row_count": 0,
+                **{key: None for key in _diagnostics(2)},
+            },
+            {
+                "row_kind": "diagnostics", "outbound_date": "", "vendor_code": "",
+                "product_code": "", "stock_code": "", "outbound_quantity": None,
+                "mapping_count": None, "exact_duplicate_row_count": None, **_diagnostics(2),
             },
         ]
     )
@@ -317,9 +325,14 @@ def test_generation_boundary() -> None:
     def query(_company_id, sql, _params, timeout):
         calls.append(sql)
         _assert(_company_id == 4 and timeout == 33, "company/timeout contract mismatch")
-        if "Rddbc040" in sql:
-            return pd.DataFrame({"product_code": ["P1", "P2"]})
-        return aggregate.copy()
+        if "FirstInbound" in sql:
+            return pd.DataFrame({
+                "product_code": ["P1", "P2"],
+                "first_normal_inbound_month": ["202501", None],
+                "current_stock_present": [1, 0],
+                "basis_inbound_present": [0, 1],
+            })
+        return event_stream.copy()
 
     repo = _DraftRepository()
     progress: list[str] = []
@@ -339,7 +352,7 @@ def test_generation_boundary() -> None:
         [row["product_code"] for row in result["relational_snapshot"].frequency_products if row["frequency_grade"] == "X"] == ["P2"],
         "universe X row missing",
     )
-    _assert(progress == ["제품 조회 중", "출고 집계 중", "등급 계산 중", "draft 저장 중"], "progress phases mismatch")
+    _assert(progress == ["제품 및 최초 정상 입고 조회 중", "출고 집계 중", "등급 계산 중", "draft 저장 중"], "progress phases mismatch")
 
 
 def test_diagnostics_fail_closed() -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.services.dashboard_inventory_frequency_snapshot import (
@@ -705,15 +705,49 @@ def product_lifecycle_sql(
     *,
     stock_codes: Iterable[Any],
     cutoff_date: Any,
+    basis_from: Any = None,
+    basis_to: Any = None,
+    stock_mode: str = "real",
+    product_group_codes: Iterable[Any] = (),
+    product_di_codes: Iterable[Any] = (),
+    product_class_codes: Iterable[Any] = (),
+    price_lookback_from: Any = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Read lifecycle evidence without changing the canonical F criterion."""
+    """Read profile-scoped lifecycle and product-universe evidence once."""
     cutoff = str(cutoff_date or "").strip()
     if len(cutoff) != 8 or not cutoff.isdigit():
         raise SnapshotContractError("lifecycle cutoff must be YYYYMMDD")
+    basis_start = str(basis_from or f"{cutoff[:6]}01").strip()
+    basis_end = str(basis_to or cutoff).strip()
+    price_start = str(price_lookback_from or basis_start).strip()
+    if (
+        len(basis_start) != 8 or not basis_start.isdigit()
+        or len(basis_end) != 8 or not basis_end.isdigit()
+        or len(price_start) != 8 or not price_start.isdigit()
+    ):
+        raise SnapshotContractError("lifecycle basis must be YYYYMMDD")
+    mode = str(stock_mode or "real").strip()
+    if mode not in {"real", "book"}:
+        raise SnapshotContractError("lifecycle stock_mode must be real or book")
     stocks = tuple(sorted({str(value or "").strip() for value in stock_codes if str(value or "").strip()}))
-    binds: dict[str, Any] = {"cutoff_date": cutoff}
+    cutoff_day = datetime.strptime(cutoff, "%Y%m%d")
+    cutoff_month = cutoff[:6]
+    next_month = (cutoff_day.replace(day=28) + timedelta(days=4)).replace(day=1)
+    is_partial_month = cutoff_day.date() < (next_month - timedelta(days=1)).date()
+    previous_day = cutoff_day.replace(day=1) - timedelta(days=1)
+    stock_month_to = previous_day.strftime("%Y%m") if is_partial_month else cutoff_month
+    binds: dict[str, Any] = {
+        "cutoff_date": cutoff,
+        "basis_from": basis_start,
+        "basis_to": basis_end,
+        "price_lookback_from": price_start,
+        "stock_month_to": stock_month_to,
+        "current_month_from": f"{cutoff_month}01",
+        "use_current_detail": 1 if is_partial_month else 0,
+    }
     inbound_stock = ""
     outbound_stock = ""
+    monthly_stock = ""
     if stocks:
         names: list[str] = []
         for index, code in enumerate(stocks):
@@ -723,15 +757,55 @@ def product_lifecycle_sql(
         values = ", ".join(names)
         inbound_stock = "AND I.Rd11_Stock_Cd_Gcode = '0018' AND I.Rd11_Stock_Cd IN (" + values + ")"
         outbound_stock = "AND O.Rd12_Stock_Cd_Gcode = '0018' AND O.Rd12_Stock_Cd IN (" + values + ")"
+        monthly_stock = "AND M.{prefix}_Stock_Cd IN (" + values + ")"
+
+    def _dimension_clause(values: Iterable[Any], *, expected_gcode: str, gcode_column: str, tcode_column: str, prefix: str) -> str:
+        checks: list[str] = []
+        for index, raw in enumerate(values):
+            text = str(raw or "").strip()
+            gcode, separator, tcode = text.partition(":")
+            if not separator or gcode != expected_gcode or not tcode:
+                continue
+            gkey, tkey = f"{prefix}_g_{index}", f"{prefix}_t_{index}"
+            binds[gkey], binds[tkey] = gcode, tcode
+            checks.append(f"({gcode_column} = :{gkey} AND {tcode_column} = :{tkey})")
+        return "(" + " OR ".join(checks) + ")" if checks else ""
+
+    product_filters = [
+        clause for clause in (
+            _dimension_clause(product_group_codes, expected_gcode="0013", gcode_column="P.Rd04_Physic_Group_Gcode", tcode_column="P.Rd04_Physic_Group", prefix="group"),
+            _dimension_clause(product_di_codes, expected_gcode="0004", gcode_column="P.Rd04_Physic_Di_Gcode", tcode_column="P.Rd04_Physic_Di", prefix="di"),
+            _dimension_clause(product_class_codes, expected_gcode="0031", gcode_column="P.Rd04_Physic_Tax_Gcode", tcode_column="P.Rd04_Physic_Tax", prefix="class"),
+        ) if clause
+    ]
+    product_filter_sql = "\n      AND " + "\n      AND ".join(product_filters) if product_filters else ""
+    monthly_prefix = "Rd21" if mode == "real" else "Rd22"
+    monthly_table = "dbo.Rddbc210" if mode == "real" else "dbo.Rddbc220"
+    monthly_in_qty = f"COALESCE(M.{monthly_prefix}_In_Quantity, 0)"
+    monthly_out_qty = f"COALESCE(M.{monthly_prefix}_Out_Quantity, 0)"
+    detail_in_date = "I.Rd11_In_YyMmDd" if mode == "real" else "I.Rd11_Trans_YyMmDd"
+    detail_out_date = "O.Rd12_Out_YyMmDd" if mode == "real" else "O.Rd12_Trans_YyMmDd"
+    detail_in_qty = "COALESCE(I.Rd11_Quantity, 0)"
+    detail_out_qty = "COALESCE(O.Rd12_Quantity, 0)"
+    if mode == "real":
+        monthly_in_qty += f" + COALESCE(M.{monthly_prefix}_In_Oquantity, 0)"
+        monthly_out_qty += f" + COALESCE(M.{monthly_prefix}_Out_Oquantity, 0)"
+        detail_in_qty += " + COALESCE(I.Rd11_Oquantity, 0)"
+        detail_out_qty += " + COALESCE(O.Rd12_Oquantity, 0)"
+    monthly_stock_sql = monthly_stock.format(prefix=monthly_prefix) if monthly_stock else ""
     sql = f"""
 WITH ProductUniverse AS (
     SELECT LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code,
+           CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Group_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Group))) AS product_group_key,
+           CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Di_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Di))) AS product_di_key,
+           CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Tax_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Tax))) AS product_class_key,
            CASE WHEN LEN(LTRIM(RTRIM(P.Rd04_Add_Date))) = 8
                      AND LTRIM(RTRIM(P.Rd04_Add_Date)) NOT LIKE '%[^0-9]%'
                      AND ISDATE(LTRIM(RTRIM(P.Rd04_Add_Date))) = 1
                 THEN LTRIM(RTRIM(P.Rd04_Add_Date)) END AS product_registered_date
     FROM dbo.Rddbc040 AS P
     WHERE NULLIF(LTRIM(RTRIM(P.Rd04_Physic_Cd)), '') IS NOT NULL
+      {product_filter_sql}
 ), FirstInbound AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
            MIN(LTRIM(RTRIM(I.Rd11_In_YyMmDd))) AS first_normal_inbound_date
@@ -745,6 +819,30 @@ WITH ProductUniverse AS (
       AND I.Rd11_In_YyMmDd <= :cutoff_date
       {inbound_stock}
     GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd))
+), BasisInbound AS (
+    SELECT DISTINCT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code
+    FROM dbo.Rddbc110 AS I
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND I.Rd11_Io_Gu IN ('001', '002')
+      AND COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0
+      AND I.Rd11_In_YyMmDd >= :basis_from AND I.Rd11_In_YyMmDd <= :basis_to
+      {inbound_stock}
+), PurchasePriceMonthly AS (
+    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
+           LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6) AS basis_month,
+           SUM(CAST(I.Rd11_Quantity AS decimal(38, 6))) AS paid_quantity,
+           SUM(CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) AS decimal(38, 6))) AS supply_amount
+    FROM dbo.Rddbc110 AS I
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND I.Rd11_Io_Gu IN ('001', '002')
+      AND COALESCE(I.Rd11_Quantity, 0) > 0
+      AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
+      AND I.Rd11_In_YyMmDd >= :price_lookback_from AND I.Rd11_In_YyMmDd <= :basis_to
+      {inbound_stock}
+    GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd)), LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6)
+), LatestPurchasePrice AS (
+    SELECT product_code, basis_month, paid_quantity, supply_amount,
+           ROW_NUMBER() OVER (PARTITION BY product_code ORDER BY basis_month DESC) AS price_rank
+    FROM PurchasePriceMonthly
+    WHERE paid_quantity > 0
 ), FirstOutbound AS (
     SELECT LTRIM(RTRIM(O.Rd12_Physic_Cd)) AS product_code,
            MIN(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) AS first_outbound_date
@@ -764,14 +862,47 @@ WITH ProductUniverse AS (
       AND O.Rd12_Out_YyMmDd <= :cutoff_date
       {outbound_stock}
     GROUP BY LTRIM(RTRIM(O.Rd12_Physic_Cd))
+), MonthlyStock AS (
+    SELECT LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) AS product_code,
+           SUM(({monthly_in_qty}) - ({monthly_out_qty})) AS stock_quantity
+    FROM {monthly_table} AS M
+    WHERE M.{monthly_prefix}_Stock_YyMm <= :stock_month_to
+      AND M.{monthly_prefix}_Io_Gu_Gcode = '0012'
+      {monthly_stock_sql}
+    GROUP BY LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd))
+), CurrentInbound AS (
+    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code, SUM({detail_in_qty}) AS quantity
+    FROM dbo.Rddbc110 AS I
+    WHERE :use_current_detail = 1 AND I.Rd11_Io_Gu_Gcode = '0012'
+      AND {detail_in_date} >= :current_month_from AND {detail_in_date} <= :cutoff_date
+      {inbound_stock}
+    GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd))
+), CurrentOutbound AS (
+    SELECT LTRIM(RTRIM(O.Rd12_Physic_Cd)) AS product_code, SUM({detail_out_qty}) AS quantity
+    FROM dbo.Rddbc120 AS O
+    WHERE :use_current_detail = 1 AND O.Rd12_Io_Gu_Gcode = '0012'
+      AND {detail_out_date} >= :current_month_from AND {detail_out_date} <= :cutoff_date
+      {outbound_stock}
+    GROUP BY LTRIM(RTRIM(O.Rd12_Physic_Cd))
 )
-SELECT P.product_code, P.product_registered_date,
+SELECT P.product_code, P.product_group_key, P.product_di_key, P.product_class_key,
+       P.product_registered_date,
        I.first_normal_inbound_date,
        LEFT(I.first_normal_inbound_date, 6) AS first_normal_inbound_month,
-       O.first_outbound_date
+       O.first_outbound_date,
+       CASE WHEN COALESCE(S.stock_quantity, 0) + COALESCE(CI.quantity, 0) - COALESCE(CO.quantity, 0) <> 0 THEN 1 ELSE 0 END AS current_stock_present,
+       CASE WHEN BI.product_code IS NULL THEN 0 ELSE 1 END AS basis_inbound_present,
+       COUNT_BIG(*) OVER () AS profile_product_count
+       ,CAST(CASE WHEN PP.paid_quantity > 0 THEN PP.supply_amount / PP.paid_quantity END AS decimal(38, 10)) AS avg_purchase_unit_cost
+       ,PP.basis_month AS purchase_price_basis_month
 FROM ProductUniverse AS P
 LEFT JOIN FirstInbound AS I ON I.product_code=P.product_code
 LEFT JOIN FirstOutbound AS O ON O.product_code=P.product_code
+LEFT JOIN BasisInbound AS BI ON BI.product_code=P.product_code
+LEFT JOIN MonthlyStock AS S ON S.product_code=P.product_code
+LEFT JOIN CurrentInbound AS CI ON CI.product_code=P.product_code
+LEFT JOIN CurrentOutbound AS CO ON CO.product_code=P.product_code
+LEFT JOIN LatestPurchasePrice AS PP ON PP.product_code=P.product_code AND PP.price_rank=1
 ORDER BY P.product_code
 """.strip()
     return sql, binds

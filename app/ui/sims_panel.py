@@ -26,6 +26,8 @@ log = logging.getLogger("ssai")
 # ==========================================================
 def _mark_submitted() -> None:
     ss = st.session_state
+    from app.ui.sims_panel_submission import record_panel_submission
+    record_panel_submission(ss)
     ss["__sims_form_submitted"] = True
     ss["__sims_submitted_form_id"] = ss.get("__sims_form_id")
     ss["__sims_query_submit_seq"] = int(ss.get("__sims_query_submit_seq") or 0) + 1
@@ -1265,6 +1267,11 @@ _CATEGORIES: Dict[str, Dict[str, Any]] = {
             "제품재고현황": rddbc_io_views.view_product_inventory,
         }
     },
+    "재고": {
+        "actions": {
+            "제품정보 조회": rddbc_io_views.view_snapshot_product_information,
+        }
+    },
 }
 
 from app.sims.meta.erp_table_feature_registry import iter_action_specs, resolve_dotted_callable
@@ -1372,6 +1379,7 @@ def _current_action_payload_key(action: str) -> Optional[str]:
         "제품수불현황": "__product_flow_last_payload",
         "제품재고현황 조회": "__io260_last_payload",
         "제품재고현황": "__io260_last_payload",
+        "제품정보 조회": "__snapshot_product_information_last_payload",
     }.get(str(action or "").strip())
     if payload_key:
         return payload_key
@@ -1653,7 +1661,7 @@ def _panel_result_target_chat_enabled() -> bool:
     return target in {"chat", "chat_only", "chat-only", "1", "true", "yes", "y", "on"}
 
 
-def _store_panel_final_payload_for_chat(payload: Dict[str, Any], action: str) -> None:
+def _store_panel_final_payload_for_chat(payload: Dict[str, Any], action: str, *, submission_id: str = "") -> None:
     """
     메인에서 채팅방으로 push할 최종 패널 payload를 보관한다.
 
@@ -1666,6 +1674,14 @@ def _store_panel_final_payload_for_chat(payload: Dict[str, Any], action: str) ->
         if not isinstance(payload, dict):
             return
 
+        if not submission_id or (payload.get("meta") or {}).get("_panel_submission_id") != submission_id:
+            return
+
+        # Preserve submission identity on the cached original, not only its bridge copy.
+        source_sig = _make_panel_source_sig(action, payload)
+        if not isinstance(payload.get("meta"), dict):
+            payload["meta"] = {}
+        payload["meta"]["_panel_source_sig"] = source_sig
         payload = dict(payload)
         payload["meta"] = dict(payload.get("meta") or {})
         canonical_action = _panel_payload_action(payload, action)
@@ -1812,6 +1828,10 @@ def _panel_query_fingerprint(payload: Mapping[str, Any] | None) -> str:
 def _make_panel_source_sig(action: str, payload: Mapping[str, Any] | None = None) -> str:
     """Identify one explicit panel query execution without treating reruns as new results."""
     try:
+        if isinstance(payload, Mapping):
+            meta = payload.get("meta")
+            if isinstance(meta, Mapping) and meta.get("_panel_source_sig"):
+                return str(meta["_panel_source_sig"])
         ss = st.session_state
         sel = ss.get("__sims_selected") or {}
         action_name = str(sel.get("action") or action)
@@ -2657,6 +2677,10 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
     category = selected["category"]
     action = selected["action"]
     ss["__sims_selected"] = selected
+    from app.ui.sims_panel_submission import consume_panel_submission
+    # Callback events are claimed before the view can abort/stop. Views with
+    # inline submit handling may record their event during the call instead.
+    submission_id = consume_panel_submission(ss, action)
 
     # SIMS 실행으로 패널만 다시 연 경우에는,
     # 같은 액션의 이전 조회 payload를 그대로 재사용하지 않도록 현재 액션 payload를 비운다.
@@ -2732,6 +2756,7 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
                     log.debug("[panel] restored last final payload for action=%s.%s", category, action)
 
     except Exception as e:
+        ss.pop("__sims_pending_submission", None)
         st.error(f"실행 오류: {e}")
         log.exception(
             "sims_panel: view render error (category=%s, action=%s, run_flag=%s, was_final=%s, form_id=%s, widget_ns=%s)",
@@ -2744,13 +2769,20 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
         )
         return
 
+    submission_id = consume_panel_submission(ss, action) or submission_id
     # payload 점검
     if not isinstance(payload, dict):
         st.info("결과가 없습니다.")
         log.info("SIMS action=%r -> no dict payload", action)
         return
     # ------------------ 결과 렌더/브리지 ------------------
-    _render_payload(payload, action)
+    if submission_id and payload.get("final"):
+        payload = dict(payload)
+        payload["meta"] = dict(payload.get("meta") or {})
+        payload["meta"]["_panel_submission_id"] = submission_id
+        payload["meta"]["_panel_source_sig"] = submission_id
+        payload.pop("id", None)
+    _render_payload(payload, action, submission_id=submission_id)
 
     log.info("[panel.main] leave")
 
@@ -3294,7 +3326,7 @@ def _payload_has_table_rows(payload: Dict[str, Any], df_full: Any, df_disp: Any)
 #    - df/df_display 또는 records/columns 자동 처리
 #    - 최종 결과이면 채팅 브리지로도 푸시(테이블/텍스트)
 # ==========================================================
-def _render_payload(payload: Dict[str, Any], action: str) -> None:
+def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str = "") -> None:
     """payload를 화면에 표시하고, 필요 시 채팅 브리지로 전달 (다운로드 버튼은 폼 밖에서)"""
 
     final = bool(payload.get("final"))
@@ -3331,6 +3363,13 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
 
     if final:
         _panel_stamp_payload_company(payload)
+
+    # A remembered final result is display state, never a new source/Chat event.
+    # Dashboard owns its separate explicit-submit event contract below.
+    if final and not submission_id and str(payload.get("type") or "").lower() != "dashboard_lite":
+        if _panel_result_target_chat_enabled():
+            _render_panel_chat_only_done(payload, action)
+        return
 
     # Dashboard is a chat-history result, not a panel result. Keep the panel
     # focused on its conditions while preserving every completed Dashboard as
@@ -3570,7 +3609,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
 
             empty_payload["meta"] = meta
 
-            _store_panel_final_payload_for_chat(empty_payload, action)
+            _store_panel_final_payload_for_chat(empty_payload, action, submission_id=submission_id)
 
             try:
                 sel = st.session_state.get("__sims_selected") or {}
@@ -3633,7 +3672,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                             action,
                             record_previous_source_for_prune=True,
                         )
-                        _store_panel_final_payload_for_chat(payload, action)
+                        _store_panel_final_payload_for_chat(payload, action, submission_id=submission_id)
 
                 except Exception:
                     log.exception("[panel] store compact payload for chat failed")
@@ -3700,7 +3739,7 @@ def _render_payload(payload: Dict[str, Any], action: str) -> None:
                 )
 
             # 메인 push용 payload 보관
-            _store_panel_final_payload_for_chat(payload, action)
+            _store_panel_final_payload_for_chat(payload, action, submission_id=submission_id)
 
             # 패널에는 표/다운로드를 그리지 않고 안내만 표시
             _render_panel_chat_only_done(payload, action)

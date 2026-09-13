@@ -32,6 +32,7 @@ class SnapshotKey:
     scope_fingerprint: str
     schema_version: str
     algorithm_version: str
+    profile_fingerprint: str = ""
 
 
 @dataclass(frozen=True)

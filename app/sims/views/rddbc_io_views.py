@@ -36,6 +36,7 @@ from app.sims.views.rddbc_io_order_views import (
     view_expected_inbound_query,
     view_order_query,
 )
+from app.sims.views.snapshot_product_information_view import view_snapshot_product_information
 
 __all__ = [
     "view_rddbc040",
@@ -56,4 +57,5 @@ __all__ = [
     "view_rddbc230",
     "view_order_query",
     "view_expected_inbound_query",
+    "view_snapshot_product_information",
 ]

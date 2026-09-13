@@ -530,12 +530,111 @@ GRANT SELECT, INSERT ON OBJECT::snapshot.frequency_lifecycle_product TO [ssai_sn
 """
 
 
+MIGRATION_006_SQL = """
+ALTER TABLE snapshot.manifest DROP CONSTRAINT CK_snapshot_manifest_counts;
+ALTER TABLE snapshot.manifest DROP CONSTRAINT CK_snapshot_manifest_representation;
+ALTER TABLE snapshot.manifest ADD CONSTRAINT CK_snapshot_manifest_counts CHECK (
+    generation_no > 0 AND item_count >= 0 AND payload_size >= 0
+    AND ((storage_representation = 'legacy_json_v1' AND payload_size > 0)
+      OR (storage_representation IN ('relational_frequency_v1','relational_frequency_v2') AND payload_size = 0))
+);
+ALTER TABLE snapshot.manifest ADD CONSTRAINT CK_snapshot_manifest_representation CHECK (
+    storage_representation IN ('legacy_json_v1','relational_frequency_v1','relational_frequency_v2')
+);
+
+ALTER TABLE snapshot.frequency_product ADD outbound_day_count_3m BIGINT NULL;
+ALTER TABLE snapshot.frequency_product ADD outbound_customer_count_3m BIGINT NULL;
+ALTER TABLE snapshot.frequency_product ADD legacy_frequency_grade CHAR(1) NULL;
+ALTER TABLE snapshot.frequency_product ADD lifecycle_status VARCHAR(32) NULL;
+ALTER TABLE snapshot.frequency_product ADD lifecycle_reason VARCHAR(64) NULL;
+ALTER TABLE snapshot.frequency_product ADD first_normal_inbound_month CHAR(6) NULL;
+ALTER TABLE snapshot.frequency_product ADD row_status VARCHAR(32) NULL;
+
+-- SQL Server compiles a batch against its pre-ALTER schema. Compile the
+-- constraints that reference the additive columns only after those columns
+-- have been added, following the migration 003 boundary contract.
+EXEC(N'
+ALTER TABLE snapshot.frequency_product DROP CONSTRAINT CK_snapshot_frequency_product_grade;
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_grade
+    CHECK (frequency_grade IN (''F'',''A'',''B'',''C'',''D'',''E'',''X''));
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_extended_counts
+    CHECK ((outbound_day_count_3m IS NULL OR outbound_day_count_3m BETWEEN 0 AND occurrence_count_3m)
+       AND (outbound_customer_count_3m IS NULL OR outbound_customer_count_3m BETWEEN 0 AND occurrence_count_3m));
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_legacy_grade
+    CHECK (legacy_frequency_grade IS NULL OR legacy_frequency_grade IN (''A'',''B'',''C'',''D'',''E'',''X''));
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_lifecycle
+    CHECK (lifecycle_status IS NULL OR lifecycle_status IN
+        (''new_product'',''established_product'',''unknown_lifecycle'',''invalid_lifecycle''));
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_row_status
+    CHECK (row_status IS NULL OR row_status IN (''ready'',''no_normal_outbound''));
+');
+
+ALTER TABLE snapshot.frequency_projection DROP CONSTRAINT CK_snapshot_frequency_projection_grade;
+ALTER TABLE snapshot.frequency_projection ADD CONSTRAINT CK_snapshot_frequency_projection_grade
+    CHECK (frequency_grade IN ('F','A','B','C','D','E','X'));
+"""
+
+
+MIGRATION_007_SQL = """
+ALTER TABLE snapshot.manifest ADD profile_fingerprint CHAR(64) NULL;
+
+-- Keep the new-column constraint out of the pre-ALTER compile scope, matching
+-- the additive-column boundary used by migration 006.
+EXEC(N'
+ALTER TABLE snapshot.manifest ADD CONSTRAINT CK_snapshot_manifest_profile_fingerprint
+    CHECK (profile_fingerprint IS NULL OR LEN(profile_fingerprint) = 64);
+');
+"""
+
+
+MIGRATION_008_SQL = """
+ALTER TABLE snapshot.frequency_product ADD outbound_qty_3m BIGINT NULL;
+ALTER TABLE snapshot.frequency_product ADD outbound_paid_qty_3m BIGINT NULL;
+ALTER TABLE snapshot.frequency_product ADD return_event_count_3m BIGINT NULL;
+ALTER TABLE snapshot.frequency_product ADD return_qty_3m BIGINT NULL;
+ALTER TABLE snapshot.frequency_product ADD return_supply_amount_3m DECIMAL(38,6) NULL;
+ALTER TABLE snapshot.frequency_product ADD avg_purchase_unit_cost DECIMAL(38,10) NULL;
+ALTER TABLE snapshot.frequency_product ADD purchase_price_basis_month CHAR(6) NULL;
+ALTER TABLE snapshot.frequency_product ADD purchase_price_status VARCHAR(24) NULL;
+ALTER TABLE snapshot.frequency_product ADD avg_sales_unit_price DECIMAL(38,10) NULL;
+ALTER TABLE snapshot.frequency_product ADD sales_price_basis_month CHAR(6) NULL;
+ALTER TABLE snapshot.frequency_product ADD sales_price_status VARCHAR(24) NULL;
+ALTER TABLE snapshot.frequency_product ADD estimated_unit_profit DECIMAL(38,10) NULL;
+ALTER TABLE snapshot.frequency_product ADD estimated_profit_rate DECIMAL(38,12) NULL;
+ALTER TABLE snapshot.frequency_product ADD profit_grade VARCHAR(16) NULL;
+ALTER TABLE snapshot.frequency_product ADD estimated_contribution_amount DECIMAL(38,6) NULL;
+ALTER TABLE snapshot.frequency_product ADD contribution_grade VARCHAR(16) NULL;
+ALTER TABLE snapshot.frequency_product ADD profitability_status VARCHAR(32) NULL;
+
+EXEC(N'
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_statistics_counts
+    CHECK ((outbound_qty_3m IS NULL OR outbound_qty_3m >= 0)
+       AND (outbound_paid_qty_3m IS NULL OR outbound_paid_qty_3m >= 0)
+       AND (return_event_count_3m IS NULL OR return_event_count_3m >= 0)
+       AND (return_qty_3m IS NULL OR return_qty_3m >= 0)
+       AND (return_supply_amount_3m IS NULL OR return_supply_amount_3m >= 0));
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_price_status
+    CHECK ((purchase_price_status IS NULL OR purchase_price_status IN (''ready'',''stale'',''unavailable''))
+       AND (sales_price_status IS NULL OR sales_price_status IN (''ready'',''stale'',''unavailable'')));
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_profit_grade
+    CHECK ((profit_grade IS NULL OR profit_grade IN (''A'',''B'',''C'',''D'',''E'',''unavailable''))
+       AND (contribution_grade IS NULL OR contribution_grade IN (''A'',''B'',''C'',''D'',''E'',''unavailable'')));
+ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_product_profitability_status
+    CHECK (profitability_status IS NULL OR profitability_status IN
+      (''ready'',''stale'',''unavailable'',''excluded_adjustment_only''));
+');
+"""
+
+
 MIGRATIONS = (
     SnapshotMigration("001_snapshot_manifest_payload", MIGRATION_001_SQL),
     SnapshotMigration("002_snapshot_frequency_projection", MIGRATION_002_SQL),
     SnapshotMigration("003_snapshot_relational_frequency_authority", MIGRATION_003_SQL),
     SnapshotMigration("004_monthly_frequency_materialization", MIGRATION_004_SQL),
     SnapshotMigration("005_frequency_lifecycle_authority", MIGRATION_005_SQL),
+    SnapshotMigration("006_frequency_product_lifecycle_extension", MIGRATION_006_SQL),
+    SnapshotMigration("007_snapshot_profile_fingerprint", MIGRATION_007_SQL),
+    SnapshotMigration("008_frequency_product_statistics_extension", MIGRATION_008_SQL),
 )
 
 

@@ -243,7 +243,7 @@ RDDBC170_RDDBC180 = ErpTableFeatureSpec(
     actions=(
         ErpTableActionSpec(
             action="발주조회",
-            aliases=("발주 조회", "발주내역 조회", "발주 내역 조회", "최근 발주내역 조회", "최근 발주 조회", "오늘 발주 조회", "이번주 발주 조회", "입고중 발주 조회", "미입고 발주 조회", "발주상태"),
+            aliases=("발주 조회", "발주 보여줘", "발주 내역 보여줘", "발주내역 조회", "발주 내역 조회", "최근 발주내역 조회", "최근 발주 조회", "오늘 발주 조회", "이번주 발주 조회", "입고중 발주 조회", "미입고 발주 조회", "발주상태", "발주내역", "발주 내역", "발주현황", "발주 현황"),
             mode="order",
             service_function="app.services.rddbc170_rddbc180_order_service.get_order_result",
             export_function="app.services.rddbc170_rddbc180_order_service.get_order_export_df",

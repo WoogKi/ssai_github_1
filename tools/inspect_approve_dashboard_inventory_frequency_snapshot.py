@@ -14,6 +14,10 @@ if str(ROOT) not in sys.path:
 
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     ALGORITHM_VERSION,
+    EXTENDED_ALGORITHM_VERSION,
+    EXTENDED_SCHEMA_VERSION,
+    PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    PRODUCT_STATISTICS_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SNAPSHOT_TYPE,
     scope_fingerprint,
@@ -37,27 +41,36 @@ _PARTITION_KEYS = (
 )
 
 
-def _parse_grade_counts(value: str) -> dict[str, int]:
+def _parse_grade_counts(value: str, *, extended: bool) -> dict[str, int]:
+    grade_keys = ("F", *_GRADE_KEYS) if extended else _GRADE_KEYS
     result: dict[str, int] = {}
     for item in str(value or "").split(","):
         key, separator, raw = item.strip().partition("=")
-        if not separator or key not in _GRADE_KEYS:
-            raise ValueError("expected grade counts must be A=..,B=..,C=..,D=..,E=..,X=..")
+        if not separator or key not in grade_keys:
+            raise ValueError("expected grade counts do not match the selected contract version")
         result[key] = int(raw)
-    if tuple(sorted(result)) != tuple(sorted(_GRADE_KEYS)) or any(value < 0 for value in result.values()):
-        raise ValueError("expected grade counts must contain every nonnegative A/B/C/D/E/X count")
+    if tuple(sorted(result)) != tuple(sorted(grade_keys)) or any(value < 0 for value in result.values()):
+        raise ValueError("expected grade counts must contain every grade for the selected contract version")
     return result
 
 
 def _key(args: argparse.Namespace) -> SnapshotKey:
     scope_codes = tuple(sorted({str(code).strip() for code in args.stock_code if str(code).strip()}))
+    contract_version = str(getattr(args, "contract_version", "1"))
+    profile_fingerprint = str(getattr(args, "expected_profile_fingerprint", "") or "").strip().lower()
+    if contract_version in {"2", "2.1"}:
+        if len(profile_fingerprint) != 64 or any(char not in "0123456789abcdef" for char in profile_fingerprint):
+            raise ValueError("--expected-profile-fingerprint must be a SHA-256 hex digest for contract v2/v2.1")
+    elif profile_fingerprint:
+        raise ValueError("--expected-profile-fingerprint is only valid for contract v2/v2.1")
     return SnapshotKey(
         company_id=str(args.company_id),
         snapshot_type=SNAPSHOT_TYPE,
         evaluation_month=str(args.evaluation_month),
         scope_fingerprint=scope_fingerprint(scope_codes),
-        schema_version=SCHEMA_VERSION,
-        algorithm_version=ALGORITHM_VERSION,
+        schema_version=(PRODUCT_STATISTICS_SCHEMA_VERSION if contract_version == "2.1" else EXTENDED_SCHEMA_VERSION if contract_version == "2" else SCHEMA_VERSION),
+        algorithm_version=(PRODUCT_STATISTICS_ALGORITHM_VERSION if contract_version == "2.1" else EXTENDED_ALGORITHM_VERSION if contract_version == "2" else ALGORITHM_VERSION),
+        profile_fingerprint=profile_fingerprint,
     )
 
 
@@ -65,7 +78,8 @@ def _verify_expected(payload: Mapping[str, Any], args: argparse.Namespace) -> di
     summary = dict(payload.get("summary") or {})
     diagnostics = dict(payload.get("source_diagnostics") or {})
     grade_counts = dict(summary.get("grade_counts") or {})
-    actual_grades = {key: int(grade_counts.get(key) or 0) for key in _GRADE_KEYS}
+    grade_keys = ("F", *_GRADE_KEYS) if str(getattr(args, "contract_version", "1")) in {"2", "2.1"} else _GRADE_KEYS
+    actual_grades = {key: int(grade_counts.get(key) or 0) for key in grade_keys}
     partition_total = sum(int(diagnostics.get(key) or 0) for key in _PARTITION_KEYS)
     checks = {
         "product_count": int(summary.get("product_count") or 0) == args.expected_product_count,
@@ -95,7 +109,8 @@ def _inspection_authority(inspection: Any) -> Mapping[str, Any] | None:
     native = getattr(inspection, "relational_snapshot", None)
     if native is None:
         return None
-    grade_counts = {key: 0 for key in _GRADE_KEYS}
+    grade_keys = ("F", *_GRADE_KEYS) if getattr(native.key, "schema_version", "") in {EXTENDED_SCHEMA_VERSION, PRODUCT_STATISTICS_SCHEMA_VERSION} else _GRADE_KEYS
+    grade_counts = {key: 0 for key in grade_keys}
     for row in native.frequency_products:
         grade = str(row.get("frequency_grade") or "")
         if grade in grade_counts:
@@ -296,6 +311,8 @@ def main() -> int:
     parser.add_argument("--expected-normal-event-count", required=True, type=int)
     parser.add_argument("--expected-source-row-count", required=True, type=int)
     parser.add_argument("--expected-grade-counts", required=True)
+    parser.add_argument("--contract-version", choices=("1", "2", "2.1"), required=True)
+    parser.add_argument("--expected-profile-fingerprint", default="")
     parser.add_argument("--approve", action="store_true")
     parser.add_argument("--approved-by", default="")
     parser.add_argument("--approval-reason", default="")
@@ -303,7 +320,9 @@ def main() -> int:
     try:
         if args.company_id <= 0 or args.generation <= 0 or args.preserve_generation < 0:
             raise ValueError("company_id/generation must be positive and preserve_generation cannot be negative")
-        args.expected_grade_counts = _parse_grade_counts(args.expected_grade_counts)
+        args.expected_grade_counts = _parse_grade_counts(
+            args.expected_grade_counts, extended=args.contract_version in {"2", "2.1"}
+        )
         if args.approve and (not str(args.approved_by).strip() or not str(args.approval_reason).strip()):
             raise ValueError("--approved-by and --approval-reason are required with --approve")
         output = run_approval_workflow(

@@ -26,6 +26,8 @@ log = logging.getLogger("ssai")
 # ---------------------------------------------------------------------
 def _trigger_panel_run() -> None:
     ss = st.session_state
+    from app.ui.sims_panel_submission import record_panel_submission
+    record_panel_submission(ss)
     ss["__sims_run_flag"] = True
     ss["__sims_inner_submit"] = True
     ss["__sims_run_seq"] = int(ss.get("__sims_run_seq", 0)) + 1

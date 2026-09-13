@@ -27,6 +27,7 @@ from app.db.mssql_client import (
 )
 from app.services.product_supplier_scope_service import apply_product_supplier_scope, supplier_scope_filter_active
 from app.services.dashboard_inventory_frequency_snapshot import FrequencyProjectionReadResult
+from app.services.business_calendar_service import BusinessDayMonthContext, business_day_month_context, kst_today
 from app.services.ssai_snapshot_repository import SnapshotReadResult
 
 
@@ -922,33 +923,39 @@ def _dashboard_time_progress(
     *,
     policy_date: Any = None,
     today: date | None = None,
+    business_day_context: BusinessDayMonthContext | None = None,
 ) -> dict[str, Any]:
-    """Return the calendar progress used only to interpret the evaluation month."""
+    """Return completed/future state or current-month business-day progress."""
     today = today or date.today()
     yyyymm = _normalize_yyyymm(evaluation_month)
     if not yyyymm:
-        return {"pct": None, "elapsed_days": None, "total_days": None, "status": "자료부족"}
+        return {"pct": None, "elapsed_days": None, "total_days": None, "status": "자료부족", "basis": "calendar"}
 
     today_ym = today.strftime("%Y%m")
     if yyyymm < today_ym:
-        return {"pct": 100.0, "elapsed_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "total_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "status": "완료월"}
+        return {"pct": 100.0, "elapsed_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "total_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "status": "완료월", "basis": "calendar"}
     if yyyymm > today_ym:
-        return {"pct": 0.0, "elapsed_days": 0, "total_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "status": "미래월"}
+        return {"pct": 0.0, "elapsed_days": 0, "total_days": monthrange(int(yyyymm[:4]), int(yyyymm[4:6]))[1], "status": "미래월", "basis": "calendar"}
 
-    total_days = monthrange(today.year, today.month)[1]
-    policy_text = re.sub(r"\D", "", str(policy_date or ""))[:8]
-    try:
-        policy_day = datetime.strptime(policy_text, "%Y%m%d").date()
-    except ValueError:
-        policy_day = today
-    if policy_day.strftime("%Y%m") != yyyymm:
-        policy_day = today
-    elapsed_days = max(0, min(int(policy_day.day), total_days))
+    context = business_day_context
+    if context is None or context.evaluation_month != yyyymm or context.authority_status != "ready":
+        return {
+            "pct": None,
+            "elapsed_days": None,
+            "total_days": None,
+            "status": "영업일자료부족",
+            "basis": "business_day",
+            "authority_status": context.authority_status if context is not None else "unavailable",
+            "reason": context.reason if context is not None else "business_day_context_missing",
+        }
     return {
-        "pct": float(elapsed_days / total_days * 100.0),
-        "elapsed_days": elapsed_days,
-        "total_days": total_days,
+        "pct": float(context.business_day_progress_ratio or 0.0) * 100.0,
+        "elapsed_days": context.elapsed_business_days,
+        "total_days": context.business_days_total,
         "status": "진행중",
+        "basis": "business_day",
+        "authority_status": context.authority_status,
+        "reason": context.reason,
     }
 
 
@@ -1136,18 +1143,35 @@ def _apply_current_month_demand_surge(
     *,
     evaluation_month: str,
     policy_date: str,
+    business_day_context: BusinessDayMonthContext | None = None,
 ) -> dict[str, Any]:
     """Add risk-only demand-surge fields without changing source shortage facts."""
     policy_digits = re.sub(r"\D", "", str(policy_date or ""))[:8]
-    current_month = bool(policy_digits and evaluation_month == policy_digits[:6])
-    elapsed_days = 0
-    total_days = 0
-    remaining_days = 0
+    current_month = bool(
+        policy_digits
+        and evaluation_month == policy_digits[:6]
+        and business_day_context is not None
+        and business_day_context.evaluation_month == evaluation_month
+    )
+    elapsed_days = total_days = remaining_business_days = None
+    remaining_calendar_days = 0
+    authority_ready = bool(
+        current_month
+        and business_day_context is not None
+        and business_day_context.evaluation_month == evaluation_month
+        and business_day_context.authority_status == "ready"
+        and business_day_context.business_days_total
+        and business_day_context.elapsed_business_days is not None
+    )
     if current_month:
         year, month = int(policy_digits[:4]), int(policy_digits[4:6])
-        total_days = monthrange(year, month)[1]
-        elapsed_days = min(max(int(policy_digits[6:8]), 1), total_days)
-        remaining_days = max(total_days - elapsed_days, 0)
+        calendar_days = monthrange(year, month)[1]
+        calendar_elapsed_days = min(max(int(policy_digits[6:8]), 1), calendar_days)
+        remaining_calendar_days = max(calendar_days - calendar_elapsed_days, 0)
+    if authority_ready:
+        elapsed_days = int(business_day_context.elapsed_business_days or 0)
+        total_days = int(business_day_context.business_days_total or 0)
+        remaining_business_days = max(total_days - elapsed_days, 0)
 
     for row in rows:
         current_shipment = float(row.get("당월현재출고수량") or 0)
@@ -1155,7 +1179,7 @@ def _apply_current_month_demand_surge(
         base_remaining = float(row.get("remaining_expected_demand_qty") or 0)
         stock = float(row.get("current_stock_qty") or 0)
         unit_price = float(row.get("stock_valuation_unit_price") or 0)
-        demand_surge = bool(current_month and current_shipment > base_forecast)
+        demand_surge = bool(authority_ready and elapsed_days and current_shipment > base_forecast)
         pace_month_end = (current_shipment / elapsed_days * total_days) if demand_surge else base_forecast
         adjusted_forecast = max(base_forecast, pace_month_end) if demand_surge else base_forecast
         adjusted_remaining = max(adjusted_forecast - current_shipment, 0.0) if demand_surge else base_remaining
@@ -1172,21 +1196,33 @@ def _apply_current_month_demand_surge(
                 "수요급증사유": "당월 현재출고수량이 기준 예상출고수량 초과" if demand_surge else "",
                 "평가월경과일수": elapsed_days,
                 "평가월총일수": total_days,
-                "평가월잔여일수": remaining_days,
+                "평가월잔여일수": remaining_calendar_days,
+                "평가월경과영업일수": elapsed_days,
+                "평가월총영업일수": total_days,
+                "평가월잔여영업일수": remaining_business_days,
                 "진행속도기준월말예상출고수량": pace_month_end if demand_surge else None,
                 "위험보정예상출고수량": adjusted_forecast,
                 "위험보정잔여예상수요": adjusted_remaining,
                 "위험보정재고준비율": adjusted_readiness,
                 "위험보정부족예상수량": adjusted_shortage_qty,
                 "위험보정부족예상금액": adjusted_shortage_amt,
-                "위험보정기준": "진행속도 보정" if demand_surge else ("현재월 아님" if not current_month else "기존 예상"),
+                "위험보정기준": "영업일 진행속도 보정" if demand_surge else (
+                    "현재월 아님" if not current_month else (
+                        "기존 예상" if authority_ready and elapsed_days else (
+                            "영업일진행률계산불가" if authority_ready else "영업일자료부족"
+                        )
+                    )
+                ),
             }
         )
     return {
         "current_month": current_month,
         "evaluation_elapsed_days": elapsed_days,
         "evaluation_total_days": total_days,
-        "evaluation_remaining_days": remaining_days,
+        "evaluation_remaining_days": remaining_calendar_days,
+        "evaluation_remaining_business_days": remaining_business_days,
+        "calendar_authority_status": business_day_context.authority_status if business_day_context is not None else "unavailable",
+        "calendar_authority_reason": business_day_context.reason if business_day_context is not None else "business_day_context_missing",
     }
 
 
@@ -1397,7 +1433,7 @@ def _attach_inventory_status_and_frequency(
 
     summary_counts = {label: 0 for label in INVENTORY_STATUS_ORDER}
     expected_demand_count = 0
-    frequency_counts = {grade: 0 for grade in ("A", "B", "C", "D", "E", "X", "빈도자료 부족")}
+    frequency_counts = {grade: 0 for grade in ("F", "A", "B", "C", "D", "E", "X", "빈도자료 부족")}
     missing_frequency_product_count = 0
     detail_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -1430,12 +1466,12 @@ def _attach_inventory_status_and_frequency(
         if frequency is None:
             grade = "빈도자료 부족"
             occurrence_count: int | None = None
-            row_frequency_status = snapshot_status if snapshot_status != "ready" else "stale"
+            row_frequency_status = snapshot_status if snapshot_status != "ready" else "product_not_in_projection"
             missing_frequency_product_count += int(snapshot_status == "ready")
         else:
             grade = str(frequency.get("frequency_grade") or "빈도자료 부족")
             occurrence_count = frequency.get("occurrence_count_3m")
-            row_frequency_status = str(frequency.get("data_status") or "ready")
+            row_frequency_status = str(frequency.get("row_status") or frequency.get("data_status") or "ready")
         if grade not in frequency_counts:
             grade = "빈도자료 부족"
         frequency_counts[grade] += 1
@@ -1444,7 +1480,31 @@ def _attach_inventory_status_and_frequency(
         row["inventory_status_ratio_pct"] = ratio
         row["outbound_frequency_grade"] = grade
         row["outbound_occurrence_count_3m"] = occurrence_count
+        row["outbound_day_count_3m"] = None if frequency is None else frequency.get("outbound_day_count_3m")
+        row["outbound_customer_count_3m"] = None if frequency is None else frequency.get("outbound_customer_count_3m")
+        row["outbound_lifecycle_status"] = "" if frequency is None else str(frequency.get("lifecycle_status") or "")
+        row["outbound_first_normal_inbound_month"] = None if frequency is None else frequency.get("first_normal_inbound_month")
         row["outbound_frequency_data_status"] = row_frequency_status
+        for field in (
+            "outbound_qty_3m",
+            "outbound_paid_qty_3m",
+            "return_event_count_3m",
+            "return_qty_3m",
+            "return_supply_amount_3m",
+            "avg_purchase_unit_cost",
+            "purchase_price_basis_month",
+            "purchase_price_status",
+            "avg_sales_unit_price",
+            "sales_price_basis_month",
+            "sales_price_status",
+            "estimated_unit_profit",
+            "estimated_profit_rate",
+            "profit_grade",
+            "estimated_contribution_amount",
+            "contribution_grade",
+            "profitability_status",
+        ):
+            row[field] = None if frequency is None else frequency.get(field)
         detail_rows.append(
             {
                 "재고상태": status,
@@ -1495,6 +1555,7 @@ def _build_sales_facts(
     policy_date: Any = None,
     sales_source_mode: str = "",
     today: date | None = None,
+    business_day_context: BusinessDayMonthContext | None = None,
 ) -> dict[str, Any]:
     df = _payload_df(payload)
     meta = _payload_meta(payload)
@@ -1509,8 +1570,19 @@ def _build_sales_facts(
     )
     evaluation_forecast_sales = _sum_col(df, "평가월 예상매출")
     evaluation_yyyymm = _normalize_yyyymm(evaluation_month) or _normalize_yyyymm(meta.get("evaluation_month") or meta.get("current_month"))
-    time_progress = _dashboard_time_progress(evaluation_yyyymm, policy_date=policy_date, today=today)
+    time_progress = _dashboard_time_progress(
+        evaluation_yyyymm,
+        policy_date=policy_date,
+        today=today,
+        business_day_context=business_day_context,
+    )
     evaluation_completed = str(time_progress.get("status") or "") == "완료월"
+    progress_day_unit = "영업일" if time_progress.get("basis") == "business_day" else "일"
+    progress_aggregation = (
+        "elapsed_business_days / business_days_total"
+        if time_progress.get("basis") == "business_day"
+        else "elapsed_days / calendar_days"
+    )
     normalized_source_mode = str(sales_source_mode or "").strip().lower()
     actual_source_table = "Rddbc210" if normalized_source_mode == "monthly_real" else (
         "Rddbc220" if normalized_source_mode == "monthly_book" else ""
@@ -1779,11 +1851,11 @@ def _build_sales_facts(
                 "시간 진척률",
                 time_progress_pct,
                 unit="%",
-                aggregation="elapsed_days / calendar_days",
+                aggregation=progress_aggregation,
                 grain="평가월",
                 time_basis=(
                     f"{evaluation_yyyymm or '평가월'} "
-                    f"{time_progress.get('elapsed_days')}/{time_progress.get('total_days')}일 경과 "
+                    f"{time_progress.get('elapsed_days')}/{time_progress.get('total_days')}{progress_day_unit} 경과 "
                     f"{time_progress.get('status') or ''}"
                 ),
                 source_columns=[],
@@ -1830,6 +1902,8 @@ def _build_sales_facts(
             "expected_to_date_sales": expected_to_date_sales,
             "evaluation_month": evaluation_yyyymm,
             "evaluation_status": time_progress.get("status"),
+            "evaluation_date": business_day_context.evaluation_date if business_day_context is not None else "",
+            "business_day_context": business_day_context.__dict__ if business_day_context is not None else None,
             "evaluation_actual_source_table": actual_source_table,
             "evaluation_actual_source_mode": normalized_source_mode,
             "evaluation_actual_cutoff_date": evaluation_cutoff_date,
@@ -2601,6 +2675,7 @@ def _build_inventory_facts(
     frequency_snapshot: SnapshotReadResult | None = None,
     frequency_rows: tuple[Mapping[str, Any], ...] | None = None,
     measurement: DashboardQueryMeasurement | None = None,
+    business_day_context: BusinessDayMonthContext | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     phase_measurement = measurement or get_active_dashboard_query_measurement()
@@ -2818,6 +2893,7 @@ def _build_inventory_facts(
         rows,
         evaluation_month=evaluation_month,
         policy_date=policy_date,
+        business_day_context=business_day_context,
     )
     demand_surge_detail = _apply_demand_surge_detail(
         rows,
@@ -3243,9 +3319,10 @@ def build_dashboard_lite_facts(
     frequency_snapshot_reader: Callable[[Any, Any, list[str]], SnapshotReadResult] | None = None,
     frequency_projection_reader: Callable[..., FrequencyProjectionReadResult] | None = None,
     today: date | None = None,
+    business_day_context_loader: Callable[..., BusinessDayMonthContext] = business_day_month_context,
 ) -> dict[str, Any]:
     """Build Dashboard Lite v0.1 facts from existing analytics payloads."""
-    today = today or date.today()
+    today = today or kst_today()
     t0 = time.perf_counter()
     needs_sales_source = manufacturer_summary_payload is None
     needs_stock_source = stock_shortage_payload is None
@@ -3286,6 +3363,28 @@ def build_dashboard_lite_facts(
         "trend_support_month_from": source_params.get("dashboard_lite_trend_month_from"),
         "basis": "조회 종료일 기준 당월은 부분월로 표시",
     }
+    business_context: BusinessDayMonthContext | None = None
+    evaluation_yyyymm = _normalize_yyyymm(service_params.get("evaluation_month"))
+    if evaluation_yyyymm == today.strftime("%Y%m"):
+        policy_digits = re.sub(r"\D", "", str(service_params.get("policy_date") or ""))[:8]
+        try:
+            evaluation_date = datetime.strptime(policy_digits, "%Y%m%d").date()
+        except ValueError:
+            evaluation_date = today
+        if evaluation_date.strftime("%Y%m") != evaluation_yyyymm:
+            evaluation_date = today
+        business_context = business_day_context_loader(evaluation_date=evaluation_date)
+        log.info(
+            "[dashboard.business_day_context] evaluation_date=%s evaluation_month=%s calendar_days=%s elapsed_calendar_days=%s business_days=%s elapsed_business_days=%s authority_status=%s reason=%s",
+            business_context.evaluation_date,
+            business_context.evaluation_month,
+            business_context.calendar_days_total,
+            business_context.elapsed_calendar_days,
+            business_context.business_days_total,
+            business_context.elapsed_business_days,
+            business_context.authority_status,
+            business_context.reason,
+        )
     physical_measurement.add_phase(
         phase="dashboard_scope_prepare",
         source_name="facts",
@@ -3601,6 +3700,7 @@ def build_dashboard_lite_facts(
         policy_date=service_params.get("policy_date"),
         sales_source_mode=str(source_params.get("source_mode") or ""),
         today=today,
+        business_day_context=business_context,
     )
     log.info(
         "[dashboard.sales_facts] company_id=%s month_from=%s month_to=%s evaluation_month=%s result_rows=%s elapsed_ms=%s",
@@ -3639,6 +3739,10 @@ def build_dashboard_lite_facts(
             company_id=service_params.get("company_id"),
             evaluation_month=service_params.get("evaluation_month"),
             stock_codes=stock_codes,
+            product_group_codes=service_params.get("product_group_list"),
+            product_di_codes=service_params.get("product_di_list"),
+            product_class_codes=service_params.get("product_class_list"),
+            stock_mode=service_params.get("stock_mode"),
             product_codes=projection_product_codes,
             as_of_date=service_params.get("policy_date"),
         )
@@ -3661,6 +3765,10 @@ def build_dashboard_lite_facts(
             company_id=service_params.get("company_id"),
             evaluation_month=service_params.get("evaluation_month"),
             stock_codes=stock_codes,
+            product_group_codes=service_params.get("product_group_list"),
+            product_di_codes=service_params.get("product_di_list"),
+            product_class_codes=service_params.get("product_class_list"),
+            stock_mode=service_params.get("stock_mode"),
             as_of_date=service_params.get("policy_date"),
         )
     elif projection.status == "legacy":
@@ -3694,6 +3802,7 @@ def build_dashboard_lite_facts(
         frequency_snapshot=frequency_snapshot,
         frequency_rows=frequency_rows,
         measurement=physical_measurement,
+        business_day_context=business_context,
     )
     def _product_codes(frame: Any, *columns: str) -> set[str]:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -3809,6 +3918,7 @@ def build_dashboard_lite_facts(
         "kind": FACTS_KIND,
         "scope": "Dashboard Lite v0.1",
         "period": period,
+        "business_day_month_context": business_context.__dict__ if business_context is not None else None,
         "filters": _dashboard_filter_facts(service_params),
         "partial_period": {
             "current_month_is_partial": True,

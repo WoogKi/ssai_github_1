@@ -472,21 +472,30 @@ _DISPLAY_NUMERIC_COLS_260 = {
 
 _FREQUENCY_GRADE_COLUMN = "출고빈도등급"
 _FREQUENCY_COUNT_COLUMN = "3개월 출고발생수"
+_PROFIT_GRADE_COLUMN = "손익등급"
+_CONTRIBUTION_GRADE_COLUMN = "기여도등급"
 _FREQUENCY_FILTER_ALL = "전체"
-_FREQUENCY_FILTER_VALUES = ("A", "B", "C", "D", "E", "X", FREQUENCY_INSUFFICIENT_GRADE)
+_FREQUENCY_FILTER_VALUES = ("F", "A", "B", "C", "D", "E", "X", FREQUENCY_INSUFFICIENT_GRADE)
 
 
 def _place_frequency_columns(df: pd.DataFrame) -> pd.DataFrame:
+    attached_columns = (
+        _FREQUENCY_GRADE_COLUMN,
+        _PROFIT_GRADE_COLUMN,
+        _CONTRIBUTION_GRADE_COLUMN,
+        _FREQUENCY_COUNT_COLUMN,
+    )
+    present_attached_columns = [column for column in attached_columns if column in df.columns]
     columns = [
         column
         for column in df.columns
-        if column not in {_FREQUENCY_GRADE_COLUMN, _FREQUENCY_COUNT_COLUMN}
+        if column not in attached_columns
     ]
-    product_code_index = columns.index("제품코드") + 1
-    columns[product_code_index:product_code_index] = [
-        _FREQUENCY_GRADE_COLUMN,
-        _FREQUENCY_COUNT_COLUMN,
-    ]
+    # 제품재고장의 KD코드는 화면상 보험코드다. Snapshot 등급은 그 뒤에
+    # 배치하고, filter-only helper frame은 제품코드 뒤에 둔다.
+    anchor = "KD코드" if "KD코드" in columns else "제품코드"
+    insert_at = columns.index(anchor) + 1
+    columns[insert_at:insert_at] = present_attached_columns
     return df.loc[:, columns]
 
 
@@ -588,6 +597,13 @@ def _resolve_frequency_snapshot_grade_product_scope(
         }
         if active_projection_reader is read_approved_frequency_projection and as_of_date:
             projection_kwargs["as_of_date"] = as_of_date
+        if active_projection_reader is read_approved_frequency_projection:
+            projection_kwargs.update(
+                product_group_codes=list(scope.product_group_codes),
+                product_di_codes=list(scope.product_di_codes),
+                product_class_codes=list(scope.product_class_codes),
+                stock_mode=scope.stock_mode,
+            )
         projection = (
             active_projection_reader(**projection_kwargs)
             if active_projection_reader is not None
@@ -671,6 +687,8 @@ def attach_dashboard_frequency_snapshot(
     detail_product_codes = set(product_codes.loc[detail_mask])
     out[_FREQUENCY_GRADE_COLUMN] = ""
     out[_FREQUENCY_COUNT_COLUMN] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out[_PROFIT_GRADE_COLUMN] = ""
+    out[_CONTRIBUTION_GRADE_COLUMN] = ""
     company_id, evaluation_month, context_reason = _inventory_frequency_context(params, date_to)
     base_meta: Dict[str, Any] = {
         "frequency_snapshot_company_id": company_id,
@@ -703,6 +721,13 @@ def attach_dashboard_frequency_snapshot(
         }
         if active_projection_reader is read_approved_frequency_projection and as_of_date:
             projection_kwargs["as_of_date"] = as_of_date
+        if active_projection_reader is read_approved_frequency_projection:
+            projection_kwargs.update(
+                product_group_codes=list(scope.product_group_codes),
+                product_di_codes=list(scope.product_di_codes),
+                product_class_codes=list(scope.product_class_codes),
+                stock_mode=scope.stock_mode,
+            )
         projection = (
             active_projection_reader(**projection_kwargs)
             if active_projection_reader is not None
@@ -753,15 +778,28 @@ def attach_dashboard_frequency_snapshot(
     if frequency_frame.empty:
         grade_by_product = pd.Series(dtype="object")
         occurrence_by_product = pd.Series(dtype="float64")
+        profit_grade_by_product = pd.Series(dtype="object")
+        contribution_grade_by_product = pd.Series(dtype="object")
     else:
         frequency_frame["product_code"] = frequency_frame["product_code"].fillna("").astype(str).str.strip()
         frequency_frame = frequency_frame.loc[frequency_frame["product_code"].ne("")]
         frequency_frame = frequency_frame.drop_duplicates(subset=["product_code"], keep="last")
+        for optional_grade in ("profit_grade", "contribution_grade"):
+            if optional_grade not in frequency_frame.columns:
+                frequency_frame[optional_grade] = "unavailable"
         grade_by_product = frequency_frame.set_index("product_code")["frequency_grade"]
         occurrence_by_product = frequency_frame.set_index("product_code")["occurrence_count_3m"]
+        profit_grade_by_product = frequency_frame.set_index("product_code")["profit_grade"]
+        contribution_grade_by_product = frequency_frame.set_index("product_code")["contribution_grade"]
 
     attached_grades = product_codes.map(grade_by_product).fillna(FREQUENCY_INSUFFICIENT_GRADE).astype(str)
     attached_occurrences = pd.to_numeric(product_codes.map(occurrence_by_product), errors="coerce")
+    out.loc[detail_mask, _PROFIT_GRADE_COLUMN] = (
+        product_codes.map(profit_grade_by_product).fillna("자료 부족").replace("unavailable", "자료 부족").astype(str).loc[detail_mask]
+    )
+    out.loc[detail_mask, _CONTRIBUTION_GRADE_COLUMN] = (
+        product_codes.map(contribution_grade_by_product).fillna("자료 부족").replace("unavailable", "자료 부족").astype(str).loc[detail_mask]
+    )
     attached_valid = (
         detail_mask
         & attached_grades.ne(FREQUENCY_INSUFFICIENT_GRADE)
@@ -2982,9 +3020,11 @@ def _current_stock_display_columns(grp: pd.DataFrame) -> list[str]:
     if {
         _FREQUENCY_GRADE_COLUMN,
         _FREQUENCY_COUNT_COLUMN,
+        _PROFIT_GRADE_COLUMN,
+        _CONTRIBUTION_GRADE_COLUMN,
     }.issubset(grp.columns):
-        product_code_index = columns.index("제품코드") + 1
-        columns[product_code_index:product_code_index] = ["출고빈도", "출고횟수"]
+        stock_index = columns.index("재고수량") + 1
+        columns[stock_index:stock_index] = ["출고빈도등급", "손익등급", "기여도등급"]
     return columns
 
 
@@ -3031,6 +3071,10 @@ def _build_current_stock_table_frames(
         work["출고빈도"] = work[_FREQUENCY_GRADE_COLUMN].fillna("").astype(str).str.strip()
     if _FREQUENCY_COUNT_COLUMN in work.columns:
         work["출고횟수"] = pd.to_numeric(work[_FREQUENCY_COUNT_COLUMN], errors="coerce")
+    if _PROFIT_GRADE_COLUMN in work.columns:
+        work["손익등급"] = work[_PROFIT_GRADE_COLUMN].fillna("").astype(str).str.strip()
+    if _CONTRIBUTION_GRADE_COLUMN in work.columns:
+        work["기여도등급"] = work[_CONTRIBUTION_GRADE_COLUMN].fillna("").astype(str).str.strip()
 
     display_columns = _current_stock_display_columns(work)
 
@@ -3154,6 +3198,16 @@ def _filter_current_stock_frequency_rows(
     out[_FREQUENCY_COUNT_COLUMN] = pd.to_numeric(
         selected_rows[_FREQUENCY_COUNT_COLUMN], errors="coerce"
     ).astype("Int64")
+    out[_PROFIT_GRADE_COLUMN] = (
+        selected_rows[_PROFIT_GRADE_COLUMN]
+        if _PROFIT_GRADE_COLUMN in selected_rows.columns
+        else pd.Series("자료 부족", index=selected_rows.index, dtype="object")
+    )
+    out[_CONTRIBUTION_GRADE_COLUMN] = (
+        selected_rows[_CONTRIBUTION_GRADE_COLUMN]
+        if _CONTRIBUTION_GRADE_COLUMN in selected_rows.columns
+        else pd.Series("자료 부족", index=selected_rows.index, dtype="object")
+    )
     return out, meta
 
 # -----------------------------------------------------------------------------

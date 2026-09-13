@@ -9,12 +9,18 @@ from typing import Any, Callable, Mapping
 
 from app.services.dashboard_inventory_frequency_snapshot import (
     FREQUENCY_PROJECTION_GRADES,
+    EXTENDED_FREQUENCY_PROJECTION_GRADES,
+    EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
     FrequencyProjectionReadResult,
     RELATIONAL_FREQUENCY_REPRESENTATION,
     RelationalFrequencySnapshot,
     SnapshotContractError,
     build_frequency_projection,
     build_relational_frequency_projection,
+    canonicalize_frequency_product_storage_row,
+    frequency_product_columns,
+    frequency_storage_representation,
+    is_extended_frequency_key,
     relational_row_checksum,
     validate_relational_frequency_snapshot,
     validate_relational_frequency_projection,
@@ -77,6 +83,16 @@ def _key_values(key: SnapshotKey) -> tuple[str, str, str, str, str, str]:
     )
 
 
+def _profile_clause(key: SnapshotKey, *, alias: str = "") -> tuple[str, tuple[str, ...]]:
+    fingerprint = str(getattr(key, "profile_fingerprint", "") or "").strip().lower()
+    if not fingerprint:
+        return "", ()
+    if len(fingerprint) != 64 or any(char not in "0123456789abcdef" for char in fingerprint):
+        raise ValueError("profile_fingerprint must be a SHA-256 hex digest")
+    prefix = f"{alias}." if alias else ""
+    return f" AND {prefix}profile_fingerprint=?", (fingerprint,)
+
+
 def _contract_checksum_values(values: tuple[Any, ...]) -> tuple[Any, ...]:
     """Restore SQL BIT fields to the writer's canonical 0/1 checksum form."""
     return tuple(int(value) if isinstance(value, bool) else value for value in values)
@@ -109,6 +125,15 @@ def _representation_column_is_absent(exc: Exception) -> bool:
     text = " ".join(values).upper()
     return "42S22" in text or (
         "INVALID COLUMN NAME" in text and "STORAGE_REPRESENTATION" in text
+    )
+
+
+def _profile_column_is_absent(exc: Exception) -> bool:
+    """Migration 007 may lag code deployment while the v1 reader remains valid."""
+    values = [str(value) for value in (getattr(exc, "args", ()) or ())]
+    text = " ".join(values).upper()
+    return "PROFILE_FINGERPRINT" in text and (
+        "42S22" in text or "INVALID COLUMN NAME" in text
     )
 
 
@@ -348,42 +373,63 @@ class SqlServerSnapshotRepository:
         validate_relational_frequency_snapshot(snapshot)
         projection_rows, projection_headers = build_relational_frequency_projection(snapshot)
         key = snapshot.key
+        representation = frequency_storage_representation(key)
         conn = self._writer_connection_factory()
         try:
             cursor = conn.cursor()
-            current = cursor.execute(
-                """
-                /* snapshot.publish.relational.latest */
-                SELECT TOP 1 manifest_id, generation_no, checksum, status, approval_status
-                FROM snapshot.manifest WITH (UPDLOCK, HOLDLOCK)
-                WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
-                  AND scope_fingerprint=? AND schema_version=? AND algorithm_version=?
-                ORDER BY generation_no DESC
-                """,
-                *_key_values(key),
-            ).fetchone()
-            if current and str(current[2]) == snapshot.checksum and str(current[3]) in {"draft", "published"} and not force:
+            if key.profile_fingerprint:
+                current = cursor.execute(
+                    """
+                    /* snapshot.publish.relational.latest */
+                    SELECT TOP 1 manifest_id, generation_no, checksum, status, approval_status, profile_fingerprint
+                    FROM snapshot.manifest WITH (UPDLOCK, HOLDLOCK)
+                    WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
+                      AND scope_fingerprint=? AND schema_version=? AND algorithm_version=?
+                    ORDER BY generation_no DESC
+                    """,
+                    *_key_values(key),
+                ).fetchone()
+            else:
+                current = cursor.execute(
+                    """
+                    /* snapshot.publish.relational.latest */
+                    SELECT TOP 1 manifest_id, generation_no, checksum, status, approval_status
+                    FROM snapshot.manifest WITH (UPDLOCK, HOLDLOCK)
+                    WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
+                      AND scope_fingerprint=? AND schema_version=? AND algorithm_version=?
+                    ORDER BY generation_no DESC
+                    """,
+                    *_key_values(key),
+                ).fetchone()
+            same_profile = bool(current) and (
+                not key.profile_fingerprint or str(current[5] or "") == key.profile_fingerprint
+            )
+            if current and same_profile and str(current[2]) == snapshot.checksum and str(current[3]) in {"draft", "published"} and not force:
                 conn.commit()
                 return SnapshotPublishResult(str(current[3]), int(current[1]), snapshot.checksum, True, int(current[0]), str(current[4]))
             generation_no = int(current[1]) + 1 if current else 1
+            profile_column = ", profile_fingerprint" if key.profile_fingerprint else ""
+            profile_placeholder = ", ?" if key.profile_fingerprint else ""
+            profile_values = (key.profile_fingerprint,) if key.profile_fingerprint else ()
             inserted = cursor.execute(
-                """
+                f"""
                 /* snapshot.publish.relational.manifest */
                 INSERT INTO snapshot.manifest (
                     company_id, snapshot_type, evaluation_month, basis_from, basis_to,
                     scope_fingerprint, schema_version, algorithm_version, generation_no,
                     status, approval_status, source_watermark, source_watermark_status,
                     source_fingerprint, item_count, payload_size, checksum, created_by,
-                    storage_representation, scope_mode, fingerprint_contract_version, fingerprint_mode
+                    storage_representation, scope_mode, fingerprint_contract_version, fingerprint_mode{profile_column}
                 )
                 OUTPUT INSERTED.manifest_id
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', 'pending', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?{profile_placeholder})
                 """,
                 key.company_id, key.snapshot_type, key.evaluation_month, snapshot.basis_from, snapshot.basis_to,
                 key.scope_fingerprint, key.schema_version, key.algorithm_version, generation_no,
                 snapshot.source_watermark, snapshot.source_watermark_status, snapshot.source_fingerprint,
-                snapshot.item_count, snapshot.checksum, actor, RELATIONAL_FREQUENCY_REPRESENTATION,
+                snapshot.item_count, snapshot.checksum, actor, representation,
                 snapshot.scope_mode, int(snapshot.source_contract.get("fingerprint_contract_version") or 0), str(snapshot.source_contract.get("fingerprint_mode") or ""),
+                *profile_values,
             ).fetchone()
             manifest_id = int(inserted[0])
             if snapshot.stock_codes:
@@ -391,13 +437,17 @@ class SqlServerSnapshotRepository:
                     "INSERT INTO snapshot.frequency_scope_stock (manifest_id, stock_code) VALUES (?, ?)",
                     [(manifest_id, code) for code in snapshot.stock_codes],
                 )
-            product_columns = ("product_code", "occurrence_count_3m", "frequency_grade", "data_status")
+            product_columns = frequency_product_columns(key)
+            insert_columns = ("manifest_id", *product_columns, "row_checksum")
+            product_storage_rows = [
+                canonicalize_frequency_product_storage_row(key, row)
+                for row in snapshot.frequency_products
+            ]
             cursor.executemany(
-                """INSERT INTO snapshot.frequency_product (manifest_id, product_code, occurrence_count_3m, frequency_grade, data_status, row_checksum)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                f"INSERT INTO snapshot.frequency_product ({', '.join(insert_columns)}) VALUES ({', '.join('?' for _ in insert_columns)})",
                 [
-                    (manifest_id, row["product_code"], row["occurrence_count_3m"], row["frequency_grade"], row["data_status"], relational_row_checksum("frequency_product", product_columns, tuple(row[column] for column in product_columns)))
-                    for row in snapshot.frequency_products
+                    (manifest_id, *(row[column] for column in product_columns), relational_row_checksum("frequency_product", product_columns, tuple(row[column] for column in product_columns)))
+                    for row in product_storage_rows
                 ],
             )
             monthly_columns = ("month", "product_code", "stock_code", "occurrence_count", "outbound_quantity", "outbound_day_count")
@@ -479,8 +529,9 @@ class SqlServerSnapshotRepository:
         conn = self._writer_connection_factory()
         try:
             cursor = conn.cursor()
+            profile_clause, profile_values = _profile_clause(key, alias="m")
             row = cursor.execute(
-                """
+                f"""
                 /* snapshot.approve.load */
                 SELECT m.manifest_id, m.status, m.approval_status, m.checksum,
                        m.storage_representation, p.payload_json, p.storage_checksum, p.payload_size
@@ -490,9 +541,11 @@ class SqlServerSnapshotRepository:
                 WHERE m.company_id=? AND m.snapshot_type=? AND m.evaluation_month=?
                   AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
                   AND m.generation_no=?
+                  {profile_clause}
                 """,
                 *_key_values(key),
                 int(generation_no),
+                *profile_values,
             ).fetchone()
             if not row:
                 raise LookupError("snapshot generation not found")
@@ -501,7 +554,10 @@ class SqlServerSnapshotRepository:
             if expected_checksum and str(row[3]).lower() != expected_checksum:
                 raise ValueError("expected checksum does not match draft generation")
             representation = str(row[4] or "")
-            if representation == RELATIONAL_FREQUENCY_REPRESENTATION:
+            if representation in {
+                RELATIONAL_FREQUENCY_REPRESENTATION,
+                EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+            }:
                 snapshot, _manifest = self._load_relational_snapshot(cursor, key, int(generation_no))
                 if snapshot is None:
                     raise ValueError("relational snapshot generation is missing")
@@ -564,13 +620,18 @@ class SqlServerSnapshotRepository:
         probe_conn = self._reader_connection_factory()
         try:
             probe_conn.timeout = INSPECTION_QUERY_TIMEOUT_SECONDS
+            profile_clause, profile_values = _profile_clause(key)
             probe = probe_conn.cursor().execute(
-                """SELECT storage_representation FROM snapshot.manifest
+                f"""SELECT storage_representation FROM snapshot.manifest
                    WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
-                     AND scope_fingerprint=? AND schema_version=? AND algorithm_version=? AND generation_no=?""",
-                *_key_values(key), int(generation_no),
+                     AND scope_fingerprint=? AND schema_version=? AND algorithm_version=? AND generation_no=?
+                     {profile_clause}""",
+                *_key_values(key), int(generation_no), *profile_values,
             ).fetchone()
-            if probe and str(probe[0] or "") == RELATIONAL_FREQUENCY_REPRESENTATION:
+            if probe and str(probe[0] or "") in {
+                RELATIONAL_FREQUENCY_REPRESENTATION,
+                EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+            }:
                 return self._inspect_relational_generation(key, int(generation_no))
         except Exception as exc:
             if not _representation_column_is_absent(exc):
@@ -593,9 +654,10 @@ class SqlServerSnapshotRepository:
                 generation_no=int(generation_no),
             )
             cursor = conn.cursor()
+            profile_clause, profile_values = _profile_clause(key, alias="m")
             started = time.perf_counter()
             statement = cursor.execute(
-                """
+                f"""
                 /* snapshot.inspect.generation */
                 SELECT m.manifest_id, m.status, m.approval_status, m.checksum,
                        p.payload_json, p.storage_checksum, p.payload_size
@@ -604,9 +666,11 @@ class SqlServerSnapshotRepository:
                 WHERE m.company_id=? AND m.snapshot_type=? AND m.evaluation_month=?
                   AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
                   AND m.generation_no=?
+                  {profile_clause}
                 """,
                 *_key_values(key),
                 int(generation_no),
+                *profile_values,
             )
             _log_read_stage(
                 key,
@@ -717,39 +781,42 @@ class SqlServerSnapshotRepository:
                 conn.close()
 
     def _inspect_relational_generation(self, key: SnapshotKey, generation_no: int) -> SnapshotGenerationInspection:
+        representation = frequency_storage_representation(key)
         conn = self._reader_connection_factory()
         try:
             conn.timeout = INSPECTION_QUERY_TIMEOUT_SECONDS
             cursor = conn.cursor()
             snapshot, manifest = self._load_relational_snapshot(cursor, key, generation_no)
             if snapshot is None or manifest is None:
-                return SnapshotGenerationInspection(status=SNAPSHOT_STATUS_MISSING, generation_no=generation_no, representation=RELATIONAL_FREQUENCY_REPRESENTATION)
+                return SnapshotGenerationInspection(status=SNAPSHOT_STATUS_MISSING, generation_no=generation_no, representation=representation)
             validate_relational_frequency_snapshot(snapshot)
             status = SNAPSHOT_STATUS_READY if manifest[1] == "published" and manifest[2] == "approved" else SNAPSHOT_STATUS_UNAPPROVED
             return SnapshotGenerationInspection(
                 status=status, manifest_status=str(manifest[1]), approval_status=str(manifest[2]),
                 reason="", manifest_id=int(manifest[0]), generation_no=generation_no, checksum=snapshot.checksum,
-                representation=RELATIONAL_FREQUENCY_REPRESENTATION, relational_snapshot=snapshot,
+                representation=representation, relational_snapshot=snapshot,
             )
         except Exception as exc:
-            return SnapshotGenerationInspection(status=SNAPSHOT_STATUS_CORRUPT, generation_no=generation_no, representation=RELATIONAL_FREQUENCY_REPRESENTATION, reason=str(exc))
+            return SnapshotGenerationInspection(status=SNAPSHOT_STATUS_CORRUPT, generation_no=generation_no, representation=representation, reason=str(exc))
         finally:
             conn.close()
 
     @staticmethod
     def _load_relational_snapshot(cursor: Any, key: SnapshotKey, generation_no: int) -> tuple[RelationalFrequencySnapshot | None, tuple[Any, ...] | None]:
+        profile_clause, profile_values = _profile_clause(key)
         manifest = cursor.execute(
-            """SELECT manifest_id, status, approval_status, checksum, basis_from, basis_to,
+            f"""SELECT manifest_id, status, approval_status, checksum, basis_from, basis_to,
                       scope_mode, source_watermark, source_watermark_status, source_fingerprint,
                       fingerprint_contract_version, fingerprint_mode, item_count, storage_representation
                  FROM snapshot.manifest
                  WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
-                   AND scope_fingerprint=? AND schema_version=? AND algorithm_version=? AND generation_no=?""",
-            *_key_values(key), int(generation_no),
+                   AND scope_fingerprint=? AND schema_version=? AND algorithm_version=? AND generation_no=?
+                   {profile_clause}""",
+            *_key_values(key), int(generation_no), *profile_values,
         ).fetchone()
         if not manifest:
             return None, None
-        if str(manifest[13] or "") != RELATIONAL_FREQUENCY_REPRESENTATION:
+        if str(manifest[13] or "") != frequency_storage_representation(key):
             raise ValueError("snapshot representation is not relational")
         manifest_id = int(manifest[0])
         scope_rows = cursor.execute("SELECT stock_code FROM snapshot.frequency_scope_stock WHERE manifest_id=? ORDER BY stock_code", manifest_id).fetchall()
@@ -773,8 +840,9 @@ class SqlServerSnapshotRepository:
         ).fetchone()
         if not contract or not diagnostics:
             raise ValueError("relational authority metadata is incomplete")
+        product_columns = frequency_product_columns(key)
         products = cursor.execute(
-            "SELECT product_code, occurrence_count_3m, frequency_grade, data_status, row_checksum FROM snapshot.frequency_product WHERE manifest_id=? ORDER BY product_code",
+            f"SELECT {', '.join(product_columns)}, row_checksum FROM snapshot.frequency_product WHERE manifest_id=? ORDER BY product_code",
             manifest_id,
         ).fetchall()
         projection_headers = cursor.execute(
@@ -798,13 +866,16 @@ class SqlServerSnapshotRepository:
         diagnostic_values = tuple(diagnostics[index] for index in range(len(diagnostic_columns)))
         if relational_row_checksum("frequency_source_diagnostics", diagnostic_columns, diagnostic_values) != str(diagnostics[15]):
             raise ValueError("relational diagnostics checksum mismatch")
-        product_columns = ("product_code", "occurrence_count_3m", "frequency_grade", "data_status")
         product_rows: list[dict[str, Any]] = []
         for row in products:
-            values = tuple(row[index] for index in range(4))
-            if relational_row_checksum("frequency_product", product_columns, values) != str(row[4]):
+            canonical_row = canonicalize_frequency_product_storage_row(
+                key,
+                dict(zip(product_columns, row[:len(product_columns)])),
+            )
+            values = tuple(canonical_row[column] for column in product_columns)
+            if relational_row_checksum("frequency_product", product_columns, values) != str(row[len(product_columns)]):
                 raise ValueError("relational product row checksum mismatch")
-            product_rows.append({**dict(zip(product_columns, values)), "row_checksum": str(row[4])})
+            product_rows.append({**dict(zip(product_columns, values)), "row_checksum": str(row[len(product_columns)])})
         monthly_columns = ("month", "product_code", "stock_code", "occurrence_count", "outbound_quantity", "outbound_day_count")
         monthly_rows: list[dict[str, Any]] = []
         for row in monthly:
@@ -835,6 +906,7 @@ class SqlServerSnapshotRepository:
             rows=product_rows,
             headers=headers,
             require_complete=True,
+            key=key,
         )
         return snapshot, tuple(manifest)
 
@@ -848,14 +920,16 @@ class SqlServerSnapshotRepository:
         """Read one approved derived projection without reading payload_json."""
         requested = tuple(sorted({str(code or "").strip() for code in product_codes if str(code or "").strip()}))
         grade = str(frequency_grade or "").strip()
-        if grade and grade not in FREQUENCY_PROJECTION_GRADES:
+        grades = EXTENDED_FREQUENCY_PROJECTION_GRADES if is_extended_frequency_key(key) else FREQUENCY_PROJECTION_GRADES
+        if grade and grade not in grades:
             return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="projection grade is invalid")
         conn = None
         try:
             conn = self._reader_connection_factory()
             cursor = conn.cursor()
+            profile_clause, profile_values = _profile_clause(key, alias="m")
             manifest = cursor.execute(
-                """
+                f"""
                 /* snapshot.projection.manifest */
                 SELECT TOP 1 m.manifest_id, m.generation_no, m.checksum, m.item_count,
                        m.storage_representation,
@@ -865,17 +939,25 @@ class SqlServerSnapshotRepository:
                 WHERE m.company_id=? AND m.snapshot_type=? AND m.evaluation_month=?
                   AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
                   AND m.status='published' AND m.approval_status='approved'
+                  {profile_clause}
                 ORDER BY m.generation_no DESC
                 """,
                 *_key_values(key),
+                *profile_values,
             ).fetchone()
             if not manifest:
                 unavailable = self._unavailable_status(cursor, key)
                 return FrequencyProjectionReadResult(status=unavailable.status, reason=unavailable.reason)
             manifest_id, generation_no, checksum, item_count, representation, payload_exists = int(manifest[0]), int(manifest[1]), str(manifest[2]), int(manifest[3]), str(manifest[4] or ""), bool(manifest[5])
-            if representation not in {"legacy_json_v1", RELATIONAL_FREQUENCY_REPRESENTATION}:
+            if representation not in {
+                "legacy_json_v1", RELATIONAL_FREQUENCY_REPRESENTATION,
+                EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+            }:
                 return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="snapshot representation is invalid", manifest_id=manifest_id, generation_no=generation_no, checksum=checksum)
-            if representation == RELATIONAL_FREQUENCY_REPRESENTATION and payload_exists:
+            if representation in {
+                RELATIONAL_FREQUENCY_REPRESENTATION,
+                EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+            } and payload_exists:
                 return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="relational generation must not have payload_json", manifest_id=manifest_id, generation_no=generation_no, checksum=checksum)
             if representation == "legacy_json_v1" and not payload_exists:
                 return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="legacy generation is missing payload_json", manifest_id=manifest_id, generation_no=generation_no, checksum=checksum)
@@ -915,11 +997,13 @@ class SqlServerSnapshotRepository:
                 return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason="projection product count does not match manifest", manifest_id=manifest_id, generation_no=generation_no, checksum=checksum)
 
             query_all = bool(grade) or not requested or len(requested) > PROJECTION_SUBSET_SAFE_LIMIT
+            product_columns = frequency_product_columns(key)
+            selected_columns = ", ".join((*product_columns, "row_checksum"))
             if grade:
                 statement = cursor.execute(
-                    """
+                    f"""
                     /* snapshot.projection.rows_by_grade */
-                    SELECT product_code, occurrence_count_3m, frequency_grade, data_status, row_checksum
+                    SELECT {selected_columns}
                     FROM snapshot.frequency_product
                     WHERE manifest_id=? AND frequency_grade=? ORDER BY product_code
                     """,
@@ -927,9 +1011,9 @@ class SqlServerSnapshotRepository:
                 )
             elif query_all:
                 statement = cursor.execute(
-                    """
+                    f"""
                     /* snapshot.projection.rows_all */
-                    SELECT product_code, occurrence_count_3m, frequency_grade, data_status, row_checksum
+                    SELECT {selected_columns}
                     FROM snapshot.frequency_product WHERE manifest_id=? ORDER BY frequency_grade, product_code
                     """,
                     manifest_id,
@@ -939,21 +1023,25 @@ class SqlServerSnapshotRepository:
                 statement = cursor.execute(
                     f"""
                     /* snapshot.projection.rows_subset */
-                    SELECT product_code, occurrence_count_3m, frequency_grade, data_status, row_checksum
+                    SELECT {selected_columns}
                     FROM snapshot.frequency_product
                     WHERE manifest_id=? AND product_code IN ({placeholders}) ORDER BY product_code
                     """,
                     manifest_id, *requested,
                 )
             rows = [
-                {"product_code": row[0], "occurrence_count_3m": row[1], "frequency_grade": row[2], "data_status": row[3], "row_checksum": row[4]}
+                {**dict(zip(product_columns, row[:len(product_columns)])), "row_checksum": row[len(product_columns)]}
                 for row in statement.fetchall()
             ]
             try:
-                if representation == RELATIONAL_FREQUENCY_REPRESENTATION:
+                if representation in {
+                    RELATIONAL_FREQUENCY_REPRESENTATION,
+                    EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+                }:
                     validated = validate_relational_frequency_projection(
                         rows=rows, headers=headers, required_grade=grade,
                         require_complete=query_all and not bool(grade),
+                        key=key,
                     )
                 else:
                     validated = validate_frequency_projection(
@@ -1000,25 +1088,33 @@ class SqlServerSnapshotRepository:
         conn = None
         try:
             conn = self._reader_connection_factory()
-            row = conn.cursor().execute(
-                """
-                /* snapshot.operating.resolve_latest */
-                SELECT TOP 1 m.evaluation_month
-                FROM snapshot.manifest AS m
-                WHERE m.company_id=? AND m.snapshot_type=?
-                  AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
-                  AND m.status='published' AND m.approval_status='approved'
-                  AND m.basis_to <= ?
-                  AND m.source_watermark_status IN ('verified', 'unverified')
-                ORDER BY m.basis_to DESC, m.evaluation_month DESC, m.generation_no DESC
-                """,
-                key.company_id,
-                key.snapshot_type,
-                key.scope_fingerprint,
-                key.schema_version,
-                key.algorithm_version,
-                as_of,
-            ).fetchone()
+            profile_clause, profile_values = _profile_clause(key, alias="m")
+            try:
+                row = conn.cursor().execute(
+                    f"""
+                    /* snapshot.operating.resolve_latest */
+                    SELECT TOP 1 m.evaluation_month
+                    FROM snapshot.manifest AS m
+                    WHERE m.company_id=? AND m.snapshot_type=?
+                      AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
+                      AND m.status='published' AND m.approval_status='approved'
+                      AND m.basis_to <= ?
+                      AND m.source_watermark_status IN ('verified', 'unverified')
+                      {profile_clause}
+                    ORDER BY m.basis_to DESC, m.evaluation_month DESC, m.generation_no DESC
+                    """,
+                    key.company_id,
+                    key.snapshot_type,
+                    key.scope_fingerprint,
+                    key.schema_version,
+                    key.algorithm_version,
+                    as_of,
+                    *profile_values,
+                ).fetchone()
+            except Exception as exc:
+                if key.profile_fingerprint and _profile_column_is_absent(exc):
+                    return None
+                raise
             if not row:
                 return None
             return SnapshotKey(
@@ -1028,10 +1124,52 @@ class SqlServerSnapshotRepository:
                 scope_fingerprint=key.scope_fingerprint,
                 schema_version=key.schema_version,
                 algorithm_version=key.algorithm_version,
+                profile_fingerprint=key.profile_fingerprint,
             )
         finally:
             if conn is not None:
                 conn.close()
+
+    def classify_frequency_resolution(self, key: SnapshotKey) -> str:
+        """Classify key mismatch dimensions without weakening exact-key reads."""
+        conn = self._reader_connection_factory()
+        try:
+            profile_column = ", profile_fingerprint" if key.profile_fingerprint else ""
+            rows = conn.cursor().execute(
+                f"""
+                SELECT scope_fingerprint, evaluation_month, schema_version, algorithm_version{profile_column}
+                FROM snapshot.manifest
+                WHERE company_id=? AND snapshot_type=?
+                  AND status='published' AND approval_status='approved'
+                """,
+                key.company_id,
+                key.snapshot_type,
+            ).fetchall()
+        finally:
+            conn.close()
+        if not rows:
+            return "no_approved_snapshot"
+        if key.profile_fingerprint and any(
+            str(row[0]) == key.scope_fingerprint
+            and str(row[1]) == key.evaluation_month
+            and str(row[2]) == key.schema_version
+            and str(row[3]) == key.algorithm_version
+            and str(row[4] or "") != key.profile_fingerprint
+            for row in rows
+        ):
+            return "profile_mismatch"
+        if any(
+            str(row[0]) == key.scope_fingerprint
+            and str(row[1]) == key.evaluation_month
+            and (str(row[2]) != key.schema_version or str(row[3]) != key.algorithm_version)
+            for row in rows
+        ):
+            return "version_mismatch"
+        if any(str(row[0]) == key.scope_fingerprint and str(row[1]) != key.evaluation_month for row in rows):
+            return "evaluation_mismatch"
+        if any(str(row[0]) != key.scope_fingerprint for row in rows):
+            return "scope_mismatch"
+        return "no_approved_snapshot"
 
     def read(self, key: SnapshotKey) -> SnapshotReadResult:
         # Native generations have no snapshot.payload row. Keep the legacy JSON
@@ -1039,21 +1177,27 @@ class SqlServerSnapshotRepository:
         representation_conn = self._reader_connection_factory()
         try:
             representation_cursor = representation_conn.cursor()
+            profile_clause, profile_values = _profile_clause(key)
             representation_row = representation_cursor.execute(
-                """SELECT TOP 1 manifest_id, generation_no, checksum, approval_status, approved_at, approved_by, approval_reason, storage_representation
+                f"""SELECT TOP 1 manifest_id, generation_no, checksum, approval_status, approved_at, approved_by, approval_reason, storage_representation
                    FROM snapshot.manifest
                    WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
                      AND scope_fingerprint=? AND schema_version=? AND algorithm_version=?
                      AND status='published' AND approval_status='approved'
+                     {profile_clause}
                    ORDER BY generation_no DESC""",
                 *_key_values(key),
+                *profile_values,
             ).fetchone()
-            if representation_row and str(representation_row[7] or "") == RELATIONAL_FREQUENCY_REPRESENTATION:
+            if representation_row and str(representation_row[7] or "") in {
+                RELATIONAL_FREQUENCY_REPRESENTATION,
+                EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+            }:
                 return SnapshotReadResult(
                     status=SNAPSHOT_STATUS_READY, manifest_id=int(representation_row[0]), generation_no=int(representation_row[1]),
                     checksum=str(representation_row[2]), approval_status=str(representation_row[3]), approved_at=str(representation_row[4] or ""),
                     approved_by=str(representation_row[5] or ""), approval_reason=str(representation_row[6] or ""),
-                    representation=RELATIONAL_FREQUENCY_REPRESENTATION,
+                    representation=str(representation_row[7]),
                 )
         except Exception as exc:
             if not _representation_column_is_absent(exc):
@@ -1083,8 +1227,9 @@ class SqlServerSnapshotRepository:
             _log_read_stage(key, "db_connection", elapsed_ms=int((time.perf_counter() - started) * 1000))
             cursor = conn.cursor()
             started = time.perf_counter()
+            profile_clause, profile_values = _profile_clause(key, alias="m")
             statement = cursor.execute(
-                """
+                f"""
                 /* snapshot.read.published */
                 SELECT TOP 1 m.manifest_id, m.generation_no, m.checksum,
                        m.approval_status, m.approved_at, m.approved_by, m.approval_reason,
@@ -1095,9 +1240,11 @@ class SqlServerSnapshotRepository:
                 WHERE m.company_id=? AND m.snapshot_type=? AND m.evaluation_month=?
                   AND m.scope_fingerprint=? AND m.schema_version=? AND m.algorithm_version=?
                   AND m.status='published' AND m.approval_status='approved'
+                  {profile_clause}
                 ORDER BY m.generation_no DESC
                 """,
                 *_key_values(key),
+                *profile_values,
             )
             _log_read_stage(key, "published_sql_execute", elapsed_ms=int((time.perf_counter() - started) * 1000))
             started = time.perf_counter()
@@ -1163,21 +1310,43 @@ class SqlServerSnapshotRepository:
 
     @staticmethod
     def _unavailable_status(cursor: Any, key: SnapshotKey) -> SnapshotReadResult:
+        profile_clause, profile_values = _profile_clause(key)
         exact = cursor.execute(
-            """
+            f"""
             /* snapshot.read.exact */
             SELECT TOP 1 status, approval_status
             FROM snapshot.manifest
             WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
               AND scope_fingerprint=? AND schema_version=? AND algorithm_version=?
+              {profile_clause}
             ORDER BY generation_no DESC
             """,
             *_key_values(key),
+            *profile_values,
         ).fetchone()
         if exact:
             if str(exact[0]) == "draft" or str(exact[1]) != "approved":
                 return SnapshotReadResult(status=SNAPSHOT_STATUS_UNAPPROVED, reason="snapshot is not approved")
             return SnapshotReadResult(status=SNAPSHOT_STATUS_STALE, reason=f"snapshot status is {exact[0]}")
+        if key.profile_fingerprint:
+            other_profile = cursor.execute(
+                """
+                /* snapshot.read.other_profile */
+                SELECT TOP 1 manifest_id
+                FROM snapshot.manifest
+                WHERE company_id=? AND snapshot_type=? AND evaluation_month=?
+                  AND scope_fingerprint=? AND schema_version=? AND algorithm_version=?
+                  AND status='published' AND approval_status='approved'
+                  AND (profile_fingerprint IS NULL OR profile_fingerprint<>?)
+                """,
+                *_key_values(key),
+                key.profile_fingerprint,
+            ).fetchone()
+            if other_profile:
+                return SnapshotReadResult(
+                    status=SNAPSHOT_STATUS_MISSING,
+                    reason="profile_mismatch",
+                )
         other_version = cursor.execute(
             """
             /* snapshot.read.other_version */

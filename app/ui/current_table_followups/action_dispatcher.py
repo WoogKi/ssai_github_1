@@ -183,28 +183,12 @@ def classify_current_table_followup_intent(query: str) -> str:
     if any(marker in intent_compact for marker in explicit_table_markers):
         return "dataframe_table"
 
-    # Analysis wording is normalized by its semantic inputs, not by the
-    # command ending. TOP/list/filter requests above remain deterministic.
-    # An explicit metric needs deterministic facts plus LLM interpretation;
-    # a dimension-only analysis retains the existing deterministic summary.
+    if "집계" in intent_compact:
+        return "dataframe_table"
+
+    # Explicit table/filter operations above remain deterministic; analysis
+    # interprets the current source instead of promoting a replacement table.
     if "분석" in intent_compact:
-        requested_metrics = _current_table_requested_metrics(text)
-        requested_dimensions = _requested_current_table_dimensions(text)
-        if requested_metrics:
-            return "llm_analysis"
-        if requested_dimensions:
-            # A dimension-only request remains the deterministic generic
-            # summary.  But an explicit unknown ``...수량/금액/...`` label
-            # must reach the interpretive capability check so it can return
-            # the existing exact missing-column notice.
-            _unknown_dimension, unknown_metric = _current_table_unresolved_request_labels(
-                text,
-                metrics=requested_metrics,
-                groupings=[key for key, _label, _aliases in requested_dimensions],
-            )
-            if unknown_metric:
-                return "llm_analysis"
-            return "dataframe_table"
         return "llm_analysis"
 
     # "의미가 뭐야/추세 설명"은 현재표의 숫자를 먼저 pandas로 확정한 뒤
@@ -417,6 +401,9 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
     ("product_category", "제품구분", ("제품구분별",), ("제품구분명", "제품구분")),
     ("product_class", "제품분류", ("제품분류별",), ("제품분류명", "제품분류")),
     ("forecast_grade", "예상등급", ("예상등급별",), ("예상등급",)),
+    ("profit_grade", "손익등급", ("손익등급별", "손익등급분석", "손익등급"), ("손익등급",)),
+    ("contribution_grade", "기여도등급", ("기여도등급별", "기여도등급분석"), ("기여도등급",)),
+    ("frequency_grade", "출고빈도등급", ("출고빈도등급별", "출고빈도등급분석"), ("출고빈도등급",)),
     ("trend_judgement", "추세판정", ("추세판정별",), ("추세판정",)),
     ("judgement_result", "판정결과", ("판정결과별",), ("판정결과",)),
 )
@@ -1646,6 +1633,8 @@ def handle_current_table_followup_by_action(
     - handler가 False를 반환하거나 예외가 나도 사용자에게 notice를 표시해서
       질문에 답 없이 끝나는 일을 막는다.
     """
+    if classify_current_table_followup_intent(query) == "llm_analysis":
+        return False
     kind = detect_current_table_kind(source_action)
     if (
         kind == "generic"
@@ -2066,7 +2055,7 @@ def handle_current_table_followup_by_action(
     normalized_query = re.sub(r"\s+", "", str(query or ""))
     requires_manufacturer_dimension = kind == "analytics_kpi" and any(
         marker in normalized_query
-        for marker in ("제조사별", "제조사명별", "제조사분석")
+        for marker in ("제조사별", "제조사명별", "제조사분석", "제조사집계")
     )
     has_manufacturer_dimension = any(
         "제조사" in str(column) or "제약사" in str(column)

@@ -394,6 +394,7 @@ def _is_numeric_display_name(col: Any) -> bool:
     # payload가 JSON/records에서 복원되어 object 문자열이 되어도
     # 화면 렌더 전에 숫자형으로 복구한다.
     explicit_numeric_cols = {
+        "추정단위손익", "추정손익률",
         "완료월총매출",
         "월평균매출",
         "완료월평균매출",
@@ -521,7 +522,7 @@ def normalize_display_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         col_name = _clean_text(col)
-        if col_name == "기준월":
+        if col_name in {"기준월", "최초정상입고월", "매입단가기준월", "매출단가기준월"}:
             out[col] = sr.map(_format_display_yyyymm)
             continue
         # Date facts do not always use the generic '일자'/'날짜' suffix.
@@ -663,6 +664,7 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         return True
 
     explicit_numeric_cols = {
+        "추정단위손익", "추정손익률",
         "완료월총매출",
         "월평균매출",
         "완료월평균매출",
@@ -773,6 +775,7 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         "증감률",
         "건수",
         "품목수",
+        "제품수",
         "거래처수",
         "매입처수",
         "재고적용처수",
@@ -808,6 +811,11 @@ def _numeric_display_kind(col: Any) -> str:
 
     if _is_row_no_col(s):
         return "int"
+
+    if s == "추정단위손익":
+        return "decimal2"
+    if s == "추정손익률":
+        return "percent2"
 
     if s == "명세서번호":
         return "int"
@@ -888,6 +896,7 @@ def _numeric_display_kind(col: Any) -> str:
         "건수",
         "행수",
         "품목수",
+        "제품수",
         "거래처수",
         "매입처수",
         "재고적용처수",
@@ -941,6 +950,10 @@ def resolve_sims_numeric_display_kind(col: Any) -> str:
 def resolve_sims_excel_number_format(col: Any) -> str:
     """Return the shared Excel number format for a SIMS numeric display column."""
     kind = resolve_sims_numeric_display_kind(col)
+    if _clean_text(col) == "추정손익률":
+        return "0.00%"
+    if _clean_text(col) == "추정단위손익":
+        return "#,##0.00"
     if kind == "int":
         return "#,##0"
     if kind == "percent2":
@@ -1030,6 +1043,8 @@ def _normalize_product_table_display_values(df: pd.DataFrame, action_name: str) 
 def prepare_sims_table_display_df(df: pd.DataFrame, *, action_name: str = "") -> pd.DataFrame:
     """Create a display-only shared SIMS table view without mutating its source."""
     out = normalize_display_df_for_streamlit(df)
+    if "추정손익률" in out:
+        out["추정손익률"] = pd.to_numeric(out["추정손익률"], errors="coerce") * 100
     out = _normalize_product_inventory_display_values(out, action_name)
     return _normalize_product_table_display_values(out, action_name)
 

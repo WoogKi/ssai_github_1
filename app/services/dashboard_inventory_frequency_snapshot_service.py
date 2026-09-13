@@ -7,6 +7,7 @@ import re
 import tempfile
 import time
 import logging
+from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
@@ -19,17 +20,32 @@ from sqlalchemy import text
 from app.db.sql_utils import sql_safe_int
 
 from app.db.mssql_client import get_current_company_id, get_engine, set_current_company_id
+from app.services.business_calendar_service import kst_today
 from app.services.dashboard_inventory_frequency_snapshot import (
     ALGORITHM_VERSION,
+    EXTENDED_ALGORITHM_VERSION,
+    EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
+    EXTENDED_SCHEMA_VERSION,
+    PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    PRODUCT_STATISTICS_SCHEMA_VERSION,
     FrequencyProjectionReadResult,
-    RELATIONAL_FREQUENCY_REPRESENTATION,
     RelationalFrequencySnapshot,
     SCHEMA_VERSION,
     SNAPSHOT_TYPE,
     SnapshotContractError,
     build_relational_frequency_snapshot_from_aggregates,
+    build_extended_relational_frequency_snapshot_from_aggregates,
+    build_product_statistics_relational_snapshot_from_aggregates,
     completed_month_basis,
+    dashboard_profile_fingerprint,
     scope_fingerprint,
+)
+from app.services.monthly_frequency_aggregate import product_lifecycle_sql
+from app.services.product_classification_contract import ClassificationStatus
+from app.services.ssai_product_classification_repository import (
+    ProductClassificationTargets,
+    classify_product_from_loaded_authority,
+    load_effective_company_classification_authority,
 )
 from app.services.ssai_snapshot_repository import (
     SNAPSHOT_STATUS_CORRUPT,
@@ -73,8 +89,14 @@ class FrequencySnapshotPlan:
     basis_to: str
     basis_months: tuple[str, str, str]
     stock_codes: tuple[str, ...]
+    product_group_codes: tuple[str, ...] = ()
+    product_di_codes: tuple[str, ...] = ()
+    product_class_codes: tuple[str, ...] = ()
+    io_gu_codes: tuple[str, ...] = ()
+    stock_mode: str = "real"
+    profile_fingerprint: str = ""
     erp_sql_call_count: int = 2
-    analytics_write_plan: str = "draft manifest 1 + immutable payload 1; approval/publish 0"
+    analytics_write_plan: str = "v2 draft manifest + immutable relational rows; approval/publish 0"
 
 
 @dataclass(frozen=True)
@@ -99,6 +121,11 @@ class DashboardProfileStockScope:
     stock_codes: tuple[str, ...]
     profile_status: str
     scope_source: str
+    product_group_codes: tuple[str, ...] = ()
+    product_di_codes: tuple[str, ...] = ()
+    product_class_codes: tuple[str, ...] = ()
+    io_gu_codes: tuple[str, ...] = ()
+    stock_mode: str = "real"
 
 
 def normalize_stock_scope(stock_codes: Sequence[Any] | None) -> tuple[str, ...]:
@@ -143,9 +170,8 @@ def resolve_dashboard_profile_stock_scope(
 
     from app.services.ssai_analysis_profile_service import normalize_company_default_conditions
 
-    stored_scope = normalize_stock_scope(
-        normalize_company_default_conditions(profile).get("stock_cd_list")
-    )
+    normalized_profile = normalize_company_default_conditions(profile)
+    stored_scope = normalize_stock_scope(normalized_profile.get("stock_cd_list"))
     if not stored_scope:
         raise SnapshotContractError("dashboard_profile_stock_scope_empty")
     if manual_stock_codes is not None:
@@ -160,24 +186,58 @@ def resolve_dashboard_profile_stock_scope(
         stock_codes=stored_scope,
         profile_status=status,
         scope_source=source,
+        product_group_codes=tuple(normalized_profile.get("product_group_list") or ()),
+        product_di_codes=tuple(normalized_profile.get("product_di_list") or ()),
+        product_class_codes=tuple(normalized_profile.get("product_class_list") or ()),
+        io_gu_codes=tuple(normalized_profile.get("io_gu_list") or ()),
+        stock_mode=str(normalized_profile.get("stock_mode") or "real").strip(),
     )
 
 
-def build_frequency_snapshot_plan(*, company_id: Any, evaluation_month: Any, stock_codes: Sequence[Any] | None) -> FrequencySnapshotPlan:
+def build_frequency_snapshot_plan(
+    *,
+    company_id: Any,
+    evaluation_month: Any,
+    stock_codes: Sequence[Any] | None,
+    product_group_codes: Sequence[Any] | None = None,
+    product_di_codes: Sequence[Any] | None = None,
+    product_class_codes: Sequence[Any] | None = None,
+    io_gu_codes: Sequence[Any] | None = None,
+    stock_mode: Any = "real",
+) -> FrequencySnapshotPlan:
     try:
         normalized_company = int(company_id)
     except (TypeError, ValueError) as exc:
         raise SnapshotContractError("company_id must be an existing numeric company id") from exc
     if normalized_company <= 0:
         raise SnapshotContractError("company_id must be positive")
+    normalized_stock_mode = str(stock_mode or "real").strip()
+    if normalized_stock_mode not in {"real", "book"}:
+        raise SnapshotContractError("stock_mode must be real or book")
     basis = completed_month_basis(evaluation_month)
+    normalized_stock_codes = normalize_stock_scope(stock_codes)
+    normalized_product_groups = normalize_stock_scope(product_group_codes)
+    normalized_product_di = normalize_stock_scope(product_di_codes)
+    normalized_product_class = normalize_stock_scope(product_class_codes)
     return FrequencySnapshotPlan(
         company_id=normalized_company,
         evaluation_month=basis.evaluation_month,
         basis_from=basis.basis_from,
         basis_to=basis.basis_to,
         basis_months=basis.months,
-        stock_codes=normalize_stock_scope(stock_codes),
+        stock_codes=normalized_stock_codes,
+        product_group_codes=normalized_product_groups,
+        product_di_codes=normalized_product_di,
+        product_class_codes=normalized_product_class,
+        io_gu_codes=normalize_stock_scope(io_gu_codes),
+        stock_mode=normalized_stock_mode,
+        profile_fingerprint=dashboard_profile_fingerprint(
+            stock_codes=normalized_stock_codes,
+            product_group_codes=normalized_product_groups,
+            product_di_codes=normalized_product_di,
+            product_class_codes=normalized_product_class,
+            stock_mode=normalized_stock_mode,
+        ),
     )
 
 
@@ -209,15 +269,47 @@ def build_frequency_month_source_plan(
     )
 
 
-def frequency_snapshot_key(plan: FrequencySnapshotPlan) -> SnapshotKey:
+def _month_start_months_before(yyyymmdd: str, months_before: int) -> str:
+    value = str(yyyymmdd or "").strip()
+    if len(value) != 8 or not value.isdigit() or months_before < 0:
+        raise SnapshotContractError("price lookback boundary is invalid")
+    month_index = int(value[:4]) * 12 + int(value[4:6]) - 1 - months_before
+    return f"{month_index // 12:04d}{month_index % 12 + 1:02d}01"
+
+
+def _price_status(evaluation_month: str, basis_month: Any) -> str:
+    text_value = str(basis_month or "").strip()
+    if len(text_value) != 6 or not text_value.isdigit():
+        return "unavailable"
+    evaluation_index = int(evaluation_month[:4]) * 12 + int(evaluation_month[4:]) - 1
+    basis_index = int(text_value[:4]) * 12 + int(text_value[4:]) - 1
+    age = evaluation_index - basis_index
+    if age < 1 or age > 12:
+        return "unavailable"
+    return "stale" if age > 6 else "ready"
+
+
+def frequency_snapshot_key(
+    plan: FrequencySnapshotPlan, *, extended: bool = False, product_statistics: bool = False
+) -> SnapshotKey:
     """Return the immutable repository key for one Dashboard frequency scope."""
     return SnapshotKey(
         company_id=str(plan.company_id),
         snapshot_type=SNAPSHOT_TYPE,
         evaluation_month=plan.evaluation_month,
         scope_fingerprint=scope_fingerprint(plan.stock_codes),
-        schema_version=SCHEMA_VERSION,
-        algorithm_version=ALGORITHM_VERSION,
+        schema_version=(PRODUCT_STATISTICS_SCHEMA_VERSION if product_statistics else EXTENDED_SCHEMA_VERSION if extended else SCHEMA_VERSION),
+        algorithm_version=(PRODUCT_STATISTICS_ALGORITHM_VERSION if product_statistics else EXTENDED_ALGORITHM_VERSION if extended else ALGORITHM_VERSION),
+        profile_fingerprint=plan.profile_fingerprint if extended or product_statistics else "",
+    )
+
+
+def frequency_snapshot_read_keys(plan: FrequencySnapshotPlan) -> tuple[SnapshotKey, SnapshotKey, SnapshotKey]:
+    """Prefer product statistics, then lifecycle v2, without invalidating v1."""
+    return (
+        frequency_snapshot_key(plan, product_statistics=True),
+        frequency_snapshot_key(plan, extended=True),
+        frequency_snapshot_key(plan),
     )
 
 
@@ -232,7 +324,7 @@ def frequency_snapshot_generation_guard(
     A stale lock intentionally remains fail-closed for an operator to inspect;
     this prevents a crashed run from silently overlapping a later retry.
     """
-    key = frequency_snapshot_key(plan)
+    key = frequency_snapshot_key(plan, product_statistics=True)
     digest_input = "|".join(
         (
             key.company_id,
@@ -241,6 +333,7 @@ def frequency_snapshot_generation_guard(
             key.scope_fingerprint,
             key.schema_version,
             key.algorithm_version,
+            key.profile_fingerprint,
         )
     )
     lock_name = f"frequency_snapshot_{hashlib.sha256(digest_input.encode('utf-8')).hexdigest()}.lock"
@@ -306,11 +399,27 @@ def _resolve_operating_key(repo: Any, requested_key: SnapshotKey, as_of_date: st
     return resolver(requested_key, available_through=as_of_date)
 
 
+def _classify_projection_unavailable(repo: Any, key: SnapshotKey) -> tuple[str, str]:
+    classifier = getattr(repo, "classify_frequency_resolution", None)
+    if not callable(classifier):
+        return "missing", "no_approved_snapshot"
+    try:
+        reason = str(classifier(key) or "no_approved_snapshot")
+    except Exception:
+        return "missing", "authority_unavailable"
+    authority = "version_mismatch" if reason == "version_mismatch" else "missing"
+    return authority, reason
+
+
 def read_approved_frequency_snapshot(
     *,
     company_id: Any,
     evaluation_month: Any,
     stock_codes: Sequence[Any] | None,
+    product_group_codes: Sequence[Any] | None = None,
+    product_di_codes: Sequence[Any] | None = None,
+    product_class_codes: Sequence[Any] | None = None,
+    stock_mode: Any = "real",
     as_of_date: Any = None,
     repository: Any | None = None,
 ) -> SnapshotReadResult:
@@ -325,22 +434,31 @@ def read_approved_frequency_snapshot(
             company_id=company_id,
             evaluation_month=evaluation_month,
             stock_codes=stock_codes,
+            product_group_codes=product_group_codes,
+            product_di_codes=product_di_codes,
+            product_class_codes=product_class_codes,
+            stock_mode=stock_mode,
         )
     except SnapshotContractError as exc:
         return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
-    key = frequency_snapshot_key(plan)
+    keys = frequency_snapshot_read_keys(plan)
     try:
         as_of = _operating_as_of_date(as_of_date)
     except SnapshotContractError as exc:
         return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
     try:
         repo = repository or _company_snapshot_repository(int(plan.company_id))
-        operating_key = _resolve_operating_key(repo, key, as_of)
+        operating_key = next(
+            (resolved for candidate in keys if (resolved := _resolve_operating_key(repo, candidate, as_of)) is not None),
+            None,
+        )
     except Exception as exc:
         reason_code = _snapshot_exception_code(exc)
         return SnapshotReadResult(status=SNAPSHOT_STATUS_STALE, reason=f"snapshot operating lookup unavailable: {reason_code}")
     if operating_key is None:
-        return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason="no approved snapshot has a completed basis")
+        _authority_status, resolution_status = _classify_projection_unavailable(repo, keys[0])
+        return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason=resolution_status)
+    key = operating_key
     cache_key = (key, as_of)
     now = time.monotonic()
     cached = _frequency_read_cache.get(cache_key)
@@ -399,6 +517,10 @@ def read_approved_frequency_projection(
     company_id: Any,
     evaluation_month: Any,
     stock_codes: Sequence[Any] | None,
+    product_group_codes: Sequence[Any] | None = None,
+    product_di_codes: Sequence[Any] | None = None,
+    product_class_codes: Sequence[Any] | None = None,
+    stock_mode: Any = "real",
     product_codes: Sequence[Any] | None = None,
     frequency_grade: str = "",
     as_of_date: Any = None,
@@ -415,27 +537,50 @@ def read_approved_frequency_projection(
             company_id=company_id,
             evaluation_month=evaluation_month,
             stock_codes=stock_codes,
+            product_group_codes=product_group_codes,
+            product_di_codes=product_di_codes,
+            product_class_codes=product_class_codes,
+            stock_mode=stock_mode,
         )
-        key = frequency_snapshot_key(plan)
+        keys = frequency_snapshot_read_keys(plan)
         as_of = _operating_as_of_date(as_of_date)
     except SnapshotContractError as exc:
         return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
     repo = repository or _company_snapshot_repository(int(plan.company_id))
     try:
-        operating_key = _resolve_operating_key(repo, key, as_of)
+        operating_key = next(
+            (resolved for candidate in keys if (resolved := _resolve_operating_key(repo, candidate, as_of)) is not None),
+            None,
+        )
     except Exception as exc:
         return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason=_snapshot_exception_code(exc))
     if operating_key is None:
-        return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_MISSING, reason="no approved snapshot has a completed basis")
+        authority_status, resolution_status = _classify_projection_unavailable(repo, keys[0])
+        return FrequencyProjectionReadResult(
+            status=SNAPSHOT_STATUS_MISSING,
+            reason=resolution_status,
+            authority_status=authority_status,
+            resolution_status=resolution_status,
+            contract_version=EXTENDED_SCHEMA_VERSION,
+        )
     reader = getattr(repo, "read_frequency_projection", None)
     if not callable(reader):
         return FrequencyProjectionReadResult(status="legacy", reason="projection reader is unavailable")
     try:
-        return reader(
+        result = reader(
             operating_key,
             product_codes=tuple(str(code or "").strip() for code in product_codes or () if str(code or "").strip()),
             frequency_grade=str(frequency_grade or "").strip(),
         )
+        if result.status == "ready":
+            return FrequencyProjectionReadResult(
+                status=result.status, rows=result.rows, reason=result.reason,
+                manifest_id=result.manifest_id, generation_no=result.generation_no,
+                checksum=result.checksum, authority_status="ready",
+                resolution_status="exact_match",
+                contract_version=operating_key.schema_version,
+            )
+        return result
     except Exception as exc:
         return FrequencyProjectionReadResult(status=SNAPSHOT_STATUS_CORRUPT, reason=_snapshot_exception_code(exc))
 
@@ -455,6 +600,40 @@ WHERE NULLIF(LTRIM(RTRIM(P.Rd04_Physic_Cd)), '') IS NOT NULL
 ORDER BY product_code
 """.strip(),
         {},
+    )
+
+
+def _product_dimension_scope_sql(
+    plan: FrequencySnapshotPlan,
+    binds: dict[str, Any],
+    *,
+    product_alias: str,
+) -> tuple[str, str]:
+    """Bind the stored Dashboard Gcode:Tcode product scope without coercion."""
+    clauses: list[str] = []
+    specs = (
+        (plan.product_group_codes, "0013", "Rd04_Physic_Group_Gcode", "Rd04_Physic_Group", "group"),
+        (plan.product_di_codes, "0004", "Rd04_Physic_Di_Gcode", "Rd04_Physic_Di", "di"),
+        (plan.product_class_codes, "0031", "Rd04_Physic_Tax_Gcode", "Rd04_Physic_Tax", "class"),
+    )
+    for values, expected_gcode, gcode_field, tcode_field, prefix in specs:
+        checks: list[str] = []
+        for index, raw in enumerate(values):
+            gcode, separator, tcode = str(raw or "").strip().partition(":")
+            if not separator or gcode != expected_gcode or not tcode:
+                continue
+            gkey, tkey = f"outbound_{prefix}_g_{index}", f"outbound_{prefix}_t_{index}"
+            binds[gkey], binds[tkey] = gcode, tcode
+            checks.append(
+                f"({product_alias}.{gcode_field} = :{gkey} AND {product_alias}.{tcode_field} = :{tkey})"
+            )
+        if checks:
+            clauses.append("(" + " OR ".join(checks) + ")")
+    if not clauses:
+        return "", ""
+    return (
+        f"INNER JOIN dbo.Rddbc040 AS {product_alias} ON {product_alias}.Rd04_Physic_Cd = O.Rd12_Physic_Cd",
+        "AND " + "\n  AND ".join(clauses),
     )
 
 
@@ -602,6 +781,11 @@ def outbound_base_rows_sql(
         # SQL Server character equality already ignores trailing blanks. Keep the
         # predicate on native columns so the ERP date/stock index remains usable.
         stock_clause = "AND O.Rd12_Stock_Cd_Gcode = '0018'\n      AND O.Rd12_Stock_Cd IN (" + ", ".join(names) + ")"
+    product_join, product_clause = (
+        _product_dimension_scope_sql(plan, binds, product_alias="P")
+        if isinstance(plan, FrequencySnapshotPlan)
+        else ("", "")
+    )
     base = f"""
 SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
     LTRIM(RTRIM(O.Rd12_Ven_Cd)) AS vendor_code,
@@ -612,8 +796,10 @@ SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
     LTRIM(RTRIM(O.Rd12_Io_Gu)) AS io_tcode,
     CAST(COALESCE(O.Rd12_Quantity, 0) + COALESCE(O.Rd12_Oquantity, 0) AS decimal(38, 6)) AS outbound_quantity
 FROM dbo.Rddbc120 AS O
+{product_join}
 WHERE O.Rd12_Out_YyMmDd >= :basis_from AND O.Rd12_Out_YyMmDd <= :basis_to
   {stock_clause}
+  {product_clause}
 """.strip()
     return base, binds
 
@@ -682,7 +868,7 @@ WITH BaseRows AS (
         COALESCE(SUM(CASE WHEN is_normal = 0 AND is_return = 0 THEN 1 ELSE 0 END), 0) AS other_tcode_row_count
     FROM Classified
 )
-SELECT 'event' AS row_kind, E.outbound_date, E.product_code, E.stock_code,
+SELECT 'event' AS row_kind, E.outbound_date, E.vendor_code, E.product_code, E.stock_code,
        E.outbound_quantity, E.mapping_count, E.exact_duplicate_row_count,
        CAST(NULL AS bigint) AS source_row_count,
        CAST(NULL AS bigint) AS normal_positive_row_count,
@@ -694,11 +880,138 @@ SELECT 'event' AS row_kind, E.outbound_date, E.product_code, E.stock_code,
        CAST(NULL AS bigint) AS other_tcode_row_count
 FROM EventGrain AS E
 UNION ALL
-SELECT 'diagnostics', '', '', '', CAST(NULL AS decimal(38, 6)), CAST(NULL AS bigint), CAST(NULL AS bigint),
+SELECT 'diagnostics', '', '', '', '', CAST(NULL AS decimal(38, 6)), CAST(NULL AS bigint), CAST(NULL AS bigint),
        B.source_row_count, B.normal_positive_row_count, B.normal_positive_missing_key_row_count,
        B.normal_positive_nonintegral_row_count, B.normal_nonpositive_row_count,
        B.return_positive_row_count, B.return_nonpositive_row_count, B.other_tcode_row_count
 FROM BaseDiagnostics AS B
+""".strip(), binds
+
+
+def product_statistics_event_stream_sql(
+    plan: FrequencySnapshotPlan,
+) -> tuple[str, dict[str, Any]]:
+    """Return 3-month event statistics and 12-month sales price in one ERP statement."""
+    binds: dict[str, Any] = {
+        "basis_from": plan.basis_from,
+        "basis_to": plan.basis_to,
+        "price_lookback_from": _month_start_months_before(plan.basis_from, 9),
+    }
+    stock_clause = ""
+    if plan.stock_codes:
+        names = []
+        for index, code in enumerate(plan.stock_codes):
+            key = f"statistics_stock_{index}"
+            binds[key] = code
+            names.append(f":{key}")
+        stock_clause = "AND O.Rd12_Stock_Cd_Gcode='0018' AND O.Rd12_Stock_Cd IN (" + ", ".join(names) + ")"
+    product_join, product_clause = _product_dimension_scope_sql(plan, binds, product_alias="P")
+    io_number = sql_safe_int("io_tcode")
+    return f"""
+WITH BaseRows AS (
+    SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
+           LTRIM(RTRIM(O.Rd12_Ven_Cd)) AS vendor_code,
+           LTRIM(RTRIM(CONVERT(varchar(100), O.Rd12_Out_Seq))) AS outbound_seq,
+           LTRIM(RTRIM(O.Rd12_Physic_Cd)) AS product_code,
+           LTRIM(RTRIM(O.Rd12_Stock_Cd)) AS stock_code,
+           LTRIM(RTRIM(O.Rd12_Io_Gu_Gcode)) AS io_gcode,
+           LTRIM(RTRIM(O.Rd12_Io_Gu)) AS io_tcode,
+           CAST(COALESCE(O.Rd12_Quantity,0)+COALESCE(O.Rd12_Oquantity,0) AS decimal(38,6)) AS outbound_quantity,
+           CAST(COALESCE(O.Rd12_Quantity,0) AS decimal(38,6)) AS paid_quantity,
+           CAST(COALESCE(O.Rd12_Fin_Supply_Price,O.Rd12_Supply_Price,0) AS decimal(38,6)) AS supply_amount
+    FROM dbo.Rddbc120 AS O
+    {product_join}
+    WHERE O.Rd12_Out_YyMmDd >= :price_lookback_from AND O.Rd12_Out_YyMmDd <= :basis_to
+      {stock_clause}
+      {product_clause}
+), Classified AS (
+    SELECT *,
+      CASE WHEN io_gcode='0012' AND LEN(io_tcode)=3 AND io_tcode NOT LIKE '%[^0-9]%'
+             AND {io_number} BETWEEN 500 AND 599 THEN 1 ELSE 0 END AS is_normal,
+      CASE WHEN io_gcode='0012' AND LEN(io_tcode)=3 AND io_tcode NOT LIKE '%[^0-9]%'
+             AND {io_number} BETWEEN 600 AND 699 THEN 1 ELSE 0 END AS is_return
+    FROM BaseRows
+), NormalExact AS (
+    SELECT outbound_date,vendor_code,outbound_seq,product_code,stock_code,outbound_quantity,
+           MAX(paid_quantity) AS paid_quantity,MAX(supply_amount) AS supply_amount,
+           COUNT_BIG(*) AS duplicate_count
+    FROM Classified
+    WHERE is_normal=1 AND outbound_quantity>0
+      AND NULLIF(outbound_date,'') IS NOT NULL AND NULLIF(vendor_code,'') IS NOT NULL
+      AND NULLIF(outbound_seq,'') IS NOT NULL AND NULLIF(product_code,'') IS NOT NULL AND NULLIF(stock_code,'') IS NOT NULL
+      AND outbound_quantity=FLOOR(outbound_quantity)
+    GROUP BY outbound_date,vendor_code,outbound_seq,product_code,stock_code,outbound_quantity
+), NormalEvents AS (
+    SELECT outbound_date,vendor_code,outbound_seq,COUNT_BIG(*) AS mapping_count,
+           MAX(product_code) AS product_code,MAX(stock_code) AS stock_code,
+           MAX(outbound_quantity) AS outbound_quantity,MAX(paid_quantity) AS paid_quantity,
+           MAX(supply_amount) AS supply_amount,SUM(duplicate_count-1) AS exact_duplicate_row_count
+    FROM NormalExact GROUP BY outbound_date,vendor_code,outbound_seq
+), SalesPriceMonthly AS (
+    SELECT product_code,LEFT(outbound_date,6) AS basis_month,
+           SUM(paid_quantity) AS paid_quantity,SUM(supply_amount) AS supply_amount
+    FROM NormalEvents
+    WHERE mapping_count=1 AND paid_quantity>0 AND supply_amount>0
+    GROUP BY product_code,LEFT(outbound_date,6)
+), LatestSalesPrice AS (
+    SELECT *,ROW_NUMBER() OVER(PARTITION BY product_code ORDER BY basis_month DESC) AS price_rank
+    FROM SalesPriceMonthly WHERE paid_quantity>0
+), ReturnExact AS (
+    SELECT outbound_date,vendor_code,outbound_seq,product_code,stock_code,outbound_quantity,supply_amount,
+           COUNT_BIG(*) AS duplicate_count
+    FROM Classified
+    WHERE is_return=1 AND outbound_date>=:basis_from AND outbound_quantity<0 AND supply_amount<0
+      AND NULLIF(outbound_date,'') IS NOT NULL AND NULLIF(vendor_code,'') IS NOT NULL
+      AND NULLIF(outbound_seq,'') IS NOT NULL AND NULLIF(product_code,'') IS NOT NULL AND NULLIF(stock_code,'') IS NOT NULL
+      AND outbound_quantity=FLOOR(outbound_quantity)
+    GROUP BY outbound_date,vendor_code,outbound_seq,product_code,stock_code,outbound_quantity,supply_amount
+), ReturnEvents AS (
+    SELECT outbound_date,vendor_code,outbound_seq,COUNT_BIG(*) AS mapping_count,
+           MAX(product_code) AS product_code,MAX(-outbound_quantity) AS return_quantity,
+           MAX(-supply_amount) AS return_supply_amount
+    FROM ReturnExact GROUP BY outbound_date,vendor_code,outbound_seq
+), ReturnProduct AS (
+    SELECT product_code,COUNT_BIG(*) AS return_event_count,
+           SUM(return_quantity) AS return_quantity,SUM(return_supply_amount) AS return_supply_amount
+    FROM ReturnEvents WHERE mapping_count=1 GROUP BY product_code
+), Diagnostics AS (
+    SELECT COUNT_BIG(*) AS source_row_count,
+      COALESCE(SUM(CASE WHEN is_normal=1 AND outbound_date>=:basis_from AND outbound_quantity>0 THEN 1 ELSE 0 END),0) AS normal_positive_row_count,
+      COALESCE(SUM(CASE WHEN is_normal=1 AND outbound_date>=:basis_from AND outbound_quantity>0 AND
+        (NULLIF(outbound_date,'') IS NULL OR NULLIF(vendor_code,'') IS NULL OR NULLIF(outbound_seq,'') IS NULL
+         OR NULLIF(product_code,'') IS NULL OR NULLIF(stock_code,'') IS NULL) THEN 1 ELSE 0 END),0) AS normal_positive_missing_key_row_count,
+      COALESCE(SUM(CASE WHEN is_normal=1 AND outbound_date>=:basis_from AND outbound_quantity>0 AND
+        NULLIF(outbound_date,'') IS NOT NULL AND NULLIF(vendor_code,'') IS NOT NULL
+        AND NULLIF(outbound_seq,'') IS NOT NULL AND NULLIF(product_code,'') IS NOT NULL AND NULLIF(stock_code,'') IS NOT NULL
+        AND outbound_quantity<>FLOOR(outbound_quantity) THEN 1 ELSE 0 END),0) AS normal_positive_nonintegral_row_count,
+      COALESCE(SUM(CASE WHEN is_normal=1 AND outbound_date>=:basis_from AND outbound_quantity<=0 THEN 1 ELSE 0 END),0) AS normal_nonpositive_row_count,
+      COALESCE(SUM(CASE WHEN is_return=1 AND outbound_date>=:basis_from AND outbound_quantity>0 THEN 1 ELSE 0 END),0) AS return_positive_row_count,
+      COALESCE(SUM(CASE WHEN is_return=1 AND outbound_date>=:basis_from AND outbound_quantity<=0 THEN 1 ELSE 0 END),0) AS return_nonpositive_row_count,
+      COALESCE(SUM(CASE WHEN is_normal=0 AND is_return=0 AND outbound_date>=:basis_from THEN 1 ELSE 0 END),0) AS other_tcode_row_count
+    FROM Classified WHERE outbound_date>=:basis_from
+)
+SELECT 'event' row_kind,E.outbound_date,E.vendor_code,E.product_code,E.stock_code,E.outbound_quantity,E.paid_quantity,
+       E.mapping_count,E.exact_duplicate_row_count,
+       CAST(NULL AS varchar(6)) basis_month,CAST(NULL AS decimal(38,10)) unit_price,
+       CAST(NULL AS bigint) return_event_count,CAST(NULL AS decimal(38,6)) return_quantity,CAST(NULL AS decimal(38,6)) return_supply_amount,
+       CAST(NULL AS bigint) source_row_count,CAST(NULL AS bigint) normal_positive_row_count,
+       CAST(NULL AS bigint) normal_nonpositive_row_count,CAST(NULL AS bigint) return_positive_row_count,
+       CAST(NULL AS bigint) return_nonpositive_row_count,CAST(NULL AS bigint) other_tcode_row_count,
+       CAST(NULL AS bigint) normal_positive_missing_key_row_count,CAST(NULL AS bigint) normal_positive_nonintegral_row_count
+FROM NormalEvents E WHERE E.outbound_date>=:basis_from
+UNION ALL
+SELECT 'sales_price','', '',P.product_code,'',NULL,NULL,NULL,NULL,P.basis_month,
+       CAST(P.supply_amount/P.paid_quantity AS decimal(38,10)),NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+FROM LatestSalesPrice P WHERE P.price_rank=1
+UNION ALL
+SELECT 'return_stats','', '',R.product_code,'',NULL,NULL,NULL,NULL,NULL,NULL,R.return_event_count,R.return_quantity,R.return_supply_amount,
+       NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL FROM ReturnProduct R
+UNION ALL
+SELECT 'diagnostics','', '', '', '',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,
+       D.source_row_count,D.normal_positive_row_count,D.normal_nonpositive_row_count,D.return_positive_row_count,D.return_nonpositive_row_count,D.other_tcode_row_count,
+       D.normal_positive_missing_key_row_count,D.normal_positive_nonintegral_row_count
+FROM Diagnostics D
+ORDER BY row_kind,product_code,outbound_date
 """.strip(), binds
 
 def _fixture_decimal(value: Any, *, field: str) -> Decimal:
@@ -800,7 +1113,9 @@ def _event_grain_int(value: Any, *, field: str) -> int:
     return int(number)
 
 
-def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+def _aggregate_extended_event_grain_chunks(
+    chunks: Iterable[pd.DataFrame],
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int], dict[str, int]]:
     """Rebuild monthly activity from a single chunked exact event stream.
 
     The SQL result already suppresses exact duplicates and marks conflicting
@@ -808,6 +1123,8 @@ def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[
     bounds local state by output grain rather than ERP event row count.
     """
     monthly: dict[tuple[str, str, str], list[int]] = {}
+    product_days: dict[str, set[str]] = {}
+    product_customers: dict[str, set[str]] = {}
     diagnostics: dict[str, int] | None = None
     duplicate_rows = 0
     conflicting_rows = 0
@@ -815,7 +1132,7 @@ def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[
     accepted_rows = 0
     event_rows = 0
     required = {
-        "row_kind", "outbound_date", "product_code", "stock_code", "outbound_quantity",
+        "row_kind", "outbound_date", "vendor_code", "product_code", "stock_code", "outbound_quantity",
         "mapping_count", "exact_duplicate_row_count", *ROW_PARTITION_FIELDS[3:], "source_row_count", "normal_positive_row_count",
     }
     for chunk in chunks:
@@ -852,7 +1169,8 @@ def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[
             outbound_date = str(record.get("outbound_date") or "").strip()
             product_code = str(record.get("product_code") or "").strip()
             stock_code = str(record.get("stock_code") or "").strip()
-            if len(outbound_date) != 8 or not outbound_date.isdigit() or not product_code or not stock_code:
+            vendor_code = str(record.get("vendor_code") or "").strip()
+            if len(outbound_date) != 8 or not outbound_date.isdigit() or not vendor_code or not product_code or not stock_code:
                 raise SnapshotContractError("outbound event stream accepted row is invalid")
             quantity = _event_grain_int(record.get("outbound_quantity"), field="outbound_quantity")
             day_of_month = int(outbound_date[6:])
@@ -864,6 +1182,8 @@ def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[
             current[0] += 1
             current[1] += quantity
             current[2] |= 1 << (day_of_month - 1)
+            product_days.setdefault(product_code, set()).add(outbound_date)
+            product_customers.setdefault(product_code, set()).add(vendor_code)
     if diagnostics is None:
         raise SnapshotContractError("outbound event stream returned no diagnostics")
     diagnostics.update({
@@ -885,7 +1205,113 @@ def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[
         "row_kind": "summary", "month": "", "product_code": "", "stock_code": "",
         "occurrence_count": 0, "outbound_quantity": 0, "outbound_day_count": 0, **diagnostics,
     })
-    return _aggregate_result(pd.DataFrame(frame_rows))
+    monthly_rows, final_diagnostics = _aggregate_result(pd.DataFrame(frame_rows))
+    return (
+        monthly_rows,
+        final_diagnostics,
+        {code: len(values) for code, values in product_days.items()},
+        {code: len(values) for code, values in product_customers.items()},
+    )
+
+
+def _aggregate_product_statistics_event_chunks(
+    chunks: Iterable[pd.DataFrame],
+) -> tuple[
+    list[dict[str, Any]], dict[str, int], dict[str, int], dict[str, int],
+    dict[str, int], dict[str, dict[str, Any]], dict[str, dict[str, Any]],
+]:
+    """Split one multi-projection R120 stream without issuing another ERP query."""
+    frequency_chunks: list[pd.DataFrame] = []
+    paid_quantities: dict[str, int] = defaultdict(int)
+    return_statistics: dict[str, dict[str, Any]] = {}
+    sales_prices: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, pd.DataFrame) or "row_kind" not in chunk.columns:
+            raise SnapshotContractError("product statistics event stream is invalid")
+        kinds = chunk["row_kind"].fillna("").astype(str)
+        frequency = chunk[kinds.isin(("event", "diagnostics"))].copy()
+        if not frequency.empty:
+            frequency_chunks.append(frequency)
+        for record in chunk[~kinds.isin(("event", "diagnostics"))].to_dict("records"):
+            kind = str(record.get("row_kind") or "")
+            code = str(record.get("product_code") or "").strip()
+            if not code:
+                raise SnapshotContractError("product statistics row has no product code")
+            if kind == "sales_price":
+                if code in sales_prices:
+                    raise SnapshotContractError("sales price projection is duplicated")
+                sales_prices[code] = {
+                    "unit_price": record.get("unit_price"),
+                    "basis_month": str(record.get("basis_month") or ""),
+                }
+            elif kind == "return_stats":
+                if code in return_statistics:
+                    raise SnapshotContractError("return projection is duplicated")
+                return_statistics[code] = {
+                    "event_count": _event_grain_int(record.get("return_event_count"), field="return_event_count"),
+                    "quantity": _event_grain_int(record.get("return_quantity"), field="return_quantity"),
+                    "supply_amount": record.get("return_supply_amount"),
+                }
+            else:
+                raise SnapshotContractError("product statistics row kind is invalid")
+        for record in chunk[kinds == "event"].to_dict("records"):
+            if _event_grain_int(record.get("mapping_count"), field="mapping_count") == 1:
+                code = str(record.get("product_code") or "").strip()
+                try:
+                    paid_quantity = Decimal(str(record.get("paid_quantity") or 0).strip())
+                except (InvalidOperation, ValueError):
+                    paid_quantity = Decimal(0)
+                if paid_quantity > 0 and paid_quantity == paid_quantity.to_integral_value():
+                    paid_quantities[code] += int(paid_quantity)
+    if not frequency_chunks:
+        raise SnapshotContractError("product statistics stream returned no frequency rows")
+    monthly, diagnostics, days, customers = _aggregate_extended_event_grain_chunks(frequency_chunks)
+    return monthly, diagnostics, days, customers, dict(paid_quantities), return_statistics, sales_prices
+
+
+def _aggregate_event_grain_chunks(chunks: Iterable[pd.DataFrame]) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    def _legacy_compatible() -> Iterable[pd.DataFrame]:
+        for chunk in chunks:
+            if isinstance(chunk, pd.DataFrame) and "vendor_code" not in chunk.columns:
+                chunk = chunk.copy()
+                chunk["vendor_code"] = "__legacy_fixture__"
+            yield chunk
+
+    monthly_rows, diagnostics, _day_counts, _customer_counts = _aggregate_extended_event_grain_chunks(_legacy_compatible())
+    return monthly_rows, diagnostics
+
+
+def _select_snapshot_product_universe(
+    lifecycle_df: pd.DataFrame,
+    monthly_rows: Sequence[Mapping[str, Any]],
+) -> tuple[list[str], dict[str, int]]:
+    """Select profile-scoped products with stock or basis-period movement evidence."""
+    required = {"product_code", "current_stock_present", "basis_inbound_present"}
+    if not isinstance(lifecycle_df, pd.DataFrame) or not required.issubset(lifecycle_df.columns):
+        raise SnapshotContractError("product universe evidence query returned an invalid shape")
+    work = lifecycle_df.copy()
+    work["product_code"] = work["product_code"].fillna("").astype(str).str.strip()
+    work = work.loc[work["product_code"].ne("")].drop_duplicates("product_code", keep="first")
+    stock_products = set(
+        work.loc[pd.to_numeric(work["current_stock_present"], errors="coerce").fillna(0).astype(int).eq(1), "product_code"]
+    )
+    inbound_products = set(
+        work.loc[pd.to_numeric(work["basis_inbound_present"], errors="coerce").fillna(0).astype(int).eq(1), "product_code"]
+    )
+    outbound_products = {
+        str(row.get("product_code") or "").strip()
+        for row in monthly_rows
+        if str(row.get("product_code") or "").strip()
+    }
+    profile_products = set(work["product_code"])
+    eligible = sorted(profile_products & (stock_products | inbound_products | outbound_products))
+    return eligible, {
+        "profile_product_count": len(profile_products),
+        "current_stock_product_count": len(stock_products),
+        "basis_inbound_product_count": len(inbound_products),
+        "basis_outbound_product_count": len(outbound_products),
+        "eligible_product_count": len(eligible),
+    }
 
 
 def query_sqlserver_fixture(sql: str, binds: Mapping[str, Any], *, timeout_seconds: int = 30) -> pd.DataFrame:
@@ -926,43 +1352,132 @@ def _aggregate_result(frame: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
     return rows, diagnostics
 
 
-def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None) -> dict[str, Any]:
+def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None, classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority) -> dict[str, Any]:
     actor = str(created_by or "").strip()
     if not actor:
         raise SnapshotContractError("created_by is required")
     query = query_executor or _query_company_df
     report = progress_reporter or (lambda _message: None)
-    universe_sql, universe_binds = product_universe_sql()
-    report("제품 조회 중")
-    universe_df = query(plan.company_id, universe_sql, universe_binds, timeout_seconds)
-    if not isinstance(universe_df, pd.DataFrame) or "product_code" not in universe_df.columns:
-        raise SnapshotContractError("product universe query returned an invalid shape")
-    product_codes = sorted({str(value).strip() for value in universe_df["product_code"].tolist() if str(value).strip()})
-    if not product_codes:
-        raise SnapshotContractError("official Rddbc040 product universe is empty")
+    evaluation_last_day = date(
+        int(plan.evaluation_month[:4]),
+        int(plan.evaluation_month[4:]),
+        calendar.monthrange(int(plan.evaluation_month[:4]), int(plan.evaluation_month[4:]))[1],
+    )
+    lifecycle_cutoff = min(evaluation_last_day, kst_today()).strftime("%Y%m%d")
+    lifecycle_sql, lifecycle_binds = product_lifecycle_sql(
+        stock_codes=plan.stock_codes,
+        cutoff_date=lifecycle_cutoff,
+        basis_from=plan.basis_from,
+        basis_to=plan.basis_to,
+        stock_mode=plan.stock_mode,
+        product_group_codes=plan.product_group_codes,
+        product_di_codes=plan.product_di_codes,
+        product_class_codes=plan.product_class_codes,
+        price_lookback_from=_month_start_months_before(plan.basis_from, 9),
+    )
+    report("제품 및 최초 정상 입고 조회 중")
+    lifecycle_df = query(plan.company_id, lifecycle_sql, lifecycle_binds, timeout_seconds)
+    if not isinstance(lifecycle_df, pd.DataFrame) or "product_code" not in lifecycle_df.columns:
+        raise SnapshotContractError("product lifecycle query returned an invalid shape")
     report("출고 집계 중")
+    aggregate_sql, aggregate_binds = product_statistics_event_stream_sql(plan)
     if query_executor is None:
-        aggregate_sql, aggregate_binds = outbound_event_grain_stream_sql(plan)
-        monthly_rows, diagnostics = _aggregate_event_grain_chunks(
+        monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
             _query_company_chunks(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds)
         )
     else:
-        # Fixture callers remain DataFrame-based; the production path above is
-        # the bounded event stream and still makes exactly two ERP calls.
-        aggregate_sql, aggregate_binds = outbound_monthly_aggregate_sql(plan)
-        monthly_rows, diagnostics = _aggregate_result(query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds))
+        monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
+            (query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds),)
+        )
+    product_codes, universe_diagnostics = _select_snapshot_product_universe(lifecycle_df, monthly_rows)
+    if not product_codes:
+        raise SnapshotContractError("dashboard profile product universe is empty")
+    product_code_set = set(product_codes)
+    monthly_rows = [row for row in monthly_rows if str(row.get("product_code") or "").strip() in product_code_set]
+    product_day_counts = {code: value for code, value in product_day_counts.items() if code in product_code_set}
+    product_customer_counts = {code: value for code, value in product_customer_counts.items() if code in product_code_set}
+    outbound_paid_quantities = {code: value for code, value in outbound_paid_quantities.items() if code in product_code_set}
+    return_statistics = {code: value for code, value in return_statistics.items() if code in product_code_set}
+    sales_prices = {code: value for code, value in sales_prices.items() if code in product_code_set}
+    for price in sales_prices.values():
+        price["status"] = _price_status(plan.evaluation_month, price.get("basis_month"))
+    first_inbound_months = {
+        str(row.get("product_code") or "").strip(): row.get("first_normal_inbound_month")
+        for row in lifecycle_df.to_dict("records")
+        if str(row.get("product_code") or "").strip() in product_code_set
+    }
+    purchase_prices = {
+        str(row.get("product_code") or "").strip(): {
+            "unit_price": row.get("avg_purchase_unit_cost"),
+            "basis_month": row.get("purchase_price_basis_month"),
+            "status": _price_status(plan.evaluation_month, row.get("purchase_price_basis_month")),
+        }
+        for row in lifecycle_df.to_dict("records")
+        if str(row.get("product_code") or "").strip() in product_code_set
+    }
+    classification_authority = classification_authority_loader(
+        company_id=plan.company_id,
+        as_of=date(int(lifecycle_cutoff[:4]), int(lifecycle_cutoff[4:6]), int(lifecycle_cutoff[6:])),
+    )
+    adjustment_only_products: set[str] = set()
+    profitability_unavailable_products: set[str] = set()
+    for row in lifecycle_df.to_dict("records"):
+        code = str(row.get("product_code") or "").strip()
+        if code not in product_code_set:
+            continue
+        targets = ProductClassificationTargets(
+            product_group_keys=tuple(value for value in (str(row.get("product_group_key") or "").strip(),) if value and not value.endswith(":")),
+            product_di_keys=tuple(value for value in (str(row.get("product_di_key") or "").strip(),) if value and not value.endswith(":")),
+            product_class_keys=tuple(value for value in (str(row.get("product_class_key") or "").strip(),) if value and not value.endswith(":")),
+        )
+        classification = classify_product_from_loaded_authority(
+            authority=classification_authority,
+            company_id=plan.company_id,
+            product_code=code,
+            targets=targets,
+        )
+        if classification.status == ClassificationStatus.READY and classification.adjustment_only:
+            adjustment_only_products.add(code)
+        elif classification.status in {
+            ClassificationStatus.UNAVAILABLE, ClassificationStatus.CONFLICT, ClassificationStatus.CORRUPT
+        }:
+            profitability_unavailable_products.add(code)
+    log.info(
+        "[dashboard.snapshot.product_universe] company_id=%s evaluation_month=%s profile_products=%s current_stock_products=%s basis_inbound_products=%s basis_outbound_products=%s eligible_products=%s product_group_filters=%s product_di_filters=%s product_class_filters=%s stock_mode=%s",
+        plan.company_id,
+        plan.evaluation_month,
+        universe_diagnostics["profile_product_count"],
+        universe_diagnostics["current_stock_product_count"],
+        universe_diagnostics["basis_inbound_product_count"],
+        universe_diagnostics["basis_outbound_product_count"],
+        universe_diagnostics["eligible_product_count"],
+        len(plan.product_group_codes),
+        len(plan.product_di_codes),
+        len(plan.product_class_codes),
+        plan.stock_mode,
+    )
     report("등급 계산 중")
-    relational_snapshot = build_relational_frequency_snapshot_from_aggregates(
+    relational_snapshot = build_product_statistics_relational_snapshot_from_aggregates(
         company_id=plan.company_id, evaluation_month=plan.evaluation_month, monthly_rows=monthly_rows,
-        product_codes=product_codes, stock_codes=plan.stock_codes, source_watermark=None,
+        product_codes=product_codes, product_day_counts=product_day_counts,
+        product_customer_counts=product_customer_counts,
+        first_normal_inbound_months=first_inbound_months,
+        outbound_paid_quantities=outbound_paid_quantities,
+        return_statistics=return_statistics,
+        purchase_prices=purchase_prices,
+        sales_prices=sales_prices,
+        adjustment_only_products=adjustment_only_products,
+        profitability_unavailable_products=profitability_unavailable_products,
+        stock_codes=plan.stock_codes, source_watermark=None,
         source_watermark_status="unverified", source_diagnostics=diagnostics,
+        profile_fingerprint=plan.profile_fingerprint,
     )
     key = relational_snapshot.key
     repo = repository or _company_snapshot_repository(int(plan.company_id))
     report("draft 저장 중")
     publish_relational = getattr(repo, "publish_relational", None)
     if not callable(publish_relational):
-        raise SnapshotContractError("repository does not support relational_frequency_v1")
+        raise SnapshotContractError("repository does not support relational frequency snapshots")
     draft = publish_relational(relational_snapshot, created_by=actor, force=bool(force))
     draft_generation_no = int(draft.generation_no or 0)
     draft_inspection = repo.inspect_generation(key, draft_generation_no)
@@ -975,7 +1490,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
             and draft_inspection.approval_status == "approved"
             and draft_inspection.generation_no == draft_generation_no
             and draft_inspection.checksum.lower() == relational_snapshot.checksum.lower()
-            and draft_inspection.representation == RELATIONAL_FREQUENCY_REPRESENTATION
+            and draft_inspection.representation == EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION
             and draft_inspection.relational_snapshot is not None
             and operating_read.status == "ready"
             and operating_read.generation_no == draft_generation_no
@@ -995,7 +1510,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
         or draft_inspection.approval_status != "pending"
         or draft_inspection.generation_no != draft_generation_no
         or draft_inspection.checksum.lower() != relational_snapshot.checksum.lower()
-        or draft_inspection.representation != RELATIONAL_FREQUENCY_REPRESENTATION
+        or draft_inspection.representation != EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION
         or draft_inspection.relational_snapshot is None
     ):
         raise SnapshotContractError("draft generation exact inspection failed before manual approval")
@@ -1012,7 +1527,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
     }
 
 
-def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None) -> dict[str, Any]:
+def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None, classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority) -> dict[str, Any]:
     """Generate one exact snapshot draft while preventing an overlapping run."""
     with frequency_snapshot_generation_guard(plan):
         return _generate_frequency_snapshot_draft_locked(
@@ -1023,4 +1538,5 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
             repository=repository,
             force=force,
             progress_reporter=progress_reporter,
+            classification_authority_loader=classification_authority_loader,
         )

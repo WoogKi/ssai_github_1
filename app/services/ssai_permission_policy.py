@@ -70,6 +70,7 @@ ACTION_PERMISSION_MAP: dict[str, str] = {
     "출고명세 조회": "IO_READ",
     "제품재고현황 조회": "IO_READ",
     "제품수불현황 조회": "IO_READ",
+    "제품정보 조회": "IO_READ",
     "실재고월집계 조회": "IO_READ",
     "장부재고월집계 조회": "IO_READ",
 

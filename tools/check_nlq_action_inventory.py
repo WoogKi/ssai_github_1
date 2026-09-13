@@ -90,10 +90,10 @@ def _check_panel_inventory() -> None:
     inventory_labels = list(all_panel_labels())
 
     registered_count = len(iter_action_specs())
-    if len(panel_labels) != 39 + registered_count:
-        _fail(f"panel label 수가 예상과 다릅니다: {len(panel_labels)} != {39 + registered_count}")
-    if len(CANONICAL_ACTIONS) != 35 + registered_count:
-        _fail(f"canonical action 수가 예상과 다릅니다: {len(CANONICAL_ACTIONS)} != {35 + registered_count}")
+    if len(panel_labels) != 40 + registered_count:
+        _fail(f"panel label 수가 예상과 다릅니다: {len(panel_labels)} != {40 + registered_count}")
+    if len(CANONICAL_ACTIONS) != 36 + registered_count:
+        _fail(f"canonical action 수가 예상과 다릅니다: {len(CANONICAL_ACTIONS)} != {36 + registered_count}")
     if len(set(panel_labels)) != len(panel_labels):
         _fail("panel action label에 중복이 있습니다.")
     if len(set(inventory_labels)) != len(inventory_labels):
@@ -128,7 +128,7 @@ def _check_statuses() -> None:
         for spec in CANONICAL_ACTIONS
         if spec.implementation_status not in {IMPLEMENTED, DASHBOARD_ONLY}
     ]
-    expected_implemented = 34 + len(iter_action_specs())
+    expected_implemented = 35 + len(iter_action_specs())
     if len(implemented) != expected_implemented or len(dashboard_only) != 1 or other:
         _fail(
             "implementation status count 불일치: "
@@ -156,7 +156,7 @@ def _check_handler_coverage() -> None:
     io_specs = {
         spec.canonical_action
         for spec in CANONICAL_ACTIONS
-        if spec.handler_kind in {"io_service", "erp_table"}
+        if spec.handler_kind in {"io_service", "snapshot_service", "erp_table"}
     }
     if set(IO_VIEW_FALLBACK_TARGETS) != io_specs:
         _fail("IO fallback action set이 canonical IO action set과 다릅니다.")
@@ -168,6 +168,8 @@ def _check_handler_coverage() -> None:
         _fail("제품수불현황 조회 fallback이 view_product_flow가 아닙니다.")
     if IO_VIEW_FALLBACK_TARGETS.get("제품재고현황 조회") != "view_product_inventory":
         _fail("제품재고현황 조회 fallback이 view_product_inventory가 아닙니다.")
+    if IO_VIEW_FALLBACK_TARGETS.get("제품정보 조회") != "view_snapshot_product_information":
+        _fail("제품정보 조회 fallback이 view_snapshot_product_information이 아닙니다.")
     if hasattr(rddbc_io_views, "view_rddbc250") or hasattr(rddbc_io_views, "view_rddbc260"):
         _fail("aggregate IO view에 사용 금지 fallback alias가 노출됐습니다.")
 

@@ -9,6 +9,7 @@ ready; they must never fall back to weekday-only calculations silently.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Mapping
 
@@ -39,6 +40,21 @@ class RecentBusinessDaysResult:
     status: str
     dates: tuple[str, ...] = ()
     reason_code: str = ""
+    authority: str = "ssai_common_calendar"
+
+
+@dataclass(frozen=True)
+class BusinessDayMonthContext:
+    evaluation_date: str
+    evaluation_month: str
+    calendar_days_total: int
+    elapsed_calendar_days: int
+    calendar_progress_ratio: float
+    business_days_total: int | None = None
+    elapsed_business_days: int | None = None
+    business_day_progress_ratio: float | None = None
+    authority_status: str = "unavailable"
+    reason: str = ""
     authority: str = "ssai_common_calendar"
 
 
@@ -103,6 +119,62 @@ def recent_business_days(
             authority=authority.authority,
         )
     return RecentBusinessDaysResult(status="ready", dates=tuple(dates), authority=authority.authority)
+
+
+def business_day_month_context(
+    *,
+    evaluation_date: date | None = None,
+    calendar_loader: CalendarLoader = load_official_holidays,
+) -> BusinessDayMonthContext:
+    """Build one reusable month-progress context from the persisted authority."""
+    target = evaluation_date or kst_today()
+    total_calendar_days = monthrange(target.year, target.month)[1]
+    month_start = target.replace(day=1)
+    month_end = target.replace(day=total_calendar_days)
+    elapsed_calendar_days = target.day
+    base = {
+        "evaluation_date": _yyyymmdd(target),
+        "evaluation_month": target.strftime("%Y%m"),
+        "calendar_days_total": total_calendar_days,
+        "elapsed_calendar_days": elapsed_calendar_days,
+        "calendar_progress_ratio": elapsed_calendar_days / total_calendar_days,
+    }
+    authority = _official_calendar(
+        start_date=month_start,
+        end_date=month_end,
+        calendar_loader=calendar_loader,
+    )
+    if authority.status != "ready":
+        return BusinessDayMonthContext(
+            **base,
+            authority_status="unavailable",
+            reason=authority.reason_code,
+            authority=authority.authority,
+        )
+
+    business_dates = [
+        month_start + timedelta(days=offset)
+        for offset in range(total_calendar_days)
+        if (month_start + timedelta(days=offset)).weekday() < 5
+        and _yyyymmdd(month_start + timedelta(days=offset)) not in authority.holiday_dates
+    ]
+    elapsed_business_days = sum(1 for value in business_dates if value <= target)
+    business_days_total = len(business_dates)
+    if business_days_total <= 0:
+        return BusinessDayMonthContext(
+            **base,
+            authority_status="unavailable",
+            reason="calendar_month_has_no_business_days",
+            authority=authority.authority,
+        )
+    return BusinessDayMonthContext(
+        **base,
+        business_days_total=business_days_total,
+        elapsed_business_days=elapsed_business_days,
+        business_day_progress_ratio=elapsed_business_days / business_days_total,
+        authority_status="ready",
+        authority=authority.authority,
+    )
 
 
 def recent_business_dates(

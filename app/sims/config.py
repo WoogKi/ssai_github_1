@@ -38,6 +38,7 @@ ACTIONS_BY_CATEGORY = {
         "재고 부족(임계치)",
         "최근 입고 100",
         "최근 출하 100",
+        "제품정보 조회",
     ],
     "입출고/명세서/재고": [
         "입고명세 조회",
@@ -80,6 +81,7 @@ ACTIONS_REQUIRE_BUTTON = {
     "출고↔세금계산서 검증",
     "제품수불현황 조회",
     "제품재고현황 조회",
+    "제품정보 조회",
 }
 
 from app.sims.meta.erp_table_feature_registry import iter_action_specs

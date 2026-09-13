@@ -354,8 +354,11 @@ def test_product_inventory_snapshot_attachment() -> None:
     _assert(calls == [{"company_id": 6, "evaluation_month": "202601", "stock_codes": ["00001"]}], "reader must use profile scope, not table filter")
     _assert(meta["frequency_snapshot_status"] == "ready" and meta["frequency_additional_erp_source_call_count"] == 0, "ready attachment keeps ERP calls at zero")
     _assert(
-        list(attached.columns[:4]) == ["제품코드", "출고빈도등급", "3개월 출고발생수", "재고수량"],
-        "frequency columns must remain beside the shared product key",
+        list(attached.columns[:6]) == [
+            "제품코드", "출고빈도등급", "손익등급", "기여도등급",
+            "3개월 출고발생수", "재고수량",
+        ],
+        "Snapshot grades must remain beside the shared product key when insurance code is absent",
     )
     _assert(attached.loc[0, "출고빈도등급"] == expected["P1"]["frequency_grade"], "P1 grade must match Dashboard snapshot")
     _assert(attached.loc[1, "출고빈도등급"] == expected["P1"]["frequency_grade"], "duplicate P1 rows must keep the same snapshot grade")

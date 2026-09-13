@@ -17,6 +17,7 @@ from app.services.product_master_filter_contract import extract_product_di_seman
 
 
 _ACTION_WORDS = (
+    "발주 내역 보여줘", "발주 보여줘", "발주내역", "발주 내역", "발주현황", "발주 현황",
     "최근 발주내역 조회", "최근 발주 조회", "발주내역 조회", "발주 내역 조회", "오늘 발주 조회", "이번주 발주 조회",
     "입고중 발주 조회", "미입고 발주 조회", "발주조회", "발주 조회",
     "발주상태",
@@ -398,11 +399,18 @@ def _resolve_order_nlq(
     return {"action": action_spec.action, "params": params}
 
 
+def is_order_calculation_request(text: str) -> bool:
+    """Reserve calculation intent without executing the existing order inquiry."""
+    return bool(re.search(r"발주\s*계산|권장\s*발주", _clean(text)))
+
+
 def resolve_registered_erp_table_nlq(
     text: str,
     *,
     today: date | None = None,
 ) -> Optional[dict[str, Any]]:
+    if is_order_calculation_request(text):
+        return None
     matched = match_action_in_text(text)
     if matched is None:
         return None

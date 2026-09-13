@@ -117,6 +117,13 @@ CANONICAL_ACTIONS: tuple[CanonicalAction, ...] = (
     _spec("제품수불현황 조회", "입출고/명세서/재고", aliases=("제품수불현황",), handler_kind="io_service", handler_target="app.services.product_flow_service.get_product_flow_result"),
     _spec("제품재고현황 조회", "입출고/명세서/재고", aliases=("제품재고현황",), handler_kind="io_service", handler_target="app.services.product_inventory_service.get_product_inventory_result"),
     _spec(
+        "제품정보 조회",
+        "재고",
+        nlq_aliases=("제품정보", "제품 정보", "제품 정보 조회", "Snapshot 제품정보 조회", "스냅샷 제품정보 조회"),
+        handler_kind="snapshot_service",
+        handler_target="app.services.snapshot_product_information_service.get_snapshot_product_information_result",
+    ),
+    _spec(
         "현재고 조회",
         "입출고/명세서/재고",
         nlq_aliases=("현재고",),
@@ -158,6 +165,7 @@ IO_VIEW_FALLBACK_TARGETS = {
     "출고↔세금계산서 검증": "view_rddbc120_tax_check",
     "제품수불현황 조회": "view_product_flow",
     "제품재고현황 조회": "view_product_inventory",
+    "제품정보 조회": "view_snapshot_product_information",
 }
 
 from app.sims.meta.erp_table_feature_registry import iter_action_specs

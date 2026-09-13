@@ -1725,7 +1725,7 @@ def handle_analytics_kpi_followup(
     # ------------------------------------------------------------
 
     wants_sales_maker = (
-        any(marker in compact for marker in ("제조사별", "제조사분석"))
+        any(marker in compact for marker in ("제조사별", "제조사분석", "제조사집계"))
         and any(w in compact for w in ("매출", "분석", "요약", "집계", "금액", "TOP", "상위"))
     )
 

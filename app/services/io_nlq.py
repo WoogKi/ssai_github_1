@@ -46,8 +46,16 @@ _PRODUCT_INVENTORY_WORDS = (
 )
 
 _CURRENT_STOCK_WORDS = ("현재고",)
+_PRODUCT_INFORMATION_WORDS = (
+    "제품정보",
+    "제품 정보",
+    "제품정보 조회",
+    "제품 정보 조회",
+    "Snapshot 제품정보 조회",
+    "스냅샷 제품정보 조회",
+)
 
-_PRODUCT_IO_WORDS = _PRODUCT_FLOW_WORDS + _PRODUCT_INVENTORY_WORDS
+_PRODUCT_IO_WORDS = _PRODUCT_FLOW_WORDS + _PRODUCT_INVENTORY_WORDS + _PRODUCT_INFORMATION_WORDS
 
 _TRANSACTION_SIGNAL_WORDS = (
     "내역",
@@ -1197,6 +1205,7 @@ _NAME_STOP_WORDS = (
     "제품수불", "제품수불부", "제품수불현황",
     "재고", "재고장", "재고현황",
     "제품재고장", "제품재고현황",
+    "제품정보", "제품 정보",
     "실수불", "장부수불", "실재고", "장부재고",
     "입출고일자", "명세서일자",
 
@@ -1829,6 +1838,8 @@ def _action_consumed_aliases(action: str) -> tuple[str, ...]:
         phrases.update(_PRODUCT_INVENTORY_WORDS)
     elif normalized_action == "현재고 조회":
         phrases.update(_CURRENT_STOCK_WORDS)
+    elif normalized_action == "제품정보 조회":
+        phrases.update(_PRODUCT_INFORMATION_WORDS)
     elif normalized_action in {"입고명세 조회", "출고명세 조회"}:
         # Detail actions accept their registered transaction nouns with or
         # without a space.  They are action syntax, never an unlabeled entity.
@@ -3021,7 +3032,9 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
     if not raw:
         return None
 
-    from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
+    from app.services.erp_table_nlq import is_order_calculation_request, resolve_registered_erp_table_nlq
+    if is_order_calculation_request(raw):
+        return None
 
     registered = resolve_registered_erp_table_nlq(raw, today=today)
     if isinstance(registered, dict):
@@ -3065,6 +3078,39 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
         and any(k in raw for k in ("입고명세", "출고명세", "거래명세서", "세금계산서", "입고", "출고", "매입", "매출"))
     ):
         params = _apply_date_params_for_io_detail(params, raw)
+
+    if _has_any(raw, _PRODUCT_INFORMATION_WORDS):
+        # Consume the registered action aliases before the common entity extractor.
+        entity_text = raw
+        for alias in sorted(_PRODUCT_INFORMATION_WORDS, key=len, reverse=True):
+            entity_text = entity_text.replace(alias, " ")
+        info_frequency = re.search(r"출고빈도(?:등급|구분)?\s*[:=]?\s*([A-FX])(?:\s*등급)?", raw, re.IGNORECASE)
+        if info_frequency:
+            frequency_grade = info_frequency.group(1).upper()
+        params = extract_params(entity_text, today=today)
+        from app.services.erp_table_nlq import _extract_name, _extract_code
+        from app.sims.meta.erp_table_feature_registry import RDDBC230, filter_labels
+        for key in ("product_keyword", "maker_nm", "product_group_nm", "product_di_nm", "product_class_nm"):
+            value = _extract_name(entity_text, filter_labels(RDDBC230, key))
+            if value:
+                params[key] = value
+        for key in ("insu_cd", "barcode"):
+            value = _extract_code(entity_text, filter_labels(RDDBC230, key))
+            if value:
+                params[key] = value
+        if frequency_grade:
+            params["frequency_grade"] = "unavailable" if frequency_grade == "빈도자료 부족" else frequency_grade
+        for key, label in (("profit_grade", "손익"), ("contribution_grade", "기여도")):
+            match = re.search(rf"{label}\s*등급\s*[:=]?\s*([A-E])(?:\s*등급)?", raw, re.IGNORECASE)
+            if match:
+                params[key] = match.group(1).upper()
+        if "신규품목" in raw or "신규 제품" in raw:
+            params["lifecycle_status"] = "new_product"
+        elif "기존품목" in raw or "기존 제품" in raw:
+            params["lifecycle_status"] = "established_product"
+        elif "최초 입고정보 없음" in raw:
+            params["lifecycle_status"] = "unknown_lifecycle"
+        return _result("제품정보 조회", params)
 
     if _has_any(raw, _CURRENT_STOCK_WORDS):
         params = _apply_date_params_for_product_inventory(params, raw)

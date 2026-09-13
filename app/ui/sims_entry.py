@@ -119,6 +119,7 @@ def _panel_sidebar() -> Dict[str, str]:
         target: list(menu_actions(business_group="재고관리", target=target))
         for target in inventory_target_options
     }
+    inventory_action_options_map.setdefault("재고", []).append("제품정보 조회")
 
     io_action_group_map = {
         "명세/공통": [

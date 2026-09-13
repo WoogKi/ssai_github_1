@@ -1073,7 +1073,11 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
         except (ValueError, TypeError):
             elapsed_days = total_days = None
 
-    judgement_digits = re.sub(r"\D", "", str((facts.get("period") or {}).get("judgement_date") or ""))[:8]
+    judgement_digits = re.sub(
+        r"\D",
+        "",
+        str((facts.get("period") or {}).get("judgement_date") or visualization.get("evaluation_date") or ""),
+    )[:8]
     judgement_day = None
     if len(judgement_digits) == 8 and (not evaluation_month or judgement_digits[:6] == evaluation_month):
         judgement_day = int(judgement_digits[-2:])
@@ -1154,7 +1158,7 @@ def _sales_gauge_state(facts: dict[str, Any]) -> dict[str, Any]:
         "gauge_max_pct": 100.0,
         "needle_pct": progress,
         "today_marker_pct": today_progress,
-        "time_basis_label": "오늘까지 누적 목표",
+        "time_basis_label": "오늘까지 영업일 기준 예상",
     }
 
 
@@ -1213,14 +1217,14 @@ def _build_sales_gauge_markup(facts: dict[str, Any], *, render_namespace: str = 
     ])
     if not gauge_available:
         main_text = "자료부족"
-        gauge_label = "비교 자료 없음" if state["is_completed_month"] else "월 목표 대비 실제 진행률 계산 불가"
+        gauge_label = "비교 자료 없음" if state["is_completed_month"] else "월말 예상 대비 실제 진행률 계산 불가"
         gauge_sub = (
             "평가월의 공식 예상매출 자료를 확인해 주세요."
             if state["is_completed_month"] else "평가월의 현재매출·월말 예상 자료를 확인해 주세요."
         )
     else:
         main_text = f"{_fmt_number(progress, 1)}%"
-        gauge_label = "월 목표 대비 실제 진행률"
+        gauge_label = "월말 예상 대비 실제 진행률"
         if state["is_completed_month"]:
             amount_unit = _facts_amount_display_unit(facts)
             difference = state.get("completed_forecast_difference")
@@ -1270,7 +1274,7 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
         (
             f"{state['judgement_basis']} 예상매출",
             state["expected_to_date_sales"],
-            "평가월 말일 기준" if state["is_completed_month"] else ("월 경과율 반영" if state["expected_to_date_available"] else "경계월 계산 제외"),
+            "평가월 말일 기준" if state["is_completed_month"] else ("영업일 경과율 반영" if state["expected_to_date_available"] else "영업일 자료 부족"),
             "amount",
             "judgement",
             "자료부족" if state["expected_to_date_sales"] is None else "",
@@ -1408,7 +1412,7 @@ def _render_sales_brief(facts: dict[str, Any]) -> None:
         f"<div class=\"dashboard-lite-sales-brief-title\">{title_icon}<span>오늘의 매출 요약</span></div>"
         + insight_html
         + "</div>"
-        + "<div class=\"dashboard-lite-sales-brief-note\">기준일 예상매출은 평가월 경과율을 반영하며, 완료월은 말일 기준입니다.</div>"
+        + "<div class=\"dashboard-lite-sales-brief-note\">현재월 기준일 예상매출은 영업일 경과율을 반영하며, 완료월은 말일 기준입니다.</div>"
         + "</div>",
         unsafe_allow_html=True,
     )
@@ -2050,6 +2054,7 @@ def _build_outbound_frequency_chart(facts: dict[str, Any]) -> alt.Chart | None:
     rows = [
         {"label": grade, "count": int(counts.get(grade) or 0), "color": color}
         for grade, color in (
+            ("F", "#7c3aed"),
             ("A", "#2563eb"), ("B", "#0ea5e9"), ("C", "#14b8a6"),
             ("D", "#f59e0b"), ("E", "#f97316"), ("X", "#94a3b8"),
             ("빈도자료 부족", "#64748b"),
@@ -2064,6 +2069,7 @@ def _build_outbound_frequency_distribution_chart(facts: dict[str, Any]) -> alt.C
     rows = [
         {"grade": grade, "count": int(counts.get(grade) or 0), "color": color}
         for grade, color in (
+            ("F", "#7c3aed"),
             ("A", "#2563eb"), ("B", "#0ea5e9"), ("C", "#14b8a6"),
             ("D", "#f59e0b"), ("E", "#f97316"), ("X", "#94a3b8"),
         )
@@ -2304,7 +2310,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     risk_rows = [dict(row) for row in (inventory.get("risk_detail_rows") or []) if isinstance(row, Mapping)]
     vendor_options, vendor_labels = _risk_detail_vendor_options(risk_rows)
     status_options = ["전체", "긴급 부족", "재고 경고", "적정 재고", "과다 재고", "예상수요 없음", "자료 부족"]
-    frequency_options = ["전체", "A", "B", "C", "D", "E", "X", "빈도자료 부족"]
+    frequency_options = ["전체", "F", "A", "B", "C", "D", "E", "X", "빈도자료 부족"]
     applied_key = f"__dashboard_lite_inventory_detail_applied::{namespace}"
     with st.form(key=f"dashboard_inventory_detail_form::{namespace}", clear_on_submit=False, enter_to_submit=False):
         filter_cols = st.columns((19, 17, 18, 23))
@@ -5236,7 +5242,7 @@ def _render_dashboard_facts(
                             )
             with top_right:
                 with st.container(key=f"dashboard_inventory_card__frequency__{render_namespace}"):
-                    _render_summary_card_heading("cycle", "frequency", "출고빈도 분포", "승인된 직전 완료 3개월 snapshot · A → E / X")
+                    _render_summary_card_heading("cycle", "frequency", "출고빈도 분포", "승인된 최근 완료 3개월 출고자료 · F / A → E / X")
                     with st.container(key=f"dashboard_inventory_card_body__frequency__{render_namespace}"):
                         frequency_chart = _build_outbound_frequency_distribution_chart(facts)
                         if frequency_chart is not None:
@@ -5245,7 +5251,7 @@ def _render_dashboard_facts(
                     if snapshot_status == "ready":
                         st.markdown(
                             '<div class="dashboard-lite-inventory-card-footer">'
-                            'X: 최근 3개월 정상 출고 발생 없음. 막대 길이는 최대 등급 대비이며, 화면 필터는 등급 산정 후 적용됩니다.'
+                            'F: 3개월 이내 최초 입고 품목. X: 최근 3개월 정상 출고 없음. 빈도자료 부족: 현재 조회범위와 일치하는 승인자료 또는 해당 제품의 출고자료가 없습니다.'
                             '</div>',
                             unsafe_allow_html=True,
                         )

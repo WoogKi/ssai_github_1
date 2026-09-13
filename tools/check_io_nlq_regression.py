@@ -7462,6 +7462,8 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                     index=out.index,
                     dtype="Int64",
                 )
+                out["손익등급"] = product_codes.map({"00001": "B", "00002": "C"}).fillna("자료 부족")
+                out["기여도등급"] = product_codes.map({"00001": "A", "00002": "D"}).fillna("자료 부족")
                 return out, {"frequency_snapshot_status": "ready", "frequency_additional_erp_source_call_count": 0}
 
             inventory_service.attach_dashboard_frequency_snapshot = _ready_frequency
@@ -7494,15 +7496,19 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                     and general_stock_meta["sum_stock_qty"] == baseline_stock_meta["sum_stock_qty"]
                     and general_stock_meta["sum_insu_amt"] == baseline_stock_meta["sum_insu_amt"]
                     and general_meta.get("frequency_additional_erp_source_call_count") == 0
-                    and list(general_display.columns)[1:4] == ["제품코드", "출고빈도", "출고횟수"]
+                    and list(general_display.columns)[
+                        list(general_display.columns).index("재고수량") + 1:
+                        list(general_display.columns).index("재고수량") + 4
+                    ] == ["출고빈도등급", "손익등급", "기여도등급"]
                     and list(general_source.columns) == list(general_display.columns)
-                    and general_display.loc[general_display["제품코드"] == "00001", "출고빈도"].eq("A").all()
-                    and general_display.loc[general_display["제품코드"] == "00001", "출고횟수"].eq(4).all()
+                    and general_display.loc[general_display["제품코드"] == "00001", "출고빈도등급"].eq("A").all()
+                    and general_display.loc[general_display["제품코드"] == "00001", "손익등급"].eq("B").all()
+                    and general_display.loc[general_display["제품코드"] == "00001", "기여도등급"].eq("A").all()
                 )
                 results.append(
                     _ok(
                         f"current stock always displays frequency columns: {query_params or 'all'}",
-                        "all rows retained; snapshot projection adds 출고빈도/출고횟수",
+                        "all rows retained; snapshot projection adds three grades after 재고수량",
                     )
                     if general_frequency_ok
                     else _fail(
@@ -7534,6 +7540,8 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                 out = frame.copy()
                 out["출고빈도등급"] = "빈도자료 부족"
                 out["3개월 출고발생수"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+                out["손익등급"] = "자료 부족"
+                out["기여도등급"] = "자료 부족"
                 return out, {"frequency_snapshot_status": "missing", "frequency_additional_erp_source_call_count": 0}
 
             inventory_service.attach_dashboard_frequency_snapshot = _missing_frequency
@@ -7565,14 +7573,17 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                 {"group_basis": "stock", "current_stock_query": True},
             )
             current_stock_frequency_columns_ok = (
-                list(frequency_display.columns)[1:3] == ["제품코드", "출고빈도"]
-                and "출고횟수" in frequency_display.columns
+                list(frequency_display.columns)[
+                    list(frequency_display.columns).index("재고수량") + 1:
+                    list(frequency_display.columns).index("재고수량") + 4
+                ] == ["출고빈도등급", "손익등급", "기여도등급"]
                 and list(frequency_source.columns) == list(frequency_display.columns)
-                and frequency_display.loc[frequency_display["제품코드"] == "00001", "출고빈도"].eq("A").all()
-                and frequency_display.loc[frequency_display["제품코드"] == "00001", "출고횟수"].eq(4).all()
+                and frequency_display.loc[frequency_display["제품코드"] == "00001", "출고빈도등급"].eq("A").all()
+                and frequency_display.loc[frequency_display["제품코드"] == "00001", "손익등급"].eq("B").all()
+                and frequency_display.loc[frequency_display["제품코드"] == "00001", "기여도등급"].eq("A").all()
             )
             results.append(
-                _ok("current stock frequency preserves display/full columns", "출고빈도/출고횟수")
+                _ok("current stock frequency preserves display/full columns", "출고빈도/손익/기여도 등급")
                 if current_stock_frequency_columns_ok
                 else _fail("current stock frequency preserves display/full columns", repr(frequency_display.to_dict("records")))
             )

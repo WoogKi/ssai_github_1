@@ -221,6 +221,7 @@ def _normalize_io_action_spacing(txt: str) -> str:
         (r"제품\s*수불", "제품수불"),
         (r"제품\s*재고\s*현황", "제품재고현황"),
         (r"제품\s*재고\s*장", "제품재고장"),
+        (r"제품\s*정보\s*조회", "제품정보 조회"),
         (r"실\s*재고\s*월\s*집계", "실재고월집계"),
         (r"장부\s*재고\s*월\s*집계", "장부재고월집계"),
         (r"입고\s*명세", "입고명세"),
@@ -339,6 +340,7 @@ def _is_io_inventory_phrase(txt: str) -> bool:
             "제품수불",
             "제품재고현황",
             "제품재고장",
+            "제품정보 조회",
             "재고현황",
             "재고장",
         )
@@ -373,6 +375,7 @@ def _is_explicit_io_nlq_phrase(txt: str) -> bool:
         "제품수불",
         "제품재고현황",
         "제품재고장",
+        "제품정보 조회",
         "재고현황",
         "재고장",
     )
@@ -1290,6 +1293,9 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     """
     normalized = keyboard_fix(str(txt or "").strip())
     if not normalized:
+        return None
+    from app.services.erp_table_nlq import is_order_calculation_request
+    if is_order_calculation_request(normalized):
         return None
     if looks_like_pasted_formatted_content(normalized):
         return None
@@ -6559,6 +6565,10 @@ def _try_handle_io_nlq(
             "app.services.product_inventory_service",
             ["get_product_inventory_result"],
         ),
+        "제품정보 조회": (
+            "app.services.snapshot_product_information_service",
+            ["get_snapshot_product_information_result"],
+        ),
     }
 
     from app.sims.meta.erp_table_feature_registry import iter_action_specs
@@ -7099,6 +7109,10 @@ def try_handle_nlq(
     """
     raw = (user_text or "").strip()
     if not raw:
+        return False
+    from app.services.erp_table_nlq import is_order_calculation_request
+    if is_order_calculation_request(raw):
+        logger.info("[nlq.router] reserved order calculation intent; defer without query")
         return False
     if looks_like_pasted_formatted_content(raw):
         logger.info("[nlq.router] pasted formatted content; defer to normal answer route")

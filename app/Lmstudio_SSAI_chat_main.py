@@ -757,6 +757,7 @@ def _clear_sims_runtime_for_company_change(reason: str = "company_change") -> No
             "__sims_panel_last_final_action",
             "__sims_panel_last_final_payload",
             "__sims_last_final_payload_for_chat",
+            "__sims_pending_submission",
             "__sims_last_final_payload_for_chat_action",
             "__sims_panel_source_promoted_sig",
             "__sims_panel_chat_push_sig",
@@ -1162,6 +1163,7 @@ def _request_sims_close_for_new_pending_room() -> None:
             "__sims_panel_last_final_action",
             "__sims_panel_last_final_payload",
             "__sims_last_final_payload_for_chat",
+            "__sims_pending_submission",
             "__sims_panel_source_promoted_sig",
             "__sims_panel_chat_push_sig",
             "__sims_last_push_sig",
@@ -1259,6 +1261,7 @@ def _close_sims_panel_for_room_change() -> None:
             "__sims_panel_last_final_action",
             "__sims_panel_last_final_payload",
             "__sims_last_final_payload_for_chat",
+            "__sims_pending_submission",
             "__sims_last_final_payload_for_chat_action",
             "__sims_last_render_run_seq",
             "__sims_panel_source_promoted_sig",
@@ -7703,8 +7706,8 @@ def _push_panel_result_to_current_chat(
     selected_for_render = selected_for_render or {}
 
     stored_payload = ss.get("__sims_last_final_payload_for_chat")
-    if not isinstance(stored_payload, dict):
-        stored_payload = ss.get("__sims_panel_last_final_payload")
+    if not isinstance(stored_payload, dict) or not (stored_payload.get("meta") or {}).get("_panel_submission_id"):
+        return False
 
     if isinstance(stored_payload, dict) and not _sims_payload_matches_current_company(stored_payload):
         payload_company_id, payload_db_name = _sims_payload_company_sig(stored_payload)
@@ -11113,7 +11116,7 @@ def _render_sims_sidebar_fragment() -> None:
 
     # 조회 결과 push 직후 다음 rerun에서 토글이 OFF로 보이는 현상을 보정한다.
     # 주의: __sims_open은 toggle 위젯 key라서, 반드시 st.toggle 생성 전에만 보정한다.
-    if st.session_state.pop("__sims_keep_open_after_push", False):
+    if st.session_state.pop("__sims_keep_open_after_push", False) and st.session_state.get("__sims_open"):
         st.session_state["__sims_open"] = True
         st.session_state["__sims_panel_active"] = True
 
@@ -11143,6 +11146,8 @@ def _render_sims_sidebar_fragment() -> None:
         st.session_state["__sims_panel_active"] = False
         st.session_state["__sims_run_flag"] = False
         st.session_state["__sims_inner_submit"] = False
+        st.session_state.pop("__sims_keep_open_after_push", None)
+        st.session_state.pop("__sims_pending_submission", None)
 
         if need_app_rerun:
             log.info("[ui.fragment] SIMS panel close requested → app rerun")

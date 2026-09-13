@@ -2936,6 +2936,14 @@ def _sims_business_terms(action_name: str) -> dict:
     """
     action = str(action_name or "")
 
+    if action == "제품정보 조회":
+        return {
+            "flow_label": "제품 통계", "amount_label": "추정기여금액", "vendor_label": "제약사",
+            "qty_label": "최근 3개월 출고수량", "amount_priority": ("추정기여금액",),
+            "avoid_words": ["매출 상위", "매출액", "매출실적", "인기 제품", "확정손익"],
+            "preferred_words": ["출고빈도등급", "손익등급", "기여도등급", "추정단위손익", "추정기여금액", "자료 부족"],
+        }
+
     if (
         "매입처별 재고부족 현황" in action
         or "매입처별 재고부족" in action
@@ -3640,6 +3648,12 @@ def _build_sims_analysis_context_from_df(
         business_terms,
     )
 
+    from app.ui.sims_analysis_profiles import snapshot_grade_analysis_contract
+    grade_contract = snapshot_grade_analysis_contract(action, base_df.columns)
+    if grade_contract:
+        # Product statistics contain estimates, not actual sales facts.
+        sales_time_profile, sales_group_profile = {}, {}
+
     doc_division_profile = _build_sims_doc_division_profile(base_df, action)
 
     # 거래명세서/세금계산서는 sales_*라는 내부 key 이름이 LLM 답변에 노출되기 쉽다.
@@ -3803,6 +3817,7 @@ def _build_sims_analysis_context_from_df(
             )
 
 
+    analysis_text += grade_contract
     if llm_summary_md:
         analysis_text += "\n[LLM 요약/전체 집계]\n" + llm_summary_md + "\n"
 
@@ -5600,7 +5615,15 @@ def _build_sims_detail_analysis_prompt(
     expected_rows: int,
 ) -> str:
     action_name = str(action_name or "SSAI 조회 결과").strip()
-
+    from app.ui.sims_analysis_profiles import snapshot_grade_analysis_contract
+    grade_contract = snapshot_grade_analysis_contract(action_name)
+    if grade_contract:
+        return (
+            f"현재 클릭한 표 [{action_name}]를 분석해줘. 전체 기준 {expected_rows:,}건, 표시 {display_rows:,}건이다.\n"
+            "전체 문맥/llm_summary_md를 우선하고 일부 표를 전체로 일반화하지 마라. "
+            "추정손익률 원자료 0.1은 10%로 읽고 가격 기준월과 자료 부족을 확인하라.\n"
+            + grade_contract
+        )
 
     if "제품수불현황" in action_name or "제품수불" in action_name:
         return f"""

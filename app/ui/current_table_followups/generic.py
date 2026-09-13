@@ -841,10 +841,10 @@ def _is_same_grouping_dimension(left: str, right: str) -> bool:
 def _distinct_label_for_group(df: pd.DataFrame, *, group_col: str) -> tuple[str, str]:
     """Choose a non-grouping distinct dimension for a generic group summary."""
     for col, label in [
+        ("제품코드", "제품수"),
         ("제약사명", "제약사수"),
         ("제조사명", "제조사수"),
         ("제품명", "제품수"),
-        ("제품코드", "제품수"),
         ("거래처명", "거래처수"),
         ("매입처명", "매입처수"),
     ]:

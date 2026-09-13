@@ -38,6 +38,7 @@ import time
 import traceback
 import warnings
 import zipfile
+from calendar import monthrange
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -2562,7 +2563,7 @@ def run_basic_checks() -> list[CheckResult]:
 
                 for query in (
                     "현재표 추세판정별 요약",
-                    "현재표 제조사별 매출분석",
+                    "현재표 제조사별 매출집계",
                     "현재표 제조사명별 요약",
                 ):
                     pushed_tables.clear()
@@ -2591,7 +2592,7 @@ def run_basic_checks() -> list[CheckResult]:
                 pushed_notices.clear()
                 handled = handle_current_table_followup_by_action(
                     df=summary.drop(columns=maker_columns),
-                    query="현재표 제조사별 매출분석",
+                    query="현재표 제조사별 매출집계",
                     top_n=20,
                     table_key=source_key,
                     source_action=source_action,
@@ -2675,7 +2676,7 @@ def run_basic_checks() -> list[CheckResult]:
                     }
                 )
                 manufacturer_results = []
-                for manufacturer_query in ("현재표 제조사별 매출 분석", "현재표 제조사 분석"):
+                for manufacturer_query in ("현재표 제조사별 매출 집계", "현재표 제조사 집계"):
                     pushed_tables.clear()
                     pushed_notices.clear()
                     handled = handle_current_table_followup_by_action(
@@ -2721,7 +2722,7 @@ def run_basic_checks() -> list[CheckResult]:
                 pushed_notices.clear()
                 handled = handle_current_table_followup_by_action(
                     df=latest_product_top_df,
-                    query="현재표 제조사별 매출 분석",
+                    query="현재표 제조사별 매출 집계",
                     top_n=20,
                     table_key="trend_filtered_product_top_20",
                     source_action="추세판정 ‘감소’ 제품별 매출 TOP 20",
@@ -2778,7 +2779,7 @@ def run_basic_checks() -> list[CheckResult]:
                 pushed_notices.clear()
                 handled = handle_current_table_followup_by_action(
                     df=latest_trend_summary_df,
-                    query="현재표 제조사 분석",
+                    query="현재표 제조사 집계",
                     top_n=20,
                     table_key="latest_trend_summary_5",
                     source_action="현재표 추세판정별 집계",
@@ -3120,7 +3121,7 @@ def run_basic_checks() -> list[CheckResult]:
                 pushed_notices.clear()
                 handled = handle_current_table_followup_by_action(
                     df=detail_df,
-                    query="현재표 제조사별 제품별 매출분석",
+                    query="현재표 제조사별 제품별 매출집계",
                     top_n=20,
                     table_key="detail_composite_analysis",
                     source_action="출고명세 조회",
@@ -6043,7 +6044,7 @@ def run_basic_checks() -> list[CheckResult]:
                 panel_mod._panel_payload_matches_current_company = lambda _payload: True
                 panel_mod._panel_stamp_payload_company = lambda _payload: None
                 panel_mod._apply_panel_display_limit_to_payload = lambda _payload, _title="": None
-                panel_mod._store_panel_final_payload_for_chat = lambda payload, _action: stored_empty_payloads.append(dict(payload))
+                panel_mod._store_panel_final_payload_for_chat = lambda payload, _action, **_kwargs: stored_empty_payloads.append(dict(payload))
                 panel_mod._remember_panel_final_payload = lambda *_args, **_kwargs: None
                 panel_mod._panel_result_target_chat_enabled = lambda: True
                 panel_mod._should_compact_panel_result_on_rerun = lambda *_args, **_kwargs: False
@@ -6075,6 +6076,7 @@ def run_basic_checks() -> list[CheckResult]:
                             "meta": {"execution_status": status, "result_status": status},
                         },
                         "거래처 목록",
+                        submission_id=f"fixture-{status}",
                     )
                     _assert_source_a(status)
                     if not stored_empty_payloads or (stored_empty_payloads[-1].get("meta") or {}).get("execution_status") != status:
@@ -6103,6 +6105,7 @@ def run_basic_checks() -> list[CheckResult]:
                         "meta": {"table_key": "source-b", "action": "거래처 목록"},
                     },
                     "거래처 목록",
+                    submission_id="fixture-source-b",
                 )
                 state = fake_panel_st.session_state
                 source_b_full = (state.get("__sims_export_tables_by_key") or {}).get("source-b")
@@ -8230,6 +8233,21 @@ def run_basic_checks() -> list[CheckResult]:
 
     try:
         dash_mod = importlib.import_module("app.services.dashboard_lite_facts")
+        def _business_context(value: str, elapsed: int, total: int):
+            target = datetime.strptime(value, "%Y%m%d").date()
+            calendar_total = monthrange(target.year, target.month)[1]
+            return dash_mod.BusinessDayMonthContext(
+                evaluation_date=value,
+                evaluation_month=value[:6],
+                calendar_days_total=calendar_total,
+                elapsed_calendar_days=target.day,
+                calendar_progress_ratio=target.day / calendar_total,
+                business_days_total=total,
+                elapsed_business_days=elapsed,
+                business_day_progress_ratio=elapsed / total,
+                authority_status="ready",
+            )
+
         sales_df = pd.DataFrame(
             [
                 {
@@ -8631,6 +8649,7 @@ def run_basic_checks() -> list[CheckResult]:
             demand_surge_rows,
             evaluation_month="202607",
             policy_date="20260712",
+            business_day_context=_business_context("20260712", 8, 23),
         )
         dash_mod._classify_stock_risk_rows(demand_surge_rows, readiness_warning_pct=98.0)
         demand_surge_by_code = {row.get("product_code"): row for row in demand_surge_rows}
@@ -8645,11 +8664,11 @@ def run_basic_checks() -> list[CheckResult]:
             or float(normal_demand.get("위험보정잔여예상수요") or 0) != 60
             or float(normal_demand.get("remaining_expected_demand_qty") or 0) != 60
             or not surge_emergency.get("수요급증여부")
-            or float(surge_emergency.get("진행속도기준월말예상출고수량") or 0) != 310
-            or float(surge_emergency.get("위험보정잔여예상수요") or 0) != 190
-            or surge_emergency.get("위험보정기준") != "진행속도 보정"
+            or float(surge_emergency.get("진행속도기준월말예상출고수량") or 0) != 345
+            or float(surge_emergency.get("위험보정잔여예상수요") or 0) != 225
+            or surge_emergency.get("위험보정기준") != "영업일 진행속도 보정"
             or surge_emergency.get("재고위험상태") != "긴급 부족"
-            or surge_warning.get("재고위험상태") != "부족 주의"
+            or surge_warning.get("재고위험상태") != "긴급 부족"
             or bool(surge_overstock.get("과잉후보여부"))
             or equal_forecast.get("수요급증여부")
             or not zero_forecast_surge.get("수요급증여부")
@@ -8663,10 +8682,10 @@ def run_basic_checks() -> list[CheckResult]:
         surge_action = next((item for item in surge_actions if item.get("product_code") == "SURGE_EMERGENCY"), {})
         if (
             surge_emergency.get("재고위험사유") != "수요급증 후 잔여수요 절반 미만"
-            or float(surge_action.get("remaining_expected_demand_qty") or 0) != 190
-            or float(surge_action.get("shortage_qty") or 0) != 100
-            or float(surge_action.get("shortage_amt") or 0) != 1000
-            or round(float(surge_action.get("stock_readiness_pct") or 0), 2) != 47.37
+            or float(surge_action.get("remaining_expected_demand_qty") or 0) != 225
+            or float(surge_action.get("shortage_qty") or 0) != 135
+            or float(surge_action.get("shortage_amt") or 0) != 1350
+            or round(float(surge_action.get("stock_readiness_pct") or 0), 2) != 40.0
             or "수요급증" not in str(surge_action.get("evidence") or "")
             or "진행속도 보정" not in str(surge_action.get("evidence") or "")
         ):
@@ -8775,7 +8794,7 @@ def run_basic_checks() -> list[CheckResult]:
         finally:
             dash_mod.log = original_stock_risk_log
         surge_log_args = stock_risk_log_records[-1][1] if stock_risk_log_records else ()
-        if len(surge_log_args) < 8 or float(surge_log_args[6] or 0) != 1000 or float(surge_log_args[7] or 0) != 950:
+        if len(surge_log_args) < 8 or float(surge_log_args[6] or 0) != 2650 or float(surge_log_args[7] or 0) != 0:
             fact_errors.append(f"stock_risk_demand_surge_log={stock_risk_log_records!r}")
         past_period_rows = [dict(surge_emergency)]
         dash_mod._apply_current_month_demand_surge(
@@ -8788,6 +8807,7 @@ def run_basic_checks() -> list[CheckResult]:
             month_end_rows,
             evaluation_month="202607",
             policy_date="20260731",
+            business_day_context=_business_context("20260731", 23, 23),
         )
         if (
             past_period_rows[0].get("수요급증여부")
@@ -10508,6 +10528,7 @@ def run_basic_checks() -> list[CheckResult]:
                     "major_purchase_vendor_days": 45,
                 },
                 today=date(2026, 7, 20),
+                business_day_context_loader=lambda **_kwargs: _business_context("20260720", 14, 23),
             )
         finally:
             setattr(sales_mod, "get_sales_trend_df", old_shared)
@@ -11197,6 +11218,10 @@ def run_basic_checks() -> list[CheckResult]:
                     evaluation_month=evaluation_month,
                     policy_date=policy_date,
                     today=date(2026, 7, 28),
+                    business_day_context=(
+                        _business_context(policy_date, 23 if policy_date.endswith("31") else 10, 23)
+                        if evaluation_month == "202607" else None
+                    ),
                 )
 
             def _chart_rows_by_series(spec: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -11244,7 +11269,7 @@ def run_basic_checks() -> list[CheckResult]:
             active_rows = _chart_rows_by_series(active_spec)
             active_marks = _chart_mark_types(active_spec)
             active_visualization = active_facts.get("visualization") or {}
-            expected_to_date = 90 * 14 / 31
+            expected_to_date = 90 * 10 / 23
             if active_marks != ["bar", "bar", "bar", "text"]:
                 chart_errors.append(f"active_grouped_bar_layers={active_marks!r}")
             if not all(active_rows.get(series) for series in ("실제매출", "월말 예상매출", "14일 기준 예상매출")):
@@ -11273,7 +11298,7 @@ def run_basic_checks() -> list[CheckResult]:
             ):
                 chart_errors.append("completed_month_actual_contract")
             if (
-                abs(float(active_visualization.get("time_progress_pct") or 0) - (14 / 31 * 100)) > 1e-9
+                abs(float(active_visualization.get("time_progress_pct") or 0) - (10 / 23 * 100)) > 1e-9
                 or abs(float(active_visualization.get("expected_to_date_sales") or 0) - expected_to_date) > 1e-9
                 or float(active_visualization.get("current_sales") or 0) != 70.0
                 or float(active_visualization.get("forecast_sales") or 0) != 90.0
@@ -11382,9 +11407,10 @@ def run_basic_checks() -> list[CheckResult]:
                 {"period": "2025-11", "period_sort": "202511", "value": 8},
                 {"period": "2025-12", "period_sort": "202512", "value": 9},
             ]
-            chart_sales = dash_mod._build_sales_facts({"df": chart_source, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28))
-            target_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_target, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28))
-            history_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_history, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28))
+            july_context = _business_context("20260714", 10, 23)
+            chart_sales = dash_mod._build_sales_facts({"df": chart_source, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28), business_day_context=july_context)
+            target_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_target, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28), business_day_context=july_context)
+            history_changed_sales = dash_mod._build_sales_facts({"df": chart_source_changed_history, "meta": {"evaluation_month": "202607"}}, history_actuals=chart_history, evaluation_month="202607", policy_date="20260714", today=date(2026, 7, 28), business_day_context=july_context)
             chart_rows = chart_sales.get("chart_rows") or []
             period_order = []
             for row in chart_rows:
@@ -11413,9 +11439,9 @@ def run_basic_checks() -> list[CheckResult]:
             if _forecast_value(chart_sales, "2026-04") == _forecast_value(history_changed_sales, "2026-04"):
                 preforecast_errors.append("prior_history_did_not_change_later_preforecast")
             visualization = chart_sales.get("visualization") or {}
-            if abs(float(visualization.get("time_progress_pct") or 0) - (14 / 31 * 100)) > 1e-9:
+            if abs(float(visualization.get("time_progress_pct") or 0) - (10 / 23 * 100)) > 1e-9:
                 preforecast_errors.append(f"time_progress={visualization.get('time_progress_pct')!r}")
-            if abs(float(visualization.get("expected_to_date_sales") or 0) - (90 * 14 / 31)) > 1e-9:
+            if abs(float(visualization.get("expected_to_date_sales") or 0) - (90 * 10 / 23)) > 1e-9:
                 preforecast_errors.append(f"expected_to_date={visualization.get('expected_to_date_sales')!r}")
             if visualization.get("remaining_forecast") != 20:
                 preforecast_errors.append(f"remaining_forecast={visualization.get('remaining_forecast')!r}")
@@ -11435,6 +11461,7 @@ def run_basic_checks() -> list[CheckResult]:
                 policy_date="20260815",
                 sales_source_mode="monthly_real",
                 today=date(2026, 8, 15),
+                business_day_context=_business_context("20260815", 10, 21),
             )
             july_progress_forecast = _forecast_value(progress_aug_sales, "2026-07")
             completed_source["평가월 예상매출"] = july_progress_forecast
@@ -11526,7 +11553,7 @@ def run_basic_checks() -> list[CheckResult]:
                 preforecast_errors.append("past_month_time_progress")
             if dash_mod._dashboard_time_progress("202608", today=date(2026, 7, 28)).get("pct") != 0.0:
                 preforecast_errors.append("future_month_time_progress")
-            if dash_mod._dashboard_time_progress("202402", today=date(2024, 2, 29)).get("pct") != 100.0:
+            if dash_mod._dashboard_time_progress("202402", today=date(2024, 2, 29), business_day_context=_business_context("20240229", 20, 20)).get("pct") != 100.0:
                 preforecast_errors.append("leap_year_time_progress")
             chart_spec = view_mod._build_sales_bar_chart({"sales": chart_sales}).to_dict()
             def _flatten_chart_layers(spec: dict[str, Any]) -> list[dict[str, Any]]:
@@ -11696,7 +11723,7 @@ def run_basic_checks() -> list[CheckResult]:
             if unchanged_remaining != 20:
                 presentation_errors.append(f"remaining_fact_mutated={unchanged_remaining!r}")
             ui_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
-            for label in ("월 목표 대비 실제 진행률", "예상 대비 달성률", "월말 예상 잔여", "월말 예상 초과", "오늘의 매출 요약"):
+            for label in ("월말 예상 대비 실제 진행률", "예상 대비 달성률", "월말 예상 잔여", "월말 예상 초과", "오늘의 매출 요약"):
                 if label not in ui_source:
                     presentation_errors.append(f"ui_label_missing={label}")
             if '"완료월" if completed' in ui_source or '"예상 대비 차이" if completed' in ui_source:
@@ -11704,7 +11731,7 @@ def run_basic_checks() -> list[CheckResult]:
             if (
                 "완료월 판단 기준일 예상매출은 사용하지 않습니다" in ui_source
                 or "판단 기준일 예상매출은 사용하지 않습니다" in ui_source
-                or "기준일 예상매출은 평가월 경과율을 반영하며, 완료월은 말일 기준입니다." not in ui_source
+                or "현재월 기준일 예상매출은 영업일 경과율을 반영하며, 완료월은 말일 기준입니다." not in ui_source
             ):
                 presentation_errors.append("sales_cutoff_guidance_not_common")
             if '"시간 진척률"' in ui_source or '"시간 대비 달성률"' in ui_source:
@@ -11962,7 +11989,7 @@ def run_basic_checks() -> list[CheckResult]:
                 gauge_errors.append("gauge_bevel_gradient_or_hub_depth_missing")
             if (
                 "112.0%" not in completed_markup
-                or "월 목표 대비 실제 진행률" not in completed_markup
+                or "월말 예상 대비 실제 진행률" not in completed_markup
                 or 'class="dashboard-lite-gauge-needle"' not in completed_markup
                 or 'class="dashboard-lite-gauge-progress"' not in completed_markup
                 or 'stroke-dasharray="100.000 100"' not in completed_markup
@@ -17378,7 +17405,7 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
         )
         errors: list[str] = []
         intent_cases = (
-            ("추세판정 분석", "품목별 매출 추세 분석", "sales", "trend_judgement"),
+            ("추세판정 집계", "품목별 매출 추세 분석", "sales", "trend_judgement"),
             ("추세판정 요약", "영업사원별 매출 예상", "", "trend_judgement"),
             ("현재표 제품별 매입금액 TOP 20", "입고명세 조회", "purchase_amount", "product"),
             ("현재표 제품별 출고수량 TOP 20", "출고명세 조회", "sales_quantity", "product"),
@@ -17536,16 +17563,16 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
                 errors.append(f"{query}: interpretive_facts={facts!r}")
 
         generic_analysis_queries = (
-            "현재표 제조사별 분석",
-            "현재표 제조사별 분석해줘",
-            "현재표 제조사별 분석해 줘",
-            "현재표 제조사별 분석 부탁해",
-            "현재표 제조사별 분석 좀 해줘",
+            "현재표 제조사별 집계",
+            "현재표 제조사별 집계해줘",
+            "현재표 제조사별 집계해 줘",
+            "현재표 제조사별 집계 부탁해",
+            "현재표 제조사별 집계 좀 해줘",
         )
         generic_analysis_outputs: list[pd.DataFrame] = []
         for query in generic_analysis_queries:
             if dispatcher.classify_current_table_followup_intent(query) != "dataframe_table":
-                errors.append(f"{query}: dimension-only analysis must remain deterministic")
+                errors.append(f"{query}: explicit aggregation must remain deterministic")
                 continue
             pushed_generic: list[dict[str, Any]] = []
             handled_generic = dispatcher.handle_current_table_followup_by_action(
@@ -17590,7 +17617,7 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
         limited_pushes: list[dict[str, Any]] = []
         limited_handled = dispatcher.handle_current_table_followup_by_action(
             df=limited_source_df.copy(deep=True),
-            query="현재표 제조사별 분석",
+            query="현재표 제조사별 집계",
             top_n=20,
             table_key="fixture-current-table-limit",
             source_action="제품재고현황 조회",
@@ -17900,9 +17927,9 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
 
         alias_phrase_outputs: list[pd.DataFrame] = []
         for query in (
-            "현재표 제조사별 분석",
-            "현재표 제조사별 분석해줘",
-            "현재표 제조사별 분석해 줘",
+            "현재표 제조사별 집계",
+            "현재표 제조사별 집계해줘",
+            "현재표 제조사별 집계해 줘",
         ):
             pushed_alias: list[dict[str, Any]] = []
             handled_alias = dispatcher.handle_current_table_followup_by_action(
@@ -18185,7 +18212,9 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
 
             handled = dispatcher.handle_current_table_followup_by_action(
                 df=df.copy(deep=True),
-                query=query,
+                # This helper verifies deterministic source tables, not the
+                # LLM handoff (covered by interpretive-facts/profile fixtures).
+                query=query.replace("분석", "집계"),
                 top_n=top_n,
                 table_key="fixture-source-contract",
                 source_action=source_action,
@@ -18588,20 +18617,14 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
         shortage_without_rate_df = pd.DataFrame(
             [{"제품코드": "S1", "제품명": "부족품목", "부족등급": "부족", "부족예상수량": 3}]
         )
-        handled, pushed = dispatch(
-            "품목별 재고부족현황",
-            "현재표 적용증감율 분석",
-            shortage_without_rate_df,
+        shortage_facts = dispatcher.build_current_table_interpretive_facts(
+            df=shortage_without_rate_df,
+            query="현재표 적용증감율 분석",
+            source_action="품목별 재고부족현황",
+            source_meta={},
         )
-        shortage_rate_meta = dict(pushed[0][1].get("extra_meta") or {}) if pushed else {}
-        if (
-            not handled
-            or not pushed
-            or pushed[0][0] != "notice"
-            or shortage_rate_meta.get("result_status") != "column_unavailable"
-            or shortage_rate_meta.get("source_call_count") != 0
-        ):
-            errors.append(f"missing shortage rate must remain unavailable: pushed={pushed!r}")
+        if shortage_facts.get("status") != "column_unavailable":
+            errors.append(f"missing shortage rate must remain unavailable: facts={shortage_facts!r}")
 
         invalid_month_df = pd.DataFrame(
             [{"입고일자": "날짜없음", "제품명": "P1", "거래처명": "V1", "수량": 1, "공급가액": 10, "세액": 1}]
