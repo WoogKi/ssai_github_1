@@ -18,6 +18,7 @@ from app.services.erp_table_nlq import resolve_registered_erp_table_nlq  # noqa:
 from app.services.knowledge_document_service import (  # noqa: E402
     KnowledgeDocumentRepository,
     build_knowledge_chat_request_context,
+    extract_text_artifact,
 )
 from app.ui.knowledge_chat_adapter import parse_business_help_knowledge_request  # noqa: E402
 from app.ui.knowledge_chat_evidence import (  # noqa: E402
@@ -178,7 +179,9 @@ def main() -> None:
                 query=route.retrieval_query,
                 request_context=request_context,
             )
-            assert len(packet.citations) == 21
+            expected_sections = extract_text_artifact(source_name=plan[0].source_name, content=content).sections
+            assert len(expected_sections) >= 21
+            assert len(packet.citations) == len(expected_sections)
             message = build_knowledge_answer_message(
                 repository=repository,
                 answer="승인된 업무질문 도움말 답변",

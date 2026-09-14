@@ -8,9 +8,9 @@ version: "2026.09.03-r1"
 
 # SIMS AI Platform 예상 일정
 
-- 기준일: 2026-09-03
+- 기준일: 2026-09-14 (9/3 예상 일정 대비 완료 상태 갱신)
 - 기준 로드맵: SIMS AI Platform Roadmap 2026-09-03 Rev.1
-- 기준 HEAD: ad609f71206081c26a551e57ca216b5fcb31f5b3
+- 기준 HEAD: 7283865dcf8709ec9673404b0321adfe208c65be (발주 1차 배포)
 - 일정 원칙: 기능 의미·조회 범위·권한·provenance를 줄여 날짜를 맞추지 않는다.
 - 운영 원칙: Snapshot 재생성과 대용량 검증은 주말 또는 비업무시간에 수행한다.
 - 일정 성격: 확정 납기표가 아니라 선행조건과 Gate를 기준으로 한 예상 실행 창이다.
@@ -24,8 +24,10 @@ version: "2026.09.03-r1"
 | 9/7~9/8 | 회사 4 SIMS 일일점검 85초 병목 조사 | P1 | 단계별 elapsed 분해, Snapshot 사용 여부, 기존 병목과 연결, 원인 확정 후 적용/보류 판단 |
 | 9/9~9/11 | 대용량 공통 처리 기반 설계 | P1 | Display Fast Path / Analysis Path / Export Path / CurrentTableContext-query contract 초안 확정 |
 | 9/14~9/16 | 대용량 공통 계약 Gate 및 소규모 PoC | P1 | 화면 표본 vs 전체범위 분리, aggregate/provenance, timeout/cancel/export 정책 검증 |
-| 9/17~9/23 | 계약단가 기능 설계·구현·회귀 | P2 | 테이블/필드 의미 확정, 권한·기간·grain 계약, NLQ/현재표/대용량 경로 재사용 |
-| 9/24~10/2 | 발주 기능 설계·구현·회귀 | P2 | 계약단가·재고·예측 기준 연결, 사용자 승인 경계, 회귀/2호기 Smoke |
+| 9/14 완료 (당초 9/17~9/23 예상) | 계약단가 조회·발주 가격 연결 | 운영 유지 | 유효 계약/적용처 코드 및 기간 누출 보정 완료 |
+| 9/14 완료 (당초 9/24~10/2 예상) | 발주 계산·NLQ 1차·2호기 배포/Smoke | 운영 유지 | 회사7 확인 및 기준 commit/Health 일치, 실제 ERP 등록 제외 |
+| 9/14 완료 | 발주 공식 문서화·RAG 등록 준비 | 승인 대기 | 공식 계약/Closeout/권한 분리. 운영 corpus 등록은 별도 승인 후 |
+| 다음 | Snapshot/Dashboard 후속 | P0 | 발주와 분리해 회사별 성능/계약 및 HY000 재발 관찰 |
 | 10/5~10/9 | 입출금 기능 설계 입력·1차 구현 | P3 | 회계 grain·민감정보·권한 범위 확정 후 읽기 중심 1차 기능 |
 | 자료 확보 시 병행 | 외부 MCP/OpenAPI 실서비스 연결 | P2 | 승인 API 명세 확보 후 endpoint/secret/allowlist/timeout/retry=0/감사/Smoke |
 | 조건 발생 시 | Embedding 재검토 | 조건부 | corpus 확대 또는 lexical 30/30 기준에서 재현 가능한 한계 발생 시만 착수 |
@@ -55,6 +57,8 @@ version: "2026.09.03-r1"
 - CurrentTableContext/query contract에는 query 조건, source identity, total row count, aggregate, provenance, capabilities를 포함하는 방향을 검증한다.
 
 ### 9/17 이후 - ERP 기능 확장
+계약단가 연결과 발주 계산/NLQ 1차는 9/14 완료됐으므로 아래는 후속 ERP 확장 순서다.
+실제 발주 등록과 운영 RAG 등록은 완료로 간주하지 않는다.
 - 계약단가 -> 발주 -> 입출금 순서를 유지한다.
 - 신규 기능마다 개별 대용량 우회 구현을 만들지 않고 공통 계약을 재사용한다.
 - 사용자 명시기간, NLQ 기본기간, 권한, 회사 격리, display/full/current-table/export 분리를 유지한다.

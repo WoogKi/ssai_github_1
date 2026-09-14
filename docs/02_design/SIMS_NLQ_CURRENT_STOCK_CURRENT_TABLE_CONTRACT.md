@@ -214,3 +214,21 @@ parsed -> resolved -> query -> result
 - Dashboard·실패 상태·compact 렌더의 current-table 비변경
 - 후속 `source_call_count=0`과 foreign company/room 차단
 - 상태·metric·grouping·grain·기간 meta 정합성
+
+## 발주 계산·제품정보 연결 (2026-09-14)
+
+기준 commit: `7283865dcf8709ec9673404b0321adfe208c65be`.
+기존 현재고/NLQ 계약을 바꾸지 않고 발주 계산의 연결 관계만 명시한다.
+
+- 제품정보는 회사별 제품 master의 제품코드/보험코드/규격/제조사 정보와 승인 Snapshot의
+  통계/등급을 연결한다. 현재 선택 회사의 profile-exact 승인 operating Snapshot을 authority로 한다.
+- 발주 계산의 제품 universe는 같은 회사·제조사·제품조건 및 저장 profile 범위다.
+  제조사 부분명은 기존 회사별 authority로 확인하고 다중 후보나 실패를 회사 전체 조회로 바꾸지 않는다.
+- Snapshot 2.1에 있는 3개월 출고수량/출고거래처수·등급은 재사용한다. 현재고·예측·대표매입처·
+  계약단가는 Snapshot row에 모두 저장돼 있다고 가정하지 않고 기존 read-only service로 연결한다.
+- 현재고는 지정 재고적용처(기본 50001)와 저장 재고위치 범위를 보존하며 음수도 실제 값이다.
+- display/editor는 공통 표시 helper를 사용하고 full/current-table/export는 동일 underlying result를 보존한다.
+  실제수량 편집은 계산/추천 원값을 덮어쓰지 않는다. 회사 변경 시 이전 수정값/원본/cache를 재사용하지 않는다.
+- 전체/발주해당자료만은 계산 후 필터다. 발주 조회와 계산의 상세 기준은
+  [발주 업무 계약](ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md), 사용자 설명은
+  [업무질문 사용 예시](../03_runbook/SIMS_AI_업무질문_사용_예시.md)를 따른다.

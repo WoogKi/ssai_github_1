@@ -8,7 +8,9 @@
 
 ## 현재 공식 문서
 
-- 발주 계산 1차 업무 정의: [발주 계산 업무 계약](02_design/ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md) (v1.3 기준, 세부 업무질문 별도 명시)
+- 발주 계산 1차 업무 정의: [발주 계산 업무 계약](02_design/ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md) (v1.4, 배포 완료 기준)
+- 발주 1차 운영 마감: [발주 계산/NLQ Closeout](04_test_results/ORDER_CALCULATION_PHASE1_CLOSEOUT_20260914.md)
+- 일반 사용자 Knowledge: [업무질문 사용 예시와 발주 업무 의미](03_runbook/SIMS_AI_업무질문_사용_예시.md)
 - 통합 로드맵·일정: [SIMS AI Platform Roadmap 2026-09-03](00_roadmap/SIMS_AI_PLATFORM_ROADMAP_20260903.md)
 - 공통 운영: [SIMS AI 공통 운영 Runbook](03_runbook/RUNBOOK_SIMSAI.md)
 - 2호기 운영: [SIMS AI 2호기 운영 점검 Runbook](03_runbook/RUNBOOK_2HO_OPERATION_CHECK.md)
@@ -17,9 +19,27 @@
 - NLQ·현재고·현재표 계약: [SIMS NLQ·현재고·현재표 공식 계약](02_design/SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md)
 - 공식 테스트 결과: [6c83962 NLQ·Dashboard·현재고 테스트 결과](04_test_results/TEST_RESULT_6C83962_NLQ_DASHBOARD_STOCK_20260809.md)
 
-공식 문서의 운영 기준선은 `feat/dashboard-stock-extension-20260727` 브랜치의
-`ad609f71206081c26a551e57ca216b5fcb31f5b3` 커밋이다. 문서에 별도 기준 커밋이 적혀 있으면 해당 문서는 그 시점의
-역사자료로 해석한다.
+발주 1차의 운영 기준선은 `feat/dashboard-stock-extension-20260727` 브랜치의
+`7283865dcf8709ec9673404b0321adfe208c65be` 커밋이다. 다른 기능의 날짜별 완료 기록은
+그 문서에 명시된 기준 commit을 유지하며 역사자료를 덮어쓰지 않는다.
+
+## 발주·Knowledge 공식 색인
+
+| 업무 | 일반 사용자 설명 authority | 기술·운영 authority |
+|---|---|---|
+| 발주 계산·NLQ·대표매입처·발주단위·공식 Calendar | 업무질문 사용 예시의 발주 계산/공식 영업일 | 발주 업무 계약 제2~5·9·12절 |
+| 계약단가·최종 매입가 | 같은 문서의 계약단가/수량과 가격 | 발주 업무 계약 제6절, 기존 계약단가 서비스 |
+| 제품정보·제조사·현재고·Snapshot/profile | 같은 문서의 제품정보와 현재고 | 발주 업무 계약 제7·9절, NLQ·현재고·현재표 계약 |
+| 입고예정 | 같은 문서의 입고예정 조회 | 발주 업무 계약 제4절, 기존 발주/입고예정 서비스 |
+| 단가적용처·재고적용처 | 같은 문서의 단가적용처와 재고적용처 | 발주 업무 계약 제6절 |
+| 기존 발주 조회 | 같은 문서의 발주 조회 | 발주 업무 계약 제1·12절 및 등록된 기존 조회 경로 |
+
+현행 NLQ 설명은 위 색인과 공식 [기간정책](02_design/SIMS_AI_NLQ_기간정책_공식기준.md),
+[현재고·현재표 계약](02_design/SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md)을 따른다.
+`90_archive/nlq_legacy/root/nlq_docs_index.md`와 `master_nlq_summary.md`는 2026-05 역사 색인이다.
+이를 현행 RAG에 재등록하거나 같은 이름의 새 기준을 만들지 않는다.
+등록 대상·분류·권한·순서는 [공통 Runbook 제9절](03_runbook/RUNBOOK_SIMSAI.md#9-발주-1차-knowledge-등록-준비)을 따른다.
+Codex 보고서, diff, 원시 로그, probe와 중간 성능 조사는 RAG authority에서 제외한다.
 
 ## 공식 폴더 구조
 
