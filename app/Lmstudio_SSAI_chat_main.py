@@ -13677,7 +13677,10 @@ with st.container():
                     panel_active
                     or ((run_flag or inner_submit) and not already_rendered_this_run)
                 )
-                if st.session_state.get("__ui_rerun_reason_current") in {"chat_room_change", "download_prepare"}:
+                reason = st.session_state.get("__ui_rerun_reason_current")
+                if reason == "chat_room_change" or (
+                    reason == "download_prepare" and selected_now.get("action") != "발주 계산"
+                ):
                     should_render = False
 
                 if should_render:

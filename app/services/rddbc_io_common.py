@@ -75,11 +75,12 @@ def query_to_df(sql: str, params: Optional[Dict[str, Any]] = None) -> pd.DataFra
             except TypeError:
                 return fn(rendered, ())
 
+    bound_params = params if params else ()
     try:
-        return fn(sql, params)
+        return fn(sql, bound_params)
     except TypeError:
         try:
-            return fn(sql=sql, params=params)
+            return fn(sql=sql, params=bound_params)
         except TypeError:
             rendered = render_named_sql(sql, params)
             try:
@@ -263,8 +264,16 @@ def _norm_series(sr: pd.Series) -> pd.Series:
     )
 
 
-@lru_cache(maxsize=1)
 def _load_rddbc010_lookup() -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+    from app.db.mssql_client import get_current_company_id
+    company_id = get_current_company_id()
+    if company_id is None:
+        return {}, {}
+    return _load_rddbc010_lookup_for_company(int(company_id))
+
+
+@lru_cache(maxsize=16)
+def _load_rddbc010_lookup_for_company(company_id: int) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
     """
     Rddbc010 전체 lookup 캐시
     - kind_by_gcode[gcode] = 코드종류명

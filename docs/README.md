@@ -8,6 +8,7 @@
 
 ## 현재 공식 문서
 
+- 발주 계산 1차 업무 정의: [발주 계산 업무 계약](02_design/ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md) (v1.3 기준, 세부 업무질문 별도 명시)
 - 통합 로드맵·일정: [SIMS AI Platform Roadmap 2026-09-03](00_roadmap/SIMS_AI_PLATFORM_ROADMAP_20260903.md)
 - 공통 운영: [SIMS AI 공통 운영 Runbook](03_runbook/RUNBOOK_SIMSAI.md)
 - 2호기 운영: [SIMS AI 2호기 운영 점검 Runbook](03_runbook/RUNBOOK_2HO_OPERATION_CHECK.md)

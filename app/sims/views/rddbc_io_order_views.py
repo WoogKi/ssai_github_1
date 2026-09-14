@@ -45,21 +45,23 @@ def _order_vendor_filters(prefix: str, defaults: dict[str, Any]) -> dict[str, An
     }
 
 
-def _application_filters(prefix: str, defaults: dict[str, Any]) -> dict[str, Any]:
-    c1, c2, c3, c4 = st.columns(4)
+def _application_filters(prefix: str, defaults: dict[str, Any], *, columns=None, include_stock=True) -> dict[str, Any]:
+    c1, c2, c3, c4 = columns if columns is not None else st.columns(4)
     with c1:
         cost_apply_cd = st.text_input("단가적용처코드", value=str(defaults.get("cost_apply_cd") or ""), key=f"{prefix}_cost_apply_cd")
     with c2:
-        cost_apply_nm = st.text_input("단가적용처명", value=str(defaults.get("cost_apply_nm") or ""), key=f"{prefix}_cost_apply_nm")
+        cost_apply_nm = st.text_input("단가적용처명", value=None if columns is not None and f"{prefix}_cost_apply_nm" in st.session_state else str(defaults.get("cost_apply_nm") or ""), key=f"{prefix}_cost_apply_nm")
     with c3:
         stock_apply_cd = st.text_input("재고적용처코드", value=str(defaults.get("stock_apply_cd") or ""), key=f"{prefix}_stock_apply_cd")
     with c4:
-        stock_apply_nm = st.text_input("재고적용처명", value=str(defaults.get("stock_apply_nm") or ""), key=f"{prefix}_stock_apply_nm")
-    c5, c6 = st.columns(2)
-    with c5:
-        stock_cd = st.text_input("재고위치코드", value=str(defaults.get("stock_cd") or ""), key=f"{prefix}_stock_cd")
-    with c6:
-        stock_nm = st.text_input("재고위치명", value=str(defaults.get("stock_nm") or ""), key=f"{prefix}_stock_nm")
+        stock_apply_nm = st.text_input("재고적용처명", value=None if columns is not None and f"{prefix}_stock_apply_nm" in st.session_state else str(defaults.get("stock_apply_nm") or ""), key=f"{prefix}_stock_apply_nm")
+    stock_cd, stock_nm = defaults.get("stock_cd"), defaults.get("stock_nm")
+    if include_stock:
+        c5, c6 = st.columns(2)
+        with c5:
+            stock_cd = st.text_input("재고위치코드", value=str(defaults.get("stock_cd") or ""), key=f"{prefix}_stock_cd")
+        with c6:
+            stock_nm = st.text_input("재고위치명", value=str(defaults.get("stock_nm") or ""), key=f"{prefix}_stock_nm")
     return {
         "cost_apply_cd": str(cost_apply_cd or "").strip(),
         "cost_apply_nm": str(cost_apply_nm or "").strip(),

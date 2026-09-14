@@ -399,9 +399,21 @@ def _resolve_order_nlq(
     return {"action": action_spec.action, "params": params}
 
 
+_ORDER_CALCULATION_INTENT = re.compile(
+    r"발주\s*(?:수량\s*계산|계산|추천)|(?:권장|추천)\s*발주(?:량|수량)?|발주할\s*(?:수량|것만\s*계산)"
+)
+
+_ORDER_CALCULATION_QUERY_MODE = re.compile(
+    r"(?<![가-힣A-Za-z0-9])(?:조회\s*구분\s*[:=]?\s*)?"
+    r"(?P<value>발주\s*해당\s*자료(?:만)?|발주\s*해당|해당|"
+    r"발주할\s*것만|발주\s*대상만|확인\s*필요|전체)"
+    r"(?![가-힣A-Za-z0-9])"
+)
+
+
 def is_order_calculation_request(text: str) -> bool:
-    """Reserve calculation intent without executing the existing order inquiry."""
-    return bool(re.search(r"발주\s*계산|권장\s*발주", _clean(text)))
+    """Explicit calculation intent must never execute the existing order inquiry."""
+    return bool(_ORDER_CALCULATION_INTENT.search(_clean(text)))
 
 
 def resolve_registered_erp_table_nlq(
@@ -410,7 +422,32 @@ def resolve_registered_erp_table_nlq(
     today: date | None = None,
 ) -> Optional[dict[str, Any]]:
     if is_order_calculation_request(text):
-        return None
+        from app.sims.meta.erp_table_feature_registry import ORDER_CALCULATION
+        action_spec = ORDER_CALCULATION.actions[0]
+        condition_text = _clean(text)
+        calculation_params = {"safety_days": 3, "target_days": 15, "closing_day": 25}
+        for key, labels in (("safety_days", r"안전\s*재고(?:일수)?"),
+                            ("target_days", r"적정\s*재고(?:일수)?"),
+                            ("closing_day", r"(?:결제|마감)\s*일(?:자)?")):
+            pattern = re.compile(labels + r"\s*[:=]?\s*(\d+)\s*(?:영업일|일)?")
+            matches = list(pattern.finditer(condition_text))
+            if matches:
+                calculation_params[key] = int(matches[-1].group(1))
+                condition_text = pattern.sub(" ", condition_text)
+        mode_matches = list(_ORDER_CALCULATION_QUERY_MODE.finditer(condition_text))
+        value = re.sub(r"\s+", "", mode_matches[-1].group("value")) if mode_matches else "전체"
+        mode = "전체" if value == "전체" else "확인 필요" if value == "확인필요" else "발주해당자료만"
+        # Capture mode before replacing an intent that itself contains '것만'.
+        condition_text = _ORDER_CALCULATION_INTENT.sub("발주 조회", condition_text)
+        condition_text = _ORDER_CALCULATION_QUERY_MODE.sub(" ", condition_text)
+        resolved = _resolve_order_nlq(condition_text, ORDER_CALCULATION, action_spec, today=today or kst_today())
+        params = resolved["params"]
+        params["order_date"] = (today or kst_today()).isoformat()
+        params.update(calculation_params)
+        params.update(query_mode=mode, only_needed=mode == "발주해당자료만")
+        from app.services.order_calculation_service import apply_application_defaults
+        resolved["params"] = apply_application_defaults(params)
+        return resolved
     matched = match_action_in_text(text)
     if matched is None:
         return None

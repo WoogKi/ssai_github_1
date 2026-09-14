@@ -812,7 +812,7 @@ def _numeric_display_kind(col: Any) -> str:
     if _is_row_no_col(s):
         return "int"
 
-    if s == "추정단위손익":
+    if s in {"추정단위손익", "계산 발주수량"}:
         return "decimal2"
     if s == "추정손익률":
         return "percent2"
@@ -1266,6 +1266,7 @@ def _make_column_config(
     pinned: bool,
     force_text: bool = False,
     force_number: bool = False,
+    align_numbers: bool = False,
 ) -> Any:
     name = _clean_text(col)
 
@@ -1278,6 +1279,8 @@ def _make_column_config(
         kwargs["pinned"] = True
 
     if (_is_numeric_display_col(df, col) or force_number) and not force_text:
+        if align_numbers:
+            kwargs["alignment"] = "right"
         kind = _numeric_display_kind(name)
 
         if kind == "int":
@@ -1523,6 +1526,7 @@ def build_sims_table_display_config(
     min_height: int = 170,
     max_height: int = 520,
     row_height: int = 32,
+    native_numeric_cells: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, Any], int, int]:
     """
     SIMS 공용 표 표시 설정.
@@ -1560,7 +1564,7 @@ def build_sims_table_display_config(
 
     final_view_df, formatted_numeric_columns = _format_numeric_null_columns_for_display(
         view_df,
-        preserve_numeric_nulls=bool(meta.get("current_stock_query")),
+        preserve_numeric_nulls=bool(meta.get("current_stock_query")) or native_numeric_cells,
     )
     column_config: Dict[str, Any] = {}
     total_width = 60
@@ -1576,6 +1580,7 @@ def build_sims_table_display_config(
                 width=width,
                 pinned=_clean_text(col) in pinned_cols,
                 force_text=col in formatted_numeric_columns or col in current_stock_text_columns,
+                align_numbers=native_numeric_cells,
             )
         except TypeError:
             # 혹시 pinned 미지원/인자 차이가 있으면 pinned 없이 재시도

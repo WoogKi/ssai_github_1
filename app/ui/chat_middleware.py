@@ -367,8 +367,13 @@ def _pick_df_from_payload(payload: Dict[str, Any]) -> Optional[pd.DataFrame]:
 # (엑셀로 다운로드할 때 오류 방지용)
 # openpyxl의 ILLEGAL_CHARACTERS_RE를 사용하되, openpyxl이 설치되어 있지 않은 경우에도 최소한의 대체 패턴을 제공한다.
 def _sanitize_excel_value(v):
+    from decimal import Decimal
     if v is None:
         return v
+    if isinstance(v, Decimal):
+        if not v.is_finite():
+            raise ValueError("Excel에 저장할 수 없는 숫자입니다.")
+        return int(v) if v == v.to_integral_value() else float(v)
     if isinstance(v, str):
         return ILLEGAL_CHARACTERS_RE.sub("", v)
     return v
@@ -6267,7 +6272,8 @@ def _attach_sims_response_timing(payload: Dict[str, Any], session_state: Dict[st
         return
 
     meta = dict(payload.get("meta") or {})
-    if not bool(meta.get("nlq")):
+    order_timing = bool(meta.get("order_calculation_editable"))
+    if not bool(meta.get("nlq")) and not order_timing:
         return
 
     # History restoration must never remeasure a completed response.
@@ -6279,6 +6285,8 @@ def _attach_sims_response_timing(payload: Dict[str, Any], session_state: Dict[st
         return
 
     context = session_state.get("__sims_nlq_response_timing") or {}
+    if order_timing and (not bool(meta.get("nlq")) or not context):
+        context = meta
     started_at = _coerce_sims_result_datetime(context.get("request_started_at"))
     if not started_at:
         return
@@ -6294,6 +6302,9 @@ def _attach_sims_response_timing(payload: Dict[str, Any], session_state: Dict[st
     meta["request_started_at"] = started_at
     meta["response_completed_at"] = dt.datetime.now().isoformat(timespec="seconds")
     meta["elapsed_ms"] = elapsed_ms
+    if order_timing:
+        meta["elapsed_authority"] = "sims_response_timing_request_to_chat_ready"
+        meta.pop("request_started_monotonic", None)
     payload["meta"] = meta
     session_state.pop("__sims_nlq_response_timing", None)
 
@@ -7266,11 +7277,13 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     }
 
     def _log_io_delivery_stage(stage: str) -> None:
-        if not io_detail_action:
+        order_action = str(action_name or '').strip() == '발주 계산'
+        if not io_detail_action and not order_action:
             return
         current_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         log.info(
-            "[io.detail.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s",
+            ("[order_calculation.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s"
+             if order_action else "[io.detail.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s"),
             action_name,
             str(current_meta.get("nlq_trace_request_id") or "")[:64],
             stage,
@@ -9321,6 +9334,34 @@ def _build_sims_result_header_view(
     if response_timing:
         line2_parts.append(response_timing)
     line2 = " · ".join(line2_parts)
+    compact_lines = []
+    order_cards = []
+    order_condition_cards = []
+    if safe_meta.get("order_calculation_editable"):
+        line1 = ""
+        line2 = ""
+        elapsed = safe_meta.get("elapsed_ms")
+        metrics = safe_meta.get("order_header_metrics") or {}
+        mode = metrics.get("query_mode")
+        order_condition_cards = [
+            ("발주일", metrics.get("order_date"), "", None),
+            ("조회구분", mode, "", None),
+            ("안전재고", metrics.get("safety_days"), "일", None),
+            ("적정재고", metrics.get("target_days"), "일", None),
+            ("결제일", "현금/당일결제" if metrics.get("closing_day") == 0 else metrics.get("closing_day"), "" if metrics.get("closing_day") == 0 else "일", None),
+        ]
+        count_label = "발주대상" if mode == "발주해당자료만" else "확인 필요" if mode == "확인 필요" else "조회대상"
+        order_cards = [
+            (count_label, full_rows, "건", None),
+            ("화면", display_rows, "건", None),
+            ("적용 필요", metrics.get("needed_days"), "영업일", None),
+            ("입고예정", f"최근 {metrics['inbound_business_days']}" if metrics.get("inbound_business_days") else None, "영업일", None),
+            ("처리시간", float(elapsed) / 1000 if isinstance(elapsed, (int, float)) else None, "초", 1),
+        ]
+        compact_lines = [
+            "",
+            "안내 | 수량은 추천이며 ERP에 등록되지 않습니다.",
+        ]
 
     result_time_text = _sims_result_datetime_text(item, safe_meta)
     nlq_query = str(
@@ -9339,6 +9380,8 @@ def _build_sims_result_header_view(
     _sims_detail_add(details, "조회시각", result_time_text)
     _sims_detail_add(details, "응답완료", response_timing)
     _sims_detail_add(details, "전체 조회조건", full_condition)
+    if safe_meta.get("order_calculation_editable"):
+        _sims_detail_add(details, "계산기준", safe_meta.get("calculation_basis"))
     _sims_detail_add(details, "NLQ 원문", nlq_query)
     if expected_rows and expected_rows != full_rows:
         _sims_detail_add(details, "조건 전체 행수", f"{expected_rows:,}건")
@@ -9365,6 +9408,9 @@ def _build_sims_result_header_view(
         "title": action_name,
         "line1": line1,
         "line2": line2,
+        "compact_lines": compact_lines,
+        "order_cards": order_cards,
+        "order_condition_cards": order_condition_cards,
         "details": details,
         "full_rows": full_rows,
         "display_rows": display_rows,
@@ -9374,6 +9420,22 @@ def _build_sims_result_header_view(
 
 
 def _render_sims_result_header_view(view: Dict[str, Any]) -> None:
+    if (view or {}).get("compact_lines"):
+        lines = view["compact_lines"]
+        if view.get("order_condition_cards"):
+            with st.container(horizontal=True, gap="small"):
+                for label, value, unit, decimals in view["order_condition_cards"]:
+                    with st.container(width=190, border=False):
+                        _chat_metric_card(label, value, unit, decimals=decimals)
+        if lines[0]:
+            st.caption(lines[0])
+        if view.get("order_cards"):
+            with st.container(horizontal=True, gap="small"):
+                for label, value, unit, decimals in view["order_cards"]:
+                    with st.container(width=190, border=False):
+                        _chat_metric_card(label, value, unit, decimals=decimals)
+        for line in lines[1:]:
+            st.caption(line)
     line1 = str((view or {}).get("line1") or "").strip()
     line2 = str((view or {}).get("line2") or "").strip()
     if line1:
@@ -9881,6 +9943,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             if bool(meta.get("current_table_followup")):
                 # ??? ???? ?? compact header? ????.
                 pass
+            elif meta.get("order_calculation_editable"):
+                # The compact common header owns the complete order summary.
+                pass
             elif _chat_is_analysis_payload(item, meta, title):
                 _render_chat_analysis_header(meta)
                 _render_chat_summary_expander_v2(
@@ -10062,7 +10127,11 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             # 후보 선택표는 실제 제품수불현황 표가 아니다.
             # 후보표는 6컬럼 정도의 선택용 목록이므로 전체 폭을 채우지 않고 compact하게 렌더한다.
             # CSV / Excel / LLM 분석 버튼은 후보표에는 붙이지 않는다.
-            if bool(meta.get("candidate_table")):
+            from app.ui.order_calculation_editor import render_actual_quantity_editor
+            order_editor_rendered = False
+            if bool(meta.get("order_calculation_editable")) and render_actual_quantity_editor(item, meta, download_uid=uid2):
+                order_editor_rendered = True
+            elif bool(meta.get("candidate_table")):
                 try:
                     candidate_df = data.copy()
 
@@ -10169,7 +10238,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 )
             )
 
-            if is_io_table:
+            if order_editor_rendered:
+                pass
+            elif is_io_table:
                 try:
                     if (is_nlq_table or is_stock_io_table) and _chat_is_large_table_for_fast_render(data, meta):
                         if is_stock_io_table:

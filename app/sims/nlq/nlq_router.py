@@ -1296,7 +1296,7 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return None
     from app.services.erp_table_nlq import is_order_calculation_request
     if is_order_calculation_request(normalized):
-        return None
+        return {"route": "io", "action": "발주 계산"}
     if looks_like_pasted_formatted_content(normalized):
         return None
     if _is_general_explanation_request(normalized):
@@ -5896,6 +5896,9 @@ _IO_DETAIL_SOURCE_ACTIONS = frozenset(
 def _record_io_display_source_query_meta(meta: Dict[str, Any], action: str) -> None:
     """Record the detail display SELECT once before a possible full-source SELECT."""
     normalized_action = str(action or "").strip()
+    if normalized_action == "발주 계산":
+        # Calculation owns its measured multi-source budget; display is not another SELECT.
+        return
     if normalized_action not in _IO_DETAIL_SOURCE_ACTIONS:
         try:
             from app.sims.meta.erp_table_feature_registry import get_action_spec
@@ -6262,6 +6265,12 @@ def _try_handle_io_nlq(
                 "_nlq_nonce": str(uuid.uuid4()),
             },
         }
+        if action == "발주 계산":
+            payload['meta']['query_summary'] = ' | '.join(
+                f"{label} {params.get(key)}{unit}" for key, label, unit in (
+                    ('safety_days', '안전재고', '일'), ('target_days', '적정재고', '일'),
+                    ('closing_day', '결제/마감일', '일'), ('cost_apply_cd', '단가적용처', ''),
+                    ('stock_apply_cd', '재고적용처', '')))
         push_sims_result_to_chat(payload, action)
         _trace(
             "result",
@@ -7112,8 +7121,7 @@ def try_handle_nlq(
         return False
     from app.services.erp_table_nlq import is_order_calculation_request
     if is_order_calculation_request(raw):
-        logger.info("[nlq.router] reserved order calculation intent; defer without query")
-        return False
+        logger.info("[nlq.router] explicit order calculation intent")
     if looks_like_pasted_formatted_content(raw):
         logger.info("[nlq.router] pasted formatted content; defer to normal answer route")
         return False

@@ -6662,7 +6662,7 @@ def run_basic_checks() -> list[CheckResult]:
             has_no_open_assignment = '"__sims_open",\n            "__sims_open_ui"' not in main_src and 'ss["__sims_open"] = False' not in main_src
             room_switch_block = main_src[main_src.find("if picked and picked != ss.current_room:"):main_src.find("cur_name = id_to_name.get", main_src.find("if picked and picked != ss.current_room:"))]
             has_no_direct_close_in_room_switch = "_close_sims_panel_for_room_change()" not in room_switch_block
-            has_render_block = 'in {"chat_room_change", "download_prepare"}' in main_src and "should_render = False" in main_src
+            has_render_block = 'reason == "chat_room_change"' in main_src and 'reason == "download_prepare" and selected_now.get("action") != "발주 계산"' in main_src and "should_render = False" in main_src
             has_room_reason = '"chat_room_change"' in main_src
             has_switch_total = 'switch_total = float(stats.get("event_to_main_elapsed") or 0.0) + float(stats.get("history_elapsed") or 0.0)' in main_src
             has_switch_event_id = '"__chat_room_switch_event_id"' in main_src and "event_id=%s" in room_switch_block

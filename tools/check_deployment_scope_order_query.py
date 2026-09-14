@@ -34,23 +34,19 @@ def test_future_intent():
     from app.services.io_nlq import resolve_io_nlq
     from app.sims.nlq.nlq_router import resolve_new_sims_nlq_candidate, try_handle_nlq
     for text in ("발주 계산", "권장발주", "제약사 중외제약 발주현황 말고 발주 계산", "제품코드 발주 계산"):
-        assert resolve_registered_erp_table_nlq(text) is None
-        assert resolve_io_nlq(text) is None
-        assert resolve_new_sims_nlq_candidate(text) is None
-        state, room = {}, {"messages": []}
-        assert not try_handle_nlq(text, room, state, lambda: "", lambda: 1, logging.getLogger("fixture"))
-        assert not state and not room["messages"]
+        assert resolve_registered_erp_table_nlq(text)["action"] == "발주 계산"
+        assert resolve_io_nlq(text)["action"] == "발주 계산"
+        assert resolve_new_sims_nlq_candidate(text) == {"route": "io", "action": "발주 계산"}
 
 
 def test_scope():
     from app.sims.nlq.action_inventory import CANONICAL_ACTIONS
-    assert all(spec.canonical_action != "발주 계산" for spec in CANONICAL_ACTIONS)
+    assert any(spec.canonical_action == "발주 계산" for spec in CANONICAL_ACTIONS)
     for path in ("app/services/order_calculation_service.py", "app/sims/views/order_calculation_view.py",
                  "app/ui/order_calculation_editor.py"):
-        assert not (ROOT / path).exists()
-    for path in ("app/ui/sims_panel.py", "app/ui/sims_entry.py", "app/ui/chat_middleware.py",
-                 "app/sims/config.py", "app/sims/nlq/action_inventory.py"):
-        assert "order_calculation" not in (ROOT / path).read_text(encoding="utf-8-sig")
+        assert (ROOT / path).exists()
+    from app.sims.meta.erp_table_feature_registry import get_action_spec
+    assert get_action_spec("발주 계산")[1].mode == "calculation"
 
 
 def test_panel_close():

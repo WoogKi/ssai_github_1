@@ -271,7 +271,21 @@ RDDBC170_RDDBC180 = ErpTableFeatureSpec(
 )
 
 
-ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230, RDDBC170_RDDBC180)
+ORDER_CALCULATION = ErpTableFeatureSpec(
+    table_key="order_calculation", source_table="snapshot.frequency_product",
+    category="발주 계산", required_permission="IO_READ",
+    primary_key=("company_id", "order_date", "order_vendor_cd", "physic_cd"),
+    filters=RDDBC170_RDDBC180.filters,
+    actions=(ErpTableActionSpec(
+        action="발주 계산", aliases=("발주 추천", "발주 수량 계산", "권장 발주량", "추천 발주량", "발주할 수량"), mode="calculation",
+        service_function="app.services.order_calculation_service.get_order_calculation_result",
+        export_function="app.services.order_calculation_service.get_order_calculation_export_df",
+        view_function="app.sims.views.order_calculation_view.view_order_calculation",
+        payload_key="__order_calculation_last_payload",
+    ),), menu_business_group="재고관리", menu_target="발주 계산",
+)
+
+ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230, RDDBC170_RDDBC180, ORDER_CALCULATION)
 
 
 def iter_action_specs() -> tuple[tuple[ErpTableFeatureSpec, ErpTableActionSpec], ...]:
@@ -365,7 +379,9 @@ def registry_completeness_errors() -> list[str]:
         if action.action in seen_actions:
             errors.append(f"duplicate action: {action.action}")
         seen_actions.add(action.action)
-        if not feature.source_table.startswith("dbo.Rddbc"):
+        if not feature.source_table.startswith("dbo.Rddbc") and not (
+            feature.table_key == "order_calculation" and feature.source_table == "snapshot.frequency_product"
+        ):
             errors.append(f"invalid source table: {feature.source_table}")
         if not feature.primary_key:
             errors.append(f"missing primary key: {feature.table_key}")

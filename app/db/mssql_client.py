@@ -413,17 +413,40 @@ def _get_engine() -> Engine:
         pass
     return engine
 
+_READ_ONLY_REQUEST = ContextVar("ssai_read_only_request", default=None)
+
+
+@contextmanager
+def read_only_request(*, timeout_seconds: int = 120):
+    """Opt-in request-local timeout and SELECT accounting; no automatic retry."""
+    state = {"timeout_seconds": max(1, int(timeout_seconds)), "queries": []}
+    token = _READ_ONLY_REQUEST.set(state)
+    try:
+        yield state
+    finally:
+        _READ_ONLY_REQUEST.reset(token)
+
+
 def get_engine() -> Engine:
     return _get_engine()
 
 @contextmanager
 def get_conn():
     conn = _get_engine().connect()
+    state = _READ_ONLY_REQUEST.get()
+    driver = conn.connection.driver_connection if state is not None else None
+    previous_timeout = driver.timeout if driver is not None else None
     try:
+        if driver is not None:
+            driver.timeout = state["timeout_seconds"]
         yield conn
     finally:
-        try: conn.close()
-        except Exception: pass
+        try:
+            if driver is not None:
+                driver.timeout = previous_timeout
+        finally:
+            try: conn.close()
+            except Exception: pass
 
 # ssai.sims.sql 로거
 _sims = logging.getLogger("ssai.sims.sql")
@@ -448,8 +471,26 @@ def log_sql(name: str, sql: str, params: Optional[Sequence[Any] | Dict[str, Any]
 def read_df(sql: str, params: Sequence[Any] | Dict[str, Any] = ()) -> pd.DataFrame:
     import time
     t0 = time.perf_counter()
+    state = _READ_ONLY_REQUEST.get()
+    record = None
+    if state is not None:
+        leading_sql = re.sub(r"\A(?:\s+|--[^\n]*(?:\n|$)|/\*.*?\*/)*", "", sql, flags=re.DOTALL)
+        if not re.match(r"(SELECT|WITH)\b", leading_sql, re.IGNORECASE):
+            raise ValueError("read-only request requires SELECT SQL")
+        record = {"tables": _dashboard_table_names(sql), "status": "pending"}
+        state["queries"].append(record)
     with get_conn() as conn:
-        df = pd.read_sql(sql, con=conn, params=params)
+        try:
+            df = pd.read_sql(sql, con=conn, params=params)
+            if record is not None:
+                record.update(status="ready", rows=len(df))
+        except Exception as exc:
+            if record is not None:
+                record.update(status="error", error_type=type(exc).__name__)
+            raise
+        finally:
+            if record is not None:
+                record["elapsed_ms"] = int((time.perf_counter() - t0) * 1000)
     ms = int((time.perf_counter() - t0) * 1000)
     measurement = _DASHBOARD_QUERY_MEASUREMENT.get()
     if measurement is not None:

@@ -44,6 +44,7 @@ def render_product_master_filters(
     include_price_filters: bool = True,
     include_audit_filters: bool = True,
     include_only_use: bool = True,
+    compact: bool = False,
 ) -> dict[str, Any]:
     values = dict(defaults or {})
     group_options = product_code_name_options("0013")
@@ -54,7 +55,8 @@ def render_product_master_filters(
         text = str(value or "").strip()
         return options.index(text) if text in options else 0
 
-    c1, c2, c3 = st.columns(3)
+    leading = st.columns(4 if compact else 3)
+    c1, c2, c3 = leading[:3]
     with c1:
         physic_cd = st.text_input("제품코드(정확)", value=str(values.get("physic_cd") or ""), key=f"{prefix}_physic_cd_{ns}")
     with c2:
@@ -62,18 +64,24 @@ def render_product_master_filters(
     with c3:
         insu_cd = st.text_input("보험코드(정확)", value=str(values.get("insu_cd") or ""), key=f"{prefix}_insu_cd_{ns}")
 
-    c4, c5, c6 = st.columns(3)
-    with c4:
-        maker_nm = st.text_input("제약사명 포함", value=str(values.get("maker_nm") or ""), key=f"{prefix}_maker_nm_{ns}")
-    with c5:
-        barcode = st.text_input("바코드(정확, 1~5)", value=str(values.get("barcode") or ""), key=f"{prefix}_barcode_{ns}")
-    with c6:
-        if include_price_filters:
-            unit_price = st.text_input("단가(정확 또는 범위)", value=str(values.get("product_unit_price") or ""), key=f"{prefix}_unit_price_{ns}")
-        else:
-            unit_price = ""
-            if display_caption:
-                st.caption(display_caption)
+    if compact:
+        maker_nm = str(values.get("maker_nm") or "")
+        unit_price = ""
+        with leading[3]:
+            barcode = st.text_input("바코드(정확, 1~5)", value=str(values.get("barcode") or ""), key=f"{prefix}_barcode_{ns}")
+    else:
+        c4, c5, c6 = st.columns(3)
+        with c4:
+            maker_nm = st.text_input("제약사명 포함", value=str(values.get("maker_nm") or ""), key=f"{prefix}_maker_nm_{ns}")
+        with c5:
+            barcode = st.text_input("바코드(정확, 1~5)", value=str(values.get("barcode") or ""), key=f"{prefix}_barcode_{ns}")
+        with c6:
+            if include_price_filters:
+                unit_price = st.text_input("단가(정확 또는 범위)", value=str(values.get("product_unit_price") or ""), key=f"{prefix}_unit_price_{ns}")
+            else:
+                unit_price = ""
+                if display_caption:
+                    st.caption(display_caption)
 
     c7, c8, c9 = st.columns(3)
     with c7:

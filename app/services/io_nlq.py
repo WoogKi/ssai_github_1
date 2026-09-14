@@ -2134,13 +2134,15 @@ def _lookup_unlabeled_io_entity_candidates(name: str, *, action: str = "") -> di
         )
 
         manufacturer_rows = resolve_supplier_vendor_codes(name, mode=SCOPE_MANUFACTURER)
-        matched = int(any(clean_text(row.get("name")) == name for row in manufacturer_rows))
+        order_action = action in {"발주조회", "입고예정조회", "발주 계산"}
+        selected_rows = [row for row in manufacturer_rows if order_action or clean_text(row.get("name")) == name]
+        matched = len(selected_rows) if order_action else int(bool(selected_rows))
         if matched:
-            for row in manufacturer_rows:
-                if clean_text(row.get("name")) == name and clean_text(row.get("code")):
+            for row in selected_rows:
+                if clean_text(row.get("code")):
                     out.append({
                         "match_type": "manufacturer",
-                        "match_value": name,
+                        "match_value": clean_text(row.get("name")) or name,
                         "match_code": clean_text(row.get("code")),
                     })
         record("manufacturer", matched, started_at)
@@ -2298,7 +2300,7 @@ def resolve_unlabeled_io_entity_condition(
     kind = next(iter(kinds))
     if kind == "transaction_vendor":
         candidate = candidates[0]
-        if action in {"발주조회", "입고예정조회"}:
+        if action in {"발주조회", "입고예정조회", "발주 계산"}:
             out["order_vendor_cd"] = clean_text(candidate.get("match_code"))
             out["order_vendor_nm"] = phrase
             out["order_vendor_nm_display"] = phrase
@@ -2306,7 +2308,7 @@ def resolve_unlabeled_io_entity_condition(
             out["ven_cd"] = clean_text(candidate.get("match_code"))
             out["ven_nm_display"] = phrase
     elif kind == "manufacturer":
-        if action in {"발주조회", "입고예정조회"}:
+        if action in {"발주조회", "입고예정조회", "발주 계산"}:
             out["maker_nm"] = phrase
         else:
             candidate = candidates[0]
@@ -3034,7 +3036,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
 
     from app.services.erp_table_nlq import is_order_calculation_request, resolve_registered_erp_table_nlq
     if is_order_calculation_request(raw):
-        return None
+        return resolve_registered_erp_table_nlq(raw, today=today)
 
     registered = resolve_registered_erp_table_nlq(raw, today=today)
     if isinstance(registered, dict):
