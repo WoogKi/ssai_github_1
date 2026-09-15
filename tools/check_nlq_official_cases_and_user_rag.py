@@ -133,7 +133,8 @@ def main() -> None:
     plan = validate_plan(DEFAULT_OUTPUT.with_suffix(".knowledge.json"))
     assert len(plan) == 1 and plan[0].scope == "GLOBAL" and plan[0].knowledge_classification == "GENERAL"
     assert plan[0].source_key == "document:sims-ai-business-question-examples"
-    assert plan[0].source_name == "SSAI_업무질문_사용_예시.md" and plan[0].version == 2
+    assert plan[0].source_name == "SSAI_업무질문_사용_예시.md" and plan[0].version == 3
+    assert len(plan[0].search_aliases) == 27
     with tempfile.TemporaryDirectory(prefix="nlq-user-rag-") as temp:
         manifest_root = Path(temp) / "manifest"
         applied = apply_plan(

@@ -1,0 +1,14 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "Wave 3 순서 1. 사용자 업무 의미 전용. 운영 등록 전 승인 및 기존 source_key 재확인 필요.",
+  "items": [{
+    "source_kind": "DOCUMENT",
+    "source_name": "SIMS_AI_MASTER_INVENTORY_USER_GUIDE.md",
+    "source_key": "document:sims-ai-master-inventory-user-guide",
+    "content_file": "SIMS_AI_MASTER_INVENTORY_USER_GUIDE.md",
+    "scope": "GLOBAL", "company_id": null, "user_id": null, "version": 1,
+    "knowledge_classification": "GENERAL",
+    "search_aliases": ["마스터 정보 업무 안내", "제품 거래처 제조사 설명", "단가적용처 재고적용처 차이", "재고위치 업무 의미", "계약단가 매입단가 차이", "제품재고장 제품정보 차이"]
+  }]
+}

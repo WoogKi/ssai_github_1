@@ -26,7 +26,7 @@ version: "2026.09.03-r1"
 | 9/14~9/16 | 대용량 공통 계약 Gate 및 소규모 PoC | P1 | 화면 표본 vs 전체범위 분리, aggregate/provenance, timeout/cancel/export 정책 검증 |
 | 9/14 완료 (당초 9/17~9/23 예상) | 계약단가 조회·발주 가격 연결 | 운영 유지 | 유효 계약/적용처 코드 및 기간 누출 보정 완료 |
 | 9/14 완료 (당초 9/24~10/2 예상) | 발주 계산·NLQ 1차·2호기 배포/Smoke | 운영 유지 | 회사7 확인 및 기준 commit/Health 일치, 실제 ERP 등록 제외 |
-| 9/14 완료 | 발주 공식 문서화·RAG 등록 준비 | 승인 대기 | 공식 계약/Closeout/권한 분리. 운영 corpus 등록은 별도 승인 후 |
+| 9/15 완료 | 발주 공식 문서화·Knowledge/RAG 등록 | 운영 유지 | 공통 계약 GLOBAL v2, 회사7 Closeout 격리, 양 서버 정합성 확인 |
 | 다음 | Snapshot/Dashboard 후속 | P0 | 발주와 분리해 회사별 성능/계약 및 HY000 재발 관찰 |
 | 10/5~10/9 | 입출금 기능 설계 입력·1차 구현 | P3 | 회계 grain·민감정보·권한 범위 확정 후 읽기 중심 1차 기능 |
 | 자료 확보 시 병행 | 외부 MCP/OpenAPI 실서비스 연결 | P2 | 승인 API 명세 확보 후 endpoint/secret/allowlist/timeout/retry=0/감사/Smoke |

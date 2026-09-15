@@ -1,0 +1,29 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "현재고·제품재고현황·현재표 원본과 후속질문 기술 계약의 전용 등록 정의. 공통 조회조건 우선순위는 KPI 공통조건 문서를 따른다.",
+  "items": [
+    {
+      "source_kind": "DOCUMENT",
+      "source_name": "SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md",
+      "source_key": "document:sims-nlq-stock-current-table-contract",
+      "content_file": "SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md",
+      "scope": "GLOBAL",
+      "company_id": null,
+      "user_id": null,
+      "version": 1,
+      "knowledge_classification": "ERP_DB_INTERNAL",
+      "search_aliases": [
+        "현재고 current-table 계약",
+        "제조사 제품 scope",
+        "회사격리 원본 export",
+        "현재고 조회 기술 계약",
+        "현재표 후속질문 원본",
+        "현재표 회사격리",
+        "현재고 표시와 전체 다운로드",
+        "제품재고현황 통합검색 계약",
+        "현재표 결과 상태 구분"
+      ]
+    }
+  ]
+}

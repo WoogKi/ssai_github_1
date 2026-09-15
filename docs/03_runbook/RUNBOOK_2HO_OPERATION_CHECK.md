@@ -1,9 +1,9 @@
 ---
 title: "SSAI 2호기 운영 점검 Runbook"
-date: "2026-08-09"
-version: "v1.0"
+date: "2026-09-15"
+version: "v2.0"
 status: "official"
-baseline_commit: "6c83962bc1b079fe440d56a313de536cf9490651"
+baseline_commit: "e75fdc49872b03cc765207715d8bc118833cca9e"
 ---
 
 # SSAI 2호기 운영 점검 Runbook
@@ -21,6 +21,9 @@ baseline_commit: "6c83962bc1b079fe440d56a313de536cf9490651"
 | Streamlit 로그 | `D:\SSAI_DATA\logs\streamlit_server_2ho.log` |
 | wrapper | `D:\SSAI_DATA\tools\run_streamlit_2ho_rotating.ps1` |
 | inner cmd | `D:\SSAI_DATA\tools\run_streamlit_2ho_inner.cmd` |
+
+이는 서버 운영 구성 기준이다. 문서의 HEAD·과거 Health 결과를 현재 서버 상태로
+간주하지 않고 실제 프로세스·승인 배포 commit·저장 경로를 실행 전에 다시 확인한다.
 
 공통 배포 순서는 [SSAI 공통 운영 Runbook](RUNBOOK_SIMSAI.md)을 따른다.
 
@@ -193,6 +196,15 @@ artifact가 변경된 경우에는 source Git pull만으로 2호기 Knowledge �
 
 ### 7.1 배포 전 확인과 백업
 
+개별 DOCUMENT 등록은 원문과 단일 `*.knowledge.json` 계획을 먼저 수동 동기화한 뒤
+2호기 `.venv\Scripts\python.exe`로 validate→승인된 apply→readback 순으로 수행한다.
+Git 제외 계획은 Git pull에 포함되지 않는다. 회사7 같은 selected-company-id는 권한
+실행 context이며 GLOBAL 문서 company_id에 넣지 않는다.
+양 서버의 같은 source_key/version/scope/company/classification/content hash를 확인한다.
+서버별 document_id는 다를 수 있다. 아래 전체 corpus 배포는 별도 승인된 복구/일괄배포
+절차에만 적용하며, 서버별 등록 이력이 있는 corpus를 무작정 덮어쓰지 않는다.
+manifest/artifact 직접 수동 편집은 금지한다.
+
 1. 1호기 검증 corpus의 `manifest.json`과 artifact 파일이 같은 검증 시점의 묶음인지
    확인한다.
 2. 2호기 기존 corpus의 `manifest.json`, 문서 수, 승인 상태를 읽기 전용으로 기록한다.
@@ -220,6 +232,12 @@ $manifest.documents | ForEach-Object {
   $artifactPath = Join-Path (Join-Path $root 'artifacts') ("{0}.json" -f $_.content_hash)
   [pscustomobject]@{
     source_name = $_.source_name
+    source_key = $_.source_key
+    version = $_.version
+    scope = $_.scope
+    company_id = $_.company_id
+    knowledge_classification = $_.knowledge_classification
+    content_hash = $_.content_hash
     document_id = $_.document_id
     approval_status = $_.approval_status
     artifact_exists = Test-Path -LiteralPath $artifactPath
@@ -241,6 +259,13 @@ HTTP `200`/`ok`를 확인한다. 그 다음 실제 UI에서 최소 다음을 실
    - ERP Knowledge 답변과 `Rddbc120.txt` citation이 표시되어야 한다.
 2. 비권한 사용자: 같은 질문
    - ERP 내부 내용, source 이름/key, citation, conflict notice가 노출되지 않아야 한다.
+
+3. GENERAL 업무 안내: RAG_USE가 있는 사용자만 열람 가능해야 한다.
+4. COMPANY 문서: 해당 회사에서는 권한 기준으로 허용하고 다른 회사에서는 차단한다.
+5. PROJECT_SOURCE: 별도 KNOWLEDGE_PROJECT_SOURCE_READ와 기술상세 모드 및 현재 소스 revision을 확인한다.
+
+권한 기준은 [Knowledge 권한 계약](../02_design/KNOWLEDGE_ACCESS_POLICY_CONTRACT.md)을 따른다.
+retire는 정확한 ID/version으로 preview 후 승인된 --apply만 사용한다.
 
 Git rollback과 corpus rollback은 서로 별개다. Git commit을 되돌려도 `D:\SSAI_DATA\knowledge_poc`
 corpus는 바뀌지 않으며, corpus를 복원해도 source Git HEAD는 바뀌지 않는다. 두 rollback은

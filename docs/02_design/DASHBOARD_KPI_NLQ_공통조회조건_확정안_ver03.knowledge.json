@@ -1,0 +1,27 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "회사별 저장 조회조건과 명시조건의 우선순위, 공급 역할, 지원하지 않는 요청, 현재표 교체 원칙의 공통 정책. 현재고 계산/후속질문 세부 계약은 현재고·현재표 전용 문서를 따른다.",
+  "items": [
+    {
+      "source_kind": "DOCUMENT",
+      "source_name": "DASHBOARD_KPI_NLQ_공통조회조건_확정안_ver03.md",
+      "source_key": "document:dashboard-kpi-nlq-common-query-contract",
+      "content_file": "DASHBOARD_KPI_NLQ_공통조회조건_확정안_ver03.md",
+      "scope": "GLOBAL",
+      "company_id": null,
+      "user_id": null,
+      "version": 1,
+      "knowledge_classification": "ERP_DB_INTERNAL",
+      "search_aliases": [
+        "Dashboard KPI NLQ 공통 조회조건",
+        "명시조건과 저장 조회조건 우선순위",
+        "회사별 기본 조회조건 정책",
+        "매입처 발주처 제조사 역할 구분",
+        "지원하지 않는 조회조건 처리",
+        "Dashboard 현재표 교체 금지",
+        "조회조건 저장 권한과 임시 변경"
+      ]
+    }
+  ]
+}

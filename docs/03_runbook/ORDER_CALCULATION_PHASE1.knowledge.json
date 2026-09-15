@@ -1,67 +1,14 @@
 {
   "approval_required": true,
-  "status": "PREPARED_NOT_IMPORTED",
+  "status": "INDEX_ONLY_NOT_APPLICABLE",
+  "registration_notes": "단일 문서 등록 계획의 색인. 이 파일에는 apply하지 않고 참조된 전용 계획을 각각 검증·승인한다.",
   "baseline_commit": "7283865dcf8709ec9673404b0321adfe208c65be",
-  "items": [
-    {
-      "source_kind": "DOCUMENT",
-      "source_name": "SSAI_업무질문_사용_예시.md",
-      "source_key": "document:sims-ai-business-question-examples",
-      "content_file": "SIMS_AI_업무질문_사용_예시.md",
-      "scope": "GLOBAL",
-      "company_id": null,
-      "user_id": null,
-      "version": 3,
-      "knowledge_classification": "GENERAL",
-      "search_aliases": ["발주 계산 기준", "발주 계산 질문 예시", "추천 발주수량", "계약단가 업무 의미", "입고예정 기준", "제품정보 설명", "단가적용처와 재고적용처", "공식 영업일"]
-    },
-    {
-      "source_kind": "DOCUMENT",
-      "source_name": "ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md",
-      "source_key": "document:order-calculation-phase1-business-contract",
-      "content_file": "../02_design/ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md",
-      "scope": "COMPANY",
-      "company_id": 7,
-      "user_id": null,
-      "version": 1,
-      "knowledge_classification": "ERP_DB_INTERNAL",
-      "search_aliases": ["발주 계산 공식 계약", "발주 단가 우선순위", "발주단위 추론", "발주 계약단가 기간 누출", "발주 NLQ 조회구분"]
-    },
-    {
-      "source_kind": "DOCUMENT",
-      "source_name": "SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md",
-      "source_key": "document:sims-nlq-stock-current-table-contract",
-      "content_file": "../02_design/SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md",
-      "scope": "GLOBAL",
-      "company_id": null,
-      "user_id": null,
-      "version": 1,
-      "knowledge_classification": "ERP_DB_INTERNAL",
-      "search_aliases": ["현재고 current-table 계약", "제조사 제품 scope", "회사격리 원본 export"]
-    },
-    {
-      "source_kind": "DOCUMENT",
-      "source_name": "SIMS_AI_NLQ_기간정책_공식기준.md",
-      "source_key": "document:sims-ai-nlq-period-contract",
-      "content_file": "../02_design/SIMS_AI_NLQ_기간정책_공식기준.md",
-      "scope": "GLOBAL",
-      "company_id": null,
-      "user_id": null,
-      "version": 1,
-      "knowledge_classification": "ERP_DB_INTERNAL",
-      "search_aliases": ["NLQ 기본기간 정책", "조회기간 기준일 구분"]
-    },
-    {
-      "source_kind": "DOCUMENT",
-      "source_name": "ORDER_CALCULATION_PHASE1_CLOSEOUT_20260914.md",
-      "source_key": "document:order-calculation-phase1-closeout-20260914",
-      "content_file": "../04_test_results/ORDER_CALCULATION_PHASE1_CLOSEOUT_20260914.md",
-      "scope": "COMPANY",
-      "company_id": 7,
-      "user_id": null,
-      "version": 1,
-      "knowledge_classification": "ERP_DB_INTERNAL",
-      "search_aliases": ["발주 1차 배포 마감", "회사7 발주 검증", "가격 NULL 원인 수정", "HY000 관찰"]
-    }
-  ]
+  "external_registration_plans": [
+    "SIMS_AI_업무질문_사용_예시.knowledge.json",
+    "../02_design/SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.knowledge.json",
+    "../02_design/ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.knowledge.json",
+    "../02_design/SIMS_AI_NLQ_기간정책_공식기준.knowledge.json",
+    "../04_test_results/ORDER_CALCULATION_PHASE1_CLOSEOUT_20260914.knowledge.json"
+  ],
+  "items": []
 }

@@ -1,0 +1,12 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "Wave 1~5 등록 완료 상태와 양 서버 Knowledge 운영 절차를 반영한 공통 Runbook v2 등록 계획이다. 기존 v1을 덮어쓰지 않고 새 version으로 등록한다.",
+  "items": [{
+    "source_kind": "DOCUMENT", "source_name": "RUNBOOK_SIMSAI.md",
+    "source_key": "document:sims-ai-runbook", "content_file": "RUNBOOK_SIMSAI.md",
+    "version": 2, "scope": "GLOBAL", "company_id": null, "user_id": null,
+    "knowledge_classification": "ERP_DB_INTERNAL",
+    "search_aliases": ["SIMS AI 공통 운영 절차", "1호기 2호기 배포", "Knowledge 등록 운영 절차", "validate apply readback", "Knowledge 계획 수동 동기화", "Git 코드 corpus 별도 배포", "운영 검사 합격 기준", "관리자 Runbook"]
+  }]
+}

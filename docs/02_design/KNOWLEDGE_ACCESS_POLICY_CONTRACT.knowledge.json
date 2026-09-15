@@ -1,0 +1,12 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "Wave 5 실제 권한 코드 기준. GENERAL로 낮추지 않으며 PROJECT_SOURCE 등록 계획과 구분.",
+  "items": [{
+    "source_kind": "DOCUMENT", "source_name": "KNOWLEDGE_ACCESS_POLICY_CONTRACT.md",
+    "source_key": "document:knowledge-access-policy-contract", "content_file": "KNOWLEDGE_ACCESS_POLICY_CONTRACT.md",
+    "version": 1, "scope": "GLOBAL", "company_id": null, "user_id": null,
+    "knowledge_classification": "ERP_DB_INTERNAL",
+    "search_aliases": ["Knowledge RAG 권한 계약", "GENERAL RAG_USE", "ERP_DB_INTERNAL 기술상세 모드", "KNOWLEDGE_PROJECT_SOURCE_READ", "Knowledge 회사 사용자 격리", "Project Source 최신성 STALE", "Knowledge 승인 퇴역 권한"]
+  }]
+}

@@ -1,0 +1,13 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "Wave 3 순서 2. 마스터/R070/R230 조회 계약. 현재 원가 상태와 거래 이력 최신 가격 구분.",
+  "items": [{
+    "source_kind": "DOCUMENT", "source_name": "SIMS_MASTER_PRICE_QUERY_CONTRACT.md",
+    "source_key": "document:sims-master-price-query-contract",
+    "content_file": "SIMS_MASTER_PRICE_QUERY_CONTRACT.md",
+    "scope": "GLOBAL", "company_id": null, "user_id": null, "version": 1,
+    "knowledge_classification": "ERP_DB_INTERNAL",
+    "search_aliases": ["거래처 제품 마스터 조회 계약", "제조사 회사별 코드명", "단가적용처 재고적용처 독립 필드", "R070 최종 계약단가 이력", "R230 구매원가 상태", "제품분류 구분 그룹 바코드 보험코드", "제품 사용여부 추가 수정 이력", "마스터관리 자연어 조회"]
+  }]
+}

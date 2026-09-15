@@ -1,0 +1,12 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "Wave 5 2호기 운영 기술 기준. 실제 회사별 배포 결과가 아닌 점검·재기동·자료 검증 절차.",
+  "items": [{
+    "source_kind": "DOCUMENT", "source_name": "RUNBOOK_2HO_OPERATION_CHECK.md",
+    "source_key": "document:sims-ai-2ho-operation-runbook", "content_file": "RUNBOOK_2HO_OPERATION_CHECK.md",
+    "version": 1, "scope": "GLOBAL", "company_id": null, "user_id": null,
+    "knowledge_classification": "ERP_DB_INTERNAL",
+    "search_aliases": ["2호기 운영 점검", "SIMS_AI_2HO_Streamlit", "2호기 .venv", "Streamlit 재기동 Health", "2호기 Knowledge readback", "Scheduled Task 잔존 프로세스"]
+  }]
+}

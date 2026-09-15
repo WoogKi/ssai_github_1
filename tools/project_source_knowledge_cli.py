@@ -20,12 +20,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from app.services.knowledge_document_service import (  # noqa: E402
+    APPROVAL_APPROVED,
+    DOCUMENT_ACTIVE,
     KnowledgeDocumentRepository,
     SOURCE_KIND_PROJECT_SOURCE,
     normalize_conflict_metadata,
 )
 from app.services.knowledge_scope_policy import (  # noqa: E402
     KnowledgeClassification,
+    can_manage_document,
     validate_document_classification,
     validate_document_scope,
 )
@@ -376,6 +379,95 @@ def apply_plan(
     }]
 
 
+def _retire_audit(source: Any, *, retired: bool | None = None) -> dict[str, Any]:
+    result = {
+        "document_id": source.document_id,
+        "source_key": source.source_key,
+        "source_kind": source.source_kind,
+        "version": source.version,
+        "scope": source.scope,
+        "company_id": source.company_id,
+        "user_id": source.user_id,
+        "knowledge_classification": source.knowledge_classification,
+        "approval_status": source.approval_status,
+        "status": source.status,
+    }
+    if retired is not None:
+        result["retired"] = retired
+    return result
+
+
+def preview_retire(*, manifest_root: Path, document_id: str, version: int) -> Any:
+    """Resolve one exact active, approved PROJECT_SOURCE without writing."""
+    repo = KnowledgeDocumentRepository(root=manifest_root)
+    target = repo._find_document(repo._read_manifest(), document_id)
+    if target.source_kind != SOURCE_KIND_PROJECT_SOURCE:
+        raise PlanValidationError("retire CLI accepts PROJECT_SOURCE only")
+    if target.version != version:
+        raise PlanValidationError("document_id/version does not identify one exact PROJECT_SOURCE")
+    if target.status != DOCUMENT_ACTIVE:
+        raise PlanValidationError("only an active PROJECT_SOURCE can be retired")
+    if target.approval_status != APPROVAL_APPROVED:
+        raise PlanValidationError("PROJECT_SOURCE retirement requires APPROVED status")
+    return target
+
+
+def authorize_retire(
+    *,
+    manifest_root: Path,
+    document_id: str,
+    version: int,
+    actor_user_id: int,
+    selected_company_id: int,
+    permission_resolver: Callable[..., Iterable[str]] = resolve_actor_permissions,
+) -> tuple[Any, tuple[str, ...]]:
+    target = preview_retire(
+        manifest_root=manifest_root,
+        document_id=document_id,
+        version=version,
+    )
+    permissions = tuple(
+        permission_resolver(
+            actor_user_id=actor_user_id,
+            selected_company_id=selected_company_id,
+        )
+    )
+    decision = can_manage_document(
+        document=target.policy_document(),
+        current_company_id=selected_company_id,
+        permission_codes=permissions,
+    )
+    if not decision.allowed:
+        raise PermissionError(f"PROJECT_SOURCE retirement denied: {decision.reason_code}")
+    return target, permissions
+
+
+def retire_project_source(
+    *,
+    manifest_root: Path,
+    document_id: str,
+    version: int,
+    actor_user_id: int,
+    selected_company_id: int,
+    permission_resolver: Callable[..., Iterable[str]] = resolve_actor_permissions,
+) -> dict[str, Any]:
+    _, permissions = authorize_retire(
+        manifest_root=manifest_root,
+        document_id=document_id,
+        version=version,
+        actor_user_id=actor_user_id,
+        selected_company_id=selected_company_id,
+        permission_resolver=permission_resolver,
+    )
+    retired, changed = KnowledgeDocumentRepository(root=manifest_root).retire_checked(
+        document_id=document_id,
+        version=version,
+        current_company_id=selected_company_id,
+        permission_codes=permissions,
+    )
+    return _retire_audit(retired, retired=changed)
+
+
 def _parse_source_key(source_key: str) -> tuple[str, str]:
     if not source_key.startswith(_SOURCE_PREFIX):
         raise PlanValidationError("invalid PROJECT_SOURCE source_key")
@@ -471,6 +563,20 @@ def main() -> int:
     apply_parser.add_argument("--selected-company-id", type=int, required=True)
     freshness_parser = subparsers.add_parser("freshness", help="Read-only PROJECT_SOURCE freshness report.")
     freshness_parser.add_argument("--manifest-root", type=Path, required=True)
+    retire_parser = subparsers.add_parser(
+        "retire",
+        help="Preview, then optionally retire one exact PROJECT_SOURCE version.",
+    )
+    retire_parser.add_argument("--manifest-root", type=Path, required=True)
+    retire_parser.add_argument("--document-id", required=True)
+    retire_parser.add_argument("--version", type=int, required=True)
+    retire_parser.add_argument("--actor-user-id", type=int, required=True)
+    retire_parser.add_argument("--selected-company-id", type=int, required=True)
+    retire_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the retirement after the default preview was reviewed.",
+    )
     args = parser.parse_args()
     try:
         if args.command == "validate":
@@ -491,8 +597,40 @@ def main() -> int:
                 selected_company_id=selected_company_id,
             )
             _print({"mode": "apply", "items": result})
-        else:
+        elif args.command == "freshness":
             _print({"mode": "freshness", "write_count": 0, "items": freshness_report(manifest_root=args.manifest_root)})
+        else:
+            actor_user_id = _positive_int(args.actor_user_id, field="actor_user_id", required=True)
+            selected_company_id = _positive_int(
+                args.selected_company_id,
+                field="selected_company_id",
+                required=True,
+            )
+            if not args.apply:
+                preview, _ = authorize_retire(
+                    manifest_root=args.manifest_root,
+                    document_id=str(args.document_id),
+                    version=int(args.version),
+                    actor_user_id=actor_user_id,
+                    selected_company_id=selected_company_id,
+                )
+                _print({
+                    "mode": "retire_preview",
+                    "write_count": 0,
+                    "item": _retire_audit(preview),
+                })
+            else:
+                _print({
+                    "mode": "retire_apply",
+                    "write_count": 1,
+                    "item": retire_project_source(
+                        manifest_root=args.manifest_root,
+                        document_id=str(args.document_id),
+                        version=int(args.version),
+                        actor_user_id=actor_user_id,
+                        selected_company_id=selected_company_id,
+                    ),
+                })
     except (PlanValidationError, PermissionError, ValueError, OSError, subprocess.SubprocessError) as exc:
         _print({"ok": False, "error_type": type(exc).__name__, "reason": str(exc)})
         return 1

@@ -178,7 +178,7 @@ def evaluation_cases() -> tuple[EvalCase, ...]:
         EvalCase("auth_role_permission_table", "SSAI ROLE PERMISSIONS 역할별 권한", ("auth-db-schema.md",), ("1. 테이블 목록",), permissions=ERP_READ, technical_detail_mode=True),
         EvalCase("auth_user_company_table", "SSAI USER COMPANIES 사용자별 접근 가능 회사", ("auth-db-schema.md",), ("1. 테이블 목록",), permissions=ERP_READ, technical_detail_mode=True),
         EvalCase("scope_company_allow", "SCOPE CO 4", (SCOPE_CONTROL_SOURCE,), ("회사 범위 평가 제어",)),
-        EvalCase("scope_company_deny", "SCOPE CO 4", excluded_sources=(SCOPE_CONTROL_SOURCE,), company_id=6, **no_match),
+        EvalCase("scope_company_deny", "SCOPE CO 4", excluded_sources=(SCOPE_CONTROL_SOURCE,), company_id=6),
         EvalCase("erp_system_admin_allow", "SSAI ROLE PERMISSIONS 역할별 권한", ("auth-db-schema.md",), ("1. 테이블 목록",), permissions=ERP_READ, technical_detail_mode=True),
         EvalCase("erp_ssart_manager_allow", "SSAI USERS 사용자 기본 테이블", ("auth-db-schema.md",), ("2. SSAI_USERS",), permissions=ERP_READ, technical_detail_mode=True),
         EvalCase("erp_ssart_staff_deny", "SSAI ROLE PERMISSIONS 역할별 권한", excluded_sources=("auth-db-schema.md",), **no_match),

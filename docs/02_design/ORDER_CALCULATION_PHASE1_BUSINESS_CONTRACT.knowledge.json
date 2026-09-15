@@ -1,0 +1,14 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "회사별 실증을 제외한 공통 계약 GLOBAL v2. 2026-09-15 양 서버 등록 완료. 기존 COMPANY7 v1은 별도 퇴역 완료했으며 회사7 실증은 Closeout 문서로 유지한다.",
+  "items": [{
+    "source_kind": "DOCUMENT",
+    "source_name": "ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md",
+    "source_key": "document:order-calculation-phase1-business-contract",
+    "content_file": "ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md",
+    "scope": "GLOBAL", "company_id": null, "user_id": null, "version": 2,
+    "knowledge_classification": "ERP_DB_INTERNAL",
+    "search_aliases": ["발주 계산 공식 계약", "발주 단가 우선순위", "발주단위 추론", "발주 계약단가 기간 누출", "발주 NLQ 조회구분"]
+  }]
+}

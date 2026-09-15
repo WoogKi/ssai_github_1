@@ -8,7 +8,13 @@
 
 ## 현재 공식 문서
 
-- 발주 계산 1차 업무 정의: [발주 계산 업무 계약](02_design/ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md) (v1.4, 배포 완료 기준)
+- Knowledge 권한: [읽기·관리·회사격리·소스 최신성 계약](02_design/KNOWLEDGE_ACCESS_POLICY_CONTRACT.md)
+- 마스터·재고정보 사용자 안내: [일반 업무 설명](03_runbook/SIMS_AI_MASTER_INVENTORY_USER_GUIDE.md)
+- 마스터·계약단가·구매원가: [현재 조회 기술 계약](02_design/SIMS_MASTER_PRICE_QUERY_CONTRACT.md)
+- 제품재고장: [기간 재고·단가 조회 계약](02_design/PRODUCT_INVENTORY_LEDGER_CONTRACT.md)
+- Snapshot 2.1·제품정보: [운영 조회 계약](02_design/SNAPSHOT_PRODUCT_INFORMATION_V21_CONTRACT.md)
+- Knowledge Wave 3: [authority 보강·등록 준비 검토](04_test_results/KNOWLEDGE_WAVE3_AUTHORITY_REVIEW_20260914.md) (등록 대상 아님)
+- 발주 계산 1차 업무 정의: [발주 계산 업무 계약](02_design/ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md) (v1.5, 회사 공통 계약·회사별 사례 분리)
 - 발주 1차 운영 마감: [발주 계산/NLQ Closeout](04_test_results/ORDER_CALCULATION_PHASE1_CLOSEOUT_20260914.md)
 - 일반 사용자 Knowledge: [업무질문 사용 예시와 발주 업무 의미](03_runbook/SIMS_AI_업무질문_사용_예시.md)
 - 통합 로드맵·일정: [SIMS AI Platform Roadmap 2026-09-03](00_roadmap/SIMS_AI_PLATFORM_ROADMAP_20260903.md)

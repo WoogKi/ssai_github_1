@@ -1,0 +1,27 @@
+{
+  "approval_required": true,
+  "status": "REGISTERED_20260915",
+  "registration_notes": "Legacy Dashboard 공식 운영 설계. 문서 제2절의 이후 확장, 제10절의 구현 순서/목표, 제11절의 이후 확장은 운영 완료 증명이 아니다. V2 preview는 비활성이다. 이 안내 필드는 운영자용이며 검색 본문에 자동 삽입되지 않는다.",
+  "items": [
+    {
+      "source_kind": "DOCUMENT",
+      "source_name": "DASHBOARD_LITE_V01_DESIGN.md",
+      "source_key": "document:dashboard-lite-v01-design",
+      "content_file": "DASHBOARD_LITE_V01_DESIGN.md",
+      "scope": "GLOBAL",
+      "company_id": null,
+      "user_id": null,
+      "version": 1,
+      "knowledge_classification": "ERP_DB_INTERNAL",
+      "search_aliases": [
+        "Legacy Dashboard 공식 운영 설계",
+        "Dashboard 상태 근거 조치 상세표",
+        "Dashboard 평가월 달성률",
+        "Dashboard 대표 매입처 기준",
+        "Dashboard 재고위험과 준비율",
+        "Dashboard 상세표와 현재표 구분",
+        "Dashboard 이후 확장 미구현 범위"
+      ]
+    }
+  ]
+}

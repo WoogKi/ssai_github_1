@@ -1,0 +1,45 @@
+{
+  "status": "REGISTERED_20260915",
+  "items": [
+    {
+      "source_kind": "DOCUMENT",
+      "source_name": "SSAI_업무질문_사용_예시.md",
+      "source_key": "document:sims-ai-business-question-examples",
+      "content_file": "SIMS_AI_업무질문_사용_예시.md",
+      "scope": "GLOBAL",
+      "company_id": null,
+      "user_id": null,
+      "version": 3,
+      "knowledge_classification": "GENERAL",
+      "search_aliases": [
+        "SSAI에서 어떤 질문을 할 수 있어",
+        "어떤 업무를 조회할 수 있어",
+        "SSAI 질문 예시",
+        "업무질문 도움말",
+        "계약단가 조회 예시",
+        "계약단가는 어떻게 물어보면 돼",
+        "최종 매입단가 조회 예시",
+        "최종 매입단가는 어떻게 조회해",
+        "발주 조회 예시",
+        "발주 조회는 어떻게 질문해",
+        "입고예정 조회 예시",
+        "입고예정은 어떻게 물어봐",
+        "단가적용처로 조회하는 방법",
+        "재고적용처로 조회하는 방법",
+        "전문약만 조회하는 방법",
+        "SIMS AI에서 어떤 질문을 할 수 있어",
+        "SIMS에서 뭘 물어볼 수 있어",
+        "SIMS 관련 프롬프트 알려줘",
+        "SIMS 사용법 알려줘",
+        "발주 계산 기준",
+        "발주 계산 질문 예시",
+        "추천 발주수량",
+        "계약단가 업무 의미",
+        "입고예정 기준",
+        "제품정보 설명",
+        "단가적용처와 재고적용처",
+        "공식 영업일"
+      ]
+    }
+  ]
+}

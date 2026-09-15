@@ -39,13 +39,13 @@ version: "2026.09.03"
 | 날짜·시간 및 Web Tool 경계 | 완료 | 운영 유지 | 명시적 route, 출처, timeout, fail-closed 계약 유지 |
 | Knowledge/RAG 제한 Chat | 완료 | 운영 유지 | `/knowledge`, `/knowledge-tech`, citation-bound 후속질문 완료 |
 | Knowledge 권한관리 UI와 SIMS 도움말 | 완료 | 운영 유지 | effective permission readback 및 승인 corpus 기반 도움말 노출 |
-| Project Source freshness | 완료 | 운영 유지 | v4 CURRENT, 1호기·2호기 운영 Smoke PASS |
+| Project Source freshness | 완료 | 운영 유지 | stale v9 양 서버 퇴역, ACTIVE PROJECT_SOURCE 0건 |
 | RAG lexical 품질 Gate | 완료 | 운영 유지 | 30/30 PASS, false positive 0 |
 | MCP 기술 PoC | 완료 | 운영 유지 | mock, 공식 Python SDK, local STDIO handshake/discovery/read/lifecycle Gate 완료 |
 | 발주 계산 1차·NLQ | 완료 | 운영 유지 | 회사7 한림/환인 scope, 조회구분, 기본값/명시값, 가격 기간 경계, editor/export 검증 |
 | 발주 1차 1호기/GitHub/2호기 배포·Smoke | 완료 | 운영 유지 | 기준 commit 일치 및 2호기 Health 200, 사용자 확인 |
 | 발주 공식 문서화 | 완료 | 운영 유지 | 공식 업무 계약 v1.4 및 2026-09-14 Closeout |
-| 발주 Knowledge/RAG 등록 준비 | 완료 | 승인 대기 | 권한 분리 및 공식 문서 세트 확정. 운영 등록/import는 미실행 |
+| 발주 Knowledge/RAG 등록 | 완료 | 운영 유지 | Wave 1~5 양 서버 등록·권한·회사격리·해시 정합성 확인 |
 
 Knowledge/RAG 마감의 상세 기준은
 [2026-09-03 Knowledge/RAG 권한·도움말 마감](../01_phase_reports/20260903_Knowledge_RAG_권한_도움말_마감.md)을 따른다.
