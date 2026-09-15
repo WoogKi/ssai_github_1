@@ -11,6 +11,7 @@ import streamlit as st
 
 from app.services.rddbc040_service import search_goods_full, get_goods_detail_full
 from app.services.utils import apply_labels
+from app.sims.views.rddbc_io_shared import _trigger_panel_run
 
 from app.sims.views.master_advanced_filters import (
     build_master_query_condition,
@@ -453,7 +454,7 @@ def view_goods_list(widget_ns: str = "0") -> Dict[str, Any]:
             only_use_default=True,
             display_caption=f"화면 표시: 최대 {panel_display_max_rows:,}건",
         )
-        submitted = st.form_submit_button("조회", type="primary")
+        submitted = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     log.info("[view.goods] submitted=%s", submitted)
 
@@ -708,7 +709,7 @@ def view_goods_detail(widget_ns: str = "0") -> Dict[str, Any]:
     ):
 
         physic_cd = st.text_input("제품코드", value="")
-        submitted = st.form_submit_button("조회")
+        submitted = st.form_submit_button("조회", on_click=_trigger_panel_run)
 
     physic_cd = str(physic_cd or "").strip()
     log.info("[view.goods.detail] submitted=%s physic_cd=%r", submitted, physic_cd)

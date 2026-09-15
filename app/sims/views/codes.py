@@ -13,6 +13,7 @@ import streamlit as st
 
 from app.services import rddbc010_service as C
 from app.services.utils import apply_labels, make_unique_columns
+from app.sims.views.rddbc_io_shared import _trigger_panel_run
 from app.sims.views.master_advanced_filters import (
     render_master_audit_filter,
     build_master_query_condition,
@@ -1052,7 +1053,7 @@ def render_code_master_search() -> Dict[str, Any]:
         mod_date_from = audit_filter["mod_date_from"]
         mod_date_to = audit_filter["mod_date_to"]
 
-        submitted = st.form_submit_button("조회", type="primary")
+        submitted = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         return {
@@ -1236,7 +1237,7 @@ def render_codes_by_group() -> Dict[str, Any]:
         with c4:
             st.caption(f"조회상한: 최대 {master_max_rows:,}건")
 
-        submitted = st.form_submit_button("조회", type="primary")
+        submitted = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         return {
@@ -1374,7 +1375,7 @@ def render_code_kind_dictionary() -> Dict[str, Any]:
             only_active = st.checkbox("사용중만", value=True, key=f"__code_kinds_active__{ns}")
         with c2:
             st.caption(f"조회상한: 최대 {master_max_rows:,}건")
-        submitted = st.form_submit_button("조회", type="primary")
+        submitted = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         return {
@@ -1440,7 +1441,7 @@ def render_code_count_by_group() -> Dict[str, Any]:
     ):        
         only_active = st.checkbox("사용중만", value=True, key=f"__code_count_active__{ns}")
         st.caption(f"조회상한: 최대 {master_max_rows:,}건")
-        submitted = st.form_submit_button("집계", type="primary")
+        submitted = st.form_submit_button("집계", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         return {

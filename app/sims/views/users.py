@@ -16,6 +16,7 @@ import streamlit as st
 
 from app.services import rddbc060_service as U
 from app.services.utils import apply_labels, make_unique_columns
+from app.sims.views.rddbc_io_shared import _trigger_panel_run
 from app.sims.views.master_advanced_filters import (
     render_master_audit_filter,
     build_master_query_condition,
@@ -636,7 +637,7 @@ def render_user_list_with_dept() -> Dict[str, Any]:
         mod_date_from = audit_filter["mod_date_from"]
         mod_date_to = audit_filter["mod_date_to"]
 
-        submitted = st.form_submit_button("조회", type="primary")
+        submitted = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         return {
@@ -781,7 +782,7 @@ def render_user_list_with_dept() -> Dict[str, Any]:
                 ),
             },
         }
-    
+
 
     except Exception as e:
         log.exception("[view.users] render_user_list_with_dept failed")
@@ -821,7 +822,7 @@ def render_user_count_by_dept() -> Dict[str, Any]:
         with c3:
             st.caption(f"조회상한: 최대 {master_max_rows:,}건")
 
-        submitted = st.form_submit_button("집계", type="primary")
+        submitted = st.form_submit_button("집계", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         return {
@@ -973,7 +974,7 @@ def render_recent_hires() -> Dict[str, Any]:
                 key=f"__users_recent_only_active__{ns}",
             )
 
-        submitted = st.form_submit_button("조회", type="primary")
+        submitted = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         last_payload = st.session_state.get(cache_key)
@@ -1127,4 +1128,3 @@ def render_recent_hires() -> Dict[str, Any]:
             "title": "최근 입사자 오류",
             "data": str(e),
         }
-    

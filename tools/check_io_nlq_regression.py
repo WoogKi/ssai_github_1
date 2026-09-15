@@ -1070,6 +1070,31 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
         ("제품재고장 제품 타심주", {"physic_nm": "타심주"}, ("nlq_unlabeled_name",)),
         ("제품재고장 제품 38093", {"physic_cd": "38093"}, ("nlq_unlabeled_name", "physic_nm")),
         ("제품재고장 제조사 한미", {"maker_nm": "한미"}, ("nlq_unlabeled_name", "physic_nm")),
+        (
+            "알잘정 2026 제품재고장",
+            {"nlq_unlabeled_name": "알잘정", "date_from": "20260101", "date_to": "20261231"},
+            ("physic_nm", "maker_nm"),
+        ),
+        (
+            "71179 2026 제품재고장",
+            {"physic_cd": "71179", "date_from": "20260101", "date_to": "20261231"},
+            ("nlq_unlabeled_name", "physic_nm"),
+        ),
+        (
+            "제조사 삼일 2026 제품재고장",
+            {"maker_nm": "삼일", "date_from": "20260101", "date_to": "20261231"},
+            ("nlq_unlabeled_name", "physic_nm"),
+        ),
+        (
+            "출고빈도 F 2026 제품재고장",
+            {"frequency_grade": "F", "date_from": "20260101", "date_to": "20261231"},
+            ("nlq_unlabeled_name", "physic_nm", "maker_nm"),
+        ),
+        (
+            "2026 제품재고장",
+            {"date_from": "20260101", "date_to": "20261231"},
+            ("nlq_unlabeled_name", "physic_nm", "maker_nm"),
+        ),
     )
     for query, expected, absent_keys in inventory_cases:
         parsed_inventory = io_nlq.resolve_io_nlq(query) or {}
@@ -1088,6 +1113,50 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
                 f"parsed={parsed_inventory!r}, resolved={resolved_inventory!r}",
             )
         )
+
+    current_stock_period_phrase = io_nlq._extract_unlabeled_entity_phrase(
+        "알잘정 2026 현재고",
+        "현재고 조회",
+    )
+    results.append(
+        CheckResult(
+            "current stock explicit year preserves unlabeled product phrase",
+            current_stock_period_phrase == "알잘정",
+            f"phrase={current_stock_period_phrase!r}",
+        )
+    )
+    current_stock_period = io_nlq.resolve_io_nlq("알잘정 2026 현재고") or {}
+    with (
+        patch.object(io_nlq, "get_current_stock_location_name_map", return_value={}),
+        patch.object(
+            io_nlq,
+            "_resolve_current_stock_code_sets",
+            return_value={
+                "maker_rows": [],
+                "product_rows": [
+                    {"match_type": "product", "match_code": "71179", "match_value": "알잘정"}
+                ],
+                "maker_elapsed_ms": 0.0,
+                "product_elapsed_ms": 0.0,
+                "errors": [],
+            },
+        ),
+    ):
+        current_stock_resolved = io_nlq.resolve_current_stock_entity_condition(
+            "알잘정 2026 현재고",
+            params=dict(current_stock_period.get("params") or {}),
+        )
+    current_stock_params = dict(current_stock_resolved.get("params") or {})
+    results.append(
+        CheckResult(
+            "current stock explicit year preserves resolved product and period",
+            current_stock_resolved.get("status") == "resolved"
+            and current_stock_params.get("physic_nm") == "알잘정"
+            and current_stock_params.get("date_from") == "20260101"
+            and current_stock_params.get("date_to") == "20261231",
+            f"result={current_stock_resolved!r}",
+        )
+    )
 
     for query in (
         "삼진 출고명세 20260731",
@@ -6833,6 +6902,11 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
                 "제품재고장 제조사 한미",
                 "제품재고장 제품 타심주",
                 "제품재고장 재고위치 00001",
+                "알잘정 2026 제품재고장",
+                "71179 2026 제품재고장",
+                "제조사 삼일 2026 제품재고장",
+                "출고빈도 F 2026 제품재고장",
+                "2026 제품재고장",
             ):
                 public_results.append(router._try_handle_io_nlq(
                     query,
@@ -6850,12 +6924,38 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
         results.append(
             _ok("product inventory action-consumed typo leaves standard scope", repr(public_params))
             if public_results[0]
-            and len(service_calls) == 7
+            and len(service_calls) == 12
             and public_params.get("stock_mode") == "real"
             and public_params.get("stock_cds") == ["00001", "00247", "00901"]
             and not public_params.get("nlq_unlabeled_name")
             and not public_params.get("physic_nm")
             else _fail("product inventory public router applies company stock defaults before service", repr(public_params))
+        )
+        explicit_period_params = service_calls[7:12]
+        explicit_period_ok = (
+            len(explicit_period_params) == 5
+            and explicit_period_params[0].get("nlq_unlabeled_name") == "알잘정"
+            and not explicit_period_params[0].get("physic_nm")
+            and explicit_period_params[1].get("physic_cd") == "71179"
+            and not explicit_period_params[1].get("nlq_unlabeled_name")
+            and explicit_period_params[2].get("maker_nm") == "삼일"
+            and explicit_period_params[3].get("frequency_grade") == "F"
+            and not explicit_period_params[4].get("nlq_unlabeled_name")
+            and all(
+                params.get("date_from") == "20260101" and params.get("date_to") == "20261231"
+                for params in explicit_period_params
+            )
+        )
+        results.append(
+            _ok(
+                "product inventory public router preserves entity plus explicit year",
+                repr(explicit_period_params),
+            )
+            if explicit_period_ok
+            else _fail(
+                "product inventory public router preserves entity plus explicit year",
+                repr(explicit_period_params),
+            )
         )
         explicit_real_params = service_calls[2] if len(service_calls) >= 3 else {}
         results.append(

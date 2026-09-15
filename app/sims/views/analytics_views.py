@@ -18,7 +18,7 @@ from app.db.mssql_client import read_df
 
 import streamlit as st
 
-from app.sims.views.rddbc_io_shared import _week_label_52
+from app.sims.views.rddbc_io_shared import _trigger_panel_run, _week_label_52
 from app.services.analytics_sales_trend_service import (
     get_sales_trend_result,
     get_sales_trend_summary_result,
@@ -1488,7 +1488,9 @@ def render_sales_trend_analysis() -> Dict[str, Any]:
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     if not submitted:
         return {
@@ -1757,7 +1759,9 @@ def render_sales_trend_summary_analysis() -> Dict[str, Any]:
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     if not submitted:
         return {
@@ -2016,7 +2020,9 @@ def render_sales_forecast_analysis() -> Dict[str, Any]:
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     if not submitted:
         return {
@@ -2211,7 +2217,9 @@ def _render_customer_sales_forecast_form(action_key: str) -> tuple[bool, Dict[st
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     if not submitted:
         log.info(
@@ -2486,7 +2494,9 @@ def _render_manufacturer_sales_trend_form(action_key: str) -> tuple[bool, Dict[s
                 placeholder="예: 테헤란로",
             )
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     source_mode = {
         "자동": "auto",
@@ -2756,7 +2766,9 @@ def render_stock_shortage_analysis() -> Dict[str, Any]:
         with c15:
             sales_man_nm = st.text_input("영업사원명", value="", key=f"__analytics_stock_shortage_sales_man_nm__{ns}")
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     if not submitted:
         return {
@@ -2951,7 +2963,9 @@ def render_supplier_stock_shortage_analysis() -> Dict[str, Any]:
         with c15:
             sales_man_nm = st.text_input("영업사원명", value="", key=f"__analytics_supplier_stock_shortage_sales_man_nm__{ns}")
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     if not submitted:
         return {

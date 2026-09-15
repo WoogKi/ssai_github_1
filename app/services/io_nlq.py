@@ -1993,7 +1993,7 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
         if pattern:
             candidate = re.sub(pattern, " ", candidate)
 
-    candidate = re.sub(r"(?:19|20)\d{6}|(?:19|20)\d{4}", " ", candidate)
+    candidate = re.sub(r"(?<!\d)(?:(?:19|20)\d{6}|(?:19|20)\d{4}|(?:19|20)\d{2})(?!\d)", " ", candidate)
     candidate = re.sub(r"(?:실\s*재고|장부\s*재고|실\s*수불|장부\s*수불)", " ", candidate)
     candidate = _ALL_STOCK_LOCATIONS_RE.sub(" ", candidate)
     candidate = _consume_document_query_syntax_residual(candidate, action)
@@ -2195,6 +2195,7 @@ def resolve_unlabeled_io_entity_condition(
     if (
         action in {"입고명세 조회", "출고명세 조회", "제품재고현황 조회"}
         and not _has_explicit_name_label(text)
+        and not clean_text(out.get("physic_cd"))
     ):
         # Generic parsing may tentatively put raw residual text in physic_nm
         # before the action is known.  It is authoritative only after the

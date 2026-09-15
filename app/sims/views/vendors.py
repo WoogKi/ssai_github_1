@@ -22,6 +22,7 @@ import streamlit as st
 from app.services import rddbc030_service as R03
 from app.services import rddbc010_service as C01
 from app.services.utils import apply_labels, make_unique_columns
+from app.sims.views.rddbc_io_shared import _trigger_panel_run
 
 from app.sims.views.master_advanced_filters import (
     render_master_audit_filter,
@@ -778,7 +779,7 @@ def render_vendor_list() -> Dict[str, Any]:
         mod_date_from = audit_filter["mod_date_from"]
         mod_date_to = audit_filter["mod_date_to"]
         
-        submitted = st.form_submit_button("조회", type="primary")
+        submitted = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     if not submitted:
         return {
@@ -967,7 +968,7 @@ def render_vendor_detail() -> Dict[str, Any]:
         enter_to_submit=False,
     ):        
         ven_cd = st.text_input("거래처코드", key=f"__vendors_detail_cd__{ns}", placeholder="예: 00077")
-        submitted_btn = st.form_submit_button("조회", type="primary")
+        submitted_btn = st.form_submit_button("조회", type="primary", on_click=_trigger_panel_run)
 
     if not submitted_btn:
         return {"final": False}

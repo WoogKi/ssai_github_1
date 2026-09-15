@@ -12,6 +12,7 @@ import streamlit as st
 
 from app.services import rddbc021_service as R21
 from app.services.utils import apply_labels, make_unique_columns
+from app.sims.views.rddbc_io_shared import _trigger_panel_run
 
 log = logging.getLogger("ssai")
 
@@ -186,7 +187,9 @@ def render_road_address_list() -> Dict[str, Any]:
         with c6:
             st.caption(f"조회상한: 최대 {master_max_rows:,}건")
 
-        submitted = st.form_submit_button("조회", type="primary", width="stretch")
+        submitted = st.form_submit_button(
+            "조회", type="primary", width="stretch", on_click=_trigger_panel_run
+        )
 
     if not submitted:
         return {
