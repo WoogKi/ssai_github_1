@@ -10,6 +10,10 @@ import pandas as pd
 import streamlit as st
 
 from app.services import rddbc010_service as C01
+from app.services.dashboard_inventory_frequency_snapshot import (
+    EXTENDED_FREQUENCY_PROJECTION_GRADES,
+    FREQUENCY_INSUFFICIENT_GRADE,
+)
 from app.services.product_inventory_service import (
     get_product_inventory_result,
     resolve_product_inventory_source_path,
@@ -35,6 +39,11 @@ from app.sims.views.rddbc_io_shared import (
 )
 
 _STOCK_GCODE = "0018"
+_FREQUENCY_GRADE_OPTIONS = [
+    "전체",
+    *EXTENDED_FREQUENCY_PROJECTION_GRADES,
+    FREQUENCY_INSUFFICIENT_GRADE,
+]
 
 
 def _clean_text(value: Any) -> str:
@@ -348,9 +357,9 @@ def view_product_inventory(params: Optional[Dict[str, Any]] = None) -> Dict[str,
         with c7:
             frequency_grade = st.selectbox(
                 "출고빈도 구분",
-                options=["전체", "A", "B", "C", "D", "E", "X", "빈도자료 부족"],
+                options=_FREQUENCY_GRADE_OPTIONS,
                 index=_pick_index(
-                    ["전체", "A", "B", "C", "D", "E", "X", "빈도자료 부족"],
+                    _FREQUENCY_GRADE_OPTIONS,
                     st.session_state.get(f"{prefix}_frequency_grade", defaults.get("frequency_grade", "전체")),
                 ),
                 key=f"{prefix}_frequency_grade",

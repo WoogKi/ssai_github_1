@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT))
 
 from app.services.web_search_service import (
     build_web_search_prompt,
+    latest_ready_web_search_message,
+    parse_web_search_followup_request,
     parse_web_search_request,
     render_web_search_answer,
     search_web,
@@ -34,6 +36,7 @@ def main() -> None:
     recent = _route("최근 OpenAI 소식 알려줘")
     assert recent.period.kind == "unspecified"
     assert _route("현재 OpenAI 소식 알려줘").period.kind == "unspecified"
+    assert _route("최근 제약사 매출 뉴스").period.kind == "unspecified"
 
     this_week = _route("이번 주 의약품 유통업 뉴스")
     assert this_week.period.kind == "this_week"
@@ -87,6 +90,65 @@ def main() -> None:
     assert "[AI policy update](https://example.com/news/ai)" in rendered
     assert "검색 기준 시각:" in rendered
 
+    parent = {
+        "role": "assistant",
+        "content": "결핵·중독 치료제 등 자가치료용 의약품 10개 품목 관련 기사입니다.",
+        "meta": {
+            "web_search": True,
+            "status": "ready",
+            "query": "오늘 의약품 관련 주요 뉴스 알려줘",
+            "sources": [{
+                "title": "자가치료용 의약품 10개 품목 긴급도입",
+                "url": "https://example.com/news/medicine",
+                "source": "example.com",
+                "snippet": "결핵·중독 치료제 등 10개 품목을 전환합니다.",
+                "published_at": "2026-08-22T08:00:00+09:00",
+            }],
+        },
+    }
+    assert latest_ready_web_search_message([parent]) is parent
+    assert latest_ready_web_search_message([parent, {"role": "user", "content": "후속질문"}]) is parent
+    assert latest_ready_web_search_message([
+        parent,
+        {"role": "assistant", "content": "일반 답변", "meta": {}},
+    ]) is None
+    detail = parse_web_search_followup_request(
+        "결핵·중독 치료제 등 자가치료용 의약품 10개 품목은 어떤 품목이야?",
+        parent_message=parent,
+        now=NOW,
+    )
+    assert detail is not None and detail.user_query.startswith("결핵·중독")
+    source = parse_web_search_followup_request("그 기사 출처 알려줘", parent_message=parent, now=NOW)
+    assert source is not None and source.prior_results[0].url.endswith("/medicine")
+    for explicit_route in (
+        "현재고 보여줘",
+        "한림 발주 계산",
+        "/knowledge-tech R230 구매원가 상태",
+    ):
+        assert parse_web_search_followup_request(explicit_route, parent_message=parent, now=NOW) is None
+    assert parse_web_search_followup_request("오늘 새 뉴스 알려줘", parent_message=parent, now=NOW) is None
+    assert parse_web_search_followup_request("저녁 메뉴 추천해줘", parent_message=parent, now=NOW) is None
+
+    followup_calls = []
+    followup_response = search_web(
+        detail,
+        api_key="fixture-key",
+        transport=lambda *_args: followup_calls.append(True) or {"web": {"results": []}},
+    )
+    assert followup_calls == [True]
+    assert followup_response.status == "ready" and followup_response.results == detail.prior_results
+    followup_prompt = build_web_search_prompt(route=detail, response=followup_response)[0]["content"]
+    assert "전체 내용이 명시되지 않았다고 답하세요" in followup_prompt
+    assert detail.user_query in followup_prompt
+    fallback_response = search_web(
+        detail,
+        api_key="fixture-key",
+        transport=lambda *_args: (_ for _ in ()).throw(TimeoutError("fixture")),
+    )
+    assert fallback_response.status == "ready"
+    assert fallback_response.reason_code == "prior_results_only"
+    assert fallback_response.results == detail.prior_results
+
     missing_calls = []
     missing = search_web(today, api_key="", transport=lambda *_args: missing_calls.append(True) or {})
     assert missing.status == "failed" and missing.reason_code == "configuration_missing"
@@ -108,10 +170,12 @@ def main() -> None:
     datetime_block = main_source[datetime_start:main_source.index("web_search_route = None", datetime_start)]
     assert "business_help_knowledge_route is not None" in datetime_block
     assert "resolve_datetime_question(user_input)" in datetime_block
-    assert datetime_start < main_source.index("web_search_route = parse_web_search_request(user_input)")
+    assert datetime_start < main_source.index(
+        "web_search_route = web_search_followup_route or parse_web_search_request(user_input)"
+    )
     assert main_source.index("if web_search_route is not None:") < main_source.index("handled = try_handle_nlq(")
     assert "_run_web_search_chat(web_search_route, room=current_room)" in main_source
-    print("RESULT OK tests=25 provider_calls=1 retries=0 db_write_count=0")
+    print("RESULT OK tests=43 provider_calls=3 retries=0 db_write_count=0")
 
 
 if __name__ == "__main__":

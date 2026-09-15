@@ -18,6 +18,7 @@ import datetime as dt
 import streamlit as st
 import pandas as pd
 from app.ui.sims_table_display import log_sims_display_fields, log_sims_table_mode, log_sims_table_render
+from app.services.query_result_status import query_result_status, tableless_user_message
 
 log = logging.getLogger("ssai")
 
@@ -1788,7 +1789,7 @@ def _render_panel_chat_only_done(payload: Dict[str, Any], action: str) -> None:
     elif loaded_rows:
         st.success(f"조회 완료: {loaded_rows:,}건. 결과는 위 채팅창에 저장되었습니다.")
     else:
-        st.info("해당 조회조건의 자료가 없습니다.")
+        st.info(tableless_user_message(payload, action))
 
     st.caption("다른 조건으로 다시 조회하려면 아래 조회조건을 수정한 뒤 조회 버튼을 다시 누르세요.")
 
@@ -3543,35 +3544,7 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
         # 표가 없다고 skip되면 사용자는 조회가 실행됐는지 알 수 없다.
         try:
             meta = dict(payload.get("meta") or {})
-            no_data_msg = str(
-                payload.get("message")
-                or payload.get("data")
-                or meta.get("message")
-                or meta.get("empty_message")
-                or ""
-            ).strip()
-
-            empty_default_msg = (
-                "검증 결과 이상 자료가 없습니다."
-                if "검증" in str(action or payload.get("action") or payload.get("title") or "")
-                else "해당 조회조건의 자료가 없습니다."
-            )
-
-            if (
-                not no_data_msg
-                or no_data_msg in {"None", "nan", "NaN"}
-                or no_data_msg in {
-                    "조회 결과가 없습니다.",
-                    "조회 결과가 없습니다",
-                    "해당 자료가 없습니다.",
-                    "해당 자료가 없습니다",
-                    "해당 자료 없습니다.",
-                    "해당 자료 없습니다",
-                    "해당 조회조건의 자료가 없습니다.",
-                    "해당 조회조건의 자료가 없습니다",
-                }
-            ):
-                no_data_msg = empty_default_msg
+            no_data_msg = tableless_user_message(payload, action)
 
             empty_payload = dict(payload)
             empty_payload.update(
@@ -3595,7 +3568,7 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
                     "display_row_count": 0,
                     "download_row_count": 0,
                     "column_count": 0,
-                    "empty_result": True,
+                    "empty_result": query_result_status(meta) in {"no_data", "empty"},
                     "_force_push": True,
                     "action": action,
                 }
@@ -3771,9 +3744,9 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
             if isinstance(data, str) and data.strip():
                 st.warning(data)
             else:
-                st.info("해당 조회조건의 자료가 없습니다.")
+                st.info(tableless_user_message(payload, action))
 
-            if final:
+            if final and query_result_status(meta) in {"no_data", "empty"}:
                 st.info("조회 완료: 0건")
         else:
             is_flow = "제품수불현황" in str(title)

@@ -15,6 +15,7 @@ import pandas as pd
 
 from app.db.mssql_client import get_current_company_id
 from app.services.dashboard_inventory_frequency_snapshot import (
+    EXTENDED_FREQUENCY_PROJECTION_GRADES,
     FREQUENCY_INSUFFICIENT_GRADE,
     FrequencyProjectionReadResult,
     frequency_rows_for_product_subset,
@@ -475,7 +476,7 @@ _FREQUENCY_COUNT_COLUMN = "3개월 출고발생수"
 _PROFIT_GRADE_COLUMN = "손익등급"
 _CONTRIBUTION_GRADE_COLUMN = "기여도등급"
 _FREQUENCY_FILTER_ALL = "전체"
-_FREQUENCY_FILTER_VALUES = ("F", "A", "B", "C", "D", "E", "X", FREQUENCY_INSUFFICIENT_GRADE)
+_FREQUENCY_FILTER_VALUES = (*EXTENDED_FREQUENCY_PROJECTION_GRADES, FREQUENCY_INSUFFICIENT_GRADE)
 
 
 def _place_frequency_columns(df: pd.DataFrame) -> pd.DataFrame:

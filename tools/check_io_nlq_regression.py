@@ -465,6 +465,18 @@ def _parser_cases() -> list[ParserCase]:
             forbidden_params=("physic_nm",),
         ),
         ParserCase(
+            query="현재고 출고빈도등급 F 조회",
+            expected_action="현재고 조회",
+            expected_params={"frequency_grade": "F"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
+            query="현재고 출고빈도등급 f 조회",
+            expected_action="현재고 조회",
+            expected_params={"frequency_grade": "F"},
+            forbidden_params=("physic_nm",),
+        ),
+        ParserCase(
             query="제품재고장 출고빈도등급 E 조회",
             expected_action="제품재고현황 조회",
             expected_params={"frequency_grade": "E"},
@@ -3189,6 +3201,80 @@ def run_response_timing_checks() -> list[CheckResult]:
                 f"delivered_guidance={delivered_guidance!r}",
             )
         )
+
+        input_payload = {
+            "type": "text",
+            "action": "현재고 조회",
+            "title": "현재고 조회",
+            "message": "현재고 조회에는 제조사명 또는 제품명이 필요합니다.",
+            "data": "현재고 조회에는 제조사명 또는 제품명이 필요합니다.",
+            "meta": {
+                "nlq": True,
+                "entity_resolution_status": "input_required",
+                "result_status": "input_required",
+                "candidate_count": 0,
+                "service_call_skipped": True,
+            },
+        }
+        input_state = {
+            "__chat_inbox": [],
+            "__chat_history": [],
+            "__chat_pending_items": [],
+            "__sims_push_count": 0,
+        }
+        delivered_input = {}
+
+        def _capture_input_delivery():
+            delivered_input.update(dict(input_state["__chat_inbox"][-1]))
+
+        with (
+            patch.object(middleware.st, "session_state", input_state),
+            patch.object(middleware, "wire_chat_context", lambda *_args, **_kwargs: None),
+            patch.object(middleware, "_chat_payload_matches_current_company", lambda _payload: True),
+            patch.object(middleware, "drain_inbox_to_chat", _capture_input_delivery),
+        ):
+            middleware.wssz(input_payload, action="현재고 조회")
+
+        results.append(
+            CheckResult(
+                "input-required guidance survives tableless chat push",
+                delivered_input.get("message") == input_payload["message"]
+                and delivered_input.get("data") == input_payload["message"]
+                and (delivered_input.get("meta") or {}).get("result_status") == "input_required"
+                and (delivered_input.get("meta") or {}).get("service_call_skipped") is True
+                and "자료가 없습니다" not in str(delivered_input.get("message") or ""),
+                f"delivered_input={delivered_input!r}",
+            )
+        )
+
+        from app.services.query_result_status import tableless_user_message
+
+        results.append(
+            CheckResult(
+                "tableless status semantics keep input, empty, selection, confirmation, and error distinct",
+                "아스피린 현재고 조회" in tableless_user_message(
+                    {"meta": {"result_status": "input_required", "service_call_skipped": True}},
+                    "현재고 조회",
+                )
+                and tableless_user_message(
+                    {"message": "후보를 선택해 주세요.", "meta": {"result_status": "selection_required"}},
+                    "제품정보 조회",
+                ) == "후보를 선택해 주세요."
+                and tableless_user_message(
+                    {"message": "가격 확인이 필요합니다.", "meta": {"result_status": "confirmation_required"}},
+                    "발주 계산",
+                ) == "가격 확인이 필요합니다."
+                and tableless_user_message(
+                    {"message": "조회 중 오류가 발생했습니다.", "meta": {"result_status": "error"}},
+                    "매출 조회",
+                ) == "조회 중 오류가 발생했습니다."
+                and tableless_user_message(
+                    {"meta": {"result_status": "no_data", "row_count": 0}},
+                    "입고명세 조회",
+                ) == "해당 조회조건의 자료가 없습니다.",
+                "status-to-message contract",
+            )
+        )
     finally:
         middleware.time.monotonic = original_monotonic
         if previous_case_log_path is None:
@@ -3940,6 +4026,7 @@ def run_product_flow_input_and_empty_payload_checks() -> list[CheckResult]:
             direct_payload.get("type") == "text"
             and bool(direct_meta.get("input_required"))
             and direct_meta.get("result_status") == "input_required"
+            and direct_meta.get("service_call_skipped") is True
             and _is_exact_numeric_zero(direct_meta.get("row_count"))
             and _is_exact_numeric_zero(direct_meta.get("row_count_total"))
             and all(key not in direct_payload for key in ("df", "df_display", "records"))
@@ -3963,17 +4050,17 @@ def run_product_flow_input_and_empty_payload_checks() -> list[CheckResult]:
     try:
         # Missing product input is a local validation path, not a live master lookup.
         with patch(
-            "app.services.io_nlq.resolve_unlabeled_io_entity_condition",
-            return_value={"status": "not_applicable", "params": {}},
+            "app.services.io_nlq._lookup_unlabeled_io_entity_candidates",
+            side_effect=AssertionError("액션만 있는 제품수불은 엔티티 조회를 실행하면 안 됩니다."),
         ):
             handled = router._try_handle_io_nlq(
-            "제품수불부 조회해줘",
-            room={"messages": []},
-            session_state=session_state,
-            make_ts=_make_ts,
-            next_seq=_next_seq_factory(),
-            logger=log,
-        )
+                "제품수불현황 조회해줘",
+                room={"messages": []},
+                session_state=session_state,
+                make_ts=_make_ts,
+                next_seq=_next_seq_factory(),
+                logger=log,
+            )
     finally:
         flow_module.get_product_flow_result = original_flow_result
     routed_payload = capture.last_since(0) or {}
@@ -3986,12 +4073,33 @@ def run_product_flow_input_and_empty_payload_checks() -> list[CheckResult]:
             and routed_payload.get("type") == "text"
             and bool(routed_meta.get("input_required"))
             and routed_meta.get("result_status") == "input_required"
+            and routed_meta.get("service_call_skipped") is True
             and _is_exact_numeric_zero(routed_meta.get("row_count"))
             and _is_exact_numeric_zero(routed_meta.get("row_count_total"))
             and all(key not in routed_payload for key in ("df", "df_display", "records"))
             and "flow_summary" not in routed_meta
             and "__sims_current_table_source_key" not in session_state,
             f"service_calls={len(flow_calls)}, type={routed_payload.get('type')}, meta_keys={sorted(routed_meta)!r}",
+        )
+    )
+
+    with patch(
+        "app.services.io_nlq._lookup_unlabeled_io_entity_candidates",
+        return_value={"candidates": [], "outcomes": []},
+    ):
+        missing_named_product = importlib.import_module(
+            "app.services.io_nlq"
+        ).resolve_unlabeled_io_entity_condition(
+            "없는약 제품수불현황 조회",
+            action="제품수불현황 조회",
+            params={},
+        )
+    results.append(
+        CheckResult(
+            "product flow explicit unknown product remains not_found",
+            missing_named_product.get("status") == "not_found"
+            and missing_named_product.get("phrase") == "없는약",
+            repr(missing_named_product),
         )
     )
 
@@ -6895,6 +7003,7 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
     shared = importlib.import_module("app.sims.views.rddbc_io_shared")
     router = importlib.import_module("app.sims.nlq.nlq_router")
     inventory_service = importlib.import_module("app.services.product_inventory_service")
+    inventory_view = importlib.import_module("app.sims.views.rddbc_io_inventory_views")
     profile_service = importlib.import_module("app.services.ssai_analysis_profile_service")
     login = importlib.import_module("app.ui.ssai_login")
     originals = {
@@ -6904,6 +7013,11 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
         "profile": profile_service.load_dashboard_profile,
         "company": login.get_selected_company,
     }
+    results.append(
+        _ok("product inventory panel uses extended frequency grades", repr(inventory_view._FREQUENCY_GRADE_OPTIONS))
+        if inventory_view._FREQUENCY_GRADE_OPTIONS == ["전체", "F", "A", "B", "C", "D", "E", "X", "빈도자료 부족"]
+        else _fail("product inventory panel uses extended frequency grades", repr(inventory_view._FREQUENCY_GRADE_OPTIONS))
+    )
     try:
         supplier.resolve_common_vendor_candidates = lambda text: (
             [
@@ -7444,9 +7558,9 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
 
         frequency_fixture = pd.DataFrame(
             {
-                "physic_cd": ["00001", "00001", "00002"],
-                "stock_cd": ["00001", "00002", "00001"],
-                "current_qty": [10, 20, 30],
+                "physic_cd": ["00001", "00001", "00002", "00003"],
+                "stock_cd": ["00001", "00002", "00001", "00001"],
+                "current_qty": [10, 20, 30, 40],
             }
         )
         original_attach_frequency = inventory_service.attach_dashboard_frequency_snapshot
@@ -7455,10 +7569,10 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                 out = frame.copy()
                 product_codes = out["제품코드"].astype(str)
                 out["출고빈도등급"] = product_codes.map(
-                    {"00001": "A", "00002": "B"}
+                    {"00001": "A", "00002": "B", "00003": "F"}
                 ).fillna("빈도자료 부족")
                 out["3개월 출고발생수"] = pd.Series(
-                    product_codes.map({"00001": 4, "00002": 2}),
+                    product_codes.map({"00001": 4, "00002": 2, "00003": 0}),
                     index=out.index,
                     dtype="Int64",
                 )
@@ -7534,6 +7648,45 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                 _ok("current stock frequency filter reuses attached product grade", "A keeps duplicate product rows")
                 if ready_frequency_ok
                 else _fail("current stock frequency filter reuses attached product grade", repr({"rows": filtered_frequency.to_dict("records"), "meta": frequency_meta}))
+            )
+
+            filtered_frequency_f, frequency_meta_f = inventory_service._filter_current_stock_frequency_rows(
+                frequency_fixture,
+                params={"frequency_grade": "F"},
+                date_to="20260831",
+            )
+            frequency_f_ok = (
+                filtered_frequency_f["physic_cd"].tolist() == ["00003"]
+                and filtered_frequency_f["출고빈도등급"].tolist() == ["F"]
+                and frequency_meta_f.get("frequency_additional_erp_source_call_count") == 0
+            )
+            results.append(
+                _ok("current stock frequency filter supports F without source calls", "F uses attached snapshot grade")
+                if frequency_f_ok
+                else _fail(
+                    "current stock frequency filter supports F without source calls",
+                    repr({"rows": filtered_frequency_f.to_dict("records"), "meta": frequency_meta_f}),
+                )
+            )
+
+            generic_followup = importlib.import_module("app.ui.current_table_followups.generic")
+            typo_value = generic_followup._strip_common_filter_value("F 제세히 보여줘")
+            grade_summary = generic_followup._build_common_group_summary(
+                pd.DataFrame({"출고빈도등급": ["A", "F", "X"]}),
+                "출고빈도등급",
+                include_numeric_sums=False,
+            )
+            current_table_frequency_ok = (
+                typo_value == "f"
+                and set(grade_summary["출고빈도등급"].tolist()) == {"A", "F", "X"}
+            )
+            results.append(
+                _ok("current table frequency F and 제세히 typo contract", "F detail and grouping retained")
+                if current_table_frequency_ok
+                else _fail(
+                    "current table frequency F and 제세히 typo contract",
+                    repr({"value": typo_value, "summary": grade_summary.to_dict("records")}),
+                )
             )
 
             def _missing_frequency(frame, **_kwargs):

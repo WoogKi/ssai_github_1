@@ -313,6 +313,8 @@ from app.services.mcp_adapter import (
 from app.services.attachment_summary_policy import build_attachment_summary_plan
 from app.services.web_search_service import (
     build_web_search_prompt,
+    latest_ready_web_search_message,
+    parse_web_search_followup_request,
     parse_web_search_request,
     render_web_search_answer,
     search_web,
@@ -7807,6 +7809,7 @@ def _push_panel_result_to_current_chat(
 
                 payload = dict(stored_payload)
                 meta = dict(payload.get("meta") or {})
+                from app.services.query_result_status import query_result_status
                 # Panel bridge idempotency is owned by _panel_source_sig.  A
                 # force nonce would turn the same rerun payload into a new
                 # assistant message and bypass chat-level duplicate checks.
@@ -7822,7 +7825,7 @@ def _push_panel_result_to_current_chat(
                         "display_row_count": 0,
                         "download_row_count": 0,
                         "column_count": 0,
-                        "empty_result": True,
+                        "empty_result": query_result_status(meta) in {"no_data", "empty"},
                         "source": "SSAI 패널",
                         "hide_meta_expander": str(os.getenv("SSAI_DEBUG_META", "false")).strip().lower()
                         not in {"1", "true", "yes", "y", "on"},
@@ -8500,10 +8503,19 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
             "web_search": True,
             "status": "ready",
             "query": route.query,
+            "user_query": route.user_query or route.query,
+            "search_query": route.query,
+            "web_search_followup": bool(route.user_query),
             "reference_at": route.reference_at.isoformat(),
             "result_count": len(response.results),
             "sources": [
-                {"title": item.title, "url": item.url, "source": item.source, "published_at": item.published_at}
+                {
+                    "title": item.title,
+                    "url": item.url,
+                    "source": item.source,
+                    "snippet": item.snippet,
+                    "published_at": item.published_at,
+                }
                 for item in response.results
             ],
         },
@@ -8529,8 +8541,14 @@ def _run_web_search_chat(route, *, room: dict[str, Any]) -> bool:
     with st.chat_message("assistant"):
         st.markdown(content)
     _render_assistant_message_controls(message, room=room)
-    log.info("[web.search] result=stored sources=%s", len(response.results))
+    log.info(
+        "[web.search] result=stored followup=%s sources=%s prior_results_only=%s",
+        bool(route.user_query),
+        len(response.results),
+        response.reason_code == "prior_results_only",
+    )
     return True
+
 
 def _consume_company_change_notice(room: dict[str, Any]) -> None:
     """
@@ -12409,6 +12427,14 @@ if user_input and user_input.strip():
         if raw_knowledge_route is not None or business_help_knowledge_route is not None
         else parse_explicit_mcp_resource_request(user_input)
     )
+    web_search_followup_route = (
+        None
+        if raw_knowledge_route is not None or business_help_knowledge_route is not None or raw_mcp_route is not None
+        else parse_web_search_followup_request(
+            user_input,
+            parent_message=latest_ready_web_search_message(current_room.get("messages")),
+        )
+    )
     if (
         raw_knowledge_route is None
         and business_help_knowledge_route is None
@@ -12431,7 +12457,7 @@ if user_input and user_input.strip():
 
     datetime_answer = (
         None
-        if business_help_knowledge_route is not None or raw_mcp_route is not None
+        if business_help_knowledge_route is not None or raw_mcp_route is not None or web_search_followup_route is not None
         else resolve_datetime_question(user_input)
     )
     web_search_route = None
@@ -12442,7 +12468,7 @@ if user_input and user_input.strip():
         and raw_mcp_route is None
         and not explicit_current_trans_doc_validation
     ):
-        web_search_route = parse_web_search_request(user_input)
+        web_search_route = web_search_followup_route or parse_web_search_request(user_input)
 
     st.session_state["__did_user_input"] = True
 
@@ -12580,7 +12606,8 @@ if user_input and user_input.strip():
         save_chat_rooms()
         st.session_state["__queue_ai"] = True
         log.info(
-            "[web.search] queued period=%s reference_at=%s",
+            "[web.search] queued followup=%s period=%s reference_at=%s",
+            bool(web_search_route.user_query),
             web_search_route.period.kind,
             web_search_route.reference_at.isoformat(),
         )
@@ -14206,6 +14233,19 @@ with st.container():
             )
             else parse_explicit_mcp_resource_request(last_user_text)
         )
+        web_search_followup_route = (
+            None
+            if (
+                raw_knowledge_followup is not None
+                or knowledge_route is not None
+                or business_help_knowledge_route is not None
+                or mcp_route is not None
+            )
+            else parse_web_search_followup_request(
+                last_user_text,
+                parent_message=latest_ready_web_search_message(current_room.get("messages")),
+            )
+        )
         web_search_route = (
             None
             if (
@@ -14214,7 +14254,7 @@ with st.container():
                 or business_help_knowledge_route is not None
                 or mcp_route is not None
             )
-            else parse_web_search_request(last_user_text)
+            else web_search_followup_route or parse_web_search_request(last_user_text)
         )
         image_followup_request = st.session_state.pop("__attachment_image_followup_request", None)
         image_followup_context_matches = (

@@ -47,6 +47,7 @@ from app.services.nlq_case_log_service import append_nlq_case_record
 from app.services.structured_response_contract import build_structured_response_envelope
 from app.services.structured_tool_routing import build_sims_internal_tool_route_decision
 from app.services.structured_presentation_poc import maybe_create_structured_presentation
+from app.services.query_result_status import is_guidance_status, tableless_user_message
 
 import datetime as dt
 import time
@@ -7390,32 +7391,11 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                         elif date_from and date_to:
                             query_summary = f"기간 {date_from}~{date_to}"
 
-                    # 0건/검증 정상 결과는 채팅 메시지를 짧게 통일한다.
-                    # 조회조건은 meta.query_summary로 렌더러가 caption에 1회 표시한다.
-                    if "검증" in str(action_name or ""):
-                        msg = "검증 결과 이상 자료가 없습니다."
-                    else:
-                        msg = "해당 조회조건의 자료가 없습니다."
-
-                    terminal_statuses = {
-                        str(meta.get(key) or "").strip()
-                        for key in (
-                            "execution_status",
-                            "result_status",
-                            "entity_resolution_status",
-                        )
-                    }
-                    preserve_resolution_guidance = bool(terminal_statuses & {
-                        "unsupported",
-                        "query_error",
-                        "routing_error",
-                        "validation_error",
-                        "candidate_required",
-                        "resolution_unavailable",
-                        "not_found",
-                        "role_mismatch",
-                    })
-                    guidance_message = str(payload.get("message") or payload.get("data") or "")
+                    # 표가 없더라도 조건 부족, 후보 선택, 확인 필요, 오류는 0건과
+                    # 다른 결과다. 서비스가 만든 업무별 안내를 그대로 보존한다.
+                    msg = tableless_user_message(payload, str(action_name or ""))
+                    preserve_resolution_guidance = is_guidance_status(meta)
+                    guidance_message = msg
                     guidance_title = str(payload.get("title") or "")
                     payload["type"] = "text"
                     payload["title"] = f"{action_name} 결과 없음"

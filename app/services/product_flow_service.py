@@ -1321,6 +1321,7 @@ def get_product_flow_result(params: Optional[Dict[str, Any]] = None) -> Dict[str
             meta={
                 "input_required": True,
                 "result_status": "input_required",
+                "service_call_skipped": True,
                 "row_count": 0,
                 "row_count_total": 0,
             },
@@ -1376,6 +1377,7 @@ def get_product_flow_result(params: Optional[Dict[str, Any]] = None) -> Dict[str
                     meta={
                         "input_required": True,
                         "result_status": "input_required",
+                        "service_call_skipped": True,
                         "row_count": 0,
                         "row_count_total": 0,
                     },

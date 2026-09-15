@@ -32,6 +32,8 @@ class WebSearchRoute:
     query: str
     reference_at: datetime
     period: WebSearchPeriod
+    user_query: str = ""
+    prior_results: tuple[WebSearchResult, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -76,6 +78,41 @@ _INTERNAL_OR_ERP_MARKERS = (
     "내부규정",
     "내부 지식",
 )
+_FOLLOWUP_INTERNAL_MARKERS = _INTERNAL_OR_ERP_MARKERS + (
+    "계약단가",
+    "구매원가",
+    "매출",
+    "매입",
+    "수불",
+    "제품정보",
+    "제조사",
+    "제약사",
+)
+_FOLLOWUP_REFERENCE_MARKERS = (
+    "그중",
+    "그 중",
+    "그 기사",
+    "이 기사",
+    "해당 기사",
+    "그 정책",
+    "이 정책",
+    "해당 정책",
+    "그 내용",
+    "그 자료",
+    "이 자료",
+    "해당 자료",
+    "그 출처",
+    "위 내용",
+    "방금 내용",
+    "앞의 내용",
+)
+_FOLLOWUP_TOKEN_PATTERN = re.compile(r"[0-9A-Za-z가-힣]+")
+_FOLLOWUP_STOPWORDS = frozenset(
+    {
+        "그중", "기사", "정책", "내용", "관련", "대한", "어떤", "무엇", "뭐야",
+        "알려줘", "알려주세요", "설명", "설명해줘", "어디야", "언제야", "품목은", "품목이야",
+    }
+)
 
 
 def _compact(text: object) -> str:
@@ -118,6 +155,91 @@ def parse_web_search_request(text: object, *, now: datetime | None = None) -> We
         reference_at=reference_at,
         period=_period_for_query(query, reference_at),
     )
+
+
+def _web_result_from_message(value: object) -> WebSearchResult | None:
+    if not isinstance(value, Mapping):
+        return None
+    title = str(value.get("title") or "").strip()
+    url = str(value.get("url") or "").strip()
+    if not title or not url.startswith(("https://", "http://")):
+        return None
+    return WebSearchResult(
+        title=title,
+        url=url,
+        source=str(value.get("source") or _result_source(url)).strip(),
+        snippet=str(value.get("snippet") or "").strip(),
+        published_at=str(value.get("published_at") or "").strip(),
+    )
+
+
+def _meaningful_followup_tokens(value: object) -> tuple[str, ...]:
+    tokens: list[str] = []
+    for token in _FOLLOWUP_TOKEN_PATTERN.findall(str(value or "").casefold()):
+        if len(token) < 2 or token in _FOLLOWUP_STOPWORDS:
+            continue
+        tokens.append(token)
+    return tuple(dict.fromkeys(tokens))
+
+
+def parse_web_search_followup_request(
+    text: object,
+    *,
+    parent_message: object,
+    now: datetime | None = None,
+) -> WebSearchRoute | None:
+    """Continue only an immediately preceding successful news/search answer."""
+    query = str(text or "").strip()
+    if not query or query.startswith("/") or not isinstance(parent_message, Mapping):
+        return None
+    if parse_web_search_request(query, now=now) is not None:
+        return None
+    compact = _compact(query).casefold()
+    if any(marker in compact for marker in _FOLLOWUP_INTERNAL_MARKERS):
+        return None
+    meta = parent_message.get("meta")
+    if not isinstance(meta, Mapping) or not bool(meta.get("web_search")) or meta.get("status") != "ready":
+        return None
+    prior_query = str(meta.get("search_query") or meta.get("query") or "").strip()
+    prior_results = tuple(
+        result
+        for result in (_web_result_from_message(item) for item in (meta.get("sources") or ()))
+        if result is not None
+    )
+    if not prior_query or not prior_results:
+        return None
+    context_text = " ".join(
+        [prior_query, str(parent_message.get("content") or "")]
+        + [f"{item.title} {item.snippet}" for item in prior_results]
+    ).casefold()
+    direct_reference = any(marker.replace(" ", "") in compact for marker in _FOLLOWUP_REFERENCE_MARKERS)
+    overlap_count = sum(token in context_text for token in _meaningful_followup_tokens(query))
+    if not direct_reference and overlap_count < 2:
+        return None
+    reference_at = operating_now(now=now)
+    return WebSearchRoute(
+        query=f"{prior_query} {query}".strip(),
+        user_query=query,
+        reference_at=reference_at,
+        period=_period_for_query(prior_query, reference_at),
+        prior_results=prior_results,
+    )
+
+
+def latest_ready_web_search_message(messages: object) -> Mapping[str, Any] | None:
+    """Return the latest assistant only when it is a successful Web Search answer."""
+    if not isinstance(messages, (list, tuple)):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, Mapping):
+            continue
+        if str(message.get("role") or "").strip().lower() != "assistant":
+            continue
+        meta = message.get("meta")
+        if isinstance(meta, Mapping) and bool(meta.get("web_search")) and meta.get("status") == "ready":
+            return message
+        return None
+    return None
 
 
 def _default_transport(url: str, headers: Mapping[str, str], timeout_s: float) -> Mapping[str, Any]:
@@ -182,7 +304,25 @@ def search_web(
         )
         results = _parse_results(payload)
     except Exception:
+        if route.prior_results:
+            return WebSearchResponse(
+                "ready",
+                route.query,
+                route.reference_at,
+                route.period,
+                results=route.prior_results,
+                reason_code="prior_results_only",
+            )
         return WebSearchResponse("failed", route.query, route.reference_at, route.period, reason_code="search_failed")
+    if route.prior_results:
+        merged: list[WebSearchResult] = []
+        seen_urls: set[str] = set()
+        for item in (*results, *route.prior_results):
+            if item.url in seen_urls:
+                continue
+            seen_urls.add(item.url)
+            merged.append(item)
+        results = tuple(merged[: WEB_SEARCH_RESULT_LIMIT * 2])
     if not results:
         return WebSearchResponse("no_match", route.query, route.reference_at, route.period, reason_code="no_results")
     return WebSearchResponse("ready", route.query, route.reference_at, route.period, results=results)
@@ -199,9 +339,12 @@ def build_web_search_prompt(*, route: WebSearchRoute, response: WebSearchRespons
     return [{
         "role": "user",
         "content": (
-            "아래 외부 검색 결과만 근거로 한국어로 짧게 요약하세요. 근거에 없는 최신 사실을 보태지 마세요. "
+            "아래 외부 검색 결과만 근거로 한국어로 짧게 답하세요. 근거에 없는 최신 사실을 보태지 마세요. "
+            "질문이 요구한 이름이나 목록이 검색 결과에 모두 없으면 추측하지 말고, 현재 확보한 기사에는 "
+            "전체 내용이 명시되지 않았다고 답하세요. "
             "출처 번호를 본문에서 만들지 말고, 제공된 검색 결과의 의미만 정리하세요.\n\n"
-            f"질문: {route.query}\n검색 기준 시각: {route.reference_at:%Y-%m-%d %H:%M:%S} {route.reference_at.tzname() or 'KST'} ({OPERATING_TIMEZONE_NAME})\n"
+            f"질문: {route.user_query or route.query}\n검색어: {route.query}\n"
+            f"검색 기준 시각: {route.reference_at:%Y-%m-%d %H:%M:%S} {route.reference_at.tzname() or 'KST'} ({OPERATING_TIMEZONE_NAME})\n"
             f"요청 기간: {period}\n\n검색 결과:\n{evidence}"
         ),
     }]

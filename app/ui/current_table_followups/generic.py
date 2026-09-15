@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from app.services.dashboard_inventory_frequency_snapshot import FREQUENCY_PROJECTION_GRADES
+from app.services.dashboard_inventory_frequency_snapshot import EXTENDED_FREQUENCY_PROJECTION_GRADES
 
 
 def _compact(text: Any) -> str:
@@ -187,11 +187,11 @@ _COMMON_FILTER_DETAIL_WORDS = (
 
 _COMMON_FILTER_VALUE_SUFFIXES = (
     "상세하게보여주세요", "상세하게보여줘", "상세히보여주세요", "상세히보여줘",
-    "자세히보여주세요", "자세히보여줘",
+    "자세히보여주세요", "자세히보여줘", "제세히보여주세요", "제세히보여줘",
     "상세표만들어줘", "상세표만들어", "목록으로보여줘", "목록보여줘",
     "리스트보여줘", "보여주세요", "보여줘요", "보여줘", "알려주세요", "알려줘",
     "조회해주세요", "조회해줘", "찾아주세요", "찾아줘", "검색해주세요", "검색해줘",
-    "상세하게", "상세히", "상세표", "상세", "목록", "리스트", "필터", "추출", "걸러줘",
+    "상세하게", "상세히", "제세히", "상세표", "상세", "목록", "리스트", "필터", "추출", "걸러줘",
     "보여", "조회", "검색", "찾아", "알려", "으로", "만", "인것", "인거", "인자료", "인데이터",
 )
 
@@ -888,7 +888,7 @@ def _build_common_group_summary(
     work = df.copy()
     if _norm_col_name(group_col) in {"출고빈도", "출고빈도등급"}:
         grade_values = work[group_col].fillna("").astype(str).str.strip()
-        work = work.loc[grade_values.isin(FREQUENCY_PROJECTION_GRADES)].copy()
+        work = work.loc[grade_values.isin(EXTENDED_FREQUENCY_PROJECTION_GRADES)].copy()
     work[group_col] = work[group_col].map(_clean_group_value)
     if group_col == "추세판정":
         work[group_col] = work[group_col].replace({"(미지정)": "자료부족", "": "자료부족"})

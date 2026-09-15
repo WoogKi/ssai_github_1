@@ -2889,6 +2889,7 @@ def _try_handle_analytics_nlq(
                 "period_policy": period_policy,
                 "result_status": "input_required",
                 "execution_status": "input_required",
+                "service_call_skipped": True,
             },
         }
         push_sims_result_to_chat(payload, action)
@@ -6225,7 +6226,10 @@ def _try_handle_io_nlq(
         if entity_status == "candidate_required":
             message = "후보가 여러 개입니다. 제조사 또는 제품 후보 중 하나를 선택해 다시 조회해 주세요." if action == "현재고 조회" else "조건 이름을 확인할 수 없습니다. 거래처, 제약사, 제품 중 하나를 지정해 다시 조회해 주세요."
         elif entity_status == "input_required":
-            message = "현재고 조회에는 제조사명 또는 제품명이 필요합니다."
+            message = (
+                "조회할 제품명·제품코드·제조사 등을 입력해 주세요.\n\n"
+                "예: 아스피린 현재고 조회"
+            )
         elif entity_status == "resolution_unavailable":
             message = "조회 조건을 확인하는 중 오류가 발생했습니다. 거래처·제약사·제품 중 조건 종류를 명시해 다시 조회해 주세요."
         else:
@@ -6261,6 +6265,7 @@ def _try_handle_io_nlq(
                 "row_count": int(len(candidate_df)),
                 "row_count_total": int(len(candidate_df)),
                 "tableless_result": bool(candidate_df.empty),
+                "service_call_skipped": True,
                 "_force_push": True,
                 "_nlq_nonce": str(uuid.uuid4()),
             },
@@ -6330,6 +6335,7 @@ def _try_handle_io_nlq(
                 "row_count": 0,
                 "row_count_total": 0,
                 "tableless_result": True,
+                "service_call_skipped": True,
                 "_force_push": True,
                 "_nlq_nonce": str(uuid.uuid4()),
             },

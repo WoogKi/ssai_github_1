@@ -12,6 +12,10 @@ import pandas as pd
 from typing import Any, Dict, Mapping, Optional
 
 from app.services.rddbc_io_common import clean_text
+from app.services.dashboard_inventory_frequency_snapshot import (
+    EXTENDED_FREQUENCY_PROJECTION_GRADES,
+    FREQUENCY_INSUFFICIENT_GRADE,
+)
 
 
 log = logging.getLogger("ssai")
@@ -1117,15 +1121,16 @@ def _extract_product_inventory_frequency_grade(text: str) -> str:
     compact = re.sub(r"\s+", "", _norm(text))
     if not compact:
         return ""
+    grade_pattern = "|".join(re.escape(grade) for grade in EXTENDED_FREQUENCY_PROJECTION_GRADES)
     match = re.search(
-        r"출고빈도(?:등급|구분)?(?:[:=])?(전체|[A-EX]|빈도자료부족|자료부족)",
+        rf"출고빈도(?:등급|구분)?(?:[:=])?(전체|{grade_pattern}|빈도자료부족|자료부족)",
         compact,
         flags=re.IGNORECASE,
     )
     if not match:
         return ""
     value = match.group(1)
-    return "빈도자료 부족" if value in {"빈도자료부족", "자료부족"} else value.upper()
+    return FREQUENCY_INSUFFICIENT_GRADE if value in {"빈도자료부족", "자료부족"} else value.upper()
 
 
 def _remove_product_inventory_frequency_phrase(params: Dict[str, Any], frequency_grade: str) -> Dict[str, Any]:
@@ -1135,15 +1140,21 @@ def _remove_product_inventory_frequency_phrase(params: Dict[str, Any], frequency
     out = dict(params or {})
     product_name = clean_text(out.get("physic_nm"))
     compact = re.sub(r"\s+", "", product_name)
-    if re.fullmatch(r"출고빈도(?:등급|구분)?(?:[:=])?(전체|[A-EX]|빈도자료부족|자료부족)(?:조회)?", compact):
+    grade_pattern = "|".join(re.escape(grade) for grade in EXTENDED_FREQUENCY_PROJECTION_GRADES)
+    if re.fullmatch(
+        rf"출고빈도(?:등급|구분)?(?:[:=])?(전체|{grade_pattern}|빈도자료부족|자료부족)(?:조회)?",
+        compact,
+        flags=re.IGNORECASE,
+    ):
         out.pop("physic_nm", None)
     return out
 
 
 def remove_outbound_frequency_phrase(text: str) -> str:
     """Keep a labelled outbound-frequency condition out of entity resolution."""
+    grade_pattern = "|".join(re.escape(grade) for grade in EXTENDED_FREQUENCY_PROJECTION_GRADES)
     return re.sub(
-        r"출고빈도(?:등급|구분)?\s*(?:[:=])?\s*(?:전체|[A-EXa-ex]|빈도\s*자료\s*부족|자료\s*부족)",
+        rf"출고빈도(?:등급|구분)?\s*(?:[:=])?\s*(?:전체|{grade_pattern}|빈도\s*자료\s*부족|자료\s*부족)",
         " ",
         str(text or ""),
         flags=re.IGNORECASE,
@@ -1976,7 +1987,7 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
         r"제품\s*재고(?:현황|장)?",
         r"현재\s*고",
         re.escape(action.replace(" 조회", "")),
-        r"조회|검색|찾아줘|찾아봐|보여줘|알려줘|확인",
+        r"(?:조회|검색)(?:해\s*주세요|해\s*줘(?:요)?)?|찾아줘|찾아봐|보여줘|알려줘|확인",
     )
     for pattern in action_patterns:
         if pattern:
