@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 # =========================================================
 # SS AI Phase 3 권한 정책
@@ -111,6 +113,18 @@ SPECIAL_PERMISSION_MAP: dict[str, str] = {
     "user_manage_all": "USER_MANAGE_ALL",
     "user_manage_company": "USER_MANAGE_COMPANY",
 }
+
+
+MANAGEMENT_COMPANY_USER_TYPES = frozenset(("SSART_ADMIN", "SSART_USER"))
+
+
+def is_management_company_user(user: Any) -> bool:
+    """Return whether the authenticated user belongs to the management company."""
+    if isinstance(user, dict):
+        user_type = user.get("user_type")
+    else:
+        user_type = getattr(user, "user_type", None)
+    return str(user_type or "").strip().upper() in MANAGEMENT_COMPANY_USER_TYPES
 
 
 def get_required_permission(

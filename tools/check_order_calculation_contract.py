@@ -199,7 +199,7 @@ def test_panel_submission():
         app.button[0].click().run()
         assert not app.exception and len(calls) == 1
         assert calls[0]["safety_days"] == 3 and calls[0]["target_days"] == 15
-        assert calls[0]["query_mode"] == "전체" and "price_basis" not in calls[0]
+        assert calls[0]["query_mode"] == "발주해당자료만" and calls[0]["only_needed"] and "price_basis" not in calls[0]
         assert app.session_state["__sims_panel_active"] is True
         assert app.selectbox[0].options == ["전체", "발주해당자료만", "확인 필요"]
         app.run()
@@ -593,7 +593,10 @@ if __name__ == "__main__":
         assert contract_query['ven_cd'] == '50002' and contract_query['as_of'] == '20260914'
         assert contract_query['physic_cd'] == '83315' and contract_query['stock_apply_cd'] == '50001'
         assert order_query['date_from'] == '20260815'
-        assert apply_application_defaults({}) == {'cost_apply_cd': '50002', 'stock_apply_cd': '50001'}
+        assert apply_application_defaults({}) == {
+            'cost_apply_cd': '50002', 'stock_apply_cd': '50001',
+            'query_mode': '발주해당자료만', 'only_needed': True,
+        }
         explicit = apply_application_defaults({'cost_apply_cd': '12345', 'stock_apply_nm': '지정처'})
         assert explicit['cost_apply_cd'] == '12345' and 'stock_apply_cd' not in explicit
         params, sources = fixture()
@@ -644,7 +647,7 @@ if __name__ == "__main__":
             assert [t.label for t in app.text_input[:4]] == ['단가적용처코드', '단가적용처명', '재고적용처코드', '재고적용처명']
             app.button[0].click().run()
             assert not app.exception and len(calls) == 1
-            app.selectbox[0].select('발주해당자료만')
+            app.selectbox[0].select('전체')
             app.button[0].click().run()
             assert not app.exception and len(calls) == 1
             assert app.text_input[1].value == '단가 적용 거래처'

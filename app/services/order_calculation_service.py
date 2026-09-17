@@ -31,6 +31,14 @@ def apply_application_defaults(params):
     for field, code in (("cost_apply", "50002"), ("stock_apply", "50001")):
         if not str(q.get(field + "_cd") or "").strip() and not str(q.get(field + "_nm") or "").strip():
             q[field + "_cd"] = code
+    explicit_mode = str(q.get("query_mode") or "").strip()
+    if explicit_mode:
+        q["query_mode"] = explicit_mode
+    elif "only_needed" in q:
+        q["query_mode"] = "발주해당자료만" if bool(q.get("only_needed")) else "전체"
+    else:
+        q["query_mode"] = "발주해당자료만"
+    q["only_needed"] = q["query_mode"] == "발주해당자료만"
     return q
 
 
@@ -172,7 +180,8 @@ def load_sources(params: dict) -> dict:
     def master(query):
         return call('master', _master, query)
     snapshot = call('snapshot_master', get_snapshot_product_information_result,
-        {**params, "evaluation_month": reference.strftime("%Y%m")}, master_loader=master)
+        {**params, "evaluation_month": reference.strftime("%Y%m")}, master_loader=master,
+        apply_viewer_projection=False)
     if snapshot.get("meta", {}).get("snapshot_status") != "ready":
         return {"snapshot": snapshot}
     scope = resolve_dashboard_profile_stock_scope(company_id=params["company_id"])
@@ -190,6 +199,7 @@ def load_sources(params: dict) -> dict:
         if source_params.get(field + "_cd"):
             source_params.pop(field + "_nm", None)
     frame = snapshot.get("df", pd.DataFrame())
+    frame = frame.rename(columns={"품목손익등급": "손익등급", "품목기여등급": "기여도등급"})
     if frame.empty:
         return {"snapshot": snapshot, "base": frame}
     # No new forecast model; the existing service supplies stock and quantity forecast together.

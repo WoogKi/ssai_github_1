@@ -270,6 +270,7 @@ from app.ui.current_table_followups.action_dispatcher import (
     current_table_analysis_query_matches,
     handle_current_table_followup_by_action,
     is_explicit_current_trans_doc_validation_request,
+    parse_current_table_rank_request,
     select_current_table_analysis_context,
 )
 from app.ui.sims_analysis_profiles import build_response_format_instruction
@@ -5538,16 +5539,12 @@ def _try_handle_current_table_dataframe_followup(
         if isinstance(stored_meta, dict):
             source_meta = dict(stored_meta)
 
-    # TOP N
+    # 현재표 순위/제한 N. 정렬어와 개수 토큰은 컬럼명/값에서 분리한다.
     top_n = 20
-    has_explicit_top = bool(re.search(r"(?:TOP|top|상위)\s*(\d{1,4})", t))
-
-    m_top = re.search(r"(?:TOP|top|상위)\s*(\d{1,3})", t)
-    if m_top:
-        try:
-            top_n = max(1, min(500, int(m_top.group(1))))
-        except Exception:
-            top_n = 20
+    rank_direction, parsed_rank_limit = parse_current_table_rank_request(t, default_limit=top_n)
+    has_explicit_top = bool(rank_direction)
+    if parsed_rank_limit:
+        top_n = parsed_rank_limit
 
 #   @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 #   현재표 후속질문 action/성격 우선 분기
@@ -8994,6 +8991,8 @@ _CHAT_PARTITION_META_ALLOW_KEYS = {
     "expected_rows",
     "display_row_count",
     "download_row_count",
+    "download_column_count",
+    "download_columns",
     "prepared_rows",
     "download_limit_rows",
     "applied_download_limit_rows",

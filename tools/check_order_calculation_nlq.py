@@ -85,12 +85,14 @@ def run():
             assert p['_registered_unlabeled_entity'] == '환인'
         if '확인 필요' in text:
             assert p['query_mode'] == '확인 필요'
+        elif '전체' not in text and '발주해당자료만' not in text:
+            assert p['query_mode'] == '발주해당자료만' and p['only_needed']
         cases.append({'text': text, **result})
     # Dispatch through the real router and service, using the same captured authority fixture.
-    for text in ('제약사 환인 발주 계산',
-                 '제약사 환인 안전재고 3일 적정재고 15일 결제일 25일 발주 계산',
-                 '제약사 한림 안전재고 5일 적정재고 20일 마감일자 25일 발주 계산',
-                 '제품코드 64063 발주 수량 계산'):
+    for text in ('제약사 환인 조회구분 전체 발주 계산',
+                 '제약사 환인 안전재고 3일 적정재고 15일 결제일 25일 조회구분 전체 발주 계산',
+                 '제약사 한림 안전재고 5일 적정재고 20일 마감일자 25일 조회구분 전체 발주 계산',
+                 '제품코드 64063 조회구분 전체 발주 수량 계산'):
         _, sources = fixture()
         sent, requests = [], []
         def service(q):

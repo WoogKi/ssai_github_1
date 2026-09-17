@@ -1185,6 +1185,7 @@ from app.ui.chat_middleware import (
     get_current_chat_room_id,
     _build_sims_detail_analysis_prompt,
     _expected_analysis_row_count,
+    _export_candidate_covers_display,
     _get_full_download_df_for_sims_item,
     _sims_clicked_llm_context_mismatch,
 )
@@ -1972,6 +1973,7 @@ def _render_compact_panel_result_placeholder(
                 display_rows=display_rows,
                 download_rows=full_rows,
                 expected_rows=full_rows,
+                columns=df_full.columns,
             )
         except Exception:
             prompt = (
@@ -2560,6 +2562,8 @@ def _stash_panel_table_for_current_followup(
         meta["download_table_key"] = table_key
         meta["display_row_count"] = int(len(df_disp))
         meta["download_row_count"] = int(len(df_full))
+        meta["download_column_count"] = int(len(df_full.columns))
+        meta["download_columns"] = [str(column) for column in df_full.columns]
         meta.setdefault("row_count_total", int(len(df_full)))
 
         log.info(
@@ -4711,11 +4715,9 @@ def _render_downloads(
             if not isinstance(session_full_df, pd.DataFrame) and isinstance(export_tables, dict):
                 session_full_df = export_tables.get(table_key)
 
-            if (
-                isinstance(session_full_df, pd.DataFrame)
-                and not session_full_df.empty
-                and isinstance(display_df, pd.DataFrame)
-                and len(session_full_df) > len(display_df)
+            if _export_candidate_covers_display(session_full_df, display_df) and (
+                len(session_full_df) > len(display_df)
+                or len(session_full_df.columns) > len(display_df.columns)
             ):
                 df_full = session_full_df
                 download_df = session_full_df
@@ -4723,6 +4725,12 @@ def _render_downloads(
     except Exception:
         log.exception("[panel.download] use session full df failed")
 
+    if str(action_name or base or "").strip() == "제품정보 조회" and isinstance(download_df, pd.DataFrame):
+        from app.services.snapshot_product_information_service import (
+            project_product_information_frame_for_viewer,
+        )
+
+        download_df = project_product_information_frame_for_viewer(download_df)
     download_df = apply_sims_export_projection(download_df)
 
     display_rows = int(len(display_df)) if isinstance(display_df, pd.DataFrame) else 0
@@ -4761,6 +4769,7 @@ def _render_downloads(
             display_rows=display_rows,
             download_rows=download_rows,
             expected_rows=download_rows,
+            columns=download_df.columns,
         )
     except Exception:
         log.exception("[panel] build detail analysis prompt failed")

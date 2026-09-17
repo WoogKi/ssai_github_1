@@ -12,7 +12,6 @@ from typing import Any, Optional
 import pandas as pd
 
 from app.services.erp_table_query_service import (
-    build_feature_result,
     execute_bound_select,
     registered_query_limits,
 )
@@ -303,6 +302,204 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _unlabeled_candidate_ctes(*, exact_code: bool) -> str:
+    eligible = " AND ".join(("C.Rd07_Del_Flag <> 'E'", *_GARBAGE_CANDIDATE_SQL))
+    maker_name = "LTRIM(RTRIM(ISNULL(PV.Rd03_Ven_Nm, '')))"
+    product_name = "LTRIM(RTRIM(ISNULL(P.Rd04_Physic_Nm, '')))"
+    cost_predicate = (
+        "LTRIM(RTRIM(CAST(C.Rd07_Cost_Apply_Cd AS VARCHAR(50)))) = ?"
+        if exact_code else "LTRIM(RTRIM(ISNULL(V.Rd03_Ven_Nm, ''))) LIKE ?"
+    )
+    manufacturer_predicate = (
+        "LTRIM(RTRIM(CAST(PV.Rd03_Ven_Cd AS VARCHAR(50)))) = ?"
+        if exact_code else f"{maker_name} LIKE ?"
+    )
+    product_predicate = (
+        "LTRIM(RTRIM(CAST(P.Rd04_Physic_Cd AS VARCHAR(50)))) = ?"
+        if exact_code else f"{product_name} LIKE ?"
+    )
+    return f"""
+CostCandidates AS (
+    SELECT DISTINCT
+        CAST('cost_apply' AS VARCHAR(20)) AS match_type,
+        LTRIM(RTRIM(CAST(C.Rd07_Cost_Apply_Cd AS VARCHAR(50)))) AS match_code,
+        LTRIM(RTRIM(ISNULL(V.Rd03_Ven_Nm, ''))) AS match_value
+    FROM dbo.Rddbc070 AS C WITH (NOLOCK)
+    LEFT JOIN dbo.Rddbc030 AS V WITH (NOLOCK)
+        ON C.Rd07_Cost_Apply_Cd = V.Rd03_Ven_Cd
+    WHERE {eligible}
+      AND {cost_predicate}
+),
+ManufacturerCandidates AS (
+    SELECT DISTINCT
+        CAST('manufacturer' AS VARCHAR(20)) AS match_type,
+        LTRIM(RTRIM(CAST(PV.Rd03_Ven_Cd AS VARCHAR(50)))) AS match_code,
+        {maker_name} AS match_value
+    FROM dbo.Rddbc070 AS C WITH (NOLOCK)
+    INNER JOIN dbo.Rddbc040 AS P WITH (NOLOCK)
+        ON C.Rd07_Physic_Cd = P.Rd04_Physic_Cd
+    INNER JOIN dbo.Rddbc030 AS PV WITH (NOLOCK)
+        ON P.Rd04_Ven_Cd = PV.Rd03_Ven_Cd
+    WHERE {eligible}
+      AND {manufacturer_predicate}
+),
+ProductCandidates AS (
+    SELECT DISTINCT
+        CAST('product' AS VARCHAR(20)) AS match_type,
+        LTRIM(RTRIM(CAST(P.Rd04_Physic_Cd AS VARCHAR(50)))) AS match_code,
+        {product_name} AS match_value
+    FROM dbo.Rddbc070 AS C WITH (NOLOCK)
+    INNER JOIN dbo.Rddbc040 AS P WITH (NOLOCK)
+        ON C.Rd07_Physic_Cd = P.Rd04_Physic_Cd
+    WHERE {eligible}
+      AND {product_predicate}
+),
+Candidates AS (
+    SELECT match_type, match_code, match_value FROM CostCandidates
+    UNION
+    SELECT match_type, match_code, match_value FROM ManufacturerCandidates
+    UNION
+    SELECT match_type, match_code, match_value FROM ProductCandidates
+),
+CandidateState AS (
+    SELECT
+        match_type AS __resolved_kind,
+        match_code AS __resolved_code,
+        match_value AS __resolved_value,
+        COUNT(*) OVER () AS __candidate_count,
+        SUM(CASE WHEN match_type = 'cost_apply' THEN 1 ELSE 0 END) OVER () AS __cost_apply_match_count,
+        SUM(CASE WHEN match_type = 'manufacturer' THEN 1 ELSE 0 END) OVER () AS __manufacturer_match_count,
+        SUM(CASE WHEN match_type = 'product' THEN 1 ELSE 0 END) OVER () AS __product_match_count
+    FROM Candidates
+)
+""".strip()
+
+
+def _unlabeled_result_sql(
+    qparams: dict[str, Any],
+    *,
+    mode: str,
+) -> tuple[str, list[Any]]:
+    join_clauses = ["X.__candidate_count >= 1", "C.Rd07_Del_Flag <> 'E'", *_GARBAGE_CANDIDATE_SQL]
+    values: list[Any] = []
+    if mode == "current":
+        join_clauses.append("C.Rd07_Start_Date <= ?")
+        values.append(qparams["as_of"])
+    else:
+        date_clauses, date_values = _date_filters(qparams)
+        join_clauses.extend(date_clauses)
+        values.extend(date_values)
+    join_clauses.append(
+        "((X.__resolved_kind = 'cost_apply' AND LTRIM(RTRIM(CAST(C.Rd07_Cost_Apply_Cd AS VARCHAR(50)))) = X.__resolved_code) OR "
+        "(X.__resolved_kind = 'manufacturer' AND EXISTS ("
+        "SELECT 1 FROM dbo.Rddbc040 AS MP WITH (NOLOCK) "
+        "WHERE MP.Rd04_Physic_Cd = C.Rd07_Physic_Cd "
+        "AND LTRIM(RTRIM(CAST(MP.Rd04_Ven_Cd AS VARCHAR(50)))) = X.__resolved_code)) OR "
+        "(X.__resolved_kind = 'product' AND LTRIM(RTRIM(CAST(C.Rd07_Physic_Cd AS VARCHAR(50)))) = X.__resolved_code))"
+    )
+    phrase = _clean(qparams.get("_r070_unlabeled_name"))
+    exact_code = bool(re.fullmatch(r"[0-9]+", phrase))
+    candidate_ctes = _unlabeled_candidate_ctes(exact_code=exact_code)
+    candidate_join = " AND ".join(join_clauses)
+    joined_source = f"""
+FROM CandidateState AS X
+LEFT JOIN dbo.Rddbc070 AS C WITH (NOLOCK)
+    ON {candidate_join}
+LEFT JOIN dbo.Rddbc030 AS V WITH (NOLOCK)
+    ON C.Rd07_Cost_Apply_Cd = V.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc040 AS P WITH (NOLOCK)
+    ON C.Rd07_Physic_Cd = P.Rd04_Physic_Cd
+LEFT JOIN dbo.Rddbc060 AS AU WITH (NOLOCK)
+    ON C.Rd07_Add_Cd = AU.Rd06_User_Cd
+LEFT JOIN dbo.Rddbc060 AS MU WITH (NOLOCK)
+    ON C.Rd07_Mod_Cd = MU.Rd06_User_Cd
+{_PRODUCT_MASTER_JOINS}
+""".strip()
+    meta_columns = (
+        "X.__candidate_count, X.__cost_apply_match_count, "
+        "X.__manufacturer_match_count, X.__product_match_count"
+    )
+    if mode == "current":
+        outer_clauses = ["R.__rn = 1"]
+        if qparams.get("date_from"):
+            outer_clauses.append("(R.[단가적용거래처] IS NULL OR R.[계약시작일자] >= ?)")
+            values.append(qparams["date_from"])
+        if qparams.get("date_to"):
+            outer_clauses.append("(R.[단가적용거래처] IS NULL OR R.[계약시작일자] <= ?)")
+            values.append(qparams["date_to"])
+        sql = f"""
+WITH {candidate_ctes},
+R AS (
+    SELECT
+{_SELECT_COLUMNS},
+        {meta_columns},
+        ROW_NUMBER() OVER (
+            PARTITION BY C.Rd07_Cost_Apply_Cd, C.Rd07_Physic_Cd
+            ORDER BY C.Rd07_Start_Date DESC, X.__resolved_kind, X.__resolved_code
+        ) AS __rn
+    {joined_source}
+)
+SELECT TOP {int(qparams['top'])}
+    R.*
+FROM R
+WHERE {' AND '.join(outer_clauses)}
+ORDER BY R.[단가적용거래처], R.[제품코드]
+""".strip()
+    else:
+        sql = f"""
+WITH {candidate_ctes}
+SELECT DISTINCT TOP {int(qparams['top'])}
+{_SELECT_COLUMNS},
+    {meta_columns}
+{joined_source}
+ORDER BY C.Rd07_Start_Date DESC, C.Rd07_Cost_Apply_Cd, C.Rd07_Physic_Cd
+""".strip()
+    authority_values = [phrase, phrase, phrase] if exact_code else [f"%{phrase}%"] * 3
+    return sql, [*authority_values, *values]
+
+
+def _execute_unlabeled_result(
+    qparams: dict[str, Any],
+    *,
+    mode: str,
+) -> tuple[pd.DataFrame, list[dict[str, Any]], str]:
+    """Resolve authority and fetch R070 rows in one physical execution."""
+    sql, values = _unlabeled_result_sql(qparams, mode=mode)
+    raw = execute_bound_select(sql, values)
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
+        return pd.DataFrame(), [], "not_found"
+    meta_row = raw.iloc[0]
+    try:
+        candidate_count = int(meta_row.get("__candidate_count") or 0)
+    except (TypeError, ValueError):
+        candidate_count = 0
+    authority_matches: list[dict[str, Any]] = []
+    for match_type, column in (
+        ("cost_apply", "__cost_apply_match_count"),
+        ("manufacturer", "__manufacturer_match_count"),
+        ("product", "__product_match_count"),
+    ):
+        try:
+            match_count = int(meta_row.get(column) or 0)
+        except (TypeError, ValueError):
+            match_count = 0
+        if match_count:
+            authority_matches.append({"match_type": match_type, "match_count": match_count})
+    phrase = _clean(qparams.get("_r070_unlabeled_name"))
+    if re.fullmatch(r"[0-9]+", phrase) and len(authority_matches) > 1:
+        return pd.DataFrame(), authority_matches, "ambiguous"
+    hidden = [
+        "__candidate_count", "__cost_apply_match_count",
+        "__manufacturer_match_count", "__product_match_count", "__rn",
+    ]
+    data = raw.drop(columns=[column for column in hidden if column in raw.columns]).copy()
+    if "단가적용거래처" in data.columns:
+        data = data.loc[data["단가적용거래처"].notna()].copy()
+    if candidate_count < 1:
+        return pd.DataFrame(), [], "not_found"
+    return _prepare_result_projection(data), authority_matches, "resolved"
+
+
 def _date_value(value: Any, *, field: str, required: bool = False) -> str:
     if isinstance(value, (date, datetime)):
         return value.strftime("%Y%m%d")
@@ -476,6 +673,8 @@ ORDER BY R.[단가적용거래처], R.[제품코드]
 
 def _query_summary(params: dict[str, Any], *, mode: str, row_count: int, df: pd.DataFrame) -> str:
     parts: list[str] = []
+    if params.get("unlabeled_name"):
+        parts.append(f"통합명칭 {_clean(params.get('unlabeled_name'))}")
     if params.get("ven_cd") or params.get("ven_nm"):
         parts.append(f"단가적용거래처 {_clean(params.get('ven_cd')) or _clean(params.get('ven_nm'))}")
     if params.get("physic_cd") or params.get("physic_nm") or params.get("product_keyword"):
@@ -510,16 +709,77 @@ def _result(params: Optional[dict[str, Any]], *, mode: str, action: str) -> dict
     qparams = normalize_rddbc070_params(params, mode=mode)
     limits = qparams.pop("_limit_contract")
     display_top = int(qparams["display_top"])
-    df = get_rddbc070_current_df(qparams) if mode == "current" else get_rddbc070_history_df(qparams)
+    unlabeled_name = _clean(qparams.get("_r070_unlabeled_name"))
+    authority_matches: list[dict[str, Any]] = []
+    authority_status = ""
+    if unlabeled_name:
+        df, authority_matches, authority_status = _execute_unlabeled_result(
+            qparams,
+            mode=mode,
+        )
+    else:
+        df = get_rddbc070_current_df(qparams) if mode == "current" else get_rddbc070_history_df(qparams)
+    qparams.pop("_r070_unlabeled_name", None)
+    if unlabeled_name:
+        qparams["unlabeled_name"] = unlabeled_name
+
+    if authority_status in {"not_found", "ambiguous"}:
+        message = (
+            "입력한 숫자 코드가 여러 조건 종류에 존재합니다. "
+            "단가적용처코드·제조사코드·제품코드 중 하나를 명시해 주세요."
+            if authority_status == "ambiguous"
+            else "해당 조건과 일치하는 단가적용처·제약사·제품을 찾지 못했습니다."
+        )
+        return {
+            "table": TABLE,
+            "action": action,
+            "title": action,
+            "params": qparams,
+            "df": pd.DataFrame(),
+            "df_display": pd.DataFrame(),
+            "records": [],
+            "columns": [],
+            "data": message,
+            "message": message,
+            "final": True,
+            "meta": {
+                "source_table": "Rddbc070",
+                "source_mode": mode,
+                "source_call_count": 1,
+                "physical_source_call_count": 1,
+                "authority_source": "r070_single_statement",
+                "entity_resolution_status": authority_status,
+                "result_status": "candidate_required" if authority_status == "ambiguous" else authority_status,
+                "candidate_count": sum(int(row.get("match_count") or 0) for row in authority_matches),
+                "authority_matches": authority_matches,
+                "candidate_table": False,
+                "row_count": 0,
+                "row_count_total": 0,
+                "service_call_skipped": False,
+                "full_source_ready": False,
+                "summary_md": message,
+            },
+        }
     summary = _query_summary(qparams, mode=mode, row_count=len(df), df=df)
-    payload = build_feature_result(
-        table=TABLE,
-        title=action,
-        params=qparams,
-        df=df,
-        summary_md=summary,
-    )
-    meta = dict(payload.get("meta") or {})
+    row_count = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    payload = {
+        "table": TABLE,
+        "title": action,
+        "action": action,
+        "params": qparams,
+        "data": summary if row_count else "해당 자료가 없습니다.",
+        "message": f"{action} {row_count:,}건" if row_count else "해당 자료가 없습니다.",
+        "final": True,
+    }
+    meta = {
+        "row_count": row_count,
+        "row_count_total": row_count,
+        "result_status": "success" if row_count else "no_data",
+        "source_call_count": 1,
+        "summary_md": summary,
+        "registered_erp_table": True,
+        "semantic_styled_max_rows": 300,
+    }
     display_df = df.head(display_top).copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
     full_source_limit = int(limits.source_top)
     full_source_limit_hit = bool(
@@ -533,6 +793,16 @@ def _result(params: Optional[dict[str, Any]], *, mode: str, action: str) -> dict
         {
             "source_table": "Rddbc070",
             "source_mode": mode,
+            "physical_source_call_count": 1,
+            "authority_source": "r070_single_statement" if unlabeled_name else "explicit_filter",
+            "entity_resolution_status": authority_status or "explicit_or_none",
+            "resolved_kind": (
+                _clean(authority_matches[0].get("match_type"))
+                if len(authority_matches) == 1 else ("combined" if authority_matches else "")
+            ),
+            "candidate_count": sum(int(row.get("match_count") or 0) for row in authority_matches),
+            "authority_matches": authority_matches,
+            "authority_candidates": [],
             "query_summary": summary.split("\n", 1)[0].replace("조회조건: ", ""),
             "condition": summary.split("\n", 1)[0].replace("조회조건: ", ""),
             "effective_date_strategy": "latest_start_date_lte_as_of" if mode == "current" else "history",

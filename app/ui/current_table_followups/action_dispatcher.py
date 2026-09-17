@@ -55,6 +55,7 @@ from app.ui.current_table_followups.generic import (
     handle_generic_followup,
     handle_common_column_filter_followup,
     handle_common_column_group_followup,
+    parse_current_table_rank_request,
 )
 
 
@@ -401,8 +402,18 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
     ("product_category", "제품구분", ("제품구분별",), ("제품구분명", "제품구분")),
     ("product_class", "제품분류", ("제품분류별",), ("제품분류명", "제품분류")),
     ("forecast_grade", "예상등급", ("예상등급별",), ("예상등급",)),
-    ("profit_grade", "손익등급", ("손익등급별", "손익등급분석", "손익등급"), ("손익등급",)),
-    ("contribution_grade", "기여도등급", ("기여도등급별", "기여도등급분석"), ("기여도등급",)),
+    (
+        "profit_grade",
+        "품목손익등급",
+        ("품목손익등급별", "품목손익등급분석", "품목손익등급", "손익등급별", "손익등급분석", "손익등급"),
+        ("품목손익등급", "손익등급"),
+    ),
+    (
+        "contribution_grade",
+        "품목기여등급",
+        ("품목기여등급별", "품목기여등급분석", "품목기여등급", "기여등급별", "기여등급분석", "기여등급", "기여도등급별", "기여도등급분석", "기여도등급"),
+        ("품목기여등급", "기여등급", "기여도등급"),
+    ),
     ("frequency_grade", "출고빈도등급", ("출고빈도등급별", "출고빈도등급분석"), ("출고빈도등급",)),
     ("trend_judgement", "추세판정", ("추세판정별",), ("추세판정",)),
     ("judgement_result", "판정결과", ("판정결과별",), ("판정결과",)),
@@ -1633,9 +1644,39 @@ def handle_current_table_followup_by_action(
     - handler가 False를 반환하거나 예외가 나도 사용자에게 notice를 표시해서
       질문에 답 없이 끝나는 일을 막는다.
     """
-    if classify_current_table_followup_intent(query) == "llm_analysis":
-        return False
+    followup_intent = classify_current_table_followup_intent(query)
     kind = detect_current_table_kind(source_action)
+    if str(source_action or "").strip() == "제품정보 조회":
+        from app.services.snapshot_product_information_service import (
+            SENSITIVE_PRODUCT_INFORMATION_COLUMNS,
+            project_product_information_frame_for_viewer,
+        )
+
+        df = project_product_information_frame_for_viewer(df)
+        requested_sensitive = any(
+            column in str(query or "") for column in SENSITIVE_PRODUCT_INFORMATION_COLUMNS
+        )
+        available_sensitive = any(
+            column in df.columns for column in SENSITIVE_PRODUCT_INFORMATION_COLUMNS
+        )
+        if requested_sensitive and not available_sensitive:
+            return bool(helpers["push_notice"](
+                title="현재표 권한 제한",
+                action="현재표 권한 제한",
+                message="현재 권한에서 제공되지 않는 제품정보 항목입니다.",
+                query_summary="현재표 / 권한 제한 / 제품정보",
+                source_query="현재표 제한 항목 요청",
+                source_table_key=table_key,
+                source_rows=len(df),
+                extra_meta={
+                    "execution_status": "permission_denied",
+                    "result_status": "permission_denied",
+                    "source_action": source_action,
+                    "source_call_count": 0,
+                    "table_created": False,
+                    "issue_codes": ["product_information_cost_metric_restricted"],
+                },
+            ))
     if (
         kind == "generic"
         and isinstance(source_meta, dict)
@@ -1663,6 +1704,36 @@ def handle_current_table_followup_by_action(
         kind=kind,
         source_meta=source_meta,
     )
+    requested_grouping = str(capability.get("requested_grouping") or "")
+    if requested_grouping in {"profit_grade", "contribution_grade"}:
+        actual_group_column = _resolve_current_table_dimension_column(
+            dispatch_df,
+            grouping=requested_grouping,
+            kind=kind,
+        )
+        if actual_group_column and actual_group_column not in dispatch_query:
+            dimension_spec = next(
+                (
+                    (label, phrases, aliases)
+                    for key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS
+                    if key == requested_grouping
+                ),
+                None,
+            )
+            if dimension_spec:
+                label, phrases, aliases = dimension_spec
+                for legacy in sorted({label, *phrases, *aliases}, key=len, reverse=True):
+                    if legacy and legacy in dispatch_query:
+                        suffix = next(
+                            (value for value in ("분석", "집계", "요약", "기준", "별") if legacy.endswith(value)),
+                            "",
+                        )
+                        dispatch_query = dispatch_query.replace(
+                            legacy,
+                            actual_group_column + suffix,
+                            1,
+                        )
+                        break
     if filter_result["status"] != "success":
         capability = {
             **capability,
@@ -1771,6 +1842,29 @@ def handle_current_table_followup_by_action(
     handler = handlers.get(kind)
     normalized_query = re.sub(r"\s+", "", str(query or ""))
 
+    if followup_intent == "llm_analysis":
+        # 일반/마스터 표의 실제 컬럼(등록자, 수정자, 직책 등)에 대한
+        # ``<컬럼>별 분석``은 결정적 집계다. 업무별 분석 계약은 기존
+        # 전용 경로에 남겨 두어 의미를 바꾸지 않는다.
+        if kind == "generic":
+            try:
+                if handle_common_column_group_followup(
+                    df=df,
+                    query=dispatch_query,
+                    top_n=top_n,
+                    table_key=table_key,
+                    source_action=source_action,
+                    helpers=dispatch_helpers,
+                    log=log,
+                ):
+                    return True
+            except Exception:
+                try:
+                    log.exception("[chat.followup_table] deterministic generic analysis group failed")
+                except Exception:
+                    pass
+        return False
+
     source_contract_priority = capability["status"] == "success" and ((
         kind in _CURRENT_TABLE_SOURCE_GROUPING_ALIASES
         and capability["requested_grouping"] in {"month", "day", "weekday", "customer"}
@@ -1848,6 +1942,49 @@ def handle_current_table_followup_by_action(
             except Exception:
                 pass
 
+    # Exact columns can safely satisfy row ranking, numeric filtering, and
+    # literal value filtering regardless of the source action.  Apply this
+    # before capability notices so source-specific columns such as 이월수량 or
+    # 확정단가 are not rejected as unknown canonical metrics.
+    common_rank_direction, _common_rank_limit_value = parse_current_table_rank_request(
+        query,
+        default_limit=top_n,
+    )
+    semantic_rank_target = bool(
+        re.search(
+            r"(?:제품|품목|거래처|매입처|제조사|제약사|담당자|영업사원|부서|직책)$",
+            normalized_query,
+        )
+    )
+    semantic_group_rank = bool(
+        common_rank_direction
+        and (
+            capability.get("requested_grouping")
+            or semantic_rank_target
+            or _requested_source_semantic_filter(kind, query)
+            or (
+                kind == "analytics_kpi"
+                and any(label in normalized_query for label in ("판정결과", "추세판정"))
+            )
+        )
+    )
+    try:
+        if not semantic_group_rank and handle_common_column_filter_followup(
+            df=df,
+            query=query,
+            top_n=top_n,
+            table_key=table_key,
+            source_action=source_action,
+            helpers=dispatch_helpers,
+            log=log,
+        ):
+            return True
+    except Exception:
+        try:
+            log.exception("[chat.followup_table] exact common filter/rank failed kind=%s", kind)
+        except Exception:
+            pass
+
     # Generic/master tables may expose dimensions that are intentionally not
     # part of the global metric/dimension vocabulary.  Let exact existing
     # columns handle literal group/filter/TOP before an unsupported notice,
@@ -1885,7 +2022,7 @@ def handle_current_table_followup_by_action(
         try:
             if handle_common_column_group_followup(
                 df=df,
-                query=query,
+                query=dispatch_query,
                 top_n=top_n,
                 table_key=table_key,
                 source_action=source_action,
@@ -1895,7 +2032,7 @@ def handle_current_table_followup_by_action(
                 return True
             if handle_common_column_filter_followup(
                 df=df,
-                query=query,
+                query=dispatch_query,
                 top_n=top_n,
                 table_key=table_key,
                 source_action=source_action,
@@ -1977,7 +2114,7 @@ def handle_current_table_followup_by_action(
             handled = bool(
                 handle_generic_followup(
                     df=df,
-                    query=query,
+                    query=dispatch_query,
                     top_n=top_n,
                     table_key=table_key,
                     source_action=source_action,
@@ -1997,7 +2134,7 @@ def handle_current_table_followup_by_action(
             handled = bool(
                 handle_common_column_group_followup(
                     df=df,
-                    query=query,
+                    query=dispatch_query,
                     top_n=top_n,
                     table_key=table_key,
                     source_action=source_action,
@@ -2017,7 +2154,7 @@ def handle_current_table_followup_by_action(
             return bool(
                 handle_common_column_filter_followup(
                     df=df,
-                    query=query,
+                    query=dispatch_query,
                     top_n=top_n,
                     table_key=table_key,
                     source_action=source_action,
@@ -2117,7 +2254,7 @@ def handle_current_table_followup_by_action(
     # "현재표 <컬럼명> <값> 상세히" 형태는 action별 미지원 안내보다 먼저
     # 실제 현재표 df.columns 기반 공통 필터 상세표로 처리한다.
     try:
-        if handle_common_column_filter_followup(
+        if not semantic_group_rank and handle_common_column_filter_followup(
             df=df,
             query=query,
             top_n=top_n,
@@ -2217,7 +2354,7 @@ def handle_current_table_followup_by_action(
     # action 전용 handler가 처리하지 못한 경우에도,
     # "현재표 <컬럼명> <값> 상세히" 형태는 모든 현재표에서 공통 필터로 처리한다.
     try:
-        if handle_common_column_filter_followup(
+        if not semantic_group_rank and handle_common_column_filter_followup(
             df=df,
             query=query,
             top_n=top_n,

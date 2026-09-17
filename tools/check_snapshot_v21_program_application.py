@@ -80,12 +80,13 @@ def test_product_information_service() -> None:
         master_loader=lambda params: pd.DataFrame([{
             "제품코드": "00001", "제품명": "검증품목", "제약사": "검증제약", "규격": "10정",
         }]),
+        viewer_user=SimpleNamespace(user_type="SSART_USER"),
     )
     frame = payload["df"]
     _assert(payload["meta"]["source_call_count"] == 1, "product enrichment source count mismatch")
     _assert(payload["meta"]["snapshot_read_call_count"] == 1, "Snapshot read provenance missing")
     _assert(payload["meta"]["snapshot_contract_version"] == "2.1", "v2.1 contract missing")
-    _assert(list(frame.loc[0, ["제품코드", "출고빈도등급", "손익등급", "기여도등급"]]) == ["00001", "F", "B", "A"], "grade projection mismatch")
+    _assert(list(frame.loc[0, ["제품코드", "출고빈도등급", "품목손익등급", "품목기여등급"]]) == ["00001", "F", "B", "A"], "grade projection mismatch")
     _assert("추정기여금액" in frame.columns and "3개월반품공급가액" in frame.columns, "detail statistics missing")
 
 
@@ -128,9 +129,11 @@ def test_nlq_and_inventory_boundaries() -> None:
         parsed = resolve_io_nlq(question)
         _assert(parsed["params"].get(key) == value, f"product information filter missing: {key}")
     info = resolve_io_nlq("손익등급 A 제품정보 조회")
+    official_info = resolve_io_nlq("품목손익등급 A 제품정보 조회")
     inventory = resolve_io_nlq("제품재고장 조회")
     flow = resolve_io_nlq("제품수불현황 조회")
     _assert(info and info["action"] == "제품정보 조회" and info["params"].get("profit_grade") == "A", "product information NLQ failed")
+    _assert(official_info and official_info["params"].get("profit_grade") == "A", "official profit-grade alias failed")
     _assert(inventory and inventory["action"] == "제품재고현황 조회", "product inventory route regressed")
     _assert(flow and flow["action"] == "제품수불현황 조회", "product flow route regressed")
     _assert(resolve_io_nlq("제품 조회") is None, "master product query was captured by Snapshot action")

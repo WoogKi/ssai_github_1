@@ -2169,6 +2169,15 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
     반환 스키마:
       {"type":"table|text|object", "title":str, "data":..., "meta":{...}}
     """
+    # Product-information history/current payloads are re-authorized here so
+    # an older stored full payload cannot bypass the current viewer projection.
+    if isinstance(result, dict) and str(result.get("action") or result.get("title") or "").strip() == "제품정보 조회":
+        from app.services.snapshot_product_information_service import (
+            project_product_information_payload_for_viewer,
+        )
+
+        result = project_product_information_payload_for_viewer(result)
+
     # 0) SIMS 패널 payload(dict)에 df/df_display/records가 있는 경우 우선 처리
     if isinstance(result, dict) and (
         isinstance(result.get("df"), pd.DataFrame)
@@ -2935,7 +2944,7 @@ def _sims_ctx_to_records(df: pd.DataFrame, limit: int = 20) -> list[dict]:
 
 # SIMS 분석 컨텍스트의 업무 용어 보정
 # - LLM이 출고/매출/입고/매입 같은 용어를 정확히 구분해서 쓰도록 유도하기 위한 보정값을 제공한다.
-def _sims_business_terms(action_name: str) -> dict:
+def _sims_business_terms(action_name: str, columns: Any = ()) -> dict:
     """
     LLM 분석 컨텍스트 업무 용어 보정.
     내부 key 이름은 sales_*를 유지하더라도, 답변 용어는 action에 맞게 쓰게 한다.
@@ -2943,11 +2952,21 @@ def _sims_business_terms(action_name: str) -> dict:
     action = str(action_name or "")
 
     if action == "제품정보 조회":
+        try:
+            labels = {str(column) for column in columns}
+        except TypeError:
+            labels = set()
+        cost_metrics = [
+            column
+            for column in ("추정단위손익", "추정손익률", "추정기여금액")
+            if column in labels
+        ]
         return {
-            "flow_label": "제품 통계", "amount_label": "추정기여금액", "vendor_label": "제약사",
-            "qty_label": "최근 3개월 출고수량", "amount_priority": ("추정기여금액",),
+            "flow_label": "제품 통계", "amount_label": cost_metrics[-1] if cost_metrics else "제품수",
+            "vendor_label": "제약사", "qty_label": "최근 3개월 출고수량",
+            "amount_priority": tuple(reversed(cost_metrics)),
             "avoid_words": ["매출 상위", "매출액", "매출실적", "인기 제품", "확정손익"],
-            "preferred_words": ["출고빈도등급", "손익등급", "기여도등급", "추정단위손익", "추정기여금액", "자료 부족"],
+            "preferred_words": ["출고빈도등급", "품목손익등급", "품목기여등급", *cost_metrics, "자료 부족"],
         }
 
     if (
@@ -3629,7 +3648,7 @@ def _build_sims_analysis_context_from_df(
         or 0
     )
 
-    business_terms = _sims_business_terms(action)
+    business_terms = _sims_business_terms(action, base_df.columns)
     try:
         meta_terms = meta.get("business_terms") if isinstance(meta.get("business_terms"), dict) else {}
         if isinstance(meta_terms, dict):
@@ -4660,6 +4679,8 @@ def _download_source_context(
         "applied_download_limit_rows",
         "download_limit_rows",
         "download_row_count",
+        "download_column_count",
+        "download_columns",
         "prepared_rows",
         "expected_rows",
         "limit_hit",
@@ -4682,6 +4703,7 @@ def _stash_sims_export_provenance(
         return
     provenance = _download_source_context(item, meta, table_key=table_key)
     provenance["rows"] = int(len(export_df))
+    provenance["columns"] = [str(column) for column in export_df.columns]
     try:
         st.session_state.setdefault("__sims_export_table_provenance_by_key", {})
         store = st.session_state["__sims_export_table_provenance_by_key"]
@@ -4706,6 +4728,7 @@ def _download_source_provenance_matches(
     expected_context: Dict[str, Any],
     *,
     candidate_rows: int,
+    candidate_columns: tuple[str, ...] = (),
 ) -> tuple[bool, str]:
     """Reject a foreign export cache without logging identifiers."""
     if not isinstance(provenance, dict):
@@ -4720,7 +4743,29 @@ def _download_source_provenance_matches(
     stored_rows = _safe_int_for_download(provenance.get("rows"), 0)
     if stored_rows > 0 and stored_rows != candidate_rows:
         return False, "row_count_mismatch"
+    stored_columns = tuple(str(column) for column in (provenance.get("columns") or ()))
+    if stored_columns and candidate_columns and stored_columns != candidate_columns:
+        return False, "column_projection_mismatch"
     return True, "verified"
+
+
+def _export_candidate_covers_display(
+    candidate: Any,
+    display_df: Any,
+    *,
+    expected_column_count: int = 0,
+) -> bool:
+    """Require an export source to preserve both rows and the visible projection."""
+    if not isinstance(candidate, pd.DataFrame) or candidate.empty:
+        return False
+    if isinstance(display_df, pd.DataFrame):
+        if len(candidate) < len(display_df):
+            return False
+        display_columns = {str(column) for column in display_df.columns}
+        candidate_columns = {str(column) for column in candidate.columns}
+        if not display_columns.issubset(candidate_columns):
+            return False
+    return expected_column_count <= 0 or len(candidate.columns) >= expected_column_count
 
 
 def _resolve_payload_full_download_source(
@@ -4732,6 +4777,7 @@ def _resolve_payload_full_download_source(
     """Resolve a verified full export source without promoting a display slice."""
     display_rows = int(len(display_df)) if isinstance(display_df, pd.DataFrame) else 0
     expected_rows = _expected_analysis_row_count(meta, display_rows)
+    expected_column_count = _safe_int_for_download(meta.get("download_column_count"), 0)
     table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
     result: Dict[str, Any] = {
         "df": None,
@@ -4799,6 +4845,7 @@ def _resolve_payload_full_download_source(
                 provenance,
                 candidate_context,
                 candidate_rows=rows,
+                candidate_columns=tuple(str(column) for column in candidate.columns),
             )
             if not provenance_ok:
                 log.info(
@@ -4808,6 +4855,19 @@ def _resolve_payload_full_download_source(
                     rows,
                     provenance_status,
                 )
+                continue
+
+            if not _export_candidate_covers_display(
+                candidate,
+                display_df,
+                expected_column_count=expected_column_count,
+            ):
+                partial_seen = True
+                if rows >= partial_source_rows:
+                    partial_source_rows = rows
+                    partial_source_name = source_name
+                    partial_source_table_key = candidate_key or table_key
+                    partial_provenance_status = "column_projection_incomplete"
                 continue
 
             is_complete = expected_rows <= 0 or rows >= expected_rows
@@ -5051,6 +5111,8 @@ def _get_full_download_df_for_sims_item(
 
             meta["download_table_key"] = table_key
             meta["download_row_count"] = int(len(export_df))
+            meta["download_column_count"] = int(len(export_df.columns))
+            meta["download_columns"] = [str(column) for column in export_df.columns]
             meta["display_row_count"] = int(display_rows)
             item["meta"] = meta
 
@@ -5177,6 +5239,15 @@ def _get_full_download_df_for_sims_item(
                 expected_rows,
                 display_rows,
             )
+        expected_column_count = _safe_int_for_download(meta.get("download_column_count"), 0)
+        if expected_column_count > len(display_df.columns):
+            log.warning(
+                "[chat.download.source] export projection incomplete action=%s expected_columns=%s display_columns=%s",
+                action,
+                expected_column_count,
+                len(display_df.columns),
+            )
+            return pd.DataFrame()
         return display_df
 
     # 전체건수가 화면건수와 같으면 굳이 재조회하지 않는다.
@@ -5343,6 +5414,15 @@ def _get_full_download_df_for_sims_item(
     except Exception:
         log.warning("[chat.stash.export] full download dataframe failed action=%s", action)
 
+    expected_column_count = _safe_int_for_download(meta.get("download_column_count"), 0)
+    if expected_column_count > len(display_df.columns):
+        log.warning(
+            "[chat.download.source] export projection unavailable action=%s expected_columns=%s display_columns=%s",
+            action,
+            expected_column_count,
+            len(display_df.columns),
+        )
+        return pd.DataFrame()
     return display_df
 
 # SIMS 결과를 채팅 컨텍스트에 올릴 때, 현재 선택된 채팅방 객체를 session_state에서 찾아 반환하는 함수
@@ -5619,15 +5699,22 @@ def _build_sims_detail_analysis_prompt(
     display_rows: int,
     download_rows: int,
     expected_rows: int,
+    columns: Any = (),
 ) -> str:
     action_name = str(action_name or "SSAI 조회 결과").strip()
     from app.ui.sims_analysis_profiles import snapshot_grade_analysis_contract
-    grade_contract = snapshot_grade_analysis_contract(action_name)
+    grade_contract = snapshot_grade_analysis_contract(action_name, columns)
     if grade_contract:
+        labels = {str(column) for column in (() if columns is None else columns)}
+        cost_hint = (
+            "추정손익률 원자료 0.1은 10%로 읽고 가격 기준월과 자료 부족을 확인하라.\n"
+            if "추정손익률" in labels
+            else "가격 기준월과 자료 부족을 확인하라.\n"
+        )
         return (
             f"현재 클릭한 표 [{action_name}]를 분석해줘. 전체 기준 {expected_rows:,}건, 표시 {display_rows:,}건이다.\n"
             "전체 문맥/llm_summary_md를 우선하고 일부 표를 전체로 일반화하지 마라. "
-            "추정손익률 원자료 0.1은 10%로 읽고 가격 기준월과 자료 부족을 확인하라.\n"
+            + cost_hint
             + grade_contract
         )
 
@@ -5853,6 +5940,12 @@ def _render_sims_result_actions_lazy(
     - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
     - [Excel 다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
     """
+    if str(clicked_action or "").strip() == "제품정보 조회" and isinstance(download_df, pd.DataFrame):
+        from app.services.snapshot_product_information_service import (
+            project_product_information_frame_for_viewer,
+        )
+
+        download_df = project_product_information_frame_for_viewer(download_df)
     analysis_ctx, analysis_ctx_source = _select_sims_analysis_ctx_for_table(
         table_key=table_key,
         action=clicked_action,
@@ -7511,6 +7604,8 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                     _stash_sims_export_provenance(table_key, df_full_for_export, payload, meta)
                     meta["download_table_key"] = table_key
                     meta["download_row_count"] = int(len(df_full_for_export))
+                    meta["download_column_count"] = int(len(df_full_for_export.columns))
+                    meta["download_columns"] = [str(column) for column in df_full_for_export.columns]
                     meta["display_row_count"] = int(len(df_display_for_ui))
                     expected_download_rows = _safe_int_for_download(
                         meta.get("row_count_total") or meta.get("expected_rows"),
@@ -8937,6 +9032,101 @@ def _is_internal_admin_for_raw_meta() -> bool:
     return False
 
 
+_SIMS_INTERNAL_OBJECT_KEYS = frozenset(
+    {
+        "params",
+        "df",
+        "df_display",
+        "source_call_count",
+        "physical_source_call_count",
+        "trace_id",
+        "trace_request_id",
+        "nlq_trace_request_id",
+        "private_routing_metadata",
+        "authority_matches",
+        "authority_candidates",
+    }
+)
+
+
+def _safe_user_facing_payload_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = value.strip()
+    lowered = text.lower()
+    if text.startswith("{") or any(
+        private_key in lowered for private_key in _SIMS_INTERNAL_OBJECT_KEYS
+    ):
+        return ""
+    return text
+
+
+def _user_facing_internal_object_message(data: Any) -> str | None:
+    """내부 SIMS 자료를 JSON으로 표시하지 않고 안전한 안내문으로 바꾼다."""
+    if not isinstance(data, dict):
+        return None
+
+    nested_meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    payload_keys = {str(key) for key in data}
+    meta_keys = {str(key) for key in nested_meta}
+    has_internal_shape = bool(
+        payload_keys.intersection(_SIMS_INTERNAL_OBJECT_KEYS)
+        or meta_keys.intersection(_SIMS_INTERNAL_OBJECT_KEYS)
+        or {"records", "columns"}.issubset(payload_keys)
+        or {"records", "columns"}.issubset(meta_keys)
+        or any(str(key).startswith("_") for key in payload_keys | meta_keys)
+    )
+    if not has_internal_shape:
+        return None
+
+    for value in (
+        data.get("message"),
+        data.get("content"),
+        nested_meta.get("summary_md"),
+        nested_meta.get("summary"),
+    ):
+        text = _safe_user_facing_payload_text(value)
+        if text:
+            return text
+
+    result_status = str(
+        data.get("result_status") or nested_meta.get("result_status") or ""
+    ).strip().lower()
+    if result_status in {"candidate_required", "selection_required", "ambiguous"}:
+        return "조회 후보가 여러 개입니다. 조회 조건을 더 구체적으로 입력해 주세요."
+    if result_status in {"input_required", "confirmation_required"}:
+        return "조회에 필요한 조건을 확인해 주세요."
+    if result_status in {"no_data", "empty", "not_found"}:
+        return "해당 조회조건의 자료가 없습니다."
+    return "조회 결과가 저장되었습니다."
+
+
+def _user_facing_chat_message(item: Dict[str, Any], meta: Dict[str, Any], data: Any) -> str:
+    """문자형 응답에서도 내부 사전이나 직렬화된 내부 JSON을 직접 표시하지 않는다."""
+    for value in (
+        item.get("message"),
+        data,
+        meta.get("summary_md"),
+        meta.get("summary"),
+    ):
+        text = _safe_user_facing_payload_text(value)
+        if text:
+            return text
+    internal_message = _user_facing_internal_object_message(data)
+    if internal_message:
+        return internal_message
+    result_status = str(meta.get("result_status") or "").strip().lower()
+    if result_status in {"no_data", "empty", "not_found"}:
+        return "해당 조회조건의 자료가 없습니다."
+    if result_status in {"candidate_required", "selection_required", "ambiguous"}:
+        return "조회 후보가 여러 개입니다. 조회 조건을 더 구체적으로 입력해 주세요."
+    if result_status in {"input_required", "confirmation_required"}:
+        return "조회에 필요한 조건을 확인해 주세요."
+    if result_status == "error":
+        return "조회 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
+    return "조회 결과가 저장되었습니다."
+
+
 def _is_internal_master_summary(meta: Dict[str, Any]) -> bool:
     """
     화면 기본 영역에는 숨기되 LLM 분석 컨텍스트에는 보존할 마스터 자동 집계 summary 판별.
@@ -9853,13 +10043,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
         if bool(meta.get("candidate_table")):
             # 제품수불현황 후보표 안내
-            guide_text = (
-                meta.get("summary_md")
-                or item.get("message")
-                or item.get("data")
-                or ""
-            )
-            guide_text = str(guide_text or "").strip()
+            guide_text = ""
+            for guide_value in (meta.get("summary_md"), item.get("message"), item.get("data")):
+                guide_text = _safe_user_facing_payload_text(guide_value)
+                if guide_text:
+                    break
+            if not guide_text:
+                guide_text = _user_facing_internal_object_message(item.get("data")) or ""
 
             if not guide_text:
                 guide_text = "제품 후보 목록입니다. 원하는 번호를 채팅창에 입력해 주세요. 예: 1번 / 첫번째 제품"
@@ -10016,16 +10206,26 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             )
 
             if bool(locals().get("old_history_table_forced", False)):
-                raw_download_df = data
+                download_source_result = _resolve_payload_full_download_source(
+                    item,
+                    meta,
+                    display_df=data,
+                )
+                verified_history_df = download_source_result.get("df")
+                expected_history_columns = _safe_int_for_download(
+                    meta.get("download_column_count"),
+                    0,
+                )
+                if isinstance(verified_history_df, pd.DataFrame):
+                    raw_download_df = verified_history_df
+                elif expected_history_columns > len(data.columns):
+                    raw_download_df = None
+                    download_source_result["source_status"] = "column_projection_unavailable"
+                else:
+                    raw_download_df = data
+                    download_source_result["source_name"] = "history_display_only"
+                    download_source_result["source_status"] = "display_only_partial"
                 defer_full_export = True
-                download_source_result = {
-                    "df": data,
-                    "source_name": "history_display_only",
-                    "source_status": "display_only_partial",
-                    "source_table_key": str(meta.get("table_key") or ""),
-                    "source_rows": display_rows_initial,
-                    "expected_rows": expected_rows_initial,
-                }
                 file_generation_status = "deferred"
             else:
                 # Source completeness and file-generation timing are separate
@@ -10688,6 +10888,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     display_rows=display_rows_for_download,
                     download_rows=download_rows,
                     expected_rows=expected_rows,
+                    columns=raw_download_df.columns,
                 )
 
                 _render_sims_result_actions_lazy(
@@ -10715,10 +10916,10 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             return
 
         # 안내/빈결과 메시지는 type 값보다 message 존재 여부를 우선해서 렌더한다.
-        msg_text = str(item.get("message") or "").strip()
+        msg_text = _safe_user_facing_payload_text(item.get("message"))
 
         if t == "text":
-            text_to_show = msg_text or str(data or "").strip()
+            text_to_show = _user_facing_chat_message(item, meta, data)
             if text_to_show in {"해당 자료 없습니다.", "해당 자료가 없습니다.", "조회 결과가 없습니다."}:
                 text_to_show = "해당 조회조건의 자료가 없습니다."
             st.info(text_to_show or "해당 조회조건의 자료가 없습니다.")
@@ -10730,6 +10931,10 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             return
 
         if t == "object":
+            safe_object_message = _user_facing_internal_object_message(data)
+            if safe_object_message is not None:
+                st.info(safe_object_message)
+                return
             if isinstance(data, (dict, list)):
                 st.json(data)
             elif data is not None and str(data).strip():
@@ -10739,6 +10944,10 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             return
 
         # fallback
+        safe_object_message = _user_facing_internal_object_message(data)
+        if safe_object_message is not None:
+            st.info(safe_object_message)
+            return
         if isinstance(data, (dict, list)):
             st.json(data)
         elif data is not None and str(data).strip():

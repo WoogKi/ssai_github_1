@@ -4572,7 +4572,7 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
 
     capped_rows = 100_000
     capped_expected_rows = 1_159_102
-    capped_df = pd.DataFrame({"순번": range(1, capped_rows + 1)})
+    capped_df = pd.concat([source] * (capped_rows // len(source)), ignore_index=True)
     capped_meta = {
         **meta,
         "download_row_count": capped_rows,
@@ -4860,7 +4860,17 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
         "current_table_followup": True,
         "analysis_row_count": 61981,
     }
-    derived_full = pd.DataFrame({"제품코드": ["P-1"] * 61981, "제품명": ["안정제품"] * 61981})
+    derived_full = pd.DataFrame(
+        {
+            "제품코드": ["P-1"] * 61981,
+            "이월수량": [1.0] * 61981,
+            "이월금액": [100.0] * 61981,
+            "이월단가": [100.0] * 61981,
+            "이월DC율": [0.0] * 61981,
+            "현보험약가": [100.0] * 61981,
+        }
+    )
+    derived_display = derived_full.head(300).copy()
     derived_provenance = {**expected_provenance, "table_key": derived_key, "rows": 61981}
     derived_session = {
         "sims_export_tables": {derived_key: derived_full, "history-product-inventory": full_df},
@@ -4871,9 +4881,9 @@ def run_product_inventory_display_export_checks() -> list[CheckResult]:
     }
     with patch.object(chat_middleware.st, "session_state", derived_session):
         derived_source = chat_middleware._resolve_payload_full_download_source(
-            {**item, "table_key": derived_key, "df": display_df},
+            {**item, "table_key": derived_key, "df": derived_display},
             derived_meta,
-            display_df=display_df,
+            display_df=derived_display,
         )
     results.append(
         CheckResult(

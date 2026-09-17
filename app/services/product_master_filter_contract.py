@@ -35,6 +35,16 @@ PRODUCT_DI_SEMANTIC_NAME_PATTERNS: dict[str, tuple[str, ...]] = {
     "non_insurance": ("비보험", "비보험(%"),
 }
 
+_PRODUCT_DI_SEMANTIC_OWNER_LABELS = (
+    "제품명", "품목명", "제품그룹명", "제품그룹", "제품분류명", "제품분류",
+    "제품구분명", "제품구분",
+)
+
+
+def _semantic_term_has_explicit_owner(source: str, start: int) -> bool:
+    prefix = source[:start].rstrip()
+    return any(re.search(rf"{re.escape(label)}\s*$", prefix) for label in _PRODUCT_DI_SEMANTIC_OWNER_LABELS)
+
 
 def extract_product_di_semantic_group(text: Any) -> str:
     """Resolve an explicit upper product group without changing name-LIKE filters."""
@@ -44,13 +54,28 @@ def extract_product_di_semantic_group(text: Any) -> str:
         key=lambda item: len(item[0]),
         reverse=True,
     ):
-        if re.search(
+        match = re.search(
             rf"(?:^|\s){re.escape(label)}(?=\s|$)",
             source,
             flags=re.IGNORECASE,
-        ):
+        )
+        if match and not _semantic_term_has_explicit_owner(source, match.start()):
             return group
     return ""
+
+
+def strip_product_di_semantic_terms(text: Any) -> str:
+    """제품구분으로 소비된 의미어를 다른 이름 조건이 다시 사용하지 못하게 제거한다."""
+    source = _text(text)
+    for label in sorted(PRODUCT_DI_SEMANTIC_GROUP_TERMS, key=len, reverse=True):
+        pattern = re.compile(rf"(?:^|\s){re.escape(label)}(?=\s|$)", re.IGNORECASE)
+        source = pattern.sub(
+            lambda match: match.group(0)
+            if _semantic_term_has_explicit_owner(source, match.start())
+            else " ",
+            source,
+        )
+    return re.sub(r"\s+", " ", source).strip()
 
 
 def classify_product_di_business_semantic(product_di_cd: Any, product_di_nm: Any) -> str:

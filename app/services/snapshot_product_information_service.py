@@ -48,7 +48,14 @@ def load_product_information_master(params: Mapping[str, Any]) -> pd.DataFrame:
     clauses: list[str] = []
     values: list[Any] = []
     append_product_master_filter_clauses(clauses, values, params, expressions=expressions)
-    if params.get("physic_nm"):
+    unlabeled_name = _clean(params.get("_product_information_unlabeled_name"))
+    if unlabeled_name:
+        clauses.append(
+            "(P.Rd04_Physic_Nm LIKE ? OR PV.Rd03_Ven_Nm LIKE ? "
+            "OR LTRIM(RTRIM(P.Rd04_Physic_Cd)) = ?)"
+        )
+        values.extend((f"%{unlabeled_name}%", f"%{unlabeled_name}%", unlabeled_name))
+    elif params.get("physic_nm"):
         clauses.append("P.Rd04_Physic_Nm LIKE ?")
         values.append(f"%{params['physic_nm']}%")
     sql = f"""
@@ -73,8 +80,8 @@ WHERE {' AND '.join(clauses) if clauses else '1 = 1'}
 _COLUMN_LABELS = {
     "product_code": "제품코드",
     "frequency_grade": "출고빈도등급",
-    "profit_grade": "손익등급",
-    "contribution_grade": "기여도등급",
+    "profit_grade": "품목손익등급",
+    "contribution_grade": "품목기여등급",
     "lifecycle_status": "제품수명주기",
     "first_normal_inbound_month": "최초정상입고월",
     "row_status": "출고자료상태",
@@ -98,9 +105,139 @@ _COLUMN_LABELS = {
     "profitability_status": "수익성상태",
 }
 
+SENSITIVE_PRODUCT_INFORMATION_COLUMNS = (
+    "추정단위손익",
+    "추정손익률",
+    "추정기여금액",
+)
+
+
+def _current_viewer() -> Any:
+    try:
+        from app.ui.ssai_login import get_current_user
+
+        return get_current_user()
+    except Exception:
+        return None
+
+
+def product_information_cost_visible(viewer_user: Any = None) -> bool:
+    from app.services.ssai_permission_policy import is_management_company_user
+
+    return is_management_company_user(_current_viewer() if viewer_user is None else viewer_user)
+
+
+def _drop_sensitive_product_information_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.drop(
+        columns=[column for column in SENSITIVE_PRODUCT_INFORMATION_COLUMNS if column in frame.columns],
+        errors="ignore",
+    )
+
+
+def project_product_information_frame_for_viewer(
+    frame: pd.DataFrame,
+    *,
+    viewer_user: Any = None,
+) -> pd.DataFrame:
+    """Re-authorize a product-information frame at a user-facing boundary."""
+    if not isinstance(frame, pd.DataFrame):
+        return frame
+    if product_information_cost_visible(viewer_user):
+        return frame
+    return _drop_sensitive_product_information_columns(frame.copy())
+
+
+def project_product_information_payload_for_viewer(
+    payload: Mapping[str, Any],
+    *,
+    viewer_user: Any = None,
+) -> dict[str, Any]:
+    """Apply the product-information user projection to every user-facing payload form."""
+    projected = dict(payload)
+    visible = product_information_cost_visible(viewer_user)
+    if visible:
+        return projected
+
+    for key in ("df", "df_display", "data"):
+        value = projected.get(key)
+        if isinstance(value, pd.DataFrame):
+            projected[key] = project_product_information_frame_for_viewer(
+                value,
+                viewer_user=viewer_user,
+            )
+
+    columns = projected.get("columns")
+    if isinstance(columns, (list, tuple)):
+        projected["columns"] = [
+            column for column in columns if str(column) not in SENSITIVE_PRODUCT_INFORMATION_COLUMNS
+        ]
+    records = projected.get("records")
+    if isinstance(records, list):
+        projected["records"] = [
+            {
+                key: value
+                for key, value in record.items()
+                if str(key) not in SENSITIVE_PRODUCT_INFORMATION_COLUMNS
+            }
+            for record in records
+            if isinstance(record, dict)
+        ]
+
+    meta = dict(projected.get("meta") or {})
+    meta["sensitive_cost_metrics_visible"] = False
+    for key in ("columns", "download_columns"):
+        values = meta.get(key)
+        if isinstance(values, (list, tuple)):
+            meta[key] = [
+                column for column in values if str(column) not in SENSITIVE_PRODUCT_INFORMATION_COLUMNS
+            ]
+    summary = str(meta.get("llm_summary_md") or "")
+    if summary:
+        safe_lines = [
+            line for line in summary.splitlines()
+            if not any(column in line for column in SENSITIVE_PRODUCT_INFORMATION_COLUMNS)
+        ]
+        meta["llm_summary_md"] = "\n".join(safe_lines)
+    projected["meta"] = meta
+    return projected
+
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _resolve_unlabeled_product_information_authority(
+    master: pd.DataFrame,
+    token: str,
+) -> tuple[str, dict[str, int]]:
+    """Classify one-query authority matches by their resulting product sets."""
+    product_codes = master.get("제품코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip()
+    masks = {
+        "제품코드": product_codes.eq(token),
+        "제품명": master.get("제품명", pd.Series(dtype="object")).fillna("").astype(str).str.contains(
+            token, regex=False
+        ),
+        "제약사": master.get("제약사", pd.Series(dtype="object")).fillna("").astype(str).str.contains(
+            token, regex=False
+        ),
+    }
+    matches = {
+        label: frozenset(product_codes.loc[mask].loc[lambda values: values.ne("")])
+        for label, mask in masks.items()
+        if bool(mask.any())
+    }
+    counts = {label: len(codes) for label, codes in matches.items()}
+    if not matches:
+        return "no_match", counts
+    if len(matches) == 1:
+        return "single", counts
+
+    sets = list(matches.values())
+    code_set = matches.get("제품코드")
+    if code_set is not None and any(codes != code_set for label, codes in matches.items() if label != "제품코드"):
+        return "ambiguous", counts
+    compatible = all(left <= right or right <= left for left in sets for right in sets)
+    return ("compatible" if compatible else "ambiguous"), counts
 
 
 def normalize_product_information_params(params: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
@@ -108,6 +245,9 @@ def normalize_product_information_params(params: Optional[Mapping[str, Any]] = N
     out.update(normalize_product_master_filters(out))
     out["physic_nm"] = _clean(out.get("physic_nm"))
     out["physic_cd"] = _clean(out.get("physic_cd"))
+    out["_product_information_unlabeled_name"] = _clean(
+        (params or {}).get("_product_information_unlabeled_name")
+    )
     for key in ("frequency_grade", "profit_grade", "contribution_grade"):
         value = _clean(out.get(key))
         out[key] = value if value in _GRADES else ""
@@ -169,6 +309,8 @@ def _get_snapshot_product_information_result(
     profile_resolver: Callable[..., Any] = resolve_dashboard_profile_stock_scope,
     projection_reader: Callable[..., Any] = read_approved_frequency_projection,
     master_loader: Callable[..., pd.DataFrame] = load_product_information_master,
+    viewer_user: Any = None,
+    apply_viewer_projection: bool = True,
 ) -> dict[str, Any]:
     qparams = normalize_product_information_params(params)
     company_id = _company_id(qparams)
@@ -229,6 +371,25 @@ def _get_snapshot_product_information_result(
             message="제품 기본정보를 확인하지 못했습니다.",
             source_call_count=1,
         )
+    unlabeled_name = qparams.get("_product_information_unlabeled_name", "")
+    if unlabeled_name and not master.empty:
+        token = str(unlabeled_name).strip()
+        authority_status, authority_counts = _resolve_unlabeled_product_information_authority(master, token)
+        log.info(
+            "[product_information.authority] company_id=%s token_len=%s status=%s match_counts=%s",
+            company_id, len(token), authority_status, authority_counts,
+        )
+        if authority_status == "ambiguous":
+            return _empty_or_error_payload(
+                params=qparams,
+                status="candidate_required",
+                reason="ambiguous_product_information_authority",
+                message=(
+                    f"'{token}'이(가) 여러 제품정보 조건에 해당합니다. "
+                    "제품명, 제품코드 또는 제약사를 붙여 다시 조회해 주세요."
+                ),
+                source_call_count=1,
+            )
     if not frame.empty:
         for key in ("profit_grade", "contribution_grade", "lifecycle_status"):
             if qparams[key] and key in frame.columns:
@@ -240,7 +401,7 @@ def _get_snapshot_product_information_result(
         basic = [key for key in master.columns if key not in leading]
         frame = frame.loc[:, leading + [key for key in frame if key not in leading + basic] + basic]
         for column in ("제품수명주기", "출고자료상태", "매입단가상태", "매출단가상태", "수익성상태",
-                       "출고빈도등급", "손익등급", "기여도등급"):
+                       "출고빈도등급", "품목손익등급", "품목기여등급"):
             if column in frame:
                 frame[column] = frame[column].replace(STATUS_LABELS)
         for column in ("최초정상입고월", "매입단가기준월", "매출단가기준월"):
@@ -256,8 +417,8 @@ def _get_snapshot_product_information_result(
         ("product_group_nm", "제품그룹"), ("product_di_nm", "구분"),
         ("product_class_nm", "제품분류"),
         ("frequency_grade", "출고빈도"),
-        ("profit_grade", "손익등급"),
-        ("contribution_grade", "기여도등급"),
+        ("profit_grade", "품목손익등급"),
+        ("contribution_grade", "품목기여등급"),
         ("lifecycle_status", "제품수명주기"),
     ):
         if qparams[key]:
@@ -280,17 +441,17 @@ def _get_snapshot_product_information_result(
     display = frame.head(qparams["top"]).copy()
     summary = f"조회조건: {condition}\n\n결과: {len(frame):,}건"
     grade_lines = []
-    for column in ("출고빈도등급", "손익등급", "기여도등급", "제품수명주기"):
+    for column in ("출고빈도등급", "품목손익등급", "품목기여등급", "제품수명주기"):
         if column in frame:
             counts = frame[column].fillna("자료 부족").value_counts().to_dict()
             grade_lines.append(f"{column}: " + ", ".join(f"{key} {value}개" for key, value in counts.items()))
     llm_summary = summary + "\n\n" + "\n".join(grade_lines) + (
-        "\n출고빈도/손익/기여도 등급은 서로 독립입니다. F는 신규품목, X는 최근 정상출고 없음입니다."
+        "\n출고빈도/품목손익/품목기여 등급은 서로 독립입니다. F는 신규품목, X는 최근 정상출고 없음입니다."
         " 자료 부족을 E/X 또는 손실로 해석하지 마세요. 추정손익률 원자료는 비율(0.1=10%)입니다."
         " 추정단위손익/추정기여금액은 관리용 추정치이며 회계 확정손익이 아닙니다."
         " 전체 등급 분포는 위 집계를 근거로 하고 일부 표 샘플을 전체로 일반화하지 마세요."
     )
-    return {
+    payload = {
         "table": TABLE,
         "title": ACTION,
         "action": ACTION,
@@ -324,6 +485,11 @@ def _get_snapshot_product_information_result(
             "semantic_styled_max_rows": 300,
         },
     }
+    return (
+        project_product_information_payload_for_viewer(payload, viewer_user=viewer_user)
+        if apply_viewer_projection
+        else payload
+    )
 
 
 def get_snapshot_product_information_result(
@@ -332,12 +498,16 @@ def get_snapshot_product_information_result(
     profile_resolver: Callable[..., Any] = resolve_dashboard_profile_stock_scope,
     projection_reader: Callable[..., Any] = read_approved_frequency_projection,
     master_loader: Callable[..., pd.DataFrame] = load_product_information_master,
+    viewer_user: Any = None,
+    apply_viewer_projection: bool = True,
 ) -> dict[str, Any]:
     """Emit one safe provenance/performance record for each query execution."""
     started = time.perf_counter()
     payload = _get_snapshot_product_information_result(
         params, profile_resolver=profile_resolver,
         projection_reader=projection_reader, master_loader=master_loader,
+        viewer_user=viewer_user,
+        apply_viewer_projection=apply_viewer_projection,
     )
     meta = payload.get("meta") or {}
     query = payload.get("params") or {}

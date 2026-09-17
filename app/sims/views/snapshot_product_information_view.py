@@ -10,6 +10,7 @@ from app.services.snapshot_product_information_service import (
     ACTION,
     STATUS_LABELS,
     get_snapshot_product_information_result,
+    project_product_information_payload_for_viewer,
 )
 from app.sims.views.rddbc_io_shared import _trigger_panel_run
 from app.sims.views.product_master_filters import render_product_master_filters
@@ -46,7 +47,7 @@ def view_snapshot_product_information(
             )
         with c3:
             profit_grade = st.selectbox(
-                "손익등급",
+                "품목손익등급",
                 ["전체", "A", "B", "C", "D", "E", "unavailable"],
                 index=_index(["전체", "A", "B", "C", "D", "E", "unavailable"], defaults.get("profit_grade") or "전체"),
                 format_func=lambda value: STATUS_LABELS.get(value, value),
@@ -54,7 +55,7 @@ def view_snapshot_product_information(
             )
         with c4:
             contribution_grade = st.selectbox(
-                "기여도등급",
+                "품목기여등급",
                 ["전체", "A", "B", "C", "D", "E", "unavailable"],
                 index=_index(["전체", "A", "B", "C", "D", "E", "unavailable"], defaults.get("contribution_grade") or "전체"),
                 format_func=lambda value: STATUS_LABELS.get(value, value),
@@ -87,7 +88,9 @@ def view_snapshot_product_information(
         return payload
     previous = st.session_state.get(payload_key)
     if isinstance(previous, dict) and previous.get("final"):
-        return previous
+        projected = project_product_information_payload_for_viewer(previous)
+        st.session_state[payload_key] = projected
+        return projected
     return {
         "title": ACTION,
         "action": ACTION,

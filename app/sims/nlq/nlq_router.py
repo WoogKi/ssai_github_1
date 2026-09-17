@@ -5958,6 +5958,24 @@ def _io_payload_table_frames(payload: Dict[str, Any]) -> tuple[pd.DataFrame | No
     return full_df, display_df
 
 
+def _io_payload_user_message(payload: Any, *, fallback: str) -> str:
+    """내부 사전을 문자열화하지 않고 승인된 사용자 안내문만 고른다."""
+    if isinstance(payload, str):
+        return payload.strip() or fallback
+    if not isinstance(payload, dict):
+        return fallback
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    for value in (
+        payload.get("message"),
+        payload.get("data"),
+        meta.get("summary_md"),
+        meta.get("summary"),
+    ):
+        if isinstance(value, str) and value.strip() and not value.lstrip().startswith("{"):
+            return value.strip()
+    return fallback
+
+
 def _try_handle_io_nlq(
     txt: str,
     *,
@@ -6147,6 +6165,13 @@ def _try_handle_io_nlq(
     if not action:
         return False
     registered_residual_entity = str(params.pop("_registered_unlabeled_entity", "") or "").strip()
+    if registered_residual_entity and action in {"최종 계약단가 조회", "계약단가 이력 조회"}:
+        # R070's parser keeps the historical physic_nm projection for direct
+        # parser callers.  In the production route it is only tentative until
+        # the common ERP entity authority identifies the unlabeled subject.
+        if str(params.get("physic_nm") or "").strip() == registered_residual_entity:
+            params.pop("physic_nm", None)
+        params["_r070_unlabeled_name"] = registered_residual_entity
     parsed_condition_keys = set(params)
 
     _trace("parsed", trace_action=action, trace_params=params)
@@ -6169,7 +6194,28 @@ def _try_handle_io_nlq(
             for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm")
         )
     )
-    if registered_filter_contract and registered_residual_entity:
+    if action == "제품정보 조회":
+        # 제품정보는 제품코드/제품명/제조사와 제품구분 조건을 한 번의
+        # 제품 master 조회 안에서 판정한다. 공통 entity resolver를 먼저
+        # 실행하면 추가 ERP round trip 뒤에 전용 service가 차단된다.
+        entity_resolution = {
+            "status": "resolved",
+            "params": params,
+            "resolved_kind": "product_information_authority",
+        }
+    elif (
+        registered_residual_entity
+        and action in {"최종 계약단가 조회", "계약단가 이력 조회"}
+    ):
+        # R070 owns a single-statement authority/result contract. Running the
+        # common vendor/manufacturer/product resolvers here would add ERP
+        # round trips before the final R070 query.
+        entity_resolution = {
+            "status": "resolved",
+            "params": params,
+            "resolved_kind": "r070_single_call",
+        }
+    elif registered_filter_contract and registered_residual_entity:
         entity_resolution = resolve_unlabeled_io_entity_condition(
             txt_for_io,
             action=action,
@@ -6213,6 +6259,7 @@ def _try_handle_io_nlq(
         show_candidates = entity_status == "candidate_required"
         candidate_labels = {
             "transaction_vendor": "거래처",
+            "cost_apply": "단가적용처",
             "manufacturer": "제조사",
             "product": "제품",
         }
@@ -6224,16 +6271,27 @@ def _try_handle_io_nlq(
             for row in candidates
         ]) if show_candidates else pd.DataFrame()
         if entity_status == "candidate_required":
-            message = "후보가 여러 개입니다. 제조사 또는 제품 후보 중 하나를 선택해 다시 조회해 주세요." if action == "현재고 조회" else "조건 이름을 확인할 수 없습니다. 거래처, 제약사, 제품 중 하나를 지정해 다시 조회해 주세요."
+            if action == "현재고 조회":
+                message = "후보가 여러 개입니다. 제조사 또는 제품 후보 중 하나를 선택해 다시 조회해 주세요."
+            elif action in {"최종 계약단가 조회", "계약단가 이력 조회"}:
+                message = "후보가 여러 개입니다. 단가적용처, 제약사 또는 제품 후보 중 하나를 선택해 다시 조회해 주세요."
+            else:
+                message = "조건 이름을 확인할 수 없습니다. 거래처, 제약사, 제품 중 하나를 지정해 다시 조회해 주세요."
         elif entity_status == "input_required":
             message = (
                 "조회할 제품명·제품코드·제조사 등을 입력해 주세요.\n\n"
                 "예: 아스피린 현재고 조회"
             )
         elif entity_status == "resolution_unavailable":
-            message = "조회 조건을 확인하는 중 오류가 발생했습니다. 거래처·제약사·제품 중 조건 종류를 명시해 다시 조회해 주세요."
+            condition_kinds = "단가적용처·제약사·제품" if action in {"최종 계약단가 조회", "계약단가 이력 조회"} else "거래처·제약사·제품"
+            message = f"조회 조건을 확인하는 중 오류가 발생했습니다. {condition_kinds} 중 조건 종류를 명시해 다시 조회해 주세요."
         else:
-            message = "해당 제조사 또는 제품을 찾을 수 없습니다." if action == "현재고 조회" else "해당 조건과 일치하는 거래처·제약사·제품을 찾지 못했습니다."
+            if action == "현재고 조회":
+                message = "해당 제조사 또는 제품을 찾을 수 없습니다."
+            elif action in {"최종 계약단가 조회", "계약단가 이력 조회"}:
+                message = "해당 조건과 일치하는 단가적용처·제약사·제품을 찾지 못했습니다."
+            else:
+                message = "해당 조건과 일치하는 거래처·제약사·제품을 찾지 못했습니다."
         payload = {
             "final": True,
             "type": "table" if not candidate_df.empty else "text",
@@ -6454,14 +6512,15 @@ def _try_handle_io_nlq(
             return _wrap_df_payload(payload, action, params)
 
         if not isinstance(payload, dict):
+            message = _io_payload_user_message(payload, fallback=f"{action} 조회 결과를 확인해 주세요.")
             return {
                 "final": True,
                 "type": "text",
                 "title": action,
                 "action": action,
                 "params": params,
-                "data": str(payload),
-                "message": str(payload),
+                "data": message,
+                "message": message,
             }
 
         payload.setdefault("title", action)
@@ -6501,15 +6560,10 @@ def _try_handle_io_nlq(
             or "전체"
         ).strip()
 
-        msg = str(
-            payload.get("message")
-            or payload.get("data")
-            or meta.get("summary_md")
-            or ""
-        ).strip()
-
-        if not msg:
-            msg = f"해당 조회조건의 자료가 없습니다.\n\n조회조건: {query_summary}"
+        msg = _io_payload_user_message(
+            payload,
+            fallback=f"해당 조회조건의 자료가 없습니다.\n\n조회조건: {query_summary}",
+        )
 
         payload["type"] = "text"
         payload["data"] = msg

@@ -16,6 +16,10 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     EXTENDED_FREQUENCY_PROJECTION_GRADES,
     FREQUENCY_INSUFFICIENT_GRADE,
 )
+from app.services.product_master_filter_contract import (
+    extract_product_di_semantic_group,
+    strip_product_di_semantic_terms,
+)
 
 
 log = logging.getLogger("ssai")
@@ -2123,8 +2127,6 @@ def _lookup_unlabeled_io_entity_candidates(name: str, *, action: str = "") -> di
         outcomes.append(outcome)
         _log_entity_resolver(action=action, final_decision="", **outcome)
 
-    # Historical detail lookup needs the same sales-side vendor-code contract
-    # as Rddbc120, including masters no longer available for new registration.
     vendor_lookup = _lookup_transaction_vendor_candidates(name, action=action)
     vendor_rows = list(vendor_lookup.get("candidates") or [])
     out.extend(vendor_rows)
@@ -2321,6 +2323,8 @@ def resolve_unlabeled_io_entity_condition(
             out["ven_nm_display"] = phrase
     elif kind == "manufacturer":
         if action in {"발주조회", "입고예정조회", "발주 계산"}:
+            out["maker_nm"] = phrase
+        elif action in {"최종 계약단가 조회", "계약단가 이력 조회"}:
             out["maker_nm"] = phrase
         else:
             candidate = candidates[0]
@@ -3112,10 +3116,30 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             value = _extract_code(entity_text, filter_labels(RDDBC230, key))
             if value:
                 params[key] = value
+        semantic_group = extract_product_di_semantic_group(raw)
+        if semantic_group:
+            params["product_di_semantic_group"] = semantic_group
+        unlabeled_source = strip_product_di_semantic_terms(raw) if semantic_group else raw
+        unlabeled_name = _extract_unlabeled_entity_phrase(unlabeled_source, "제품정보 조회")
+        if (
+            unlabeled_name
+            and not _has_explicit_name_label(raw)
+            and not clean_text(params.get("physic_cd"))
+        ):
+            if clean_text(params.get("physic_nm")) == unlabeled_name:
+                params.pop("physic_nm", None)
+            params["_product_information_unlabeled_name"] = unlabeled_name
         if frequency_grade:
             params["frequency_grade"] = "unavailable" if frequency_grade == "빈도자료 부족" else frequency_grade
-        for key, label in (("profit_grade", "손익"), ("contribution_grade", "기여도")):
-            match = re.search(rf"{label}\s*등급\s*[:=]?\s*([A-E])(?:\s*등급)?", raw, re.IGNORECASE)
+        for key, label_pattern in (
+            ("profit_grade", r"(?:품목\s*)?손익"),
+            ("contribution_grade", r"(?:품목\s*)?기여(?:도)?"),
+        ):
+            match = re.search(
+                rf"{label_pattern}\s*등급\s*[:=]?\s*([A-E])(?:\s*등급)?",
+                raw,
+                re.IGNORECASE,
+            )
             if match:
                 params[key] = match.group(1).upper()
         if "신규품목" in raw or "신규 제품" in raw:

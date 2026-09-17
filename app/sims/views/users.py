@@ -389,8 +389,9 @@ def _build_user_list_view(df: pd.DataFrame) -> pd.DataFrame:
         view_df = view_df.drop(columns=["순번"])
     view_df.insert(0, "순번", range(1, len(view_df) + 1))
 
-    # 화면 표시는 한글 표시 컬럼만 사용한다.
-    # 원본 Rd06_* 스키마 컬럼은 df 원본에 남겨두므로 Excel/CSV 다운로드와 LLM 분석에는 영향 없다.
+    # 일반 사용자에게 승격되는 표는 승인된 한글 표시 컬럼만 사용한다.
+    # 원본 Rd06_* 스키마는 이름/코드 계산에만 쓰고 채팅, 현재표,
+    # LLM 분석, Excel/CSV 다운로드에는 전달하지 않는다.
     display_cols = [
         "순번",
         "사용자코드",
@@ -748,7 +749,10 @@ def render_user_list_with_dept() -> Dict[str, Any]:
             "title": "사용자목록 + 부서명",
             "action": "사용자목록 + 부서명",
             "params": params,
-            "df": df,
+            # 사용자 마스터의 current/full/download source는 승인된 화면
+            # projection의 전체 행이다. 원본 Rd06_* 보조 필드는 조회 내부에서
+            # 이름/코드 계산에만 쓰고 일반 채팅·현재표·다운로드로 승격하지 않는다.
+            "df": df_display_all,
             "df_display": df_display,
             "meta": {
                 "조회상한": int(fetch_top),

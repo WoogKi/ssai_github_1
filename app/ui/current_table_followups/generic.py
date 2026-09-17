@@ -16,6 +16,68 @@ def _compact(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "").strip())
 
 
+def parse_current_table_rank_request(
+    query: Any,
+    *,
+    default_limit: int = 20,
+) -> tuple[str, int]:
+    """Return the canonical row-ranking direction and limit.
+
+    The parser deliberately keeps ranking words separate from column names and
+    filter values.  An empty direction means that the request is not a rank
+    request.  Superlatives without an explicit count select one row.
+    """
+    compact = _compact(query)
+    lower = compact.lower()
+    if not compact:
+        return "", 0
+
+    low = bool(re.search(r"(?:low|하위|최저|적은순|제일적은|가장적은)", lower))
+    high = bool(re.search(r"(?:top|high|상위|최고|1위|많은순|제일많은|가장많은)", lower))
+    if "작은" in compact and not any(marker in compact for marker in ("보다작은", "작거나같")):
+        low = True
+    if "적은" in compact and not any(marker in compact for marker in ("보다적은",)):
+        low = True
+    if "큰" in compact and not any(marker in compact for marker in ("보다큰", "크거나같")):
+        high = True
+    if "많은" in compact and not any(marker in compact for marker in ("보다많은",)):
+        high = True
+
+    if low == high:
+        return "", 0
+
+    limit = 0
+    rank_count = re.search(
+        r"(?:top|high|low|상위|하위)\s*(\d{1,3})",
+        str(query or ""),
+        flags=re.IGNORECASE,
+    )
+    if rank_count:
+        limit = int(rank_count.group(1))
+    else:
+        row_count = re.search(r"(\d{1,3})\s*(?:개|건|행)(?:만)?", str(query or ""))
+        if row_count:
+            limit = int(row_count.group(1))
+
+    if limit <= 0:
+        if any(
+            marker in compact
+            for marker in ("최고", "최저", "1위", "제일많은", "가장많은", "제일적은", "가장적은")
+        ):
+            limit = 1
+        else:
+            limit = max(int(default_limit or 20), 1)
+    return ("asc" if low else "desc"), min(limit, 500)
+
+
+def _explicit_current_table_row_limit(query: Any) -> int:
+    """Read only an explicit row-count suffix such as ``10개`` or ``10건만``."""
+    match = re.search(r"(\d{1,3})\s*(?:개|건|행)(?:만)?", str(query or ""))
+    if not match:
+        return 0
+    return min(max(int(match.group(1)), 1), 500)
+
+
 def _clean_group_value(v: Any) -> str:
     try:
         if pd.isna(v):
@@ -546,11 +608,11 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
     """
     if not isinstance(df, pd.DataFrame) or df.empty:
         return "", ""
-    if not _has_common_filter_intent(query):
-        return "", ""
 
     q_norm = _norm_col_name(query)
     if not q_norm:
+        return "", ""
+    if any(q_norm.endswith(_norm_col_name(word)) for word in ("요약", "분석", "집계", "현황")):
         return "", ""
 
     candidates: list[tuple[int, str, str, int]] = []
@@ -580,6 +642,8 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
         tail = q_norm[pos + len(alias):]
         value = _strip_common_filter_value(tail)
         if not value:
+            continue
+        if value in {"요약", "분석", "집계", "현황"}:
             continue
         if _looks_like_numeric_condition_value(value):
             continue
@@ -666,6 +730,88 @@ def _extract_common_filter_candidate(query: str) -> str:
     return m.group(1) if m else ""
 
 
+_UNLABELED_CURRENT_TABLE_AUTHORITIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("product_name", ("제품명", "품목명", "상품명")),
+    ("product_code", ("제품코드", "품목코드", "상품코드", "보험코드", "바코드")),
+    ("manufacturer", ("제조사명", "제약사명", "제조처명", "메이커명", "제조사", "제약사")),
+    ("vendor_name", ("거래처명", "매입처명", "발주처명", "실납처명", "매출처명", "판매처명")),
+    ("vendor_code", ("거래처코드", "매입처코드", "발주처코드", "실납처코드", "매출처코드", "판매처코드")),
+    ("cost_apply_name", ("단가적용처명", "단가적용거래처명")),
+    ("cost_apply_code", ("단가적용처코드", "단가적용거래처", "단가적용코드")),
+    ("stock_apply_name", ("재고적용처명", "재고적용거래처명")),
+    ("stock_apply_code", ("재고적용처코드", "재고적용코드")),
+)
+
+
+def _approved_unlabeled_search_columns(df: pd.DataFrame) -> list[tuple[str, str, int]]:
+    """Return only user-facing identity columns approved for unlabeled lookup."""
+    columns: list[tuple[str, str, int]] = []
+    actual = [str(col) for col in df.columns]
+    for authority, aliases in _UNLABELED_CURRENT_TABLE_AUTHORITIES:
+        alias_norms = [_norm_col_name(alias) for alias in aliases]
+        for col in actual:
+            norm = _norm_col_name(col)
+            if norm in alias_norms:
+                columns.append((authority, col, alias_norms.index(norm)))
+    return columns
+
+
+def _resolve_unlabeled_current_table_value(df: pd.DataFrame, query: str) -> dict[str, Any]:
+    """Resolve one residual value against approved current-table identities only."""
+    candidate = _extract_common_filter_candidate(query)
+    value_norm = _norm_col_name(candidate)
+    approved = _approved_unlabeled_search_columns(df)
+    available = list(dict.fromkeys(col for _authority, col, _priority in approved))
+    if not candidate or not value_norm or not approved:
+        return {"status": "not_applicable", "columns": available}
+
+    explicit_labels = {
+        _norm_col_name(alias)
+        for _authority, aliases in _UNLABELED_CURRENT_TABLE_AUTHORITIES
+        for alias in aliases
+    }
+    if value_norm in explicit_labels:
+        return {"status": "not_applicable", "columns": available}
+
+    matches: list[tuple[str, str, int, int]] = []
+    for authority, col, priority in approved:
+        values = _series_compact_for_filter(_first_series_for_column(df, col))
+        mask = values.str.contains(re.escape(value_norm), na=False, regex=True)
+        if not bool(mask.any()):
+            continue
+        exact_count = int(values.eq(value_norm).sum())
+        matches.append((authority, col, exact_count, priority))
+
+    if not matches:
+        return {
+            "status": "no_match",
+            "value": candidate,
+            "value_norm": value_norm,
+            "columns": available,
+        }
+
+    authorities = {authority for authority, _col, _exact, _priority in matches}
+    if len(authorities) != 1:
+        return {
+            "status": "ambiguous",
+            "value": candidate,
+            "value_norm": value_norm,
+            "columns": list(dict.fromkeys(col for _authority, col, _exact, _priority in matches)),
+        }
+
+    # 동일 authority의 별칭 컬럼은 exact match 수와 정의 우선순위로 결정한다.
+    matches.sort(key=lambda row: (row[2], -row[3]), reverse=True)
+    authority, col, _exact_count, _priority = matches[0]
+    return {
+        "status": "resolved",
+        "authority": authority,
+        "column": col,
+        "value": candidate,
+        "value_norm": value_norm,
+        "columns": available,
+    }
+
+
 def _add_seq_column(out: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(out, pd.DataFrame):
         return out
@@ -673,6 +819,43 @@ def _add_seq_column(out: pd.DataFrame) -> pd.DataFrame:
     if "순번" in out.columns:
         out = out.drop(columns=["순번"])
     out.insert(0, "순번", range(1, len(out) + 1))
+    return out
+
+
+def _is_verified_product_grain(df: pd.DataFrame, source_action: str) -> bool:
+    """제품 원천이며 제품코드가 실제로 행마다 유일한 경우만 제품 grain으로 본다."""
+    source = _compact(source_action)
+    if not any(label in source for label in ("제품정보조회", "제품코드목록", "제품마스터")):
+        return False
+    product_col = next(
+        (col for col in ("제품코드", "품목코드", "상품코드") if col in df.columns),
+        "",
+    )
+    if not product_col or df.empty:
+        return False
+    values = df[product_col].fillna("").astype(str).str.strip()
+    return bool(values.ne("").all() and values.nunique(dropna=False) == len(df))
+
+
+def _hide_redundant_product_grain_row_count(
+    out: pd.DataFrame,
+    *,
+    source_df: pd.DataFrame,
+    source_action: str,
+    distinct_label: str = "제품수",
+) -> pd.DataFrame:
+    """제품 grain에서만 중복 표시인 행수를 숨기고 검증용 행수는 attrs에 둔다."""
+    if (
+        isinstance(out, pd.DataFrame)
+        and "행수" in out.columns
+        and distinct_label in out.columns
+        and _is_verified_product_grain(source_df, source_action)
+    ):
+        result = out.drop(columns=["행수"]).copy()
+        result.attrs.update(getattr(out, "attrs", {}))
+        result.attrs["source_row_count"] = int(len(source_df))
+        result.attrs["row_count_hidden_reason"] = "verified_product_grain"
+        return result
     return out
 
 
@@ -690,11 +873,17 @@ def _drop_current_followup_detail_attrs(out: pd.DataFrame) -> pd.DataFrame:
 def _find_common_top_numeric_column(df: pd.DataFrame, query: str) -> str:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return ""
-    if not any(w in _compact(query) for w in ("TOP", "top", "상위")):
+    direction, _limit = parse_current_table_rank_request(query)
+    if not direction:
         return ""
 
     body_norm = _norm_col_name(query)
-    body_norm = re.sub(r"(top|상위)\d*", "", body_norm, flags=re.IGNORECASE)
+    body_norm = re.sub(
+        r"(top|high|low|상위|하위|최고|최저|1위|큰|작은|많은순|적은순|많은|적은|제일많은|제일적은|가장많은|가장적은)\d*",
+        "",
+        body_norm,
+        flags=re.IGNORECASE,
+    )
     body_norm = re.sub(r"\d+", "", body_norm)
     if not body_norm:
         return ""
@@ -884,6 +1073,7 @@ def _build_common_group_summary(
     group_col: str,
     *,
     include_numeric_sums: bool = True,
+    source_action: str = "",
 ) -> pd.DataFrame:
     work = df.copy()
     if _norm_col_name(group_col) in {"출고빈도", "출고빈도등급"}:
@@ -968,7 +1158,13 @@ def _build_common_group_summary(
     out = _add_seq_column(out)
     order = [c for c in front if c in out.columns] + [c for c in preferred if c in out.columns and c not in front]
     rest = [c for c in out.columns if c not in order]
-    return out.loc[:, order + rest]
+    out = out.loc[:, order + rest]
+    return _hide_redundant_product_grain_row_count(
+        out,
+        source_df=df,
+        source_action=source_action,
+        distinct_label=distinct_label,
+    )
 
 
 def _select_common_group_top_metric(out: pd.DataFrame, query: str) -> tuple[str, str]:
@@ -1092,12 +1288,8 @@ def _select_common_group_top_metric(out: pd.DataFrame, query: str) -> tuple[str,
 
 
 def _common_rank_limit(query: str, top_n: int) -> tuple[bool, int]:
-    compact = _compact(query)
-    if any(marker in compact for marker in ("가장많은", "제일많은", "최고", "1위")):
-        return True, 1
-    if any(marker in compact for marker in ("TOP", "top", "상위")):
-        return True, max(int(top_n or 0), 1)
-    return False, 0
+    direction, limit = parse_current_table_rank_request(query, default_limit=top_n)
+    return bool(direction), limit
 
 
 def handle_common_column_group_followup(
@@ -1139,8 +1331,10 @@ def handle_common_column_group_followup(
         df,
         group_col,
         include_numeric_sums=not count_only,
+        source_action=source_action,
     )
-    has_top, rank_limit = _common_rank_limit(t, top_n)
+    rank_direction, rank_limit = parse_current_table_rank_request(t, default_limit=top_n)
+    has_top = bool(rank_direction)
     metric_col = ""
     metric_label = ""
     if has_top and rank_limit:
@@ -1150,14 +1344,15 @@ def handle_common_column_group_followup(
             out = out.assign(__sort_metric=nums)
             out = out.sort_values(
                 ["__sort_metric", group_col],
-                ascending=[False, True],
+                ascending=[rank_direction == "asc", True],
                 kind="mergesort",
             ).drop(columns=["__sort_metric"])
         out = out.head(rank_limit).copy()
         out = _add_seq_column(out)
     out = _drop_current_followup_detail_attrs(out)
 
-    title = f"현재표 {group_col}별 TOP {rank_limit}" if has_top and rank_limit else f"현재표 {group_col}별 집계"
+    rank_label = "LOW" if rank_direction == "asc" else "TOP"
+    title = f"현재표 {group_col}별 {rank_label} {rank_limit}" if has_top and rank_limit else f"현재표 {group_col}별 집계"
     try:
         log.info(
             "[chat.followup.generic_group] query=%r source_action=%r group_column=%r metric_column=%r source_rows=%s result_rows=%s table_key=%s",
@@ -1177,7 +1372,7 @@ def handle_common_column_group_followup(
         action=title,
         df=out,
         query_summary=(
-            f"현재표 / {group_col}별 TOP {rank_limit} · 기준: {metric_col or metric_label or '건수'} / 전체 {len(df):,}건 기준"
+            f"현재표 / {group_col}별 {rank_label} {rank_limit} · 기준: {metric_col or metric_label or '건수'} / 전체 {len(df):,}건 기준"
             if has_top and rank_limit
             else f"현재표 / {group_col}별 집계 / 전체 {len(df):,}건 기준"
         ),
@@ -1229,8 +1424,9 @@ def handle_common_column_filter_followup(
     if not callable(push_table):
         return False
 
-    # 0) 조건 없는 숫자 TOP: 현재표 배정부족예상금액 TOP 20
-    if top_n and any(w in _compact(t) for w in ("TOP", "top", "상위")):
+    # 0) 조건 없는 숫자 순위: 현재표 배정부족예상금액 TOP 20 / low 10
+    rank_direction, rank_limit = parse_current_table_rank_request(t, default_limit=top_n)
+    if rank_direction:
         try:
             if _find_common_group_column(df, t):
                 return False
@@ -1238,12 +1434,16 @@ def handle_common_column_filter_followup(
             pass
 
     top_col = _find_common_top_numeric_column(df, t)
-    if top_col and top_col in df.columns and top_n:
+    if top_col and top_col in df.columns and rank_limit:
         try:
             nums = _to_numeric_for_common_filter(_first_series_for_column(df, top_col))
             out = df.copy()
             out[top_col] = nums.values
-            out = out.sort_values(top_col, ascending=False).head(int(top_n)).copy()
+            out = out.sort_values(
+                top_col,
+                ascending=rank_direction == "asc",
+                kind="mergesort",
+            ).head(int(rank_limit)).copy()
             out = _reorder_numeric_filter_columns(out, top_col)
             out = _add_seq_column(out)
             out = _drop_current_followup_detail_attrs(out)
@@ -1254,7 +1454,8 @@ def handle_common_column_filter_followup(
                 pass
             return False
 
-        title = f"현재표 {top_col} TOP {top_n}"
+        rank_label = "LOW" if rank_direction == "asc" else "TOP"
+        title = f"현재표 {top_col} {rank_label} {rank_limit}"
         try:
             log.info(
                 "[chat.followup.generic_top] query=%r source_action=%r top_column=%r source_rows=%s rows=%s table_key=%s",
@@ -1272,14 +1473,15 @@ def handle_common_column_filter_followup(
             title=title,
             action=title,
             df=out,
-            query_summary=f"현재표 / {top_col} TOP {top_n} / 전체 {len(df):,}건 기준",
+            query_summary=f"현재표 / {top_col} {rank_label} {rank_limit} / 전체 {len(df):,}건 기준",
             source_query=t,
             source_table_key=table_key,
             source_rows=len(df),
-            display_limit=top_n,
+            display_limit=rank_limit,
             extra_meta={
                 "top_column": top_col,
-                "top_n": int(top_n),
+                "top_n": int(rank_limit),
+                "rank_direction": rank_direction,
                 "source_row_count": int(len(df)),
             },
         ))
@@ -1319,21 +1521,28 @@ def handle_common_column_filter_followup(
                 source_query=t,
             ))
 
-        has_top = any(w in _compact(t) for w in ("TOP", "top", "상위"))
+        rank_direction, rank_limit = parse_current_table_rank_request(t, default_limit=top_n)
+        explicit_limit = _explicit_current_table_row_limit(t)
+        result_limit = rank_limit if rank_direction else explicit_limit
         out = filtered.copy()
-        if has_top and top_n:
-            ascending = op in ("<", "<=")
+        if result_limit:
             try:
-                out = out.sort_values(num_col, ascending=ascending).head(int(top_n)).copy()
+                if rank_direction:
+                    out = out.sort_values(
+                        num_col,
+                        ascending=rank_direction == "asc",
+                        kind="mergesort",
+                    )
+                out = out.head(int(result_limit)).copy()
             except Exception:
-                out = out.head(int(top_n)).copy()
+                out = out.head(int(result_limit)).copy()
         out = _reorder_numeric_filter_columns(out, num_col)
         out = _add_seq_column(out)
         out = _drop_current_followup_detail_attrs(out)
 
         title = (
-            f"현재표 {num_col} {threshold_text} {op_label} TOP {top_n}"
-            if has_top
+            f"현재표 {num_col} {threshold_text} {op_label} {result_limit}개"
+            if result_limit
             else f"현재표 {num_col} {threshold_text} {op_label} 목록"
         )
 
@@ -1371,12 +1580,14 @@ def handle_common_column_filter_followup(
             source_query=t,
             source_table_key=table_key,
             source_rows=len(df),
-            display_limit=top_n if has_top else None,
+            display_limit=result_limit or None,
             extra_meta={
                 "filter_column": num_col,
                 "filter_operator": op,
                 "filter_value": threshold_label,
                 "source_row_count": int(len(df)),
+                "result_limit": int(result_limit or 0),
+                "rank_direction": rank_direction,
             },
         ))
 
@@ -1386,6 +1597,48 @@ def handle_common_column_filter_followup(
         if callable(push_notice) and _has_common_filter_intent(t):
             candidate = _extract_common_filter_candidate(t)
             if candidate:
+                unlabeled = _resolve_unlabeled_current_table_value(df, t)
+                if unlabeled.get("status") == "resolved":
+                    col = str(unlabeled.get("column") or "")
+                    value_norm = str(unlabeled.get("value_norm") or "")
+                elif unlabeled.get("status") == "ambiguous":
+                    columns = [str(v) for v in unlabeled.get("columns") or []]
+                    return bool(push_notice(
+                        title=f"현재표 '{candidate}' 검색 조건 확인",
+                        action=f"현재표 '{candidate}' 검색 조건 확인",
+                        message=(
+                            f"'{candidate}'이(가) 여러 검색 의미에서 확인됩니다: {', '.join(columns)}.\n"
+                            "제품명·제조사명·거래처명처럼 검색할 컬럼을 함께 입력해 주세요."
+                        ),
+                        query_summary=f"현재표 / 비라벨 값 {candidate} / 후보 확인",
+                        source_query=t,
+                        extra_meta={
+                            "result_status": "candidate_required",
+                            "execution_status": "candidate_required",
+                            "candidate_columns": columns,
+                            "unlabeled_value": candidate,
+                        },
+                    ))
+                elif unlabeled.get("status") == "no_match":
+                    columns = [str(v) for v in unlabeled.get("columns") or []]
+                    return bool(push_notice(
+                        title=f"현재표 '{candidate}' 검색 결과 없음",
+                        action=f"현재표 '{candidate}' 검색 결과 없음",
+                        message=(
+                            f"현재표의 승인된 검색 컬럼에서 '{candidate}'을(를) 찾지 못했습니다.\n"
+                            f"검색 가능한 컬럼: {', '.join(columns) or '(없음)'}"
+                        ),
+                        query_summary=f"현재표 / 비라벨 값 {candidate} / 0건",
+                        source_query=t,
+                        extra_meta={
+                            "result_status": "no_data",
+                            "execution_status": "no_data",
+                            "unlabeled_value": candidate,
+                        },
+                    ))
+            if col and value_norm:
+                pass
+            elif candidate:
                 available = _available_common_filter_columns(df)
                 available_text = ", ".join(available)
                 try:
@@ -1408,7 +1661,8 @@ def handle_common_column_filter_followup(
                     query_summary=f"현재표 / {candidate} 상세표 불가 / 컬럼 없음",
                     source_query=t,
                 ))
-        return False
+        if not col or col not in df.columns or not value_norm:
+            return False
 
     try:
         compact_values = _series_compact_for_filter(_first_series_for_column(df, col))
@@ -1819,6 +2073,11 @@ def handle_generic_followup(
             distinct_col=product_code_col,
             count_label="제품수",
         ).rename(columns={group_col: "제품그룹명"})
+        out = _hide_redundant_product_grain_row_count(
+            out,
+            source_df=df,
+            source_action=source_action,
+        )
 
         out = _main_columns_first(out, ("순번", "제품그룹명", "제품수", "행수"))
         out = _apply_top_if_requested(out, compact, top_n)
@@ -1883,6 +2142,11 @@ def handle_generic_followup(
             distinct_col=product_code_col,
             count_label="제품수",
         ).rename(columns={maker_col: "제조사명"})
+        out = _hide_redundant_product_grain_row_count(
+            out,
+            source_df=df,
+            source_action=source_action,
+        )
         out = _main_columns_first(out, ("순번", "제조사명", "제품수", "행수"))
         out = _apply_top_if_requested(out, compact, top_n)
 

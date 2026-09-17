@@ -13,7 +13,10 @@ from app.services.io_nlq import (
     nlq_period_to_date_range,
     strip_nlq_period_expressions,
 )
-from app.services.product_master_filter_contract import extract_product_di_semantic_group
+from app.services.product_master_filter_contract import (
+    extract_product_di_semantic_group,
+    strip_product_di_semantic_terms,
+)
 
 
 _ACTION_WORDS = (
@@ -177,7 +180,8 @@ def _resolve_rddbc230_nlq(
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
     labels = lambda key: filter_labels(feature, key)
 
-    params.update(_extract_registered_roles(raw, feature, (
+    entity_raw = strip_product_di_semantic_terms(raw)
+    params.update(_extract_registered_roles(entity_raw, feature, (
         ("buy_cd", "buy_nm"),
         ("stock_cd", "stock_nm"),
         ("stock_apply_cd", "stock_apply_nm"),
@@ -188,7 +192,7 @@ def _resolve_rddbc230_nlq(
         if value:
             params[key] = value
     for key in ("physic_nm",):
-        value = _extract_name(raw, labels(key))
+        value = _extract_name(entity_raw, labels(key))
         if value:
             params[key] = value
 
@@ -225,7 +229,7 @@ def _resolve_rddbc230_nlq(
         "product_keyword", "maker_nm", "product_group_nm",
         "product_class_nm",
     ):
-        value = _extract_name(raw, labels(key))
+        value = _extract_name(entity_raw, labels(key))
         if value:
             params[key] = value
     for key in ("unit_cost", "fin_unit_cost", "in_quantity", "out_quantity"):
@@ -435,7 +439,7 @@ def resolve_registered_erp_table_nlq(
                 calculation_params[key] = int(matches[-1].group(1))
                 condition_text = pattern.sub(" ", condition_text)
         mode_matches = list(_ORDER_CALCULATION_QUERY_MODE.finditer(condition_text))
-        value = re.sub(r"\s+", "", mode_matches[-1].group("value")) if mode_matches else "전체"
+        value = re.sub(r"\s+", "", mode_matches[-1].group("value")) if mode_matches else "발주해당자료만"
         mode = "전체" if value == "전체" else "확인 필요" if value == "확인필요" else "발주해당자료만"
         # Capture mode before replacing an intent that itself contains '것만'.
         condition_text = _ORDER_CALCULATION_INTENT.sub("발주 조회", condition_text)
@@ -463,9 +467,10 @@ def resolve_registered_erp_table_nlq(
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
 
     labels = lambda key: filter_labels(feature, key)
-    params.update(_extract_registered_roles(raw, feature, (("ven_cd", "ven_nm"),)))
+    entity_raw = strip_product_di_semantic_terms(raw)
+    params.update(_extract_registered_roles(entity_raw, feature, (("ven_cd", "ven_nm"),)))
     physic_cd = _extract_code(raw, labels("physic_cd"))
-    physic_nm = _extract_name(raw, labels("physic_nm"))
+    physic_nm = _extract_name(entity_raw, labels("physic_nm"))
     product_di_nm = _extract_name(raw, labels("product_di_nm"))
     product_di_semantic_group = (
         "" if product_di_nm else extract_product_di_semantic_group(raw)
@@ -479,9 +484,15 @@ def resolve_registered_erp_table_nlq(
             )
         )
         physic_nm = _extract_unlabeled_product_prefix(
-            raw,
+            entity_raw,
             explicit_labels=explicit_labels,
         )
+        # Keep the legacy parser projection for compatibility, but mark the
+        # value as tentative.  The production router must resolve an unlabeled
+        # R070 subject against cost-application vendor, manufacturer, and
+        # product authority instead of assuming that every name is a product.
+        if physic_nm:
+            params["_registered_unlabeled_entity"] = physic_nm
 
     if physic_cd:
         params["physic_cd"] = physic_cd
@@ -500,7 +511,7 @@ def resolve_registered_erp_table_nlq(
         "product_keyword", "maker_nm", "product_group_nm",
         "product_class_nm", "product_add_user_nm", "product_mod_user_nm",
     ):
-        value = _extract_name(raw, labels(key))
+        value = _extract_name(entity_raw, labels(key))
         if value:
             params[key] = value
     price_match = re.search(
