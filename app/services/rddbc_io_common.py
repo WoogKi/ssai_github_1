@@ -14,6 +14,27 @@ import pandas as pd
 OUTBOUND_TRANS_DI_PRIMARY = "3"
 OUTBOUND_TRANS_DI_COMPAT = ("3", "2")
 
+STOCK_MOVEMENT_IO_PREFIXES = {
+    "real": {
+        "inbound": ("0", "1", "3", "4"),
+        "outbound": ("5", "6", "8", "9"),
+    },
+    "book": {
+        "inbound": ("0", "1", "2", "4"),
+        "outbound": ("5", "6", "7", "9"),
+    },
+}
+
+
+def stock_movement_io_prefixes(stock_mode: Any) -> dict[str, tuple[str, ...]]:
+    """Return the ERP stock-ledger movement prefixes for real or book stock."""
+    mode = "real" if str(stock_mode or "").strip().lower() == "real" else "book"
+    contract = STOCK_MOVEMENT_IO_PREFIXES[mode]
+    return {
+        "inbound": tuple(contract["inbound"]),
+        "outbound": tuple(contract["outbound"]),
+    }
+
 
 def _resolve_query_func():
     from app.db import mssql_client

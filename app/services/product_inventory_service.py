@@ -33,6 +33,7 @@ from app.services.rddbc_io_common import (
     coalesce_params,
     normalize_top,
     query_to_df,
+    stock_movement_io_prefixes,
 )
 
 TABLE = "product_inventory"
@@ -1463,6 +1464,7 @@ def _group_label(basis: str) -> str:
 
 def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
     stock_mode = _resolve_stock_mode(params.get("stock_mode") or params.get("stock_kind"))
+    stock_io_prefixes = stock_movement_io_prefixes(stock_mode)
     group_basis = _resolve_group_basis(params.get("group_basis") or params.get("group_type"))
     price_mode = _resolve_price_mode(params.get("price_mode") or params.get("unit_basis"))
 
@@ -1473,8 +1475,8 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
         out_date_field = "T.Rd12_Out_YyMmDd"
         in_qty_expr = "ISNULL(T.Rd11_Quantity, 0) + ISNULL(T.Rd11_Oquantity, 0)"
         out_qty_expr = "ISNULL(T.Rd12_Quantity, 0) + ISNULL(T.Rd12_Oquantity, 0)"
-        in_exclude_prefix = ("2",)
-        out_exclude_prefix = ("7",)
+        in_exclude_prefix = tuple(sorted(set("01234") - set(stock_io_prefixes["inbound"])))
+        out_exclude_prefix = tuple(sorted(set("56789") - set(stock_io_prefixes["outbound"])))
         month_in_qty_expr = "ISNULL(M.Rd21_In_Quantity, 0) + ISNULL(M.Rd21_In_Oquantity, 0)"
         month_out_qty_expr = "ISNULL(M.Rd21_Out_Quantity, 0) + ISNULL(M.Rd21_Out_Oquantity, 0)"
         month_in_amt_expr = "ISNULL(M.Rd21_In_Supply_Price, 0) + ISNULL(M.Rd21_In_Tax_Price, 0)"
@@ -1486,8 +1488,8 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
         out_date_field = "T.Rd12_Trans_YyMmDd"
         in_qty_expr = "ISNULL(T.Rd11_Quantity, 0)"
         out_qty_expr = "ISNULL(T.Rd12_Quantity, 0)"
-        in_exclude_prefix = ("3",)
-        out_exclude_prefix = ("8",)
+        in_exclude_prefix = tuple(sorted(set("01234") - set(stock_io_prefixes["inbound"])))
+        out_exclude_prefix = tuple(sorted(set("56789") - set(stock_io_prefixes["outbound"])))
         month_in_qty_expr = "ISNULL(M.Rd22_In_Quantity, 0)"
         month_out_qty_expr = "ISNULL(M.Rd22_Out_Quantity, 0)"
         month_in_amt_expr = "ISNULL(M.Rd22_In_Supply_Price, 0) + ISNULL(M.Rd22_In_Tax_Price, 0)"
@@ -1509,6 +1511,8 @@ def _settings(params: Dict[str, Any]) -> Dict[str, Any]:
         "month_out_amt_expr": month_out_amt_expr,
         "in_exclude_prefix": in_exclude_prefix,
         "out_exclude_prefix": out_exclude_prefix,
+        "in_include_prefix": stock_io_prefixes["inbound"],
+        "out_include_prefix": stock_io_prefixes["outbound"],
         "current_stock_query": bool(params.get("current_stock_query")),
         "stock_location_name_map": {
             clean_text(code): clean_text(name)

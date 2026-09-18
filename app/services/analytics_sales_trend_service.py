@@ -34,6 +34,7 @@ from app.services.rddbc_io_common import (
     coalesce_params,
     like_value,
     query_to_df,
+    stock_movement_io_prefixes,
 )
 from app.services.ssai_analysis_profile_service import (
     normalize_business_code,
@@ -4913,11 +4914,12 @@ def _stock_current_cutoff_month(params: Dict[str, Any]) -> str:
     return pd.Timestamp.today().strftime("%Y%m")
 
 
-def _stock_current_monthly_spec(stock_mode: str) -> Dict[str, str]:
+def _stock_current_monthly_spec(stock_mode: str) -> Dict[str, Any]:
     """
     재고부족현황 현재고 산정용 월집계 테이블 spec.
     source_mode와 별개로 stock_mode만 보고 결정한다.
     """
+    io_prefixes = stock_movement_io_prefixes(stock_mode)
     if str(stock_mode or "").strip() == "real":
         return {
             "table": "dbo.Rddbc210",
@@ -4928,6 +4930,8 @@ def _stock_current_monthly_spec(stock_mode: str) -> Dict[str, str]:
             "fallback_unit_col": "Rd04_In_Real_Unit_Cost",
             "source_table": "Rddbc210",
             "source_label": "실재고월집계(Rddbc210) 누계",
+            "inbound_io_prefixes": io_prefixes["inbound"],
+            "outbound_io_prefixes": io_prefixes["outbound"],
         }
 
     return {
@@ -4939,6 +4943,8 @@ def _stock_current_monthly_spec(stock_mode: str) -> Dict[str, str]:
         "fallback_unit_col": "Rd04_In_Acc_Unit_Cost",
         "source_table": "Rddbc220",
         "source_label": "장부재고월집계(Rddbc220) 누계",
+        "inbound_io_prefixes": io_prefixes["inbound"],
+        "outbound_io_prefixes": io_prefixes["outbound"],
     }
 
 
@@ -5169,6 +5175,9 @@ def _load_product_current_month_stock_movements(
     date_from = f"{date_to[:6]}01"
 
     real_mode = str(stock_mode or "").strip() == "real"
+    io_prefixes = stock_movement_io_prefixes(stock_mode)
+    inbound_prefix_sql = ", ".join(f"'{value}'" for value in io_prefixes["inbound"])
+    outbound_prefix_sql = ", ".join(f"'{value}'" for value in io_prefixes["outbound"])
     in_date_field = "T.Rd11_In_YyMmDd" if real_mode else "T.Rd11_Trans_YyMmDd"
     out_date_field = "T.Rd12_Out_YyMmDd" if real_mode else "T.Rd12_Trans_YyMmDd"
     in_qty_expr = (
@@ -5224,6 +5233,7 @@ WITH InAgg AS (
       AND {in_date_field} >= %(date_from)s
       AND {in_date_field} <= %(date_to)s
       AND T.Rd11_Io_Gu_Gcode = %(io_gu_gcode)s
+      AND LEFT(LTRIM(RTRIM(T.Rd11_Io_Gu)), 1) IN ({inbound_prefix_sql})
       {in_stock_filter}
     GROUP BY LTRIM(RTRIM(T.Rd11_Physic_Cd))
 ),
@@ -5237,6 +5247,7 @@ OutAgg AS (
       AND {out_date_field} >= %(date_from)s
       AND {out_date_field} <= %(date_to)s
       AND T.Rd12_Io_Gu_Gcode = %(io_gu_gcode)s
+      AND LEFT(LTRIM(RTRIM(T.Rd12_Io_Gu)), 1) IN ({outbound_prefix_sql})
       {out_stock_filter}
     GROUP BY LTRIM(RTRIM(T.Rd12_Physic_Cd))
 )
@@ -5322,6 +5333,8 @@ def _load_product_current_stock(
     monthly_stock_month_to = _prev_yyyymm(detail_date_to[:6]) if use_mid_month_detail else stock_month_to
     if not monthly_stock_month_to:
         monthly_stock_month_to = stock_month_to
+    inbound_prefix_sql = ", ".join(f"'{value}'" for value in spec["inbound_io_prefixes"])
+    outbound_prefix_sql = ", ".join(f"'{value}'" for value in spec["outbound_io_prefixes"])
     if measurement is not None:
         measurement.add_phase(
             phase="stock_source_policy",
@@ -5406,16 +5419,32 @@ WITH StockAgg AS (
         M.{pfx}_Physic_Cd AS [제품코드_RAW],
 
         SUM(
-            {in_qty_expr}
+            CASE
+                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
+                    THEN {in_qty_expr}
+                ELSE 0
+            END
         ) AS [입고총수량],
 
         SUM(
-            {out_qty_expr}
+            CASE
+                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
+                    THEN {out_qty_expr}
+                ELSE 0
+            END
         ) AS [출고총수량],
 
         SUM(
-            {in_qty_expr}
-          - {out_qty_expr}
+            CASE
+                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
+                    THEN {in_qty_expr}
+                ELSE 0
+            END
+          - CASE
+                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
+                    THEN {out_qty_expr}
+                ELSE 0
+            END
         ) AS [현재재고수량원본],
 
         SUM(
@@ -5427,6 +5456,9 @@ WITH StockAgg AS (
     WHERE M.{pfx}_Physic_Cd IN ({",".join(placeholders)})
       AND M.{pfx}_Stock_YyMm <= %(stock_month_to)s
       AND M.{pfx}_Io_Gu_Gcode = %(io_gu_gcode)s
+      AND LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN (
+          {inbound_prefix_sql}, {outbound_prefix_sql}
+      )
       {stock_filter_sql}
 
     GROUP BY

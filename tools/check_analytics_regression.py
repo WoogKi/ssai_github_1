@@ -13685,6 +13685,79 @@ def run_basic_checks() -> list[CheckResult]:
                 io_scope_errors.append("current_month_movement_prefix_exclusion_present")
             if "Rd11_Io_Gu_Gcode = %(io_gu_gcode)s" not in movement_source or "Rd12_Io_Gu_Gcode = %(io_gu_gcode)s" not in movement_source:
                 io_scope_errors.append("current_month_movement_gcode_missing")
+            real_prefixes = io_scope_mod.stock_movement_io_prefixes("real")
+            book_prefixes = io_scope_mod.stock_movement_io_prefixes("book")
+            if real_prefixes != {
+                "inbound": ("0", "1", "3", "4"),
+                "outbound": ("5", "6", "8", "9"),
+            }:
+                io_scope_errors.append(f"real_stock_io_authority={real_prefixes!r}")
+            if book_prefixes != {
+                "inbound": ("0", "1", "2", "4"),
+                "outbound": ("5", "6", "7", "9"),
+            }:
+                io_scope_errors.append(f"book_stock_io_authority={book_prefixes!r}")
+
+            captured_stock_sql: list[str] = []
+            old_stock_query = io_scope_mod.query_to_df
+            try:
+                def _capture_stock_query(sql, _bind):
+                    captured_stock_sql.append(str(sql))
+                    if "FROM dbo.Rddbc210 AS M" in str(sql):
+                        return pd.DataFrame([{
+                            "제품코드": "P001",
+                            "실재고수량": 7.0,
+                            "실재고평가단가": 10.0,
+                            "실재고금액": 70.0,
+                        }])
+                    if "FROM dbo.Rddbc220 AS M" in str(sql):
+                        return pd.DataFrame([{
+                            "제품코드": "P001",
+                            "장부재고수량": 6.0,
+                            "장부재고평가단가": 10.0,
+                            "장부재고금액": 60.0,
+                        }])
+                    return pd.DataFrame([{
+                        "제품코드": "P001",
+                        "당월입고수량": -2.0,
+                        "당월출고수량": -3.0,
+                        "당월재고증감수량": 1.0,
+                    }])
+
+                io_scope_mod.query_to_df = _capture_stock_query
+                io_scope_mod._load_product_current_month_stock_movements(
+                    ["P001"], stock_mode="real", date_to="20260918"
+                )
+                io_scope_mod._load_product_current_month_stock_movements(
+                    ["P001"], stock_mode="book", date_to="20260918"
+                )
+                io_scope_mod._load_product_current_stock(
+                    ["P001"], stock_mode="real", month_to="202608",
+                    date_to="20260831", policy_date="20260918",
+                )
+                io_scope_mod._load_product_current_stock(
+                    ["P001"], stock_mode="book", month_to="202608",
+                    date_to="20260831", policy_date="20260918",
+                )
+            finally:
+                io_scope_mod.query_to_df = old_stock_query
+
+            if len(captured_stock_sql) != 4:
+                io_scope_errors.append(f"stock_authority_query_count={len(captured_stock_sql)}")
+            else:
+                real_detail_sql, book_detail_sql, real_monthly_sql, book_monthly_sql = captured_stock_sql
+                for label, sql, inbound, outbound, excluded in (
+                    ("real_detail", real_detail_sql, "'0', '1', '3', '4'", "'5', '6', '8', '9'", ("'2'", "'7'")),
+                    ("book_detail", book_detail_sql, "'0', '1', '2', '4'", "'5', '6', '7', '9'", ("'3'", "'8'")),
+                    ("real_monthly", real_monthly_sql, "'0', '1', '3', '4'", "'5', '6', '8', '9'", ("'2'", "'7'")),
+                    ("book_monthly", book_monthly_sql, "'0', '1', '2', '4'", "'5', '6', '7', '9'", ("'3'", "'8'")),
+                ):
+                    if inbound not in sql or outbound not in sql:
+                        io_scope_errors.append(f"{label}_stock_prefix_contract_missing")
+                    if "ABS(ISNULL(T.Rd11_Quantity" in sql or "ABS(ISNULL(T.Rd12_Quantity" in sql:
+                        io_scope_errors.append(f"{label}_return_source_sign_not_preserved")
+                    if label.endswith("detail") and any(f"IN ({value})" in sql for value in excluded):
+                        io_scope_errors.append(f"{label}_excluded_prefix_present")
             zero_io_plan = io_scope_mod._stock_query_batch_plan(stock_cd_count=100, io_gu_count=0, configured_value="1800")
             if zero_io_plan["io_gu_parameter_count"] != 0 or zero_io_plan["total_parameter_count"] >= io_scope_mod.SQL_SERVER_PARAMETER_LIMIT:
                 io_scope_errors.append(f"current_stock_zero_io_bind_plan={zero_io_plan!r}")
