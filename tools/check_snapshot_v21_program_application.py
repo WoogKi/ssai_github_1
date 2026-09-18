@@ -110,7 +110,7 @@ def test_inventory_grade_attachment_and_placement() -> None:
         _PROFIT_GRADE_COLUMN, _CONTRIBUTION_GRADE_COLUMN,
     ]))
     stock = current_columns.index("재고수량")
-    _assert(current_columns[stock + 1:stock + 4] == ["출고빈도등급", "손익등급", "기여도등급"], "current-stock grade placement mismatch")
+    _assert(current_columns[stock + 1:stock + 4] == ["출고빈도등급", "품목손익등급", "품목기여등급"], "current-stock grade placement mismatch")
 
 
 def test_nlq_and_inventory_boundaries() -> None:

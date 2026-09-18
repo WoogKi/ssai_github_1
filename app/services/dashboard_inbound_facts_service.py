@@ -152,10 +152,14 @@ SELECT
     LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code,
     LTRIM(RTRIM(P.Rd04_Orven_Cd)) AS master_order_vendor_code,
     LTRIM(RTRIM(MasterVendor.Rd03_Ven_Nm)) AS master_order_vendor_name,
+    LTRIM(RTRIM(MasterVendor.Rd03_Sales_Man)) AS master_order_staff_code,
+    LTRIM(RTRIM(MasterStaff.Rd06_User_Nm)) AS master_order_staff_name,
     LTRIM(RTRIM(I.Rd11_In_YyMmDd)) AS inbound_date,
     LTRIM(RTRIM(I.Rd11_Io_Gu)) AS io_tcode,
     LTRIM(RTRIM(I.Rd11_Ven_Cd)) AS vendor_code,
     LTRIM(RTRIM(InboundVendor.Rd03_Ven_Nm)) AS inbound_vendor_name,
+    LTRIM(RTRIM(InboundVendor.Rd03_Sales_Man)) AS inbound_vendor_staff_code,
+    LTRIM(RTRIM(InboundStaff.Rd06_User_Nm)) AS inbound_vendor_staff_name,
     CAST(COALESCE(I.Rd11_Quantity, 0) AS decimal(28, 6)) AS quantity,
     CAST(COALESCE(I.Rd11_Oquantity, 0) AS decimal(28, 6)) AS oquantity,
     CAST(COALESCE(I.Rd11_Supply_Price, 0) AS decimal(28, 6)) AS supply_price
@@ -165,8 +169,12 @@ LEFT JOIN dbo.Rddbc110 AS I WITH (NOLOCK)
    AND {on_sql}
 LEFT JOIN dbo.Rddbc030 AS InboundVendor WITH (NOLOCK)
     ON InboundVendor.Rd03_Ven_Cd = I.Rd11_Ven_Cd
+LEFT JOIN dbo.Rddbc060 AS InboundStaff WITH (NOLOCK)
+    ON InboundStaff.Rd06_User_Cd = InboundVendor.Rd03_Sales_Man
 LEFT JOIN dbo.Rddbc030 AS MasterVendor WITH (NOLOCK)
     ON MasterVendor.Rd03_Ven_Cd = P.Rd04_Orven_Cd
+LEFT JOIN dbo.Rddbc060 AS MasterStaff WITH (NOLOCK)
+    ON MasterStaff.Rd06_User_Cd = MasterVendor.Rd03_Sales_Man
 WHERE {where_sql}
 """, binds
 
@@ -187,6 +195,8 @@ def build_dashboard_inbound_facts_frame(
         "normal_inbound_positive_qty_365", "inbound_return_raw_qty_365",
         "normal_inbound_90_exists", "normal_inbound_365_exists", "recent_inbound_vendor_code",
         "recent_inbound_vendor_name", "recent_inbound_vendor_qty_90", "recent_inbound_vendor_last_date", "recent_inbound_vendor_source",
+        "recent_inbound_vendor_staff_code", "recent_inbound_vendor_staff_name",
+        "recent_inbound_vendor_count_90", "master_order_staff_code", "master_order_staff_name",
         "recent_inbound_vendor_fallback", "inbound_cycle_days", "inbound_vendor_days", "data_cutoff_date",
     ]
     raw = source_df.copy() if isinstance(source_df, pd.DataFrame) else pd.DataFrame()
@@ -197,7 +207,12 @@ def build_dashboard_inbound_facts_frame(
         return result
 
     normalize_started = time.perf_counter()
-    for key in ("inbound_date", "io_tcode", "vendor_code", "inbound_vendor_name", "master_order_vendor_code", "master_order_vendor_name"):
+    for key in (
+        "inbound_date", "io_tcode", "vendor_code", "inbound_vendor_name",
+        "inbound_vendor_staff_code", "inbound_vendor_staff_name",
+        "master_order_vendor_code", "master_order_vendor_name",
+        "master_order_staff_code", "master_order_staff_name",
+    ):
         if key not in raw.columns:
             raw[key] = ""
         raw[key] = raw[key].fillna("").astype(str).str.strip()
@@ -211,26 +226,47 @@ def build_dashboard_inbound_facts_frame(
     cutoff_ts = pd.Timestamp(cutoff)
     cycle_start_ts = cutoff_ts - pd.Timedelta(days=max(1, int(cycle_lookback_days)) - 1)
     vendor_start_ts = cutoff_ts - pd.Timedelta(days=max(1, int(vendor_lookback_days)) - 1)
+    purchase_vendor_count_start_ts = cutoff_ts - pd.Timedelta(days=89)
     raw["inbound_date_value"] = pd.to_datetime(raw["inbound_date"], format="%Y%m%d", errors="coerce")
     raw["event_qty"] = raw["quantity"] + raw["oquantity"]
     raw["within_cycle"] = raw["inbound_date_value"].between(cycle_start_ts, cutoff_ts, inclusive="both")
     raw["within_vendor"] = raw["inbound_date_value"].between(vendor_start_ts, cutoff_ts, inclusive="both")
+    raw["within_purchase_vendor_count_90"] = raw["inbound_date_value"].between(
+        purchase_vendor_count_start_ts, cutoff_ts, inclusive="both"
+    )
     raw["is_normal"] = raw["within_cycle"] & raw["io_tcode"].isin(NORMAL_INBOUND_TCODES)
     raw["is_return"] = raw["within_cycle"] & raw["io_tcode"].isin(INBOUND_RETURN_TCODES)
     raw["is_positive_normal"] = raw["is_normal"] & raw["event_qty"].gt(0)
     normalize_ms = int((time.perf_counter() - normalize_started) * 1000)
 
-    master = raw[["product_code", "master_order_vendor_code", "master_order_vendor_name"]].copy()
-    master[["master_order_vendor_code", "master_order_vendor_name"]] = master[["master_order_vendor_code", "master_order_vendor_name"]].replace("", pd.NA)
+    master_columns = [
+        "master_order_vendor_code", "master_order_vendor_name",
+        "master_order_staff_code", "master_order_staff_name",
+    ]
+    master = raw[["product_code", *master_columns]].copy()
+    master[master_columns] = master[master_columns].replace("", pd.NA)
     master = master.groupby("product_code", as_index=False, sort=False).first().fillna("")
-    positive = raw.loc[raw["is_positive_normal"], ["product_code", "inbound_date_value", "event_qty", "quantity", "supply_price", "vendor_code", "inbound_vendor_name", "within_vendor"]].copy()
+    positive = raw.loc[raw["is_positive_normal"], [
+        "product_code", "inbound_date_value", "event_qty", "quantity", "supply_price",
+        "vendor_code", "inbound_vendor_name", "inbound_vendor_staff_code", "inbound_vendor_staff_name",
+        "within_vendor", "within_purchase_vendor_count_90",
+    ]].copy()
     event_aggregate_started = time.perf_counter()
     normal_raw = raw.loc[raw["is_normal"]].groupby("product_code", sort=False)["event_qty"].sum().rename("normal_inbound_raw_qty_365")
     normal_positive = positive.groupby("product_code", sort=False)["event_qty"].sum().rename("normal_inbound_positive_qty_365")
     returns = raw.loc[raw["is_return"]].groupby("product_code", sort=False)["event_qty"].sum().rename("inbound_return_raw_qty_365")
     history_365 = positive.groupby("product_code", sort=False).size().rename("_history_365_count")
     history_90 = positive.loc[positive["within_vendor"]].groupby("product_code", sort=False).size().rename("_history_90_count")
-    event_stats = pd.concat([normal_raw, normal_positive, returns, history_365, history_90], axis=1).reset_index()
+    vendor_count_90 = (
+        positive.loc[positive["within_purchase_vendor_count_90"] & positive["vendor_code"].ne("")]
+        .groupby("product_code", sort=False)["vendor_code"]
+        .nunique()
+        .rename("recent_inbound_vendor_count_90")
+    )
+    event_stats = pd.concat(
+        [normal_raw, normal_positive, returns, history_365, history_90, vendor_count_90],
+        axis=1,
+    ).reset_index()
     event_aggregate_ms = int((time.perf_counter() - event_aggregate_started) * 1000)
     gap_started = time.perf_counter()
     normal_days = positive[["product_code", "inbound_date_value"]].drop_duplicates().sort_values(["product_code", "inbound_date_value"], kind="stable")
@@ -245,7 +281,11 @@ def build_dashboard_inbound_facts_frame(
     vendor_started = time.perf_counter()
     recent = positive.loc[positive["within_vendor"] & positive["vendor_code"].ne("")].copy()
     if recent.empty:
-        vendor_top = pd.DataFrame(columns=["product_code", "recent_inbound_vendor_code", "recent_inbound_vendor_name", "recent_inbound_vendor_qty_90", "recent_inbound_vendor_last_date"])
+        vendor_top = pd.DataFrame(columns=[
+            "product_code", "recent_inbound_vendor_code", "recent_inbound_vendor_name",
+            "recent_inbound_vendor_staff_code", "recent_inbound_vendor_staff_name",
+            "recent_inbound_vendor_qty_90", "recent_inbound_vendor_last_date",
+        ])
     else:
         recent["inbound_vendor_name"] = recent["inbound_vendor_name"].replace("", pd.NA)
         vendor_top = recent.groupby(["product_code", "vendor_code"], as_index=False, sort=False).agg(
@@ -253,6 +293,8 @@ def build_dashboard_inbound_facts_frame(
             _supply_price=("supply_price", "sum"),
             _last_date=("inbound_date_value", "max"),
             recent_inbound_vendor_name=("inbound_vendor_name", "first"),
+            recent_inbound_vendor_staff_code=("inbound_vendor_staff_code", "first"),
+            recent_inbound_vendor_staff_name=("inbound_vendor_staff_name", "first"),
         )
         vendor_top = vendor_top.sort_values(
             ["product_code", "recent_inbound_vendor_qty_90", "_supply_price", "_last_date", "vendor_code"],
@@ -260,8 +302,14 @@ def build_dashboard_inbound_facts_frame(
         ).drop_duplicates("product_code", keep="first")
         vendor_top = vendor_top.rename(columns={"vendor_code": "recent_inbound_vendor_code", "_last_date": "recent_inbound_vendor_last_date"})
         vendor_top["recent_inbound_vendor_name"] = vendor_top["recent_inbound_vendor_name"].fillna("")
+        vendor_top["recent_inbound_vendor_staff_code"] = vendor_top["recent_inbound_vendor_staff_code"].fillna("")
+        vendor_top["recent_inbound_vendor_staff_name"] = vendor_top["recent_inbound_vendor_staff_name"].fillna("")
         vendor_top["recent_inbound_vendor_last_date"] = vendor_top["recent_inbound_vendor_last_date"].dt.strftime("%Y%m%d")
-        vendor_top = vendor_top[["product_code", "recent_inbound_vendor_code", "recent_inbound_vendor_name", "recent_inbound_vendor_qty_90", "recent_inbound_vendor_last_date"]]
+        vendor_top = vendor_top[[
+            "product_code", "recent_inbound_vendor_code", "recent_inbound_vendor_name",
+            "recent_inbound_vendor_staff_code", "recent_inbound_vendor_staff_name",
+            "recent_inbound_vendor_qty_90", "recent_inbound_vendor_last_date",
+        ]]
     vendor_aggregate_ms = int((time.perf_counter() - vendor_started) * 1000)
 
     finalize_started = time.perf_counter()
@@ -269,6 +317,7 @@ def build_dashboard_inbound_facts_frame(
     for key in ("normal_inbound_raw_qty_365", "normal_inbound_positive_qty_365", "inbound_return_raw_qty_365", "recent_inbound_vendor_qty_90"):
         result[key] = pd.to_numeric(result.get(key), errors="coerce").fillna(0.0)
     result["normal_inbound_day_count_365"] = result["normal_inbound_day_count_365"].fillna(0).astype(int)
+    result["recent_inbound_vendor_count_90"] = result["recent_inbound_vendor_count_90"].fillna(0).astype(int)
     result["normal_inbound_365_exists"] = result["_history_365_count"].fillna(0).gt(0)
     result["normal_inbound_90_exists"] = result["_history_90_count"].fillna(0).gt(0)
     result["inbound_delay_days"] = (cutoff_ts - result["last_date"]).dt.days
@@ -284,11 +333,15 @@ def build_dashboard_inbound_facts_frame(
     result.loc[has_actual, "recent_inbound_vendor_source"] = "actual_inbound"
     result.loc[~has_actual & has_master, "recent_inbound_vendor_code"] = result.loc[~has_actual & has_master, "master_order_vendor_code"]
     result.loc[~has_actual & has_master, "recent_inbound_vendor_name"] = result.loc[~has_actual & has_master, "master_order_vendor_name"]
+    result.loc[~has_actual & has_master, "recent_inbound_vendor_staff_code"] = result.loc[~has_actual & has_master, "master_order_staff_code"]
+    result.loc[~has_actual & has_master, "recent_inbound_vendor_staff_name"] = result.loc[~has_actual & has_master, "master_order_staff_name"]
     result["recent_inbound_vendor_fallback"] = result["recent_inbound_vendor_source"].eq("master_order_vendor")
     result["last_normal_inbound_date"] = result["last_date"].dt.strftime("%Y%m%d").fillna("")
     result["recent_inbound_vendor_last_date"] = result["recent_inbound_vendor_last_date"].fillna("")
     result["recent_inbound_vendor_name"] = result["recent_inbound_vendor_name"].fillna("")
     result["recent_inbound_vendor_code"] = result["recent_inbound_vendor_code"].fillna("")
+    result["recent_inbound_vendor_staff_code"] = result["recent_inbound_vendor_staff_code"].fillna("")
+    result["recent_inbound_vendor_staff_name"] = result["recent_inbound_vendor_staff_name"].fillna("")
     result["inbound_cycle_days"] = int(cycle_lookback_days)
     result["inbound_vendor_days"] = int(vendor_lookback_days)
     result["data_cutoff_date"] = cutoff.strftime("%Y%m%d")

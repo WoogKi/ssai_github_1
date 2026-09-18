@@ -42,7 +42,7 @@ _VALUE_BOUNDARY = (
     r"매입처(?:코드|명)?|재고위치(?:코드|명)?|재고적용처(?:코드|명)?|재고적용코드|"
     r"단가적용거래처(?:코드|명)?|단가적용처(?:코드|명)?|단가적용코드|거래처(?:코드|명)?|"
     r"제품(?:코드|명|키워드|그룹명?|구분명?|분류명?|단가|등록자|수정자)?|"
-    r"품목(?:코드|명|키워드)?|보험코드|바코드|제약사명?|제조사|키워드|"
+    r"품목(?:코드|명|키워드)?|보험코드|바코드|제약사명?|제조사|키워드|발주담당자|담당자|"
     r"실입고단가|장부입고단가|입고수량|출고수량|최종단가변경일자|"
     r"제품등록일|제품수정일|계약시작일(?:자)?|기준일|조회건수|TOP)\b|$)"
 )
@@ -298,6 +298,7 @@ def _has_explicit_order_residual_owner(params: Mapping[str, Any]) -> bool:
             "physic_cd", "physic_nm", "product_keyword", "insu_cd", "barcode",
             "maker_nm", "product_group_nm", "product_class_nm", "product_di_nm",
             "order_vendor_cd", "cost_apply_cd", "cost_apply_nm",
+            "staff_nm",
             "stock_apply_cd", "stock_apply_nm", "stock_cd", "stock_nm",
             "expected_vendor_cd", "expected_vendor_nm", "real_vendor_cd", "real_vendor_nm",
         )
@@ -346,6 +347,9 @@ def _resolve_order_nlq(
         value = _extract_name(raw, filter_labels(feature, key))
         if value:
             params[key] = value
+    staff_nm = _extract_name(raw, filter_labels(feature, "staff_nm"))
+    if staff_nm:
+        params["staff_nm"] = staff_nm
     if not params.get("physic_nm"):
         physic_nm = _extract_name_before_label(raw, filter_labels(feature, "physic_nm"))
         if physic_nm:

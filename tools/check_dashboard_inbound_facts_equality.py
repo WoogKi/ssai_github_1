@@ -23,7 +23,9 @@ from app.services.dashboard_lite_facts import _attach_dashboard_inbound_facts, _
 CUTOFF = "20260825"
 INBOUND_COLUMNS = (
     "product_code", "master_order_vendor_code", "master_order_vendor_name",
+    "master_order_staff_code", "master_order_staff_name",
     "inbound_date", "io_tcode", "vendor_code", "inbound_vendor_name",
+    "inbound_vendor_staff_code", "inbound_vendor_staff_name",
     "quantity", "oquantity", "supply_price",
 )
 
@@ -32,19 +34,19 @@ def _source_fixture() -> pd.DataFrame:
     return pd.DataFrame(
         [
             # Same quantity/price/date: vendor-code ascending must win.
-            ("ACT", "MASTER-A", "마스터A", "20260820", "001", "V2", "실제V2", 10, 0, 100),
-            ("ACT", "MASTER-A", "마스터A", "20260820", "001", "V1", "실제V1", 10, 0, 100),
+            ("ACT", "MASTER-A", "마스터A", "U1", "담당자A", "20260820", "001", "V2", "실제V2", "U12", "윤정아", 10, 0, 100),
+            ("ACT", "MASTER-A", "마스터A", "U1", "담당자A", "20260820", "001", "V1", "실제V1", "U11", "이기재", 10, 0, 100),
             # Actual return is not a normal inbound or representative vendor.
-            ("ACT", "MASTER-A", "마스터A", "20260822", "101", "V3", "반품V3", 5, 0, 50),
+            ("ACT", "MASTER-A", "마스터A", "U1", "담당자A", "20260822", "101", "V3", "반품V3", "U13", "반품담당", 5, 0, 50),
             # No actual inbound: retain product-master order-vendor fallback.
-            ("MASTER", "MASTER-B", "마스터B", "", "", "", "", 0, 0, 0),
+            ("MASTER", "MASTER-B", "마스터B", "U2", "담당자B", "", "", "", "", "", "", 0, 0, 0),
             # No actual or master vendor: retain explicit none.
-            ("NONE", "", "", "", "", "", "", 0, 0, 0),
+            ("NONE", "", "", "", "", "", "", "", "", "", "", 0, 0, 0),
             # Two normal days in the 365-day window but outside 90 days: delayed.
-            ("DELAY", "MASTER-D", "마스터D", "20250830", "001", "OLD", "과거V", 1, 0, 10),
-            ("DELAY", "MASTER-D", "마스터D", "20250915", "001", "OLD", "과거V", 1, 0, 10),
+            ("DELAY", "MASTER-D", "마스터D", "U3", "담당자D", "20250830", "001", "OLD", "과거V", "U31", "과거담당", 1, 0, 10),
+            ("DELAY", "MASTER-D", "마스터D", "U3", "담당자D", "20250915", "001", "OLD", "과거V", "U31", "과거담당", 1, 0, 10),
             # Exactly 90-day inclusive boundary for current authority window.
-            ("BOUND90", "", "", "20260528", "002", "B90", "경계V", 3, 0, 30),
+            ("BOUND90", "", "", "", "", "20260528", "002", "B90", "경계V", "U90", "경계담당", 3, 0, 30),
         ],
         columns=INBOUND_COLUMNS,
     )
@@ -81,9 +83,21 @@ def main() -> int:
     ).set_index("product_code")
 
     assert facts.loc["ACT", "recent_inbound_vendor_code"] == "V1"
+    assert facts.loc["ACT", "recent_inbound_vendor_count_90"] == 2
+    assert facts.loc["ACT", "master_order_staff_code"] == "U1"
+    assert facts.loc["ACT", "master_order_staff_name"] == "담당자A"
+    assert facts.loc["ACT", "recent_inbound_vendor_staff_code"] == "U11"
+    assert facts.loc["ACT", "recent_inbound_vendor_staff_name"] == "이기재"
     assert facts.loc["ACT", "recent_inbound_vendor_source"] == "actual_inbound"
     assert facts.loc["ACT", "normal_inbound_90_exists"]
     assert facts.loc["ACT", "normal_inbound_365_exists"]
+    assert facts.loc["MASTER", "recent_inbound_vendor_staff_code"] == "U2"
+    assert facts.loc["MASTER", "recent_inbound_vendor_staff_name"] == "담당자B"
+
+    profile_45 = build_dashboard_inbound_facts_frame(
+        _source_fixture(), data_cutoff_date=CUTOFF, cycle_lookback_days=365, vendor_lookback_days=45
+    ).set_index("product_code")
+    assert profile_45.loc["ACT", "recent_inbound_vendor_count_90"] == 2
     assert facts.loc["MASTER", "recent_inbound_vendor_code"] == "MASTER-B"
     assert facts.loc["MASTER", "recent_inbound_vendor_source"] == "master_order_vendor"
     assert bool(facts.loc["MASTER", "recent_inbound_vendor_fallback"])

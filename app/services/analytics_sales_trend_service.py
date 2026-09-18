@@ -5164,6 +5164,8 @@ def _load_product_current_month_stock_movements(
     stock_cd: Any = None,
     stock_apply_cd: Any = None,
 ) -> pd.DataFrame:
+    # Compatibility input only: stock application does not scope stock quantity.
+    _ = stock_apply_cd
     codes = sorted({str(x or "").strip() for x in product_codes if str(x or "").strip()})
     columns = ["제품코드", "당월입고수량", "당월출고수량", "당월재고증감수량"]
     if not codes:
@@ -5218,10 +5220,6 @@ def _load_product_current_month_stock_movements(
 
         in_stock_filter = _stock_filter("T.Rd11_Stock_Cd", bind_params, "in")
         out_stock_filter = _stock_filter("T.Rd12_Stock_Cd", bind_params, "out")
-        if clean_text(stock_apply_cd):
-            bind_params["stock_apply_cd"] = clean_text(stock_apply_cd)
-            in_stock_filter += "\n      AND T.Rd11_Stock_Apply_Cd = %(stock_apply_cd)s"
-            out_stock_filter += "\n      AND T.Rd12_Stock_Apply_Cd = %(stock_apply_cd)s"
         sql = f"""
 WITH InAgg AS (
     SELECT
@@ -5298,6 +5296,8 @@ def _load_product_current_stock(
     SQL Server parameter limit을 피하기 위해 product code를 batch로 나누되,
     전체 product code를 조회한다.
     """
+    # Compatibility input only: stock application does not scope stock quantity.
+    _ = stock_apply_cd
     t0 = time.perf_counter()
     measurement = get_active_dashboard_query_measurement()
     codes = [str(x or "").strip() for x in product_codes if str(x or "").strip()]
@@ -5406,10 +5406,6 @@ def _load_product_current_stock(
                 stock_names.append(f"%({key})s")
             stock_filter_sql = f"\n      AND M.{pfx}_Stock_Cd IN ({', '.join(stock_names)})"
         bind_params["io_gu_gcode"] = "0012"
-        if clean_text(stock_apply_cd):
-            bind_params["stock_apply_cd"] = clean_text(stock_apply_cd)
-            stock_filter_sql += f"\n      AND M.{pfx}_Stock_Apply_Cd = %(stock_apply_cd)s"
-
         if len(bind_params) >= SQL_SERVER_PARAMETER_LIMIT:
             raise ValueError("stock query parameter count reached the SQL Server limit")
 
@@ -5548,7 +5544,6 @@ OPTION (RECOMPILE)
             date_to=detail_date_to,
             stock_cd_list=stock_cd_list,
             stock_cd=stock_cd,
-            stock_apply_cd=stock_apply_cd,
         )
         if movement_df is not None and not movement_df.empty:
             if stock_df is None or stock_df.empty:
@@ -5828,7 +5823,6 @@ def get_stock_shortage_df(
         policy_date=current_stock_params.get("policy_date") or current_stock_params.get("as_of_date") or current_stock_params.get("today"),
         stock_cd_list=current_stock_params.get("stock_cd_list"),
         stock_cd=current_stock_params.get("stock_cd"),
-        stock_apply_cd=current_stock_params.get("order_stock_apply_cd"),
         ignored_io_gu_count=ignored_io_count,
     )
     t_stock = time.perf_counter()

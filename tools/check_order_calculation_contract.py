@@ -128,11 +128,18 @@ def test_full_month_forecast_and_blank_pending():
 
 def fixture():
     base = pd.DataFrame({"제품코드": ["00001"], "제품명": ["fixture"], "출고빈도등급": ["F"],
+                         "품목손익등급": ["B"], "품목기여등급": ["A"],
+                         "추정단위손익": [D(10)], "추정손익률": [D("0.1")], "추정기여금액": [D(300)],
                          "제품등록실단가": [D(100)]})
     demand = pd.DataFrame({"제품코드": ["00001"], "현재재고수량": [D(-2)],
                            "당월 예상출고수량": [D(30)], "수요예상기준": ["최근3개월평균수요수량"]})
     supplier = pd.DataFrame({"product_code": ["00001"], "recent_inbound_vendor_code": ["00100"],
-                             "recent_inbound_vendor_name": ["fixture-vendor"]})
+                             "recent_inbound_vendor_name": ["fixture-vendor"],
+                             "recent_inbound_vendor_count_90": [2],
+                             "recent_inbound_vendor_staff_code": ["U001"],
+                             "recent_inbound_vendor_staff_name": ["홍길동"],
+                             "master_order_staff_code": ["U999"],
+                             "master_order_staff_name": ["다른담당자"]})
     params = {"company_id": 7, "order_date": "2026-09-25", "safety_days": 3, "target_days": 15, "closing_day": 25, "price_basis": "real"}
     sources = {"snapshot": {"meta": {"snapshot_status": "ready"}}, "base": base, "demand": demand,
         "suppliers": supplier, "pending": pd.DataFrame(), "prices": {"df": pd.DataFrame()},
@@ -170,6 +177,27 @@ def test_company_isolation():
     with patch("app.services.order_calculation_service.get_current_company_id", return_value=7):
         result = get_order_calculation_result(params, source_loader=lambda p: sources)
     assert result["meta"]["source_call_count"] == 0 and len(result["df"]) == 1
+
+
+def test_purchase_vendor_count_staff_and_sensitive_projection():
+    params, sources = fixture()
+    row = assemble_result(params, sources).iloc[0]
+    assert row["매입거래처수"] == 2
+    assert row["발주담당자코드"] == "U001" and row["발주담당자"] == "홍길동"
+    assert row["발주담당자"] != sources["suppliers"].iloc[0]["master_order_staff_name"]
+    assert len(assemble_result({**params, "staff_nm": "홍길"}, sources)) == 1
+    assert assemble_result({**params, "staff_nm": "없는담당자"}, sources).empty
+    sensitive = {"추정단위손익", "추정손익률", "추정기여금액"}
+    with patch("app.services.order_calculation_service.get_current_company_id", return_value=7), \
+         patch("app.services.snapshot_product_information_service.product_information_cost_visible", return_value=False):
+        member = get_order_calculation_result(params, source_loader=lambda q: sources)
+    assert not sensitive.intersection(member["df"].columns)
+    assert not sensitive.intersection(member["df_display"].columns)
+    assert not sensitive.intersection(member["records"][0])
+    with patch("app.services.order_calculation_service.get_current_company_id", return_value=7), \
+         patch("app.services.snapshot_product_information_service.product_information_cost_visible", return_value=True):
+        management = get_order_calculation_result(params, source_loader=lambda q: sources)
+    assert sensitive.issubset(management["df"].columns)
 
 
 def test_routes_menu():
@@ -444,7 +472,7 @@ def test_code_lookup_company_cache():
 
 
 if __name__ == "__main__":
-    tests = (test_horizon, test_monthly_allocation, test_quantities, test_assembly_edit_export, test_company_isolation, test_routes_menu, test_panel_submission, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_editor_callback_ownership_and_cache)
+    tests = (test_horizon, test_monthly_allocation, test_quantities, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_editor_callback_ownership_and_cache)
     tests += (test_empty_parameter_bridge_and_check_mode, test_snapshot_scope_to_demand_scope)
     tests += (test_code_lookup_company_cache,)
     tests += (test_excel_numeric_round_trip, test_production_editor_render_boundary)
@@ -583,6 +611,8 @@ if __name__ == "__main__":
         assert unavailable['추천 발주수량'] is None and unavailable['실제 발주수량'] is None
     tests += (test_compact_order_header_and_initial_values,)
     def test_export_order_and_application_defaults():
+        import inspect
+        from app.services import order_calculation_service as order_service
         from app.services.order_calculation_service import apply_application_defaults, build_contract_price_params
         order_query = {'order_date': '2026-09-14', 'cost_apply_cd': '50002',
                        'stock_apply_cd': '50001', 'physic_cd': '83315',
@@ -602,15 +632,19 @@ if __name__ == "__main__":
         params, sources = fixture()
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
             result = get_order_calculation_result(params, source_loader=lambda q: sources)
-        core = ['제품코드', '제품명', '규격', '추세', '계산 발주수량', '추천 발주수량', '실제 발주수량',
-                '재고수량', '입고예정수량', '발주처', '발주단가', '발주금액(부가세포함)',
-                '월 기준 예상수량', '안전재고 기준수량', '적용 필요예정수량']
-        present = [c for c in core if c in result['df']]
-        assert list(result['df'].columns[:len(present)]) == present
-        assert list(result['df_display'].columns[:len(present)]) == present
+        primary_front = ['제품코드', '제품명', '추세', '계산 발주수량', '추천 발주수량', '실제 발주수량',
+                '재고수량', '입고예정수량', '발주처', '발주담당자', '매입거래처수',
+                '발주단가', '발주금액(부가세포함)', '월 기준 예상수량']
+        assert list(result['df'].columns[:len(primary_front)]) == primary_front
+        assert list(result['df_display'].columns[:len(primary_front)]) == primary_front
         assert '단가출처' in result['df'] and '발주단위 근거' in result['df']
+        assert {'품목손익등급', '품목기여등급'}.issubset(result['df'].columns)
+        assert {'품목손익등급', '품목기여등급'}.issubset(result['df_display'].columns)
+        assert not {'손익등급', '기여도등급', '손익기여도'}.intersection(result['df'].columns)
         assert result['params']['cost_apply_cd'] == '50002'
         assert result['params']['stock_apply_cd'] == '50001'
+        assert 'search_vendors_full' not in inspect.getsource(order_service.load_sources)
+        assert "demand_params['order_stock_apply_cd']" not in inspect.getsource(order_service.load_sources)
     tests += (test_export_order_and_application_defaults,)
     def test_query_mode_is_display_only():
         params, sources = fixture()

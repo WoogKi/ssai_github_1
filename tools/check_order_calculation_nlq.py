@@ -14,6 +14,23 @@ from app.services.order_calculation_service import get_order_calculation_result
 from tools.check_order_calculation_contract import fixture
 
 
+def staff_fixture():
+    params, sources = fixture()
+    product_codes = ["00001", "00002", "00003", "00004"]
+    base = pd.concat([sources["base"].iloc[[0]]] * len(product_codes), ignore_index=True)
+    base["제품코드"] = product_codes
+    demand = pd.concat([sources["demand"].iloc[[0]]] * len(product_codes), ignore_index=True)
+    demand["제품코드"] = product_codes
+    suppliers = pd.concat([sources["suppliers"].iloc[[0]]] * len(product_codes), ignore_index=True)
+    suppliers["product_code"] = product_codes
+    suppliers["recent_inbound_vendor_code"] = ["V001", "V002", "V003", "V004"]
+    suppliers["recent_inbound_vendor_name"] = ["신민우 발주처", "윤정아 발주처", "담당자없는 발주처", "사용자미매칭 발주처"]
+    suppliers["recent_inbound_vendor_staff_code"] = ["U001", "U002", "", "U004"]
+    suppliers["recent_inbound_vendor_staff_name"] = ["신민우", "윤정아", "", ""]
+    sources.update({"base": base, "demand": demand, "suppliers": suppliers})
+    return params, sources
+
+
 def run():
     mode_cases = [
         ('한림 안전재고 5일 적정재고 20일 마감일자 25일 조회구분 해당 발주 계산', '한림', True),
@@ -60,6 +77,11 @@ def run():
         ('제약사 환인 마감일 20 발주할 수량', 3, 15, 20),
         ('제품코드 64063 조회구분 발주해당자료만 단가적용처코드 12345 재고적용처코드 23456 발주 계산', 3, 15, 25),
         ('제약사 한림 조회구분 확인 필요 발주 계산', 3, 15, 25),
+        ('발주 계산 담당자 홍길동', 3, 15, 25),
+        ('발주담당자 홍길동 발주 계산', 3, 15, 25),
+        ('담당자 신 발주계산', 3, 15, 25),
+        ('발주담당자 신민우 발주계산', 3, 15, 25),
+        ('담당자 윤 발주계산', 3, 15, 25),
     ]
     for text, safety, target, closing in calculations:
         result = resolve_registered_erp_table_nlq(text, today=date(2026, 9, 14))
@@ -87,6 +109,9 @@ def run():
             assert p['query_mode'] == '확인 필요'
         elif '전체' not in text and '발주해당자료만' not in text:
             assert p['query_mode'] == '발주해당자료만' and p['only_needed']
+        if '담당자' in text:
+            expected_staff = next(name for name in ('홍길동', '신민우', '신', '윤') if name in text)
+            assert p['staff_nm'] == expected_staff
         cases.append({'text': text, **result})
     # Dispatch through the real router and service, using the same captured authority fixture.
     for text in ('제약사 환인 조회구분 전체 발주 계산',
@@ -108,6 +133,43 @@ def run():
             panel = get_order_calculation_result(requests[0], source_loader=lambda p: sources)
         pd.testing.assert_frame_equal(sent[0]['df'], panel['df'])
         assert sent[0]['meta']['source_call_count'] == 0
+
+    staff_cases = {
+        '담당자 신 발주계산': ['신민우'],
+        '발주담당자 신민우 발주계산': ['신민우'],
+        '담당자 윤 발주계산': ['윤정아'],
+        '담당자 없는이름 발주계산': [],
+    }
+    for text, expected_names in staff_cases.items():
+        _, sources = staff_fixture()
+        sent, requests = [], []
+        def staff_service(q):
+            requests.append(q)
+            return get_order_calculation_result(q, source_loader=lambda p: sources)
+        with patch('app.services.order_calculation_service.get_current_company_id', return_value=7), \
+             patch('app.services.order_calculation_service.get_order_calculation_result', side_effect=staff_service), \
+             patch('app.ui.chat_middleware.push_sims_result_to_chat', side_effect=lambda p, a: sent.append(p) or p['meta']):
+            assert _try_handle_io_nlq(text, room={}, session_state={}, make_ts=lambda: 'fixture',
+                next_seq=lambda: 1, logger=logging.getLogger('fixture'))
+        assert len(requests) == len(sent) == 1
+        assert requests[0]['staff_nm'] in text
+        if expected_names:
+            assert sorted(sent[0]['df']['발주담당자'].drop_duplicates().tolist()) == expected_names
+        else:
+            assert sent[0].get('records') == [] and sent[0]['meta']['row_count_total'] == 0
+        assert sent[0]['meta']['source_call_count'] == 0
+
+    _, sources = staff_fixture()
+    with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+        all_rows = get_order_calculation_result(
+            {"company_id": 7, "query_mode": "전체", "only_needed": False},
+            source_loader=lambda p: sources,
+        )
+    assert len(all_rows['df']) == 4
+    assert all_rows['df']['발주담당자'].eq('').sum() == 2
+    assert all_rows['meta']['order_staff_resolution'] == {
+        'missing_order_vendor': 0, 'missing_sales_man': 1, 'unmatched_user': 1,
+    }
     print(json.dumps(cases, ensure_ascii=False, indent=2))
     from app.services import io_nlq
     for action in ('발주 계산', '발주조회'):
@@ -133,7 +195,7 @@ def run():
         assert _try_handle_io_nlq('가상회사 안전재고 5일 적정재고 20일 마감일 0 발주 계산',
             room={}, session_state={}, make_ts=lambda: 'fixture', next_seq=lambda: 1, logger=logging.getLogger('fixture'))
     assert all(value in sent[0]['meta']['query_summary'] for value in ('안전재고 5일', '적정재고 20일', '결제/마감일 0일', '50002', '50001'))
-    print('PASS NLQ cases 17/17; production dispatch parity 4/4; ERP calls 0')
+    print('PASS NLQ cases 22/22; production dispatch parity 9/9; ERP calls 0')
     print('PASS manufacturer partial/ambiguous 4/4; no_data conditions 1/1')
     print('PASS vendor/manufacturer collision 1/1')
 

@@ -86,11 +86,6 @@ def _diagnostic_sql(
     monthly_scope = _scope_clause(f"M.{monthly_prefix}_Stock_Cd", stock_codes, binds, "month_stock")
     inbound_scope = _scope_clause("T.Rd11_Stock_Cd", stock_codes, binds, "in_stock")
     outbound_scope = _scope_clause("T.Rd12_Stock_Cd", stock_codes, binds, "out_stock")
-    if stock_apply_cd:
-        binds["stock_apply_cd"] = stock_apply_cd
-        monthly_scope += f" AND M.{monthly_prefix}_Stock_Apply_Cd = %(stock_apply_cd)s"
-        inbound_scope += " AND T.Rd11_Stock_Apply_Cd = %(stock_apply_cd)s"
-        outbound_scope += " AND T.Rd12_Stock_Apply_Cd = %(stock_apply_cd)s"
     monthly_source_part = "monthly_prior" if use_hybrid else "monthly_current"
     sql = f"""
 SELECT LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) AS product_code,
@@ -188,6 +183,7 @@ def _offline_result() -> dict[str, Any]:
         assert _prefix_sql(contract["outbound"]) in current_sql
         assert "monthly_current" in current_sql
         assert "Rddbc110" not in current_sql and "Rddbc120" not in current_sql
+        assert "Stock_Apply_Cd" not in current_sql and "stock_apply_cd" not in current_binds
         assert current_binds["month_to"] == "202609"
 
         historical_sql, historical_binds = _diagnostic_sql(
@@ -200,6 +196,7 @@ def _offline_result() -> dict[str, Any]:
         )
         assert "monthly_prior" in historical_sql
         assert "Rddbc110" in historical_sql and "Rddbc120" in historical_sql
+        assert "Stock_Apply_Cd" not in historical_sql and "stock_apply_cd" not in historical_binds
         assert historical_binds["month_to"] == "202607"
         assert historical_binds["date_from"] == "20260801"
         assert historical_binds["date_to"] == "20260815"
@@ -290,6 +287,7 @@ def _live_result(args: argparse.Namespace) -> dict[str, Any]:
         "stock_mode": scope.stock_mode,
         "stock_code_count": len(stock_codes),
         "io_gu_profile_count_ignored_for_stock": len(scope.io_gu_codes),
+        "stock_apply_cd_ignored_for_stock": stock_apply_cd,
         "period_policy": period_policy,
         "diagnostic_select_count": 1,
         "diagnostic_source_shape": "monthly_plus_detail" if period_policy["use_hybrid_detail"] else "monthly_only",

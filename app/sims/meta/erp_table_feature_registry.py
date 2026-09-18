@@ -275,7 +275,10 @@ ORDER_CALCULATION = ErpTableFeatureSpec(
     table_key="order_calculation", source_table="snapshot.frequency_product",
     category="발주 계산", required_permission="IO_READ",
     primary_key=("company_id", "order_date", "order_vendor_cd", "physic_cd"),
-    filters=RDDBC170_RDDBC180.filters,
+    filters=(*RDDBC170_RDDBC180.filters, ErpFilterSpec(
+        "staff_nm", "발주담당자", "최종 발주처코드 -> Rddbc030.Rd03_Sales_Man -> Rddbc060.Rd06_User_Nm",
+        "text", ("담당자",),
+    )),
     actions=(ErpTableActionSpec(
         action="발주 계산", aliases=("발주 추천", "발주 수량 계산", "권장 발주량", "추천 발주량", "발주할 수량"), mode="calculation",
         service_function="app.services.order_calculation_service.get_order_calculation_result",

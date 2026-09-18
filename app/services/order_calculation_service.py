@@ -199,13 +199,11 @@ def load_sources(params: dict) -> dict:
         if source_params.get(field + "_cd"):
             source_params.pop(field + "_nm", None)
     frame = snapshot.get("df", pd.DataFrame())
-    frame = frame.rename(columns={"품목손익등급": "손익등급", "품목기여등급": "기여도등급"})
     if frame.empty:
         return {"snapshot": snapshot, "base": frame}
     # No new forecast model; the existing service supplies stock and quantity forecast together.
     # Saved classification is R040 Tax scope, not the legacy Physic_Gu filter.
     demand_params = build_demand_params(source_params, scope)
-    demand_params['order_stock_apply_cd'] = params.get('stock_apply_cd')
     demand = call('forecast_stock', get_stock_shortage_df, demand_params, product_universe_df=frame[["제품코드"]])
     for key in ('stock_sql_ms', 'stock_aggregate_ms', 'stock_shortage_build_ms', 'stock_shortage_total_ms'):
         timings[key] = demand.attrs.get(key, 0)
@@ -231,13 +229,6 @@ def load_sources(params: dict) -> dict:
     defaults = normalize_company_default_conditions(profile.profile)
     suppliers = call('representative_vendor', get_dashboard_inbound_facts, source_params, data_cutoff_date=reference.strftime("%Y%m%d"),
         vendor_lookback_days=int(defaults.get("major_purchase_vendor_days", 90)))
-    staff_vendors = None
-    if params.get("staff_nm"):
-        from app.services.rddbc030_service import search_vendors_full
-        staff_rows = call('staff_vendor_source', search_vendors_full, sales_man_nm=params["staff_nm"], only_active=False, top=100000)
-        if len(staff_rows) >= 100000:
-            raise ValueError("발주담당자 거래처 범위의 완전성을 확인하지 못했습니다.")
-        staff_vendors = set(staff_rows["Rd03_Ven_Cd"].astype(str).str.strip()) if not staff_rows.empty else set()
     pending_params = build_pending_params(source_params)
     pending = call('pending_four_business_days', get_expected_inbound_product_totals, pending_params)
     prices = call('prices_code_names', get_rddbc230_result, source_params)
@@ -264,7 +255,6 @@ def load_sources(params: dict) -> dict:
             "business_dates": business_dates, "calendar_status": authority.status,
             "elapsed_days": context.elapsed_business_days,
             "normal_outbound_verified": True,
-            "staff_vendors": staff_vendors,
             "source_params": source_params, "current_customer_counts": customer_counts,
             "order_history": order_history, "order_history_complete": order_history_complete,
             "performance_ms": timings,
@@ -313,7 +303,10 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         supplier = vendors.get(code, {})
         vendor_code = str(supplier.get("recent_inbound_vendor_code") or "").strip()
         vendor_name = str(supplier.get("recent_inbound_vendor_name") or "").strip()
-        if sources.get("staff_vendors") is not None and vendor_code not in sources["staff_vendors"]:
+        order_staff_code = str(supplier.get("recent_inbound_vendor_staff_code") or "").strip()
+        order_staff_name = str(supplier.get("recent_inbound_vendor_staff_name") or "").strip()
+        staff_filter = str(params.get("staff_nm") or "").strip()
+        if staff_filter and staff_filter != order_staff_code and staff_filter not in order_staff_name:
             continue
         if params.get("order_vendor_cd") and params["order_vendor_cd"] != vendor_code:
             continue
@@ -434,7 +427,8 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
                "조달주의": '' if unit is not None else unit_reason, "발주단가": price, "단가출처": price_source,
                "재고적용처코드": params.get("stock_apply_cd", ""), "재고적용처": params.get("stock_apply_nm", ""),
                "단가적용처코드": params.get("cost_apply_cd", ""), "단가적용처": params.get("cost_apply_nm", ""),
-               "발주담당자": params.get("staff_nm", ""), "매입거래처수": None}
+               "발주담당자코드": order_staff_code, "발주담당자": order_staff_name,
+               "매입거래처수": int(supplier.get("recent_inbound_vendor_count_90") or 0)}
         row["추천대비수정수량"] = Decimal(0) if quantity["추천 발주수량"] is not None else None
         actual = quantity["실제 발주수량"]
         row.update(amounts(actual if actual is not None else Decimal(0), price) if actual is not None else amounts(Decimal(0), None))
@@ -500,15 +494,17 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
             return {**snapshot, "action": ACTION, "title": ACTION, "table": TABLE}
         frame = assemble_result(q, sources)
     primary = ["제품코드", "제품명", "규격", "추세", "계산 발주수량", "추천 발주수량", "실제 발주수량",
-               "재고수량", "입고예정수량", "발주처", "발주단가", "발주금액(부가세포함)",
+               "재고수량", "입고예정수량", "발주처", "발주담당자", "매입거래처수",
+               "발주단가", "발주금액(부가세포함)",
                "월 기준 예상수량", "안전재고 기준수량", "적용 필요예정수량",
                "수요근거", "기준 1영업일 예상수량", "발주단위",
-               "당월 출고 거래처수", "3개월출고거래처수", "당월 정상출고수량", "3개월출고수량", "기여도등급", "손익등급", "출고빈도등급",
-               "매입거래처수", "제약사", "계산상태", "단가출처", "조달주의"]
+               "당월 출고 거래처수", "3개월출고거래처수", "당월 정상출고수량", "3개월출고수량", "품목기여등급", "품목손익등급", "출고빈도등급",
+               "제약사", "계산상태", "단가출처", "조달주의"]
     detail = ["기준 1영업일 예상수량", "당월 정상출고수량", "당월 출고 거래처수", "3개월출고수량",
-              "3개월출고거래처수", "매입거래처수", "발주단위", "발주단위 근거", "단가출처",
+              "3개월출고거래처수", "매입거래처수", "발주담당자코드", "발주담당자",
+              "발주단위", "발주단위 근거", "단가출처",
               "단가적용처코드", "단가적용처", "재고적용처코드", "재고적용처", "계산상태", "조달주의",
-              "기여도등급", "손익등급", "출고빈도등급"]
+              "품목기여등급", "품목손익등급", "출고빈도등급"]
     export_order = list(dict.fromkeys(primary[:15] + detail + list(frame.columns)))
     frame = frame.loc[:, [c for c in export_order if c in frame]]
     projection_started = time.perf_counter()
@@ -563,14 +559,22 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
             "elapsed_authority": "order_calculation_request_to_result_ready",
             "request_started_at": request_started_at,
             "request_started_monotonic": request_started_monotonic,
-            "purchase_customer_3m_authority": "unavailable: approved Snapshot 2.1 and loaded inbound facts do not store distinct purchase customer counts",
+            "purchase_customer_3m_authority": "R110 정상입고 / 기준일 포함 최근 90일 / 제품별 DISTINCT 매입거래처코드",
+            "order_staff_authority": "최종 발주처코드 -> R030 Sales_Man -> R060 사용자명",
+            "order_staff_resolution": {
+                "missing_order_vendor": int(frame.get("발주처코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().eq("").sum()),
+                "missing_sales_man": int((frame.get("발주처코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().ne("") & frame.get("발주담당자코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().eq("")).sum()),
+                "unmatched_user": int((frame.get("발주담당자코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().ne("") & frame.get("발주담당자", pd.Series(dtype="object")).fillna("").astype(str).str.strip().eq("")).sum()),
+            },
             "settlement_rounding_status": "정산 반올림 미적용(원 계산 보존)", "full_source_ready": True}
     log.info("[order_calculation.query] company_id=%s rows=%s snapshot=%s source_call_count=%s elapsed_ms=%s",
              current, len(frame), meta.get("snapshot_manifest_id"), meta["source_call_count"],
              round((time.perf_counter() - started) * 1000, 1))
-    return {"table": TABLE, "action": ACTION, "title": ACTION, "params": q, "df": frame,
+    payload = {"table": TABLE, "action": ACTION, "title": ACTION, "params": q, "df": frame,
             "df_display": display, "records": display.to_dict("records"), "columns": list(display),
             "data": summary, "message": summary, "meta": meta, "final": True}
+    from app.services.snapshot_product_information_service import project_product_information_payload_for_viewer
+    return project_product_information_payload_for_viewer(payload)
 
 
 def get_order_calculation_export_df(params=None):

@@ -355,7 +355,7 @@ def test_product_inventory_snapshot_attachment() -> None:
     _assert(meta["frequency_snapshot_status"] == "ready" and meta["frequency_additional_erp_source_call_count"] == 0, "ready attachment keeps ERP calls at zero")
     _assert(
         list(attached.columns[:6]) == [
-            "제품코드", "출고빈도등급", "손익등급", "기여도등급",
+            "제품코드", "출고빈도등급", "품목손익등급", "품목기여등급",
             "3개월 출고발생수", "재고수량",
         ],
         "Snapshot grades must remain beside the shared product key when insurance code is absent",

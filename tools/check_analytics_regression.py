@@ -13726,18 +13726,18 @@ def run_basic_checks() -> list[CheckResult]:
 
                 io_scope_mod.query_to_df = _capture_stock_query
                 io_scope_mod._load_product_current_month_stock_movements(
-                    ["P001"], stock_mode="real", date_to="20260918"
+                    ["P001"], stock_mode="real", date_to="20260918", stock_apply_cd="50001"
                 )
                 io_scope_mod._load_product_current_month_stock_movements(
-                    ["P001"], stock_mode="book", date_to="20260918"
+                    ["P001"], stock_mode="book", date_to="20260918", stock_apply_cd="59999"
                 )
                 io_scope_mod._load_product_current_stock(
                     ["P001"], stock_mode="real", month_to="202608",
-                    date_to="20260831", policy_date="20260918",
+                    date_to="20260831", policy_date="20260918", stock_apply_cd="50001",
                 )
                 io_scope_mod._load_product_current_stock(
                     ["P001"], stock_mode="book", month_to="202608",
-                    date_to="20260831", policy_date="20260918",
+                    date_to="20260831", policy_date="20260918", stock_apply_cd="59999",
                 )
             finally:
                 io_scope_mod.query_to_df = old_stock_query
@@ -13756,6 +13756,8 @@ def run_basic_checks() -> list[CheckResult]:
                         io_scope_errors.append(f"{label}_stock_prefix_contract_missing")
                     if "ABS(ISNULL(T.Rd11_Quantity" in sql or "ABS(ISNULL(T.Rd12_Quantity" in sql:
                         io_scope_errors.append(f"{label}_return_source_sign_not_preserved")
+                    if "Stock_Apply_Cd" in sql or "stock_apply_cd" in sql:
+                        io_scope_errors.append(f"{label}_stock_apply_filter_present")
                     if label.endswith("detail") and any(f"IN ({value})" in sql for value in excluded):
                         io_scope_errors.append(f"{label}_excluded_prefix_present")
             zero_io_plan = io_scope_mod._stock_query_batch_plan(stock_cd_count=100, io_gu_count=0, configured_value="1800")

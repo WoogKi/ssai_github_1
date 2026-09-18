@@ -474,8 +474,8 @@ _DISPLAY_NUMERIC_COLS_260 = {
 
 _FREQUENCY_GRADE_COLUMN = "출고빈도등급"
 _FREQUENCY_COUNT_COLUMN = "3개월 출고발생수"
-_PROFIT_GRADE_COLUMN = "손익등급"
-_CONTRIBUTION_GRADE_COLUMN = "기여도등급"
+_PROFIT_GRADE_COLUMN = "품목손익등급"
+_CONTRIBUTION_GRADE_COLUMN = "품목기여등급"
 _FREQUENCY_FILTER_ALL = "전체"
 _FREQUENCY_FILTER_VALUES = (*EXTENDED_FREQUENCY_PROJECTION_GRADES, FREQUENCY_INSUFFICIENT_GRADE)
 
@@ -3029,7 +3029,11 @@ def _current_stock_display_columns(grp: pd.DataFrame) -> list[str]:
         _CONTRIBUTION_GRADE_COLUMN,
     }.issubset(grp.columns):
         stock_index = columns.index("재고수량") + 1
-        columns[stock_index:stock_index] = ["출고빈도등급", "손익등급", "기여도등급"]
+        columns[stock_index:stock_index] = [
+            "출고빈도등급",
+            _PROFIT_GRADE_COLUMN,
+            _CONTRIBUTION_GRADE_COLUMN,
+        ]
     return columns
 
 
@@ -3077,9 +3081,9 @@ def _build_current_stock_table_frames(
     if _FREQUENCY_COUNT_COLUMN in work.columns:
         work["출고횟수"] = pd.to_numeric(work[_FREQUENCY_COUNT_COLUMN], errors="coerce")
     if _PROFIT_GRADE_COLUMN in work.columns:
-        work["손익등급"] = work[_PROFIT_GRADE_COLUMN].fillna("").astype(str).str.strip()
+        work[_PROFIT_GRADE_COLUMN] = work[_PROFIT_GRADE_COLUMN].fillna("").astype(str).str.strip()
     if _CONTRIBUTION_GRADE_COLUMN in work.columns:
-        work["기여도등급"] = work[_CONTRIBUTION_GRADE_COLUMN].fillna("").astype(str).str.strip()
+        work[_CONTRIBUTION_GRADE_COLUMN] = work[_CONTRIBUTION_GRADE_COLUMN].fillna("").astype(str).str.strip()
 
     display_columns = _current_stock_display_columns(work)
 
