@@ -5676,6 +5676,22 @@ def _build_qty_workforward_metrics_from_wide(
         .reset_index(level=0, drop=True)
         .fillna(0)
     )
+    monthly["직전3개월평균수요수량"] = (
+        monthly.groupby("제품코드", dropna=False)["수요수량"]
+        .shift(4)
+        .groupby(monthly["제품코드"], dropna=False)
+        .rolling(3, min_periods=3)
+        .mean()
+        .reset_index(level=0, drop=True)
+        .fillna(0)
+    )
+    monthly["최근3개월대직전3개월증감률"] = [
+        _pct_change(recent3, previous3)
+        for recent3, previous3 in zip(
+            monthly["최근3개월평균수요수량"].tolist(),
+            monthly["직전3개월평균수요수량"].tolist(),
+        )
+    ]
     monthly["수요증감률"] = [
         _pct_change(r3, r6)
         for r3, r6 in zip(monthly["최근3개월평균수요수량"].tolist(), monthly["최근6개월평균수요수량"].tolist())
@@ -5880,6 +5896,8 @@ def get_stock_shortage_df(
             "완료월평균수요수량",
             "최근3개월평균수요수량",
             "최근6개월평균수요수량",
+            "직전3개월평균수요수량",
+            "최근3개월대직전3개월증감률",
             "수요증감률",
             "수요적용증감률",
             "수요예상기준",
@@ -5902,6 +5920,8 @@ def get_stock_shortage_df(
         "완료월평균수요수량",
         "최근3개월평균수요수량",
         "최근6개월평균수요수량",
+        "직전3개월평균수요수량",
+        "최근3개월대직전3개월증감률",
         "수요증감률",
         "수요적용증감률",
         "예상기준월수량",

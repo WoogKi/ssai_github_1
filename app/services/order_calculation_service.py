@@ -16,7 +16,8 @@ import pandas as pd
 
 from app.db.mssql_client import get_current_company_id, query_to_df, read_only_request
 from app.services.order_calculation_contract import (
-    OrderConditions, amounts, calculate_quantities, demand_for_dates, horizon_dates, infer_order_unit,
+    OrderConditions, amounts, calculate_quantities, demand_for_dates, demand_trend_adjustment,
+    horizon_dates, infer_order_unit,
 )
 
 ACTION = "발주 계산"
@@ -305,8 +306,13 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         vendor_name = str(supplier.get("recent_inbound_vendor_name") or "").strip()
         order_staff_code = str(supplier.get("recent_inbound_vendor_staff_code") or "").strip()
         order_staff_name = str(supplier.get("recent_inbound_vendor_staff_name") or "").strip()
-        staff_filter = str(params.get("staff_nm") or "").strip()
-        if staff_filter and staff_filter != order_staff_code and staff_filter not in order_staff_name:
+        pharma_staff_code = str(supplier.get("manufacturer_staff_code") or "").strip()
+        pharma_staff_name = str(supplier.get("manufacturer_staff_name") or "").strip()
+        order_staff_filter = str(params.get("order_staff_nm") or "").strip()
+        pharma_staff_filter = str(params.get("pharma_staff_nm") or "").strip()
+        if order_staff_filter and order_staff_filter != order_staff_code and order_staff_filter not in order_staff_name:
+            continue
+        if pharma_staff_filter and pharma_staff_filter != pharma_staff_code and pharma_staff_filter not in pharma_staff_name:
             continue
         if params.get("order_vendor_cd") and params["order_vendor_cd"] != vendor_code:
             continue
@@ -319,11 +325,28 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         if params.get("stock_apply_nm") and not params.get("stock_apply_cd"):
             # A name-only application cannot safely constrain stock by an exact code.
             stock = None
-        plan = decimal_or_none(demand.get("당월 예상출고수량"))
+        forecast_plan = decimal_or_none(demand.get("당월 예상출고수량"))
+        base_plan = decimal_or_none(demand.get("예상기준월수량"))
+        if base_plan is None:
+            base_plan = forecast_plan
         basis = str(demand.get("수요예상기준") or "")
+        current_actual = decimal_or_none(demand.get("당월 현재출고수량"))
+        recent_3m_avg = decimal_or_none(demand.get("최근3개월평균수요수량"))
+        if recent_3m_avg is None:
+            recent_3m_avg = decimal_or_none(demand.get("최근3개월평균출고수량"))
+        previous_3m_avg = decimal_or_none(demand.get("직전3개월평균수요수량"))
+        completed_months = int(decimal_or_none(demand.get("완료월수")) or 0)
+        frequency_grade = str(basic.get("출고빈도등급") or demand.get("출고빈도등급") or "").strip().upper()
+        trend_rate, trend_adjustment, trend_reason = demand_trend_adjustment(
+            recent_3m_avg=recent_3m_avg,
+            previous_3m_avg=previous_3m_avg,
+            completed_months=completed_months,
+            frequency_grade=frequency_grade,
+        )
+        adjusted_plan = base_plan * (Decimal(1) + trend_adjustment) if base_plan is not None else None
         plans = {}
-        if plan is not None and basis and "부족" not in basis:
-            plans[reference.strftime("%Y%m")] = plan
+        if adjusted_plan is not None and adjusted_plan > 0 and basis and "부족" not in basis:
+            plans[reference.strftime("%Y%m")] = adjusted_plan
         # Explicit future plans may be supplied by an existing adapter; never extend current plan.
         plans.update(sources.get("future_plans", {}).get(code, {}))
         hd, missing = demand_for_dates(horizon, reference_date=reference,
@@ -332,17 +355,18 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         sd, safety_missing = demand_for_dates(safety, reference_date=reference,
                                              business_dates=dates, monthly_forecast=plans,
                                              month_day_counts=month_day_counts, date_month_counts=safety_month_counts)
-        current_actual = decimal_or_none(demand.get("당월 현재출고수량"))
         elapsed = sources.get("elapsed_days")
-        daily = plan / Decimal(month_days) if reference.strftime("%Y%m") in plans and month_days else None
+        daily = adjusted_plan / Decimal(month_days) if reference.strftime("%Y%m") in plans and month_days else None
         forecast_basis = basis
         basis = "예측기반" if reference.strftime("%Y%m") in plans else "수요근거 없음"
+        fallback_reason = trend_reason
         if not plans and sources.get("normal_outbound_verified") and current_actual is not None and current_actual > 0 and elapsed:
             daily = current_actual / Decimal(elapsed)
             # Actual-pace fallback is allowed only within the known current month.
             hd = daily * len(horizon) if all(d.month == reference.month for d in horizon) else None
             sd = daily * len(safety) if all(d.month == reference.month for d in safety) else None
             basis = "실적기반"
+            fallback_reason = "current_month_actual_pace"
             missing = tuple(m for m in missing if m != reference.strftime("%Y%m"))
             safety_missing = tuple(m for m in safety_missing if m != reference.strftime("%Y%m"))
         calendar_ready = sources.get("calendar_status") == "ready"
@@ -350,9 +374,7 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
             hd = sd = None
             daily = None
         pending_qty = decimal_or_none(pending.get(code, {}).get("입고예정수량", 0))
-        growth = decimal_or_none(demand.get("최근3개월수량증감률"))
-        history_count = decimal_or_none(demand.get("완료월수"))
-        increasing = growth is not None and growth > 0 and history_count is not None and history_count >= 3
+        increasing = trend_adjustment > 0
         demand_ms += (time.perf_counter() - demand_started) * 1000
         unit_started = time.perf_counter()
         selected_history = history_groups.get((code, vendor_code), [])
@@ -415,7 +437,7 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
                "적용 horizon 영업일수": len(horizon), "horizon 예정수량": hd,
                "적용 필요 영업일수": len(horizon), "적용 필요예정수량": hd,
                "당월 정상출고수량": current_actual, "수요근거": basis,
-               "월 기준 예상수량": plan if basis == "예측기반" else None,
+               "월 기준 예상수량": adjusted_plan if basis == "예측기반" else None,
                "예측 산출근거": forecast_basis,
                "해당 월 전체 영업일수": month_days if calendar_ready else None,
                "경과 영업일수": elapsed, "기준 1영업일 예상수량": daily,
@@ -428,7 +450,14 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
                "재고적용처코드": params.get("stock_apply_cd", ""), "재고적용처": params.get("stock_apply_nm", ""),
                "단가적용처코드": params.get("cost_apply_cd", ""), "단가적용처": params.get("cost_apply_nm", ""),
                "발주담당자코드": order_staff_code, "발주담당자": order_staff_name,
-               "매입거래처수": int(supplier.get("recent_inbound_vendor_count_90") or 0)}
+               "제약담당자코드": pharma_staff_code, "제약담당자": pharma_staff_name,
+               "매입거래처수": int(supplier.get("recent_inbound_vendor_count_90") or 0),
+               "base_demand_qty": base_plan, "recent_3m_avg": recent_3m_avg,
+               "previous_3m_avg": previous_3m_avg, "trend_rate": trend_rate,
+               "trend_adjustment": trend_adjustment, "adjusted_demand_qty": adjusted_plan,
+               "raw_order_qty": quantity.get("계산 발주수량"),
+               "final_recommended_qty": quantity.get("추천 발주수량"),
+               "fallback_reason": fallback_reason}
         row["추천대비수정수량"] = Decimal(0) if quantity["추천 발주수량"] is not None else None
         actual = quantity["실제 발주수량"]
         row.update(amounts(actual if actual is not None else Decimal(0), price) if actual is not None else amounts(Decimal(0), None))
@@ -467,6 +496,15 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
     request_started_at = datetime.now().isoformat(timespec="seconds")
     request_started_monotonic = time.monotonic()
     q = apply_application_defaults({"safety_days": 3, "target_days": 15, "closing_day": 25, **dict(params or {})})
+    if q.pop("_ambiguous_staff_role", False):
+        message = "담당자 역할을 지정해 주세요. 발주담당자 또는 제약담당자로 조회할 수 있습니다."
+        return {
+            "table": TABLE, "action": ACTION, "title": ACTION, "params": q,
+            "data": message, "message": message, "records": [], "columns": [], "final": True,
+            "meta": {"result_status": "input_required", "input_required": True,
+                     "service_call_skipped": True, "source_call_count": 0,
+                     "row_count": 0, "row_count_total": 0, "tableless_result": True},
+        }
     mode = q.get("query_mode") or ("발주해당자료만" if q.get("only_needed") else "전체")
     if mode not in ("전체", "발주해당자료만", "확인 필요"):
         raise ValueError("발주 계산 조회구분을 확인하세요.")
@@ -494,7 +532,7 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
             return {**snapshot, "action": ACTION, "title": ACTION, "table": TABLE}
         frame = assemble_result(q, sources)
     primary = ["제품코드", "제품명", "규격", "추세", "계산 발주수량", "추천 발주수량", "실제 발주수량",
-               "재고수량", "입고예정수량", "발주처", "발주담당자", "매입거래처수",
+               "재고수량", "입고예정수량", "발주처", "발주담당자", "제약담당자", "매입거래처수",
                "발주단가", "발주금액(부가세포함)",
                "월 기준 예상수량", "안전재고 기준수량", "적용 필요예정수량",
                "수요근거", "기준 1영업일 예상수량", "발주단위",
@@ -502,10 +540,12 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
                "제약사", "계산상태", "단가출처", "조달주의"]
     detail = ["기준 1영업일 예상수량", "당월 정상출고수량", "당월 출고 거래처수", "3개월출고수량",
               "3개월출고거래처수", "매입거래처수", "발주담당자코드", "발주담당자",
+              "제약담당자코드", "제약담당자",
               "발주단위", "발주단위 근거", "단가출처",
               "단가적용처코드", "단가적용처", "재고적용처코드", "재고적용처", "계산상태", "조달주의",
               "품목기여등급", "품목손익등급", "출고빈도등급"]
-    export_order = list(dict.fromkeys(primary[:15] + detail + list(frame.columns)))
+    # Keep the compact business header deterministic even when optional 규격 is absent.
+    export_order = list(dict.fromkeys(primary[:16] + detail + list(frame.columns)))
     frame = frame.loc[:, [c for c in export_order if c in frame]]
     projection_started = time.perf_counter()
     display = frame.head(300).loc[:, [c for c in primary if c in frame]].copy()
@@ -526,7 +566,8 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
                      f" | 재고적용처명 {q.get('stock_apply_nm') or ''}"
                      f" | 안전재고 {conditions.safety_days}일 | 적정재고 {conditions.target_days}일 | {payment}")
     for field, label in (("physic_cd", "제품코드"),
-                         ("physic_nm", "제품명"), ("order_vendor_nm", "발주처"), ("staff_nm", "발주담당자"),
+                         ("physic_nm", "제품명"), ("order_vendor_nm", "발주처"),
+                         ("order_staff_nm", "발주담당자"), ("pharma_staff_nm", "제약담당자"),
                          ("maker_cd", "제약사코드"), ("order_vendor_cd", "발주처코드"),
                          ("product_keyword", "제품 키워드"), ("insu_cd", "보험코드"),
                          ("maker_nm", "제약사"),
@@ -547,6 +588,7 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
             "order_unit_authority": "R170/R180 최근1개월 대표매입처/반복발주 v1",
             "order_history_period": sources.get('order_history_period'),
             "order_demand_contract": "monthly_forecast_full_business_days_v1",
+            "order_demand_trend_contract": "completed_recent3_vs_previous3_deadband10_half_cap30_before_stock_pending_unit_v1",
             "summary_md": summary, "llm_summary_md": summary + "\n계산/추천/실제수량은 독립입니다. 단가와 수요 확인 필요 상태를 정상값으로 해석하지 마세요. ERP 발주 확정 또는 회계 확정손익이 아닙니다.",
             "order_calculation_editable": True, "query_summary": query_summary,
             "calculation_basis": calculation_basis + " | 입고예정 최근 4영업일",
@@ -561,6 +603,7 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
             "request_started_monotonic": request_started_monotonic,
             "purchase_customer_3m_authority": "R110 정상입고 / 기준일 포함 최근 90일 / 제품별 DISTINCT 매입거래처코드",
             "order_staff_authority": "최종 발주처코드 -> R030 Sales_Man -> R060 사용자명",
+            "pharma_staff_authority": "제품마스터 제약사코드(R040 Rd04_Ven_Cd) -> R030 Sales_Man -> R060 사용자명",
             "order_staff_resolution": {
                 "missing_order_vendor": int(frame.get("발주처코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().eq("").sum()),
                 "missing_sales_man": int((frame.get("발주처코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().ne("") & frame.get("발주담당자코드", pd.Series(dtype="object")).fillna("").astype(str).str.strip().eq("")).sum()),

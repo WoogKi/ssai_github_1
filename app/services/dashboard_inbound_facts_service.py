@@ -150,6 +150,10 @@ def _sql(params: Mapping[str, Any], *, start_date: str, cutoff_date: str) -> tup
     return f"""
 SELECT
     LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code,
+    LTRIM(RTRIM(P.Rd04_Ven_Cd)) AS manufacturer_vendor_code,
+    LTRIM(RTRIM(ManufacturerVendor.Rd03_Ven_Nm)) AS manufacturer_vendor_name,
+    LTRIM(RTRIM(ManufacturerVendor.Rd03_Sales_Man)) AS manufacturer_staff_code,
+    LTRIM(RTRIM(ManufacturerStaff.Rd06_User_Nm)) AS manufacturer_staff_name,
     LTRIM(RTRIM(P.Rd04_Orven_Cd)) AS master_order_vendor_code,
     LTRIM(RTRIM(MasterVendor.Rd03_Ven_Nm)) AS master_order_vendor_name,
     LTRIM(RTRIM(MasterVendor.Rd03_Sales_Man)) AS master_order_staff_code,
@@ -175,6 +179,10 @@ LEFT JOIN dbo.Rddbc030 AS MasterVendor WITH (NOLOCK)
     ON MasterVendor.Rd03_Ven_Cd = P.Rd04_Orven_Cd
 LEFT JOIN dbo.Rddbc060 AS MasterStaff WITH (NOLOCK)
     ON MasterStaff.Rd06_User_Cd = MasterVendor.Rd03_Sales_Man
+LEFT JOIN dbo.Rddbc030 AS ManufacturerVendor WITH (NOLOCK)
+    ON ManufacturerVendor.Rd03_Ven_Cd = P.Rd04_Ven_Cd
+LEFT JOIN dbo.Rddbc060 AS ManufacturerStaff WITH (NOLOCK)
+    ON ManufacturerStaff.Rd06_User_Cd = ManufacturerVendor.Rd03_Sales_Man
 WHERE {where_sql}
 """, binds
 
@@ -196,6 +204,8 @@ def build_dashboard_inbound_facts_frame(
         "normal_inbound_90_exists", "normal_inbound_365_exists", "recent_inbound_vendor_code",
         "recent_inbound_vendor_name", "recent_inbound_vendor_qty_90", "recent_inbound_vendor_last_date", "recent_inbound_vendor_source",
         "recent_inbound_vendor_staff_code", "recent_inbound_vendor_staff_name",
+        "manufacturer_vendor_code", "manufacturer_vendor_name",
+        "manufacturer_staff_code", "manufacturer_staff_name",
         "recent_inbound_vendor_count_90", "master_order_staff_code", "master_order_staff_name",
         "recent_inbound_vendor_fallback", "inbound_cycle_days", "inbound_vendor_days", "data_cutoff_date",
     ]
@@ -210,6 +220,8 @@ def build_dashboard_inbound_facts_frame(
     for key in (
         "inbound_date", "io_tcode", "vendor_code", "inbound_vendor_name",
         "inbound_vendor_staff_code", "inbound_vendor_staff_name",
+        "manufacturer_vendor_code", "manufacturer_vendor_name",
+        "manufacturer_staff_code", "manufacturer_staff_name",
         "master_order_vendor_code", "master_order_vendor_name",
         "master_order_staff_code", "master_order_staff_name",
     ):
@@ -240,6 +252,8 @@ def build_dashboard_inbound_facts_frame(
     normalize_ms = int((time.perf_counter() - normalize_started) * 1000)
 
     master_columns = [
+        "manufacturer_vendor_code", "manufacturer_vendor_name",
+        "manufacturer_staff_code", "manufacturer_staff_name",
         "master_order_vendor_code", "master_order_vendor_name",
         "master_order_staff_code", "master_order_staff_name",
     ]

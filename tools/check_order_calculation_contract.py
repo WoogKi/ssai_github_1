@@ -8,7 +8,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.order_calculation_contract import (
-    OrderConditions, horizon_dates, demand_for_dates, calculate_quantities, recommend_quantity, amounts,
+    OrderConditions, horizon_dates, demand_for_dates, demand_trend_adjustment,
+    calculate_quantities, recommend_quantity, amounts,
 )
 from app.services.order_calculation_service import assemble_result, get_order_calculation_result
 from app.ui.order_calculation_editor import apply_actual_edits
@@ -77,6 +78,48 @@ def test_quantities():
     assert calculate_quantities(stock=D(100), pending=D(0), safety_demand=D(3), horizon_demand=D(50))["추천 발주수량"] == 0
 
 
+def test_demand_trend_adjustment():
+    cases = (
+        (0, 0), (5, 0), (10, 0), (20, 10), (40, 20), (60, 30), (100, 30),
+        (-5, 0), (-10, 0), (-20, -10), (-40, -20), (-60, -30), (-100, -30),
+    )
+    for rate_pct, expected_pct in cases:
+        recent = D(100) * (D(1) + D(rate_pct) / D(100))
+        rate, adjustment, _reason = demand_trend_adjustment(
+            recent_3m_avg=recent, previous_3m_avg=D(100), completed_months=6, frequency_grade="A",
+        )
+        assert rate == D(rate_pct) / D(100)
+        assert adjustment == D(expected_pct) / D(100)
+    for grade in ("F", "X"):
+        rate, adjustment, reason = demand_trend_adjustment(
+            recent_3m_avg=D(0), previous_3m_avg=D(100), completed_months=6, frequency_grade=grade,
+        )
+        assert rate is None and adjustment == 0 and grade in reason
+    assert demand_trend_adjustment(
+        recent_3m_avg=D(2), previous_3m_avg=D(1), completed_months=5, frequency_grade="A",
+    )[1] == 0
+
+    boundary_cases = (
+        ("90.0001", "0"), ("90.0000", "0"), ("89.9999", "-0.0500005"),
+        ("109.9999", "0"), ("110.0000", "0"), ("110.0001", "0.0500005"),
+    )
+    for recent_text, expected_adjustment in boundary_cases:
+        _rate, adjustment, _reason = demand_trend_adjustment(
+            recent_3m_avg=D(recent_text), previous_3m_avg=D(100),
+            completed_months=6, frequency_grade="A",
+        )
+        assert adjustment == D(expected_adjustment), (recent_text, adjustment)
+
+    # Product 27252 equivalent: the recurring three-month average arrives as
+    # a finite decimal just below 13 1/3, but the business change is -10%.
+    for previous_text in ("13.33333333333333", "13.333333333333332"):
+        _rate, adjustment, reason = demand_trend_adjustment(
+            recent_3m_avg=D(12), previous_3m_avg=D(previous_text),
+            completed_months=6, frequency_grade="A",
+        )
+        assert adjustment == 0 and reason == "deadband", previous_text
+
+
 def test_full_month_forecast_and_blank_pending():
     from app.services.order_calculation_service import build_pending_params
     params, sources = fixture()
@@ -138,6 +181,10 @@ def fixture():
                              "recent_inbound_vendor_count_90": [2],
                              "recent_inbound_vendor_staff_code": ["U001"],
                              "recent_inbound_vendor_staff_name": ["홍길동"],
+                             "manufacturer_vendor_code": ["M001"],
+                             "manufacturer_vendor_name": ["fixture-maker"],
+                             "manufacturer_staff_code": ["P001"],
+                             "manufacturer_staff_name": ["이기재"],
                              "master_order_staff_code": ["U999"],
                              "master_order_staff_name": ["다른담당자"]})
     params = {"company_id": 7, "order_date": "2026-09-25", "safety_days": 3, "target_days": 15, "closing_day": 25, "price_basis": "real"}
@@ -145,6 +192,44 @@ def fixture():
         "suppliers": supplier, "pending": pd.DataFrame(), "prices": {"df": pd.DataFrame()},
         "calendar_status": "ready", "business_dates": [date(2026, 9, d) for d in (28, 29, 30)]}
     return params, sources
+
+
+def test_trend_applies_before_stock_pending_and_unit():
+    params, sources = fixture()
+    params.update(order_date="2026-09-01", safety_days=15, target_days=15)
+    sources["business_dates"] = [date(2026, 9, day) for day in range(2, 31)
+                                 if date(2026, 9, day).weekday() < 5][:15]
+    sources["demand"]["현재재고수량"] = D(60)
+    sources["demand"]["당월 예상출고수량"] = D(999)
+    sources["demand"]["예상기준월수량"] = D(100)
+    sources["demand"]["최근3개월평균수요수량"] = D(140)
+    sources["demand"]["직전3개월평균수요수량"] = D(100)
+    sources["demand"]["완료월수"] = 6
+    sources["base"]["출고빈도등급"] = "A"
+    sources["pending"] = pd.DataFrame({"제품코드": ["00001"], "입고예정수량": [D(20)]})
+    row = assemble_result(params, sources).iloc[0]
+    assert row["base_demand_qty"] == 100
+    assert row["trend_rate"] == D("0.4") and row["trend_adjustment"] == D("0.2")
+    assert row["adjusted_demand_qty"] == 120
+    assert row["계산 발주수량"] == 40 and row["추천 발주수량"] == 40
+    assert row["raw_order_qty"] == 40 and row["final_recommended_qty"] == 40
+
+    for grade in ("F", "X"):
+        grade_sources = {**sources, "base": sources["base"].copy(), "demand": sources["demand"].copy()}
+        grade_sources["base"]["출고빈도등급"] = grade
+        grade_row = assemble_result(params, grade_sources).iloc[0]
+        assert grade_row["trend_adjustment"] == 0 and grade_row["adjusted_demand_qty"] == 100
+
+    pace_sources = {**sources, "base": sources["base"].copy(), "demand": sources["demand"].copy()}
+    pace_sources["base"]["출고빈도등급"] = "X"
+    pace_sources["demand"]["예상기준월수량"] = D(0)
+    pace_sources["demand"]["당월 예상출고수량"] = D(0)
+    pace_sources["demand"]["당월 현재출고수량"] = D(10)
+    pace_sources["elapsed_days"] = 5
+    pace_sources["normal_outbound_verified"] = True
+    pace_row = assemble_result(params, pace_sources).iloc[0]
+    assert pace_row["수요근거"] == "실적기반"
+    assert pace_row["fallback_reason"] == "current_month_actual_pace"
 
 
 def test_assembly_edit_export():
@@ -184,9 +269,12 @@ def test_purchase_vendor_count_staff_and_sensitive_projection():
     row = assemble_result(params, sources).iloc[0]
     assert row["매입거래처수"] == 2
     assert row["발주담당자코드"] == "U001" and row["발주담당자"] == "홍길동"
+    assert row["제약담당자코드"] == "P001" and row["제약담당자"] == "이기재"
     assert row["발주담당자"] != sources["suppliers"].iloc[0]["master_order_staff_name"]
-    assert len(assemble_result({**params, "staff_nm": "홍길"}, sources)) == 1
-    assert assemble_result({**params, "staff_nm": "없는담당자"}, sources).empty
+    assert len(assemble_result({**params, "order_staff_nm": "홍길"}, sources)) == 1
+    assert assemble_result({**params, "order_staff_nm": "없는담당자"}, sources).empty
+    assert len(assemble_result({**params, "pharma_staff_nm": "이기"}, sources)) == 1
+    assert assemble_result({**params, "pharma_staff_nm": "없는담당자"}, sources).empty
     sensitive = {"추정단위손익", "추정손익률", "추정기여금액"}
     with patch("app.services.order_calculation_service.get_current_company_id", return_value=7), \
          patch("app.services.snapshot_product_information_service.product_information_cost_visible", return_value=False):
@@ -472,7 +560,7 @@ def test_code_lookup_company_cache():
 
 
 if __name__ == "__main__":
-    tests = (test_horizon, test_monthly_allocation, test_quantities, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_editor_callback_ownership_and_cache)
+    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_editor_callback_ownership_and_cache)
     tests += (test_empty_parameter_bridge_and_check_mode, test_snapshot_scope_to_demand_scope)
     tests += (test_code_lookup_company_cache,)
     tests += (test_excel_numeric_round_trip, test_production_editor_render_boundary)
@@ -520,10 +608,12 @@ if __name__ == "__main__":
         updated = apply_actual_edits(pd.DataFrame([row]), pd.DataFrame([row]), {0: {'실제 발주수량': '40'}}).iloc[0]
         assert updated['계산 발주수량'] == 32 and updated['추천 발주수량'] == 30
         assert updated['실제 발주수량'] == 40 and updated['발주금액(부가세포함)'] == 4400
-        sources['demand']['최근3개월수량증감률'] = D(10)
-        sources['demand']['완료월수'] = 3
+        sources['base']['출고빈도등급'] = 'A'
+        sources['demand']['최근3개월평균수요수량'] = D(120)
+        sources['demand']['직전3개월평균수요수량'] = D(100)
+        sources['demand']['완료월수'] = 6
         assert assemble_result(params, sources).iloc[0]['추천 발주수량'] == 40
-        sources['demand']['최근3개월수량증감률'] = D(0)
+        sources['demand']['최근3개월평균수요수량'] = D(100)
         sources['order_history']['발주수량'] = 100
         zero = assemble_result(params, sources).iloc[0]
         assert zero['계산 발주수량'] == 32 and zero['추천 발주수량'] == 100
@@ -633,7 +723,7 @@ if __name__ == "__main__":
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
             result = get_order_calculation_result(params, source_loader=lambda q: sources)
         primary_front = ['제품코드', '제품명', '추세', '계산 발주수량', '추천 발주수량', '실제 발주수량',
-                '재고수량', '입고예정수량', '발주처', '발주담당자', '매입거래처수',
+                '재고수량', '입고예정수량', '발주처', '발주담당자', '제약담당자', '매입거래처수',
                 '발주단가', '발주금액(부가세포함)', '월 기준 예상수량']
         assert list(result['df'].columns[:len(primary_front)]) == primary_front
         assert list(result['df_display'].columns[:len(primary_front)]) == primary_front

@@ -112,3 +112,26 @@ def calculate_quantities(*, stock: Decimal, pending: Decimal | None,
         recommend_quantity(raw, unit, increasing=increasing) if trigger else Decimal(0))
     return {"발주trigger": trigger, "계산 발주수량": raw,
             "추천 발주수량": recommended, "실제 발주수량": recommended}
+
+
+def demand_trend_adjustment(
+    *, recent_3m_avg: Decimal | None, previous_3m_avg: Decimal | None,
+    completed_months: int, frequency_grade: str,
+) -> tuple[Decimal | None, Decimal, str]:
+    """Apply the approved deadband/half-rate/cap policy to demand only."""
+    grade = str(frequency_grade or "").strip().upper()
+    if grade == "F":
+        return None, Decimal(0), "frequency_F_new_product_excluded"
+    if grade == "X":
+        return None, Decimal(0), "frequency_X_no_recent_outbound_excluded"
+    if completed_months < 6 or recent_3m_avg is None or previous_3m_avg is None:
+        return None, Decimal(0), "insufficient_six_completed_months"
+    if previous_3m_avg <= 0:
+        return None, Decimal(0), "previous_3m_non_positive"
+    rate = recent_3m_avg / previous_3m_avg - Decimal(1)
+    # Compare the source quantities directly so a repeating monthly average
+    # cannot push an exact 10% boundary outside the deadband after division.
+    if abs(recent_3m_avg - previous_3m_avg) <= previous_3m_avg * Decimal("0.10"):
+        return rate, Decimal(0), "deadband"
+    adjustment = max(Decimal("-0.30"), min(Decimal("0.30"), rate * Decimal("0.50")))
+    return rate, adjustment, "trend_half_capped"

@@ -1582,7 +1582,7 @@ def _extract_io_compound_named_values(text: str) -> dict[str, str]:
         ("order_nm", ("발주처명", "발주처")),
         ("buy_nm", ("매입처명", "매입처")),
         ("real_ven_nm", ("실납처명", "실납처")),
-        ("sales_man_nm", ("영업사원명", "영업사원")),
+        ("sales_man_nm", ("영업담당자명", "영업담당자", "영업사원명", "영업사원")),
         ("stock_nm", ("재고위치명", "재고위치")),
     )
     def label_pattern(label: str) -> str:
@@ -2600,7 +2600,8 @@ def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
     buy_cd = _extract_code(text, "매입처", 5)
 
     real_ven_cd = _extract_code(text, "실납처", 5) or _extract_code(text, "실납처코드", 5)
-    sales_man = _extract_code(text, "영업사원", 5) or _extract_code(text, "영업사원코드", 5)
+    sales_man = (_extract_code(text, "영업사원", 5) or _extract_code(text, "영업사원코드", 5)
+                 or _extract_code(text, "영업담당자", 5) or _extract_code(text, "영업담당자코드", 5))
 
     # Keep every labelled value inside its own condition boundary.  This also
     # preserves legacy product-code handling because matching code values are
@@ -2642,7 +2643,7 @@ def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
     order_nm = compound_named_values.get("order_nm") or _extract_named_text(text, ("발주처명", "발주처"))
     buy_nm = compound_named_values.get("buy_nm") or _extract_named_text(text, ("매입처명", "매입처"))
     real_ven_nm = compound_named_values.get("real_ven_nm") or _extract_named_text(text, ("실납처명", "실납처"))
-    sales_man_nm = compound_named_values.get("sales_man_nm") or _extract_named_text(text, ("영업사원명",))
+    sales_man_nm = compound_named_values.get("sales_man_nm") or _extract_named_text(text, ("영업담당자명", "영업사원명"))
 
     product_group_nm = _extract_named_text(text, ("제품그룹명", "제품그룹", "그룹명"))
     product_di_nm = _extract_named_text(text, ("제품구분명", "제품구분", "구분명"))
