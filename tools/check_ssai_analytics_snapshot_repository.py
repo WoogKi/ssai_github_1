@@ -680,6 +680,7 @@ def test_migration_idempotency_and_rollback() -> None:
             "006_frequency_product_lifecycle_extension",
             "007_snapshot_profile_fingerprint",
             "008_frequency_product_statistics_extension",
+            "009_frequency_product_x_grade",
         ],
         "001-005 authority must apply migrations 006 and 007 in order",
     )
@@ -699,6 +700,7 @@ def test_migration_idempotency_and_rollback() -> None:
             "006_frequency_product_lifecycle_extension",
             "007_snapshot_profile_fingerprint",
             "008_frequency_product_statistics_extension",
+            "009_frequency_product_x_grade",
         ],
         "001-003 authority must apply 004 through 007 in order",
     )

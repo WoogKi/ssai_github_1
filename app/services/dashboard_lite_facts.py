@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from calendar import monthrange
 from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
 import logging
 import re
 import time
@@ -44,7 +45,10 @@ DASHBOARD_LITE_SETTING_DEFAULTS = {
 # Compatibility name for callers that use the service-level fallback directly.
 STOCK_READY_THRESHOLD_PCT = float(DASHBOARD_LITE_SETTING_DEFAULTS["readiness_warning_pct"])
 MAX_DASHBOARD_MONTHS = 13
-INVENTORY_STATUS_ORDER = ("긴급 부족", "재고 경고", "적정 재고", "과다 재고", "예상수요 없음", "자료 부족")
+INVENTORY_STATUS_ORDER = (
+    "자료 부족", "신제품 재고", "예상수요 없음", "수요없는 재고", "긴급 부족",
+    "재고 부족", "안전재고 확보", "적정 재고", "과다 재고",
+)
 
 log = logging.getLogger("ssai.sims.dashboard_lite")
 
@@ -1409,6 +1413,12 @@ def _attach_inventory_status_and_frequency(
     *,
     frequency_snapshot: SnapshotReadResult,
     frequency_rows: tuple[Mapping[str, Any], ...] | None = None,
+    frequency_evaluation_month: str = "",
+    previous_frequency_projection: FrequencyProjectionReadResult | None = None,
+    previous_frequency_evaluation_month: str = "",
+    monthly_business_days: int | None = None,
+    pending_available: bool = False,
+    pending_authority: str = "unavailable",
 ) -> dict[str, Any]:
     """Attach display-only inventory state and approved outbound frequency facts.
 
@@ -1432,36 +1442,28 @@ def _attach_inventory_status_and_frequency(
         }
 
     summary_counts = {label: 0 for label in INVENTORY_STATUS_ORDER}
+    pending_counts = {label: 0 for label in INVENTORY_STATUS_ORDER}
     expected_demand_count = 0
-    frequency_counts = {grade: 0 for grade in ("F", "A", "B", "C", "D", "E", "X", "빈도자료 부족")}
+    negative_pending_count = 0
+    changed_count = 0
+    improved_count = 0
+    changed_to_overstock_count = 0
+    frequency_counts = {grade: 0 for grade in ("A", "B", "C", "D", "E", "F", "X", "빈도자료 부족")}
+    profit_grade_counts = {grade: 0 for grade in ("A", "B", "C", "D", "E", "X", "등급자료 부족")}
+    contribution_grade_counts = {grade: 0 for grade in ("A", "B", "C", "D", "E", "X", "등급자료 부족")}
+    grade_keys = ("A", "B", "C", "D", "E", "X")
+    grade_matrix = {profit: {contribution: 0 for contribution in grade_keys} for profit in grade_keys}
+    grade_missing_reasons = {
+        "product_not_in_projection": 0, "stale": 0, "unavailable": 0,
+        "excluded_adjustment_only": 0, "other": 0,
+    }
+    grade_missing_both = grade_missing_profit_only = grade_missing_contribution_only = 0
     missing_frequency_product_count = 0
     detail_rows: list[dict[str, Any]] = []
     for row in rows:
         product_code = str(row.get("product_code") or "").strip()
         stock_present = bool(row.get("inventory_current_stock_present"))
         demand_present = bool(row.get("evaluation_expected_demand_present"))
-        stock = _num(row.get("current_stock_qty"))
-        demand = _num(row.get("evaluation_expected_demand_qty"))
-        ratio: float | None = None
-        if not stock_present or not demand_present:
-            status = "자료 부족"
-        elif demand <= 0:
-            status = "예상수요 없음"
-        else:
-            expected_demand_count += 1
-            # 재고상태는 실제 재고 원값을 평가월 예상수요와 비교한다.
-            # 음수 재고도 부족 정도를 그대로 드러내야 한다.
-            ratio = stock / demand * 100.0
-            if ratio < 30.0:
-                status = "긴급 부족"
-            elif ratio < 50.0:
-                status = "재고 경고"
-            elif ratio < 150.0:
-                status = "적정 재고"
-            else:
-                status = "과다 재고"
-        summary_counts[status] += 1
-
         frequency = frequency_by_product.get(product_code)
         if frequency is None:
             grade = "빈도자료 부족"
@@ -1475,9 +1477,73 @@ def _attach_inventory_status_and_frequency(
         if grade not in frequency_counts:
             grade = "빈도자료 부족"
         frequency_counts[grade] += 1
+        profit_grade = str(frequency.get("profit_grade") or "").strip().upper() if frequency is not None else ""
+        contribution_grade = str(frequency.get("contribution_grade") or "").strip().upper() if frequency is not None else ""
+        profit_ready = profit_grade in grade_keys
+        contribution_ready = contribution_grade in grade_keys
+        profit_grade_counts[profit_grade if profit_ready else "등급자료 부족"] += 1
+        contribution_grade_counts[contribution_grade if contribution_ready else "등급자료 부족"] += 1
+        if profit_ready and contribution_ready:
+            grade_matrix[profit_grade][contribution_grade] += 1
+        else:
+            grade_missing_both += int(not profit_ready and not contribution_ready)
+            grade_missing_profit_only += int(not profit_ready and contribution_ready)
+            grade_missing_contribution_only += int(profit_ready and not contribution_ready)
+            reason = "product_not_in_projection" if frequency is None else str(frequency.get("profitability_status") or "")
+            grade_missing_reasons[reason if reason in grade_missing_reasons else "other"] += 1
+
+        stock = _num(row.get("current_stock_qty"))
+        demand = _num(row.get("evaluation_expected_demand_qty"))
+        expected_demand_count += int(demand_present and demand > 0)
+
+        def classify(stock_value: Any) -> tuple[str, Decimal | None]:
+            if not stock_present or not demand_present or not monthly_business_days or monthly_business_days <= 0:
+                return "자료 부족", None
+            try:
+                stock_decimal = Decimal(str(stock_value))
+                demand_decimal = Decimal(str(demand))
+                days_decimal = Decimal(monthly_business_days)
+                if not stock_decimal.is_finite() or not demand_decimal.is_finite():
+                    return "자료 부족", None
+            except (InvalidOperation, ValueError):
+                return "자료 부족", None
+            if grade == "F" and stock_decimal > 0:
+                return "신제품 재고", None
+            if demand_decimal <= 0:
+                return ("수요없는 재고" if stock_decimal > 0 else "예상수요 없음"), None
+            cover = stock_decimal * days_decimal / demand_decimal
+            if cover < 1:
+                return "긴급 부족", cover
+            if cover < 3:
+                return "재고 부족", cover
+            if cover < 15:
+                return "안전재고 확보", cover
+            if cover < days_decimal * Decimal("1.10"):
+                return "적정 재고", cover
+            return "과다 재고", cover
+
+        status, cover_days = classify(stock)
+        summary_counts[status] += 1
+        raw_pending = _num(row.get("raw_pending_inbound_qty"))
+        negative_pending_count += int(pending_available and raw_pending < 0)
+        dashboard_pending = max(raw_pending, 0.0) if pending_available else None
+        effective_stock = Decimal(str(stock)) + Decimal(str(dashboard_pending)) if dashboard_pending is not None else None
+        pending_status, pending_cover_days = classify(effective_stock) if effective_stock is not None else (None, None)
+        if pending_status is not None:
+            pending_counts[pending_status] += 1
+            changed_count += int(pending_status != status)
+            improved_count += int(
+                status in ("긴급 부족", "재고 부족")
+                and pending_status in ("안전재고 확보", "적정 재고")
+            )
+            changed_to_overstock_count += int(status != "과다 재고" and pending_status == "과다 재고")
 
         row["inventory_status"] = status
-        row["inventory_status_ratio_pct"] = ratio
+        row["inventory_status_cover_business_days"] = float(cover_days) if cover_days is not None else None
+        row["dashboard_pending_qty"] = dashboard_pending
+        row["effective_stock_qty"] = float(effective_stock) if effective_stock is not None else None
+        row["pending_inventory_status"] = pending_status
+        row["pending_inventory_status_cover_business_days"] = float(pending_cover_days) if pending_cover_days is not None else None
         row["outbound_frequency_grade"] = grade
         row["outbound_occurrence_count_3m"] = occurrence_count
         row["outbound_day_count_3m"] = None if frequency is None else frequency.get("outbound_day_count_3m")
@@ -1508,7 +1574,9 @@ def _attach_inventory_status_and_frequency(
         detail_rows.append(
             {
                 "재고상태": status,
-                "재고수요비율": ratio,
+                "재고보유영업일": row["inventory_status_cover_business_days"],
+                "입고예정 포함 재고상태": pending_status,
+                "입고예정수량": dashboard_pending,
                 "제품코드": product_code,
                 "제품명": str(row.get("product_name") or ""),
                 "제조사명": str(row.get("manufacturer_name") or ""),
@@ -1519,6 +1587,8 @@ def _attach_inventory_status_and_frequency(
                 "평가월 예상수요": demand if demand_present else None,
                 "재고 커버일": row.get("stock_cover_days"),
                 "출고빈도등급": grade,
+                "품목손익등급": profit_grade if profit_ready else "등급자료 부족",
+                "품목기여등급": contribution_grade if contribution_ready else "등급자료 부족",
                 "3개월 출고발생수": occurrence_count,
                 "출고빈도 자료상태": row_frequency_status,
                 "주요매입처명": str(row.get("주요매입처명") or ""),
@@ -1530,17 +1600,85 @@ def _attach_inventory_status_and_frequency(
                 "수요급증세부분류사유": str(row.get("수요급증세부분류사유") or ""),
             }
         )
+    comparison_grades = ("F", "A", "B", "C", "D", "E", "X")
+    previous_projection = previous_frequency_projection or FrequencyProjectionReadResult(
+        status="missing", reason="previous projection was not requested"
+    )
+    previous_by_product = {
+        str(item.get("product_code") or "").strip(): str(item.get("frequency_grade") or "").strip()
+        for item in previous_projection.rows
+        if isinstance(item, Mapping) and str(item.get("product_code") or "").strip()
+    }
+    product_universe = {
+        str(row.get("product_code") or "").strip()
+        for row in rows
+        if str(row.get("product_code") or "").strip()
+    }
+    previous_counts = {grade: 0 for grade in comparison_grades}
+    previous_missing_count = 0
+    if previous_projection.usable:
+        for product_code in product_universe:
+            grade = previous_by_product.get(product_code, "")
+            if grade in previous_counts:
+                previous_counts[grade] += 1
+            else:
+                previous_missing_count += 1
+    current_resolved_month = str(frequency_evaluation_month or "").strip()
+    previous_resolved_month = str(previous_projection.resolved_evaluation_month or "").strip()
+    comparison_status = "ready"
+    comparison_reason = ""
+    if snapshot_status != "ready":
+        comparison_status = "current_missing"
+        comparison_reason = str(frequency_snapshot.reason or "current snapshot is unavailable")
+    elif not previous_projection.usable:
+        comparison_status = "previous_missing"
+        comparison_reason = str(previous_projection.reason or "previous snapshot is unavailable")
+    elif previous_resolved_month and previous_resolved_month != str(previous_frequency_evaluation_month or "").strip():
+        comparison_status = "previous_month_mismatch"
+        comparison_reason = "requested previous month did not resolve to the same evaluation month"
+    elif current_resolved_month and previous_resolved_month and current_resolved_month == previous_resolved_month:
+        comparison_status = "duplicate_month"
+        comparison_reason = "current and previous requests resolved to the same snapshot month"
     return {
         "summary": {
             "total_product_count": len(rows),
             "expected_demand_product_count": expected_demand_count,
             "status_counts": summary_counts,
+            "pending_status_counts": pending_counts if pending_available else None,
+            "pending_authority": pending_authority,
+            "pending_available": pending_available,
+            "pending_negative_product_count": negative_pending_count,
+            "pending_changed_product_count": changed_count,
+            "pending_unchanged_product_count": len(rows) - changed_count if pending_available else None,
+            "pending_improved_product_count": improved_count,
+            "pending_to_overstock_product_count": changed_to_overstock_count,
+            "monthly_business_days": monthly_business_days,
             "frequency_counts": frequency_counts,
+            "profit_grade_counts": profit_grade_counts,
+            "contribution_grade_counts": contribution_grade_counts,
+            "profit_contribution_grade_matrix": grade_matrix,
+            "grade_missing_primary_counts": grade_missing_reasons,
+            "grade_missing_both_count": grade_missing_both,
+            "grade_missing_profit_only_count": grade_missing_profit_only,
+            "grade_missing_contribution_only_count": grade_missing_contribution_only,
             "snapshot_status": snapshot_status,
             "snapshot_generation_no": frequency_snapshot.generation_no,
             "snapshot_checksum": frequency_snapshot.checksum,
             "snapshot_reason": str(frequency_snapshot.reason or ""),
             "missing_frequency_product_count": missing_frequency_product_count,
+            "frequency_month_comparison": {
+                "status": comparison_status,
+                "reason": comparison_reason,
+                "current_month": current_resolved_month or str(frequency_evaluation_month or ""),
+                "previous_month": previous_resolved_month or str(previous_frequency_evaluation_month or ""),
+                "current_counts": {grade: int(frequency_counts.get(grade) or 0) for grade in comparison_grades},
+                "previous_counts": previous_counts,
+                "product_universe_count": len(product_universe),
+                "current_missing_count": int(frequency_counts.get("빈도자료 부족") or 0),
+                "previous_missing_count": previous_missing_count,
+                "current_generation_no": frequency_snapshot.generation_no,
+                "previous_generation_no": previous_projection.generation_no,
+            },
         },
         "detail_rows": detail_rows,
     }
@@ -2674,6 +2812,9 @@ def _build_inventory_facts(
     stock_mode: str = "real",
     frequency_snapshot: SnapshotReadResult | None = None,
     frequency_rows: tuple[Mapping[str, Any], ...] | None = None,
+    frequency_evaluation_month: str = "",
+    previous_frequency_projection: FrequencyProjectionReadResult | None = None,
+    previous_frequency_evaluation_month: str = "",
     measurement: DashboardQueryMeasurement | None = None,
     business_day_context: BusinessDayMonthContext | None = None,
 ) -> dict[str, Any]:
@@ -2704,6 +2845,11 @@ def _build_inventory_facts(
     input_started = time.perf_counter()
     df = _payload_df(payload)
     meta = _payload_meta(payload)
+    pending_available = (
+        "입고예정수량" in df.columns
+        and str(meta.get("expected_inbound_historical_authority") or "") != "unavailable"
+        and meta.get("expected_inbound_attached") is True
+    )
     _record_inventory_phase(
         "inventory_input_prepare",
         input_started,
@@ -2751,6 +2897,7 @@ def _build_inventory_facts(
                     "당월기준예상출고수량": evaluation_expected,
                     "evaluation_expected_demand_qty": evaluation_expected,
                     "evaluation_expected_demand_present": row.get("당월 예상출고수량") is not None and pd.notna(row.get("당월 예상출고수량")) and str(row.get("당월 예상출고수량")).strip() != "",
+                    "raw_pending_inbound_qty": _num(row.get("입고예정수량")),
                     "3개월필요수량": _num(row.get("3개월필요수량")),
                     "_source_shortage_qty": source_shortage_qty,
                     "_source_shortage_amt": source_shortage_amt,
@@ -2793,6 +2940,7 @@ def _build_inventory_facts(
                     "당월기준예상출고수량": 0.0,
                     "evaluation_expected_demand_qty": 0.0,
                     "evaluation_expected_demand_present": True,
+                    "raw_pending_inbound_qty": None,
                     "3개월필요수량": 0.0,
                     "_source_shortage_qty": 0.0,
                     "_source_shortage_amt": 0.0,
@@ -2814,6 +2962,10 @@ def _build_inventory_facts(
             acc["당월현재출고수량"] += float(item.get("당월현재출고수량") or 0)
             acc["당월기준예상출고수량"] += float(item.get("당월기준예상출고수량") or 0)
             acc["evaluation_expected_demand_qty"] += float(item.get("evaluation_expected_demand_qty") or 0)
+            if acc["raw_pending_inbound_qty"] is None:
+                acc["raw_pending_inbound_qty"] = item["raw_pending_inbound_qty"]
+            elif acc["raw_pending_inbound_qty"] != item["raw_pending_inbound_qty"]:
+                pending_available = False
             acc["3개월필요수량"] += float(item.get("3개월필요수량") or 0)
             acc["_source_shortage_qty"] += float(item.get("_source_shortage_qty") or 0)
             acc["_source_shortage_amt"] += float(item.get("_source_shortage_amt") or 0)
@@ -2869,6 +3021,7 @@ def _build_inventory_facts(
                     "당월기준예상출고수량": float(row.get("당월기준예상출고수량") or 0),
                     "evaluation_expected_demand_qty": float(row.get("evaluation_expected_demand_qty") or 0),
                     "evaluation_expected_demand_present": bool(row.get("evaluation_expected_demand_present")),
+                    "raw_pending_inbound_qty": float(row.get("raw_pending_inbound_qty") or 0),
                     "3개월필요수량": float(row.get("3개월필요수량") or 0),
                     "stock_readiness_pct": readiness,
                     "shortage_qty": shortage_qty,
@@ -2955,6 +3108,19 @@ def _build_inventory_facts(
         rows,
         frequency_snapshot=frequency_snapshot or SnapshotReadResult(status="missing", reason="frequency snapshot was not requested"),
         frequency_rows=frequency_rows,
+        frequency_evaluation_month=frequency_evaluation_month,
+        previous_frequency_projection=previous_frequency_projection,
+        previous_frequency_evaluation_month=previous_frequency_evaluation_month,
+        monthly_business_days=(
+            business_day_context.business_days_total
+            if business_day_context is not None and business_day_context.authority_status == "ready"
+            else None
+        ),
+        pending_available=pending_available,
+        pending_authority=(
+            "recent_four_business_days" if pending_available
+            else str(meta.get("expected_inbound_historical_authority") or "unavailable")
+        ),
     )
     _record_inventory_phase(
         "inventory_status_frequency_attach",
@@ -3385,6 +3551,11 @@ def build_dashboard_lite_facts(
             business_context.authority_status,
             business_context.reason,
         )
+    inventory_business_context = business_context
+    if inventory_business_context is None and evaluation_yyyymm:
+        inventory_business_context = business_day_context_loader(
+            evaluation_date=datetime.strptime(_last_day_yyyymm(evaluation_yyyymm), "%Y%m%d").date()
+        )
     physical_measurement.add_phase(
         phase="dashboard_scope_prepare",
         source_name="facts",
@@ -3640,6 +3811,7 @@ def build_dashboard_lite_facts(
                     **service_params,
                     "month_to": service_params.get("evaluation_month"),
                     "date_to": source_params.get("date_to"),
+                    "_expected_inbound_auto_period": True,
                 },
                 sales_raw_df=visible_sales_df,
                 sales_forecast_df=shared_sales_forecast_df,
@@ -3749,6 +3921,12 @@ def build_dashboard_lite_facts(
         if active_projection_reader is not None
         else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
     )
+    previous_frequency_evaluation_month = _add_months(str(service_params.get("evaluation_month") or ""), -1)
+    previous_projection = FrequencyProjectionReadResult(
+        status="not_requested",
+        reason="Dashboard displays the current evaluation-month distribution",
+        resolved_evaluation_month=previous_frequency_evaluation_month,
+    )
     frequency_rows: tuple[Mapping[str, Any], ...] | None = None
     if projection.usable:
         frequency_rows = projection.rows
@@ -3801,8 +3979,11 @@ def build_dashboard_lite_facts(
         stock_mode=str(service_params.get("stock_mode") or "real"),
         frequency_snapshot=frequency_snapshot,
         frequency_rows=frequency_rows,
+        frequency_evaluation_month=str(projection.resolved_evaluation_month or service_params.get("evaluation_month") or ""),
+        previous_frequency_projection=previous_projection,
+        previous_frequency_evaluation_month=previous_frequency_evaluation_month,
         measurement=physical_measurement,
-        business_day_context=business_context,
+        business_day_context=inventory_business_context,
     )
     def _product_codes(frame: Any, *columns: str) -> set[str]:
         if not isinstance(frame, pd.DataFrame) or frame.empty:

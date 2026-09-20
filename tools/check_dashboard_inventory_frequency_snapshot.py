@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import copy
 import inspect
+import logging
 import random
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -53,7 +55,9 @@ from app.services import product_inventory_service  # noqa: E402
 from app.services.product_inventory_service import (  # noqa: E402
     attach_dashboard_frequency_snapshot,
     filter_product_inventory_frequency_rows,
+    filter_product_inventory_snapshot_grade_rows,
 )
+from app.services.io_nlq import resolve_io_nlq, remove_product_inventory_grade_phrases  # noqa: E402
 from app.services.ssai_analysis_profile_service import DashboardProfileLoadResult  # noqa: E402
 from app.services.dashboard_lite_facts import _attach_inventory_status_and_frequency  # noqa: E402
 
@@ -931,6 +935,87 @@ def test_inventory_prefilters_pass_policy_date_to_shared_operating_reader() -> N
     _assert(all(call["as_of_date"] == "20260829" for call in calls), "policy date must prevent a future basis from early operating use")
 
 
+def test_inventory_grade_nlq_and_shared_postfilter() -> None:
+    cases = (
+        ("현재고 품목손익 X", "현재고 조회", {"profit_grade": "X"}),
+        ("현재고 품목기여 A", "현재고 조회", {"contribution_grade": "A"}),
+        ("현재고 품목손익 자료부족", "현재고 조회", {"profit_grade": "자료 부족"}),
+        ("현재고 삼진제약 품목손익 D", "현재고 조회", {"profit_grade": "D"}),
+        ("제품재고장 품목손익 X", "제품재고현황 조회", {"profit_grade": "X"}),
+        ("제품재고장 품목기여 A", "제품재고현황 조회", {"contribution_grade": "A"}),
+        ("제품재고장 제약사 삼진제약 품목기여 A", "제품재고현황 조회", {"contribution_grade": "A", "maker_nm": "삼진제약"}),
+    )
+    for query, action, expected in cases:
+        resolved = resolve_io_nlq(query)
+        _assert(resolved["action"] == action, "grade query must keep inventory action")
+        _assert(all(resolved["params"].get(key) == value for key, value in expected.items()), "grade or maker condition lost")
+        _assert("품목손익" not in remove_product_inventory_grade_phrases(query) and "품목기여" not in remove_product_inventory_grade_phrases(query), "grade phrase must not become entity name")
+    for action_text in ("현재고", "제품재고장"):
+        for label, key in (("품목손익", "profit_grade"), ("품목기여", "contribution_grade")):
+            for grade in "ABCDEX":
+                resolved = resolve_io_nlq(f"{action_text} {label} {grade}")
+                _assert(resolved["params"].get(key) == grade, "A-E/X grade parse contract")
+    bare = resolve_io_nlq("제품재고장 삼진제약")
+    _assert(bare["params"].get("physic_nm") == "삼진제약", "bare inventory lookup must retain its original meaning")
+
+    source = pd.DataFrame({"제품코드": ["P1", "P2", "P3", "P4"], "재고수량": [1, 2, 3, 4]})
+    rows = (
+        {"product_code": "P1", "frequency_grade": "A", "occurrence_count_3m": 12, "profit_grade": "X", "contribution_grade": "A"},
+        {"product_code": "P2", "frequency_grade": "B", "occurrence_count_3m": 5, "profit_grade": "D", "contribution_grade": "A"},
+        {"product_code": "P3", "frequency_grade": "X", "occurrence_count_3m": 0, "profit_grade": "unavailable", "contribution_grade": "unavailable"},
+    )
+    original_company = product_inventory_service.get_current_company_id
+    product_inventory_service.get_current_company_id = lambda: 7
+    calls: list[dict[str, Any]] = []
+    try:
+        attached, meta = attach_dashboard_frequency_snapshot(
+            source, params={"company_id": 7}, date_to="20260920",
+            profile_scope_resolver=lambda **_kwargs: DashboardProfileStockScope(7, ("00001",), "ready", "fixture"),
+            projection_reader=lambda **kwargs: (calls.append(kwargs) or FrequencyProjectionReadResult(status="ready", rows=rows, manifest_id=8, generation_no=1, checksum="a" * 64)),
+        )
+    finally:
+        product_inventory_service.get_current_company_id = original_company
+    _assert(len(calls) == 1 and meta["frequency_additional_erp_source_call_count"] == 0, "one approved projection read without ERP call")
+    _assert(list(attached.loc[0, ["출고빈도등급", "품목손익등급", "품목기여등급"]]) == ["A", "X", "A"], "grade attachment contract")
+    _assert(list(attached.loc[2, ["출고빈도등급", "품목손익등급", "품목기여등급"]]) == ["X", "자료 부족", "자료 부족"], "unavailable is not X")
+    _assert(list(attached.loc[3, ["출고빈도등급", "품목손익등급", "품목기여등급"]]) == ["빈도자료 부족", "자료 부족", "자료 부족"], "missing projection is not X")
+    for filters, codes in (({"profit_grade": "X"}, ["P1"]), ({"contribution_grade": "A"}, ["P1", "P2"]), ({"profit_grade": "자료 부족"}, ["P3", "P4"]), ({"profit_grade": "D", "contribution_grade": "A"}, ["P2"])):
+        selected = filter_product_inventory_snapshot_grade_rows(attached, filters)
+        _assert(list(selected["제품코드"]) == codes, "shared grade postfilter must use attached rows")
+    grouped = pd.DataFrame({"physic_cd": ["P1", "P2", "P3", "P4"], "stock_qty": [1, 2, 3, 4]})
+    with patch.object(product_inventory_service, "attach_dashboard_frequency_snapshot", return_value=(attached, meta)):
+        selected_group, _ = product_inventory_service._filter_current_stock_frequency_rows(
+            grouped, params={"profit_grade": "D", "contribution_grade": "A"}, date_to="20260920"
+        )
+    _assert(list(selected_group["physic_cd"]) == ["P2"] and list(selected_group[["출고빈도등급", "품목손익등급", "품목기여등급"]].iloc[0]) == ["B", "D", "A"], "current-stock frame must carry filtered grades to display and full export")
+
+    from app.sims.nlq import nlq_router
+    from app.services import io_nlq
+    from app.ui import chat_middleware
+    captured: list[dict[str, Any]] = []
+    delivered: list[dict[str, Any]] = []
+
+    def result(params=None, **_kwargs):
+        captured.append(dict(params or {}))
+        return {"final": True, "type": "text", "data": "fixture", "message": "fixture", "meta": {"result_status": "success", "row_count": 1, "row_count_total": 1}}
+
+    with patch.object(product_inventory_service, "get_product_inventory_result", side_effect=result), patch.object(chat_middleware, "push_sims_result_to_chat", side_effect=lambda payload, _action: delivered.append(payload)):
+        for query, key, value in (("현재고 품목손익 X", "profit_grade", "X"), ("현재고 품목기여 A", "contribution_grade", "A"), ("제품재고장 품목손익 X", "profit_grade", "X"), ("제품재고장 품목기여 A", "contribution_grade", "A")):
+            _assert(nlq_router._try_handle_io_nlq(query, room={"messages": []}, session_state={}, make_ts=lambda: "2026-09-20", next_seq=lambda: 1, logger=logging.getLogger("grade-fixture")), "grade-only request must be routed")
+            _assert(captured[-1].get(key) == value and delivered[-1]["meta"]["result_status"] == "success", "grade-only request must reach inventory service")
+    residual: list[str] = []
+
+    def resolved_entity(text, *, params, action=None):
+        residual.append(text)
+        return {"status": "resolved", "resolved_kind": "fixture", "params": dict(params)}
+
+    with patch.object(io_nlq, "resolve_current_stock_entity_condition", side_effect=resolved_entity), patch.object(io_nlq, "resolve_unlabeled_io_entity_condition", side_effect=resolved_entity), patch.object(product_inventory_service, "get_product_inventory_result", side_effect=result), patch.object(chat_middleware, "push_sims_result_to_chat", side_effect=lambda payload, _action: delivered.append(payload)):
+        for query in ("현재고 삼진제약 품목손익 D", "제품재고장 삼진제약 품목기여 A", "제품재고장 제약사 삼진제약 품목기여 A"):
+            _assert(nlq_router._try_handle_io_nlq(query, room={"messages": []}, session_state={}, make_ts=lambda: "2026-09-20", next_seq=lambda: 1, logger=logging.getLogger("grade-fixture")), "compound grade request must be routed")
+    _assert(len(residual) == 3 and all("삼진제약" in text and "품목" not in text for text in residual), "entity resolver must see only the remaining name")
+    _assert(captured[-1].get("maker_nm") == "삼진제약" and captured[-1].get("contribution_grade") == "A", "explicit manufacturer must remain separate from grade")
+
+
 def main() -> int:
     tests = (
         test_tcode_and_event_contract,
@@ -948,6 +1033,7 @@ def main() -> int:
         test_product_inventory_frequency_filter_totals_and_summary,
         test_operating_projection_selects_only_completed_approved_basis,
         test_inventory_prefilters_pass_policy_date_to_shared_operating_reader,
+        test_inventory_grade_nlq_and_shared_postfilter,
     )
     for test in tests:
         test()

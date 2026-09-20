@@ -519,6 +519,19 @@ def filter_product_inventory_frequency_rows(df: pd.DataFrame, frequency_grade: A
     return df.loc[df[_FREQUENCY_GRADE_COLUMN].fillna("").astype(str) == selected].copy()
 
 
+def filter_product_inventory_snapshot_grade_rows(df: pd.DataFrame, params: Mapping[str, Any]) -> pd.DataFrame:
+    """Apply labelled grades to the same attached, approved projection for both inventory routes."""
+    out = filter_product_inventory_frequency_rows(df, params.get("frequency_grade"))
+    for key, column in (("profit_grade", _PROFIT_GRADE_COLUMN), ("contribution_grade", _CONTRIBUTION_GRADE_COLUMN)):
+        selected = clean_text(params.get(key))
+        if selected not in {"A", "B", "C", "D", "E", "X", "자료 부족"}:
+            continue
+        if column not in out.columns:
+            return out.iloc[0:0].copy()
+        out = out.loc[out[column].fillna("").astype(str).str.strip() == selected].copy()
+    return out
+
+
 def _inventory_frequency_context(params: Dict[str, Any], date_to: str) -> tuple[int | None, str, str]:
     """Return the company/evaluation key without letting request params cross companies."""
     context_company = get_current_company_id()
@@ -2929,10 +2942,7 @@ def _final_display_df(
         perf["frequency_attach_ms"] = round((time.perf_counter() - frequency_attach_started) * 1000, 1)
         perf["frequency_rows_before_filter"] = int(len(out))
         frequency_filter_started = time.perf_counter()
-        out = filter_product_inventory_frequency_rows(
-            out,
-            frequency_params.get("frequency_grade"),
-        )
+        out = filter_product_inventory_snapshot_grade_rows(out, frequency_params)
         perf["frequency_filter_ms"] = round((time.perf_counter() - frequency_filter_started) * 1000, 1)
         perf["frequency_rows_after_filter"] = int(len(out))
     perf["final_display_frame_ms"] = round((time.perf_counter() - display_started) * 1000, 1)
@@ -3188,7 +3198,6 @@ def _filter_current_stock_frequency_rows(
     date_to: str,
 ) -> tuple[pd.DataFrame, Dict[str, Any]]:
     """Attach approved frequency facts and apply a grade filter only when requested."""
-    selected = _normalize_product_inventory_frequency_filter(params.get("frequency_grade"))
     if grp is None or grp.empty:
         return grp, {}
 
@@ -3198,7 +3207,7 @@ def _filter_current_stock_frequency_rows(
         params=params,
         date_to=date_to,
     )
-    selected_rows = filter_product_inventory_frequency_rows(attached, selected)
+    selected_rows = filter_product_inventory_snapshot_grade_rows(attached, params)
     out = grp.loc[selected_rows.index].copy()
     # The current-stock frame owns display/full/export provenance. Keep the
     # snapshot values on that frame instead of leaving them on the filter-only

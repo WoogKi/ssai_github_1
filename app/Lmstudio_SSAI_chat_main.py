@@ -9153,6 +9153,8 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(message, dict):
         return {}
     out: dict[str, Any] = {}
+    dashboard_matrix = None
+    dashboard_grade_counts: dict[str, dict[str, int]] = {}
     for key in _CHAT_PARTITION_MESSAGE_ALLOW_KEYS:
         if key not in message:
             continue
@@ -9171,8 +9173,14 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
                         snapshot_source["room_id"] = value.get("room_id")
                         snapshot_source["dashboard_event_id"] = value.get("dashboard_event_id")
                         try:
-                            from app.sims.views.dashboard_lite import build_dashboard_lite_chat_snapshot
+                            from app.sims.views.dashboard_lite import build_dashboard_lite_chat_snapshot, _valid_profit_contribution_grade_matrix
                             meta_out[mk] = build_dashboard_lite_chat_snapshot(snapshot_source)
+                            summary = (((meta_out[mk].get("facts") or {}).get("inventory") or {}).get("inventory_status_summary") or {})
+                            dashboard_matrix = _valid_profit_contribution_grade_matrix(summary)
+                            for count_key in ("profit_grade_counts", "contribution_grade_counts", "grade_missing_primary_counts"):
+                                counts = summary.get(count_key)
+                                if isinstance(counts, dict) and all(isinstance(count, int) and not isinstance(count, bool) and count >= 0 for count in counts.values()):
+                                    dashboard_grade_counts[count_key] = {str(grade): count for grade, count in counts.items()}
                         except Exception as exc:
                             log.warning(
                                 "[chat.storage.dashboard_snapshot] snapshot_ok=False fallback=minimal error_type=%s",
@@ -9200,7 +9208,13 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
         out[key] = value
     if "meta" not in out and isinstance(message.get("meta"), dict):
         out["meta"] = {}
-    return _json_sanitize(out)
+    sanitized = _json_sanitize(out)
+    if dashboard_matrix is not None or dashboard_grade_counts:
+        summary = sanitized["meta"]["dashboard_cache"]["facts"]["inventory"]["inventory_status_summary"]
+        if dashboard_matrix is not None:
+            summary["profit_contribution_grade_matrix"] = dashboard_matrix
+        summary.update(dashboard_grade_counts)
+    return sanitized
 
 
 def _partition_logical_message_key(message: dict[str, Any]) -> str:

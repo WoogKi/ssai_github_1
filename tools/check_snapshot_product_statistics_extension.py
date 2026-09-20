@@ -16,6 +16,8 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     PRODUCT_STATISTICS_DECIMAL_STORAGE,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     SnapshotContractError,
+    _cumulative_amount_grades,
+    _profit_rate_grade,
     build_product_statistics_relational_snapshot_from_aggregates,
     build_relational_frequency_projection,
     calculate_relational_frequency_checksum,
@@ -32,7 +34,7 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (  # noq
     build_frequency_snapshot_plan,
     product_statistics_event_stream_sql,
 )
-from app.services.ssai_analytics_snapshot_migration import MIGRATION_008_SQL, MIGRATIONS  # noqa: E402
+from app.services.ssai_analytics_snapshot_migration import MIGRATION_008_SQL, MIGRATION_009_SQL, MIGRATIONS  # noqa: E402
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
 
 
@@ -94,6 +96,7 @@ def test_product_statistics_and_profitability() -> None:
     _assert(first["estimated_unit_profit"] == Decimal("50"), "unit profit")
     _assert(first["estimated_profit_rate"] == Decimal("0.333333333333"), "profit rate")
     _assert(first["estimated_contribution_amount"] == Decimal("500.000000"), "contribution")
+    _assert(first["profit_grade"] == "A" and first["contribution_grade"] == "A", "independent grade policies")
     second = rows["00002"]
     _assert(second["frequency_grade"] == "F" and second["outbound_qty_3m"] == 5, "F raw statistics")
     _assert(second["profitability_status"] == "excluded_adjustment_only", "adjustment exclusion")
@@ -107,6 +110,63 @@ def test_price_status_boundaries() -> None:
     _assert(_price_status("202609", "202602") == "stale", "seven-month price")
     _assert(_price_status("202609", "202509") == "stale", "twelve-month price")
     _assert(_price_status("202609", "202508") == "unavailable", "lookback exceeded")
+
+
+def test_cumulative_amount_grade_boundaries_and_nonpositive() -> None:
+    grades = _cumulative_amount_grades({
+        "a": Decimal(80), "b": Decimal(10), "c": Decimal(5),
+        "d": Decimal(4), "e": Decimal(1), "zero": Decimal(0), "loss": Decimal(-2),
+    })
+    _assert([grades[key] for key in ("a", "b", "c", "d", "e")] == list("ABCDE"), "amount boundary grades")
+    _assert(grades["zero"] == grades["loss"] == "E", "nonpositive management grade")
+    crossing = _cumulative_amount_grades({"large": Decimal(82), "next": Decimal(10), "last": Decimal(8)})
+    _assert(crossing == {"large": "A", "next": "B", "last": "C"}, "crossing item belongs to starting band")
+    tied = _cumulative_amount_grades({"first": Decimal(50), "tie1": Decimal(25), "tie2": Decimal(25)})
+    _assert(tied["tie1"] == tied["tie2"], "equal amounts must not split")
+    _assert(_cumulative_amount_grades({"zero": Decimal(0), "loss": Decimal(-1)}) == {"zero": "E", "loss": "E"}, "no positive denominator")
+    _assert(_cumulative_amount_grades({"positive": Decimal(1), "zero": Decimal(0)}, nonpositive_grade="X") == {"positive": "A", "zero": "X"}, "new contribution X")
+    _assert([_profit_rate_grade(Decimal(value)) for value in ("0.30", "0.20", "0.10", "0.05", "0.001", "0", "-0.01")] == list("ABCDEXX"), "absolute profit rate boundaries")
+
+
+def test_profit_and_contribution_use_distinct_quantity_sources() -> None:
+    snapshot = build_product_statistics_relational_snapshot_from_aggregates(
+        company_id="07", evaluation_month="202609",
+        monthly_rows=(
+            {"month": "202608", "product_code": "00001", "stock_code": "00001", "occurrence_count": 1, "outbound_quantity": 100, "outbound_day_count": 1},
+            {"month": "202608", "product_code": "00002", "stock_code": "00001", "occurrence_count": 1, "outbound_quantity": 1, "outbound_day_count": 1},
+        ),
+        product_codes=("00001", "00002"), product_day_counts={}, product_customer_counts={},
+        first_normal_inbound_months={}, outbound_paid_quantities={"00001": 1, "00002": 1},
+        return_statistics={},
+        purchase_prices={code: {"unit_price": "10", "status": "ready"} for code in ("00001", "00002")},
+        sales_prices={"00001": {"unit_price": "11", "status": "ready"}, "00002": {"unit_price": "20", "status": "ready"}},
+        stock_codes=("00001",),
+    )
+    rows = {row["product_code"]: row for row in snapshot.frequency_products}
+    _assert(rows["00001"]["profit_grade"] == "D" and rows["00001"]["contribution_grade"] == "A", "profit rate must ignore quantity")
+    _assert(rows["00002"]["profit_grade"] == "A" and rows["00002"]["contribution_grade"] == "C", "contribution must include quantity")
+
+
+def test_nonpositive_and_return_only_x() -> None:
+    codes = ("P1", "P2", "P3", "P4")
+    snapshot = build_product_statistics_relational_snapshot_from_aggregates(
+        company_id="07", evaluation_month="202609",
+        monthly_rows=tuple(
+            {"month": "202608", "product_code": code, "stock_code": "00001", "occurrence_count": 1, "outbound_quantity": 1, "outbound_day_count": 1}
+            for code in codes[:3]
+        ),
+        product_codes=codes, product_day_counts={}, product_customer_counts={},
+        first_normal_inbound_months={}, outbound_paid_quantities={},
+        return_statistics={"P4": {"event_count": 1, "quantity": 2, "supply_amount": "10"}},
+        purchase_prices={code: {"unit_price": cost, "status": "ready"} for code, cost in zip(codes, ("5", "10", "12", "5"))},
+        sales_prices={code: {"unit_price": "10", "status": "ready"} for code in codes},
+        stock_codes=("00001",),
+    )
+    validate_relational_frequency_snapshot(snapshot)
+    rows = {row["product_code"]: row for row in snapshot.frequency_products}
+    _assert(rows["P1"]["profit_grade"] == rows["P1"]["contribution_grade"] == "A", "positive ready grade")
+    _assert(all(rows[code][field] == "X" for code in ("P2", "P3", "P4") for field in ("profit_grade", "contribution_grade")), "zero, loss, and return-only X")
+    _assert(rows["P4"]["profitability_status"] == "ready" and rows["P4"]["return_qty_3m"] == 2, "return-only is not missing authority")
 
 
 def test_statistics_checksum_covers_additive_fields() -> None:
@@ -378,6 +438,8 @@ def test_multi_projection_event_stream() -> None:
     _assert(paid == {"00001": 8}, "paid quantity projection")
     _assert(returns["00001"]["supply_amount"] == "300", "return projection")
     _assert(prices["00001"]["basis_month"] == "202608", "sales price projection")
+    split = _aggregate_product_statistics_event_chunks((rows.iloc[:1], rows.iloc[1:3], rows.iloc[3:]))
+    _assert(split == (monthly, diagnostics, days, customers, paid, returns, prices), "chunk boundaries must not change product statistics")
 
 
 def test_sql_and_migration_contract() -> None:
@@ -392,13 +454,17 @@ def test_sql_and_migration_contract() -> None:
         "estimated_contribution_amount", "contribution_grade", "profitability_status",
     )
     _assert(all(column in MIGRATION_008_SQL for column in required), "migration columns")
-    _assert(MIGRATIONS[-1].migration_id == "008_frequency_product_statistics_extension", "migration order")
+    _assert(MIGRATIONS[-1].migration_id == "009_frequency_product_x_grade", "migration order")
+    _assert("DROP CONSTRAINT CK_snapshot_frequency_product_profit_grade" in MIGRATION_009_SQL and "'X'" in MIGRATION_009_SQL, "versioned X grade migration")
 
 
 def main() -> int:
     tests = (
         test_product_statistics_and_profitability,
         test_price_status_boundaries,
+        test_cumulative_amount_grade_boundaries_and_nonpositive,
+        test_profit_and_contribution_use_distinct_quantity_sources,
+        test_nonpositive_and_return_only_x,
         test_statistics_checksum_covers_additive_fields,
         test_sql_decimal_storage_round_trip_checksum,
         test_sql_decimal_storage_collapse_matrix,

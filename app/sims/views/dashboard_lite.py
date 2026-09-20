@@ -20,6 +20,7 @@ import pandas as pd
 import streamlit as st
 
 from app.services.dashboard_lite_facts import (
+    INVENTORY_STATUS_ORDER,
     build_dashboard_lite_facts,
     default_dashboard_lite_settings,
     default_dashboard_lite_scope,
@@ -411,6 +412,7 @@ def _fmt_dashboard_amount(value: Any, unit: str) -> str:
 _DASHBOARD_INLINE_ICON_PATHS = {
     "box": '<path d="M4 8.5 12 4l8 4.5v8L12 21l-8-4.5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M4 8.5 12 13l8-4.5M12 13v8M8 6.2l8 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>',
     "bars": '<path d="M5 19V13h3v6zm5 0V9h3v10zm5 0V5h3v14z" fill="currentColor"/>',
+    "coins": '<circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M17 6.5a6 6 0 1 1-10.5 10.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M6.5 8h3m5 8h3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>',
     "cycle": '<path d="M7 7h8l-2.5-2.5M17 17H9l2.5 2.5M18.5 10A7 7 0 0 0 7 7M5.5 14A7 7 0 0 0 17 17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
     "trend": '<path d="M4 17l5-5 4 3 7-8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 7h5v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
     "truck": '<path d="M3 6h11v10H3zM14 10h3l3 3v3h-6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="7" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="17" cy="18" r="2" fill="none" stroke="currentColor" stroke-width="1.8"/>',
@@ -559,6 +561,8 @@ def _inject_dashboard_lite_styles_once() -> None:
         .dashboard-lite-icon-remaining { background: linear-gradient(145deg, #94a3b8, #64748b); }
         .dashboard-lite-icon-inventory { background: linear-gradient(145deg, #4f83ff, #2563eb); }
         .dashboard-lite-icon-frequency { background: linear-gradient(145deg, #2dd4c7, #0f9f98); }
+        .dashboard-lite-icon-profit,
+        .dashboard-lite-icon-contribution { background: linear-gradient(145deg, #2dd4c7, #0f9f98); }
         .dashboard-lite-icon-surge { background: linear-gradient(145deg, #a78bfa, #7c3aed); }
         .dashboard-lite-icon-vendor { background: linear-gradient(145deg, #fb7185, #dc2626); }
         .dashboard-lite-icon-compact {
@@ -597,7 +601,26 @@ def _inject_dashboard_lite_styles_once() -> None:
             background: linear-gradient(90deg, color-mix(in srgb, var(--dashboard-inventory-accent) 74%, white), color-mix(in srgb, var(--dashboard-inventory-accent) 28%, transparent));
         }
         [class*="st-key-dashboard_inventory_card__status__"] { --dashboard-inventory-accent: #2563eb; }
+        [class*="st-key-dashboard_inventory_card__status__"] {
+            min-height: 0 !important;
+            padding: 14px 17px !important;
+        }
+        [class*="st-key-dashboard_inventory_minor_section__"] {
+            --dashboard-inventory-accent: #64748b;
+            padding-top: 14px;
+        }
+        [class*="st-key-dashboard_inventory_card_body__status__"] {
+            justify-content: flex-start !important;
+        }
         [class*="st-key-dashboard_inventory_card__frequency__"] { --dashboard-inventory-accent: #0f9f98; }
+        [class*="st-key-dashboard_inventory_card__grade_matrix__"] { --dashboard-inventory-accent: #4f759b; }
+        [class*="st-key-dashboard_inventory_card__profit__"] { --dashboard-inventory-accent: #0f9f98; }
+        [class*="st-key-dashboard_inventory_card__contribution__"] { --dashboard-inventory-accent: #0f9f98; }
+        [class*="st-key-dashboard_inventory_card__profit__missing__"],
+        [class*="st-key-dashboard_inventory_card__contribution__missing__"] {
+            min-height: 0 !important;
+            padding-bottom: 13px;
+        }
         [class*="st-key-dashboard_inventory_card__surge__"] { --dashboard-inventory-accent: #7c3aed; }
         [class*="st-key-dashboard_inventory_card__vendor__"] { --dashboard-inventory-accent: #dc2626; }
         [class*="st-key-dashboard_inventory_row__"] [data-testid="stHorizontalBlock"] {
@@ -643,6 +666,8 @@ def _inject_dashboard_lite_styles_once() -> None:
             font-size: 0.78rem;
             line-height: 1.4;
         }
+        [class*="st-key-dashboard_inventory_card__status__"] .dashboard-lite-inventory-card-subtitle,
+        [class*="st-key-dashboard_inventory_minor_section__"] .dashboard-lite-inventory-card-subtitle { margin-bottom: 4px; }
         .dashboard-lite-inventory-legend {
             display: grid;
             gap: 4px;
@@ -684,6 +709,70 @@ def _inject_dashboard_lite_styles_once() -> None:
         .dashboard-lite-inventory-status-layout .dashboard-lite-inventory-legend {
             margin: -3px 0 0;
         }
+        .dashboard-lite-status-donut-title {
+            color: #334155;
+            font-size: 0.86rem;
+            font-weight: 700;
+            text-align: center;
+        }
+        [class*="st-key-dashboard_inventory_donut_group__"] {
+            width: min(100%, 1060px);
+            margin-inline: auto;
+        }
+        [class*="st-key-dashboard_inventory_donut_group__"] [data-testid="stHorizontalBlock"] { align-items: center; }
+        .dashboard-lite-status-legend {
+            display: grid;
+            justify-content: center;
+            gap: 11px;
+            margin: 0;
+            color: #475569;
+            font-size: 0.79rem;
+        }
+        .dashboard-lite-status-legend-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+        .dashboard-lite-status-legend-dot { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+        .dashboard-lite-status-minor { display: grid; gap: 0; font-variant-numeric: tabular-nums; }
+        .dashboard-lite-status-minor-item {
+            margin-top: 7px;
+            padding: 10px 12px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            background: #fbfcfe;
+        }
+        .dashboard-lite-status-minor-name { font-size: 0.78rem; font-weight: 700; color: #334155; }
+        .dashboard-lite-status-minor-values { margin-top: 3px; color: #475569; font-size: 0.78rem; }
+        .dashboard-lite-status-minor-pct { color: #64748b; font-size: 0.73rem; }
+        .dashboard-lite-status-minor-empty { margin: 0 0 7px; color: #64748b; font-size: 0.73rem; }
+        .dashboard-lite-status-change {
+            display: grid;
+            gap: 0;
+            margin-top: 7px;
+            font-variant-numeric: tabular-nums;
+        }
+        .dashboard-lite-status-change-row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto;
+            gap: 2px 6px;
+            padding: 7px 2px;
+            border-top: 1px solid #e2e8f0;
+        }
+        .dashboard-lite-status-change-title { margin-top: 13px; font-size: 0.8rem; font-weight: 700; color: #334155; }
+        .dashboard-lite-status-change-label { font-size: 0.76rem; font-weight: 700; color: #334155; }
+        .dashboard-lite-status-change-values { grid-column: 1; color: #64748b; font-size: 0.71rem; }
+        .dashboard-lite-status-change-delta { grid-column: 2; grid-row: 1 / span 2; align-self: center; font-size: 0.78rem; font-weight: 700; white-space: nowrap; }
+        .dashboard-lite-status-change-note { margin-top: 5px; color: #64748b; font-size: 0.68rem; line-height: 1.35; }
+        [class*="st-key-dashboard_inventory_minor_section__"] .dashboard-lite-inventory-card-subtitle { margin-bottom: 3px; }
+        [class*="st-key-dashboard_inventory_minor_section__"] .dashboard-lite-status-minor-item {
+            margin-top: 2px;
+            padding: 5px 0;
+            border: 0;
+            border-bottom: 1px solid #e2e8f0;
+            border-radius: 0;
+            background: transparent;
+        }
+        [class*="st-key-dashboard_inventory_minor_section__"] .dashboard-lite-status-change-title { margin: 3px 0 8px; }
+        [class*="st-key-dashboard_inventory_minor_section__"] .dashboard-lite-status-change-row { padding: 5px 0; }
+        [class*="st-key-dashboard_inventory_minor_section__"] .dashboard-lite-status-change-delta { font-size: 0.71rem; }
+        [class*="st-key-dashboard_inventory_minor_section__"] .dashboard-lite-status-change-note { font-size: 0.65rem; }
         .dashboard-lite-demand-surge-flow {
             display: flex;
             align-items: center;
@@ -735,6 +824,13 @@ def _inject_dashboard_lite_styles_once() -> None:
             color: rgba(71, 85, 105, 0.76);
             font-size: 0.78rem;
             line-height: 1.38;
+        }
+        @media (max-width: 1150px) {
+            [class*="st-key-dashboard_inventory_donut_group__"] [data-testid="stHorizontalBlock"] { flex-direction: column; }
+            [class*="st-key-dashboard_inventory_donut_group__"] [data-testid="stColumn"] { width: 100% !important; }
+            [class*="st-key-dashboard_inventory_donut_group__"] [data-testid="column"] { width: 100% !important; }
+            [class*="st-key-dashboard_inventory_row__top__"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] { flex-direction: column; }
+            [class*="st-key-dashboard_inventory_row__top__"] > [data-testid="stLayoutWrapper"] > [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] { width: 100% !important; flex: 1 1 auto !important; }
         }
         @media (max-width: 760px) {
             [class*="st-key-dashboard_inventory_row__"] [data-testid="stHorizontalBlock"] {
@@ -1865,36 +1961,154 @@ def _inventory_status_summary(facts: Mapping[str, Any]) -> Mapping[str, Any]:
 def _build_inventory_status_chart(facts: dict[str, Any]) -> alt.Chart | None:
     summary = _inventory_status_summary(facts)
     counts = summary.get("status_counts") or {}
-    rows = [
-        {"label": "긴급 부족", "count": int(counts.get("긴급 부족") or 0), "amount": 0.0},
-        {"label": "재고 경고", "count": int(counts.get("재고 경고") or 0), "amount": 0.0},
-        {"label": "적정 재고", "count": int(counts.get("적정 재고") or 0), "amount": 0.0},
-        {"label": "과다 재고", "count": int(counts.get("과다 재고") or 0), "amount": 0.0},
-        {"label": "예상수요 없음", "count": int(counts.get("예상수요 없음") or 0), "amount": 0.0},
-        {"label": "자료 부족", "count": int(counts.get("자료 부족") or 0), "amount": 0.0},
-    ]
+    rows = [{"label": label, "count": int(counts.get(label) or 0), "amount": 0.0} for label in INVENTORY_STATUS_ORDER]
     return _build_count_donut(
         rows,
         total_label="관리 품목",
         total=int(summary.get("total_product_count") or 0),
-        colors=["#dc2626", "#f59e0b", "#16a34a", "#7c3aed", "#94a3b8", "#64748b"],
+        colors=[row["color"] for row in _inventory_status_rows(facts)],
     )
 
 
-def _inventory_status_rows(facts: Mapping[str, Any]) -> list[dict[str, Any]]:
+_INVENTORY_STATUS_COLORS = {
+    "자료 부족": ("#64748b", "#ffffff"),
+    "신제품 재고": ("#7c3aed", "#ffffff"),
+    "예상수요 없음": ("#94a3b8", "#1f2937"),
+    "수요없는 재고": ("#a16207", "#ffffff"),
+    "긴급 부족": ("#dc2626", "#ffffff"),
+    "재고 부족": ("#f97316", "#ffffff"),
+    "안전재고 확보": ("#f5b700", "#1f2937"),
+    "적정 재고": ("#16a34a", "#ffffff"),
+    "과다 재고": ("#7c3aed", "#ffffff"),
+}
+
+
+def _inventory_status_rows(facts: Mapping[str, Any], *, pending: bool = False) -> list[dict[str, Any]]:
     summary = _inventory_status_summary(facts)
-    counts = summary.get("status_counts") or {}
+    counts = summary.get("pending_status_counts" if pending else "status_counts") or {}
     return [
-        {"label": label, "count": int(counts.get(label) or 0), "color": color, "text_color": text_color}
-        for label, color, text_color in (
-            ("긴급 부족", "#dc2626", "#ffffff"),
-            ("재고 경고", "#f59e0b", "#ffffff"),
-            ("적정 재고", "#16a34a", "#ffffff"),
-            ("과다 재고", "#7c3aed", "#ffffff"),
-            ("예상수요 없음", "#94a3b8", "#1f2937"),
-            ("자료 부족", "#64748b", "#ffffff"),
-        )
+        {"label": label, "count": int(counts.get(label) or 0), "color": _INVENTORY_STATUS_COLORS[label][0], "text_color": _INVENTORY_STATUS_COLORS[label][1]}
+        for label in INVENTORY_STATUS_ORDER
     ]
+
+
+def _inventory_status_core_donut(facts: Mapping[str, Any], *, pending: bool = False) -> alt.Chart | None:
+    summary = _inventory_status_summary(facts)
+    if pending and not summary.get("pending_available"):
+        return None
+    rows = _inventory_status_rows(facts, pending=pending)
+    total = int(summary.get("total_product_count") or 0)
+    if total <= 0 or sum(row["count"] for row in rows) != total:
+        return None
+    core_rows = [row for row in rows[4:] if row["count"] > 0]
+    if not core_rows:
+        return None
+    records: list[dict[str, Any]] = []
+    for index, row in enumerate(core_rows):
+        pct = row["count"] / total * 100
+        records.append({
+            **row,
+            "pct": pct,
+            "sort_order": index,
+            "inside_count": f'{row["count"]:,}개' if pct >= 8 else "",
+            "outside_label": f'{pct:.1f}%',
+        })
+    other_count = total - sum(row["count"] for row in core_rows)
+    arc_rows = [*records, {
+        "label": "기타 재고 상태", "count": other_count, "pct": other_count / total * 100,
+        "sort_order": len(records), "inside_count": "", "outside_label": "",
+    }]
+    base = alt.Chart(pd.DataFrame(arc_rows))
+    arcs = base.mark_arc(innerRadius=90, outerRadius=138, cornerRadius=2).encode(
+        theta=alt.Theta("count:Q", stack=True),
+        order=alt.Order("sort_order:Q", sort="ascending"),
+        color=alt.Color("label:N", legend=None, scale=alt.Scale(
+            domain=[row["label"] for row in rows[4:]] + ["기타 재고 상태"],
+            range=[row["color"] for row in rows[4:]] + ["#e8edf2"],
+        )),
+        tooltip=[
+            alt.Tooltip("label:N", title="재고 상태"),
+            alt.Tooltip("count:Q", title="제품수", format=",.0f"),
+            alt.Tooltip("pct:Q", title="전체 관리품목 비율", format=".1f"),
+        ],
+    )
+    inside = base.mark_text(radius=114, fontSize=12, fontWeight=700).encode(
+        theta=alt.Theta("count:Q", stack=True), order=alt.Order("sort_order:Q", sort="ascending"), text="inside_count:N",
+        color=alt.Color("text_color:N", scale=None),
+    )
+    outside = base.mark_text(radius=158, fontSize=11, fontWeight=600, color="#475569").encode(
+        theta=alt.Theta("count:Q", stack=True), order=alt.Order("sort_order:Q", sort="ascending"), text="outside_label:N",
+    )
+    center = pd.DataFrame([{"total": f"{total:,}개", "label": "전체 관리 품목"}])
+    total_text = alt.Chart(center).mark_text(fontSize=22, fontWeight=700, dy=-8, color="#1f2937").encode(text="total:N")
+    center_label = alt.Chart(center).mark_text(fontSize=11, dy=16, color="#64748b").encode(text="label:N")
+    return alt.layer(arcs, inside, outside, total_text, center_label).resolve_scale(theta="independent").properties(
+        height=350, padding={"top": 6, "bottom": 6, "left": 4, "right": 4}
+    ).configure(background="transparent").configure_view(stroke=None)
+
+
+def _inventory_status_core_legend_html() -> str:
+    items = [
+        '<span class="dashboard-lite-status-legend-item">'
+        f'<span class="dashboard-lite-status-legend-dot" style="background:{_INVENTORY_STATUS_COLORS[label][0]}"></span>'
+        f'{html.escape(label)}</span>'
+        for label in INVENTORY_STATUS_ORDER[4:]
+    ]
+    return '<div class="dashboard-lite-status-legend">' + ''.join(items) + '</div>'
+
+
+def _inventory_status_minor_html(facts: Mapping[str, Any]) -> str | None:
+    summary = _inventory_status_summary(facts)
+    if not summary.get("pending_available"):
+        return None
+    current = _inventory_status_rows(facts)
+    pending = _inventory_status_rows(facts, pending=True)
+    total = int(summary.get("total_product_count") or 0)
+    if sum(row["count"] for row in current) != total or sum(row["count"] for row in pending) != total:
+        return None
+    parts = ['<div class="dashboard-lite-status-minor">']
+    shortage = (current[0], pending[0])
+    if shortage[0]["count"] == shortage[1]["count"] == 0:
+        parts.append('<div class="dashboard-lite-status-minor-empty">자료 부족 0건</div>')
+        minor_rows = zip(current[1:4], pending[1:4])
+    else:
+        minor_rows = zip(current[:4], pending[:4])
+    for left, right in minor_rows:
+        parts.append(
+            '<div class="dashboard-lite-status-minor-item">'
+            f'<div class="dashboard-lite-status-minor-name">{html.escape(str(left["label"]))}</div>'
+            f'<div class="dashboard-lite-status-minor-values">현재 {left["count"]:,}개 → 예정 {right["count"]:,}개</div>'
+            f'<div class="dashboard-lite-status-minor-pct">{left["count"] / total * 100 if total else 0:.1f}% → {right["count"] / total * 100 if total else 0:.1f}%</div>'
+            '</div>'
+        )
+    return ''.join(parts) + '</div>'
+
+
+def _inventory_status_change_html(facts: Mapping[str, Any]) -> str | None:
+    summary = _inventory_status_summary(facts)
+    if not summary.get("pending_available"):
+        return None
+    current = summary.get("status_counts") or {}
+    pending = summary.get("pending_status_counts") or {}
+    groups = (
+        ("부족재고", ("긴급 부족", "재고 부족"), "#dc2626"),
+        ("적정 재고", ("적정 재고",), "#16a34a"),
+        ("과다 재고", ("과다 재고",), "#7c3aed"),
+    )
+    parts = ['<div class="dashboard-lite-status-change">']
+    for title, labels, color in groups:
+        before = sum(int(current.get(label) or 0) for label in labels)
+        after = sum(int(pending.get(label) or 0) for label in labels)
+        delta = after - before
+        parts.append(
+            '<div class="dashboard-lite-status-change-row">'
+            f'<div class="dashboard-lite-status-change-label">{title}</div>'
+            f'<div class="dashboard-lite-status-change-values">{before:,}개 → {after:,}개</div>'
+            f'<div class="dashboard-lite-status-change-delta" style="color:{color}">{delta:+,}개 순증감</div>'
+            '</div>'
+        )
+    parts.append('</div>')
+    return ''.join(parts)
 
 
 def _build_labeled_summary_donut(
@@ -1907,6 +2121,7 @@ def _build_labeled_summary_donut(
     outer_radius: int = 92,
     top_padding: int = 12,
     show_segment_details: bool = False,
+    show_outside_labels: bool = True,
     segment_detail_outside_offset: int = 21,
 ) -> alt.Chart | None:
     """Render persisted counts with labels tied to the original pie geometry."""
@@ -1947,7 +2162,7 @@ def _build_labeled_summary_donut(
             lambda row: row["pct_label"] if float(row["pct"]) >= 7.0 else "", axis=1
         )
         frame["outside_label"] = frame.apply(
-            lambda row: row["pct_label"] if 0.0 < float(row["pct"]) < 7.0 else "", axis=1
+            lambda row: row["pct_label"] if show_outside_labels and 0.0 < float(row["pct"]) < 7.0 else "", axis=1
         )
     color_domain = [str(row["label"]) for row in rows]
     color_range = [str(row["color"]) for row in rows]
@@ -2036,35 +2251,189 @@ def _render_inventory_summary_legend(rows: list[dict[str, Any]], *, total: int) 
     st.markdown('<div class="dashboard-lite-inventory-legend">' + ''.join(items) + '</div>', unsafe_allow_html=True)
 
 
-def _build_inventory_status_summary_chart(facts: dict[str, Any]) -> alt.Chart | None:
+def _build_inventory_status_summary_chart(facts: dict[str, Any], *, pending: bool = False) -> alt.Chart | None:
     summary = _inventory_status_summary(facts)
+    if pending and not summary.get("pending_available"):
+        return None
     return _build_labeled_summary_donut(
-        _inventory_status_rows(facts),
+        _inventory_status_rows(facts, pending=pending),
         total_label="전체 관리 품목",
         total=int(summary.get("total_product_count") or 0),
         height=270,
         inner_radius=76,
         outer_radius=116,
+        show_outside_labels=False,
     )
 
 
-def _build_outbound_frequency_chart(facts: dict[str, Any]) -> alt.Chart | None:
+_DASHBOARD_GRADE_COLORS = {
+    "A": "#2563eb", "B": "#0ea5e9", "C": "#14b8a6",
+    "D": "#f59e0b", "E": "#f97316", "F": "#7c3aed",
+    "X": "#94a3b8", "빈도자료 부족": "#64748b", "등급자료 부족": "#64748b",
+}
+
+
+def _dashboard_grade_distribution_rows(
+    facts: dict[str, Any], count_key: str
+) -> list[dict[str, Any]]:
     summary = _inventory_status_summary(facts)
-    counts = summary.get("frequency_counts") or {}
-    rows = [
-        {"label": grade, "count": int(counts.get(grade) or 0), "color": color}
-        for grade, color in (
-            ("F", "#7c3aed"),
-            ("A", "#2563eb"), ("B", "#0ea5e9"), ("C", "#14b8a6"),
-            ("D", "#f59e0b"), ("E", "#f97316"), ("X", "#94a3b8"),
-            ("빈도자료 부족", "#64748b"),
-        )
+    if count_key in ("profit_grade_counts", "contribution_grade_counts") and summary.get(count_key) is None:
+        return []
+    counts = dict(summary.get(count_key) or {})
+    grades = (
+        ("A", "B", "C", "D", "E", "F", "X", "빈도자료 부족")
+        if count_key == "frequency_counts"
+        else ("A", "B", "C", "D", "E", "X", "등급자료 부족")
+    )
+    total = int(summary.get("total_product_count") or 0)
+    missing_grade = grades[-1]
+    counts[missing_grade] = int(counts.get(missing_grade) or 0) + max(
+        0, total - sum(int(counts.get(grade) or 0) for grade in grades)
+    )
+    return [
+        {
+            "grade": grade,
+            "count": int(counts.get(grade) or 0),
+            "percent": int(counts.get(grade) or 0) / total * 100 if total else 0.0,
+            "color": _DASHBOARD_GRADE_COLORS[grade],
+        }
+        for grade in grades
     ]
-    return _build_follow_up_chart(rows)
+
+
+def _build_dashboard_grade_distribution_chart(
+    facts: dict[str, Any], count_key: str
+) -> alt.Chart | None:
+    rows = _dashboard_grade_distribution_rows(facts, count_key)
+    if not rows:
+        return None
+    frame = pd.DataFrame(rows)
+    frame["count_label"] = frame.apply(
+        lambda row: f"{int(row['count']):,}개 · {row['percent']:.1f}%", axis=1
+    )
+    order = frame["grade"].tolist()
+    max_count = max(1, int(frame["count"].max()))
+    y = alt.Y("grade:N", sort=order, title=None, axis=alt.Axis(labelLimit=100, labelFontSize=11))
+    count_scale = alt.Scale(
+        domain=[0, max_count * 1.4],
+        type="sqrt" if count_key == "frequency_counts" else "linear",
+    )
+    base = alt.Chart(frame).encode(
+        x=alt.X("count:Q", title=None, axis=None, scale=count_scale),
+        y=y,
+        tooltip=[alt.Tooltip("grade:N", title="등급"), alt.Tooltip("count:Q", title="제품수", format=",.0f"), alt.Tooltip("percent:Q", title="비율", format=".1f")],
+    )
+    bars = base.mark_bar(cornerRadiusEnd=4, size=21).encode(
+        color=alt.Color("grade:N", legend=None, scale=alt.Scale(domain=order, range=[_DASHBOARD_GRADE_COLORS[grade] for grade in order]))
+    )
+    labels = base.mark_text(align="left", dx=5, color="#334155", fontSize=10).encode(text="count_label:N")
+    return (bars + labels).properties(height=288).configure(background="transparent").configure_view(stroke=None)
+
+
+def _build_outbound_frequency_chart(facts: dict[str, Any]) -> alt.Chart | None:
+    return _build_dashboard_grade_distribution_chart(facts, "frequency_counts")
+
+
+def _valid_profit_contribution_grade_matrix(summary: Mapping[str, Any]) -> Mapping[str, Mapping[str, int]] | None:
+    matrix = summary.get("profit_contribution_grade_matrix")
+    if not isinstance(matrix, Mapping):
+        return None
+    grades = ("A", "B", "C", "D", "E", "X")
+    if set(matrix) != set(grades):
+        return None
+    if any(
+        not isinstance(matrix.get(profit), Mapping)
+        or set(matrix[profit]) != set(grades)
+        or any(
+            contribution not in matrix[profit]
+            or not isinstance(matrix[profit][contribution], int)
+            or isinstance(matrix[profit][contribution], bool)
+            or matrix[profit][contribution] < 0
+            for contribution in grades
+        )
+        for profit in grades
+    ):
+        return None
+    return matrix
+
+
+def _build_profit_contribution_grade_heatmap(facts: dict[str, Any]) -> alt.Chart | None:
+    summary = _inventory_status_summary(facts)
+    matrix = _valid_profit_contribution_grade_matrix(summary)
+    if matrix is None:
+        return None
+    grades = ("A", "B", "C", "D", "E", "X")
+    total = int(summary.get("total_product_count") or 0)
+    rows = [
+        {
+            "profit": profit,
+            "contribution": contribution,
+            "count": matrix[profit][contribution],
+        }
+        for profit in grades for contribution in grades
+    ]
+    maximum = max(1, *(row["count"] for row in rows))
+    for row in rows:
+        row["percent"] = row["count"] / total * 100 if total else 0.0
+        row["visual_intensity"] = (row["count"] / maximum) ** 0.38
+        row["count_label"] = f'{row["count"]:,}'
+        row["percent_label"] = f'{row["percent"]:.1f}%'
+    base = alt.Chart(pd.DataFrame(rows)).encode(
+        x=alt.X("contribution:N", sort=list(grades), title="품목기여등급", axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("profit:N", sort=list(grades), title="품목손익등급"),
+        tooltip=[
+            alt.Tooltip("profit:N", title="손익"), alt.Tooltip("contribution:N", title="기여"),
+            alt.Tooltip("count:Q", title="제품수", format=",.0f"),
+            alt.Tooltip("percent:Q", title="관리품목 비율", format=".1f"),
+        ],
+    )
+    text_color = alt.condition(alt.datum.visual_intensity >= 0.7, alt.value("#ffffff"), alt.value("#24364a"))
+    cells = base.mark_rect(cornerRadius=3).encode(
+        color=alt.Color("visual_intensity:Q", legend=None, scale=alt.Scale(
+            domain=[0, 0.2, 0.4, 0.6, 0.8, 1],
+            range=["#f5f7fa", "#e7edf4", "#b9cadb", "#7899b8", "#4f759b", "#355d83"],
+        ))
+    )
+    counts = base.mark_text(dy=-7, fontSize=12, fontWeight="bold").encode(text="count_label:N", color=text_color)
+    percents = base.mark_text(dy=9, fontSize=10).encode(text="percent_label:N", color=text_color)
+    return (cells + counts + percents).properties(height=312).configure(background="transparent").configure_view(stroke=None)
 
 
 def _build_outbound_frequency_distribution_chart(facts: dict[str, Any]) -> alt.Chart | None:
     summary = _inventory_status_summary(facts)
+    comparison = summary.get("frequency_month_comparison") or {}
+    if comparison.get("status") == "ready":
+        current_month = str(comparison.get("current_month") or "현재월")
+        previous_month = str(comparison.get("previous_month") or "전월")
+        current_counts = comparison.get("current_counts") or {}
+        previous_counts = comparison.get("previous_counts") or {}
+        rows = [
+            {"grade": grade, "period": period, "count": int(counts.get(grade) or 0)}
+            for grade in ("F", "A", "B", "C", "D", "E", "X")
+            for period, counts in ((previous_month, previous_counts), (current_month, current_counts))
+        ]
+        frame = pd.DataFrame(rows)
+        order = ["F", "A", "B", "C", "D", "E", "X"]
+        period_order = [previous_month, current_month]
+        base = alt.Chart(frame).encode(
+            x=alt.X("count:Q", title="제품 수", axis=alt.Axis(format=",.0f")),
+            y=alt.Y("grade:N", sort=order, title="출고빈도등급", axis=alt.Axis(labelFontWeight=700)),
+            yOffset=alt.YOffset("period:N", sort=period_order),
+            color=alt.Color(
+                "period:N",
+                title=None,
+                sort=period_order,
+                scale=alt.Scale(domain=period_order, range=["#94a3b8", "#2563eb"]),
+            ),
+            tooltip=[
+                alt.Tooltip("period:N", title="평가월"),
+                alt.Tooltip("grade:N", title="등급"),
+                alt.Tooltip("count:Q", title="제품 수", format=",.0f"),
+            ],
+        )
+        bars = base.mark_bar(cornerRadiusEnd=5)
+        labels = base.mark_text(align="left", dx=4, color="#334155", fontSize=10).encode(text=alt.Text("count:Q", format=",.0f"))
+        return (bars + labels).properties(height=286).configure(background="transparent").configure_view(stroke=None)
     counts = summary.get("frequency_counts") or {}
     rows = [
         {"grade": grade, "count": int(counts.get(grade) or 0), "color": color}
@@ -2130,9 +2499,9 @@ def _render_inventory_cover_days(facts: dict[str, Any]) -> None:
 
 
 _INVENTORY_DETAIL_COLUMNS = (
-    "재고상태", "위험 품목 여부", "위험 유형", "출고빈도등급", "3개월 출고발생수",
+    "재고상태", "위험 품목 여부", "위험 유형", "출고빈도등급", "품목손익등급", "품목기여등급", "3개월 출고발생수",
     "제품코드", "제품명", "규격", "제조사명", "제품그룹명", "제품구분명", "제품분류명",
-    "주요매입처명", "현재재고수량", "평가월 예상수요", "재고수요비율", "재고 커버일",
+    "주요매입처명", "현재재고수량", "평가월 예상수요", "재고보유영업일", "입고예정수량", "입고예정 포함 재고상태", "재고 커버일",
     "위험사유", "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액",
     "위험보정재고준비율", "재고커버 자료상태", "수요급증상위분류", "수요급증세부분류", "수요급증세부분류사유", "최근 정상 입고일",
     "입고 경과일", "정상 입고 거래일수", "평균 입고간격일", "입고 자료상태", "입고 지연후보",
@@ -2159,11 +2528,15 @@ def _inventory_detail_filter_values(
     demand_surge_filter: str,
     vendor_key: str,
     search_text: str,
+    profit_grade: str = "전체",
+    contribution_grade: str = "전체",
 ) -> dict[str, str]:
     """Keep editable widget values separate from the last submitted local query."""
     return {
         "inventory_status": str(inventory_status or "전체"),
         "frequency_grade": str(frequency_grade or "전체"),
+        "profit_grade": str(profit_grade or "전체"),
+        "contribution_grade": str(contribution_grade or "전체"),
         "risk_filter": str(risk_filter or "전체"),
         "demand_surge_filter": str(demand_surge_filter or "전체"),
         "vendor_key": str(vendor_key or "전체"),
@@ -2245,12 +2618,18 @@ def _filter_integrated_inventory_detail_rows(
     vendor_key: str,
     search_text: str,
     demand_surge_filter: str = "전체",
+    profit_grade: str = "전체",
+    contribution_grade: str = "전체",
 ) -> pd.DataFrame:
     filtered = frame.copy()
     if inventory_status != "전체":
         filtered = filtered.loc[filtered["재고상태"].eq(inventory_status)]
     if frequency_grade != "전체":
         filtered = filtered.loc[filtered["출고빈도등급"].eq(frequency_grade)]
+    if profit_grade != "전체":
+        filtered = filtered.loc[filtered["품목손익등급"].eq(profit_grade)]
+    if contribution_grade != "전체":
+        filtered = filtered.loc[filtered["품목기여등급"].eq(contribution_grade)]
     if risk_filter == "위험 품목":
         filtered = filtered.loc[filtered["위험 품목 여부"].eq("위험 품목")]
     elif risk_filter in {"긴급 부족", "부족 주의"}:
@@ -2275,15 +2654,15 @@ def _filter_integrated_inventory_detail_rows(
             | filtered["제품명"].fillna("").astype(str).str.casefold().str.contains(token, regex=False)
             | filtered["제조사명"].fillna("").astype(str).str.casefold().str.contains(token, regex=False)
         ]
-    filtered["재고수요비율"] = pd.to_numeric(
-        filtered.get("재고수요비율", pd.Series(index=filtered.index, dtype="float64")), errors="coerce"
+    filtered["재고보유영업일"] = pd.to_numeric(
+        filtered.get("재고보유영업일", pd.Series(index=filtered.index, dtype="float64")), errors="coerce"
     )
     filtered["위험보정부족예상금액"] = pd.to_numeric(
         filtered.get("위험보정부족예상금액", pd.Series(index=filtered.index, dtype="float64")), errors="coerce"
     ).fillna(0)
     filtered["_위험정렬"] = filtered["위험 품목 여부"].ne("위험 품목").astype(int)
     return filtered.sort_values(
-        ["_위험정렬", "위험보정부족예상금액", "재고상태", "재고수요비율", "제품코드"],
+        ["_위험정렬", "위험보정부족예상금액", "재고상태", "재고보유영업일", "제품코드"],
         ascending=[True, False, True, True, True],
         kind="stable",
         na_position="last",
@@ -2309,34 +2688,41 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     namespace = _dashboard_render_namespace(dict(cache), render_mode="inventory-status-detail")
     risk_rows = [dict(row) for row in (inventory.get("risk_detail_rows") or []) if isinstance(row, Mapping)]
     vendor_options, vendor_labels = _risk_detail_vendor_options(risk_rows)
-    status_options = ["전체", "긴급 부족", "재고 경고", "적정 재고", "과다 재고", "예상수요 없음", "자료 부족"]
+    status_options = ["전체", *INVENTORY_STATUS_ORDER]
     frequency_options = ["전체", "F", "A", "B", "C", "D", "E", "X", "빈도자료 부족"]
+    grade_options = ["전체", "A", "B", "C", "D", "E", "X", "등급자료 부족"]
     applied_key = f"__dashboard_lite_inventory_detail_applied::{namespace}"
     with st.form(key=f"dashboard_inventory_detail_form::{namespace}", clear_on_submit=False, enter_to_submit=False):
-        filter_cols = st.columns((19, 17, 18, 23))
+        filter_cols = st.columns((1.2, 1, 1, 1, 1.2))
         with filter_cols[0]:
             selected_status = st.selectbox("재고 상태", status_options, key=f"dashboard_inventory_detail::{namespace}::state")
         with filter_cols[1]:
             selected_frequency = st.selectbox("출고빈도 등급", frequency_options, key=f"dashboard_inventory_detail::{namespace}::frequency")
         with filter_cols[2]:
-            selected_risk = st.selectbox("위험 품목", ["전체", "위험 품목", "긴급 부족", "부족 주의", "비위험 품목"], key=f"dashboard_inventory_detail::{namespace}::risk")
+            selected_profit = st.selectbox("품목손익등급", grade_options, key=f"dashboard_inventory_detail::{namespace}::profit")
         with filter_cols[3]:
+            selected_contribution = st.selectbox("품목기여등급", grade_options, key=f"dashboard_inventory_detail::{namespace}::contribution")
+        with filter_cols[4]:
+            selected_risk = st.selectbox("위험 품목", ["전체", "위험 품목", "긴급 부족", "부족 주의", "비위험 품목"], key=f"dashboard_inventory_detail::{namespace}::risk")
+        lower_filter_cols = st.columns((1.8, 1.5, 2, 1.2), gap="small", vertical_alignment="bottom")
+        with lower_filter_cols[0]:
             selected_surge = st.selectbox(
                 "수요급증 유형",
                 ["전체", "수요급증 전체", "기존 예상 초과", "예상외 출고 발생", "신규 출고 후보", "계절성 재발생 후보", "3개월 이상 재출고", "예상 누락", "분류자료 부족"],
                 key=f"dashboard_inventory_detail::{namespace}::surge",
             )
-        lower_filter_cols = st.columns((10, 9, 2.5), gap="small", vertical_alignment="bottom")
-        with lower_filter_cols[0]:
-            vendor_key = st.selectbox("주요매입처", vendor_options, format_func=lambda value: vendor_labels.get(value, "매입처 미확인"), key=f"dashboard_inventory_detail::{namespace}::vendor")
         with lower_filter_cols[1]:
-            search_text = st.text_input("제품 검색", key=f"dashboard_inventory_detail::{namespace}::search")
+            vendor_key = st.selectbox("주요매입처", vendor_options, format_func=lambda value: vendor_labels.get(value, "매입처 미확인"), key=f"dashboard_inventory_detail::{namespace}::vendor")
         with lower_filter_cols[2]:
+            search_text = st.text_input("제품 검색", key=f"dashboard_inventory_detail::{namespace}::search")
+        with lower_filter_cols[3]:
             submitted = st.form_submit_button("재고 상세 조회", type="primary", width="stretch")
     if submitted:
         st.session_state[applied_key] = _inventory_detail_filter_values(
             inventory_status=selected_status,
             frequency_grade=selected_frequency,
+            profit_grade=selected_profit,
+            contribution_grade=selected_contribution,
             risk_filter=selected_risk,
             demand_surge_filter=selected_surge,
             vendor_key=vendor_key,
@@ -2350,6 +2736,8 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
         frame,
         inventory_status=str(applied.get("inventory_status") or "전체"),
         frequency_grade=str(applied.get("frequency_grade") or "전체"),
+        profit_grade=str(applied.get("profit_grade") or "전체"),
+        contribution_grade=str(applied.get("contribution_grade") or "전체"),
         risk_filter=str(applied.get("risk_filter") or "전체"),
         demand_surge_filter=str(applied.get("demand_surge_filter") or "전체"),
         vendor_key=str(applied.get("vendor_key") or "전체"),
@@ -2357,6 +2745,8 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     )
     applied_status = str(applied.get("inventory_status") or "전체")
     applied_frequency = str(applied.get("frequency_grade") or "전체")
+    applied_profit = str(applied.get("profit_grade") or "전체")
+    applied_contribution = str(applied.get("contribution_grade") or "전체")
     applied_risk = str(applied.get("risk_filter") or "전체")
     applied_surge = str(applied.get("demand_surge_filter") or "전체")
     applied_vendor = str(applied.get("vendor_key") or "전체")
@@ -2396,13 +2786,15 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
             "위험 품목 여부": st.column_config.TextColumn("위험 품목", width=100, pinned=True, alignment="center"),
             "위험 유형": st.column_config.TextColumn("위험 유형", width=100, pinned=True, alignment="center"),
             "출고빈도등급": st.column_config.TextColumn("출고빈도", width=90, alignment="center"),
+            "품목손익등급": st.column_config.TextColumn("손익등급", width=90, alignment="center"),
+            "품목기여등급": st.column_config.TextColumn("기여등급", width=90, alignment="center"),
         },
     )
     if not bool(require_permission("EXPORT_EXCEL", show_error=False)):
         st.warning("다운로드 권한이 없습니다. 필요 권한: EXPORT_EXCEL (엑셀/CSV 다운로드)")
         return
     filter_signature = hashlib.sha256(
-        "|".join((applied_status, applied_frequency, applied_risk, applied_surge, applied_vendor, applied_search)).encode("utf-8")
+        "|".join((applied_status, applied_frequency, applied_profit, applied_contribution, applied_risk, applied_surge, applied_vendor, applied_search)).encode("utf-8")
     ).hexdigest()[:12]
     excel_key = f"__dashboard_lite_inventory_detail_excel::{namespace}::{filter_signature}"
     cache_entry = st.session_state.get(excel_key)
@@ -2414,6 +2806,8 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
             conditions.extend([
                 {"조건명": "재고 상태", "값": applied_status},
                 {"조건명": "출고빈도 등급", "값": applied_frequency},
+                {"조건명": "품목손익등급", "값": applied_profit},
+                {"조건명": "품목기여등급", "값": applied_contribution},
                 {"조건명": "위험 품목", "값": applied_risk},
                 {"조건명": "수요급증 유형", "값": applied_surge},
                 {"조건명": "주요매입처", "값": vendor_labels.get(applied_vendor, applied_vendor)},
@@ -4668,6 +5062,8 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
     facts = dict(source.get("facts") or {})
     sales = dict(facts.get("sales") or {})
     inventory = dict(facts.get("inventory") or {})
+    status_summary = inventory.get("inventory_status_summary") or {}
+    canonical_matrix = _valid_profit_contribution_grade_matrix(status_summary) if isinstance(status_summary, Mapping) else None
     try:
         requested_limit = int(params.get("risk_quick_view_count") or 10)
     except (TypeError, ValueError):
@@ -4730,7 +5126,14 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
                 key: (inventory.get("inventory_status_summary") or {}).get(key)
                 for key in (
                     "total_product_count", "expected_demand_product_count", "status_counts",
-                    "frequency_counts", "snapshot_status", "snapshot_generation_no",
+                    "pending_status_counts", "pending_available", "pending_authority",
+                    "pending_negative_product_count", "pending_changed_product_count",
+                    "pending_unchanged_product_count", "pending_improved_product_count",
+                    "pending_to_overstock_product_count", "monthly_business_days",
+                    "frequency_counts", "profit_grade_counts", "contribution_grade_counts",
+                    "profit_contribution_grade_matrix", "grade_missing_primary_counts",
+                    "grade_missing_both_count", "grade_missing_profit_only_count", "grade_missing_contribution_only_count",
+                    "snapshot_status", "snapshot_generation_no",
                     "snapshot_checksum", "snapshot_reason", "missing_frequency_product_count",
                 )
             },
@@ -4802,6 +5205,12 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             if key in (facts.get("performance") or {})
         },
     }
+    if canonical_matrix is not None:
+        grades = ("A", "B", "C", "D", "E", "X")
+        compact_facts["inventory"]["inventory_status_summary"]["profit_contribution_grade_matrix"] = {
+            profit: {contribution: int(canonical_matrix[profit][contribution]) for contribution in grades}
+            for profit in grades
+        }
     return {
         "snapshot_version": 1,
         "cache_key": source.get("cache_key"),
@@ -5222,41 +5631,84 @@ def _render_dashboard_facts(
         st.caption(
             f"관리 품목 {int(status_summary.get('total_product_count') or 0):,}개 / "
             f"평가월 예상수요 품목 {int(status_summary.get('expected_demand_product_count') or 0):,}개. "
-            "상태는 현재고 ÷ 평가월 예상수요의 비제한 비율로 분류합니다."
+            f"평가월 총영업일 {status_summary.get('monthly_business_days') or '자료 없음'}일 기준."
         )
         with st.container(key=f"dashboard_inventory_row__top__{render_namespace}"):
-            top_left, top_right = st.columns(2, gap="medium", vertical_alignment="top")
+            top_left, top_right = st.columns([3, 1], gap="medium", vertical_alignment="top")
             with top_left:
                 with st.container(key=f"dashboard_inventory_card__status__{render_namespace}"):
-                    _render_summary_card_heading("box", "inventory", "재고 핵심상태", "현재고 ÷ 평가월 예상수요")
+                    _render_summary_card_heading("box", "inventory", "재고핵심상태", "영업일 기준 재고보유일수 · 기타 상태는 오른쪽")
                     with st.container(key=f"dashboard_inventory_card_body__status__{render_namespace}"):
-                        donut_col, legend_col = st.columns([45, 55], gap="small", vertical_alignment="center")
-                        with donut_col:
-                            chart = _build_inventory_status_summary_chart(facts)
-                            if chart is not None:
-                                st.altair_chart(chart, width="stretch")
-                        with legend_col:
-                            _render_inventory_summary_legend(
-                                _inventory_status_rows(facts),
-                                total=int(status_summary.get("total_product_count") or 0),
-                            )
+                        current_chart = _inventory_status_core_donut(facts)
+                        pending_chart = _inventory_status_core_donut(facts, pending=True)
+                        if current_chart is not None and pending_chart is not None:
+                            with st.container(key=f"dashboard_inventory_donut_group__{render_namespace}"):
+                                current_col, legend_col, pending_col = st.columns((1, 0.39, 1), gap="small")
+                                with current_col:
+                                    st.markdown('<div class="dashboard-lite-status-donut-title">현재재고 상태</div>', unsafe_allow_html=True)
+                                    st.altair_chart(current_chart, width="stretch")
+                                with legend_col:
+                                    st.markdown(_inventory_status_core_legend_html(), unsafe_allow_html=True)
+                                with pending_col:
+                                    st.markdown('<div class="dashboard-lite-status-donut-title">입고예정 포함 상태</div>', unsafe_allow_html=True)
+                                    st.altair_chart(pending_chart, width="stretch")
+                        else:
+                            st.info("입고예정 자료가 없거나 양쪽 제품수 합계가 달라 상태 분포를 표시하지 않습니다.")
             with top_right:
-                with st.container(key=f"dashboard_inventory_card__frequency__{render_namespace}"):
-                    _render_summary_card_heading("cycle", "frequency", "출고빈도 분포", "승인된 최근 완료 3개월 출고자료 · F / A → E / X")
-                    with st.container(key=f"dashboard_inventory_card_body__frequency__{render_namespace}"):
-                        frequency_chart = _build_outbound_frequency_distribution_chart(facts)
-                        if frequency_chart is not None:
-                            st.altair_chart(frequency_chart, width="stretch")
-                    snapshot_status = str(status_summary.get("snapshot_status") or "missing")
-                    if snapshot_status == "ready":
-                        st.markdown(
-                            '<div class="dashboard-lite-inventory-card-footer">'
-                            'F: 3개월 이내 최초 입고 품목. X: 최근 3개월 정상 출고 없음. 빈도자료 부족: 현재 조회범위와 일치하는 승인자료 또는 해당 제품의 출고자료가 없습니다.'
-                            '</div>',
-                            unsafe_allow_html=True,
-                        )
+                with st.container(key=f"dashboard_inventory_minor_section__{render_namespace}"):
+                    minor_col, change_col = st.columns(2, gap="small", vertical_alignment="top")
+                    with minor_col:
+                        _render_summary_card_heading("box", "inventory", "기타 재고 상태", "현재재고 → 입고예정 포함")
+                        minor_summary = _inventory_status_minor_html(facts)
+                        if minor_summary is not None:
+                            st.markdown(minor_summary, unsafe_allow_html=True)
+                        else:
+                            st.info("입고예정 자료가 없어 기타 상태를 표시하지 않습니다.")
+                    with change_col:
+                        change_summary = _inventory_status_change_html(facts)
+                        if change_summary is not None:
+                            st.markdown('<div class="dashboard-lite-status-change-title">재고 변화 요약</div>', unsafe_allow_html=True)
+                            st.markdown(change_summary, unsafe_allow_html=True)
+                            st.markdown('<div class="dashboard-lite-status-change-note">상태별 제품수의 순증감이며, 개별 제품 상태전환 수가 아님</div>', unsafe_allow_html=True)
+
+        frequency_column, matrix_column = st.columns((1, 2), gap="medium", vertical_alignment="top")
+        with frequency_column:
+            with st.container(key=f"dashboard_inventory_card__frequency__{render_namespace}"):
+                _render_summary_card_heading("cycle", "frequency", "출고빈도 분포", "현재 평가월 · A / B / C / D / E / F / X")
+                with st.container(key=f"dashboard_inventory_card_body__frequency__{render_namespace}"):
+                    chart = _build_dashboard_grade_distribution_chart(facts, "frequency_counts")
+                    if chart is not None:
+                        st.altair_chart(chart, width="stretch")
+                if str(status_summary.get("snapshot_status") or "missing") == "ready":
+                    st.caption("막대 길이: 제곱근 척도 · F: 최근 3개월 이내 신제품 · X: 최근 3개월 정상 출고 없음")
+                else:
+                    st.caption("일치하는 승인 Snapshot이 없어 등급자료 부족으로 표시합니다.")
+        with matrix_column:
+            with st.container(key=f"dashboard_inventory_card__grade_matrix__{render_namespace}"):
+                _render_summary_card_heading("bars", "contribution", "품목손익 × 품목기여등급", "승인 Snapshot · 세로 손익 / 가로 기여")
+                with st.container(key=f"dashboard_inventory_card_body__grade_matrix__{render_namespace}"):
+                    chart = _build_profit_contribution_grade_heatmap(facts)
+                    if chart is not None:
+                        st.altair_chart(chart, width="stretch")
                     else:
-                        st.warning("출고빈도 자료 부족: 승인·일치하는 snapshot이 없어 등급을 표시하지 않습니다. ERP 실시간 재계산은 수행하지 않습니다.")
+                        st.info("저장된 결과에 등급 교차분포가 없습니다. 새 조회에서 확인해 주세요.")
+                matrix = _valid_profit_contribution_grade_matrix(status_summary)
+                if matrix is not None:
+                    matrix_count = sum(value for values in matrix.values() for value in values.values())
+                    total = int(status_summary.get("total_product_count") or 0)
+                    missing = max(0, total - matrix_count)
+                    st.caption(f"등급자료 부족 {missing:,}개 · {missing / total * 100 if total else 0:.1f}% (6×6 제외)")
+                    reason_labels = {
+                        "product_not_in_projection": "Snapshot 행 없음", "stale": "가격자료 오래됨",
+                        "unavailable": "산정자료 없음", "excluded_adjustment_only": "조정 내역만 존재", "other": "기타",
+                    }
+                    reasons = status_summary.get("grade_missing_primary_counts") or {}
+                    if isinstance(reasons, Mapping) and sum(int(count or 0) for count in reasons.values()) == missing:
+                        top_reasons = sorted(((name, int(count or 0)) for name, count in reasons.items() if int(count or 0) > 0), key=lambda item: -item[1])
+                        if len(top_reasons) > 3:
+                            top_reasons = [*top_reasons[:2], ("other", sum(count for _, count in top_reasons[2:]))]
+                        if top_reasons:
+                            st.caption(" · ".join(f"{reason_labels.get(name, name)} {count:,}개" for name, count in top_reasons))
 
         with st.container(key=f"dashboard_inventory_row__bottom__{render_namespace}"):
             bottom_left, bottom_right = st.columns(2, gap="medium", vertical_alignment="top")

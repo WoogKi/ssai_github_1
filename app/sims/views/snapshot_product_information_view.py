@@ -48,16 +48,16 @@ def view_snapshot_product_information(
         with c3:
             profit_grade = st.selectbox(
                 "품목손익등급",
-                ["전체", "A", "B", "C", "D", "E", "unavailable"],
-                index=_index(["전체", "A", "B", "C", "D", "E", "unavailable"], defaults.get("profit_grade") or "전체"),
+                ["전체", "A", "B", "C", "D", "E", "X", "unavailable"],
+                index=_index(["전체", "A", "B", "C", "D", "E", "X", "unavailable"], defaults.get("profit_grade") or "전체"),
                 format_func=lambda value: STATUS_LABELS.get(value, value),
                 key=f"{prefix}_profit_grade",
             )
         with c4:
             contribution_grade = st.selectbox(
                 "품목기여등급",
-                ["전체", "A", "B", "C", "D", "E", "unavailable"],
-                index=_index(["전체", "A", "B", "C", "D", "E", "unavailable"], defaults.get("contribution_grade") or "전체"),
+                ["전체", "A", "B", "C", "D", "E", "X", "unavailable"],
+                index=_index(["전체", "A", "B", "C", "D", "E", "X", "unavailable"], defaults.get("contribution_grade") or "전체"),
                 format_func=lambda value: STATUS_LABELS.get(value, value),
                 key=f"{prefix}_contribution_grade",
             )

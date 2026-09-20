@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 import ast
 import hashlib
 import json
@@ -89,6 +90,25 @@ def test_product_information_service() -> None:
     _assert(list(frame.loc[0, ["제품코드", "출고빈도등급", "품목손익등급", "품목기여등급"]]) == ["00001", "F", "B", "A"], "grade projection mismatch")
     _assert("추정기여금액" in frame.columns and "3개월반품공급가액" in frame.columns, "detail statistics missing")
 
+    def x_projection(**_kwargs):
+        original = _projection()
+        return replace(original, rows=({**original.rows[0], "profit_grade": "X", "contribution_grade": "X"},))
+
+    x_payload = get_snapshot_product_information_result(
+        {"company_id": 7, "profit_grade": "X", "contribution_grade": "X"},
+        profile_resolver=_scope,
+        projection_reader=x_projection,
+        master_loader=lambda params: pd.DataFrame([{
+            "제품코드": "00001", "제품명": "검증품목", "제약사": "검증제약", "규격": "10정",
+        }]),
+        viewer_user=SimpleNamespace(user_type="SSART_USER"),
+    )
+    _assert(
+        len(x_payload["df"]) == 1
+        and list(x_payload["df"].loc[0, ["품목손익등급", "품목기여등급"]]) == ["X", "X"],
+        "v3 X grades must survive Product Information filters and projection",
+    )
+
 
 def test_inventory_grade_attachment_and_placement() -> None:
     source = pd.DataFrame([{"제품코드": "00001", "KD코드": "012345", "재고수량": 4}])
@@ -134,6 +154,8 @@ def test_nlq_and_inventory_boundaries() -> None:
     flow = resolve_io_nlq("제품수불현황 조회")
     _assert(info and info["action"] == "제품정보 조회" and info["params"].get("profit_grade") == "A", "product information NLQ failed")
     _assert(official_info and official_info["params"].get("profit_grade") == "A", "official profit-grade alias failed")
+    _assert(resolve_io_nlq("품목손익등급 X 제품정보 조회")["params"].get("profit_grade") == "X", "profit X NLQ failed")
+    _assert(resolve_io_nlq("품목기여등급 X 제품정보 조회")["params"].get("contribution_grade") == "X", "contribution X NLQ failed")
     _assert(inventory and inventory["action"] == "제품재고현황 조회", "product inventory route regressed")
     _assert(flow and flow["action"] == "제품수불현황 조회", "product flow route regressed")
     _assert(resolve_io_nlq("제품 조회") is None, "master product query was captured by Snapshot action")

@@ -1154,6 +1154,33 @@ def _remove_product_inventory_frequency_phrase(params: Dict[str, Any], frequency
     return out
 
 
+_PRODUCT_INVENTORY_GRADE_PHRASE = re.compile(
+    r"(?:품목\s*)?(?:손익|기여(?:도)?)(?:\s*등급)?\s*[:=]?\s*(?:[A-EX]|등급\s*자료\s*부족|자료\s*부족)(?:\s*등급)?",
+    re.IGNORECASE,
+)
+
+
+def extract_product_inventory_grade_filters(text: str) -> Dict[str, str]:
+    """Parse labelled profit/contribution grades for both inventory routes."""
+    compact = re.sub(r"\s+", "", _norm(text))
+    filters: Dict[str, str] = {}
+    for key, label in (("profit_grade", "손익"), ("contribution_grade", "기여(?:도)?")):
+        match = re.search(
+            rf"(?:품목)?{label}(?:등급)?[:=]?(등급자료부족|자료부족|[A-EX])(?:등급)?",
+            compact,
+            re.IGNORECASE,
+        )
+        if match:
+            value = match.group(1)
+            filters[key] = "자료 부족" if "자료부족" in value else value.upper()
+    return filters
+
+
+def remove_product_inventory_grade_phrases(text: str) -> str:
+    """Do not resolve a labelled grade as a product or manufacturer name."""
+    return _PRODUCT_INVENTORY_GRADE_PHRASE.sub(" ", str(text or ""))
+
+
 def remove_outbound_frequency_phrase(text: str) -> str:
     """Keep a labelled outbound-frequency condition out of entity resolution."""
     grade_pattern = "|".join(re.escape(grade) for grade in EXTENDED_FREQUENCY_PROJECTION_GRADES)
@@ -3064,7 +3091,8 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
     if is_io_validation_explanation_request(raw):
         return None
 
-    params = extract_params(raw, today=today)
+    grade_filters = extract_product_inventory_grade_filters(raw) if _has_any(raw, (*_CURRENT_STOCK_WORDS, *_PRODUCT_INVENTORY_WORDS)) else {}
+    params = extract_params(remove_product_inventory_grade_phrases(raw) if grade_filters else raw, today=today)
     frequency_grade = _extract_product_inventory_frequency_grade(raw)
 
     def _result(action: str, params_in: Dict[str, Any]) -> Dict[str, Any]:
@@ -3137,7 +3165,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             ("contribution_grade", r"(?:품목\s*)?기여(?:도)?"),
         ):
             match = re.search(
-                rf"{label_pattern}\s*등급\s*[:=]?\s*([A-E])(?:\s*등급)?",
+                rf"{label_pattern}\s*등급\s*[:=]?\s*([A-EX])(?:\s*등급)?",
                 raw,
                 re.IGNORECASE,
             )
@@ -3153,6 +3181,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
 
     if _has_any(raw, _CURRENT_STOCK_WORDS):
         params = _apply_date_params_for_product_inventory(params, raw)
+        params.update(grade_filters)
         if frequency_grade:
             params["frequency_grade"] = frequency_grade
             params = _remove_product_inventory_frequency_phrase(params, frequency_grade)
@@ -3235,6 +3264,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
 
     if _has_any(raw, _PRODUCT_INVENTORY_WORDS):
         params = _apply_date_params_for_product_inventory(params, raw)
+        params.update(grade_filters)
         if frequency_grade:
             params["frequency_grade"] = frequency_grade
             params = _remove_product_inventory_frequency_phrase(params, frequency_grade)

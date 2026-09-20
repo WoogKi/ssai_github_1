@@ -27,7 +27,9 @@ ALGORITHM_VERSION = "outbound_frequency_v1"
 EXTENDED_SCHEMA_VERSION = "2.0"
 EXTENDED_ALGORITHM_VERSION = "outbound_frequency_v2"
 PRODUCT_STATISTICS_SCHEMA_VERSION = "2.1"
-PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v1"
+LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v1"
+CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v2"
+PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v3"
 PRODUCT_STATISTICS_DECIMAL_STORAGE = {
     "return_supply_amount_3m": (38, 6),
     "avg_purchase_unit_cost": (38, 10),
@@ -93,6 +95,7 @@ class FrequencyProjectionReadResult:
     authority_status: str = ""
     resolution_status: str = ""
     contract_version: str = ""
+    resolved_evaluation_month: str = ""
 
     @property
     def usable(self) -> bool:
@@ -406,7 +409,11 @@ def _is_lifecycle_key(key: SnapshotKey) -> bool:
 def _is_product_statistics_key(key: SnapshotKey) -> bool:
     return (
         key.schema_version == PRODUCT_STATISTICS_SCHEMA_VERSION
-        and key.algorithm_version == PRODUCT_STATISTICS_ALGORITHM_VERSION
+        and key.algorithm_version in {
+            LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION,
+            CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION,
+            PRODUCT_STATISTICS_ALGORITHM_VERSION,
+        }
     )
 
 
@@ -711,20 +718,43 @@ def canonicalize_frequency_product_storage_row(
     return canonical
 
 
-def _relative_grades(values: Mapping[str, Decimal]) -> dict[str, str]:
-    """Assign deterministic relative quintiles while keeping equal values together."""
+def _cumulative_amount_grades(
+    values: Mapping[str, Decimal], *, nonpositive_grade: str = "E"
+) -> dict[str, str]:
+    """Grade positive amount concentration; keep ties and nonpositive items together."""
     groups: dict[Decimal, list[str]] = defaultdict(list)
     for code, value in values.items():
         groups[value].append(code)
-    total = sum(len(codes) for codes in groups.values())
-    before = 0
+    positive_total = sum(
+        (value * len(codes) for value, codes in groups.items() if value > 0),
+        Decimal(0),
+    )
+    boundaries = (Decimal("0.80"), Decimal("0.90"), Decimal("0.95"), Decimal("0.99"))
+    before = Decimal(0)
     grades: dict[str, str] = {}
-    for value in sorted(groups, reverse=True):
-        grade = FREQUENCY_GRADES[min((before * 5) // max(total, 1), 4)]
+    for value in sorted((amount for amount in groups if amount > 0), reverse=True):
+        share_before = before / positive_total
+        grade = FREQUENCY_GRADES[sum(share_before >= boundary for boundary in boundaries)]
         for code in groups[value]:
             grades[code] = grade
-        before += len(groups[value])
+        before += value * len(groups[value])
+    for value, codes in groups.items():
+        if value <= 0:
+            for code in codes:
+                grades[code] = nonpositive_grade
     return grades
+
+
+def _profit_rate_grade(rate: Decimal) -> str:
+    if rate <= 0:
+        return "X"
+    for minimum, grade in (
+        (Decimal("0.30"), "A"), (Decimal("0.20"), "B"),
+        (Decimal("0.10"), "C"), (Decimal("0.05"), "D"),
+    ):
+        if rate >= minimum:
+            return grade
+    return "E"
 
 
 def build_product_statistics_relational_snapshot_from_aggregates(
@@ -772,7 +802,6 @@ def build_product_statistics_relational_snapshot_from_aggregates(
         )
 
     rows: list[dict[str, Any]] = []
-    profit_scores: dict[str, Decimal] = {}
     contribution_scores: dict[str, Decimal] = {}
     for source in lifecycle.frequency_products:
         code = str(source["product_code"])
@@ -786,6 +815,7 @@ def build_product_statistics_relational_snapshot_from_aggregates(
         if purchase_status not in {"ready", "stale", "unavailable"} or sales_status not in {"ready", "stale", "unavailable"}:
             raise SnapshotContractError("price status is invalid")
         unit_profit = sales_price - purchase_cost if purchase_cost is not None and sales_price is not None else None
+        paid_quantity = _required_nonnegative_int(outbound_paid_quantities.get(code, 0), field="outbound_paid_qty_3m")
         profit_rate = (
             unit_profit / sales_price
             if unit_profit is not None and sales_price is not None and sales_price != 0
@@ -796,18 +826,17 @@ def build_product_statistics_relational_snapshot_from_aggregates(
             profitability_status = "excluded_adjustment_only"
         elif code in unavailable_codes:
             profitability_status = "unavailable"
-        elif purchase_status == "unavailable" or sales_status == "unavailable" or profit_rate is None:
+        elif purchase_status == "unavailable" or sales_status == "unavailable" or profit_rate is None or sales_price is None or sales_price <= 0:
             profitability_status = "unavailable"
         elif purchase_status == "stale" or sales_status == "stale":
             profitability_status = "stale"
         else:
             profitability_status = "ready"
-            profit_scores[code] = profit_rate
             contribution_scores[code] = contribution or Decimal(0)
         rows.append({
             **source,
             "outbound_qty_3m": outbound_quantities.get(code, 0),
-            "outbound_paid_qty_3m": _required_nonnegative_int(outbound_paid_quantities.get(code, 0), field="outbound_paid_qty_3m"),
+            "outbound_paid_qty_3m": paid_quantity,
             "return_event_count_3m": _required_nonnegative_int(returns.get("event_count", 0), field="return_event_count_3m"),
             "return_qty_3m": _required_nonnegative_int(returns.get("quantity", 0), field="return_qty_3m"),
             "return_supply_amount_3m": _optional_decimal(returns.get("supply_amount", 0), field="return_supply_amount_3m") or Decimal(0),
@@ -824,13 +853,16 @@ def build_product_statistics_relational_snapshot_from_aggregates(
             "contribution_grade": "unavailable",
             "profitability_status": profitability_status,
         })
-    profit_grades = _relative_grades(profit_scores)
-    contribution_grades = _relative_grades(contribution_scores)
+    contribution_grades = _cumulative_amount_grades(contribution_scores, nonpositive_grade="X")
     for row in rows:
         code = str(row["product_code"])
         if row["profitability_status"] == "ready":
-            row["profit_grade"] = profit_grades[code]
-            row["contribution_grade"] = contribution_grades[code]
+            return_only = row["outbound_qty_3m"] == 0 and row["return_qty_3m"] > 0
+            row["profit_grade"] = (
+                "X" if return_only or row["estimated_unit_profit"] <= 0
+                else _profit_rate_grade(row["estimated_profit_rate"])
+            )
+            row["contribution_grade"] = "X" if return_only else contribution_grades[code]
 
     key = SnapshotKey(
         lifecycle.key.company_id,
@@ -847,12 +879,13 @@ def build_product_statistics_relational_snapshot_from_aggregates(
         "fingerprint_contract_version": 5,
         "fingerprint_mode": "event_product_statistics_v1",
     })
+    product_columns = _frequency_product_columns(key)
     source_fingerprint = hashlib.sha256(
         lifecycle.source_fingerprint.encode("ascii")
         + _canonical_section(
             "product_statistics_source",
-            _frequency_product_columns(key),
-            [tuple(row.get(column) for column in _frequency_product_columns(key)) for row in rows],
+            product_columns,
+            [tuple(row.get(column) for column in product_columns) for row in rows],
         )
     ).hexdigest()
     checksum = calculate_relational_frequency_checksum(
@@ -1033,7 +1066,12 @@ def validate_relational_frequency_snapshot(snapshot: RelationalFrequencySnapshot
                 profit_grade = str(row.get("profit_grade") or "")
                 contribution_grade = str(row.get("contribution_grade") or "")
                 if profitability_status == "ready":
-                    if profit_grade not in FREQUENCY_GRADES or contribution_grade not in FREQUENCY_GRADES:
+                    allowed_grades = (
+                        {*FREQUENCY_GRADES, "X"}
+                        if snapshot.key.algorithm_version == PRODUCT_STATISTICS_ALGORITHM_VERSION
+                        else set(FREQUENCY_GRADES)
+                    )
+                    if profit_grade not in allowed_grades or contribution_grade not in allowed_grades:
                         raise SnapshotContractError("relational product profitability grade is invalid")
                 elif profit_grade != "unavailable" or contribution_grade != "unavailable":
                     raise SnapshotContractError("unavailable profitability must not expose a grade")

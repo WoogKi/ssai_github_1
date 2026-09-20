@@ -10,7 +10,7 @@ import logging
 from collections import defaultdict
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -23,9 +23,11 @@ from app.db.mssql_client import get_current_company_id, get_engine, set_current_
 from app.services.business_calendar_service import kst_today
 from app.services.dashboard_inventory_frequency_snapshot import (
     ALGORITHM_VERSION,
+    CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION,
     EXTENDED_ALGORITHM_VERSION,
     EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
     EXTENDED_SCHEMA_VERSION,
+    LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     FrequencyProjectionReadResult,
@@ -396,7 +398,17 @@ def _resolve_operating_key(repo: Any, requested_key: SnapshotKey, as_of_date: st
         # Test doubles that predate the operating-read contract retain their
         # exact-key behavior; the production repository always implements it.
         return requested_key
-    return resolver(requested_key, available_through=as_of_date)
+    resolved = resolver(requested_key, available_through=as_of_date)
+    if resolved is not None or requested_key.algorithm_version != PRODUCT_STATISTICS_ALGORITHM_VERSION:
+        return resolved
+    for version in (
+        CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION,
+        LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    ):
+        resolved = resolver(replace(requested_key, algorithm_version=version), available_through=as_of_date)
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def _classify_projection_unavailable(repo: Any, key: SnapshotKey) -> tuple[str, str]:
@@ -579,6 +591,7 @@ def read_approved_frequency_projection(
                 checksum=result.checksum, authority_status="ready",
                 resolution_status="exact_match",
                 contract_version=operating_key.schema_version,
+                resolved_evaluation_month=operating_key.evaluation_month,
             )
         return result
     except Exception as exc:
@@ -1115,6 +1128,8 @@ def _event_grain_int(value: Any, *, field: str) -> int:
 
 def _aggregate_extended_event_grain_chunks(
     chunks: Iterable[pd.DataFrame],
+    *,
+    paid_quantities: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, int], dict[str, int]]:
     """Rebuild monthly activity from a single chunked exact event stream.
 
@@ -1161,6 +1176,14 @@ def _aggregate_extended_event_grain_chunks(
             exact_duplicates = _event_grain_int(record.get("exact_duplicate_row_count"), field="exact_duplicate_row_count")
             if mapping_count < 1 or exact_duplicates < 0:
                 raise SnapshotContractError("outbound event stream count is invalid")
+            if paid_quantities is not None and mapping_count == 1:
+                code = str(record.get("product_code") or "").strip()
+                try:
+                    paid_quantity = Decimal(str(record.get("paid_quantity") or 0).strip())
+                except (InvalidOperation, ValueError):
+                    paid_quantity = Decimal(0)
+                if paid_quantity > 0 and paid_quantity == paid_quantity.to_integral_value():
+                    paid_quantities[code] += int(paid_quantity)
             duplicate_rows += exact_duplicates
             if mapping_count > 1:
                 conflicting_rows += mapping_count
@@ -1221,51 +1244,44 @@ def _aggregate_product_statistics_event_chunks(
     dict[str, int], dict[str, dict[str, Any]], dict[str, dict[str, Any]],
 ]:
     """Split one multi-projection R120 stream without issuing another ERP query."""
-    frequency_chunks: list[pd.DataFrame] = []
     paid_quantities: dict[str, int] = defaultdict(int)
     return_statistics: dict[str, dict[str, Any]] = {}
     sales_prices: dict[str, dict[str, Any]] = {}
-    for chunk in chunks:
-        if not isinstance(chunk, pd.DataFrame) or "row_kind" not in chunk.columns:
-            raise SnapshotContractError("product statistics event stream is invalid")
-        kinds = chunk["row_kind"].fillna("").astype(str)
-        frequency = chunk[kinds.isin(("event", "diagnostics"))].copy()
-        if not frequency.empty:
-            frequency_chunks.append(frequency)
-        for record in chunk[~kinds.isin(("event", "diagnostics"))].to_dict("records"):
-            kind = str(record.get("row_kind") or "")
-            code = str(record.get("product_code") or "").strip()
-            if not code:
-                raise SnapshotContractError("product statistics row has no product code")
-            if kind == "sales_price":
-                if code in sales_prices:
-                    raise SnapshotContractError("sales price projection is duplicated")
-                sales_prices[code] = {
-                    "unit_price": record.get("unit_price"),
-                    "basis_month": str(record.get("basis_month") or ""),
-                }
-            elif kind == "return_stats":
-                if code in return_statistics:
-                    raise SnapshotContractError("return projection is duplicated")
-                return_statistics[code] = {
-                    "event_count": _event_grain_int(record.get("return_event_count"), field="return_event_count"),
-                    "quantity": _event_grain_int(record.get("return_quantity"), field="return_quantity"),
-                    "supply_amount": record.get("return_supply_amount"),
-                }
-            else:
-                raise SnapshotContractError("product statistics row kind is invalid")
-        for record in chunk[kinds == "event"].to_dict("records"):
-            if _event_grain_int(record.get("mapping_count"), field="mapping_count") == 1:
+    def frequency_chunks() -> Iterable[pd.DataFrame]:
+        for chunk in chunks:
+            if not isinstance(chunk, pd.DataFrame) or "row_kind" not in chunk.columns:
+                raise SnapshotContractError("product statistics event stream is invalid")
+            kinds = chunk["row_kind"].fillna("").astype(str)
+            frequency_mask = kinds.isin(("event", "diagnostics"))
+            for record in chunk.loc[~frequency_mask].to_dict("records"):
+                kind = str(record.get("row_kind") or "")
                 code = str(record.get("product_code") or "").strip()
-                try:
-                    paid_quantity = Decimal(str(record.get("paid_quantity") or 0).strip())
-                except (InvalidOperation, ValueError):
-                    paid_quantity = Decimal(0)
-                if paid_quantity > 0 and paid_quantity == paid_quantity.to_integral_value():
-                    paid_quantities[code] += int(paid_quantity)
-    if not frequency_chunks:
-        raise SnapshotContractError("product statistics stream returned no frequency rows")
-    monthly, diagnostics, days, customers = _aggregate_extended_event_grain_chunks(frequency_chunks)
+                if not code:
+                    raise SnapshotContractError("product statistics row has no product code")
+                if kind == "sales_price":
+                    if code in sales_prices:
+                        raise SnapshotContractError("sales price projection is duplicated")
+                    sales_prices[code] = {
+                        "unit_price": record.get("unit_price"),
+                        "basis_month": str(record.get("basis_month") or ""),
+                    }
+                elif kind == "return_stats":
+                    if code in return_statistics:
+                        raise SnapshotContractError("return projection is duplicated")
+                    return_statistics[code] = {
+                        "event_count": _event_grain_int(record.get("return_event_count"), field="return_event_count"),
+                        "quantity": _event_grain_int(record.get("return_quantity"), field="return_quantity"),
+                        "supply_amount": record.get("return_supply_amount"),
+                    }
+                else:
+                    raise SnapshotContractError("product statistics row kind is invalid")
+            frequency = chunk if frequency_mask.all() else chunk.loc[frequency_mask]
+            if not frequency.empty:
+                yield frequency
+
+    monthly, diagnostics, days, customers = _aggregate_extended_event_grain_chunks(
+        frequency_chunks(), paid_quantities=paid_quantities
+    )
     return monthly, diagnostics, days, customers, dict(paid_quantities), return_statistics, sales_prices
 
 

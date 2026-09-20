@@ -6043,7 +6043,9 @@ def _try_handle_io_nlq(
 
     try:
         from app.services.io_nlq import (
+            _extract_unlabeled_entity_phrase,
             remove_outbound_frequency_phrase,
+            remove_product_inventory_grade_phrases,
             resolve_io_nlq,
             resolve_current_stock_entity_condition,
             resolve_unlabeled_io_entity_condition,
@@ -6186,13 +6188,17 @@ def _try_handle_io_nlq(
     # Label-free proper nouns are never assigned to a condition by wording
     # alone.  The IO master relationships must identify exactly one semantic
     # target; otherwise retain the existing candidate-table result contract.
-    current_stock_frequency_only = (
-        action == "현재고 조회"
-        and bool(str(params.get("frequency_grade") or "").strip())
+    inventory_entity_text = remove_product_inventory_grade_phrases(txt_for_io)
+    if action == "현재고 조회" and params.get("frequency_grade"):
+        inventory_entity_text = remove_outbound_frequency_phrase(inventory_entity_text)
+    inventory_grade_only = (
+        action in {"현재고 조회", "제품재고현황 조회"}
+        and any(str(params.get(key) or "").strip() for key in ("frequency_grade", "profit_grade", "contribution_grade"))
         and not any(
             str(params.get(key) or "").strip()
-            for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm")
+            for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm", "nlq_unlabeled_name")
         )
+        and not _extract_unlabeled_entity_phrase(inventory_entity_text, action)
     )
     if action == "제품정보 조회":
         # 제품정보는 제품코드/제품명/제조사와 제품구분 조건을 한 번의
@@ -6230,16 +6236,12 @@ def _try_handle_io_nlq(
             "params": params,
             "resolved_kind": "registered_filters",
         }
-    elif current_stock_frequency_only:
+    elif inventory_grade_only:
         # An explicitly labelled grade is already a complete local filter.
         # Do not reinterpret its grade token as a product/manufacturer name.
-        entity_resolution = {"status": "resolved", "params": params, "resolved_kind": "frequency_only"}
+        entity_resolution = {"status": "resolved", "params": params, "resolved_kind": "inventory_grade_only"}
     else:
-        entity_text = (
-            remove_outbound_frequency_phrase(txt_for_io)
-            if action == "현재고 조회" and params.get("frequency_grade")
-            else txt_for_io
-        )
+        entity_text = inventory_entity_text
         entity_resolution = (
             resolve_current_stock_entity_condition(entity_text, params=params)
             if action == "현재고 조회"
@@ -6430,6 +6432,10 @@ def _try_handle_io_nlq(
         condition_sources.setdefault("stock_codes", "explicit")
     if action in {"제품재고현황 조회", "현재고 조회"} and params.get("frequency_grade") not in (None, ""):
         condition_sources.setdefault("frequency_grade", "explicit")
+    if action in {"제품재고현황 조회", "현재고 조회"}:
+        for grade_key in ("profit_grade", "contribution_grade"):
+            if params.get(grade_key) not in (None, ""):
+                condition_sources.setdefault(grade_key, "explicit")
     if resolved_kind == "unlabeled_like" and str(params.get("nlq_unlabeled_name") or "").strip():
         condition_sources.setdefault("unlabeled_name", "explicit")
 

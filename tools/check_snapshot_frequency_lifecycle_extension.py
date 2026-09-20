@@ -13,6 +13,9 @@ if str(ROOT) not in sys.path:
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     EXTENDED_ALGORITHM_VERSION,
     EXTENDED_SCHEMA_VERSION,
+    LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    PRODUCT_STATISTICS_ALGORITHM_VERSION,
     FrequencyProjectionReadResult,
     SnapshotContractError,
     build_extended_relational_frequency_snapshot_from_aggregates,
@@ -165,7 +168,7 @@ def test_migration_006_sql_server_batch_boundary() -> None:
         "new-column constraints escaped the dynamic compile scope",
     )
     _assert(
-        [migration.migration_id for migration in MIGRATIONS][-4:]
+        [migration.migration_id for migration in MIGRATIONS][-5:-1]
         == [
             "005_frequency_lifecycle_authority",
             "006_frequency_product_lifecycle_extension",
@@ -264,6 +267,30 @@ def test_v1_operating_fallback_and_scope_reason() -> None:
         as_of_date="20260731", repository=Repository(),
     )
     _assert(result.usable and result.contract_version == "1.0", "approved v1 fallback must remain usable")
+
+    class LegacyStatisticsRepository(Repository):
+        def resolve_latest_eligible_key(self, key, *, available_through):
+            return key if key.algorithm_version == LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION else None
+
+    old_statistics = read_approved_frequency_projection(
+        company_id=4, evaluation_month="202607", stock_codes=("00001",),
+        as_of_date="20260731", repository=LegacyStatisticsRepository(),
+    )
+    _assert(
+        old_statistics.usable and old_statistics.contract_version == "2.1",
+        "approved legacy product statistics must remain readable before new approval",
+    )
+    _assert(PRODUCT_STATISTICS_ALGORITHM_VERSION != LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION, "new grade algorithm needs a distinct key")
+
+    class CumulativeStatisticsRepository(Repository):
+        def resolve_latest_eligible_key(self, key, *, available_through):
+            return key if key.algorithm_version == CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION else None
+
+    cumulative_statistics = read_approved_frequency_projection(
+        company_id=4, evaluation_month="202607", stock_codes=("00001",),
+        as_of_date="20260731", repository=CumulativeStatisticsRepository(),
+    )
+    _assert(cumulative_statistics.usable and cumulative_statistics.contract_version == "2.1", "approved v2 remains readable before v3 approval")
 
     class MismatchRepository(Repository):
         def resolve_latest_eligible_key(self, key, *, available_through):

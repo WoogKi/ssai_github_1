@@ -626,6 +626,14 @@ ALTER TABLE snapshot.frequency_product ADD CONSTRAINT CK_snapshot_frequency_prod
 """
 
 
+MIGRATION_009_SQL = """
+ALTER TABLE snapshot.frequency_product DROP CONSTRAINT CK_snapshot_frequency_product_profit_grade;
+ALTER TABLE snapshot.frequency_product WITH CHECK ADD CONSTRAINT CK_snapshot_frequency_product_profit_grade
+    CHECK ((profit_grade IS NULL OR profit_grade IN ('A','B','C','D','E','X','unavailable'))
+       AND (contribution_grade IS NULL OR contribution_grade IN ('A','B','C','D','E','X','unavailable')));
+"""
+
+
 MIGRATIONS = (
     SnapshotMigration("001_snapshot_manifest_payload", MIGRATION_001_SQL),
     SnapshotMigration("002_snapshot_frequency_projection", MIGRATION_002_SQL),
@@ -635,6 +643,7 @@ MIGRATIONS = (
     SnapshotMigration("006_frequency_product_lifecycle_extension", MIGRATION_006_SQL),
     SnapshotMigration("007_snapshot_profile_fingerprint", MIGRATION_007_SQL),
     SnapshotMigration("008_frequency_product_statistics_extension", MIGRATION_008_SQL),
+    SnapshotMigration("009_frequency_product_x_grade", MIGRATION_009_SQL),
 )
 
 
