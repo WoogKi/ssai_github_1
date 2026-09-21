@@ -244,6 +244,44 @@ def load_supplier_manager_options(*, mode: str, vendor_codes: Any = None) -> lis
     return [{"code": str(row.get("user_code") or "").strip(), "name": str(row.get("user_name") or "").strip()} for _, row in df.iterrows() if str(row.get("user_code") or "").strip()]
 
 
+def load_dashboard_staff_options() -> dict[str, list[dict[str, str]]]:
+    """Load both Dashboard staff roles in one option-query round trip."""
+    sql = """
+    SELECT StaffRows.staff_role, StaffRows.user_code, StaffRows.user_name
+    FROM (
+        SELECT DISTINCT 'pharma' AS staff_role,
+            LTRIM(RTRIM(V.Rd03_Sales_Man)) AS user_code,
+            COALESCE(NULLIF(LTRIM(RTRIM(U.Rd06_User_Nm)), ''), LTRIM(RTRIM(V.Rd03_Sales_Man))) AS user_name
+        FROM dbo.Rddbc040 AS P WITH (NOLOCK)
+        INNER JOIN dbo.Rddbc030 AS V WITH (NOLOCK) ON P.Rd04_Ven_Cd = V.Rd03_Ven_Cd
+        LEFT JOIN dbo.Rddbc060 AS U WITH (NOLOCK) ON V.Rd03_Sales_Man = U.Rd06_User_Cd
+        WHERE LTRIM(RTRIM(V.Rd03_Sales_Man)) <> ''
+        UNION
+        SELECT DISTINCT 'order' AS staff_role,
+            LTRIM(RTRIM(V.Rd03_Sales_Man)) AS user_code,
+            COALESCE(NULLIF(LTRIM(RTRIM(U.Rd06_User_Nm)), ''), LTRIM(RTRIM(V.Rd03_Sales_Man))) AS user_name
+        FROM dbo.Rddbc040 AS P WITH (NOLOCK)
+        INNER JOIN dbo.Rddbc030 AS V WITH (NOLOCK) ON P.Rd04_Orven_Cd = V.Rd03_Ven_Cd
+        LEFT JOIN dbo.Rddbc060 AS U WITH (NOLOCK) ON V.Rd03_Sales_Man = U.Rd06_User_Cd
+        WHERE LTRIM(RTRIM(V.Rd03_Sales_Man)) <> ''
+    ) AS StaffRows
+    ORDER BY StaffRows.staff_role, StaffRows.user_name, StaffRows.user_code
+    """
+    df = query_to_df(sql, ())
+    result = {"order": [], "pharma": []}
+    if not isinstance(df, pd.DataFrame):
+        return result
+    seen: dict[str, set[str]] = {"order": set(), "pharma": set()}
+    for _, row in df.iterrows():
+        role = str(row.get("staff_role") or "").strip()
+        code = str(row.get("user_code") or "").strip()
+        if role not in result or not code or code in seen[role]:
+            continue
+        seen[role].add(code)
+        result[role].append({"code": code, "name": str(row.get("user_name") or "").strip() or code})
+    return result
+
+
 def supplier_scope_summary(params: Mapping[str, Any] | None, *, vendor_rows: Any = None, manager_rows: Any = None) -> dict[str, str]:
     scope = normalize_product_supplier_scope(params)
     mode = scope["product_supplier_scope_mode"]

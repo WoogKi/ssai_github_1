@@ -36,7 +36,7 @@ from app.services.product_supplier_scope_service import (
     SCOPE_MANUFACTURER,
     SCOPE_ORDER_VENDOR,
     apply_product_supplier_scope,
-    load_supplier_manager_options,
+    load_dashboard_staff_options,
     normalize_product_supplier_scope,
     resolve_supplier_vendor_codes,
     supplier_scope_fingerprint,
@@ -104,7 +104,7 @@ DASHBOARD_LITE_SESSION_KEYS = (
 )
 
 DASHBOARD_LITE_OPTION_CACHE_KEY = "__dashboard_lite_scope_options"
-DASHBOARD_LITE_OPTION_CACHE_VERSION = 3
+DASHBOARD_LITE_OPTION_CACHE_VERSION = 4
 _DASHBOARD_RENDER_TARGET: Any | None = None
 _DASHBOARD_V2_PREVIEW_AVAILABLE = False
 
@@ -1202,6 +1202,8 @@ def _sales_presentation_state(facts: dict[str, Any]) -> dict[str, Any]:
         "forecast_sales": forecast,
         "expected_to_date_sales": expected_to_date_value,
         "remaining_forecast_sales": remaining if remaining is not None else visualization.get("remaining_forecast"),
+        "next_month_forecast_sales": visualization.get("next_month_forecast_sales", (metrics.get("next_month_forecast_sales") or {}).get("value")),
+        "following_month_forecast_sales": visualization.get("following_month_forecast_sales", (metrics.get("following_month_forecast_sales") or {}).get("value")),
         "sales_progress_pct": (
             completed_achievement if is_completed_month
             else visualization.get("sales_progress_pct", (metrics.get("current_month_progress_pct") or {}).get("value"))
@@ -1383,6 +1385,8 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
             "remaining",
             "자료부족" if state["remaining_forecast_sales"] is None else "",
         ),
+        ("다음달 예상매출", state["next_month_forecast_sales"], "기존 품목별 매출 예측식", "amount", "forecast", ""),
+        ("다다음달 예상매출", state["following_month_forecast_sales"], "기존 품목별 매출 예측식의 순차 투영", "amount", "forecast", ""),
     ]
     if amount_unit == "auto":
         amount_values = [value for _label, value, _help, kind, _semantic, _display in cards if kind == "amount"]
@@ -1393,7 +1397,7 @@ def _render_status_cards(facts: dict[str, Any]) -> None:
         divisor, _label = _amount_display_spec("auto", max_amount)
         amount_unit = "million" if divisor == 1_000_000 else ("thousand" if divisor == 1_000 else "won")
 
-    cols = st.columns(4)
+    cols = st.columns(6)
     for col, (label, value, help_text, kind, semantic_class, display_text) in zip(cols, cards):
         with col:
             _metric_card(
@@ -1556,7 +1560,7 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     ).fillna("실제매출")
     forecast_df["series"] = "월말 예상매출"
     forecast_df["value_kind"] = forecast_df["kind"].map(
-        {"완료월 사전예상": "완료월 사전예상", "당월 예상": "당월 월말 예상"}
+        {"완료월 사전예상": "완료월 사전예상", "당월 예상": "당월 월말 예상", "미래월 예상": "미래월 예상매출"}
     ).fillna("예상매출")
     actual_sales_by_period = (
         actual_df.assign(_actual_sales=pd.to_numeric(actual_df["value"], errors="coerce"))
@@ -1610,7 +1614,7 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
         {"완료월 실제": "완료월", "당월 현재(부분월)": "평가월"}
     ).fillna("실제")
     forecast_df["month_status"] = forecast_df["kind"].map(
-        {"완료월 사전예상": "완료월", "당월 예상": "평가월"}
+        {"완료월 사전예상": "완료월", "당월 예상": "평가월", "미래월 예상": "미래월"}
     ).fillna("예상")
     return_df["month_status"] = "반품"
     visualization = (facts.get("sales") or {}).get("visualization") or {}
@@ -4177,13 +4181,15 @@ def _risk_detail_query_conditions(
     if mode == SCOPE_MANUFACTURER:
         supplier_conditions.extend([
             {"조건명": "제약사", "값": str(params.get("supplier_scope_label") or "전체")},
-            {"조건명": "제약사 담당자", "값": str(params.get("supplier_manager_label") or "전체")},
         ])
     elif mode == SCOPE_ORDER_VENDOR:
         supplier_conditions.extend([
             {"조건명": "발주처", "값": str(params.get("supplier_scope_label") or "전체")},
-            {"조건명": "발주담당자", "값": str(params.get("supplier_manager_label") or "전체")},
         ])
+    supplier_conditions.extend([
+        {"조건명": "발주담당자", "값": str(params.get("order_staff_label") or "전체")},
+        {"조건명": "제약담당자", "값": str(params.get("pharma_staff_label") or "전체")},
+    ])
     return [
         {"조건명": "시작월", "값": str(params.get("month_from") or "")},
         {"조건명": "종료월", "값": str(params.get("month_to") or "")},
@@ -4587,8 +4593,8 @@ def _clear_inactive_dashboard_supplier_state(mode: str) -> bool:
     """Clear inactive temporary supplier controls on every mode transition."""
     removed = False
     keys = {
-        SCOPE_MANUFACTURER: ("__dashboard_lite_order_vendor_text", "__dashboard_lite_purchase_manager_codes"),
-        SCOPE_ORDER_VENDOR: ("__dashboard_lite_manufacturer_text", "__dashboard_lite_manufacturer_manager_codes", "__dashboard_lite_manufacturer_test_codes", "__dashboard_lite_manufacturer_scope"),
+        SCOPE_MANUFACTURER: ("__dashboard_lite_order_vendor_text",),
+        SCOPE_ORDER_VENDOR: ("__dashboard_lite_manufacturer_text", "__dashboard_lite_manufacturer_test_codes", "__dashboard_lite_manufacturer_scope"),
     }.get(mode, ())
     for key in keys:
         if st.session_state.get(key):
@@ -4755,6 +4761,11 @@ def _load_dashboard_scope_options() -> dict[str, Any]:
     vendor_group_codes, vendor_group_code_to_name = _dashboard_code_name_options("0019")
     vendor_kind_codes, vendor_kind_code_to_name = _dashboard_code_name_options("0009")
     io_gu_codes, io_gu_code_to_name = _dashboard_code_name_options("0012")
+    try:
+        staff_options = load_dashboard_staff_options()
+    except Exception as exc:
+        log.warning("[dashboard.staff_options] status=error error_type=%s", type(exc).__name__)
+        staff_options = {"order": [], "pharma": []}
     return {
         "cache_version": DASHBOARD_LITE_OPTION_CACHE_VERSION,
         "stock_codes": stock_codes,
@@ -4771,6 +4782,8 @@ def _load_dashboard_scope_options() -> dict[str, Any]:
         "vendor_kind_code_to_name": vendor_kind_code_to_name,
         "io_gu_codes": io_gu_codes,
         "io_gu_code_to_name": io_gu_code_to_name,
+        "order_staff_options": list(staff_options.get("order") or []),
+        "pharma_staff_options": list(staff_options.get("pharma") or []),
     }
 
 
@@ -4798,6 +4811,8 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
     vendor_kind_code_to_name = dict(option_cache.get("vendor_kind_code_to_name") or {})
     io_gu_codes = _clean_list(option_cache.get("io_gu_codes"))
     io_gu_code_to_name = dict(option_cache.get("io_gu_code_to_name") or {})
+    order_staff_options = list(option_cache.get("order_staff_options") or [])
+    pharma_staff_options = list(option_cache.get("pharma_staff_options") or [])
     stock_widget_key = "__dashboard_lite_stock_labels"
     _prepare_dashboard_multiselect_state(stock_widget_key, stock_codes)
     _prepare_dashboard_multiselect_state("__dashboard_lite_vendor_group_list", vendor_group_codes)
@@ -4830,7 +4845,7 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
     if st.session_state.get("__dashboard_lite_product_supplier_scope_mode") not in {SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR}:
         st.session_state["__dashboard_lite_product_supplier_scope_mode"] = SCOPE_MANUFACTURER
 
-    scope_cols = st.columns([1, 1, 1, 1.1, 2.1, 2.1], gap="small")
+    scope_cols = st.columns([1, 1, 1, 1.1, 2.1], gap="small")
     with scope_cols[0]:
         month_from = st.text_input("시작월", max_chars=6, help="YYYYMM", key="__dashboard_lite_month_from")
     with scope_cols[1]:
@@ -4853,25 +4868,23 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
             supplier_text = st.text_input("발주처", key="__dashboard_lite_order_vendor_text")
         else:
             supplier_text = st.text_input("제약사", key="__dashboard_lite_manufacturer_text")
-    manager_options: list[dict[str, str]] = []
-    manager_option_error = False
-    try:
-        manager_options = _dashboard_supplier_manager_options(scope_mode)
-    except Exception:
-        manager_option_error = True
-    manager_codes = [row["code"] for row in manager_options]
-    manager_names = {row["code"]: row["name"] for row in manager_options}
-    manager_key = "__dashboard_lite_manufacturer_manager_codes" if scope_mode == SCOPE_MANUFACTURER else "__dashboard_lite_purchase_manager_codes"
-    with scope_cols[5]:
-        st.session_state[manager_key] = [code for code in _clean_list(st.session_state.get(manager_key)) if code in manager_codes]
-        if manager_option_error:
-            st.warning("담당자 목록을 불러오지 못했습니다.")
-        else:
-            st.multiselect(
-                "제약사 담당자" if scope_mode == SCOPE_MANUFACTURER else "발주담당자",
-                options=manager_codes, key=manager_key,
-                format_func=lambda code: f"{manager_names.get(str(code), str(code))} [{code}]",
-            )
+    staff_cols = st.columns(2)
+    order_staff_codes = [str(row.get("code") or "").strip() for row in order_staff_options if str(row.get("code") or "").strip()]
+    order_staff_names = {str(row.get("code") or "").strip(): str(row.get("name") or "").strip() for row in order_staff_options}
+    pharma_staff_codes = [str(row.get("code") or "").strip() for row in pharma_staff_options if str(row.get("code") or "").strip()]
+    pharma_staff_names = {str(row.get("code") or "").strip(): str(row.get("name") or "").strip() for row in pharma_staff_options}
+    _prepare_dashboard_multiselect_state("__dashboard_lite_purchase_manager_codes", order_staff_codes)
+    _prepare_dashboard_multiselect_state("__dashboard_lite_manufacturer_manager_codes", pharma_staff_codes)
+    with staff_cols[0]:
+        selected_order_staff_codes = st.multiselect(
+            "발주담당자", options=order_staff_codes, key="__dashboard_lite_purchase_manager_codes",
+            format_func=lambda code: f"{order_staff_names.get(str(code), str(code))} [{code}]",
+        )
+    with staff_cols[1]:
+        selected_pharma_staff_codes = st.multiselect(
+            "제약담당자", options=pharma_staff_codes, key="__dashboard_lite_manufacturer_manager_codes",
+            format_func=lambda code: f"{pharma_staff_names.get(str(code), str(code))} [{code}]",
+        )
     with st.expander(f"\ucd94\uac00 \ubd84\uc11d\uc870\uac74 \u00b7 {condition_summary}", expanded=False):
         row1 = st.columns([1, 3, 1])
         with row1[0]:
@@ -4930,9 +4943,10 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
     product_group_codes_selected = _clean_list(product_groups)
     product_di_codes_selected = _clean_list(product_di)
     product_class_codes_selected = _clean_list(product_class)
-    selected_manager_codes = _clean_list(st.session_state.get(manager_key))
-    selected_manager_labels = [f"{manager_names.get(code, code)} [{code}]" for code in selected_manager_codes]
-    supplier_manager_label = "전체" if not selected_manager_labels else (selected_manager_labels[0] if len(selected_manager_labels) == 1 else f"{len(selected_manager_labels)}명")
+    selected_order_staff_codes = _clean_list(selected_order_staff_codes)
+    selected_pharma_staff_codes = _clean_list(selected_pharma_staff_codes)
+    order_staff_labels = [f"{order_staff_names.get(code, code)} [{code}]" for code in selected_order_staff_codes]
+    pharma_staff_labels = [f"{pharma_staff_names.get(code, code)} [{code}]" for code in selected_pharma_staff_codes]
     raw_params = {
         "month_from": month_from,
         "month_to": month_to,
@@ -4951,13 +4965,15 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
         "_require_company_io": True,
         "product_supplier_scope_mode": scope_mode,
         "manufacturer_codes": supplier_result["codes"] if scope_mode == SCOPE_MANUFACTURER else [],
-        "manufacturer_manager_codes": selected_manager_codes if scope_mode == SCOPE_MANUFACTURER else [],
+        "manufacturer_manager_codes": [],
         "order_vendor_codes": supplier_result["codes"] if scope_mode == SCOPE_ORDER_VENDOR else [],
-        "purchase_manager_codes": selected_manager_codes if scope_mode == SCOPE_ORDER_VENDOR else [],
+        "purchase_manager_codes": [],
+        "dashboard_order_staff_codes": selected_order_staff_codes,
+        "dashboard_pharma_staff_codes": selected_pharma_staff_codes,
         "supplier_scope_label": supplier_result["label"],
         "supplier_scope_names": supplier_result["names"],
-        "supplier_manager_label": supplier_manager_label,
-        "supplier_manager_labels": selected_manager_labels,
+        "order_staff_label": "전체" if not order_staff_labels else (order_staff_labels[0] if len(order_staff_labels) == 1 else f"{len(order_staff_labels)}명"),
+        "pharma_staff_label": "전체" if not pharma_staff_labels else (pharma_staff_labels[0] if len(pharma_staff_labels) == 1 else f"{len(pharma_staff_labels)}명"),
         "inactive_scope_cleared": inactive_scope_cleared,
         "major_purchase_vendor_days": major_purchase_vendor_days,
         "risk_analysis_days": risk_analysis_days,
@@ -5001,10 +5017,10 @@ def _dashboard_scope_header(params: dict[str, Any]) -> str:
     if mode == SCOPE_MANUFACTURER:
         manufacturer_label = str(params.get("supplier_scope_label") or params.get("manufacturer_scope_label") or "전체").strip() or "전체"
         parts.append(f"제약사: {manufacturer_label}")
-        parts.append(f"제약사 담당자: {str(params.get('supplier_manager_label') or '전체').strip() or '전체'}")
     elif mode == SCOPE_ORDER_VENDOR:
         parts.append(f"발주처: {str(params.get('supplier_scope_label') or '전체').strip() or '전체'}")
-        parts.append(f"발주담당자: {str(params.get('supplier_manager_label') or '전체').strip() or '전체'}")
+    parts.append(f"발주담당자: {str(params.get('order_staff_label') or '전체').strip() or '전체'}")
+    parts.append(f"제약담당자: {str(params.get('pharma_staff_label') or '전체').strip() or '전체'}")
     stock_codes = _clean_list(params.get("stock_cd_list"))
     stock_names = _clean_list(params.get("stock_name_list"))
     stock_labels = [
@@ -5075,7 +5091,8 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
             "month_from", "month_to", "evaluation_month", "stock_mode", "stock_cd_list", "stock_name_list",
             "product_group_list", "product_di_list", "product_class_list", "amount_display_unit",
             "io_gu_list", "io_gu_source",
-            "product_supplier_scope_mode", "supplier_scope_label", "supplier_manager_label", "supplier_manager_labels",
+            "product_supplier_scope_mode", "supplier_scope_label", "order_staff_label", "pharma_staff_label",
+            "dashboard_order_staff_codes", "dashboard_pharma_staff_codes",
         )
         if key in params
     }

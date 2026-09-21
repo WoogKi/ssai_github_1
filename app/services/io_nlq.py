@@ -442,6 +442,18 @@ def extract_nlq_natural_period(
             _NLQ_PERIOD_KIND_KEY: "explicit_period",
         }
 
+    # Registry-backed actions use this helper directly, so preserve compact
+    # YYYYMM and Korean/formatted month input before their default-day policy.
+    explicit_month = _extract_month_range(raw)
+    if explicit_month.get("month_from"):
+        month_from = explicit_month["month_from"]
+        month_to = explicit_month.get("month_to") or month_from
+        return {
+            "month_from": month_from,
+            "month_to": month_to,
+            _NLQ_PERIOD_KIND_KEY: "calendar_month" if month_from == month_to else "explicit_period",
+        }
+
     if re.search(r"(?:최근\s*)?(?:한\s*달|1\s*개월)", raw):
         return {
             "date_from": (current_day - timedelta(days=30)).strftime("%Y%m%d"),
@@ -530,6 +542,7 @@ def strip_nlq_period_expressions(text: str) -> str:
         r"(?:최근\s*)?(?:한\s*달|1\s*개월)",
         r"(?:오늘|어제|그저께|당일|하루|최근\s*1\s*일)",
         r"(?:이번|지난)\s*(?:달|월)",
+        r"(?<!\d)(?:19|20)\d{4}(?!\d)",
         r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
         r"(?<!\d)\d{1,2}\s*월(?!\s*\d)",
     )

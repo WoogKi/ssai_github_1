@@ -933,6 +933,25 @@ _COMMON_GROUP_SUM_EXCLUDE = (
     "커버월수",
     "비율",
 )
+_COMMON_GROUP_IDENTIFIER_TOKENS = (
+    "코드",
+    "명",
+    "번호",
+    "id",
+    "아이디",
+    "일자",
+    "날짜",
+    "구분",
+    "상태",
+    "순번",
+)
+
+# 현재표 원본의 실제 컬럼명과 사용자-facing 차원명은 다를 수 있다.
+# 코드/명 쌍은 코드까지 함께 집계 키로 사용해 같은 이름의 서로 다른 적용처를 합치지 않는다.
+_COMMON_GROUP_DISPLAY_SPECS: dict[str, tuple[str, str]] = {
+    "발주담당자명": ("발주담당자", ""),
+    "재고적용처명": ("재고적용처", "재고적용처코드"),
+}
 
 
 def _normalize_common_group_query(query: str) -> str:
@@ -1005,9 +1024,26 @@ def _find_common_group_column(df: pd.DataFrame, query: str) -> str:
     return candidates[0][3]
 
 
-def _is_sum_candidate_column(col: str) -> bool:
+def _common_group_display_spec(df: pd.DataFrame, group_col: str) -> tuple[str, str]:
+    """Return the user-facing label and optional code key for a known dimension."""
+    label, code_col = _COMMON_GROUP_DISPLAY_SPECS.get(group_col, (group_col, ""))
+    if code_col not in df.columns:
+        code_col = ""
+    return label, code_col
+
+
+def _is_metric_column(col: str) -> bool:
+    """Return whether a current-table column is a meaningful additive metric.
+
+    Numeric coercion alone is insufficient: ERP identifier columns often contain
+    numeric-looking codes.  A semantic identifier must never be summed, even
+    when its name happens to include a metric phrase such as ``예상매출처``.
+    """
     s = str(col or "").strip()
     if not s or s == "순번":
+        return False
+    normalized = _norm_col_name(s)
+    if any(_norm_col_name(token) in normalized for token in _COMMON_GROUP_IDENTIFIER_TOKENS):
         return False
     if any(w in s for w in _COMMON_GROUP_SUM_EXCLUDE):
         return False
@@ -1072,6 +1108,7 @@ def _build_common_group_summary(
     df: pd.DataFrame,
     group_col: str,
     *,
+    group_code_col: str = "",
     include_numeric_sums: bool = True,
     source_action: str = "",
 ) -> pd.DataFrame:
@@ -1080,11 +1117,15 @@ def _build_common_group_summary(
         grade_values = work[group_col].fillna("").astype(str).str.strip()
         work = work.loc[grade_values.isin(EXTENDED_FREQUENCY_PROJECTION_GRADES)].copy()
     work[group_col] = work[group_col].map(_clean_group_value)
+    group_cols = [group_col]
+    if group_code_col and group_code_col in work.columns:
+        work[group_code_col] = work[group_code_col].map(_clean_group_value)
+        group_cols.insert(0, group_code_col)
     if group_col == "추세판정":
         work[group_col] = work[group_col].replace({"(미지정)": "자료부족", "": "자료부족"})
 
-    g = work.groupby(group_col, dropna=False)
-    out = pd.DataFrame({group_col: g.size().index.astype(str), "행수": g.size().values})
+    g = work.groupby(group_cols, dropna=False)
+    out = g.size().reset_index(name="행수")
 
     distinct_col, distinct_label = _distinct_label_for_group(work, group_col=group_col)
     if distinct_col and distinct_col in work.columns:
@@ -1107,9 +1148,9 @@ def _build_common_group_summary(
     sum_cols: list[str] = []
     if include_numeric_sums:
         for col in [str(c) for c in work.columns]:
-            if col == group_col or col in out.columns or col in _COMMON_FILTER_SKIP_COLUMNS:
+            if col in group_cols or col in out.columns or col in _COMMON_FILTER_SKIP_COLUMNS:
                 continue
-            if not _is_sum_candidate_column(col):
+            if not _is_metric_column(col):
                 continue
             nums = _to_numeric_for_common_filter(work[col])
             if nums.notna().sum() <= 0:
@@ -1130,10 +1171,10 @@ def _build_common_group_summary(
             actual_sum = g["__actual_for_progress"].sum()
             expected_sum = g["__expected_for_progress"].sum()
             progress = actual_sum.divide(expected_sum.where(expected_sum != 0)).mul(100).fillna(0)
-            out[progress_col] = out[group_col].map(progress.to_dict()).fillna(0).astype(float)
+            out[progress_col] = progress.to_numpy()
             break
 
-    front = ["순번", group_col, distinct_label, "행수", ratio_label]
+    front = ["순번", *group_cols, distinct_label, "행수", ratio_label]
     preferred = [
         "총매출공급가액",
         "총매출세액",
@@ -1152,8 +1193,8 @@ def _build_common_group_summary(
         out["_sort"] = out[group_col].map(_trend_sort_key)
         out = out.sort_values(["_sort", group_col], ascending=[True, True]).drop(columns=["_sort"])
     else:
-        sort_columns = [distinct_label, "행수", group_col] if distinct_col else ["행수", group_col]
-        sort_ascending = [False, False, True] if distinct_col else [False, True]
+        sort_columns = [distinct_label, "행수", *group_cols] if distinct_col else ["행수", *group_cols]
+        sort_ascending = [False, False, *([True] * len(group_cols))] if distinct_col else [False, *([True] * len(group_cols))]
         out = out.sort_values(sort_columns, ascending=sort_ascending)
     out = _add_seq_column(out)
     order = [c for c in front if c in out.columns] + [c for c in preferred if c in out.columns and c not in front]
@@ -1179,7 +1220,7 @@ def _select_common_group_top_metric(out: pd.DataFrame, query: str) -> tuple[str,
     # DataFrame 계약 안에서 동일하게 처리한다.
     named_numeric_candidates: list[tuple[int, str]] = []
     for column in [str(c) for c in out.columns]:
-        if column == "순번" or not _is_sum_candidate_column(column):
+        if column == "순번" or not _is_metric_column(column):
             continue
         column_norm = _compact(column)
         if column_norm and column_norm in compact:
@@ -1318,7 +1359,7 @@ def handle_common_column_group_followup(
     if count_only:
         compact = _compact(t)
         for column in [str(c) for c in df.columns]:
-            if column == group_col or not _is_sum_candidate_column(column):
+            if column == group_col or not _is_metric_column(column):
                 continue
             if _norm_col_name(column) not in compact:
                 continue
@@ -1327,12 +1368,16 @@ def handle_common_column_group_followup(
                 # columns.  An explicit price metric must stay fail-closed.
                 return False
 
+    group_label, group_code_col = _common_group_display_spec(df, group_col)
     out = _build_common_group_summary(
         df,
         group_col,
+        group_code_col=group_code_col,
         include_numeric_sums=not count_only,
         source_action=source_action,
     )
+    if group_label != group_col and group_col in out.columns:
+        out = out.rename(columns={group_col: group_label})
     rank_direction, rank_limit = parse_current_table_rank_request(t, default_limit=top_n)
     has_top = bool(rank_direction)
     metric_col = ""
@@ -1343,7 +1388,7 @@ def handle_common_column_group_followup(
             nums = _to_numeric_for_common_filter(out[metric_col])
             out = out.assign(__sort_metric=nums)
             out = out.sort_values(
-                ["__sort_metric", group_col],
+                ["__sort_metric", group_label],
                 ascending=[rank_direction == "asc", True],
                 kind="mergesort",
             ).drop(columns=["__sort_metric"])
@@ -1352,7 +1397,7 @@ def handle_common_column_group_followup(
     out = _drop_current_followup_detail_attrs(out)
 
     rank_label = "LOW" if rank_direction == "asc" else "TOP"
-    title = f"현재표 {group_col}별 {rank_label} {rank_limit}" if has_top and rank_limit else f"현재표 {group_col}별 집계"
+    title = f"현재표 {group_label}별 {rank_label} {rank_limit}" if has_top and rank_limit else f"현재표 {group_label}별 집계"
     try:
         log.info(
             "[chat.followup.generic_group] query=%r source_action=%r group_column=%r metric_column=%r source_rows=%s result_rows=%s table_key=%s",
@@ -1372,9 +1417,9 @@ def handle_common_column_group_followup(
         action=title,
         df=out,
         query_summary=(
-            f"현재표 / {group_col}별 {rank_label} {rank_limit} · 기준: {metric_col or metric_label or '건수'} / 전체 {len(df):,}건 기준"
+            f"현재표 / {group_label}별 {rank_label} {rank_limit} · 기준: {metric_col or metric_label or '건수'} / 전체 {len(df):,}건 기준"
             if has_top and rank_limit
-            else f"현재표 / {group_col}별 집계 / 전체 {len(df):,}건 기준"
+            else f"현재표 / {group_label}별 집계 / 전체 {len(df):,}건 기준"
         ),
         source_query=t,
         source_table_key=table_key,
@@ -1382,6 +1427,7 @@ def handle_common_column_group_followup(
         display_limit=rank_limit if has_top else None,
         extra_meta={
             "group_column": group_col,
+            "group_display_label": group_label,
             "group_top_metric": metric_col,
             "source_row_count": int(len(df)),
         },

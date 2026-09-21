@@ -203,7 +203,7 @@ def normalize_order_params(params: Optional[dict[str, Any]] = None, *, mode: str
         "physic_nm", "order_vendor_cd", "order_vendor_nm", "status_code",
         "cost_apply_cd", "cost_apply_nm", "stock_apply_cd", "stock_apply_nm",
         "stock_cd", "stock_nm", "expected_vendor_cd", "expected_vendor_nm",
-        "real_vendor_cd", "real_vendor_nm",
+        "real_vendor_cd", "real_vendor_nm", "order_staff_nm", "pharma_staff_nm",
     ):
         out[key] = _clean(source.get(key))
     out["status_codes"] = _order_status_codes(source.get("status_codes"), fallback=out["status_code"])
@@ -293,6 +293,20 @@ def _filters(params: dict[str, Any], *, mode: str) -> tuple[list[str], list[Any]
         if params.get(key):
             clauses.append(f"{expression} LIKE ?")
             values.append(f"%{params[key]}%")
+    if params.get("order_staff_nm"):
+        clauses.append("(RTRIM(H.Rd17_DamDang) = ? OR U.Rd06_User_Nm LIKE ?)")
+        values.extend((params["order_staff_nm"], f"%{params['order_staff_nm']}%"))
+    if params.get("pharma_staff_nm"):
+        clauses.append(
+            "EXISTS (SELECT 1 FROM dbo.Rddbc040 AS StaffProduct WITH (NOLOCK) "
+            "INNER JOIN dbo.Rddbc030 AS StaffVendor WITH (NOLOCK) "
+            "ON StaffProduct.Rd04_Ven_Cd = StaffVendor.Rd03_Ven_Cd "
+            "LEFT JOIN dbo.Rddbc060 AS StaffUser WITH (NOLOCK) "
+            "ON StaffVendor.Rd03_Sales_Man = StaffUser.Rd06_User_Cd "
+            "WHERE StaffProduct.Rd04_Physic_Cd = D.Rd18_Physic_Cd "
+            "AND (RTRIM(StaffVendor.Rd03_Sales_Man) = ? OR StaffUser.Rd06_User_Nm LIKE ?))"
+        )
+        values.extend((params["pharma_staff_nm"], f"%{params['pharma_staff_nm']}%"))
     for key, expression, op in (("due_date_from", "H.Rd17_Put_YyMmDd", ">="), ("due_date_to", "H.Rd17_Put_YyMmDd", "<=")):
         if params.get(key):
             clauses.append(f"{expression} {op} ?")

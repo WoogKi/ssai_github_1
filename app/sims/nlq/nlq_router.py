@@ -30,7 +30,7 @@ _DASHBOARD_NLQ_PHRASES = (
     "SIMS 운영점검",
 )
 _DASHBOARD_NLQ_CONDITION_LABELS = (
-    "제약사", "제조사", "발주처", "담당자",
+    "발주담당자", "제약담당자", "제약사", "제조사", "발주처", "담당자",
     "재고기준", "재고위치", "제품그룹", "제품구분", "제품분류",
     "거래처그룹", "거래처종류", "입출고구분",
 )
@@ -5518,6 +5518,16 @@ def _build_dashboard_nlq_params(
     conditions, residual = _extract_dashboard_nlq_conditions(
         stock_basis.get("text_without_stock_basis") or text
     )
+    if conditions.get("담당자") and not any(
+        key in conditions for key in ("발주담당자", "제약담당자", "발주처", "제약사", "제조사")
+    ):
+        return {}, _dashboard_nlq_text_payload(
+            "담당자 역할을 지정해 주세요. 발주담당자 또는 제약담당자로 조회할 수 있습니다.",
+            status="input_required", params={**params, "_ambiguous_staff_role": True}, question=text,
+        )
+    for label, key in (("발주담당자", "dashboard_order_staff_nm"), ("제약담당자", "dashboard_pharma_staff_nm")):
+        if conditions.get(label):
+            params[key] = conditions[label]
     mode, supplier_text = SCOPE_ALL, ""
     supplier_mode_explicit = False
     if "발주처" in conditions:

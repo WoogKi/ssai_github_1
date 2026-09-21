@@ -397,6 +397,7 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
     ("purchase_vendor", "매입처", ("매입처별", "매입처명별"), ("매입처명", "매입처", "매입처코드")),
     ("order_vendor", "발주처", ("발주처별", "발주처명별"), ("발주처명", "발주처", "발주처코드")),
+    ("stock_apply", "재고적용처", ("재고적용처별", "재고적용처명별"), ("재고적용처명", "재고적용처", "재고적용처코드")),
     ("stock_location", "재고위치", ("재고위치별", "재고위치명별"), ("재고위치명", "재고위치", "재고위치코드")),
     ("product_group", "제품그룹", ("제품그룹별",), ("제품그룹명", "제품그룹")),
     ("product_category", "제품구분", ("제품구분별",), ("제품구분명", "제품구분")),
@@ -763,7 +764,7 @@ def _current_table_requested_metrics(query: str) -> list[str]:
     elif (
         "재고" in compact
         and "부족" not in compact
-        and not any(term in compact for term in ("재고위치", "재고처"))
+        and not any(term in compact for term in ("재고위치", "재고처", "재고적용처"))
     ):
         metrics.append("stock")
     return metrics

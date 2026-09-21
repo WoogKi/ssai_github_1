@@ -167,6 +167,8 @@ def normalize_dashboard_lite_params(
         "exclude_product_di_nm_list",
         "exclude_product_class_list",
         "exclude_product_class_nm_list",
+        "dashboard_order_staff_codes",
+        "dashboard_pharma_staff_codes",
     ):
         out[key] = _clean_list_param(out.get(key))
     out["io_gu_list"] = _clean_list_param(out.get("io_gu_list"))
@@ -740,6 +742,83 @@ def _filter_sales_source_for_dashboard(df: pd.DataFrame | None, params: Mapping[
     return out
 
 
+def dashboard_staff_filter_active(params: Mapping[str, Any] | None) -> bool:
+    source = dict(params or {})
+    return bool(
+        _clean_list_param(source.get("dashboard_order_staff_codes"))
+        or _clean_list_param(source.get("dashboard_pharma_staff_codes"))
+        or str(source.get("dashboard_order_staff_nm") or source.get("order_staff_nm") or "").strip()
+        or str(source.get("dashboard_pharma_staff_nm") or source.get("pharma_staff_nm") or "").strip()
+    )
+
+
+def filter_dashboard_inbound_facts_by_staff(
+    frame: pd.DataFrame | None,
+    params: Mapping[str, Any] | None,
+) -> pd.DataFrame | None:
+    """Apply independent order/pharma staff conditions to the one inbound source.
+
+    Codes are exact business identifiers and names are partial matches.  Each
+    role is resolved from its approved authority columns; when both roles are
+    supplied their masks are combined with AND.
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty or not dashboard_staff_filter_active(params):
+        return frame
+    source = dict(params or {})
+    specs = (
+        (
+            "order_staff",
+            "recent_inbound_vendor_staff_code",
+            "recent_inbound_vendor_staff_name",
+            _clean_list_param(source.get("dashboard_order_staff_codes")),
+            str(source.get("dashboard_order_staff_nm") or source.get("order_staff_nm") or "").strip(),
+        ),
+        (
+            "pharma_staff",
+            "manufacturer_staff_code",
+            "manufacturer_staff_name",
+            _clean_list_param(source.get("dashboard_pharma_staff_codes")),
+            str(source.get("dashboard_pharma_staff_nm") or source.get("pharma_staff_nm") or "").strip(),
+        ),
+    )
+    mask = pd.Series(True, index=frame.index)
+    diagnostics: list[dict[str, Any]] = []
+    for role, code_column, name_column, codes, name in specs:
+        role_mask = pd.Series(True, index=frame.index)
+        if codes:
+            values = frame.get(code_column, pd.Series("", index=frame.index)).fillna("").astype(str).str.strip()
+            role_mask &= values.isin(codes)
+        if name:
+            values = frame.get(name_column, pd.Series("", index=frame.index)).fillna("").astype(str)
+            role_mask &= values.str.contains(name, case=False, regex=False, na=False)
+        if codes or name:
+            mask &= role_mask
+            diagnostics.append({
+                "role": role,
+                "code_count": len(codes),
+                "name_filter": name,
+                "matched_product_count": int(role_mask.sum()),
+            })
+    attrs = dict(getattr(frame, "attrs", {}) or {})
+    result = frame.loc[mask].copy()
+    result.attrs.update(attrs)
+    result.attrs["dashboard_staff_filter_diagnostics"] = diagnostics
+    return result
+
+
+def _filter_frame_to_product_codes(frame: pd.DataFrame | None, product_codes: set[str]) -> pd.DataFrame | None:
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame
+    product_column = "제품코드" if "제품코드" in frame.columns else "product_code" if "product_code" in frame.columns else ""
+    if not product_column:
+        return frame
+    attrs = dict(getattr(frame, "attrs", {}) or {})
+    values = frame[product_column].fillna("").astype(str).str.strip()
+    result = frame.loc[values.isin(product_codes)].copy()
+    result.attrs.update(attrs)
+    return result
+
+
 def _filter_payload_df_for_dashboard(payload: Mapping[str, Any] | None, params: Mapping[str, Any]) -> Mapping[str, Any] | None:
     if not isinstance(payload, Mapping):
         return payload
@@ -806,6 +885,10 @@ def _dashboard_filter_facts(params: Mapping[str, Any]) -> dict[str, Any]:
         "manufacturer_manager_codes": supplier_scope["manufacturer_manager_codes"],
         "order_vendor_codes": supplier_scope["order_vendor_codes"],
         "purchase_manager_codes": supplier_scope["purchase_manager_codes"],
+        "dashboard_order_staff_codes": _clean_list_param(params.get("dashboard_order_staff_codes")),
+        "dashboard_pharma_staff_codes": _clean_list_param(params.get("dashboard_pharma_staff_codes")),
+        "dashboard_order_staff_name": str(params.get("dashboard_order_staff_nm") or params.get("order_staff_nm") or "").strip(),
+        "dashboard_pharma_staff_name": str(params.get("dashboard_pharma_staff_nm") or params.get("pharma_staff_nm") or "").strip(),
         "io_gu_tcodes": _clean_list_param(params.get("io_gu_list")),
         "io_gu_source": str(params.get("io_gu_source") or ""),
         "stock_mode": str(params.get("stock_mode") or "real"),
@@ -1687,6 +1770,7 @@ def _attach_inventory_status_and_frequency(
 def _build_sales_facts(
     payload: Mapping[str, Any] | None,
     *,
+    future_forecast_df: pd.DataFrame | None = None,
     history_actuals: list[dict[str, Any]] | None = None,
     history_sales_returns: list[dict[str, Any]] | None = None,
     evaluation_month: Any = None,
@@ -1930,6 +2014,32 @@ def _build_sales_facts(
                     "aggregation_contract": "출고반품은 순매출과 별도로 양수 magnitude를 보존하고 차트에 음수로 표시",
                 }
             )
+    if isinstance(future_forecast_df, pd.DataFrame) and not future_forecast_df.empty and evaluation_yyyymm:
+        for offset, column in ((1, "다음월예상매출"), (2, "다다음월예상매출")):
+            if column not in future_forecast_df.columns:
+                continue
+            month = _add_months(evaluation_yyyymm, offset)
+            period, period_sort = _chart_period(month)
+            chart_rows.append({
+                "period": period,
+                "period_sort": period_sort,
+                "value": float(pd.to_numeric(future_forecast_df[column], errors="coerce").fillna(0).sum()),
+                "kind": "미래월 예상",
+                "partial_period": False,
+                "forecast_basis": "제품별 기존 매출 예측식의 월별 순차 투영",
+                "forecast_status": "예상",
+                "forecast_source": column,
+            })
+    next_month_forecast_sales = (
+        _sum_col(future_forecast_df, "다음월예상매출")
+        if isinstance(future_forecast_df, pd.DataFrame)
+        else 0.0
+    )
+    following_month_forecast_sales = (
+        _sum_col(future_forecast_df, "다다음월예상매출")
+        if isinstance(future_forecast_df, pd.DataFrame)
+        else 0.0
+    )
     chart_rows.sort(key=lambda row: (str(row.get("period_sort") or ""), str(row.get("kind") or "")))
 
     return {
@@ -1974,6 +2084,26 @@ def _build_sales_facts(
                 time_basis="평가월 말일 잔여 예상 매출" if evaluation_completed else "평가월 잔여 예상 매출",
                 source_columns=["당월 잔여예상", "당월 예상매출", "당월 현재매출"],
                 partial_period=not evaluation_completed,
+            ),
+            "next_month_forecast_sales": _fact(
+                "다음달 예상매출",
+                next_month_forecast_sales,
+                unit="원",
+                aggregation="sum",
+                grain="제품",
+                time_basis=f"{_add_months(evaluation_yyyymm, 1) if evaluation_yyyymm else '다음월'} 예상",
+                source_columns=["다음월예상매출"],
+                partial_period=False,
+            ),
+            "following_month_forecast_sales": _fact(
+                "다다음달 예상매출",
+                following_month_forecast_sales,
+                unit="원",
+                aggregation="sum",
+                grain="제품",
+                time_basis=f"{_add_months(evaluation_yyyymm, 2) if evaluation_yyyymm else '다다음월'} 예상",
+                source_columns=["다다음월예상매출"],
+                partial_period=False,
             ),
             "current_month_progress_pct": _fact(
                 "예상매출 달성률",
@@ -2033,6 +2163,8 @@ def _build_sales_facts(
             "current_sales": current_sales,
             "forecast_sales": forecast_sales,
             "remaining_forecast": remaining_sales,
+            "next_month_forecast_sales": next_month_forecast_sales,
+            "following_month_forecast_sales": following_month_forecast_sales,
             "sales_progress_pct": progress_pct,
             "time_progress_pct": time_progress_pct,
             "time_adjusted_achievement_pct": time_adjusted_achievement_pct,
@@ -3518,7 +3650,8 @@ def build_dashboard_lite_facts(
         "date_from": f"{source_params.get('dashboard_lite_trend_month_from')}01",
     }
     supplier_scope = apply_product_supplier_scope(service_params)
-    scope_filter_active = supplier_scope_filter_active(service_params)
+    staff_filter_active = dashboard_staff_filter_active(service_params)
+    scope_filter_active = supplier_scope_filter_active(service_params) or staff_filter_active
     period = {
         "month_from": service_params.get("month_from"),
         "month_to": service_params.get("month_to"),
@@ -3631,6 +3764,16 @@ def build_dashboard_lite_facts(
         inbound_source_rows = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_source_rows") or len(inbound_facts_df))
         inbound_query_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_query_elapsed_ms") or 0)
         inbound_build_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_build_elapsed_ms") or 0)
+    inbound_facts_df = filter_dashboard_inbound_facts_by_staff(inbound_facts_df, service_params)
+    staff_product_codes = {
+        str(value).strip()
+        for value in (
+            inbound_facts_df.get("product_code", pd.Series(dtype="object")).fillna("").astype(str).tolist()
+            if isinstance(inbound_facts_df, pd.DataFrame)
+            else []
+        )
+        if str(value).strip()
+    }
     log.info(
         "[dashboard.inbound.source_load] source_rows=%s product_rows=%s source_call_count=%s data_cutoff_date=%s query_elapsed_ms=%s build_elapsed_ms=%s elapsed_ms=%s",
         inbound_source_rows,
@@ -3686,6 +3829,9 @@ def build_dashboard_lite_facts(
             )
         t_filter = time.perf_counter()
         expanded_sales_source_df = _filter_sales_source_for_dashboard(expanded_sales_source_df, service_params)
+        if staff_filter_active:
+            expanded_sales_source_df = _filter_frame_to_product_codes(expanded_sales_source_df, staff_product_codes)
+            purchase_vendor_df = _filter_frame_to_product_codes(purchase_vendor_df, staff_product_codes)
         if isinstance(purchase_vendor_df, pd.DataFrame) and isinstance(expanded_sales_source_df, pd.DataFrame) and "제품코드" in purchase_vendor_df.columns and "제품코드" in expanded_sales_source_df.columns:
             allowed_product_codes = set(expanded_sales_source_df["제품코드"].fillna("").astype(str).str.strip())
             purchase_vendor_df = purchase_vendor_df.loc[purchase_vendor_df["제품코드"].fillna("").astype(str).str.strip().isin(allowed_product_codes)].copy()
@@ -3775,10 +3921,13 @@ def build_dashboard_lite_facts(
         manufacturer_summary_payload = _filter_payload_df_for_dashboard(manufacturer_summary_payload, service_params)
         payload_df = _payload_df(manufacturer_summary_payload)
         filter_diagnostics.extend(list(payload_df.attrs.get("dashboard_filter_diagnostics") or []))
+    future_forecast_df = pd.DataFrame()
+    future_forecast_elapsed_ms = 0
     if stock_shortage_payload is None:
         from app.services.analytics_sales_trend_service import (
             get_sales_forecast_df,
             get_stock_shortage_result,
+            project_sales_forecast_next_two_months,
         )
 
         t_forecast = time.perf_counter()
@@ -3790,6 +3939,11 @@ def build_dashboard_lite_facts(
             },
             raw_df=visible_sales_df,
         )
+        t_future_forecast = time.perf_counter()
+        future_forecast_df = project_sales_forecast_next_two_months(
+            shared_sales_forecast_df, str(service_params.get("evaluation_month") or ""),
+        )
+        future_forecast_elapsed_ms = int((time.perf_counter() - t_future_forecast) * 1000)
         forecast_elapsed_ms = int((time.perf_counter() - t_forecast) * 1000)
         if narrow_sales_bundle is not None:
             log.info(
@@ -3866,6 +4020,7 @@ def build_dashboard_lite_facts(
     t_sales = time.perf_counter()
     sales = _build_sales_facts(
         manufacturer_summary_payload,
+        future_forecast_df=future_forecast_df,
         history_actuals=source_monthly_actuals,
         history_sales_returns=source_monthly_sales_returns,
         evaluation_month=service_params.get("evaluation_month"),
@@ -4154,6 +4309,7 @@ def build_dashboard_lite_facts(
     facts["performance"]["inbound_source_rows"] = inbound_source_rows
     facts["performance"]["sales_source_elapsed_ms"] = sales_source_elapsed_ms
     facts["performance"]["stock_source_elapsed_ms"] = stock_source_elapsed_ms
+    facts["performance"]["future_forecast_elapsed_ms"] = future_forecast_elapsed_ms
     facts["performance"]["sales_transaction_cycle_elapsed_ms"] = sales_cycle_total_elapsed_ms
     facts["performance"]["sales_transaction_cycle_source_elapsed_ms"] = sales_cycle_source_elapsed_ms
     facts["performance"]["sales_transaction_cycle_calculation_elapsed_ms"] = sales_cycle_calculation_elapsed_ms

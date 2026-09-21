@@ -271,6 +271,14 @@ def _extract_name_before_label(raw: str, labels: tuple[str, ...]) -> str:
     return _clean(match.group(1)) if match else ""
 
 
+def _strip_labeled_values_for_period(raw: str, labels: tuple[str, ...]) -> str:
+    """Keep explicitly labelled numeric staff values out of common date parsing."""
+    if not labels:
+        return raw
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    return re.sub(rf"(?:{label_pattern})\s*[:=]?\s*\S+", " ", raw)
+
+
 def _extract_unlabeled_order_vendor(
     raw: str,
     *,
@@ -347,8 +355,11 @@ def _resolve_order_nlq(
         value = _extract_name(raw, filter_labels(feature, key))
         if value:
             params[key] = value
+    staff_labels: list[tuple[str, ...]] = []
     for key in ("order_staff_nm", "pharma_staff_nm"):
-        staff_name = _extract_name(raw, filter_labels(feature, key))
+        labels = filter_labels(feature, key)
+        staff_labels.append(labels)
+        staff_name = _extract_name(raw, labels) if labels else ""
         if staff_name:
             params[key] = staff_name
     if re.search(r"(?<!발주)(?<!제약)(?<!영업)담당자(?:명)?\s*[:=]?\s*\S+", raw):
@@ -382,7 +393,10 @@ def _resolve_order_nlq(
             if explicit_from:
                 params["date_from"], params["date_to"] = explicit_from, explicit_to
             else:
-                params.update(nlq_period_to_date_range(extract_nlq_natural_period(raw, today=today)))
+                period_raw = raw
+                for labels in staff_labels:
+                    period_raw = _strip_labeled_values_for_period(period_raw, labels)
+                params.update(nlq_period_to_date_range(extract_nlq_natural_period(period_raw, today=today)))
     else:
         # Expected inbound keeps the Business Calendar default for ordinary
         # questions. Only an absolute user-written order period replaces it.

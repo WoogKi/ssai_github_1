@@ -12,6 +12,7 @@ from __future__ import annotations
 import calendar
 import logging
 import os
+import re
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -4518,6 +4519,64 @@ def _forecast_meta_from_df(df: pd.DataFrame) -> Dict[str, Any]:
         "customer_count_label": customer_label,
         "month_count": int(len(month_sales_cols)),
     }
+
+
+def project_sales_forecast_next_two_months(
+    forecast_df: pd.DataFrame,
+    evaluation_month: str,
+) -> pd.DataFrame:
+    """Project two future months from the already-loaded product forecast.
+
+    The second month rolls the existing forecast projection forward using the
+    evaluation-month projection and the first future-month projection. No new
+    ERP source or alternative growth formula is introduced.
+    """
+    if not isinstance(forecast_df, pd.DataFrame) or forecast_df.empty:
+        return pd.DataFrame()
+    month = str(evaluation_month or "").replace("-", "").strip()
+    if not re.fullmatch(r"\d{6}", month):
+        return pd.DataFrame()
+    required = {"제품코드", "당월 예상매출", "다음월예상매출"}
+    if not required.issubset(forecast_df.columns):
+        return pd.DataFrame()
+    if forecast_df["제품코드"].astype(str).duplicated().any():
+        raise ValueError("product forecast must be one row per product")
+    completed_cols = sorted(
+        (col for col in forecast_df.columns
+         if re.fullmatch(r"\d{4}-\d{2} 매출", str(col))
+         and str(col)[:7].replace("-", "") < month),
+        key=lambda col: str(col)[:7],
+    )
+    if not completed_cols:
+        return pd.DataFrame()
+    history = [pd.to_numeric(forecast_df[col], errors="coerce").fillna(0.0) for col in completed_cols]
+    current_projection = pd.to_numeric(forecast_df["당월 예상매출"], errors="coerce").fillna(0.0)
+    next_projection = pd.to_numeric(forecast_df["다음월예상매출"], errors="coerce").fillna(0.0)
+    history.extend([current_projection, next_projection])
+    recent3 = sum(history[-3:]) / min(3, len(history))
+    recent6 = sum(history[-6:]) / min(6, len(history))
+    previous3 = sum(history[-6:-3]) / len(history[-6:-3]) if len(history) > 3 else recent3.mul(0)
+    total = sum(history)
+    rate = recent3.sub(recent6).div(recent6.where(recent6.abs().ge(1e-12))).mul(100).fillna(0)
+    work = forecast_df.copy()
+    work["최근3개월평균매출"] = recent3
+    work["최근6개월평균매출"] = recent6
+    work["직전3개월평균매출"] = previous3
+    work["최근3개월증감률"] = rate
+    work["완료월총매출"] = total
+    work["완료월수"] = len(history)
+    work["완료월평균매출"] = total / len(history)
+    work["월평균매출"] = work["완료월평균매출"]
+    work["매출발생월수"] = sum(value.ne(0).astype(int) for value in history)
+    work["추세판정"] = _vectorized_trend_judge(
+        total, recent3, recent6, pd.concat(history, axis=1).lt(0).any(axis=1), previous3=previous3,
+    )
+    _, _, following_projection, _ = _vectorized_forecast_projection(work)
+    return pd.DataFrame({
+        "제품코드": forecast_df["제품코드"].astype(str),
+        "다음월예상매출": next_projection,
+        "다다음월예상매출": following_projection.round(0),
+    })
 
 
 def get_sales_forecast_df(

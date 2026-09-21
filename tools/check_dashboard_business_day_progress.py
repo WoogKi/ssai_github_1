@@ -12,6 +12,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.services.business_calendar_service import BusinessDayMonthContext, business_day_month_context
+from app.services.analytics_sales_trend_service import (
+    _apply_month_or_date_params,
+    _apply_period_source_policy_params,
+    normalize_stock_shortage_time_axis,
+    project_sales_forecast_next_two_months,
+)
+from app.services.rddbc170_rddbc180_order_service import _filters, normalize_order_params
 from app.services.dashboard_inventory_frequency_snapshot import FrequencyProjectionReadResult
 from app.services.dashboard_lite_facts import (
     _apply_current_month_demand_surge,
@@ -19,6 +26,7 @@ from app.services.dashboard_lite_facts import (
     build_dashboard_lite_facts,
 )
 from app.services.ssai_business_calendar_repository import CalendarAuthorityRead
+from app.sims.views.dashboard_lite import _build_sales_bar_chart
 
 
 def _ready_context() -> BusinessDayMonthContext:
@@ -59,6 +67,32 @@ def _sales_payload() -> dict:
 
 
 def main() -> int:
+    # Dashboard's sales horizon must not become the expected-inbound period.
+    inbound_fixture = {
+        "date_from": "20260301", "date_to": "20260919", "_today": "20260919",
+        "_business_dates": ("20260915", "20260916", "20260917", "20260918"),
+    }
+    explicit = normalize_order_params(inbound_fixture, mode="expected")
+    recent = normalize_order_params(
+        {**inbound_fixture, "_expected_inbound_auto_period": True}, mode="expected",
+    )
+    assert explicit["_expected_inbound_explicit_period"] is True
+    assert recent["_expected_inbound_explicit_period"] is False
+    assert recent["_business_dates"] == inbound_fixture["_business_dates"]
+    recent_clauses, recent_values = _filters(recent, mode="expected")
+    assert any("Rd17_Or_YyMmDd IN" in clause for clause in recent_clauses)
+    assert not any("Rd17_Or_YyMmDd >=" in clause for clause in recent_clauses)
+    assert all(day in recent_values for day in inbound_fixture["_business_dates"])
+    shortage_params = {
+        **inbound_fixture, "month_from": "202603", "month_to": "202609",
+        "policy_date": "20260919", "_expected_inbound_auto_period": True,
+    }
+    shortage_params = normalize_stock_shortage_time_axis(shortage_params)
+    shortage_params = _apply_month_or_date_params(shortage_params)
+    shortage_params = _apply_period_source_policy_params(shortage_params)
+    assert shortage_params["_expected_inbound_auto_period"] is True
+    assert normalize_order_params(shortage_params, mode="expected")["_expected_inbound_explicit_period"] is False
+
     context = _ready_context()
     sales = _build_sales_facts(
         _sales_payload(),
@@ -72,6 +106,28 @@ def main() -> int:
     assert abs(float(visualization["expected_to_date_sales"]) - 45.0) < 1e-12
     assert abs(float(visualization["time_adjusted_achievement_pct"]) - (50 / 45 * 100)) < 1e-12
     assert float(visualization["forecast_sales"]) == 100.0
+    product_forecast = pd.DataFrame([{
+        "제품코드": "fixture-1",
+        **{f"2026-{month:02d} 매출": float(month * 10) for month in range(3, 9)},
+        "당월 예상매출": 100.0,
+        "다음월예상매출": 110.0,
+        "총매출액": 330.0,
+    }])
+    future = project_sales_forecast_next_two_months(product_forecast, "202609")
+    assert len(future) == 1 and future.iloc[0]["다음월예상매출"] == 110.0
+    assert future.iloc[0]["다다음월예상매출"] >= 0
+    sales_with_future = _build_sales_facts(
+        _sales_payload(), evaluation_month="202609", policy_date="20260911",
+        today=date(2026, 9, 11), business_day_context=context,
+        future_forecast_df=future,
+    )
+    future_rows = [row for row in sales_with_future["chart_rows"] if row["kind"] == "미래월 예상"]
+    assert [row["period_sort"] for row in future_rows] == ["202610", "202611"]
+    assert len([row for row in sales_with_future["chart_rows"] if row["period_sort"] in ("202610", "202611")]) == 2
+    assert sales_with_future["metrics"]["next_month_forecast_sales"]["value"] == 110.0
+    assert sales_with_future["metrics"]["following_month_forecast_sales"]["value"] == future.iloc[0]["다다음월예상매출"]
+    assert sales_with_future["visualization"]["next_month_forecast_sales"] == 110.0
+    assert _build_sales_bar_chart({"sales": sales_with_future}) is not None
 
     rows = [{
         "당월현재출고수량": 45.0,

@@ -96,6 +96,13 @@ def main() -> int:
         failures.append("Panel maker_nm did not bind to the product-maker PMV alias")
     if "OV.Rd03_Ven_Nm LIKE ?" not in filter_sql or "%종근당주식회사%" not in filter_values:
         failures.append("Panel order_vendor_nm did not bind independently to the OV alias")
+    staff_filters = service.normalize_order_params(
+        {"date_from": "20260901", "date_to": "20260930", "order_staff_nm": "김", "pharma_staff_nm": "이"},
+        mode="order",
+    )
+    staff_sql = " ".join(service._filters(staff_filters, mode="order")[0])
+    if "H.Rd17_DamDang" not in staff_sql or "StaffProduct.Rd04_Ven_Cd" not in staff_sql:
+        failures.append("order/pharma staff authorities are not independently bound")
 
     for column, value in (("발주순번", 16.0), ("상세순번", 1.0)):
         normalized_identifier = _maybe_to_numeric(pd.Series([value]), column).iloc[0]
@@ -118,6 +125,12 @@ def main() -> int:
         ("단가적용처 50002 발주 조회", "발주조회", {"cost_apply_cd": "50002"}),
         ("재고적용처 50001 발주 조회", "발주조회", {"stock_apply_cd": "50001"}),
         ("9월 동구바이오 발주 조회", "발주조회", {"date_from": "20260901", "date_to": "20260930", "order_vendor_nm": "동구바이오"}),
+        ("발주조회 202609", "발주조회", {"date_from": "20260901", "date_to": "20260930"}),
+        ("발주조회 2026년 9월", "발주조회", {"date_from": "20260901", "date_to": "20260930"}),
+        ("발주조회 오늘", "발주조회", {"date_from": "20260907", "date_to": "20260907"}),
+        ("발주담당자 김 발주조회", "발주조회", {"order_staff_nm": "김"}),
+        ("제약담당자 김 발주조회", "발주조회", {"pharma_staff_nm": "김"}),
+        ("발주담당자 202609 발주조회", "발주조회", {"order_staff_nm": "202609"}),
         ("종근당 전문약 발주 조회", "발주조회", {"order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}),
         ("9월 종근당 전문약 발주 조회", "발주조회", {"date_from": "20260901", "date_to": "20260930", "order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}),
         ("단가적용처 한미 발주 조회", "발주조회", {"cost_apply_nm": "한미"}),
@@ -149,6 +162,10 @@ def main() -> int:
                 resolved_value = parsed.get("params", {}).get("_registered_unlabeled_entity")
             if resolved_value != value:
                 failures.append(f"NLQ filter mismatch: {text!r}/{key} -> {parsed}")
+        if text == "발주조회 202609" and any(
+            parsed.get("params", {}).get(key) for key in ("order_staff_nm", "pharma_staff_nm", "_registered_unlabeled_entity")
+        ):
+            failures.append(f"YYYYMM leaked into a non-period filter: {parsed}")
         if text in {
             "어제 발주 조회", "입고중 발주조회", "발주상태 입고중 조회",
             "단가적용처 50002 발주 조회", "재고적용처 50001 발주 조회",
@@ -386,6 +403,83 @@ def main() -> int:
         failures.append("current-table literal/TOP source reuse failed")
     if len(captured) != calls_before_followup:
         failures.append("current-table follow-up re-queried the DB source")
+
+    group_pushed: list[dict] = []
+    group_calls_before_followup = len(captured)
+    for group_query, expected_title, expected_columns in (
+        (
+            "현재표 발주담당자별 집계",
+            "현재표 발주담당자별 집계",
+            ("순번", "발주담당자", "제품수", "행수", "전체 제품 대비 포함 비율", "발주수량", "할증수량", "입고수량", "미입고수량"),
+        ),
+        (
+            "현재표 재고적용처별 집계",
+            "현재표 재고적용처별 집계",
+            ("순번", "재고적용처코드", "재고적용처", "제품수", "행수", "전체 제품 대비 포함 비율", "발주수량", "할증수량", "입고수량", "미입고수량"),
+        ),
+    ):
+        group_handled = handle_current_table_followup_by_action(
+            df=order.get("df"),
+            query=group_query,
+            top_n=20,
+            table_key="sims_order_group_gate",
+            source_action="발주조회",
+            helpers={
+                "find_col": lambda df, exact=(), include_any=(), exclude_any=(): next(
+                    (column for column in df.columns if column in exact or (any(token in str(column) for token in include_any) and not any(token in str(column) for token in exclude_any))),
+                    "",
+                ),
+                "push_table": lambda **kwargs: group_pushed.append(kwargs) or True,
+                "push_notice": lambda **_kwargs: False,
+            },
+            log=logging.getLogger("order.group.gate"),
+            source_meta=order.get("meta"),
+        )
+        payload = group_pushed[-1] if group_pushed else {}
+        result_df = payload.get("df")
+        if (
+            not group_handled
+            or payload.get("title") != expected_title
+            or not isinstance(result_df, pd.DataFrame)
+            or tuple(result_df.columns) != expected_columns
+            or any("코드" in column or column.endswith("명") for column in result_df.columns if column not in {"재고적용처코드", "재고적용처"})
+        ):
+            failures.append(f"current-table group contract failed: {group_query!r} -> {payload!r}")
+    if len(captured) != group_calls_before_followup:
+        failures.append("current-table group follow-up re-queried the DB source")
+
+    generic_group_df = pd.DataFrame([
+        {"제품코드": "00001", "영업사원명": "김영업", "품목기여등급": "A", "제조사명": "한미", "매출금액": 100},
+        {"제품코드": "00002", "영업사원명": "김영업", "품목기여등급": "B", "제조사명": "한미", "매출금액": 200},
+        {"제품코드": "00003", "영업사원명": "이영업", "품목기여등급": "A", "제조사명": "유한", "매출금액": 50},
+    ])
+    for group_query in ("현재표 영업사원명별 집계", "현재표 품목기여등급별 집계", "현재표 제조사명별 집계"):
+        generic_pushed: list[dict] = []
+        generic_handled = handle_current_table_followup_by_action(
+            df=generic_group_df,
+            query=group_query,
+            top_n=20,
+            table_key="sims_generic_group_gate",
+            source_action="테스트 현재표",
+            helpers={
+                "find_col": lambda df, exact=(), include_any=(), exclude_any=(): next(
+                    (column for column in df.columns if column in exact or (any(token in str(column) for token in include_any) and not any(token in str(column) for token in exclude_any))),
+                    "",
+                ),
+                "push_table": lambda **kwargs: generic_pushed.append(kwargs) or True,
+                "push_notice": lambda **_kwargs: False,
+            },
+            log=logging.getLogger("generic.group.gate"),
+            source_meta={"result_status": "success"},
+        )
+        generic_result = generic_pushed[-1].get("df") if generic_pushed else None
+        if (
+            not generic_handled
+            or not isinstance(generic_result, pd.DataFrame)
+            or "매출금액" not in generic_result.columns
+            or "제품코드" in generic_result.columns
+        ):
+            failures.append(f"common generic group metric contract failed: {group_query!r} -> {generic_pushed!r}")
 
     expected_pushed: list[dict] = []
     expected_calls_before_followup = len(captured)
