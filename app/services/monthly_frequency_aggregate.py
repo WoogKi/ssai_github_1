@@ -712,6 +712,8 @@ def product_lifecycle_sql(
     product_di_codes: Iterable[Any] = (),
     product_class_codes: Iterable[Any] = (),
     price_lookback_from: Any = None,
+    include_first_outbound: bool = True,
+    snapshot_projection_only: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Read profile-scoped lifecycle and product-universe evidence once."""
     cutoff = str(cutoff_date or "").strip()
@@ -793,16 +795,57 @@ def product_lifecycle_sql(
         detail_in_qty += " + COALESCE(I.Rd11_Oquantity, 0)"
         detail_out_qty += " + COALESCE(O.Rd12_Oquantity, 0)"
     monthly_stock_sql = monthly_stock.format(prefix=monthly_prefix) if monthly_stock else ""
+    stock_sum_sql = f"SUM(({monthly_in_qty}) - ({monthly_out_qty}))"
+    monthly_stock_cte = f""", MonthlyStock AS (
+    SELECT LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) AS product_code,
+           {stock_sum_sql} AS stock_quantity
+    FROM {monthly_table} AS M
+    INNER JOIN ProductUniverse AS PU
+      ON LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) = PU.product_code
+    WHERE M.{monthly_prefix}_Stock_YyMm <= :stock_month_to
+      AND M.{monthly_prefix}_Io_Gu_Gcode = '0012'
+      {monthly_stock_sql}
+    GROUP BY LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd))
+)"""
+    monthly_stock_join = "LEFT JOIN MonthlyStock AS S ON S.product_code=P.product_code"
+    first_outbound_cte = """
+, FirstOutbound AS (
+    SELECT LTRIM(RTRIM(O.Rd12_Physic_Cd)) AS product_code,
+           MIN(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) AS first_outbound_date
+    FROM dbo.Rddbc120 AS O
+    WHERE O.Rd12_Io_Gu_Gcode = '0012'
+      AND LEN(LTRIM(RTRIM(O.Rd12_Io_Gu))) = 3
+      AND LTRIM(RTRIM(O.Rd12_Io_Gu)) NOT LIKE '%[^0-9]%'
+      AND CONVERT(int, CASE
+            WHEN LEN(LTRIM(RTRIM(O.Rd12_Io_Gu))) = 3
+             AND LTRIM(RTRIM(O.Rd12_Io_Gu)) NOT LIKE '%[^0-9]%'
+            THEN LTRIM(RTRIM(O.Rd12_Io_Gu)) ELSE NULL END) BETWEEN 500 AND 599
+      AND COALESCE(O.Rd12_Quantity, 0) + COALESCE(O.Rd12_Oquantity, 0) > 0
+      AND NULLIF(LTRIM(RTRIM(O.Rd12_Physic_Cd)), '') IS NOT NULL
+      AND LEN(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) = 8
+      AND LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) NOT LIKE '%[^0-9]%'
+      AND ISDATE(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) = 1
+      AND O.Rd12_Out_YyMmDd <= :cutoff_date
+      {outbound_stock}
+    GROUP BY LTRIM(RTRIM(O.Rd12_Physic_Cd))
+)""" if include_first_outbound else ""
+    first_outbound_select = "       O.first_outbound_date,\n" if include_first_outbound else ""
+    first_outbound_join = "LEFT JOIN FirstOutbound AS O ON O.product_code=P.product_code" if include_first_outbound else ""
+    registered_date_select = "" if snapshot_projection_only else """,
+           CASE WHEN LEN(LTRIM(RTRIM(P.Rd04_Add_Date))) = 8
+                     AND LTRIM(RTRIM(P.Rd04_Add_Date)) NOT LIKE '%[^0-9]%'
+                     AND ISDATE(LTRIM(RTRIM(P.Rd04_Add_Date))) = 1
+                THEN LTRIM(RTRIM(P.Rd04_Add_Date)) END AS product_registered_date"""
+    legacy_lifecycle_select = "" if snapshot_projection_only else """       P.product_registered_date,
+       I.first_normal_inbound_date,
+"""
+    profile_count_select = "" if snapshot_projection_only else "       COUNT_BIG(*) OVER () AS profile_product_count,\n"
     sql = f"""
 WITH ProductUniverse AS (
     SELECT LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code,
            CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Group_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Group))) AS product_group_key,
            CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Di_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Di))) AS product_di_key,
-           CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Tax_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Tax))) AS product_class_key,
-           CASE WHEN LEN(LTRIM(RTRIM(P.Rd04_Add_Date))) = 8
-                     AND LTRIM(RTRIM(P.Rd04_Add_Date)) NOT LIKE '%[^0-9]%'
-                     AND ISDATE(LTRIM(RTRIM(P.Rd04_Add_Date))) = 1
-                THEN LTRIM(RTRIM(P.Rd04_Add_Date)) END AS product_registered_date
+           CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Tax_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Tax))) AS product_class_key{registered_date_select}
     FROM dbo.Rddbc040 AS P
     WHERE NULLIF(LTRIM(RTRIM(P.Rd04_Physic_Cd)), '') IS NOT NULL
       {product_filter_sql}
@@ -843,34 +886,7 @@ WITH ProductUniverse AS (
            ROW_NUMBER() OVER (PARTITION BY product_code ORDER BY basis_month DESC) AS price_rank
     FROM PurchasePriceMonthly
     WHERE paid_quantity > 0
-), FirstOutbound AS (
-    SELECT LTRIM(RTRIM(O.Rd12_Physic_Cd)) AS product_code,
-           MIN(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) AS first_outbound_date
-    FROM dbo.Rddbc120 AS O
-    WHERE O.Rd12_Io_Gu_Gcode = '0012'
-      AND LEN(LTRIM(RTRIM(O.Rd12_Io_Gu))) = 3
-      AND LTRIM(RTRIM(O.Rd12_Io_Gu)) NOT LIKE '%[^0-9]%'
-      AND CONVERT(int, CASE
-            WHEN LEN(LTRIM(RTRIM(O.Rd12_Io_Gu))) = 3
-             AND LTRIM(RTRIM(O.Rd12_Io_Gu)) NOT LIKE '%[^0-9]%'
-            THEN LTRIM(RTRIM(O.Rd12_Io_Gu)) ELSE NULL END) BETWEEN 500 AND 599
-      AND COALESCE(O.Rd12_Quantity, 0) + COALESCE(O.Rd12_Oquantity, 0) > 0
-      AND NULLIF(LTRIM(RTRIM(O.Rd12_Physic_Cd)), '') IS NOT NULL
-      AND LEN(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) = 8
-      AND LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) NOT LIKE '%[^0-9]%'
-      AND ISDATE(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) = 1
-      AND O.Rd12_Out_YyMmDd <= :cutoff_date
-      {outbound_stock}
-    GROUP BY LTRIM(RTRIM(O.Rd12_Physic_Cd))
-), MonthlyStock AS (
-    SELECT LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) AS product_code,
-           SUM(({monthly_in_qty}) - ({monthly_out_qty})) AS stock_quantity
-    FROM {monthly_table} AS M
-    WHERE M.{monthly_prefix}_Stock_YyMm <= :stock_month_to
-      AND M.{monthly_prefix}_Io_Gu_Gcode = '0012'
-      {monthly_stock_sql}
-    GROUP BY LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd))
-), CurrentInbound AS (
+){first_outbound_cte}{monthly_stock_cte}, CurrentInbound AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code, SUM({detail_in_qty}) AS quantity
     FROM dbo.Rddbc110 AS I
     WHERE :use_current_detail = 1 AND I.Rd11_Io_Gu_Gcode = '0012'
@@ -886,20 +902,18 @@ WITH ProductUniverse AS (
     GROUP BY LTRIM(RTRIM(O.Rd12_Physic_Cd))
 )
 SELECT P.product_code, P.product_group_key, P.product_di_key, P.product_class_key,
-       P.product_registered_date,
-       I.first_normal_inbound_date,
+{legacy_lifecycle_select}
        LEFT(I.first_normal_inbound_date, 6) AS first_normal_inbound_month,
-       O.first_outbound_date,
+{first_outbound_select}
        CASE WHEN COALESCE(S.stock_quantity, 0) + COALESCE(CI.quantity, 0) - COALESCE(CO.quantity, 0) <> 0 THEN 1 ELSE 0 END AS current_stock_present,
        CASE WHEN BI.product_code IS NULL THEN 0 ELSE 1 END AS basis_inbound_present,
-       COUNT_BIG(*) OVER () AS profile_product_count
-       ,CAST(CASE WHEN PP.paid_quantity > 0 THEN PP.supply_amount / PP.paid_quantity END AS decimal(38, 10)) AS avg_purchase_unit_cost
-       ,PP.basis_month AS purchase_price_basis_month
+{profile_count_select}       CAST(CASE WHEN PP.paid_quantity > 0 THEN PP.supply_amount / PP.paid_quantity END AS decimal(38, 10)) AS avg_purchase_unit_cost,
+       PP.basis_month AS purchase_price_basis_month
 FROM ProductUniverse AS P
 LEFT JOIN FirstInbound AS I ON I.product_code=P.product_code
-LEFT JOIN FirstOutbound AS O ON O.product_code=P.product_code
+{first_outbound_join}
 LEFT JOIN BasisInbound AS BI ON BI.product_code=P.product_code
-LEFT JOIN MonthlyStock AS S ON S.product_code=P.product_code
+{monthly_stock_join}
 LEFT JOIN CurrentInbound AS CI ON CI.product_code=P.product_code
 LEFT JOIN CurrentOutbound AS CO ON CO.product_code=P.product_code
 LEFT JOIN LatestPurchasePrice AS PP ON PP.product_code=P.product_code AND PP.price_rank=1

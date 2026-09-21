@@ -21,6 +21,7 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (  # noq
 )
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     FrequencyProjectionReadResult,
+    build_product_statistics_relational_snapshot_from_aggregates,
     dashboard_profile_fingerprint,
 )
 from app.services.monthly_frequency_aggregate import product_lifecycle_sql  # noqa: E402
@@ -186,6 +187,50 @@ def test_two_statement_sql_carries_scope_and_evidence() -> None:
     _assert(outbound_binds["outbound_group_t_0"] == "9998", "outbound product-group bind missing")
     _assert("outbound_io" not in " ".join(outbound_binds), "saved IO list must not redefine canonical 500-599 frequency")
     _assert(plan.erp_sql_call_count == 2, "ERP statement contract changed")
+    _assert("FirstOutbound" in lifecycle_sql and "first_outbound_date" in lifecycle_sql, "legacy lifecycle provenance changed")
+    v21_sql, _ = product_lifecycle_sql(
+        stock_codes=plan.stock_codes,
+        cutoff_date="20260911",
+        basis_from=plan.basis_from,
+        basis_to=plan.basis_to,
+        stock_mode=plan.stock_mode,
+        product_group_codes=plan.product_group_codes,
+        product_di_codes=plan.product_di_codes,
+        product_class_codes=plan.product_class_codes,
+        include_first_outbound=False,
+    )
+    _assert("FirstOutbound" not in v21_sql and "first_outbound_date" not in v21_sql, "v2.1 lifecycle query retained unused lifetime outbound scan")
+    v3_sql, v3_binds = product_lifecycle_sql(
+        stock_codes=plan.stock_codes,
+        cutoff_date="20260911",
+        basis_from=plan.basis_from,
+        basis_to=plan.basis_to,
+        stock_mode=plan.stock_mode,
+        product_group_codes=plan.product_group_codes,
+        product_di_codes=plan.product_di_codes,
+        product_class_codes=plan.product_class_codes,
+        include_first_outbound=False,
+        snapshot_projection_only=True,
+    )
+    _assert(v3_binds == lifecycle_binds, "v3 lifecycle bind contract changed")
+    _assert(v3_sql.endswith("ORDER BY P.product_code"), "v3 lifecycle row order changed")
+    for unused in ("COUNT_BIG(*) OVER ()", "Rd04_Add_Date", "P.product_registered_date", "I.first_normal_inbound_date,\n"):
+        _assert(unused not in v3_sql, f"v3 lifecycle retained unused expression: {unused}")
+        _assert(unused in lifecycle_sql, f"legacy lifecycle expression changed: {unused}")
+    for required in (
+        "AS first_normal_inbound_month", "AS current_stock_present", "AS basis_inbound_present",
+        "AS avg_purchase_unit_cost", "AS purchase_price_basis_month", "Rd04_Physic_Group_Gcode",
+        "Rd04_Physic_Di_Gcode", "Rd04_Physic_Tax_Gcode", "dbo.Rddbc210",
+    ):
+        _assert(required in v3_sql, f"v3 lifecycle lost required evidence: {required}")
+    projection = v3_sql.split("\nSELECT P.product_code", 1)[1].split("\nFROM ProductUniverse AS P", 1)[0]
+    columns = (
+        "P.product_group_key", "P.product_di_key", "P.product_class_key",
+        "AS first_normal_inbound_month", "AS current_stock_present", "AS basis_inbound_present",
+        "AS avg_purchase_unit_cost", "AS purchase_price_basis_month",
+    )
+    _assert([projection.index(column) for column in columns] == sorted(projection.index(column) for column in columns),
+            "v3 lifecycle projection column order changed")
 
 
 def test_union_product_universe_and_leading_zero() -> None:
@@ -210,6 +255,44 @@ def test_union_product_universe_and_leading_zero() -> None:
     }, "product universe diagnostics changed")
 
 
+def test_v3_unused_lifecycle_columns_do_not_change_snapshot() -> None:
+    legacy = pd.DataFrame([
+        {
+            "product_code": "00001", "current_stock_present": 1, "basis_inbound_present": 0,
+            "first_normal_inbound_month": "202606", "avg_purchase_unit_cost": "10",
+            "purchase_price_basis_month": "202608", "product_registered_date": "20260101",
+            "first_normal_inbound_date": "20260603", "profile_product_count": 2,
+        },
+        {
+            "product_code": "00002", "current_stock_present": 0, "basis_inbound_present": 1,
+            "first_normal_inbound_month": "202608", "avg_purchase_unit_cost": "20",
+            "purchase_price_basis_month": "202608", "product_registered_date": "20260201",
+            "first_normal_inbound_date": "20260809", "profile_product_count": 2,
+        },
+    ])
+    lean = legacy.drop(columns=["product_registered_date", "first_normal_inbound_date", "profile_product_count"])
+
+    def snapshot(frame: pd.DataFrame):
+        product_codes, diagnostics = _select_snapshot_product_universe(frame, ())
+        rows = frame.set_index("product_code")
+        result = build_product_statistics_relational_snapshot_from_aggregates(
+            company_id=7, evaluation_month="202609", monthly_rows=(
+                {"month": "202608", "product_code": "00001", "stock_code": "00001", "occurrence_count": 1,
+                 "outbound_quantity": 2, "outbound_day_count": 1},
+            ),
+            product_codes=product_codes, product_day_counts={}, product_customer_counts={},
+            first_normal_inbound_months=rows["first_normal_inbound_month"].to_dict(),
+            outbound_paid_quantities={"00001": 2}, return_statistics={},
+            purchase_prices={code: {"unit_price": rows.at[code, "avg_purchase_unit_cost"],
+                                     "basis_month": rows.at[code, "purchase_price_basis_month"], "status": "ready"}
+                             for code in product_codes},
+            sales_prices={"00001": {"unit_price": "15", "status": "ready"}}, stock_codes=("00001",),
+        )
+        return diagnostics, result.checksum, result.frequency_products
+
+    _assert(snapshot(legacy) == snapshot(lean), "v3 lifecycle projection changed product universe or checksum")
+
+
 def main() -> int:
     tests = (
         test_profile_contract_reaches_snapshot_plan,
@@ -217,6 +300,7 @@ def main() -> int:
         test_profile_mismatch_fails_closed_and_v1_fallback_survives,
         test_two_statement_sql_carries_scope_and_evidence,
         test_union_product_universe_and_leading_zero,
+        test_v3_unused_lifecycle_columns_do_not_change_snapshot,
     )
     for test in tests:
         test()

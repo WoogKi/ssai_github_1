@@ -1305,7 +1305,8 @@ def _select_snapshot_product_universe(
     required = {"product_code", "current_stock_present", "basis_inbound_present"}
     if not isinstance(lifecycle_df, pd.DataFrame) or not required.issubset(lifecycle_df.columns):
         raise SnapshotContractError("product universe evidence query returned an invalid shape")
-    work = lifecycle_df.copy()
+    # Universe 판정에는 세 증거 열만 필요하므로 전체 lifecycle frame을 복사하지 않는다.
+    work = lifecycle_df.loc[:, ["product_code", "current_stock_present", "basis_inbound_present"]].copy()
     work["product_code"] = work["product_code"].fillna("").astype(str).str.strip()
     work = work.loc[work["product_code"].ne("")].drop_duplicates("product_code", keep="first")
     stock_products = set(
@@ -1390,6 +1391,8 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
         product_di_codes=plan.product_di_codes,
         product_class_codes=plan.product_class_codes,
         price_lookback_from=_month_start_months_before(plan.basis_from, 9),
+        include_first_outbound=False,
+        snapshot_projection_only=True,
     )
     report("제품 및 최초 정상 입고 조회 중")
     lifecycle_df = query(plan.company_id, lifecycle_sql, lifecycle_binds, timeout_seconds)
@@ -1417,34 +1420,29 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
     sales_prices = {code: value for code, value in sales_prices.items() if code in product_code_set}
     for price in sales_prices.values():
         price["status"] = _price_status(plan.evaluation_month, price.get("basis_month"))
-    first_inbound_months = {
-        str(row.get("product_code") or "").strip(): row.get("first_normal_inbound_month")
-        for row in lifecycle_df.to_dict("records")
-        if str(row.get("product_code") or "").strip() in product_code_set
-    }
-    purchase_prices = {
-        str(row.get("product_code") or "").strip(): {
-            "unit_price": row.get("avg_purchase_unit_cost"),
-            "basis_month": row.get("purchase_price_basis_month"),
-            "status": _price_status(plan.evaluation_month, row.get("purchase_price_basis_month")),
-        }
-        for row in lifecycle_df.to_dict("records")
-        if str(row.get("product_code") or "").strip() in product_code_set
-    }
+    first_inbound_months: dict[str, Any] = {}
+    purchase_prices: dict[str, dict[str, Any]] = {}
     classification_authority = classification_authority_loader(
         company_id=plan.company_id,
         as_of=date(int(lifecycle_cutoff[:4]), int(lifecycle_cutoff[4:6]), int(lifecycle_cutoff[6:])),
     )
     adjustment_only_products: set[str] = set()
     profitability_unavailable_products: set[str] = set()
-    for row in lifecycle_df.to_dict("records"):
-        code = str(row.get("product_code") or "").strip()
+    for row in lifecycle_df.itertuples(index=False):
+        code = str(getattr(row, "product_code", "") or "").strip()
         if code not in product_code_set:
             continue
+        purchase_price_basis_month = getattr(row, "purchase_price_basis_month", None)
+        first_inbound_months[code] = getattr(row, "first_normal_inbound_month", None)
+        purchase_prices[code] = {
+            "unit_price": getattr(row, "avg_purchase_unit_cost", None),
+            "basis_month": purchase_price_basis_month,
+            "status": _price_status(plan.evaluation_month, purchase_price_basis_month),
+        }
         targets = ProductClassificationTargets(
-            product_group_keys=tuple(value for value in (str(row.get("product_group_key") or "").strip(),) if value and not value.endswith(":")),
-            product_di_keys=tuple(value for value in (str(row.get("product_di_key") or "").strip(),) if value and not value.endswith(":")),
-            product_class_keys=tuple(value for value in (str(row.get("product_class_key") or "").strip(),) if value and not value.endswith(":")),
+            product_group_keys=tuple(value for value in (str(getattr(row, "product_group_key", "") or "").strip(),) if value and not value.endswith(":")),
+            product_di_keys=tuple(value for value in (str(getattr(row, "product_di_key", "") or "").strip(),) if value and not value.endswith(":")),
+            product_class_keys=tuple(value for value in (str(getattr(row, "product_class_key", "") or "").strip(),) if value and not value.endswith(":")),
         )
         classification = classify_product_from_loaded_authority(
             authority=classification_authority,
