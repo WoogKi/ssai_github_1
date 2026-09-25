@@ -505,6 +505,14 @@ def _relational_projection_digest(rows: Iterable[Mapping[str, Any]], *, key: Sna
     return hashlib.sha256(_canonical_section("frequency_projection", columns, sorted(canonical))).hexdigest()
 
 
+def _relational_projection_digest_from_canonical_rows(
+    rows: Iterable[Mapping[str, Any]], *, columns: Sequence[str]
+) -> str:
+    """Hash rows already normalized by relational projection validation."""
+    canonical = [tuple(row.get(column) for column in columns) for row in rows]
+    return hashlib.sha256(_canonical_section("frequency_projection", columns, sorted(canonical))).hexdigest()
+
+
 def build_relational_frequency_snapshot_from_aggregates(
     *,
     company_id: Any,
@@ -966,14 +974,14 @@ def validate_relational_frequency_projection(
     if required_grade:
         grade_rows = [row for row in normalized_rows if row["frequency_grade"] == required_grade]
         header = normalized_headers.get(required_grade)
-        if header is None or len(grade_rows) != header["expected_product_count"] or _relational_projection_digest(grade_rows, key=key) != header["projection_checksum"]:
+        if header is None or len(grade_rows) != header["expected_product_count"] or _relational_projection_digest_from_canonical_rows(grade_rows, columns=product_columns) != header["projection_checksum"]:
             raise SnapshotContractError("relational projection grade checksum does not match")
     elif require_complete:
         if sum(row["expected_product_count"] for row in normalized_headers.values()) != len(normalized_rows):
             raise SnapshotContractError("relational projection product count does not match")
         for grade, header in normalized_headers.items():
             grade_rows = [row for row in normalized_rows if row["frequency_grade"] == grade]
-            if len(grade_rows) != header["expected_product_count"] or _relational_projection_digest(grade_rows, key=key) != header["projection_checksum"]:
+            if len(grade_rows) != header["expected_product_count"] or _relational_projection_digest_from_canonical_rows(grade_rows, columns=product_columns) != header["projection_checksum"]:
                 raise SnapshotContractError("relational projection checksum does not match")
     return tuple(normalized_rows)
 

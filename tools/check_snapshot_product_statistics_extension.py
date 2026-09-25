@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import sys
 from dataclasses import replace
 from decimal import Decimal
@@ -16,6 +17,8 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     PRODUCT_STATISTICS_DECIMAL_STORAGE,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     SnapshotContractError,
+    _relational_projection_digest,
+    _relational_projection_digest_from_canonical_rows,
     _cumulative_amount_grades,
     _profit_rate_grade,
     build_product_statistics_relational_snapshot_from_aggregates,
@@ -29,10 +32,13 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     validate_relational_frequency_snapshot,
 )
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
+    _PRODUCT_STATISTICS_STREAM_COLUMNS,
     _aggregate_product_statistics_event_chunks,
+    _python_product_statistics_projection_chunks,
     _price_status,
     build_frequency_snapshot_plan,
     product_statistics_event_stream_sql,
+    product_statistics_raw_event_stream_sql,
 )
 from app.services.ssai_analytics_snapshot_migration import MIGRATION_008_SQL, MIGRATION_009_SQL, MIGRATIONS  # noqa: E402
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
@@ -100,8 +106,16 @@ def test_product_statistics_and_profitability() -> None:
     second = rows["00002"]
     _assert(second["frequency_grade"] == "F" and second["outbound_qty_3m"] == 5, "F raw statistics")
     _assert(second["profitability_status"] == "excluded_adjustment_only", "adjustment exclusion")
-    _assert(second["profit_grade"] == "unavailable", "adjustment grade exclusion")
-    _assert(rows["00003"]["profitability_status"] == "stale", "stale profitability")
+    _assert(
+        second["profit_grade"] == second["contribution_grade"] == "unavailable",
+        "adjustment grade exclusion",
+    )
+    stale = rows["00003"]
+    _assert(stale["profitability_status"] == "stale", "stale profitability")
+    _assert(
+        stale["profit_grade"] == stale["contribution_grade"] == "unavailable",
+        "stale profitability must not expose X",
+    )
 
 
 def test_price_status_boundaries() -> None:
@@ -164,9 +178,40 @@ def test_nonpositive_and_return_only_x() -> None:
     )
     validate_relational_frequency_snapshot(snapshot)
     rows = {row["product_code"]: row for row in snapshot.frequency_products}
-    _assert(rows["P1"]["profit_grade"] == rows["P1"]["contribution_grade"] == "A", "positive ready grade")
+    positive = rows["P1"]
+    _assert(
+        positive["estimated_profit_rate"] > 0
+        and positive["outbound_qty_3m"] > 0
+        and positive["profit_grade"] != "X",
+        "positive ready non-return product must not receive profit X",
+    )
+    _assert(positive["profit_grade"] == positive["contribution_grade"] == "A", "positive ready grade")
     _assert(all(rows[code][field] == "X" for code in ("P2", "P3", "P4") for field in ("profit_grade", "contribution_grade")), "zero, loss, and return-only X")
-    _assert(rows["P4"]["profitability_status"] == "ready" and rows["P4"]["return_qty_3m"] == 2, "return-only is not missing authority")
+    return_only = rows["P4"]
+    _assert(
+        return_only["profitability_status"] == "ready"
+        and return_only["estimated_profit_rate"] > 0
+        and return_only["outbound_qty_3m"] == 0
+        and return_only["return_qty_3m"] == 2,
+        "return-only X exception authority",
+    )
+    _assert(
+        return_only["estimated_contribution_amount"] == 0
+        and return_only["profit_grade"] == return_only["contribution_grade"] == "X",
+        "return-only must receive profit and contribution X",
+    )
+
+    unavailable = build_product_statistics_relational_snapshot_from_aggregates(
+        company_id="07", evaluation_month="202609", monthly_rows=(),
+        product_codes=("P5",), product_day_counts={}, product_customer_counts={},
+        first_normal_inbound_months={}, outbound_paid_quantities={}, return_statistics={},
+        purchase_prices={}, sales_prices={}, stock_codes=("00001",),
+    ).frequency_products[0]
+    _assert(
+        unavailable["profitability_status"] == "unavailable"
+        and unavailable["profit_grade"] == unavailable["contribution_grade"] == "unavailable",
+        "unavailable profitability must not expose X",
+    )
 
 
 def test_statistics_checksum_covers_additive_fields() -> None:
@@ -180,6 +225,95 @@ def test_statistics_checksum_covers_additive_fields() -> None:
         pass
     else:
         raise AssertionError("statistics tampering must invalidate row checksum")
+
+
+def test_validation_reuses_canonical_rows_without_changing_integrity() -> None:
+    snapshot = _snapshot()
+    key = snapshot.key
+    columns = frequency_product_columns(key)
+    rows, headers = build_relational_frequency_projection(snapshot)
+    raw_rows = copy.deepcopy(rows)
+    raw_rows[0].update({
+        "return_supply_amount_3m": Decimal("-0.0000004"),
+        "avg_purchase_unit_cost": Decimal("100.0000000000000"),
+        "avg_sales_unit_price": Decimal("-12.5000000000000"),
+        "estimated_unit_profit": None,
+        "estimated_profit_rate": Decimal("-0.0000000000004"),
+        "estimated_contribution_amount": None,
+    })
+    for row in raw_rows:
+        canonical = canonicalize_frequency_product_storage_row(key, row)
+        row["row_checksum"] = relational_row_checksum(
+            "frequency_product", columns, tuple(canonical[column] for column in columns)
+        )
+    rebuilt_headers = [
+        {
+            "frequency_grade": header["frequency_grade"],
+            "expected_product_count": header["expected_product_count"],
+            "projection_checksum": _relational_projection_digest(
+                (row for row in raw_rows if row["frequency_grade"] == header["frequency_grade"]),
+                key=key,
+            ),
+        }
+        for header in headers
+    ]
+
+    validated = validate_relational_frequency_projection(
+        rows=raw_rows, headers=rebuilt_headers, require_complete=True, key=key
+    )
+    _assert(
+        [row["product_code"] for row in validated] == [row["product_code"] for row in raw_rows],
+        "validation must retain canonical row sequence",
+    )
+    for header in rebuilt_headers:
+        grade = header["frequency_grade"]
+        raw_grade = [row for row in raw_rows if row["frequency_grade"] == grade]
+        canonical_grade = [row for row in validated if row["frequency_grade"] == grade]
+        old_digest = _relational_projection_digest(raw_grade, key=key)
+        new_digest = _relational_projection_digest_from_canonical_rows(
+            canonical_grade, columns=columns
+        )
+        _assert(old_digest == new_digest == header["projection_checksum"], f"{grade} digest exact equality")
+    _assert(
+        validated[0]["return_supply_amount_3m"] == Decimal("0.000000")
+        and not validated[0]["return_supply_amount_3m"].is_signed(),
+        "signed zero must remain canonical",
+    )
+    _assert(validated[0]["estimated_unit_profit"] is None, "null decimal must remain canonical")
+    _assert(validated[0]["avg_sales_unit_price"] == Decimal("-12.5000000000"), "negative decimal sign and scale")
+
+    checksum_corrupt = copy.deepcopy(raw_rows)
+    checksum_corrupt[0]["row_checksum"] = "0" * 64
+    try:
+        validate_relational_frequency_projection(
+            rows=checksum_corrupt, headers=rebuilt_headers, require_complete=True, key=key
+        )
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("row checksum mismatch must fail closed")
+
+    digest_corrupt = copy.deepcopy(rebuilt_headers)
+    digest_corrupt[0]["projection_checksum"] = "0" * 64
+    try:
+        validate_relational_frequency_projection(
+            rows=raw_rows, headers=digest_corrupt, require_complete=True, key=key
+        )
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("projection digest mismatch must fail closed")
+
+    duplicate = copy.deepcopy(raw_rows)
+    duplicate.append(copy.deepcopy(raw_rows[0]))
+    try:
+        validate_relational_frequency_projection(
+            rows=duplicate, headers=rebuilt_headers, require_complete=True, key=key
+        )
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("duplicate product code must fail closed")
 
 
 def test_sql_decimal_storage_round_trip_checksum() -> None:
@@ -442,6 +576,59 @@ def test_multi_projection_event_stream() -> None:
     _assert(split == (monthly, diagnostics, days, customers, paid, returns, prices), "chunk boundaries must not change product statistics")
 
 
+def test_python_source2_projection_fixture() -> None:
+    raw = pd.DataFrame([
+        {"outbound_date": "20250901", "vendor_code": "V0", "outbound_seq": "1", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "500", "quantity": Decimal("2"), "oquantity": 0, "supply_price": 200, "final_supply_price": None},
+        {"outbound_date": "20260801", "vendor_code": "V1", "outbound_seq": "1", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "500", "quantity": Decimal("8"), "oquantity": 2, "supply_price": 1100, "final_supply_price": 1200},
+        {"outbound_date": "20260801", "vendor_code": "V1", "outbound_seq": "1", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "500", "quantity": Decimal("8"), "oquantity": 2, "supply_price": 1100, "final_supply_price": 1200},
+        {"outbound_date": "20260802", "vendor_code": "V2", "outbound_seq": "2", "product_code": "P2", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "501", "quantity": 1, "oquantity": 0, "supply_price": 10, "final_supply_price": None},
+        {"outbound_date": "20260802", "vendor_code": "V2", "outbound_seq": "2", "product_code": "P3", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "501", "quantity": 1, "oquantity": 0, "supply_price": 20, "final_supply_price": None},
+        {"outbound_date": "20260803", "vendor_code": "", "outbound_seq": "3", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "599", "quantity": 1, "oquantity": 0, "supply_price": 10, "final_supply_price": None},
+        {"outbound_date": "20260804", "vendor_code": "V4", "outbound_seq": "4", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "599", "quantity": Decimal("1.5"), "oquantity": 0, "supply_price": 10, "final_supply_price": None},
+        {"outbound_date": "20260805", "vendor_code": "V5", "outbound_seq": "5", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "500", "quantity": 0, "oquantity": 0, "supply_price": 0, "final_supply_price": None},
+        {"outbound_date": "20260806", "vendor_code": "V6", "outbound_seq": "6", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "600", "quantity": -2, "oquantity": 0, "supply_price": -300, "final_supply_price": None},
+        {"outbound_date": "20260807", "vendor_code": "V7", "outbound_seq": "7", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "600", "quantity": 1, "oquantity": 0, "supply_price": 100, "final_supply_price": None},
+        {"outbound_date": "20260808", "vendor_code": "V8", "outbound_seq": "8", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "A50", "quantity": 1, "oquantity": 0, "supply_price": 100, "final_supply_price": None},
+    ])
+    raw["outbound_quantity"] = raw.apply(lambda row: Decimal(str(row["quantity"])) + Decimal(str(row["oquantity"])), axis=1)
+    raw["paid_quantity"] = raw["quantity"].map(lambda value: Decimal(str(value)))
+    raw["supply_amount"] = raw.apply(
+        lambda row: Decimal(str(row["final_supply_price"] if pd.notna(row["final_supply_price"]) else row["supply_price"])),
+        axis=1,
+    )
+    raw = raw.drop(columns=["quantity", "oquantity", "supply_price", "final_supply_price"])
+    projected_records = []
+    for chunk in _python_product_statistics_projection_chunks(
+        (raw.iloc[:3], raw.iloc[3:]), basis_from="20260601", output_chunk_rows=1
+    ):
+        projected_records.extend(chunk.to_dict("records"))
+    projected = pd.DataFrame.from_records(projected_records, columns=_PRODUCT_STATISTICS_STREAM_COLUMNS)
+    _assert(tuple(projected.columns) == _PRODUCT_STATISTICS_STREAM_COLUMNS, "Python Source-2 output column contract")
+    events = projected.loc[projected["row_kind"].eq("event")].sort_values("outbound_date")
+    _assert(len(events) == 2, "Python Source-2 event grain")
+    first = events.iloc[0]
+    _assert(first["product_code"] == "P1" and first["mapping_count"] == 1 and first["exact_duplicate_row_count"] == 1, "Python Source-2 exact duplicate")
+    conflict = events.iloc[1]
+    _assert(conflict["product_code"] == "P3" and conflict["mapping_count"] == 2, "Python Source-2 mapping conflict")
+    prices = projected.loc[projected["row_kind"].eq("sales_price")]
+    _assert(len(prices) == 1 and prices.iloc[0]["basis_month"] == "202608" and prices.iloc[0]["unit_price"] == Decimal("150.0000000000"), "Python Source-2 latest sales price")
+    returns = projected.loc[projected["row_kind"].eq("return_stats")]
+    _assert(len(returns) == 1 and returns.iloc[0]["return_quantity"] == Decimal("2.000000") and returns.iloc[0]["return_supply_amount"] == Decimal("300.000000"), "Python Source-2 return")
+    diagnostic = projected.loc[projected["row_kind"].eq("diagnostics")].iloc[0]
+    expected = {
+        "source_row_count": 10, "normal_positive_row_count": 6,
+        "normal_positive_missing_key_row_count": 1, "normal_positive_nonintegral_row_count": 1,
+        "normal_nonpositive_row_count": 1, "return_positive_row_count": 1,
+        "return_nonpositive_row_count": 1, "other_tcode_row_count": 1,
+    }
+    _assert(all(int(diagnostic[key]) == value for key, value in expected.items()), "Python Source-2 diagnostics")
+    sql, binds = product_statistics_raw_event_stream_sql(
+        build_frequency_snapshot_plan(company_id=7, evaluation_month="202609", stock_codes=("00001",))
+    )
+    _assert(sql.count("Rddbc120") == 1 and "GROUP BY" not in sql and "UNION ALL" not in sql, "raw Source-2 remains one simple extraction")
+    _assert(binds["basis_from"] == "20260601" and binds["price_lookback_from"] == "20250901", "raw Source-2 bounds")
+
+
 def test_sql_and_migration_contract() -> None:
     plan = build_frequency_snapshot_plan(company_id=7, evaluation_month="202609", stock_codes=("00001",))
     sql, binds = product_statistics_event_stream_sql(plan)
@@ -458,6 +645,25 @@ def test_sql_and_migration_contract() -> None:
     _assert("DROP CONSTRAINT CK_snapshot_frequency_product_profit_grade" in MIGRATION_009_SQL and "'X'" in MIGRATION_009_SQL, "versioned X grade migration")
 
 
+def test_io_classification_candidate_a_contract() -> None:
+    values = ("500", "501", "599", "600", "601", "699", "499", "700", "050", "5A0", "A50", "", "   ", "500   ", " 500", "5 0")
+    for io_gcode in ("0012", "0013"):
+        for raw_value in values:
+            value = raw_value.strip()
+            safe_integer = int(value) if len(value) == 3 and value.isascii() and value.isdigit() else None
+            old_normal = io_gcode == "0012" and safe_integer is not None and 500 <= safe_integer <= 599
+            old_return = io_gcode == "0012" and safe_integer is not None and 600 <= safe_integer <= 699
+            candidate_common = io_gcode == "0012" and len(value) == 3 and value.isascii() and value.isdigit()
+            candidate_normal = candidate_common and value[0] == "5"
+            candidate_return = candidate_common and value[0] == "6"
+            _assert(old_normal == candidate_normal, f"normal IO contract changed: {io_gcode!r}, {raw_value!r}")
+            _assert(old_return == candidate_return, f"return IO contract changed: {io_gcode!r}, {raw_value!r}")
+    plan = build_frequency_snapshot_plan(company_id=7, evaluation_month="202609", stock_codes=("00001",))
+    sql, _ = product_statistics_event_stream_sql(plan)
+    _assert("LEFT(io_tcode,1)='5'" in sql and "LEFT(io_tcode,1)='6'" in sql, "candidate A SQL missing")
+    _assert("sql_safe_int(\"io_tcode\")" not in sql, "safe integer range conversion remained in Source-2")
+
+
 def main() -> int:
     tests = (
         test_product_statistics_and_profitability,
@@ -466,11 +672,14 @@ def main() -> int:
         test_profit_and_contribution_use_distinct_quantity_sources,
         test_nonpositive_and_return_only_x,
         test_statistics_checksum_covers_additive_fields,
+        test_validation_reuses_canonical_rows_without_changing_integrity,
         test_sql_decimal_storage_round_trip_checksum,
         test_sql_decimal_storage_collapse_matrix,
         test_repository_inserts_the_checksummed_storage_values,
         test_multi_projection_event_stream,
+        test_python_source2_projection_fixture,
         test_sql_and_migration_contract,
+        test_io_classification_candidate_a_contract,
     )
     for test in tests:
         test()

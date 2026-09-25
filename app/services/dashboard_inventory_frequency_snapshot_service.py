@@ -9,7 +9,7 @@ import time
 import logging
 from collections import defaultdict
 from contextlib import contextmanager
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
@@ -919,7 +919,6 @@ def product_statistics_event_stream_sql(
             names.append(f":{key}")
         stock_clause = "AND O.Rd12_Stock_Cd_Gcode='0018' AND O.Rd12_Stock_Cd IN (" + ", ".join(names) + ")"
     product_join, product_clause = _product_dimension_scope_sql(plan, binds, product_alias="P")
-    io_number = sql_safe_int("io_tcode")
     return f"""
 WITH BaseRows AS (
     SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
@@ -940,9 +939,9 @@ WITH BaseRows AS (
 ), Classified AS (
     SELECT *,
       CASE WHEN io_gcode='0012' AND LEN(io_tcode)=3 AND io_tcode NOT LIKE '%[^0-9]%'
-             AND {io_number} BETWEEN 500 AND 599 THEN 1 ELSE 0 END AS is_normal,
+             AND LEFT(io_tcode,1)='5' THEN 1 ELSE 0 END AS is_normal,
       CASE WHEN io_gcode='0012' AND LEN(io_tcode)=3 AND io_tcode NOT LIKE '%[^0-9]%'
-             AND {io_number} BETWEEN 600 AND 699 THEN 1 ELSE 0 END AS is_return
+             AND LEFT(io_tcode,1)='6' THEN 1 ELSE 0 END AS is_return
     FROM BaseRows
 ), NormalExact AS (
     SELECT outbound_date,vendor_code,outbound_seq,product_code,stock_code,outbound_quantity,
@@ -1027,6 +1026,54 @@ FROM Diagnostics D
 ORDER BY row_kind,product_code,outbound_date
 """.strip(), binds
 
+
+_PRODUCT_STATISTICS_STREAM_COLUMNS = (
+    "row_kind", "outbound_date", "vendor_code", "product_code", "stock_code",
+    "outbound_quantity", "paid_quantity", "mapping_count", "exact_duplicate_row_count",
+    "basis_month", "unit_price", "return_event_count", "return_quantity", "return_supply_amount",
+    "source_row_count", "normal_positive_row_count", "normal_nonpositive_row_count",
+    "return_positive_row_count", "return_nonpositive_row_count", "other_tcode_row_count",
+    "normal_positive_missing_key_row_count", "normal_positive_nonintegral_row_count",
+)
+
+
+def product_statistics_raw_event_stream_sql(
+    plan: FrequencySnapshotPlan,
+) -> tuple[str, dict[str, Any]]:
+    """Return one ordered, profile-scoped R120 stream for Python aggregation."""
+    binds: dict[str, Any] = {
+        "basis_from": plan.basis_from,
+        "basis_to": plan.basis_to,
+        "price_lookback_from": _month_start_months_before(plan.basis_from, 9),
+    }
+    stock_clause = ""
+    if plan.stock_codes:
+        names = []
+        for index, code in enumerate(plan.stock_codes):
+            key = f"statistics_stock_{index}"
+            binds[key] = code
+            names.append(f":{key}")
+        stock_clause = "AND O.Rd12_Stock_Cd_Gcode='0018' AND O.Rd12_Stock_Cd IN (" + ", ".join(names) + ")"
+    product_join, product_clause = _product_dimension_scope_sql(plan, binds, product_alias="P")
+    return f"""
+SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
+       LTRIM(RTRIM(O.Rd12_Ven_Cd)) AS vendor_code,
+       LTRIM(RTRIM(CONVERT(varchar(100), O.Rd12_Out_Seq))) AS outbound_seq,
+       LTRIM(RTRIM(O.Rd12_Physic_Cd)) AS product_code,
+       LTRIM(RTRIM(O.Rd12_Stock_Cd)) AS stock_code,
+       LTRIM(RTRIM(O.Rd12_Io_Gu_Gcode)) AS io_gcode,
+       LTRIM(RTRIM(O.Rd12_Io_Gu)) AS io_tcode,
+       CAST(COALESCE(O.Rd12_Quantity,0)+COALESCE(O.Rd12_Oquantity,0) AS decimal(38,6)) AS outbound_quantity,
+       CAST(COALESCE(O.Rd12_Quantity,0) AS decimal(38,6)) AS paid_quantity,
+       CAST(COALESCE(O.Rd12_Fin_Supply_Price,O.Rd12_Supply_Price,0) AS decimal(38,6)) AS supply_amount
+FROM dbo.Rddbc120 AS O
+{product_join}
+WHERE O.Rd12_Out_YyMmDd >= :price_lookback_from AND O.Rd12_Out_YyMmDd <= :basis_to
+  {stock_clause}
+  {product_clause}
+ORDER BY O.Rd12_Out_YyMmDd, O.Rd12_Ven_Cd, O.Rd12_Out_Seq
+""".strip(), binds
+
 def _fixture_decimal(value: Any, *, field: str) -> Decimal:
     if value is None or (isinstance(value, str) and not value.strip()):
         raise SnapshotContractError(f"SQL fixture {field} is required")
@@ -1096,6 +1143,7 @@ def _query_company_chunks(
     timeout_seconds: int,
     *,
     chunk_rows: int = 50000,
+    metrics: dict[str, Any] | None = None,
 ) -> Iterable[pd.DataFrame]:
     """Read one ERP statement incrementally without retaining its full event result."""
     previous_company_id = get_current_company_id()
@@ -1105,13 +1153,244 @@ def _query_company_chunks(
             raw = getattr(conn.connection, "driver_connection", conn.connection)
             if hasattr(raw, "timeout"):
                 raw.timeout = max(1, int(timeout_seconds))
-            chunks = pd.read_sql_query(text(sql), conn, params=dict(params), chunksize=max(1, int(chunk_rows)))
-            for chunk in chunks:
+            query_started = time.perf_counter()
+            chunks = pd.read_sql_query(
+                text(sql), conn, params=dict(params), chunksize=max(1, int(chunk_rows)), coerce_float=False
+            )
+            query_finished = time.perf_counter()
+            fetched_rows = 0
+            fetch_ms = 0.0
+            iterator = iter(chunks)
+            while True:
+                fetch_started = time.perf_counter()
+                try:
+                    chunk = next(iterator)
+                except StopIteration:
+                    fetch_ms += (time.perf_counter() - fetch_started) * 1000
+                    break
+                fetch_ms += (time.perf_counter() - fetch_started) * 1000
                 if not isinstance(chunk, pd.DataFrame):
                     raise SnapshotContractError("outbound event stream returned an invalid chunk")
+                fetched_rows += len(chunk)
                 yield chunk
+            if metrics is not None:
+                metrics.update({
+                    "db_query_ms": round((query_finished - query_started) * 1000, 3),
+                    "fetch_rows": fetched_rows,
+                    "fetch_ms": round(fetch_ms, 3),
+                })
     finally:
         set_current_company_id(previous_company_id)
+
+
+def _stream_text(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def _stream_decimal(value: Any, *, field: str, nullable: bool = False) -> Decimal | None:
+    if value is None or pd.isna(value):
+        if nullable:
+            return None
+        value = 0
+    try:
+        number = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise SnapshotContractError(f"raw outbound stream {field} must be numeric") from exc
+    if not number.is_finite():
+        raise SnapshotContractError(f"raw outbound stream {field} must be finite")
+    quantum = Decimal("0.000001")
+    try:
+        with localcontext() as context:
+            context.prec = 96
+            context.rounding = ROUND_HALF_UP
+            canonical = number.quantize(quantum)
+    except InvalidOperation as exc:
+        raise SnapshotContractError(f"raw outbound stream {field} exceeds decimal(38,6)") from exc
+    if canonical.is_zero():
+        canonical = Decimal(0).quantize(quantum)
+    if canonical and canonical.adjusted() >= 32:
+        raise SnapshotContractError(f"raw outbound stream {field} exceeds decimal(38,6)")
+    return canonical
+
+
+def _sales_unit_price(supply_amount: Decimal, paid_quantity: Decimal) -> Decimal:
+    """Match SQL Server decimal(38,6) division followed by decimal(38,10) cast."""
+    try:
+        with localcontext() as context:
+            context.prec = 96
+            context.rounding = ROUND_HALF_UP
+            intermediate = (supply_amount / paid_quantity).quantize(Decimal("0.000001"))
+            result = intermediate.quantize(Decimal("0.0000000001"))
+    except (InvalidOperation, ZeroDivisionError) as exc:
+        raise SnapshotContractError("sales price exceeds decimal(38,10)") from exc
+    if result.is_zero():
+        result = Decimal(0).quantize(Decimal("0.0000000001"))
+    if result and result.adjusted() >= 28:
+        raise SnapshotContractError("sales price exceeds decimal(38,10)")
+    return result
+
+
+def _python_product_statistics_projection_chunks(
+    chunks: Iterable[pd.DataFrame],
+    *,
+    basis_from: str,
+    output_chunk_rows: int = 50000,
+    metrics: dict[str, Any] | None = None,
+) -> Iterable[pd.DataFrame]:
+    """Convert one ordered raw R120 stream to the legacy 22-column projection."""
+    required = {
+        "outbound_date", "vendor_code", "outbound_seq", "product_code", "stock_code",
+        "io_gcode", "io_tcode", "outbound_quantity", "paid_quantity", "supply_amount",
+    }
+    started = time.perf_counter()
+    output_rows: list[dict[str, Any]] = []
+    sales_monthly: dict[tuple[str, str], list[Decimal]] = {}
+    return_products: dict[str, list[Any]] = {}
+    diagnostics = {
+        "source_row_count": 0,
+        "normal_positive_row_count": 0,
+        "normal_positive_missing_key_row_count": 0,
+        "normal_positive_nonintegral_row_count": 0,
+        "normal_nonpositive_row_count": 0,
+        "return_positive_row_count": 0,
+        "return_nonpositive_row_count": 0,
+        "other_tcode_row_count": 0,
+    }
+    current_slip: tuple[str, str, str] | None = None
+    normal_exact: dict[tuple[str, str, Decimal], list[Any]] = {}
+    return_exact: dict[tuple[str, str, Decimal, Decimal], int] = {}
+
+    def projection(**values: Any) -> dict[str, Any]:
+        return {column: values.get(column) for column in _PRODUCT_STATISTICS_STREAM_COLUMNS}
+
+    def flush_slip() -> None:
+        nonlocal normal_exact, return_exact
+        if current_slip is None:
+            return
+        outbound_date, vendor_code, _outbound_seq = current_slip
+        if normal_exact:
+            mapping_count = len(normal_exact)
+            product_code = max(key[0] for key in normal_exact)
+            stock_code = max(key[1] for key in normal_exact)
+            outbound_quantity = max(key[2] for key in normal_exact)
+            paid_quantity = max(value[0] for value in normal_exact.values())
+            supply_amount = max(value[1] for value in normal_exact.values())
+            exact_duplicates = sum(int(value[2]) - 1 for value in normal_exact.values())
+            if mapping_count == 1 and paid_quantity > 0 and supply_amount > 0:
+                price_key = (product_code, outbound_date[:6])
+                price = sales_monthly.setdefault(price_key, [Decimal(0), Decimal(0)])
+                price[0] += paid_quantity
+                price[1] += supply_amount
+            if outbound_date >= basis_from:
+                output_rows.append(projection(
+                    row_kind="event", outbound_date=outbound_date, vendor_code=vendor_code,
+                    product_code=product_code, stock_code=stock_code,
+                    outbound_quantity=outbound_quantity, paid_quantity=paid_quantity,
+                    mapping_count=mapping_count, exact_duplicate_row_count=exact_duplicates,
+                ))
+        if return_exact:
+            mapping_count = len(return_exact)
+            if mapping_count == 1:
+                key = next(iter(return_exact))
+                product_code, _stock_code, outbound_quantity, supply_amount = key
+                current = return_products.setdefault(product_code, [0, Decimal(0), Decimal(0)])
+                current[0] += 1
+                current[1] += -outbound_quantity
+                current[2] += -supply_amount
+        normal_exact = {}
+        return_exact = {}
+
+    for chunk in chunks:
+        if not isinstance(chunk, pd.DataFrame) or not required.issubset(chunk.columns):
+            raise SnapshotContractError("raw outbound event stream columns are invalid")
+        for record in chunk.to_dict("records"):
+            outbound_date = _stream_text(record.get("outbound_date"))
+            vendor_code = _stream_text(record.get("vendor_code"))
+            outbound_seq = _stream_text(record.get("outbound_seq"))
+            product_code = _stream_text(record.get("product_code"))
+            stock_code = _stream_text(record.get("stock_code"))
+            io_gcode = _stream_text(record.get("io_gcode"))
+            io_tcode = _stream_text(record.get("io_tcode"))
+            outbound_quantity = _stream_decimal(record.get("outbound_quantity"), field="outbound_quantity")
+            paid_quantity = _stream_decimal(record.get("paid_quantity"), field="paid_quantity")
+            supply_amount = _stream_decimal(record.get("supply_amount"), field="supply_amount")
+            slip = (outbound_date, vendor_code, outbound_seq)
+            if current_slip is None:
+                current_slip = slip
+            elif slip != current_slip:
+                flush_slip()
+                current_slip = slip
+                if len(output_rows) >= max(1, int(output_chunk_rows)):
+                    yield pd.DataFrame.from_records(output_rows, columns=_PRODUCT_STATISTICS_STREAM_COLUMNS)
+                    output_rows = []
+
+            ascii_digits = len(io_tcode) == 3 and io_tcode.isascii() and io_tcode.isdigit()
+            is_normal = io_gcode == "0012" and ascii_digits and io_tcode[0] == "5"
+            is_return = io_gcode == "0012" and ascii_digits and io_tcode[0] == "6"
+            if outbound_date >= basis_from:
+                diagnostics["source_row_count"] += 1
+                if is_normal and outbound_quantity > 0:
+                    diagnostics["normal_positive_row_count"] += 1
+                    missing_key = not all((outbound_date, vendor_code, outbound_seq, product_code, stock_code))
+                    if missing_key:
+                        diagnostics["normal_positive_missing_key_row_count"] += 1
+                    elif outbound_quantity != outbound_quantity.to_integral_value():
+                        diagnostics["normal_positive_nonintegral_row_count"] += 1
+                elif is_normal:
+                    diagnostics["normal_nonpositive_row_count"] += 1
+                elif is_return and outbound_quantity > 0:
+                    diagnostics["return_positive_row_count"] += 1
+                elif is_return:
+                    diagnostics["return_nonpositive_row_count"] += 1
+                else:
+                    diagnostics["other_tcode_row_count"] += 1
+
+            complete_key = all((outbound_date, vendor_code, outbound_seq, product_code, stock_code))
+            integral_quantity = outbound_quantity == outbound_quantity.to_integral_value()
+            if is_normal and outbound_quantity > 0 and complete_key and integral_quantity:
+                exact_key = (product_code, stock_code, outbound_quantity)
+                exact = normal_exact.get(exact_key)
+                if exact is None:
+                    normal_exact[exact_key] = [paid_quantity, supply_amount, 1]
+                else:
+                    exact[0] = max(exact[0], paid_quantity)
+                    exact[1] = max(exact[1], supply_amount)
+                    exact[2] += 1
+            if (
+                is_return and outbound_date >= basis_from and outbound_quantity < 0 and supply_amount < 0
+                and complete_key and integral_quantity
+            ):
+                exact_key = (product_code, stock_code, outbound_quantity, supply_amount)
+                return_exact[exact_key] = return_exact.get(exact_key, 0) + 1
+
+    flush_slip()
+    if output_rows:
+        yield pd.DataFrame.from_records(output_rows, columns=_PRODUCT_STATISTICS_STREAM_COLUMNS)
+
+    tail_rows = [projection(row_kind="diagnostics", **diagnostics)]
+    latest_prices: dict[str, tuple[str, Decimal, Decimal]] = {}
+    for (product_code, basis_month), (paid_quantity, supply_amount) in sales_monthly.items():
+        previous = latest_prices.get(product_code)
+        if previous is None or basis_month > previous[0]:
+            latest_prices[product_code] = (basis_month, paid_quantity, supply_amount)
+    for product_code, (basis_month, paid_quantity, supply_amount) in sorted(latest_prices.items()):
+        tail_rows.append(projection(
+            row_kind="sales_price", outbound_date="", vendor_code="", product_code=product_code,
+            stock_code="", basis_month=basis_month,
+            unit_price=_sales_unit_price(supply_amount, paid_quantity),
+        ))
+    for product_code, (event_count, quantity, supply_amount) in sorted(return_products.items()):
+        tail_rows.append(projection(
+            row_kind="return_stats", outbound_date="", vendor_code="", product_code=product_code,
+            stock_code="", return_event_count=event_count, return_quantity=quantity,
+            return_supply_amount=supply_amount,
+        ))
+    yield pd.DataFrame.from_records(tail_rows, columns=_PRODUCT_STATISTICS_STREAM_COLUMNS)
+    if metrics is not None:
+        total_ms = (time.perf_counter() - started) * 1000
+        metrics["python_aggregate_ms"] = round(max(0.0, total_ms - float(metrics.get("fetch_ms") or 0)), 3)
 
 
 def _event_grain_int(value: Any, *, field: str) -> int:
@@ -1392,22 +1671,52 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
         product_class_codes=plan.product_class_codes,
         price_lookback_from=_month_start_months_before(plan.basis_from, 9),
         include_first_outbound=False,
+        force_hash_join=plan.company_id == 8,
         snapshot_projection_only=True,
+        seek_char5_monthly_stock=plan.company_id in (12, 13) and plan.stock_mode == "real",
     )
     report("제품 및 최초 정상 입고 조회 중")
+    source1_started = time.perf_counter()
     lifecycle_df = query(plan.company_id, lifecycle_sql, lifecycle_binds, timeout_seconds)
+    source_metrics: dict[str, Any] = {
+        "source1_ms": round((time.perf_counter() - source1_started) * 1000, 3),
+    }
     if not isinstance(lifecycle_df, pd.DataFrame) or "product_code" not in lifecycle_df.columns:
         raise SnapshotContractError("product lifecycle query returned an invalid shape")
     report("출고 집계 중")
-    aggregate_sql, aggregate_binds = product_statistics_event_stream_sql(plan)
     if query_executor is None:
+        aggregate_sql, aggregate_binds = product_statistics_raw_event_stream_sql(plan)
+        source2_metrics: dict[str, Any] = {}
+        source2_started = time.perf_counter()
         monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
-            _query_company_chunks(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds)
+            _python_product_statistics_projection_chunks(
+                _query_company_chunks(
+                    plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds, metrics=source2_metrics
+                ),
+                basis_from=plan.basis_from,
+                metrics=source2_metrics,
+            )
+        )
+        source2_metrics["total_ms"] = round((time.perf_counter() - source2_started) * 1000, 3)
+        source_metrics["source2"] = dict(source2_metrics)
+        log.info(
+            "[dashboard.snapshot.source2_python] company_id=%s evaluation_month=%s db_query_ms=%s fetch_rows=%s fetch_ms=%s python_aggregate_ms=%s total_ms=%s source_calls=1 retry=0 timeout_s=%s",
+            plan.company_id,
+            plan.evaluation_month,
+            source2_metrics.get("db_query_ms"),
+            source2_metrics.get("fetch_rows"),
+            source2_metrics.get("fetch_ms"),
+            source2_metrics.get("python_aggregate_ms"),
+            source2_metrics.get("total_ms"),
+            timeout_seconds,
         )
     else:
+        aggregate_sql, aggregate_binds = product_statistics_event_stream_sql(plan)
+        source2_started = time.perf_counter()
         monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
             (query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds),)
         )
+        source_metrics["source2"] = {"total_ms": round((time.perf_counter() - source2_started) * 1000, 3)}
     product_codes, universe_diagnostics = _select_snapshot_product_universe(lifecycle_df, monthly_rows)
     if not product_codes:
         raise SnapshotContractError("dashboard profile product universe is empty")
@@ -1515,6 +1824,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
                 "draft": draft,
                 "read_status": operating_read.status,
                 "draft_inspection_status": draft_inspection.status,
+                "source_metrics": source_metrics,
             }
         raise SnapshotContractError("identical snapshot already exists but is not an approved operating generation")
     if (
@@ -1538,6 +1848,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
         "draft": draft,
         "read_status": operating_read.status,
         "draft_inspection_status": draft_inspection.status,
+        "source_metrics": source_metrics,
     }
 
 

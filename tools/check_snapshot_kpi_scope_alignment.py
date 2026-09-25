@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -200,6 +201,22 @@ def test_two_statement_sql_carries_scope_and_evidence() -> None:
         include_first_outbound=False,
     )
     _assert("FirstOutbound" not in v21_sql and "first_outbound_date" not in v21_sql, "v2.1 lifecycle query retained unused lifetime outbound scan")
+    company8_sql, company8_binds = product_lifecycle_sql(
+        stock_codes=plan.stock_codes,
+        cutoff_date="20260911",
+        basis_from=plan.basis_from,
+        basis_to=plan.basis_to,
+        stock_mode=plan.stock_mode,
+        product_group_codes=plan.product_group_codes,
+        product_di_codes=plan.product_di_codes,
+        product_class_codes=plan.product_class_codes,
+        include_first_outbound=False,
+        force_hash_join=True,
+    )
+    _assert("OPTION (HASH JOIN)" not in v21_sql, "default lifecycle join strategy changed")
+    _assert(company8_sql.endswith("OPTION (HASH JOIN)"), "company8 lifecycle join strategy missing")
+    _assert("ORDER BY P.product_code" in company8_sql, "company8 lifecycle result order changed")
+    _assert(company8_binds == {**lifecycle_binds}, "join strategy must not change binds")
     v3_sql, v3_binds = product_lifecycle_sql(
         stock_codes=plan.stock_codes,
         cutoff_date="20260911",
@@ -293,6 +310,74 @@ def test_v3_unused_lifecycle_columns_do_not_change_snapshot() -> None:
     _assert(snapshot(legacy) == snapshot(lean), "v3 lifecycle projection changed product universe or checksum")
 
 
+def test_verified_char5_monthly_stock_seek_preserves_projection() -> None:
+    options = dict(
+        stock_codes=("00001",), cutoff_date="20260920", basis_from="20260601",
+        basis_to="20260831", stock_mode="real", include_first_outbound=False,
+        snapshot_projection_only=True,
+    )
+    original_sql, original_binds = product_lifecycle_sql(**options)
+    seek_sql, seek_binds = product_lifecycle_sql(**options, seek_char5_monthly_stock=True)
+    _assert(seek_binds == original_binds, "company12 R210 seek changed lifecycle binds")
+    _assert("OUTER APPLY" in seek_sql and "MonthlyStock AS" not in seek_sql,
+            "company12 R210 seek did not move the aggregation below ProductUniverse")
+    _assert("GROUP BY LTRIM(RTRIM(M.Rd21_Physic_Cd))" in original_sql,
+            "default lifecycle stock aggregation changed")
+    projection = lambda sql: sql.split("\nSELECT P.product_code", 1)[1].split("\nFROM ProductUniverse AS P", 1)[0]
+    _assert(projection(seek_sql) == projection(original_sql), "company12 lifecycle projection changed")
+    _assert(seek_sql.endswith("ORDER BY P.product_code"), "company12 lifecycle sort changed")
+    _assert(seek_sql.count("dbo.Rddbc210") == 1, "company12 R210 source count changed")
+    for count in range(1, 5):
+        _assert(f"REPLICATE(CHAR(32), {count}) + P.product_code" in seek_sql,
+                "company12 char(5) leading-space variant missing")
+
+    values = (" ", "0", "A")
+    raw_codes = ["".join(chars) for chars in product(values, repeat=5)]
+    for raw_product in raw_codes:
+        key = raw_product.strip(" ")
+        if not key:
+            continue
+        for raw_stock in raw_codes:
+            old_match = raw_stock.strip(" ") == key
+            new_match = any(raw_stock.rstrip(" ") == (" " * count + key).rstrip(" ")
+                            for count in range(5))
+            _assert(old_match == new_match, "char(5) seek changes normalized stock product matching")
+
+    stock_rows = (("0001 ", 2), (" 0001", -1), ("00002", 0))
+
+    def snapshot(company_id: int, use_seek: bool):
+        rows = []
+        for code, basis_inbound in (("0001", 0), ("00002", 1), ("00003", 0)):
+            quantity = sum(
+                amount for raw_code, amount in stock_rows
+                if (any(raw_code.rstrip(" ") == (" " * count + code).rstrip(" ")
+                        for count in range(5)) if use_seek else raw_code.strip(" ") == code)
+            )
+            rows.append({
+                "product_code": code, "current_stock_present": int(quantity != 0),
+                "basis_inbound_present": basis_inbound,
+            })
+        product_codes, diagnostics = _select_snapshot_product_universe(pd.DataFrame(rows), ())
+        result = build_product_statistics_relational_snapshot_from_aggregates(
+            company_id=company_id, evaluation_month="202609", monthly_rows=(
+                {"month": "202608", "product_code": "0001", "stock_code": "00001",
+                 "occurrence_count": 1, "outbound_quantity": 2, "outbound_day_count": 1},
+            ),
+            product_codes=product_codes, product_day_counts={}, product_customer_counts={},
+            first_normal_inbound_months={"0001": "202606", "00002": "202608"},
+            outbound_paid_quantities={"0001": 2}, return_statistics={},
+            purchase_prices={"0001": {"unit_price": "10", "basis_month": "202608", "status": "ready"},
+                             "00002": {"unit_price": "20", "basis_month": "202608", "status": "ready"}},
+            sales_prices={"0001": {"unit_price": "15", "status": "ready"}},
+            stock_codes=("00001",),
+        )
+        return product_codes, diagnostics, result.checksum
+
+    for company_id in (12, 13):
+        _assert(snapshot(company_id, False) == snapshot(company_id, True),
+                f"company{company_id} R210 seek changed universe or checksum")
+
+
 def main() -> int:
     tests = (
         test_profile_contract_reaches_snapshot_plan,
@@ -301,6 +386,7 @@ def main() -> int:
         test_two_statement_sql_carries_scope_and_evidence,
         test_union_product_universe_and_leading_zero,
         test_v3_unused_lifecycle_columns_do_not_change_snapshot,
+        test_verified_char5_monthly_stock_seek_preserves_projection,
     )
     for test in tests:
         test()

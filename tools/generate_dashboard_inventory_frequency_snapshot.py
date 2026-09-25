@@ -155,6 +155,7 @@ def main() -> int:
                 "approval_status": draft.approval_status,
                 "read_status": result["read_status"],
                 "no_op": draft.no_op,
+                "source_metrics": result.get("source_metrics", {}),
             }
         )
     except Exception as exc:

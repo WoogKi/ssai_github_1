@@ -713,7 +713,9 @@ def product_lifecycle_sql(
     product_class_codes: Iterable[Any] = (),
     price_lookback_from: Any = None,
     include_first_outbound: bool = True,
+    force_hash_join: bool = False,
     snapshot_projection_only: bool = False,
+    seek_char5_monthly_stock: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Read profile-scoped lifecycle and product-universe evidence once."""
     cutoff = str(cutoff_date or "").strip()
@@ -731,6 +733,8 @@ def product_lifecycle_sql(
     mode = str(stock_mode or "real").strip()
     if mode not in {"real", "book"}:
         raise SnapshotContractError("lifecycle stock_mode must be real or book")
+    if seek_char5_monthly_stock and (mode != "real" or not snapshot_projection_only):
+        raise SnapshotContractError("char5 monthly stock seek requires real v3 projection")
     stocks = tuple(sorted({str(value or "").strip() for value in stock_codes if str(value or "").strip()}))
     cutoff_day = datetime.strptime(cutoff, "%Y%m%d")
     cutoff_month = cutoff[:6]
@@ -796,18 +800,40 @@ def product_lifecycle_sql(
         detail_out_qty += " + COALESCE(O.Rd12_Oquantity, 0)"
     monthly_stock_sql = monthly_stock.format(prefix=monthly_prefix) if monthly_stock else ""
     stock_sum_sql = f"SUM(({monthly_in_qty}) - ({monthly_out_qty}))"
-    monthly_stock_cte = f""", MonthlyStock AS (
-    SELECT LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) AS product_code,
-           {stock_sum_sql} AS stock_quantity
+    stock_source_sql = f"""
+    FROM {monthly_table} AS M
+    WHERE M.{monthly_prefix}_Stock_YyMm <= :stock_month_to
+      AND M.{monthly_prefix}_Io_Gu_Gcode = '0012'
+      {monthly_stock_sql}"""
+    if seek_char5_monthly_stock:
+        # Company 12's CHAR(5) key needs every leading-space form; equality ignores trailing padding.
+        padded_codes = ", ".join(
+            ["P.product_code"]
+            + [f"REPLICATE(CHAR(32), {count}) + P.product_code" for count in range(1, 5)]
+        )
+        monthly_stock_cte = ""
+        monthly_stock_join = f"""OUTER APPLY (
+    SELECT {stock_sum_sql} AS stock_quantity
+{stock_source_sql}
+      AND M.Rd21_Physic_Cd IN ({padded_codes})
+) AS S"""
+    else:
+        # Keep ProductUniverse as the result authority, but eliminate out-of-scope
+        # monthly rows before the stock aggregate for both R210 and R220.
+        monthly_stock_source_sql = f"""
     FROM {monthly_table} AS M
     INNER JOIN ProductUniverse AS PU
       ON LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) = PU.product_code
     WHERE M.{monthly_prefix}_Stock_YyMm <= :stock_month_to
       AND M.{monthly_prefix}_Io_Gu_Gcode = '0012'
-      {monthly_stock_sql}
+      {monthly_stock_sql}"""
+        monthly_stock_cte = f""", MonthlyStock AS (
+    SELECT LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd)) AS product_code,
+           {stock_sum_sql} AS stock_quantity
+{monthly_stock_source_sql}
     GROUP BY LTRIM(RTRIM(M.{monthly_prefix}_Physic_Cd))
 )"""
-    monthly_stock_join = "LEFT JOIN MonthlyStock AS S ON S.product_code=P.product_code"
+        monthly_stock_join = "LEFT JOIN MonthlyStock AS S ON S.product_code=P.product_code"
     first_outbound_cte = """
 , FirstOutbound AS (
     SELECT LTRIM(RTRIM(O.Rd12_Physic_Cd)) AS product_code,
@@ -831,6 +857,7 @@ def product_lifecycle_sql(
 )""" if include_first_outbound else ""
     first_outbound_select = "       O.first_outbound_date,\n" if include_first_outbound else ""
     first_outbound_join = "LEFT JOIN FirstOutbound AS O ON O.product_code=P.product_code" if include_first_outbound else ""
+    hash_join_hint = "\nOPTION (HASH JOIN)" if force_hash_join else ""
     registered_date_select = "" if snapshot_projection_only else """,
            CASE WHEN LEN(LTRIM(RTRIM(P.Rd04_Add_Date))) = 8
                      AND LTRIM(RTRIM(P.Rd04_Add_Date)) NOT LIKE '%[^0-9]%'
@@ -847,7 +874,7 @@ WITH ProductUniverse AS (
            CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Di_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Di))) AS product_di_key,
            CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Tax_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Tax))) AS product_class_key{registered_date_select}
     FROM dbo.Rddbc040 AS P
-    WHERE NULLIF(LTRIM(RTRIM(P.Rd04_Physic_Cd)), '') IS NOT NULL
+    WHERE P.Rd04_Physic_Cd <> ''
       {product_filter_sql}
 ), FirstInbound AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
@@ -917,7 +944,7 @@ LEFT JOIN BasisInbound AS BI ON BI.product_code=P.product_code
 LEFT JOIN CurrentInbound AS CI ON CI.product_code=P.product_code
 LEFT JOIN CurrentOutbound AS CO ON CO.product_code=P.product_code
 LEFT JOIN LatestPurchasePrice AS PP ON PP.product_code=P.product_code AND PP.price_rank=1
-ORDER BY P.product_code
+ORDER BY P.product_code{hash_join_hint}
 """.strip()
     return sql, binds
 
