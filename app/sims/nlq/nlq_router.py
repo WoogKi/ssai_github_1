@@ -6786,16 +6786,31 @@ def _try_handle_io_nlq(
             }
 
     if payload is None:
+        handler = None
         try:
-            from app.sims.views import rddbc_io_views
+            from app.sims.meta.erp_table_feature_registry import (
+                get_action_spec,
+                resolve_dotted_callable,
+            )
+
+            registered_action = get_action_spec(action)
+            if registered_action:
+                handler = resolve_dotted_callable(registered_action[1].view_function)
         except Exception:
-            logger.exception("[nlq.router] failed to import io views")
+            logger.exception("[nlq.router] failed to resolve registered io view fallback action=%r", action)
             return False
 
-        from app.sims.nlq.action_inventory import IO_VIEW_FALLBACK_TARGETS
+        if handler is None:
+            try:
+                from app.sims.views import rddbc_io_views
+            except Exception:
+                logger.exception("[nlq.router] failed to import io views")
+                return False
 
-        fallback_name = IO_VIEW_FALLBACK_TARGETS.get(action, "")
-        handler = getattr(rddbc_io_views, fallback_name, None) if fallback_name else None
+            from app.sims.nlq.action_inventory import IO_VIEW_FALLBACK_TARGETS
+
+            fallback_name = IO_VIEW_FALLBACK_TARGETS.get(action, "")
+            handler = getattr(rddbc_io_views, fallback_name, None) if fallback_name else None
         if not callable(handler):
             logger.warning("[nlq.router] io action mapped but no handler: %r", action)
             return False

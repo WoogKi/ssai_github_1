@@ -187,9 +187,23 @@ def classify_current_table_followup_intent(query: str) -> str:
     if "집계" in intent_compact:
         return "dataframe_table"
 
-    # Explicit table/filter operations above remain deterministic; analysis
-    # interprets the current source instead of promoting a replacement table.
+    # A requested existing dimension makes "...별 분석" a deterministic
+    # current-table aggregation. Narrative analysis remains on the LLM path.
     if "분석" in intent_compact:
+        requested_dimensions = _requested_current_table_dimensions(text)
+        requested_metrics = _current_table_requested_metrics(text)
+        unknown_dimension, unknown_metric = _current_table_unresolved_request_labels(
+            text,
+            metrics=requested_metrics,
+            groupings=[key for key, _label, _aliases in requested_dimensions],
+        )
+        if (
+            requested_dimensions
+            and not requested_metrics
+            and not unknown_dimension
+            and not unknown_metric
+        ):
+            return "dataframe_table"
         return "llm_analysis"
 
     # "의미가 뭐야/추세 설명"은 현재표의 숫자를 먼저 pandas로 확정한 뒤
@@ -784,10 +798,19 @@ def _current_table_unresolved_request_labels(
             body = body.split(marker, 1)[0]
             break
     body = body.replace("현재표", "").replace("현재결과", "")
+    dimension_body = body
 
-    for _key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
-        for term in (label, *phrases, *aliases):
-            body = body.replace(re.sub(r"\s+", "", term), "")
+    dimension_terms = sorted(
+        {
+            re.sub(r"\s+", "", term)
+            for _key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS
+            for term in (label, *phrases, *aliases)
+        },
+        key=len,
+        reverse=True,
+    )
+    for term in dimension_terms:
+        body = body.replace(term, "")
     for _key, label, aliases in _CURRENT_TABLE_METRIC_SPECS:
         for term in (label, *aliases):
             body = body.replace(re.sub(r"\s+", "", term), "")
@@ -795,7 +818,13 @@ def _current_table_unresolved_request_labels(
 
     unknown_dimension = ""
     unknown_metric = ""
-    if not groupings and "별" in compact:
+    if dimension_body.endswith("별"):
+        for term in dimension_terms:
+            dimension_body = dimension_body.replace(term, "")
+        dimension_body = re.sub(r"(?:별|기준|으로|로|과|와|및|그리고)+", "", dimension_body)
+        if len(dimension_body) >= 2:
+            unknown_dimension = dimension_body
+    if not unknown_dimension and not groupings and "별" in compact:
         before_grouping = compact.split("별", 1)[0]
         before_grouping = before_grouping.replace("현재표", "").replace("현재결과", "")
         for _key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:

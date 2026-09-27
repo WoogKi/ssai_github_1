@@ -142,6 +142,7 @@ def _check_statuses() -> None:
 def _check_handler_coverage() -> None:
     from app.sims.nlq import nlq_router
     from app.sims.views import rddbc_io_views
+    from app.sims.meta.erp_table_feature_registry import get_action_spec, resolve_dotted_callable
 
     for spec in CANONICAL_ACTIONS:
         if spec.implementation_status != IMPLEMENTED:
@@ -161,6 +162,15 @@ def _check_handler_coverage() -> None:
     if set(IO_VIEW_FALLBACK_TARGETS) != io_specs:
         _fail("IO fallback action set이 canonical IO action set과 다릅니다.")
     for action, target_name in IO_VIEW_FALLBACK_TARGETS.items():
+        registered_action = get_action_spec(action)
+        if registered_action:
+            try:
+                handler = resolve_dotted_callable(registered_action[1].view_function)
+            except Exception as exc:
+                _fail(f"등록 IO fallback export를 찾지 못했습니다: {action}: {type(exc).__name__}: {exc}")
+            if not callable(handler):
+                _fail(f"등록 IO fallback export가 callable이 아닙니다: {action}")
+            continue
         if not callable(getattr(rddbc_io_views, target_name, None)):
             _fail(f"IO fallback export를 찾지 못했습니다: {action} -> {target_name}")
 

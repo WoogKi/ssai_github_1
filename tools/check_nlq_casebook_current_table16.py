@@ -14,7 +14,11 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.ui.current_table_followups.action_dispatcher import handle_current_table_followup_by_action
+from app.ui.current_table_followups.action_dispatcher import (
+    build_current_table_interpretive_facts,
+    classify_current_table_followup_intent,
+    handle_current_table_followup_by_action,
+)
 
 
 LOG = logging.getLogger(__name__)
@@ -194,6 +198,35 @@ def _cases() -> tuple[Case, ...]:
 
 def main() -> int:
     failures: list[str] = []
+    intent_cases = (
+        ("현재표 제조사명별 분석", "dataframe_table"),
+        ("현재표 예상등급 분석", "dataframe_table"),
+        ("현재표 제조사명별 임의없는차원별 분석", "llm_analysis"),
+        ("현재표 임의없는차원별 분석", "llm_analysis"),
+    )
+    for query, expected_intent in intent_cases:
+        actual_intent = classify_current_table_followup_intent(query)
+        if actual_intent != expected_intent:
+            failures.append(
+                f"FAIL intent {query}: actual={actual_intent!r}, expected={expected_intent!r}"
+            )
+    unknown_dimension_facts = build_current_table_interpretive_facts(
+        df=_inventory_frame(),
+        query="현재표 제조사명별 임의없는차원별 분석",
+        source_action="제품재고장",
+        source_meta={"result_status": "success"},
+    )
+    unknown_dimension_missing = list(
+        (unknown_dimension_facts.get("capability") or {}).get("missing_columns") or []
+    )
+    if (
+        unknown_dimension_facts.get("status") != "column_unavailable"
+        or unknown_dimension_missing != ["임의없는차원"]
+    ):
+        failures.append(
+            "FAIL mixed unknown dimension must return column_unavailable "
+            f"facts={unknown_dimension_facts!r}"
+        )
     for case in _cases():
         try:
             _handled, kind, payload = _dispatch(case)
