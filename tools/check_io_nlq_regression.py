@@ -453,6 +453,36 @@ def _parser_cases() -> list[ParserCase]:
             forbidden_params=("physic_nm",),
         ),
         ParserCase(
+            query="이가탄 재고",
+            expected_action="현재고 조회",
+            expected_params={},
+        ),
+        ParserCase(
+            query="이가탄 현재고",
+            expected_action="현재고 조회",
+            expected_params={},
+        ),
+        ParserCase(
+            query="이가탄 제품재고장",
+            expected_action="제품재고현황 조회",
+            expected_params={"physic_nm": "이가탄"},
+        ),
+        ParserCase(
+            query="이가탄 재고장",
+            expected_action="제품재고현황 조회",
+            expected_params={"physic_nm": "이가탄"},
+        ),
+        ParserCase(
+            query="이가탄 제품재고현황",
+            expected_action="제품재고현황 조회",
+            expected_params={"physic_nm": "이가탄"},
+        ),
+        ParserCase(
+            query="이가탄 매출",
+            expected_action="출고명세 조회",
+            expected_params={},
+        ),
+        ParserCase(
             query="출고빈도 A 현재고",
             expected_action="현재고 조회",
             expected_params={"frequency_grade": "A"},
@@ -7149,6 +7179,8 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
                     {"Rd04_Physic_Cd": "00201", "Rd04_Physic_Nm": "아모크라정"},
                     {"Rd04_Physic_Cd": "00202", "Rd04_Physic_Nm": "아모크라듀오"},
                 ])
+            if "이가탄" in keyword:
+                return pd.DataFrame([{"Rd04_Physic_Cd": "00301", "Rd04_Physic_Nm": "이가탄"}])
             return pd.DataFrame()
         goods_service.search_goods_full = _goods_like_fixture
         shared._load_stock_code_options = lambda: [(".본사 창고 (00001)", "00001", ".본사 창고"), (".지점 창고 (00002)", "00002", ".지점 창고")]
@@ -7163,6 +7195,40 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
         product = io_nlq.resolve_current_stock_entity_condition("현재고 제품명 타이레놀", params={"physic_nm": "타이레놀"})
         product_params = dict(product.get("params") or {})
         results.append(_ok("current stock product LIKE", "타이레놀 scope") if product.get("status") == "resolved" and product_params.get("physic_nm") == "타이레놀" else _fail("current stock product LIKE", repr(product)))
+
+        bare_stock = io_nlq.resolve_io_nlq("이가탄 재고") or {}
+        bare_stock_resolved = io_nlq.resolve_current_stock_entity_condition(
+            "이가탄 재고 조회", params=dict(bare_stock.get("params") or {})
+        )
+        bare_stock_params = dict(bare_stock_resolved.get("params") or {})
+        bare_stock_ok = (
+            bare_stock.get("action") == "현재고 조회"
+            and bare_stock_resolved.get("status") == "resolved"
+            and bare_stock_params.get("physic_nm") == "이가탄"
+        )
+        results.append(
+            _ok("bare product plus stock routes current stock with product condition", "이가탄 -> 현재고 조회")
+            if bare_stock_ok
+            else _fail("bare product plus stock routes current stock with product condition", repr({"parsed": bare_stock, "resolved": bare_stock_resolved}))
+        )
+
+        outbound = io_nlq.resolve_io_nlq("이가탄 매출") or {}
+        outbound_resolved = io_nlq.resolve_unlabeled_io_entity_condition(
+            "이가탄 매출 조회",
+            action=str(outbound.get("action") or ""),
+            params=dict(outbound.get("params") or {}),
+        )
+        outbound_params = dict(outbound_resolved.get("params") or {})
+        outbound_ok = (
+            outbound.get("action") == "출고명세 조회"
+            and outbound_resolved.get("status") == "resolved"
+            and outbound_params.get("nlq_unlabeled_name") == "이가탄"
+        )
+        results.append(
+            _ok("bare product plus sales keeps the unlabeled product condition", "이가탄 -> 출고명세 조회")
+            if outbound_ok
+            else _fail("bare product plus sales keeps the unlabeled product condition", repr({"parsed": outbound, "resolved": outbound_resolved}))
+        )
 
         located_params_input = io_nlq.extract_params("현재고 재고위치 본사 창고 제품명 타이레놀")
         located = io_nlq.resolve_current_stock_entity_condition("현재고 재고위치 본사 창고 제품명 타이레놀", params=located_params_input)

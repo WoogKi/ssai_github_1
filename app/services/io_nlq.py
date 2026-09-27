@@ -49,11 +49,11 @@ _PRODUCT_FLOW_WORDS = (
 _PRODUCT_INVENTORY_WORDS = (
     "제품재고현황",
     "제품재고장",
-    "재고현황",
     "재고장",
 )
 
 _CURRENT_STOCK_WORDS = ("현재고",)
+_BARE_CURRENT_STOCK_WORDS = ("재고", "재고수량", "재고현황", "재고 현황")
 _PRODUCT_INFORMATION_WORDS = (
     "제품정보",
     "제품 정보",
@@ -498,6 +498,25 @@ def extract_nlq_natural_period(
             }.get(token, "today"),
         }
 
+    relative_week = re.search(r"(이번|지난)\s*주(?:간)?", raw)
+    if relative_week:
+        current_week_start = current_day - timedelta(days=current_day.weekday())
+        if relative_week.group(1) == "지난":
+            week_start = current_week_start - timedelta(days=7)
+            week_end = week_start + timedelta(days=6)
+            period_kind = "previous_calendar_week"
+        else:
+            week_start = current_week_start
+            # This week remains an elapsed-to-date query; the prior week is a
+            # completed Monday-through-Sunday calendar period.
+            week_end = current_day
+            period_kind = "current_week_to_date"
+        return {
+            "date_from": week_start.strftime("%Y%m%d"),
+            "date_to": week_end.strftime("%Y%m%d"),
+            _NLQ_PERIOD_KIND_KEY: period_kind,
+        }
+
     relative_month = re.search(r"(이번|지난)\s*(?:달|월)", raw)
     if relative_month:
         from app.services.datetime_tool import month_range
@@ -563,6 +582,7 @@ def strip_nlq_period_expressions(text: str) -> str:
     patterns = (
         r"(?:최근\s*)?(?:한\s*달|1\s*개월)",
         r"(?:오늘|어제|그저께|당일|하루|최근\s*1\s*일)",
+        r"(?:이번|지난)\s*주(?:간)?",
         r"(?:이번|지난)\s*(?:달|월)",
         r"(?<!\d)(?:19|20)\d{4}(?!\d)",
         r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
@@ -1922,6 +1942,8 @@ def _action_consumed_aliases(action: str) -> tuple[str, ...]:
         phrases.update(_PRODUCT_INVENTORY_WORDS)
     elif normalized_action == "현재고 조회":
         phrases.update(_CURRENT_STOCK_WORDS)
+        phrases.update(_BARE_CURRENT_STOCK_WORDS)
+        phrases.update(f"{phrase} 조회" for phrase in _BARE_CURRENT_STOCK_WORDS)
     elif normalized_action == "제품정보 조회":
         phrases.update(_PRODUCT_INFORMATION_WORDS)
     elif normalized_action in {"입고명세 조회", "출고명세 조회"}:
@@ -1929,6 +1951,9 @@ def _action_consumed_aliases(action: str) -> tuple[str, ...]:
         # without a space.  They are action syntax, never an unlabeled entity.
         roots = ("입고", "매입") if normalized_action.startswith("입고") else ("출고", "매출")
         for root in roots:
+            phrases.add(root)
+            phrases.add(f"{root}명세서")
+            phrases.add(f"{root} 명세서")
             for signal in (*_TRANSACTION_SIGNAL_WORDS, *_MASTER_QUERY_WORDS):
                 phrases.add(f"{root}{signal}")
                 phrases.add(f"{root} {signal}")
@@ -1974,23 +1999,71 @@ def _consume_io_action_text(text: str, action: str) -> str:
         return ""
 
     aliases = _action_consumed_aliases(action)
+    min_alias_length = 2 if clean_text(action) in {
+        "현재고 조회", "입고명세 조회", "출고명세 조회",
+    } else 3 if clean_text(action) == "제품재고현황 조회" else 4
     alias_tokens = {
         re.sub(r"\s+", "", phrase)
         for phrase in aliases
-        if len(re.sub(r"\s+", "", phrase)) >= 4
+        if len(re.sub(r"\s+", "", phrase)) >= min_alias_length
     }
     parts = source.split()
+    normalized_parts = [
+        re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", part)
+        for part in parts
+    ]
+    # Registered action aliases may contain spaces (for example, "매출 조회").
+    # Consume an exact consecutive token sequence before the existing
+    # single-token typo tolerance so the residual remains the user's entity.
+    alias_sequences = sorted(
+        {
+            tuple(
+                re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", token)
+                for token in phrase.split()
+            )
+            for phrase in aliases
+            if len(phrase.split()) > 1
+        },
+        key=len,
+        reverse=True,
+    )
     retained_parts: list[str] = []
-    for part in parts:
-        token = re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", part)
+    index = 0
+    while index < len(parts):
+        part = parts[index]
+        token = normalized_parts[index]
+        if any(
+            tuple(normalized_parts[index:index + len(sequence)]) == sequence
+            for sequence in alias_sequences
+            if index + len(sequence) <= len(normalized_parts)
+        ):
+            matched_length = next(
+                len(sequence)
+                for sequence in alias_sequences
+                if index + len(sequence) <= len(normalized_parts)
+                and tuple(normalized_parts[index:index + len(sequence)]) == sequence
+            )
+            index += matched_length
+            continue
         compact_token = re.sub(r"\s+", "", token)
         if compact_token and any(
             _single_edit_distance_at_most_one(compact_token, alias)
             for alias in alias_tokens
         ):
+            index += 1
             continue
         retained_parts.append(part)
+        index += 1
     return " ".join(retained_parts)
+
+
+def _has_bare_current_stock_intent(text: str) -> bool:
+    """Recognize a terminal generic stock request without stealing explanations."""
+    normalized = _norm(text)
+    return bool(re.search(
+        r"(?:^|\s)(?:재고(?:\s*현황|수량)?)(?:\s*(?:조회|검색|확인|보여줘|알려줘))?\s*$",
+        normalized,
+    ))
 
 
 _DOCUMENT_DIRECTION_RESIDUAL_TOKENS = frozenset({
@@ -3221,7 +3294,17 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             params["lifecycle_status"] = "unknown_lifecycle"
         return _result("제품정보 조회", params)
 
-    if _has_any(raw, _CURRENT_STOCK_WORDS):
+    # A terminal generic stock request asks for the current stock view unless a
+    # product-inventory ledger intent is explicit.  Do not treat "재고" merely
+    # appearing inside a policy/explanation question as an executable action.
+    compact_raw = re.sub(r"\s+", "", raw)
+    is_explicit_product_inventory = _has_any(raw, _PRODUCT_INVENTORY_WORDS) or _has_any(
+        compact_raw,
+        tuple(re.sub(r"\s+", "", phrase) for phrase in _PRODUCT_INVENTORY_WORDS),
+    )
+    if _has_any(raw, _CURRENT_STOCK_WORDS) or (
+        _has_bare_current_stock_intent(raw) and not is_explicit_product_inventory
+    ):
         params = _apply_date_params_for_product_inventory(params, raw)
         params.update(grade_filters)
         if frequency_grade:
@@ -3304,7 +3387,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
     if _has_any(raw, _PRODUCT_FLOW_WORDS):
         return _result("제품수불현황 조회", params)
 
-    if _has_any(raw, _PRODUCT_INVENTORY_WORDS):
+    if is_explicit_product_inventory:
         params = _apply_date_params_for_product_inventory(params, raw)
         params.update(grade_filters)
         if frequency_grade:

@@ -87,6 +87,14 @@ def _extract_name(text: str, labels: tuple[str, ...]) -> str:
     for action_word in _ACTION_WORDS:
         value = value.replace(action_word, " ")
     value = re.sub(r"\s+(?:조회|검색|확인|보여줘|알려줘)\s*$", "", value)
+    # Period syntax belongs to the shared period authority, not to a labelled
+    # business-name value.  Keep this generic for every registry label so the
+    # staff, vendor, product, and manufacturer parsers share the same boundary.
+    value = re.sub(
+        r"\s+(?:(?:19|20)\d{4}(?:\d{2})?|(?:19|20)\d{2}\s*년(?:\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?)?)\s*$",
+        "",
+        value,
+    )
     return re.sub(r"\s+", " ", value).strip()
 
 

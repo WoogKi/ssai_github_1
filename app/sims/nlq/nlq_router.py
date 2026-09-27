@@ -1299,6 +1299,8 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return {"route": "io", "action": "발주 계산"}
     if looks_like_pasted_formatted_content(normalized):
         return None
+    if _is_stock_shortage_explanation_request(normalized):
+        return None
     if _is_general_explanation_request(normalized):
         return None
 
@@ -6238,6 +6240,15 @@ def _try_handle_io_nlq(
             action=action,
             params=params,
             residual_phrase=registered_residual_entity,
+        )
+    elif registered_filter_contract and action in {"입고명세 조회", "출고명세 조회"}:
+        # Registry metadata owns labelled filters, but a remaining proper noun
+        # still needs the common detail resolver before the handler is called.
+        # Explicitly labelled and unfiltered requests remain unchanged there.
+        entity_resolution = resolve_unlabeled_io_entity_condition(
+            txt_for_io,
+            action=action,
+            params=params,
         )
     elif registered_filter_contract:
         # Registry-backed parsers own their filter metadata. Reinterpreting the
