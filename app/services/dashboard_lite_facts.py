@@ -401,9 +401,14 @@ def _build_demand_surge_history_by_product(
         return context
 
     grouped = work.groupby(["제품코드", "기준월"], as_index=False)["출고수량"].sum()
-    for product_code, part in grouped.groupby("제품코드", sort=False):
-        amounts = {str(row["기준월"]): float(row["출고수량"] or 0.0) for _, row in part.iterrows()}
-        context["by_product"][str(product_code)] = amounts
+    by_product: dict[str, dict[str, float]] = {}
+    for product_code, month, quantity in zip(
+        grouped["제품코드"].to_numpy(),
+        grouped["기준월"].to_numpy(),
+        grouped["출고수량"].to_numpy(),
+    ):
+        by_product.setdefault(str(product_code), {})[str(month)] = float(quantity or 0.0)
+    context["by_product"] = by_product
     return context
 
 
@@ -585,9 +590,9 @@ def _code_pair_items(values: Any, names: Any = None, default_gcode: str = "") ->
     return out
 
 
-def _first_text(row: pd.Series, columns: list[str], default: str = "") -> str:
+def _first_text(row: Mapping[str, Any] | pd.Series, columns: list[str], default: str = "") -> str:
     for col in columns:
-        if col in row.index:
+        if col in row:
             text = str(row.get(col) or "").strip()
             if text:
                 return text
@@ -2995,7 +3000,7 @@ def _build_inventory_facts(
         maker_cols = ["제약사명", "제조사명", "매입처명"]
         normalize_started = time.perf_counter()
         work_rows: list[dict[str, Any]] = []
-        for _, row in df.iterrows():
+        for row in df.to_dict("records"):
             product_code = str(row.get(code_col) or "").strip()
             stock = _num(row.get("현재재고수량"))
             remaining = _num(row.get("당월 잔여예상출고수량"))
@@ -3853,8 +3858,14 @@ def build_dashboard_lite_facts(
             existing_support_sales_df = expanded_sales_source_df
             visible_sales_df = expanded_sales_source_df
         range_slice_elapsed_ms = int((time.perf_counter() - t_ranges) * 1000)
+        # Staff scope is resolved from the authoritative inbound/vendor facts
+        # after the narrow bundle has already been loaded.  Its precomputed
+        # month totals therefore still represent the unscoped product set.
+        # Re-aggregate the filtered product-month frame for staff requests.
         source_monthly_frame = (
-            narrow_sales_bundle.sales_month_total_df
+            existing_support_sales_df
+            if staff_filter_active
+            else narrow_sales_bundle.sales_month_total_df
             if narrow_sales_bundle is not None
             else existing_support_sales_df
         )
@@ -3912,9 +3923,16 @@ def build_dashboard_lite_facts(
         from app.services.analytics_sales_trend_service import adapt_dashboard_narrow_bundle_for_manufacturer
 
         t_manufacturer = time.perf_counter()
+        manufacturer_source_df = (
+            existing_support_sales_df
+            if staff_filter_active
+            else adapt_dashboard_narrow_bundle_for_manufacturer(narrow_sales_bundle)
+            if narrow_sales_bundle is not None
+            else existing_support_sales_df
+        )
         manufacturer_summary_payload = get_manufacturer_sales_trend_summary_result(
             dict(existing_support_params),
-            raw_df=(adapt_dashboard_narrow_bundle_for_manufacturer(narrow_sales_bundle) if narrow_sales_bundle is not None else existing_support_sales_df),
+            raw_df=manufacturer_source_df,
         )
         manufacturer_summary_elapsed_ms = int((time.perf_counter() - t_manufacturer) * 1000)
     else:

@@ -122,6 +122,20 @@ def test_forecast_truth_table_and_momentum_projection() -> None:
     _assert(math.isclose(capped_up, 15.0) and math.isclose(projected_up, 115.0), "positive clamp changed")
     _assert(math.isclose(capped_down, -15.0) and math.isclose(projected_down, 85.0), "negative clamp changed")
 
+    projection_rows = pd.DataFrame([row.to_dict() for row, _expected in cases])
+    labels, rates, projections, grades = analytics._vectorized_forecast_projection(projection_rows)
+    row_results = [analytics._forecast_projection_from_row(row) for _, row in projection_rows.iterrows()]
+    _assert(labels.tolist() == [value[0] for value in row_results], "vector forecast base label changed")
+    _assert(
+        all(math.isclose(float(actual), float(expected)) for actual, expected in zip(rates, [value[1] for value in row_results])),
+        "vector forecast rate changed",
+    )
+    _assert(
+        all(math.isclose(float(actual), float(expected)) for actual, expected in zip(projections, [value[2] for value in row_results])),
+        "vector forecast projection changed",
+    )
+    _assert(grades.tolist() == [analytics._forecast_grade(row) for _, row in projection_rows.iterrows()], "vector forecast grade changed")
+
 
 def test_shortage_truth_table_and_values() -> None:
     cases = (
@@ -157,6 +171,89 @@ def test_shortage_truth_table_and_values() -> None:
             break
     _assert(option_values, "SHORTAGE_GRADE_OPTIONS must be statically discoverable")
     _assert("2개월내 부족주의" not in option_values, "new query UI must not expose the unreachable legacy label")
+
+
+def test_order_product_month_forecast_and_shortage_exact_equality() -> None:
+    rows: list[dict[str, object]] = []
+    for month_index, month in enumerate(("202603", "202604", "202605", "202606", "202607", "202608", "202609"), start=1):
+        for product, multiplier in (("00001", 1), ("00002", 2)):
+            for vendor, share in (("V1", 0.4), ("V2", 0.6)):
+                quantity = month_index * multiplier * share * 10
+                rows.append({
+                    "기준월": month,
+                    "제품코드": product,
+                    "매입처코드": vendor,
+                    "재고적용처코드": "50001",
+                    "출고수량": quantity,
+                    "출고할증수량": 0,
+                    "매출공급가액": quantity * 100,
+                    "매출세액": quantity * 10,
+                    "매출합계": quantity * 110,
+                    "매출반품금액": 0,
+                    "집계건수": 1,
+                    "매입처수": 1,
+                    "분석자료원": "월집계-실재고(Rddbc210)",
+                })
+    legacy = pd.DataFrame(rows)
+    numeric = [
+        "출고수량", "출고할증수량", "매출공급가액", "매출세액",
+        "매출합계", "매출반품금액", "집계건수",
+    ]
+    compact = legacy.groupby(["기준월", "제품코드"], as_index=False)[numeric].sum()
+    params = {
+        "evaluation_month": "202609",
+        "month_from": "202603",
+        "month_to": "202609",
+        "date_to": "20260930",
+        "source_mode": "monthly_real",
+        "stock_mode": "real",
+    }
+    legacy_forecast = analytics.get_sales_forecast_df(params, raw_df=legacy)
+    compact_forecast = analytics.get_sales_forecast_df(params, raw_df=compact)
+    forecast_columns = [
+        "제품코드", "총출고수량", "완료월총매출", "완료월평균매출",
+        "최근3개월평균매출", "직전3개월평균매출", "최근6개월평균매출",
+        "최근3개월증감률", "추세판정", "다음월예상매출",
+    ] + [column for column in legacy_forecast.columns if str(column).endswith(" 수량")]
+    pd.testing.assert_frame_equal(
+        legacy_forecast[forecast_columns].sort_values("제품코드").reset_index(drop=True),
+        compact_forecast[forecast_columns].sort_values("제품코드").reset_index(drop=True),
+        check_dtype=False,
+        check_exact=True,
+    )
+
+    original_stock_loader = analytics._load_product_current_stock
+    analytics._load_product_current_stock = lambda *_args, **_kwargs: pd.DataFrame({
+        "제품코드": ["00001", "00002"],
+        "실재고수량": [25.0, 0.0],
+        "실재고금액": [2500.0, 0.0],
+        "실재고평가단가": [100.0, 100.0],
+    })
+    try:
+        legacy_shortage = analytics.get_stock_shortage_df(params, sales_forecast_df=legacy_forecast)
+        compact_shortage = analytics.get_stock_shortage_df(params, sales_forecast_df=compact_forecast)
+    finally:
+        analytics._load_product_current_stock = original_stock_loader
+    shortage_columns = [
+        "제품코드", "평가월 예상수요수량", "예상기준월수량", "현재재고수량",
+        "재고커버월수", "부족등급", "부족예상수량", "당월 재고충족률", "재고부족판정",
+    ]
+    pd.testing.assert_frame_equal(
+        legacy_shortage[shortage_columns].sort_values("제품코드").reset_index(drop=True),
+        compact_shortage[shortage_columns].sort_values("제품코드").reset_index(drop=True),
+        check_dtype=False,
+        check_exact=True,
+    )
+    _assert(
+        compact_shortage["부족등급"].tolist()
+        == compact_shortage.apply(analytics._stock_shortage_grade, axis=1).tolist(),
+        "vectorized shortage grade diverged from row contract",
+    )
+    _assert(
+        compact_shortage["재고부족판정"].tolist()
+        == compact_shortage.apply(analytics._stock_shortage_current_judge, axis=1).tolist(),
+        "vectorized current shortage judge diverged from row contract",
+    )
 
 
 def test_shortage_current_time_axis_and_historical_policy() -> None:
@@ -491,11 +588,72 @@ def test_company_default_stock_scope_authority() -> None:
     _assert(full["selected_count"] == 3 and full["default_count"] == 3, "scope counts changed")
 
 
+def test_order_large_product_scope_uses_full_authority_then_exact_filter() -> None:
+    requested = [f"P{index:05d}" for index in range(analytics.SQL_SERVER_PARAMETER_LIMIT)]
+    source = pd.DataFrame({"제품코드": [requested[0], requested[-1], "OTHER"], "거래처수": [1, 2, 9]})
+    original_query = analytics.query_to_df
+    captured: list[dict[str, object]] = []
+
+    def fake_query(sql: str, params: dict[str, object]) -> pd.DataFrame:
+        captured.append({"sql": sql, "params": dict(params)})
+        return source.copy()
+
+    analytics.query_to_df = fake_query
+    try:
+        result = analytics.get_outbound_customer_counts_df(
+            {"date_from": "20260901", "date_to": "20260927", "order_product_code_list": requested}
+        )
+    finally:
+        analytics.query_to_df = original_query
+    _assert(len(captured) == 1, "large customer scope increased physical query count")
+    _assert(
+        not any(
+            str(key).startswith("order_product_code_") and str(key) != "order_product_code_list"
+            for key in captured[0]["params"]
+        ),
+        "large customer scope leaked expanded product binds",
+    )
+    _assert(set(result["제품코드"]) == {requested[0], requested[-1]}, "large customer exact filter changed")
+    _assert(result.attrs["order_product_scope_mode"] == "full_authority_post_filter", "large customer strategy changed")
+
+    from app.services import dashboard_narrow_sales_candidate_service as narrow
+
+    forecast_source = pd.DataFrame({"기준월": ["202608", "202608", "202608"], "제품코드": [requested[0], requested[-1], "OTHER"], "출고수량": [1, 2, 9]})
+    original_narrow_query = narrow.query_to_df
+    narrow_calls: list[tuple[str, dict[str, object]]] = []
+
+    def fake_narrow_query(sql: str, params: dict[str, object]) -> pd.DataFrame:
+        narrow_calls.append((sql, dict(params)))
+        return forecast_source.copy()
+
+    narrow.query_to_df = fake_narrow_query
+    try:
+        forecast = narrow.load_order_product_month_sales(
+            {
+                "month_from": "202608", "month_to": "202608", "evaluation_month": "202609",
+                "source_mode": "monthly_book", "order_product_code_list": requested,
+            }
+        )
+    finally:
+        narrow.query_to_df = original_narrow_query
+    _assert(len(narrow_calls) == 1, "large forecast scope increased physical query count")
+    _assert(
+        not any(
+            str(key).startswith("order_product_code_") and str(key) != "order_product_code_list"
+            for key in narrow_calls[0][1]
+        ),
+        "large forecast scope leaked expanded product binds",
+    )
+    _assert(set(forecast["제품코드"]) == {requested[0], requested[-1]}, "large forecast exact filter changed")
+    _assert(forecast.attrs["forecast_product_scope_mode"] == "full_authority_post_filter", "large forecast strategy changed")
+
+
 def main() -> int:
     tests = (
         test_trend_truth_table_and_nested_window_meaning,
         test_forecast_truth_table_and_momentum_projection,
         test_shortage_truth_table_and_values,
+        test_order_product_month_forecast_and_shortage_exact_equality,
         test_shortage_current_time_axis_and_historical_policy,
         test_dashboard_daily_check_period_metadata_contract,
         test_shortage_demand_consistency_and_user_projection,
@@ -503,6 +661,7 @@ def main() -> int:
         test_frequency_and_expected_inbound_grain_contracts,
         test_expected_inbound_sql_projection_contract,
         test_company_default_stock_scope_authority,
+        test_order_large_product_scope_uses_full_authority_then_exact_filter,
     )
     for test in tests:
         test()

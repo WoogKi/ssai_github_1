@@ -65,9 +65,23 @@ def _candidate_scope(sales: pd.DataFrame, purchase: pd.DataFrame, params: dict[s
 
 def main() -> int:
     params = _params()
-    assert can_use_dashboard_narrow_sales_candidate(params) == (True, "monthly_product_group_contract")
-    unsupported = dict(params, product_di_list=["0004:D1"])
-    assert can_use_dashboard_narrow_sales_candidate(unsupported) == (False, "product_dimension_filter_contract")
+    assert can_use_dashboard_narrow_sales_candidate(params) == (True, "monthly_product_dimension_contract")
+    canonical_dimensions = dict(
+        params,
+        product_di_list=[],
+        dashboard_product_di_list=["0004:1", "0004:2"],
+    )
+    assert can_use_dashboard_narrow_sales_candidate(canonical_dimensions) == (
+        True, "monthly_product_dimension_contract"
+    )
+    malformed = dict(params, dashboard_product_di_list=["D1"])
+    assert can_use_dashboard_narrow_sales_candidate(malformed) == (
+        False, "product_dimension_pair_contract"
+    )
+    excluded = dict(params, exclude_product_di_list=["0004:D1"])
+    assert can_use_dashboard_narrow_sales_candidate(excluded) == (
+        False, "product_dimension_filter_contract"
+    )
 
     sales = _sales_fixture()
     purchase = _purchase_fixture()
@@ -115,6 +129,16 @@ def main() -> int:
     assert "M.Rd22_Stock_YyMm" in sales_universe_sql
     assert "M.Rd22_Physic_Cd" in sales_universe_sql
     assert "S.Rd22_Physic_Cd" not in sales_universe_sql
+
+    dimension_queries, dimension_meta = _queries(canonical_dimensions)
+    assert dimension_meta["product_scope_applied"] is True
+    dimension_sql, dimension_bind = dimension_queries["product_month_sales"]
+    assert "P.Rd04_Physic_Di_Gcode" in dimension_sql
+    assert "P.Rd04_Physic_Di" in dimension_sql
+    assert dimension_bind["dashboard_product_di_list_g_0"] == "0004"
+    assert dimension_bind["dashboard_product_di_list_t_0"] == "1"
+    assert dimension_bind["dashboard_product_di_list_g_1"] == "0004"
+    assert dimension_bind["dashboard_product_di_list_t_1"] == "2"
     print("PASS: narrow product-group scope matches legacy sales universe and purchase intersection fixture")
     return 0
 

@@ -143,15 +143,31 @@ def _log_purchase_facts_observability(**fields: Any) -> None:
     )
 
 
-def _supports_exact_product_group_scope(params: Dict[str, Any]) -> bool:
-    values = _dimension_values(params, "dashboard_product_group_list", "product_group_list")
+def _supports_exact_dimension_scope(
+    params: Dict[str, Any],
+    *,
+    expected_gcode: str,
+    keys: tuple[str, ...],
+) -> bool:
+    values = _dimension_values(params, *keys)
     if not values:
-        return False
+        return True
     for value in values:
         gcode, separator, tcode = value.partition(":")
-        if separator != ":" or gcode.strip() != "0013" or not tcode.strip():
+        if separator != ":" or gcode.strip() != expected_gcode or not tcode.strip():
             return False
     return True
+
+
+def _canonicalize_dashboard_product_dimensions(params: Dict[str, Any]) -> None:
+    """Copy exact legacy code pairs to the Dashboard keys consumed by the scope CTE."""
+    for source_key, dashboard_key in (
+        ("product_group_list", "dashboard_product_group_list"),
+        ("product_di_list", "dashboard_product_di_list"),
+        ("product_class_list", "dashboard_product_class_list"),
+    ):
+        if not _dimension_values(params, dashboard_key) and _dimension_values(params, source_key):
+            params[dashboard_key] = _dimension_values(params, source_key)
 
 
 def _product_scope_cte(
@@ -173,8 +189,7 @@ def _product_scope_cte(
 
 def _sales_cte(params: Dict[str, Any]) -> tuple[str, Dict[str, Any], dict[str, Any]]:
     prepared = _apply_period_source_policy_params(_apply_month_or_date_params(coalesce_params(params)))
-    if not _dimension_values(prepared, "dashboard_product_group_list") and _dimension_values(prepared, "product_group_list"):
-        prepared["dashboard_product_group_list"] = _dimension_values(prepared, "product_group_list")
+    _canonicalize_dashboard_product_dimensions(prepared)
     policy = prepared.get("_period_source_policy") or {}
     if bool(policy.get("use_hybrid") or policy.get("use_hybrid_detail")):
         raise ValueError("Dashboard narrow sales candidate requires monthly-only policy")
@@ -233,15 +248,36 @@ def can_use_dashboard_narrow_sales_candidate(params: Dict[str, Any]) -> tuple[bo
         return False, "hybrid_detail_contract"
     if _resolve_source_mode(prepared) not in {"monthly_book", "monthly_real"}:
         return False, "non_monthly_source"
-    if _dimension_values(prepared, "product_di_list", "dashboard_product_di_list", "product_class_list", "dashboard_product_class_list", "exclude_product_group_list", "exclude_product_di_list", "exclude_product_class_list"):
+    _canonicalize_dashboard_product_dimensions(prepared)
+    if _dimension_values(
+        prepared,
+        "exclude_product_group_list", "exclude_product_group_nm_list",
+        "exclude_product_di_list", "exclude_product_di_nm_list",
+        "exclude_product_class_list", "exclude_product_class_nm_list",
+    ):
         return False, "product_dimension_filter_contract"
-    product_group_values = _dimension_values(prepared, "product_group_list", "dashboard_product_group_list")
-    if product_group_values:
-        if not _supports_exact_product_group_scope(prepared):
-            return False, "product_group_pair_contract"
-        if str(prepared.get("product_group") or "").strip() or str(prepared.get("product_group_nm") or "").strip() or _dimension_values(prepared, "product_group_nm_list", "exclude_product_group_nm_list"):
-            return False, "product_group_name_contract"
-        return True, "monthly_product_group_contract"
+    if any(
+        str(prepared.get(key) or "").strip()
+        for key in (
+            "product_group", "product_group_nm", "product_di", "product_di_nm",
+            "product_class", "product_class_nm",
+        )
+    ) or _dimension_values(
+        prepared, "product_group_nm_list", "product_di_nm_list", "product_class_nm_list"
+    ):
+        return False, "product_dimension_name_contract"
+    dimension_contracts = (
+        ("0013", ("dashboard_product_group_list", "product_group_list")),
+        ("0004", ("dashboard_product_di_list", "product_di_list")),
+        ("0031", ("dashboard_product_class_list", "product_class_list")),
+    )
+    if not all(
+        _supports_exact_dimension_scope(prepared, expected_gcode=gcode, keys=keys)
+        for gcode, keys in dimension_contracts
+    ):
+        return False, "product_dimension_pair_contract"
+    if any(_dimension_values(prepared, *keys) for _gcode, keys in dimension_contracts):
+        return True, "monthly_product_dimension_contract"
     return True, "monthly_only_contract"
 
 
@@ -435,9 +471,9 @@ def load_dashboard_narrow_sales_candidate(params: Dict[str, Any]) -> dict[str, A
             )
     assembly_started = time.perf_counter()
     manufacturer_started = time.perf_counter()
-    manufacturer = _manufacturer_month(frames["product_month_sales"].copy(), frames["product_identity"], frames["manufacturer_vendor_relation"])
+    manufacturer = _manufacturer_month(frames["product_month_sales"], frames["product_identity"], frames["manufacturer_vendor_relation"])
     manufacturer_reconstruction_ms = int((time.perf_counter() - manufacturer_started) * 1000)
-    bundle = build_dashboard_narrow_bundle_from_projections(frames["product_identity"], _sales_facts(frames["product_month_sales"].copy(), frames["product_identity"], manufacturer), frames["purchase_facts"])
+    bundle = build_dashboard_narrow_bundle_from_projections(frames["product_identity"], _sales_facts(frames["product_month_sales"], frames["product_identity"], manufacturer), frames["purchase_facts"])
     return {"bundle": bundle, "vendor_relation_df": frames["manufacturer_vendor_relation"], "perf": {"representation": "narrow_monthly_v1", "source_mode": meta["source_mode"], "physical_query_count": len(queries), "projection_results": details, "manufacturer_reconstruction_ms": manufacturer_reconstruction_ms, "bundle_assembly_ms": int((time.perf_counter() - assembly_started) * 1000), "elapsed_ms": int((time.perf_counter() - started) * 1000)}}
 
 

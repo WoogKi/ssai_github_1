@@ -7574,6 +7574,9 @@ def run_basic_checks() -> list[CheckResult]:
                 def info(self, *args: Any, **kwargs: Any) -> None:
                     return None
 
+                def debug(self, *args: Any, **kwargs: Any) -> None:
+                    return None
+
             class _SelectorStreamlit:
                 def __init__(self) -> None:
                     self.rerun_count = 0
@@ -10893,6 +10896,7 @@ def run_basic_checks() -> list[CheckResult]:
             setattr(view_mod, "build_dashboard_lite_facts", _fake_build)
             setattr(view_mod, "_dashboard_stock_options", _fake_stock_options)
             setattr(view_mod, "_dashboard_code_name_options", _fake_code_options)
+            setattr(view_mod, "load_dashboard_staff_options", lambda: {"order": [], "pharma": []})
             setattr(view_mod, "_dashboard_context_identity", lambda: {"user_id": "8", "company_id": "4", "db_sig": ""})
             setattr(view_mod, "get_current_chat_room_id", lambda: "dashboard-room")
             setattr(view_mod, "load_dashboard_profile", lambda **_kwargs: {"io_gu_list": ["0012:I_EX"]})
@@ -10913,7 +10917,7 @@ def run_basic_checks() -> list[CheckResult]:
                 render_errors.append(f"open_called_service={len(build_calls)}")
             if option_calls != {"stock": 1, "code": 6}:
                 render_errors.append(f"open_called_option_source={option_calls!r}")
-            if fake_st.column_specs[:1] != [[1, 1, 1, 1.1, 2.1, 2.1]]:
+            if fake_st.column_specs[:1] != [[1, 1, 1, 1.1, 2.1]]:
                 render_errors.append(f"single_scope_row_not_expected_columns={fake_st.column_specs!r}")
             if (opened.get("meta") or {}).get("status") != "condition_only":
                 render_errors.append(f"open_status={opened!r}")
@@ -12964,6 +12968,7 @@ def run_basic_checks() -> list[CheckResult]:
                 "log": type("Log", (), {
                     "warning": staticmethod(lambda *_args, **_kwargs: None),
                     "info": staticmethod(lambda *_args, **_kwargs: None),
+                    "debug": staticmethod(lambda *_args, **_kwargs: None),
                 })(),
             }
             exec(compile(ast.Module(body=[minimal_snapshot_node, partition_node], type_ignores=[]), "dashboard_partition", "exec"), partition_ns)
@@ -13012,7 +13017,7 @@ def run_basic_checks() -> list[CheckResult]:
                         },
                         "chart_rows": [{"period": "2026-01", "value": 1}],
                     },
-                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "inventory_status_summary": {"total_product_count": 10, "expected_demand_product_count": 8, "status_counts": {"긴급 부족": 2, "재고 경고": 1, "적정 재고": 4, "과다 재고": 1, "예상수요 없음": 2, "자료 부족": 0}, "frequency_counts": {"A": 1, "B": 1, "C": 1, "D": 1, "E": 1, "X": 5, "빈도자료 부족": 0}, "snapshot_status": "ready", "snapshot_generation_no": 2, "snapshot_checksum": "fixture"}, "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "visual_phase2_summary": {"inventory_count": 1, "cover_partition_valid": True, "briefing_lines": ["브리핑 1", "브리핑 2", "브리핑 3"], "additional_source_call_count": 0}, "purchase_trend_rows": [{"month": "202601", "amount": 10}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
+                    "inventory": {"metrics": {"sku": 1}, "risk_targets": [{"code": "P1"}], "stock_risk_summary": [{"재고위험상태": "긴급 부족", "품목수": 1, "부족예상금액": 1, "현재재고금액": 1}], "inventory_status_summary": {"total_product_count": 10, "expected_demand_product_count": 8, "status_counts": {"긴급 부족": 2, "재고 부족": 1, "적정 재고": 4, "과다 재고": 1, "예상수요 없음": 2, "자료 부족": 0}, "frequency_counts": {"A": 1, "B": 1, "C": 1, "D": 1, "E": 1, "X": 5, "빈도자료 부족": 0}, "snapshot_status": "ready", "snapshot_generation_no": 2, "snapshot_checksum": "fixture"}, "stock_overstock_summary": {"품목수": 1, "과잉후보수량": 2, "과잉후보금액": 3}, "stock_demand_surge_summary": {"품목수": 1, "위험보정부족예상수량": 2, "위험보정부족예상금액": 3}, "vendor_stock_risk_summary": {"assigned_rows": 1, "assigned_adjusted_shortage_amount": 2}, "vendor_stock_risk_top_rows": [{"주요매입처명": "검증매입처", "전체위험보정부족금액": 2}], "visual_phase2_summary": {"inventory_count": 1, "cover_partition_valid": True, "briefing_lines": ["브리핑 1", "브리핑 2", "브리핑 3"], "additional_source_call_count": 0}, "purchase_trend_rows": [{"month": "202601", "amount": 10}], "readiness_rows": [{"code": str(i), "amount": i} for i in range(10000)]},
                     "today_actions": [{"priority": 1}],
                     "transaction_cycle": {
                         "period_days": 90,
@@ -13814,7 +13819,7 @@ def run_basic_checks() -> list[CheckResult]:
         supplier_scope_errors: list[str] = []
         try:
             from app.services.product_supplier_scope_service import (
-                build_product_supplier_scope_sql, load_supplier_manager_options,
+                build_product_supplier_scope_sql, load_dashboard_staff_options, load_supplier_manager_options,
                 normalize_product_supplier_scope, supplier_scope_filter_active, supplier_scope_fingerprint,
             )
             manufacturer = normalize_product_supplier_scope({
@@ -13866,6 +13871,27 @@ def run_basic_checks() -> list[CheckResult]:
                 or "P.Rd04_Orven_Cd IN (?)" not in captured_manager_queries[1][0]
             ):
                 supplier_scope_errors.append("supplier_manager_sql_bind_or_string_contract")
+            captured_staff_queries: list[tuple[str, Any]] = []
+            try:
+                scope_service.query_to_df = lambda sql, query_params=(): (
+                    captured_staff_queries.append((sql, query_params))
+                    or pd.DataFrame([
+                        {"staff_role": "order", "user_code": "00031", "user_name": "발주담당"},
+                        {"staff_role": "pharma", "user_code": "00021", "user_name": "제약담당"},
+                    ])
+                )
+                staff_rows = load_dashboard_staff_options()
+            finally:
+                scope_service.query_to_df = original_manager_query
+            if (
+                len(captured_staff_queries) != 1
+                or captured_staff_queries[0][1] != ()
+                or "'order' AS staff_role" not in captured_staff_queries[0][0]
+                or "'pharma' AS staff_role" not in captured_staff_queries[0][0]
+                or staff_rows.get("order", [{}])[0].get("code") != "00031"
+                or staff_rows.get("pharma", [{}])[0].get("code") != "00021"
+            ):
+                supplier_scope_errors.append("dashboard_staff_options_single_query_contract")
             if supplier_scope_fingerprint({"product_supplier_scope_mode": "manufacturer", "manufacturer_codes": ["00002", "00001"]}) != supplier_scope_fingerprint({"product_supplier_scope_mode": "manufacturer", "manufacturer_codes": ["00001", "00002"]}):
                 supplier_scope_errors.append("supplier_scope_fingerprint_order_dependent")
             inbound_mod = importlib.import_module("app.services.dashboard_inbound_facts_service")
@@ -13879,14 +13905,16 @@ def run_basic_checks() -> list[CheckResult]:
             form_start = view_source.index('with st.form("dashboard_lite_scope_form"')
             scope_form_end = view_source.index("def _dashboard_scope_header")
             scope_form_source = view_source[form_start:scope_form_end]
-            scope_row_start = view_source.index("scope_cols = st.columns([1, 1, 1, 1.1, 2.1, 2.1], gap=\"small\")")
+            scope_row_start = view_source.index("scope_cols = st.columns([1, 1, 1, 1.1, 2.1], gap=\"small\")")
             scope_start = view_source.index('"공급 기준"', scope_row_start)
             if (
                 not (scope_row_start < scope_start < form_start)
                 or "result = _render_dashboard_scope_form_contents()" not in scope_form_source
                 or "return result" not in scope_form_source
                 or "options=[SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR]" not in view_source
-                or "담당자 목록을 불러오지 못했습니다." not in view_source
+                or '"발주담당자"' not in view_source
+                or '"제약담당자"' not in view_source
+                or "load_dashboard_staff_options()" not in view_source
                 or "enter_to_submit=False" not in view_source
                 or "on_change=_on_dashboard_supplier_scope_mode_change" in view_source[
                     view_source.index("def _render_dashboard_scope_form_contents"):
@@ -13894,11 +13922,11 @@ def run_basic_checks() -> list[CheckResult]:
                 ]
             ):
                 supplier_scope_errors.append("supplier_scope_atomic_form_contract")
-            header = view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "product_supplier_scope_mode": "manufacturer", "supplier_scope_label": "제약사A [00015]", "supplier_manager_label": "담당자A [00021]"})
-            if "제약사 담당자: 담당자A [00021]" not in header:
-                supplier_scope_errors.append("supplier_manager_header_contract")
+            header = view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "product_supplier_scope_mode": "manufacturer", "supplier_scope_label": "제약사A [00015]", "order_staff_label": "발주담당A [00031]", "pharma_staff_label": "제약담당A [00021]"})
+            if "발주담당자: 발주담당A [00031]" not in header or "제약담당자: 제약담당A [00021]" not in header:
+                supplier_scope_errors.append("dashboard_staff_header_contract")
             blank_header = view_mod._dashboard_scope_header({"month_from": "202601", "month_to": "202606", "evaluation_month": "202607", "product_supplier_scope_mode": "all"})
-            if "공급 기준: 제약사" not in blank_header or "제약사: 전체" not in blank_header or "제약사 담당자: 전체" not in blank_header or "공급 기준: 전체" in blank_header:
+            if "공급 기준: 제약사" not in blank_header or "제약사: 전체" not in blank_header or "발주담당자: 전체" not in blank_header or "제약담당자: 전체" not in blank_header or "공급 기준: 전체" in blank_header:
                 supplier_scope_errors.append("supplier_scope_header_legacy_all_contract")
             for log_source_path in (
                 Path("app/services/analytics_sales_trend_service.py"),
@@ -13912,7 +13940,7 @@ def run_basic_checks() -> list[CheckResult]:
         if supplier_scope_errors:
             results.append(_fail("Dashboard product supplier scope contract", "; ".join(supplier_scope_errors)))
         else:
-            results.append(_ok("Dashboard product supplier scope contract", "manufacturer/order-vendor scopes are exclusive, legacy all normalizes to blank manufacturer, and manager binds are positional"))
+            results.append(_ok("Dashboard product supplier scope contract", "manufacturer/order-vendor scopes remain exclusive while order/pharma staff filters are independent and load in one option query"))
 
         product_universe_errors: list[str] = []
         try:
@@ -16873,7 +16901,6 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
             ("SIMS 일일점검", "manufacturer", 0, 0),
             ("오늘의 경영점검 한미", "manufacturer", 1, 0),
             ("SIMS 운영점검 발주처 한미", "order_vendor", 1, 0),
-            ("SIMS 일일점검 담당자 신민우", "order_vendor", 0, 1),
             ("SIMS 일일점검 해줘", "manufacturer", 0, 0),
             ("오늘의 경영점검 해줘", "manufacturer", 0, 0),
             ("SIMS 운영점검 실행해줘", "manufacturer", 0, 0),
@@ -17020,13 +17047,13 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
         )
 
         explicit_manager_scope, explicit_manager_notice = router._build_dashboard_nlq_params(
-            "오늘의 경영점검 담당자 신민우 재고위치 00001",
+            "오늘의 경영점검 발주담당자 신민우 재고위치 00001",
             session_state={}, logger=log,
         )
         explicit_manager_scope_ok = (
             explicit_manager_notice is None
-            and explicit_manager_scope.get("product_supplier_scope_mode") == "order_vendor"
-            and explicit_manager_scope.get("purchase_manager_codes") == ["SHIN"]
+            and explicit_manager_scope.get("dashboard_order_staff_nm") == "신민우"
+            and not explicit_manager_scope.get("purchase_manager_codes")
             and explicit_manager_scope.get("stock_cd_list") == ["00001"]
         )
         results.append(
@@ -17162,15 +17189,37 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
             "SIMS 운영점검 담당자 신민우", session_state={}, logger=log
         )
         ambiguous_ok = (
-            ambiguous_notice is None
-            and ambiguous_params.get("product_supplier_scope_mode") == "order_vendor"
-            and ambiguous_params.get("purchase_manager_codes") == ["SHIN"]
-            and not ambiguous_params.get("manufacturer_manager_codes")
+            not ambiguous_params
+            and isinstance(ambiguous_notice, dict)
+            and (ambiguous_notice.get("meta") or {}).get("result_status") == "input_required"
+            and (ambiguous_notice.get("meta") or {}).get("source_call_count") == 0
         )
         results.append(
-            _ok("dashboard NLQ manager default supplier mode", repr(ambiguous_params))
-            if ambiguous_ok else _fail("dashboard NLQ manager default supplier mode", repr(ambiguous_params))
+            _ok("dashboard NLQ bare manager requires role", repr(ambiguous_notice))
+            if ambiguous_ok else _fail("dashboard NLQ bare manager requires role", repr(ambiguous_notice))
         )
+
+        for query, order_name, pharma_name in (
+            ("발주담당자 김 sims 일일점검", "김", ""),
+            ("제약담당자 김 sims 일일점검", "", "김"),
+            ("발주담당자 김 제약담당자 이 sims 일일점검", "김", "이"),
+        ):
+            role_params, role_notice = router._build_dashboard_nlq_params(
+                query, session_state={}, logger=log
+            )
+            role_ok = (
+                role_notice is None
+                and role_params.get("dashboard_order_staff_nm", "") == order_name
+                and role_params.get("dashboard_pharma_staff_nm", "") == pharma_name
+                and role_params.get("order_staff_label", "") == order_name
+                and role_params.get("pharma_staff_label", "") == pharma_name
+                and not role_params.get("manufacturer_manager_codes")
+                and not role_params.get("purchase_manager_codes")
+            )
+            results.append(
+                _ok(f"dashboard NLQ explicit staff roles: {query}", repr(role_params))
+                if role_ok else _fail(f"dashboard NLQ explicit staff roles: {query}", f"notice={role_notice!r}, params={role_params!r}")
+            )
 
         mode_only_cases = (
             ("SIMS 운영점검 발주처 담당자 신민우", "order_vendor", "purchase_manager_codes"),
@@ -17237,7 +17286,7 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
         pushed: list[dict[str, Any]] = []
         chat_middleware.get_current_chat_room_id = lambda: "room-fixture"
         chat_middleware.push_sims_result_to_chat = lambda payload, _action: pushed.append(dict(payload))
-        for query in ("SIMS 일일점검", "오늘의 경영점검 한미", "SIMS 운영점검", "SIMS 운영점검 담당자 신민우"):
+        for query in ("SIMS 일일점검", "오늘의 경영점검 한미", "SIMS 운영점검", "SIMS 운영점검 발주담당자 신민우"):
             pushed.clear()
             handled = router._try_handle_dashboard_nlq(
                 query, room={"id": "room-fixture"}, session_state={}, logger=log
@@ -17250,6 +17299,43 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
                 and success_meta.get("source_call_count") == 3
             )
             results.append(_ok(f"dashboard NLQ handler alias: {query}", "success, source_call_count=3") if success_ok else _fail(f"dashboard NLQ handler alias: {query}", f"handled={handled}, pushed={pushed!r}"))
+
+        pushed.clear()
+        facts_calls.clear()
+        bare_handled = router._try_handle_dashboard_nlq(
+            "담당자 김 sims 일일점검", room={"id": "room-fixture"}, session_state={}, logger=log
+        )
+        bare_meta = (pushed[0].get("meta") or {}) if pushed else {}
+        bare_ok = (
+            bare_handled is True and len(pushed) == 1 and not facts_calls
+            and bare_meta.get("result_status") == "input_required"
+            and bare_meta.get("source_call_count") == 0
+        )
+        results.append(_ok("dashboard NLQ bare staff skips facts", repr(bare_meta)) if bare_ok else _fail("dashboard NLQ bare staff skips facts", repr(pushed)))
+
+        for query, order_name, pharma_name in (
+            ("발주담당자 김 sims 일일점검", "김", ""),
+            ("제약담당자 김 sims 일일점검", "", "김"),
+            ("발주담당자 김 제약담당자 이 sims 일일점검", "김", "이"),
+        ):
+            pushed.clear()
+            facts_calls.clear()
+            handled = router._try_handle_dashboard_nlq(
+                query, room={"id": "room-fixture"}, session_state={}, logger=log
+            )
+            actual = facts_calls[0] if facts_calls else {}
+            meta = (pushed[0].get("meta") or {}) if pushed else {}
+            role_dispatch_ok = (
+                handled is True and len(pushed) == 1 and len(facts_calls) == 1
+                and meta.get("result_status") == "success"
+                and meta.get("source_call_count") == 3
+                and actual.get("dashboard_order_staff_nm", "") == order_name
+                and actual.get("dashboard_pharma_staff_nm", "") == pharma_name
+            )
+            results.append(
+                _ok(f"dashboard NLQ staff dispatcher: {query}", repr(actual))
+                if role_dispatch_ok else _fail(f"dashboard NLQ staff dispatcher: {query}", f"handled={handled}, facts={facts_calls!r}, pushed={pushed!r}")
+            )
 
         pushed.clear()
         facts_calls.clear()
@@ -18767,22 +18853,137 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
             policy_date="20260816",
             inbound_facts_df=pd.DataFrame(),
             frequency_snapshot=approved,
+            business_day_context=importlib.import_module("app.services.business_calendar_service").BusinessDayMonthContext(
+                evaluation_date="20260816", evaluation_month="202608", calendar_days_total=31,
+                elapsed_calendar_days=16, calendar_progress_ratio=16 / 31,
+                business_days_total=20, authority_status="ready",
+            ),
         )
         summary = inventory.get("inventory_status_summary") or {}
         counts = summary.get("status_counts") or {}
-        expected_counts = {"긴급 부족": 1, "재고 경고": 1, "적정 재고": 1, "과다 재고": 1, "예상수요 없음": 1, "자료 부족": 1}
+        expected_counts = {label: 0 for label in dash_mod.INVENTORY_STATUS_ORDER}
+        expected_counts.update({"긴급 부족": 1, "안전재고 확보": 2, "과다 재고": 1, "수요없는 재고": 1, "자료 부족": 1})
         errors: list[str] = []
         if counts != expected_counts:
             errors.append(f"unbounded_status_boundaries={counts!r}")
         if int(summary.get("expected_demand_product_count") or 0) != 4:
             errors.append(f"expected_demand_count={summary!r}")
         detail = {row.get("제품코드"): row for row in inventory.get("inventory_status_detail_rows") or []}
-        if detail.get("P4", {}).get("재고수요비율") != 150.0:
-            errors.append(f"overstock_ratio_capped={detail.get('P4')!r}")
-        if detail.get("P1", {}).get("재고수요비율") != -29.9:
-            errors.append(f"negative_stock_ratio_not_raw={detail.get('P1')!r}")
+        if detail.get("P4", {}).get("재고보유영업일") != 30.0:
+            errors.append(f"overstock_cover_days={detail.get('P4')!r}")
+        if detail.get("P1", {}).get("재고보유영업일") != -5.98:
+            errors.append(f"negative_stock_cover_days={detail.get('P1')!r}")
         if detail.get("P1", {}).get("출고빈도등급") != "A" or detail.get("P6", {}).get("출고빈도등급") != "X":
             errors.append(f"approved_frequency_join={detail!r}")
+        pending_df = stock_df.copy()
+        pending_df["입고예정수량"] = [100, -5, 0, 0, 0, 0]
+        pending_inventory = dash_mod._build_inventory_facts(
+            {"df": pending_df, "meta": {"expected_inbound_attached": True}},
+            evaluation_month="202608", policy_date="20260816", inbound_facts_df=pd.DataFrame(),
+            frequency_snapshot=approved,
+            business_day_context=importlib.import_module("app.services.business_calendar_service").BusinessDayMonthContext(
+                evaluation_date="20260816", evaluation_month="202608", calendar_days_total=31,
+                elapsed_calendar_days=16, calendar_progress_ratio=16 / 31,
+                business_days_total=20, authority_status="ready",
+            ),
+        )
+        pending_summary = pending_inventory["inventory_status_summary"]
+        pending_detail = {row["제품코드"]: row for row in pending_inventory["inventory_status_detail_rows"]}
+        if (
+            not pending_summary["pending_available"]
+            or pending_summary["pending_negative_product_count"] != 1
+            or pending_detail["P2"]["입고예정수량"] != 0
+            or pending_detail["P1"]["재고상태"] == pending_detail["P1"]["입고예정 포함 재고상태"]
+            or sum(pending_summary["pending_status_counts"].values()) != pending_summary["total_product_count"]
+        ):
+            errors.append(f"pending_stock_payload_projection={pending_summary!r}")
+        if importlib.import_module("app.sims.views.dashboard_lite")._build_inventory_status_summary_chart(
+            {"inventory": pending_inventory}, pending=True,
+        ) is None:
+            errors.append("pending_inventory_chart_missing")
+        historical_inventory = dash_mod._build_inventory_facts(
+            {"df": pending_df, "meta": {"expected_inbound_attached": True, "expected_inbound_historical_authority": "unavailable"}},
+            evaluation_month="202608", policy_date="20260816", inbound_facts_df=pd.DataFrame(),
+            frequency_snapshot=approved,
+        )
+        if historical_inventory["inventory_status_summary"]["pending_available"] or historical_inventory["inventory_status_summary"]["pending_status_counts"] is not None:
+            errors.append("historical_pending_authority_fabricated")
+        for business_days in (20, 21, 22):
+            overstock = business_days * 1.1
+            boundary_cases = [
+                ("below_one", 0.9999, "긴급 부족"),
+                ("one", 1, "재고 부족"),
+                ("below_three", 2.9999, "재고 부족"),
+                ("three", 3, "안전재고 확보"),
+                ("below_fifteen", 14.9999, "안전재고 확보"),
+                ("fifteen", 15, "적정 재고"),
+                ("below_overstock", overstock - 0.0001, "적정 재고"),
+                ("overstock", overstock, "과다 재고"),
+                ("above_overstock", overstock + 0.0001, "과다 재고"),
+            ]
+            boundary_rows = [
+                {"product_code": code, "current_stock_qty": cover, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": business_days, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": 0}
+                for code, cover, _ in boundary_cases
+            ]
+            boundary_rows.extend([
+                {"product_code": "new", "current_stock_qty": 50, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": business_days, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": 0},
+                {"product_code": "zero", "current_stock_qty": 0, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": 0, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": 0},
+                {"product_code": "no_demand_stock", "current_stock_qty": 1, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": 0, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": 0},
+                {"product_code": "negative", "current_stock_qty": -1, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": business_days, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": 0},
+                {"product_code": "pending_improves", "current_stock_qty": 2, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": business_days, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": 14},
+                {"product_code": "pending_overstock", "current_stock_qty": 15, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": business_days, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": 10},
+                {"product_code": "pending_negative", "current_stock_qty": 2, "inventory_current_stock_present": True,
+                 "evaluation_expected_demand_qty": business_days, "evaluation_expected_demand_present": True,
+                 "raw_pending_inbound_qty": -5},
+            ])
+            boundary_snapshot = snapshot_mod.SnapshotReadResult(status="ready")
+            boundary = dash_mod._attach_inventory_status_and_frequency(
+                boundary_rows, frequency_snapshot=boundary_snapshot,
+                frequency_rows=tuple({"product_code": code, "frequency_grade": "F" if code == "new" else "X"}
+                                     for code in [row["product_code"] for row in boundary_rows]),
+                monthly_business_days=business_days, pending_available=True,
+                pending_authority="recent_four_business_days",
+            )
+            by_code = {row["제품코드"]: row for row in boundary["detail_rows"]}
+            for code, _, expected in boundary_cases:
+                if by_code[code]["재고상태"] != expected:
+                    errors.append(f"business_day_boundary={business_days}:{code}:{by_code[code]['재고상태']}")
+            if by_code["new"]["재고상태"] != "신제품 재고" or by_code["zero"]["재고상태"] != "예상수요 없음":
+                errors.append(f"business_day_lifecycle={business_days}")
+            if by_code["no_demand_stock"]["재고상태"] != "수요없는 재고" or by_code["negative"]["재고상태"] != "긴급 부족":
+                errors.append(f"business_day_zero_negative={business_days}")
+            if by_code["pending_improves"]["입고예정 포함 재고상태"] != "적정 재고":
+                errors.append(f"pending_improvement={business_days}")
+            if by_code["pending_overstock"]["입고예정 포함 재고상태"] != "과다 재고":
+                errors.append(f"pending_overstock={business_days}")
+            if by_code["pending_negative"]["입고예정수량"] != 0:
+                errors.append(f"pending_negative_clamp={business_days}")
+            boundary_summary = boundary["summary"]
+            if sum(boundary_summary["status_counts"].values()) != len(boundary_rows) or sum(boundary_summary["pending_status_counts"].values()) != len(boundary_rows):
+                errors.append(f"pending_universe_mismatch={business_days}")
+            if boundary_summary["pending_negative_product_count"] != 1:
+                errors.append(f"pending_negative_count={business_days}")
+            missing_calendar = dash_mod._attach_inventory_status_and_frequency(
+                [{"product_code": "missing", "current_stock_qty": 1, "inventory_current_stock_present": True,
+                  "evaluation_expected_demand_qty": business_days, "evaluation_expected_demand_present": True}],
+                frequency_snapshot=boundary_snapshot, monthly_business_days=None,
+            )
+            if missing_calendar["detail_rows"][0]["재고상태"] != "자료 부족" or missing_calendar["summary"]["pending_status_counts"] is not None:
+                errors.append("missing_calendar_or_pending_authority_not_closed")
         missing = dash_mod._build_inventory_facts(
             {"df": stock_df, "meta": {}},
             evaluation_month="202608",
@@ -19263,7 +19464,7 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
                 errors.append(f"inventory_detail_empty_contract={detail_st.info_messages!r}|frames={len(detail_st.dataframes)}|buttons={detail_st.button_calls}|downloads={detail_st.download_calls}")
             if len(set(detail_st.form_keys)) != 1 or not detail_st.form_keys[0].endswith("detail-fixture"):
                 errors.append(f"inventory_detail_form_namespace_contract={detail_st.form_keys!r}")
-            if (10, 9, 2.5) not in detail_st.column_specs:
+            if (1.2, 1, 1, 1, 1.2) not in detail_st.column_specs or (1.8, 1.5, 2, 1.2) not in detail_st.column_specs:
                 errors.append(f"inventory_detail_submit_inline_layout={detail_st.column_specs!r}")
         finally:
             view_mod.st = old_detail_st
@@ -19274,7 +19475,10 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
         view_source = (PROJECT_ROOT / "app" / "sims" / "views" / "dashboard_lite.py").read_text(encoding="utf-8")
         required_view_tokens = (
             "## 재고 현황",
-            "재고 핵심상태",
+            "재고핵심상태",
+            "현재재고 상태",
+            "입고예정 포함 상태",
+            "기타 재고 상태",
             "출고빈도 분포",
             "수요급증 세부",
             "매입처별 부족예상 TOP 10",
@@ -19283,7 +19487,6 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
             "dashboard_inventory_detail_form::{namespace}",
             "__dashboard_lite_inventory_detail_applied::{namespace}",
             "재고 상세 조회",
-            "ERP 실시간 재계산은 수행하지 않습니다.",
         )
         if any(token not in view_source for token in required_view_tokens):
             errors.append("inventory_status_view_contract_missing")
@@ -19296,13 +19499,19 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
             if removed_call in render_source:
                 errors.append(f"removed_dashboard_panel_remains={removed_call}")
         summary_calls = {
-            "status": render_source.count("_build_inventory_status_summary_chart(facts)"),
-            "frequency": render_source.count("_build_outbound_frequency_distribution_chart(facts)"),
+            "status_current": render_source.count("_inventory_status_core_donut(facts)"),
+            "status_pending": render_source.count("_inventory_status_core_donut(facts, pending=True)"),
+            "status_legend": render_source.count("_inventory_status_core_legend_html()"),
+            "minor": render_source.count("_inventory_status_minor_html(facts)"),
+            "change": render_source.count("_inventory_status_change_html(facts)"),
+            "grades": render_source.count("frequency_column, matrix_column = st.columns((1, 2)"),
             "surge": render_source.count("_render_demand_surge_summary_card(facts,"),
             "vendor": render_source.count("_render_vendor_stock_risk_summary_card(facts,"),
         }
-        if summary_calls != {"status": 1, "frequency": 1, "surge": 1, "vendor": 1}:
+        if summary_calls != {"status_current": 1, "status_pending": 1, "status_legend": 1, "minor": 1, "change": 1, "grades": 1, "surge": 1, "vendor": 1}:
             errors.append(f"inventory_summary_card_calls={summary_calls!r}")
+        if "_build_inventory_status_summary_chart(facts" in render_source:
+            errors.append("inventory_status_donut_call_remains")
         removed_summary_calls = (
             "_render_inventory_cover_days(facts)",
             "_render_vendor_stock_risk(facts)",
@@ -19313,6 +19522,7 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
         required_summary_keys = (
             "dashboard_inventory_card__status__",
             "dashboard_inventory_card__frequency__",
+            "dashboard_inventory_card__grade_matrix__",
             "dashboard_inventory_card__surge__",
             "dashboard_inventory_card__vendor__",
         )
@@ -19337,7 +19547,7 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
         if errors:
             results.append(_fail("Dashboard inventory status and approved frequency snapshot", "; ".join(errors)))
         else:
-            results.append(_ok("Dashboard inventory status and approved frequency snapshot", "30/50/150 status is uncapped; unapproved snapshots fail closed; scope key is company/evaluation/stock exact"))
+            results.append(_ok("Dashboard inventory status and approved frequency snapshot", "business-day boundaries and pending status share one product universe; unapproved snapshots fail closed"))
     except Exception as exc:
         results.append(_fail("Dashboard inventory status and approved frequency snapshot", f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}"))
     return results

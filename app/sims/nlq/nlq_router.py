@@ -5528,6 +5528,7 @@ def _build_dashboard_nlq_params(
     for label, key in (("발주담당자", "dashboard_order_staff_nm"), ("제약담당자", "dashboard_pharma_staff_nm")):
         if conditions.get(label):
             params[key] = conditions[label]
+            params["order_staff_label" if label == "발주담당자" else "pharma_staff_label"] = conditions[label]
     mode, supplier_text = SCOPE_ALL, ""
     supplier_mode_explicit = False
     if "발주처" in conditions:

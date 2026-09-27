@@ -2160,9 +2160,9 @@ def get_dashboard_sales_source_bundle(params: Optional[Dict[str, Any]] = None) -
         source_mode,
         params.get("evaluation_month") or "",
         bool(source_policy.get("use_hybrid") or source_policy.get("use_hybrid_detail")),
-        len(_clean_list_param(params.get("product_group_list"))),
-        len(_clean_list_param(params.get("product_di_list"))),
-        len(_clean_list_param(params.get("product_class_list"))),
+        len(_clean_list_param(params.get("dashboard_product_group_list") or params.get("product_group_list"))),
+        len(_clean_list_param(params.get("dashboard_product_di_list") or params.get("product_di_list"))),
+        len(_clean_list_param(params.get("dashboard_product_class_list") or params.get("product_class_list"))),
         len(_clean_list_param(params.get("exclude_product_group_list"))),
         len(_clean_list_param(params.get("exclude_product_di_list"))),
         len(_clean_list_param(params.get("exclude_product_class_list"))),
@@ -5932,23 +5932,38 @@ def _build_qty_workforward_metrics_from_wide(
         "매출발생월수": monthly["평가월 이전 완료월수"],
         "추세판정": "",
     })
-    projection = projection_src.apply(lambda r: _forecast_projection_from_row(r), axis=1, result_type="expand")
-    if not projection.empty:
-        projection.columns = ["수요예상기준", "수요적용증감률", "평가월 예상수요수량"]
-        monthly["수요예상기준"] = projection["수요예상기준"].replace({
+    projection_label, projection_rate, projection_qty, _projection_grade = _vectorized_forecast_projection(
+        projection_src
+    )
+    if not projection_src.empty:
+        monthly["수요예상기준"] = projection_label.replace({
             "최근3개월평균매출": "최근3개월평균수요수량",
             "최근6개월평균매출": "최근6개월평균수요수량",
             "완료월평균매출": "완료월평균수요수량",
             "월평균매출": "완료월평균수요수량",
             "자료부족": "비교자료부족",
         })
-        monthly["수요적용증감률"] = projection["수요적용증감률"]
-        monthly["평가월 예상수요수량"] = projection["평가월 예상수요수량"]
+        monthly["수요적용증감률"] = projection_rate
+        monthly["평가월 예상수요수량"] = projection_qty
     else:
         monthly["수요예상기준"] = "비교자료부족"
         monthly["수요적용증감률"] = 0
         monthly["평가월 예상수요수량"] = 0
-    monthly["예상기준월수량"] = projection_src.apply(lambda r: _forecast_base_and_label(r)[0], axis=1)
+    monthly["예상기준월수량"] = np.select(
+        [
+            projection_src["최근3개월평균매출"].gt(0),
+            projection_src["최근6개월평균매출"].gt(0),
+            projection_src["완료월평균매출"].gt(0),
+            projection_src["월평균매출"].gt(0),
+        ],
+        [
+            projection_src["최근3개월평균매출"],
+            projection_src["최근6개월평균매출"],
+            projection_src["완료월평균매출"],
+            projection_src["월평균매출"],
+        ],
+        default=0.0,
+    )
     monthly.loc[monthly["평가월 이전 완료월수"] <= 0, "평가월 예상수요수량"] = 0
     monthly.loc[monthly["평가월 이전 완료월수"] <= 0, "예상기준월수량"] = 0
     monthly["평가월 실제수요수량"] = monthly["수요수량"]
@@ -6212,27 +6227,51 @@ def get_stock_shortage_df(
     out["2개월부족수량"] = (out["2개월필요수량"] - out["현재재고수량"]).clip(lower=0)
     out["3개월부족수량"] = (out["3개월필요수량"] - out["현재재고수량"]).clip(lower=0)
 
-    def _calc_stock_cover_months(row: pd.Series) -> float:
-        stock_qty = _safe_float(row.get("현재재고수량"))
-        avg_qty = _safe_float(row.get("예상기준월수량"))
+    avg_qty = pd.to_numeric(out["예상기준월수량"], errors="coerce").fillna(0.0)
+    stock_qty = pd.to_numeric(out["현재재고수량"], errors="coerce").fillna(0.0)
+    positive_demand_stock = avg_qty.gt(0) & stock_qty.gt(0)
+    out["재고커버월수"] = np.select(
+        [avg_qty.le(0) & stock_qty.gt(0), positive_demand_stock],
+        [999.0, stock_qty.div(avg_qty.where(avg_qty.ne(0), np.nan)).fillna(0.0)],
+        default=0.0,
+    )
 
-        # 수요가 없고 재고가 있으면 부족 위험이 낮으므로 큰 값
-        if avg_qty <= 0 and stock_qty > 0:
-            return 999
-
-        # 수요도 없고 재고도 없거나, 재고가 마이너스면 커버월수는 0으로 본다
-        if avg_qty <= 0:
-            return 0
-
-        if stock_qty <= 0:
-            return 0
-
-        return stock_qty / avg_qty
-
-
-    out["재고커버월수"] = out.apply(_calc_stock_cover_months, axis=1)
-
-    out["부족등급"] = out.apply(_stock_shortage_grade, axis=1)
+    demand_exists = pd.concat(
+        [
+            pd.to_numeric(out.get(column, 0), errors="coerce").fillna(0.0).gt(0)
+            for column in (
+                "예상기준월수량",
+                "평가월 예상수요수량",
+                "평가월 실제수요수량",
+                "평가월 잔여예상수요수량",
+            )
+        ],
+        axis=1,
+    ).any(axis=1)
+    cover = pd.to_numeric(out["재고커버월수"], errors="coerce").fillna(0.0)
+    out["부족등급"] = np.select(
+        [
+            avg_qty.le(0) & stock_qty.le(0) & demand_exists,
+            avg_qty.le(0) & stock_qty.le(0) & ~demand_exists,
+            avg_qty.le(0) & stock_qty.gt(0),
+            avg_qty.gt(0) & stock_qty.le(0),
+            cover.lt(1),
+            cover.lt(2),
+            cover.lt(3),
+            cover.le(3),
+        ],
+        [
+            "재고없음",
+            "재고없음/수요없음",
+            "수요관찰",
+            "재고없음",
+            "1개월내 부족",
+            "2개월내 부족",
+            "3개월내 부족",
+            "3개월내 부족주의",
+        ],
+        default="정상",
+    )
 
     remaining_out_qty = pd.to_numeric(out["당월 잔여예상출고수량"], errors="coerce").fillna(0)
     current_stock_qty = pd.to_numeric(out["현재재고수량"], errors="coerce").fillna(0)
@@ -6295,11 +6334,24 @@ def get_stock_shortage_df(
             out.attrs.get("expected_inbound_attached_product_count"),
             out.attrs.get("expected_inbound_elapsed_s"),
         )
-    out["당월 재고충족률"] = [
-        (max(float(stock), 0.0) / float(remain) * 100) if float(remain or 0) > 0 else 100.0
-        for stock, remain in zip(current_stock_qty.tolist(), remaining_out_qty.tolist())
-    ]
-    out["재고부족판정"] = out.apply(_stock_shortage_current_judge, axis=1)
+    out["당월 재고충족률"] = (
+        current_stock_qty.clip(lower=0)
+        .div(remaining_out_qty.where(remaining_out_qty.gt(0), np.nan))
+        .mul(100)
+        .fillna(100.0)
+    )
+    fill_rate = pd.to_numeric(out["당월 재고충족률"], errors="coerce").fillna(0.0)
+    shortage_qty = pd.to_numeric(out["부족예상수량"], errors="coerce").fillna(0.0)
+    out["재고부족판정"] = np.select(
+        [
+            shortage_qty.gt(0),
+            remaining_out_qty.le(0) & demand_exists,
+            remaining_out_qty.le(0) & ~demand_exists,
+            fill_rate.lt(120),
+        ],
+        ["부족", "적정", "수요없음", "주의"],
+        default="적정",
+    )
     _record_stock_phase("stock_shortage_calculation", shortage_calc_started, input_df=base, result_df=out)
 
     shortage_grade_filter = clean_text(

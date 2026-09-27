@@ -27,6 +27,9 @@ from app.services.dashboard_lite_facts import (
     _build_demand_surge_history_by_product,
     _build_visual_phase2_summary,
     _dashboard_internal_source_params,
+    _filter_frame_to_product_codes,
+    _monthly_sales_actuals_from_source,
+    _monthly_sales_returns_from_source,
     normalize_dashboard_lite_params,
 )
 import app.services.dashboard_narrow_sales_candidate_service as narrow_candidate_service
@@ -116,10 +119,13 @@ def main() -> int:
     assert can_use_dashboard_narrow_sales_candidate(smoke_source_params) == (True, "monthly_only_contract")
     rejected_params = dict(smoke_source_params)
     rejected_params["product_di_list"] = ["0004:D1"]
-    assert can_use_dashboard_narrow_sales_candidate(rejected_params) == (False, "product_dimension_filter_contract")
+    assert can_use_dashboard_narrow_sales_candidate(rejected_params) == (True, "monthly_product_dimension_contract")
     rejected_class_params = dict(smoke_source_params)
     rejected_class_params["product_class_list"] = ["0031:C1"]
-    assert can_use_dashboard_narrow_sales_candidate(rejected_class_params) == (False, "product_dimension_filter_contract")
+    assert can_use_dashboard_narrow_sales_candidate(rejected_class_params) == (True, "monthly_product_dimension_contract")
+    excluded_params = dict(smoke_source_params)
+    excluded_params["exclude_product_di_list"] = ["0004:D1"]
+    assert can_use_dashboard_narrow_sales_candidate(excluded_params) == (False, "product_dimension_filter_contract")
 
     params = dict(smoke_source_params)
     queries, _meta = _queries(params)
@@ -206,6 +212,54 @@ def main() -> int:
     assert facts["forecast_rows"] > 0
     assert facts["manufacturer_summary_rows"] > 0
     assert facts["purchase_month_total_rows"] > 0
+
+    # Staff scope is resolved after the compact source is loaded.  Every
+    # product-grain consumer must therefore use the same resolved universe;
+    # precomputed all-product month/manufacturer totals are not reusable.
+    expanded = adapt_dashboard_narrow_bundle_for_forecast(candidate)
+    seeds = []
+    for owner, product_codes, factor in (("A", ("A1", "A2"), 1), ("B", ("B1", "B2"), 10)):
+        for offset, product_code in enumerate(product_codes, start=1):
+            clone = expanded.copy()
+            clone["제품코드"] = product_code
+            clone["제조사코드"] = f"M{owner}"
+            clone["제조사명"] = f"제약사{owner}"
+            for column in ("출고수량", "출고할증수량", "매출공급가액", "매출세액", "매출합계", "매출반품금액"):
+                if column in clone:
+                    clone[column] = pd.to_numeric(clone[column], errors="coerce").fillna(0) * factor * offset
+            seeds.append(clone)
+    staff_source = pd.concat(seeds, ignore_index=True)
+    staff_a_codes = {"A1", "A2"}
+    staff_b_codes = {"B1", "B2"}
+    staff_a = _filter_frame_to_product_codes(staff_source, staff_a_codes)
+    staff_b = _filter_frame_to_product_codes(staff_source, staff_b_codes)
+    assert set(staff_a["제품코드"]) == staff_a_codes
+    assert set(staff_b["제품코드"]) == staff_b_codes
+
+    def _month_map(rows: list[dict[str, object]], value_key: str) -> dict[str, float]:
+        return {str(row["period_sort"]): float(row[value_key]) for row in rows}
+
+    full_actual = _month_map(_monthly_sales_actuals_from_source(staff_source), "value")
+    a_actual = _month_map(_monthly_sales_actuals_from_source(staff_a), "value")
+    b_actual = _month_map(_monthly_sales_actuals_from_source(staff_b), "value")
+    full_returns = _month_map(_monthly_sales_returns_from_source(staff_source), "magnitude")
+    a_returns = _month_map(_monthly_sales_returns_from_source(staff_a), "magnitude")
+    b_returns = _month_map(_monthly_sales_returns_from_source(staff_b), "magnitude")
+    assert all(full_actual[key] == a_actual[key] + b_actual[key] for key in full_actual)
+    assert all(full_returns[key] == a_returns[key] + b_returns[key] for key in full_returns)
+
+    a_manufacturer = get_manufacturer_sales_trend_summary(fixture_params, raw_df=staff_a)
+    b_manufacturer = get_manufacturer_sales_trend_summary(fixture_params, raw_df=staff_b)
+    assert set(a_manufacturer["제약사명"].astype(str)) == {"제약사A"}
+    assert set(b_manufacturer["제약사명"].astype(str)) == {"제약사B"}
+
+    for frame in (
+        pd.DataFrame({"제품코드": ["A1", "A2", "B1", "B2"], "현재고": [1, 2, 3, 4]}),
+        pd.DataFrame({"product_code": ["A1", "A2", "B1", "B2"], "입고": [4, 3, 2, 1]}),
+    ):
+        scoped = _filter_frame_to_product_codes(frame, staff_a_codes)
+        product_column = "제품코드" if "제품코드" in scoped else "product_code"
+        assert set(scoped[product_column]) == staff_a_codes
     print("PASS: dashboard final sales candidate E2E static gate")
     return 0
 

@@ -157,6 +157,24 @@ def _sql(params: Mapping[str, Any], *, start_date: str, cutoff_date: str) -> tup
     where_sql = "\n  AND ".join(product_filters) if product_filters else "1 = 1"
     on_sql = "\n   AND ".join(transaction_filters)
     return f"""
+WITH InboundEvents AS (
+    SELECT
+        LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
+        LTRIM(RTRIM(I.Rd11_In_YyMmDd)) AS inbound_date,
+        LTRIM(RTRIM(I.Rd11_Io_Gu)) AS io_tcode,
+        LTRIM(RTRIM(I.Rd11_Ven_Cd)) AS vendor_code,
+        SUM(COALESCE(I.Rd11_Quantity, 0)) AS quantity,
+        SUM(COALESCE(I.Rd11_Oquantity, 0)) AS oquantity,
+        SUM(COALESCE(I.Rd11_Supply_Price, 0)) AS supply_price
+    FROM dbo.Rddbc110 AS I WITH (NOLOCK)
+    WHERE {on_sql}
+    GROUP BY
+        LTRIM(RTRIM(I.Rd11_Physic_Cd)),
+        LTRIM(RTRIM(I.Rd11_In_YyMmDd)),
+        LTRIM(RTRIM(I.Rd11_Io_Gu)),
+        LTRIM(RTRIM(I.Rd11_Ven_Cd)),
+        CASE WHEN COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0 THEN 1 ELSE 0 END
+)
 SELECT
     LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code,
     LTRIM(RTRIM(P.Rd04_Ven_Cd)) AS manufacturer_vendor_code,
@@ -167,21 +185,20 @@ SELECT
     LTRIM(RTRIM(MasterVendor.Rd03_Ven_Nm)) AS master_order_vendor_name,
     LTRIM(RTRIM(MasterVendor.Rd03_Sales_Man)) AS master_order_staff_code,
     LTRIM(RTRIM(MasterStaff.Rd06_User_Nm)) AS master_order_staff_name,
-    LTRIM(RTRIM(I.Rd11_In_YyMmDd)) AS inbound_date,
-    LTRIM(RTRIM(I.Rd11_Io_Gu)) AS io_tcode,
-    LTRIM(RTRIM(I.Rd11_Ven_Cd)) AS vendor_code,
+    I.inbound_date,
+    I.io_tcode,
+    I.vendor_code,
     LTRIM(RTRIM(InboundVendor.Rd03_Ven_Nm)) AS inbound_vendor_name,
     LTRIM(RTRIM(InboundVendor.Rd03_Sales_Man)) AS inbound_vendor_staff_code,
     LTRIM(RTRIM(InboundStaff.Rd06_User_Nm)) AS inbound_vendor_staff_name,
-    CAST(COALESCE(I.Rd11_Quantity, 0) AS decimal(28, 6)) AS quantity,
-    CAST(COALESCE(I.Rd11_Oquantity, 0) AS decimal(28, 6)) AS oquantity,
-    CAST(COALESCE(I.Rd11_Supply_Price, 0) AS decimal(28, 6)) AS supply_price
+    CAST(COALESCE(I.quantity, 0) AS decimal(28, 6)) AS quantity,
+    CAST(COALESCE(I.oquantity, 0) AS decimal(28, 6)) AS oquantity,
+    CAST(COALESCE(I.supply_price, 0) AS decimal(28, 6)) AS supply_price
 FROM dbo.Rddbc040 AS P WITH (NOLOCK)
-LEFT JOIN dbo.Rddbc110 AS I WITH (NOLOCK)
-    ON I.Rd11_Physic_Cd = P.Rd04_Physic_Cd
-   AND {on_sql}
+LEFT JOIN InboundEvents AS I
+    ON I.product_code = P.Rd04_Physic_Cd
 LEFT JOIN dbo.Rddbc030 AS InboundVendor WITH (NOLOCK)
-    ON InboundVendor.Rd03_Ven_Cd = I.Rd11_Ven_Cd
+    ON InboundVendor.Rd03_Ven_Cd = I.vendor_code
 LEFT JOIN dbo.Rddbc060 AS InboundStaff WITH (NOLOCK)
     ON InboundStaff.Rd06_User_Cd = InboundVendor.Rd03_Sales_Man
 LEFT JOIN dbo.Rddbc030 AS MasterVendor WITH (NOLOCK)
