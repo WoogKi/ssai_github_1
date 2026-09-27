@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.services import order_calculation_service
+
 
 def _fixture() -> pd.DataFrame:
     base = {
@@ -104,6 +106,149 @@ def main() -> int:
     if "H.Rd17_DamDang" not in staff_sql or "StaffProduct.Rd04_Ven_Cd" not in staff_sql:
         failures.append("order/pharma staff authorities are not independently bound")
 
+    price_history_filters = service.normalize_order_params(
+        {
+            "date_from": "20250925", "date_to": "20260925",
+            "cost_apply_cd": "00007", "_order_price_history": True,
+            "status_codes": ("1", "2", "3"),
+        },
+        mode="order",
+    )
+    price_history_sql, price_history_values = service._filters(price_history_filters, mode="order")
+    if "D.Rd18_Or_Di IN (?,?,?)" not in " ".join(price_history_sql) or not all(
+        status in price_history_values for status in ("1", "2", "3")
+    ):
+        failures.append("order-calculation price history did not retain normal-order status filtering")
+    ordinary_order_sql = " ".join(service._filters(normalized_filters, mode="order")[0])
+    if "D.Rd18_Or_Di IN" in ordinary_order_sql:
+        failures.append("price-history status filtering leaked into ordinary order lookup")
+    if price_history_filters.get("date_from") != "20250925":
+        failures.append("one-year price-history window contract is not bound")
+    minimal_price_history = service.normalize_order_params(
+        {
+            "date_from": "20260625", "date_to": "20260925", "cost_apply_cd": "00007",
+            "_order_price_history": True, "_order_price_history_minimal": True,
+            "order_price_product_code_list": tuple(f"{index:05d}" for index in range(1621)),
+        },
+        mode="order",
+    )
+    minimal_price_sql, minimal_price_values = service._filters(minimal_price_history, mode="order")
+    minimal_query = service.get_order_df
+    if (
+        "D.Rd18_Physic_Cd IN" in " ".join(minimal_price_sql)
+        or len(minimal_price_values) != 6
+        or not all(value in minimal_price_values for value in ("20260625", "20260925", "00007"))
+    ):
+        failures.append("minimal order-price history leaked a product-code payload")
+    with patch.object(service, "execute_bound_select", return_value=pd.DataFrame()) as minimal_select:
+        minimal_query(minimal_price_history, mode="order")
+    minimal_sql = minimal_select.call_args.args[0]
+    forbidden_joins = ("Rddbc040", "Rddbc030", "Rddbc010", "Rddbc060")
+    required_columns = ("[발주일자]", "[제품코드]", "[단가적용처코드]", "[단가]", "[발주상태코드]", "[발주거래처코드]", "[발주순번]", "[상세순번]")
+    if (
+        any(token in minimal_sql for token in forbidden_joins)
+        or not all(token in minimal_sql for token in required_columns)
+        or "ROW_NUMBER() OVER" not in minimal_sql
+        or "D.Rd18_Unit_Cost > 0" not in minimal_sql
+    ):
+        failures.append("minimal order-price history projection/join contract changed")
+
+    bounded_price_history = service.normalize_order_params(
+        {
+            "date_from": "20260625", "date_to": "20260925", "cost_apply_cd": "00007",
+            "_order_price_history": True, "_order_price_history_minimal": True,
+            "order_price_product_code_list": ("00001", "00002", "00003"),
+        },
+        mode="order",
+    )
+    bounded_clauses, bounded_values = service._filters(bounded_price_history, mode="order")
+    if (
+        "D.Rd18_Physic_Cd IN (?,?,?)" not in " ".join(bounded_clauses)
+        or bounded_values[-3:] != ["00001", "00002", "00003"]
+    ):
+        failures.append("bounded order-price fallback scope was not pushed to R180")
+
+    unit_history = service.normalize_order_params(
+        {
+            "date_from": "20260825", "date_to": "20260925",
+            "cost_apply_cd": "50002", "stock_apply_cd": "50001",
+            "stock_cd_list": ("00001", "00008", "00013"),
+            "include_blank_stock_cd": True,
+            "_order_unit_history_minimal": True,
+        },
+        mode="order",
+    )
+    scoped_unit_params = order_calculation_service.build_order_unit_history_params(
+        {
+            "policy_date": "20260927", "order_staff_nm": "윤상민", "pharma_staff_nm": "한승현",
+            "cost_apply_cd": "50002", "stock_apply_cd": "50001",
+        },
+        reference=date(2026, 9, 27),
+    )
+    if scoped_unit_params.get("order_staff_nm") or scoped_unit_params.get("pharma_staff_nm"):
+        failures.append("order-unit authority retained requesting staff scope")
+    with patch.object(service, "execute_bound_select", return_value=pd.DataFrame()) as unit_select:
+        service.get_order_df(unit_history, mode="order")
+    unit_sql, unit_values = unit_select.call_args.args
+    unit_required_columns = (
+        "AS [발주일자]", "AS [발주거래처코드]", "AS [제품코드]", "AS [발주수량]",
+        "AS [발주순번]", "AS [상세순번]",
+    )
+    if (
+        any(token in unit_sql for token in forbidden_joins)
+        or not all(token in unit_sql for token in unit_required_columns)
+        or "D.Rd18_Cost_Apply_Cd = ?" not in unit_sql
+        or "D.Rd18_Stock_Apply_Cd = ?" not in unit_sql
+        or "NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL" not in unit_sql
+        or unit_values[:4] != ["20260825", "20260925", "50002", "50001"]
+    ):
+        failures.append("order-unit minimal R170/R180 projection/filter contract changed")
+
+    from app.services.order_calculation_contract import infer_order_unit
+    from app.services.order_calculation_service import _history_index, _latest_order_prices_by_windows
+
+    captured_unit = pd.DataFrame(
+        [
+            {"제품코드": "P1", "발주거래처코드": "V1", "발주일자": day, "발주수량": quantity,
+             "발주순번": index, "상세순번": 1, "제품명": "표시용", "발주거래처명": "표시용"}
+            for index, (day, quantity) in enumerate(
+                (("20260920", 10), ("20260918", 20), ("20260916", 10), ("20260914", 30)), start=1
+            )
+        ]
+    )
+    captured_unit_minimal = captured_unit[
+        ["제품코드", "발주거래처코드", "발주일자", "발주수량", "발주순번", "상세순번"]
+    ].copy()
+    old_unit = infer_order_unit(_history_index(captured_unit)[("P1", "V1")])
+    candidate_unit = infer_order_unit(_history_index(captured_unit_minimal)[("P1", "V1")])
+    if old_unit != candidate_unit:
+        failures.append(f"captured-source order-unit equality changed: old={old_unit} candidate={candidate_unit}")
+
+    captured_prices = pd.DataFrame(
+        [
+            {"제품코드": "P1", "단가적용처코드": "50002", "발주일자": "20260920", "발주거래처코드": "V1", "발주순번": 1, "상세순번": 1, "단가": 100, "발주상태코드": "1"},
+            {"제품코드": "P1", "단가적용처코드": "50002", "발주일자": "20260910", "발주거래처코드": "V1", "발주순번": 2, "상세순번": 1, "단가": 90, "발주상태코드": "2"},
+            {"제품코드": "P2", "단가적용처코드": "50002", "발주일자": "20260921", "발주거래처코드": "V2", "발주순번": 3, "상세순번": 1, "단가": 0, "발주상태코드": "1"},
+            {"제품코드": "P2", "단가적용처코드": "50002", "발주일자": "20260201", "발주거래처코드": "V2", "발주순번": 4, "상세순번": 1, "단가": 80, "발주상태코드": "3"},
+            {"제품코드": "OTHER", "단가적용처코드": "50002", "발주일자": "20260922", "발주거래처코드": "V3", "발주순번": 5, "상세순번": 1, "단가": 999, "발주상태코드": "1"},
+        ]
+    )
+    target_codes = {"P1", "P2"}
+    old_price_maps = _latest_order_prices_by_windows(
+        captured_prices, reference=date(2026, 9, 25), months=(3, 12),
+    )
+    candidate_price_maps = _latest_order_prices_by_windows(
+        captured_prices.loc[captured_prices["제품코드"].isin(target_codes)].copy(),
+        reference=date(2026, 9, 25), months=(3, 12),
+    )
+    for months in (3, 12):
+        expected = {key: value for key, value in old_price_maps[months].items() if key[0] in target_codes}
+        if expected != candidate_price_maps[months]:
+            failures.append(
+                f"captured-source order-price {months}m equality changed: "
+                f"old={expected} candidate={candidate_price_maps[months]}"
+            )
+
     for column, value in (("발주순번", 16.0), ("상세순번", 1.0)):
         normalized_identifier = _maybe_to_numeric(pd.Series([value]), column).iloc[0]
         if int(normalized_identifier) != int(value) or _numeric_display_kind(column) != "int":
@@ -173,6 +318,64 @@ def main() -> int:
             "입고예정자료 조회", "입고예정자료조회", "입고예정 자료 조회",
         } and parsed.get("params", {}).get("order_vendor_nm"):
             failures.append(f"consumed syntax leaked into order vendor: {text!r} -> {parsed}")
+
+    explicit_order_period_cases = (
+        ("제품코드 38941 2026 발주조회", "20260101", "20261231", "202601", "202612", "38941"),
+        ("제품코드 38941 2026년 발주조회", "20260101", "20261231", "202601", "202612", "38941"),
+        ("2026년 제품코드 38941 발주조회", "20260101", "20261231", "202601", "202612", "38941"),
+        ("제품코드 38941 2026년 1월 발주조회", "20260101", "20260131", "202601", "202601", "38941"),
+        ("제품코드 38941 2026-01-01부터 2026-06-30까지 발주조회", "20260101", "20260630", None, None, "38941"),
+    )
+    for text, date_from, date_to, month_from, month_to, product_code in explicit_order_period_cases:
+        parsed = resolve_registered_erp_table_nlq(text, today=date(2026, 9, 23)) or {}
+        parsed_params = dict(parsed.get("params") or {})
+        policy_params, policy = apply_nlq_default_period_policy(
+            parsed_params, "발주조회", today=date(2026, 9, 23),
+        )
+        if (
+            parsed.get("action") != "발주조회"
+            or policy_params.get("physic_cd") != product_code
+            or policy_params.get("date_from") != date_from
+            or policy_params.get("date_to") != date_to
+            or (month_from is not None and policy_params.get("month_from") != month_from)
+            or (month_to is not None and policy_params.get("month_to") != month_to)
+            or not policy.get("explicit_period_present")
+            or policy.get("default_policy") != "explicit_period"
+            or policy.get("auto_applied")
+        ):
+            failures.append(f"explicit product/order period mismatch: {text!r}/{policy_params}/{policy}")
+
+    product_name_period = resolve_registered_erp_table_nlq(
+        "타이레놀 2026년 발주조회", today=date(2026, 9, 23),
+    ) or {}
+    product_name_params, product_name_policy = apply_nlq_default_period_policy(
+        dict(product_name_period.get("params") or {}), "발주조회", today=date(2026, 9, 23),
+    )
+    if (
+        product_name_period.get("action") != "발주조회"
+        or product_name_params.get("_registered_unlabeled_entity") != "타이레놀"
+        or product_name_params.get("date_from") != "20260101"
+        or product_name_params.get("date_to") != "20261231"
+        or not product_name_policy.get("explicit_period_present")
+        or product_name_policy.get("default_policy") != "explicit_period"
+    ):
+        failures.append(f"product-name explicit order period mismatch: {product_name_params}/{product_name_policy}")
+
+    no_period_order = resolve_registered_erp_table_nlq(
+        "제품코드 38941 발주조회", today=date(2026, 9, 23),
+    ) or {}
+    no_period_params, no_period_policy = apply_nlq_default_period_policy(
+        dict(no_period_order.get("params") or {}), "발주조회", today=date(2026, 9, 23),
+    )
+    if (
+        no_period_params.get("physic_cd") != "38941"
+        or no_period_params.get("date_from") != "20260824"
+        or no_period_params.get("date_to") != "20260923"
+        or no_period_policy.get("explicit_period_present")
+        or no_period_policy.get("default_policy") != "rolling_1month"
+        or not no_period_policy.get("auto_applied")
+    ):
+        failures.append(f"no-period order rolling-month regression: {no_period_params}/{no_period_policy}")
 
     expected_period_cases = (
         (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+from datetime import date
 import logging
 import os
 from pathlib import Path
@@ -61,7 +63,110 @@ def _find_col(df, exact=(), include_any=(), exclude_any=()):
     return ""
 
 
+_ORDER_PRICE_COLUMNS = [
+    "단가적용거래처", "제품코드", "계약시작일자",
+    "실입고단가", "장부입고단가", "otc 입고단가",
+    "실줄고단가", "장부출고단가", "otc 출고단가",
+]
+
+
+def _run_company_actual(company_id: int, *, as_of: str, scope_size: int, timeout_seconds: int) -> int:
+    """One discovery plus one full/minimal comparison through production helpers."""
+    from app.db.mssql_client import query_to_df, read_only_request, set_current_company_id
+    from app.services.order_calculation_service import _contract_purchase_price_map
+    from app.services.rddbc070_service import get_rddbc070_current_df
+    from app.utils.env_config import load_project_env
+
+    load_project_env()
+    set_current_company_id(company_id)
+    discovery_sql = """
+WITH CostApply AS (
+    SELECT TOP 1 C.Rd07_Cost_Apply_Cd AS cost_apply_cd
+    FROM dbo.Rddbc070 AS C WITH (NOLOCK)
+    WHERE C.Rd07_Del_Flag <> 'E'
+      AND LTRIM(RTRIM(C.Rd07_Cost_Apply_Cd)) <> ''
+      AND LTRIM(RTRIM(C.Rd07_Start_Date)) <> '00000000'
+      AND C.Rd07_Start_Date <= ?
+      AND NOT (C.Rd07_In_Amt = 0 AND C.Rd07_In_Ramt = 0 AND C.Rd07_In_Oamt = 0
+               AND C.Rd07_Out_Amt = 0 AND C.Rd07_Out_Ramt = 0 AND C.Rd07_Out_Oamt = 0)
+    ORDER BY C.Rd07_Cost_Apply_Cd
+)
+SELECT DISTINCT TOP (?)
+    C.Rd07_Cost_Apply_Cd AS cost_apply_cd,
+    C.Rd07_Physic_Cd AS product_code
+FROM dbo.Rddbc070 AS C WITH (NOLOCK)
+INNER JOIN CostApply AS A ON C.Rd07_Cost_Apply_Cd = A.cost_apply_cd
+WHERE C.Rd07_Del_Flag <> 'E'
+  AND LTRIM(RTRIM(C.Rd07_Start_Date)) <> '00000000'
+  AND C.Rd07_Start_Date <= ?
+  AND NOT (C.Rd07_In_Amt = 0 AND C.Rd07_In_Ramt = 0 AND C.Rd07_In_Oamt = 0
+           AND C.Rd07_Out_Amt = 0 AND C.Rd07_Out_Ramt = 0 AND C.Rd07_Out_Oamt = 0)
+ORDER BY C.Rd07_Physic_Cd
+""".strip()
+    with read_only_request(timeout_seconds=timeout_seconds) as discovery_measurement:
+        scope = query_to_df(discovery_sql, (as_of, int(scope_size), as_of))
+    if scope.empty:
+        print("[R070 ACTUAL]")
+        print(f"company_id={company_id}")
+        print("status=NO_DIAGNOSTIC_SCOPE")
+        return 1
+    cost_apply = str(scope.iloc[0]["cost_apply_cd"]).strip()
+    product_codes = sorted({str(value).strip() for value in scope["product_code"] if str(value).strip()})
+    base_params = {
+        "ven_cd": cost_apply,
+        "as_of": as_of,
+        "order_product_code_list": product_codes,
+    }
+    with read_only_request(timeout_seconds=timeout_seconds) as full_measurement:
+        full = get_rddbc070_current_df(base_params)
+    with read_only_request(timeout_seconds=timeout_seconds) as minimal_measurement:
+        minimal = get_rddbc070_current_df({**base_params, "_order_contract_projection_only": True})
+    full_contract = full.loc[:, _ORDER_PRICE_COLUMNS].sort_values(_ORDER_PRICE_COLUMNS[:3]).reset_index(drop=True)
+    minimal_contract = minimal.loc[:, _ORDER_PRICE_COLUMNS].sort_values(_ORDER_PRICE_COLUMNS[:3]).reset_index(drop=True)
+    try:
+        pd.testing.assert_frame_equal(full_contract, minimal_contract, check_dtype=False)
+        frame_equal = True
+    except AssertionError:
+        frame_equal = False
+    selected_equal = _contract_purchase_price_map(full_contract) == _contract_purchase_price_map(minimal_contract)
+    profile = dict(minimal.attrs.get("order_contract_price_profile") or {})
+    duplicate_count = int(len(minimal) - len(minimal.loc[:, ["단가적용거래처", "제품코드"]].drop_duplicates()))
+    print("[R070 ACTUAL]")
+    print(f"company_id={company_id}")
+    print(f"as_of={as_of}")
+    print(f"input_product_count={len(product_codes)}")
+    print(f"full_result_rows={len(full)}")
+    print(f"minimal_result_rows={len(minimal)}")
+    print(f"latest_key_count={profile.get('unique_key_count')}")
+    print(f"duplicate_count={duplicate_count}")
+    print(f"full_sql_ms={dict(full.attrs.get('order_contract_price_profile') or {}).get('r070_sql_fetch_ms')}")
+    print(f"minimal_sql_ms={profile.get('r070_sql_fetch_ms')}")
+    print(f"full_python_ms={dict(full.attrs.get('order_contract_price_profile') or {}).get('total_python_ms')}")
+    print(f"minimal_python_ms={profile.get('total_python_ms')}")
+    print(f"discovery_physical_calls={len(discovery_measurement.get('queries') or [])}")
+    print(f"full_physical_calls={len(full_measurement.get('queries') or [])}")
+    print(f"minimal_physical_calls={len(minimal_measurement.get('queries') or [])}")
+    print(f"r070_sql_mode={profile.get('r070_sql_mode')}")
+    print(f"contract_fields_exact_equal={frame_equal}")
+    print(f"selected_purchase_price_exact_equal={selected_equal}")
+    print(f"status={'PASS' if frame_equal and selected_equal else 'FAIL'}")
+    return 0 if frame_equal and selected_equal else 1
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--actual-company-id", type=int)
+    parser.add_argument("--actual-as-of", default=date.today().strftime("%Y%m%d"))
+    parser.add_argument("--actual-scope-size", type=int, default=290)
+    parser.add_argument("--actual-timeout", type=int, default=120)
+    args, _unknown = parser.parse_known_args()
+    if args.actual_company_id is not None:
+        return _run_company_actual(
+            args.actual_company_id,
+            as_of=str(args.actual_as_of),
+            scope_size=max(1, int(args.actual_scope_size)),
+            timeout_seconds=max(1, int(args.actual_timeout)),
+        )
     failures: list[str] = []
 
     from app.services import rddbc070_service as service
@@ -503,6 +608,226 @@ def main() -> int:
         failures.append(f"garbage candidate trace contract mismatch: {meta}")
     if meta.get("zero_price_contract") != "partial_zero_preserved_selected_price_zero_no_revive":
         failures.append(f"partial-zero trace contract mismatch: {meta}")
+
+    captured.clear()
+    with patch.object(service, "execute_bound_select", side_effect=_capture):
+        order_contract = service.get_rddbc070_current_result(
+            {
+                "ven_cd": "50002", "as_of": "20260901",
+                "order_product_code_list": ["00086", "00085", "00085"],
+                "_order_contract_projection_only": True,
+            }
+        )
+    order_df = order_contract.get("df")
+    if not isinstance(order_df, pd.DataFrame):
+        failures.append("order contract-price projection dataframe missing")
+    else:
+        expected_order_columns = {
+            "단가적용거래처", "제품코드", "계약시작일자",
+            "실입고단가", "장부입고단가", "otc 입고단가",
+            "실줄고단가", "장부출고단가", "otc 출고단가",
+        }
+        if set(order_df.columns) != expected_order_columns:
+            failures.append(f"order contract-price projection changed: {list(order_df.columns)}")
+        if {"계약상태", "종료단가"}.intersection(order_df.columns):
+            failures.append("order contract-price projection retained display-only status columns")
+        profile = dict(order_df.attrs.get("order_contract_price_profile") or {})
+        if (
+            profile.get("input_product_code_count") != 2
+            or profile.get("projection_mode") != "order_contract_price_only"
+            or profile.get("contract_status_mode") != "not_required_by_order_calculation"
+            or profile.get("r070_sql_mode") != "order_contract_minimal_bounded_product_in"
+            or profile.get("product_scope_strategy") != "bounded_product_in"
+            or profile.get("product_scope_bind_count") != 2
+            or profile.get("latest_selection_mode") != "eligible_max_start_then_tie_rank"
+            or profile.get("r070_sql_tables") != ["Rddbc070"]
+        ):
+            failures.append(f"order contract-price profile mismatch: {profile}")
+    if len(captured) != 1:
+        failures.append(f"order contract-price physical calls expected=1 got={len(captured)}")
+    else:
+        order_sql, order_values = captured[0]
+        if "C.Rd07_Physic_Cd IN (?, ?)" not in order_sql:
+            failures.append("order contract-price product scope was not pushed to R070 SQL")
+        if order_values[:4] != ("50002", "00085", "00086", "20260901"):
+            failures.append(f"order contract-price bound value order mismatch: {order_values}")
+        minimal_required = (
+            "FROM dbo.Rddbc070 AS C WITH (NOLOCK)",
+            "WITH LatestStart AS",
+            "MAX(C.Rd07_Start_Date) AS Rd07_Start_Date",
+            "INNER JOIN LatestStart AS L",
+            "PARTITION BY C.Rd07_Cost_Apply_Cd, C.Rd07_Physic_Cd",
+            "ORDER BY C.Rd07_Start_Date DESC",
+            "C.Rd07_Del_Flag <> 'E'",
+            "LTRIM(RTRIM(C.Rd07_Cost_Apply_Cd)) <> ''",
+            "LTRIM(RTRIM(C.Rd07_Start_Date)) <> '00000000'",
+        )
+        if any(token not in order_sql for token in minimal_required):
+            failures.append("order contract-price minimal SQL eligibility/latest contract missing")
+        display_only_joins = (
+            "dbo.Rddbc030", "dbo.Rddbc040", "dbo.Rddbc060", "dbo.Rddbc010",
+        )
+        if any(token in order_sql for token in display_only_joins):
+            failures.append("order contract-price SQL retained display/master JOINs")
+
+    # Full order calculation must use the same R070-only contract even when the
+    # selected product universe is too large to send as an IN list.
+    captured.clear()
+    with patch.object(service, "execute_bound_select", side_effect=_capture):
+        full_scope_order_contract = service.get_rddbc070_current_result(
+            {
+                "ven_cd": "50002", "as_of": "20260901",
+                "_order_contract_projection_only": True,
+            }
+        )
+    full_scope_df = full_scope_order_contract.get("df")
+    if not isinstance(full_scope_df, pd.DataFrame):
+        failures.append("full-scope order contract-price dataframe missing")
+    else:
+        full_scope_profile = dict(full_scope_df.attrs.get("order_contract_price_profile") or {})
+        if (
+            full_scope_profile.get("input_product_code_count") != 0
+            or full_scope_profile.get("r070_sql_mode") != "order_contract_minimal_full_authority"
+            or full_scope_profile.get("product_scope_strategy") != "full_authority"
+            or full_scope_profile.get("r070_sql_tables") != ["Rddbc070"]
+        ):
+            failures.append(f"full-scope order contract-price profile mismatch: {full_scope_profile}")
+    if len(captured) != 1:
+        failures.append(f"full-scope order contract physical calls expected=1 got={len(captured)}")
+    else:
+        full_scope_sql, full_scope_values = captured[0]
+        if "C.Rd07_Physic_Cd IN (" in full_scope_sql:
+            failures.append("full-scope order contract unexpectedly packed product codes")
+        if full_scope_values[:2] != ("50002", "20260901"):
+            failures.append(f"full-scope order contract bound value order mismatch: {full_scope_values}")
+        if any(token in full_scope_sql for token in display_only_joins):
+            failures.append("full-scope order contract retained display/master JOINs")
+
+    # Product-scope strategy must keep one logical/physical R070 source while
+    # avoiding both the 2,100-bind failure and the known slow medium IN shape.
+    price_fixture = _fixture(zero_latest=False)
+    strategy_cases = (
+        ("small", ["00085", "00086", "00087"], "bounded_product_in", 3),
+        ("medium", [f"M{i:05d}" for i in range(893)], "full_authority_post_filter", 0),
+        ("large", [f"L{i:05d}" for i in range(10952)], "full_authority_post_filter", 0),
+    )
+    for label, product_codes, expected_strategy, expected_bind_count in strategy_cases:
+        source = pd.concat(
+            [
+                price_fixture.assign(제품코드=product_codes[0]),
+                price_fixture.assign(제품코드="OUTSIDE"),
+            ],
+            ignore_index=True,
+        )
+        local_calls: list[tuple[str, tuple]] = []
+
+        def _strategy_capture(sql: str, values, *, _source=source) -> pd.DataFrame:
+            local_calls.append((sql, tuple(values)))
+            if "C.Rd07_Physic_Cd IN (" in sql:
+                selected = {str(value).strip() for value in values[1:-1]}
+                return _source.loc[_source["제품코드"].isin(selected)].copy()
+            return _source.copy()
+
+        with patch.object(service, "execute_bound_select", side_effect=_strategy_capture):
+            strategy_result = service.get_rddbc070_current_df(
+                {
+                    "ven_cd": "50002",
+                    "as_of": "20260901",
+                    "order_product_code_list": product_codes,
+                    "_order_contract_projection_only": True,
+                }
+            )
+        strategy_profile = dict(strategy_result.attrs.get("order_contract_price_profile") or {})
+        if len(local_calls) != 1:
+            failures.append(f"{label} R070 scope physical call count changed: {len(local_calls)}")
+            continue
+        strategy_sql, strategy_values = local_calls[0]
+        if (
+            strategy_profile.get("product_scope_strategy") != expected_strategy
+            or strategy_profile.get("product_scope_bind_count") != expected_bind_count
+        ):
+            failures.append(f"{label} R070 strategy mismatch: {strategy_profile}")
+        if len(strategy_values) >= service.SQL_SERVER_PARAMETER_LIMIT:
+            failures.append(f"{label} R070 exceeded SQL Server bind limit: {len(strategy_values)}")
+        if expected_strategy == "bounded_product_in":
+            if "C.Rd07_Physic_Cd IN (?, ?, ?)" not in strategy_sql:
+                failures.append("small R070 scope did not use bounded IN")
+        elif "C.Rd07_Physic_Cd IN (" in strategy_sql:
+            failures.append(f"{label} R070 scope retained oversized IN")
+        if strategy_result["제품코드"].astype(str).str.strip().tolist() != [product_codes[0]]:
+            failures.append(f"{label} R070 post-latest exact product filter changed")
+
+    # Compare both latest-selection shapes on one captured source, including a
+    # duplicate latest date, an allowed partial-null row, and excluded garbage.
+    price_columns = [column for column, _label in service._PRICE_COLUMNS]
+    captured_source = pd.DataFrame(
+        [
+            {"단가적용거래처": "50002", "제품코드": "P1", "계약시작일자": "20260801", "삭제 flag": "", **{column: 100 for column in price_columns}},
+            {"단가적용거래처": "50002", "제품코드": "P1", "계약시작일자": "20260901", "삭제 flag": "", **{column: 200 for column in price_columns}},
+            {"단가적용거래처": "50002", "제품코드": "P2", "계약시작일자": "20260901", "삭제 flag": "", **{column: (None if column == "실입고단가" else 300) for column in price_columns}},
+            {"단가적용거래처": "50002", "제품코드": "P2", "계약시작일자": "20260901", "삭제 flag": "", **{column: 301 for column in price_columns}},
+            {"단가적용거래처": "50002", "제품코드": "ZERO", "계약시작일자": "20260901", "삭제 flag": "", **{column: 0 for column in price_columns}},
+            {"단가적용거래처": "", "제품코드": "BLANK", "계약시작일자": "20260901", "삭제 flag": "", **{column: 1 for column in price_columns}},
+            {"단가적용거래처": "50002", "제품코드": "DELETED", "계약시작일자": "20260901", "삭제 flag": "E", **{column: 1 for column in price_columns}},
+            {"단가적용거래처": "50002", "제품코드": "FUTURE", "계약시작일자": "20261001", "삭제 flag": "", **{column: 1 for column in price_columns}},
+        ]
+    )
+    captured_source["__source_order"] = range(len(captured_source))
+    numeric_prices = captured_source[price_columns].apply(pd.to_numeric, errors="coerce")
+    eligible = captured_source.loc[
+        captured_source["삭제 flag"].ne("E")
+        & captured_source["단가적용거래처"].astype(str).str.strip().ne("")
+        & captured_source["계약시작일자"].ne("00000000")
+        & captured_source["계약시작일자"].le("20260901")
+        & ~numeric_prices.eq(0).all(axis=1)
+    ].copy()
+    key_columns = ["단가적용거래처", "제품코드"]
+    old_latest = (
+        eligible.sort_values([*key_columns, "계약시작일자", "__source_order"], ascending=[True, True, False, True], kind="stable")
+        .drop_duplicates(key_columns, keep="first")
+    )
+    latest_start = eligible.groupby(key_columns, sort=False)["계약시작일자"].transform("max")
+    candidate_latest = (
+        eligible.loc[eligible["계약시작일자"].eq(latest_start)]
+        .sort_values([*key_columns, "계약시작일자", "__source_order"], ascending=[True, True, False, True], kind="stable")
+        .drop_duplicates(key_columns, keep="first")
+    )
+    equality_columns = [*key_columns, "계약시작일자", *price_columns]
+    try:
+        pd.testing.assert_frame_equal(
+            old_latest[equality_columns].reset_index(drop=True),
+            candidate_latest[equality_columns].reset_index(drop=True),
+            check_dtype=False,
+        )
+    except AssertionError as exc:
+        failures.append(f"captured-source latest selector equality changed: {exc}")
+
+    # The order-only projection may omit display fields, but it must preserve the
+    # latest-grain key and every price consumed by order calculation exactly.
+    captured.clear()
+    with patch.object(service, "execute_bound_select", side_effect=_capture):
+        registered_contract = service.get_rddbc070_current_result(
+            {"ven_cd": "50002", "physic_cd": "00085", "as_of": "20260901"}
+        )
+    registered_df = registered_contract.get("df")
+    price_semantic_columns = [
+        "단가적용거래처", "제품코드", "계약시작일자",
+        "실입고단가", "장부입고단가", "otc 입고단가",
+        "실줄고단가", "장부출고단가", "otc 출고단가",
+    ]
+    if not isinstance(order_df, pd.DataFrame) or not isinstance(registered_df, pd.DataFrame):
+        failures.append("contract-price projection equality dataframe missing")
+    else:
+        actual_prices = order_df.loc[:, price_semantic_columns].sort_values(
+            ["단가적용거래처", "제품코드", "계약시작일자"]
+        ).reset_index(drop=True)
+        expected_prices = registered_df.loc[:, price_semantic_columns].sort_values(
+            ["단가적용거래처", "제품코드", "계약시작일자"]
+        ).reset_index(drop=True)
+        try:
+            pd.testing.assert_frame_equal(actual_prices, expected_prices, check_dtype=False)
+        except AssertionError as exc:
+            failures.append(f"order contract-price semantic projection changed: {exc}")
 
     semantic_cases = {
         "insurance": ("보험", "보험(%", "%(보험)"),

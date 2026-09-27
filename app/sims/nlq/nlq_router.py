@@ -6471,6 +6471,9 @@ def _try_handle_io_nlq(
     for key in ("date_from", "date_to", "month_from", "month_to"):
         if params.get(key) not in (None, ""):
             condition_sources.setdefault(key, period_source)
+    if action == "발주 계산":
+        # Keep the original question only for the local comparison artifact.
+        params["_original_question"] = txt
     parsed["params"] = params
 
     _log_nlq_period_policy(logger, action, period_policy, params)

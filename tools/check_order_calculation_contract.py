@@ -8,10 +8,12 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.order_calculation_contract import (
-    OrderConditions, horizon_dates, demand_for_dates, demand_trend_adjustment,
+    OrderConditions, closing_day_relation, horizon_dates, demand_for_dates, demand_trend_adjustment,
     calculate_quantities, recommend_quantity, amounts,
 )
 from app.services.order_calculation_service import assemble_result, get_order_calculation_result
+from app.services.business_calendar_service import next_business_day_on_or_after
+from app.services.ssai_business_calendar_repository import CalendarAuthorityRead
 from app.ui.order_calculation_editor import apply_actual_edits
 
 
@@ -121,7 +123,10 @@ def test_demand_trend_adjustment():
 
 
 def test_full_month_forecast_and_blank_pending():
-    from app.services.order_calculation_service import build_pending_params
+    from app.services.order_calculation_service import (
+        build_order_price_history_params,
+        build_pending_params,
+    )
     params, sources = fixture()
     params["order_date"] = "2026-09-14"
     sources["business_dates"] = [date(2026, 9, d) for d in range(1, 31)
@@ -154,7 +159,24 @@ def test_full_month_forecast_and_blank_pending():
     q = build_pending_params({"policy_date": "20260914", "stock_cd_list": ["00001"],
                               "order_vendor_cd": "different", "date_to": "20260914"})
     assert q["include_blank_stock_cd"] and "date_to" not in q and "order_vendor_cd" not in q
+    history_q = build_order_price_history_params(
+        {
+            "policy_date": "20260923",
+            "order_staff_nm": "김",
+            "pharma_staff_nm": "이",
+            "cost_apply_cd": "50002",
+            "stock_apply_cd": "50001",
+            "stock_cd_list": ["00001"],
+        },
+        reference=date(2026, 9, 23),
+    )
+    assert history_q["date_from"] == "20250923" and history_q["date_to"] == "20260923"
+    assert history_q["status_codes"] == ["1", "2", "3"] and history_q["cost_apply_cd"] == "50002"
+    assert "order_staff_nm" not in history_q and "pharma_staff_nm" not in history_q
+    assert "stock_apply_cd" not in history_q and "stock_cd_list" not in history_q
     from app.services import rddbc170_rddbc180_order_service as pending
+    history_sql = " ".join(pending._filters(pending.normalize_order_params(history_q, mode="order"), mode="order")[0])
+    assert "H.Rd17_DamDang" not in history_sql and "StaffProduct.Rd04_Ven_Cd" not in history_sql
     with patch.object(pending, "execute_bound_select", return_value=pd.DataFrame()) as query:
         pending.get_expected_inbound_product_totals({**q, "_business_dates": ("20260914", "20260911", "20260910", "20260909")})
     sql = query.call_args.args[0]
@@ -187,11 +209,112 @@ def fixture():
                              "manufacturer_staff_name": ["이기재"],
                              "master_order_staff_code": ["U999"],
                              "master_order_staff_name": ["다른담당자"]})
-    params = {"company_id": 7, "order_date": "2026-09-25", "safety_days": 3, "target_days": 15, "closing_day": 25, "price_basis": "real"}
+    params = {"company_id": 7, "order_date": "2026-09-24", "safety_days": 3, "target_days": 15, "closing_day": 25,
+              "price_basis": "real", "cost_apply_cd": "00007"}
     sources = {"snapshot": {"meta": {"snapshot_status": "ready"}}, "base": base, "demand": demand,
-        "suppliers": supplier, "pending": pd.DataFrame(), "prices": {"df": pd.DataFrame()},
+        "suppliers": supplier, "pending": pd.DataFrame(),
+        "prices": {"df": pd.DataFrame({"제품코드": ["00001"], "단가적용코드": [""],
+                                         "실입고단가": [D(100)], "장부입고단가": [None]})},
+        "order_history": pd.DataFrame([{
+            "제품코드": "00001", "단가적용처코드": "00007", "발주일자": "20260920",
+            "발주거래처코드": "00100", "발주순번": "1", "상세순번": "1",
+            "발주상태코드": "1", "발주수량": D(10), "단가": D(100),
+        }]),
         "calendar_status": "ready", "business_dates": [date(2026, 9, d) for d in (28, 29, 30)]}
     return params, sources
+
+
+def test_closing_boundary_business_day_policy():
+    holidays = frozenset({"20260914", "20260924", "20260925", "20261001", "20261005"})
+
+    def calendar_loader(*, start_date: date, end_date: date) -> CalendarAuthorityRead:
+        del start_date, end_date
+        return CalendarAuthorityRead(status="ready", holiday_dates=holidays)
+
+    calendar = [
+        date(2026, 9, 1) + timedelta(days=offset)
+        for offset in range((date(2026, 11, 30) - date(2026, 9, 1)).days + 1)
+        if (date(2026, 9, 1) + timedelta(days=offset)).weekday() < 5
+        and (date(2026, 9, 1) + timedelta(days=offset)).strftime("%Y%m%d") not in holidays
+    ]
+    cases = (
+        # input, effective, shifted, shift days, relation, authority month, applied days
+        ("2026-09-23", "2026-09-23", False, 0, "BEFORE", "202609", 3),
+        ("2026-09-26", "2026-09-28", True, 2, "AFTER", "202610", 15),
+        ("2026-09-27", "2026-09-28", True, 1, "AFTER", "202610", 15),
+        ("2026-09-14", "2026-09-15", True, 1, "BEFORE", "202609", 9),
+        ("2026-09-24", "2026-09-28", True, 4, "AFTER", "202610", 15),
+        ("2026-10-31", "2026-11-02", True, 2, "BEFORE", "202611", 15),
+    )
+    for order_date, effective_date, shifted, shift_days, expected_relation, authority_month, applied_days in cases:
+        resolved = next_business_day_on_or_after(
+            date.fromisoformat(order_date), calendar_loader=calendar_loader,
+        )
+        assert resolved.status == "ready"
+        assert resolved.effective_date == effective_date.replace("-", "")
+        assert resolved.shifted is shifted and resolved.shift_days == shift_days
+        params, sources = fixture()
+        params["order_date"] = order_date
+        sources.update(
+            effective_business_date=effective_date,
+            business_date_shifted=shifted,
+            business_date_shift_days=shift_days,
+        )
+        sources["business_dates"] = calendar
+        sources["demand"]["당월 예상출고수량"] = D(200)
+        sources["demand"]["현재재고수량"] = D(20)
+        sources["pending"] = pd.DataFrame({"제품코드": ["00001"], "입고예정수량": [D(10)]})
+
+        row = assemble_result(params, sources).iloc[0]
+        conditions = OrderConditions(date.fromisoformat(effective_date), 3, 15, 25)
+        assert closing_day_relation(conditions) == expected_relation
+        assert row["입력 발주일자"] == order_date and row["발주일자"] == effective_date
+        assert bool(row["영업일 보정 여부"]) == shifted and row["영업일 보정 일수"] == shift_days
+        assert row["결제일 관계"] == expected_relation
+        assert row["수요 authority 월"] == authority_month
+        assert row["적용 필요 영업일수"] == applied_days
+        assert row["수요근거"] == ("예측기반" if expected_relation == "BEFORE" else "다음달 예측기반")
+        assert row["안전재고 기준수량"] is not None
+        assert row["horizon 예정수량"] is not None
+        assert row["계산 발주수량"] == row["horizon 예정수량"] - D(20) - D(10)
+        assert row["추천 발주수량"] is not None
+        assert row["계산상태"] != "수요/재고 사용자확인"
+
+    params, sources = fixture()
+    params["order_date"] = "2026-09-26"
+    sources.update(
+        effective_business_date="2026-09-28",
+        business_date_shifted=True,
+        business_date_shift_days=2,
+    )
+    sources["business_dates"] = calendar
+    sources["demand"]["수요예상기준"] = "비교자료부족"
+    missing = assemble_result(params, sources).iloc[0]
+    assert missing["수요근거"] == "수요근거 없음"
+    assert missing["수요 사용자확인월"] == "202610"
+    assert missing["추천 발주수량"] is None
+    assert missing["계산상태"] == "수요/재고 사용자확인"
+
+
+def test_full_scope_compact_representative_vendor_equality():
+    params, detailed_sources = fixture()
+    detailed_sources["suppliers"] = detailed_sources["suppliers"].assign(
+        recent_inbound_vendor_source="actual_inbound",
+        recent_inbound_vendor_count_90=2,
+        normal_inbound_raw_qty_365=D(100),
+        inbound_delay_days=1,
+    )
+    detailed = assemble_result(params, detailed_sources)
+    compact_columns = [
+        "product_code", "recent_inbound_vendor_code", "recent_inbound_vendor_name",
+        "recent_inbound_vendor_staff_code", "recent_inbound_vendor_staff_name",
+        "manufacturer_vendor_code", "manufacturer_vendor_name",
+        "manufacturer_staff_code", "manufacturer_staff_name",
+        "recent_inbound_vendor_count_90", "recent_inbound_vendor_source",
+    ]
+    compact_sources = {**detailed_sources, "suppliers": detailed_sources["suppliers"][compact_columns].copy()}
+    compact = assemble_result(params, compact_sources)
+    pd.testing.assert_frame_equal(detailed, compact)
 
 
 def test_trend_applies_before_stock_pending_and_unit():
@@ -234,6 +357,12 @@ def test_trend_applies_before_stock_pending_and_unit():
 
 def test_assembly_edit_export():
     params, sources = fixture()
+    params["cost_apply_cd"] = "00007"
+    sources["order_history"] = pd.DataFrame([{
+        "제품코드": "00001", "단가적용처코드": "00007", "발주일자": "20260920",
+        "발주거래처코드": "00100", "발주순번": "1", "상세순번": "1",
+        "발주상태코드": "1", "발주수량": D(10), "단가": D(100),
+    }])
     frame = assemble_result(params, sources)
     assert frame.iloc[0]["출고빈도등급"] == "F" and frame.iloc[0]["제품코드"] == "00001"
     assert frame.iloc[0]["추천 발주수량"] == 32
@@ -326,21 +455,111 @@ def test_panel_submission():
 
 
 def test_price_conflict_and_field_status():
+    def history(*rows):
+        return pd.DataFrame([{
+            "제품코드": "00001", "단가적용처코드": "00007", "발주일자": "20260920",
+            "발주거래처코드": "00100", "발주순번": "1", "상세순번": "1",
+            "발주상태코드": "1", "발주수량": D(10), "단가": D(100), **row,
+        } for row in rows])
+
+    def contract(*, real=None, book=None, outbound=None):
+        return {"df": pd.DataFrame([{
+            "단가적용거래처": "00007", "제품코드": "00001", "실입고단가": real,
+            "장부입고단가": book, "otc 입고단가": None, "출고단가": outbound,
+        }])}
+
+    def row_for(*, contracts=None, order_history=None, product_code="00001",
+                cost_apply_cd="00007", order_date="2026-09-25"):
+        params, sources = fixture()
+        params.update(order_date=order_date, cost_apply_cd=cost_apply_cd, cost_apply_nm="fixture-cost")
+        for frame, column in (("base", "제품코드"), ("demand", "제품코드"), ("suppliers", "product_code")):
+            sources[frame] = sources[frame].copy()
+            sources[frame][column] = product_code
+        sources["contracts"] = contracts or {"df": pd.DataFrame()}
+        sources["order_history"] = order_history if order_history is not None else pd.DataFrame()
+        sources["order_history_price_truncated"] = False
+        return assemble_result(params, sources).iloc[0]
+
+    # A. Positive inbound contract cost wins over every other candidate.
+    selected = row_for(contracts=contract(real=D(200)), order_history=history({"단가": D(150)}))
+    assert selected["발주단가"] == 200 and selected["단가출처"] == "계약단가" and selected["단가판정"] == "확정"
+
+    # B. No valid contract cost, then the latest normal order within three months.
+    selected = row_for(contracts=contract(real=D(0)), order_history=history({"단가": D(150)}))
+    assert selected["발주단가"] == 150 and selected["단가출처"] == "최근3개월발주단가"
+
+    # C. Only a four-to-twelve month normal order remains.
+    selected = row_for(order_history=history({"발주일자": "20260520", "단가": D(140)}))
+    assert selected["발주단가"] == 140 and selected["단가출처"] == "최근1년발주단가"
+
+    # 38941: a positive normal 2026-01-09 order for application 50002 is in the one-year fallback.
+    selected = row_for(
+        product_code="38941", cost_apply_cd="50002", order_date="2026-09-23",
+        order_history=history({"제품코드": "38941", "단가적용처코드": "50002",
+                               "발주일자": "20260109", "발주상태코드": "1", "단가": D(321)}),
+    )
+    assert selected["발주단가"] == 321 and selected["단가출처"] == "최근1년발주단가"
+
+    # A one-year-external history is not a fallback candidate.
+    selected = row_for(
+        order_date="2026-09-23", order_history=history({"발주일자": "20250922", "단가": D(140)}),
+    )
+    assert selected["발주단가"] is None and selected["단가출처"] == "미확정"
+
+    # D. R230 is never a purchase-order price fallback.
+    selected = row_for(order_history=history({"단가": D(0)}))
+    assert selected["발주단가"] is None and selected["단가출처"] == "미확정"
+
+    # E. Zero, null, and blank are not prices; product-registration cost is not a fallback.
+    selected = row_for(contracts=contract(real=D(0)), order_history=history({"단가": D(0)}))
+    assert selected["발주단가"] is None and selected["단가출처"] == "미확정" and selected["단가판정"] == "REVIEW"
+    assert selected["발주공급가액"] is None and selected["발주세액"] is None and selected["발주금액(부가세포함)"] is None
+
+    # F. Contract outbound price never qualifies as a purchase-order price.
+    selected = row_for(contracts=contract(real=D(0), outbound=D(999)), order_history=history({"단가": D(120)}))
+    assert selected["발주단가"] == 120 and selected["단가출처"] == "최근3개월발주단가"
+
+    # G. Zero, null, blank, and non-normal order costs remain REVIEW.
+    selected = row_for(order_history=history(
+        {"단가": D(0)}, {"단가": None, "상세순번": "2"}, {"단가": "", "상세순번": "3"},
+        {"발주상태코드": "4", "단가": D(999), "상세순번": "4"},
+    ))
+    assert selected["발주단가"] is None and selected["단가출처"] == "미확정"
+
+    # H. A different application code is never a fallback candidate.
+    selected = row_for(order_history=history({"단가적용처코드": "OTHER", "단가": D(150)}))
+    assert selected["발주단가"] is None and selected["단가판정"] == "REVIEW"
+
+    # I. A newer cancelled/invalid order is excluded in favor of the latest normal order.
+    selected = row_for(order_history=history(
+        {"발주일자": "20260924", "발주상태코드": "4", "단가": D(999)},
+        {"발주일자": "20260920", "발주상태코드": "1", "단가": D(110), "발주순번": "2"},
+    ))
+    assert selected["발주단가"] == 110 and selected["단가출처"] == "최근3개월발주단가"
+
+    # J. The three-month window always wins when it and the one-year window both exist.
+    selected = row_for(order_history=history(
+        {"발주일자": "20260520", "단가": D(140), "발주순번": "1"},
+        {"발주일자": "20260920", "단가": D(150), "발주순번": "2"},
+    ))
+    assert selected["발주단가"] == 150 and selected["단가출처"] == "최근3개월발주단가"
+
+    # No contract or normal order-history price remains REVIEW even if a legacy R230 frame exists.
     params, sources = fixture()
-    sources["prices"] = {"df": pd.DataFrame({"제품코드": ["00001", "00001"],
-        "매입처코드": ["00100", "00100"], "실입고단가": [D(100), D(101)]})}
-    frame = assemble_result(params, sources)
-    assert frame.iloc[0]["추천 발주수량"] == 32
-    assert frame.iloc[0]["단가출처"] == "복수 최종매입가 사용자확인"
-    assert frame.iloc[0]["발주금액(부가세포함)"] is None
-    sources["prices"]["df"]["실입고단가"] = [D(100), D(100)]
-    assert assemble_result(params, sources).iloc[0]["발주단가"] == 100
-    params["cost_apply_cd"] = "00007"
-    sources["contracts"] = {"df": pd.DataFrame({"제품코드": ["00001"], "실입고단가": [D(200)]})}
-    assert assemble_result(params, sources).iloc[0]["발주단가"] == 200
-    sources["contracts"]["df"]["실입고단가"] = [D(0)]
-    frame = assemble_result(params, sources)
-    assert frame.iloc[0]["발주단가"] is None and frame.iloc[0]["추천 발주수량"] == 32
+    params.update(cost_apply_cd="00007", cost_apply_nm="fixture-cost")
+    sources["order_history"] = pd.DataFrame()
+    sources["order_price_3m"] = {}
+    sources["order_price_1y"] = {}
+    sources["prices"] = {"df": pd.DataFrame({"제품코드": ["00001"], "단가적용코드": ["00007"], "실입고단가": [D(100)]})}
+    selected = assemble_result(params, sources).iloc[0]
+    assert selected["발주단가"] is None and selected["단가출처"] == "미확정" and selected["단가판정"] == "REVIEW"
+
+    from app.services.order_calculation_service import _unresolved_order_price_codes
+    unresolved = _unresolved_order_price_codes(
+        ["00001", "38941", "00003"], cost_apply_code="50002",
+        contract_prices={("00001", "50002"): D(10)}, order_price_3m={("00003", "50002"): D(20)},
+    )
+    assert unresolved == ["38941"]
 
 
 def test_scoped_timeout_and_no_retry():
@@ -560,7 +779,7 @@ def test_code_lookup_company_cache():
 
 
 if __name__ == "__main__":
-    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_editor_callback_ownership_and_cache)
+    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_closing_boundary_business_day_policy, test_full_scope_compact_representative_vendor_equality, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_editor_callback_ownership_and_cache)
     tests += (test_empty_parameter_bridge_and_check_mode, test_snapshot_scope_to_demand_scope)
     tests += (test_code_lookup_company_cache,)
     tests += (test_excel_numeric_round_trip, test_production_editor_render_boundary)
@@ -601,7 +820,12 @@ if __name__ == "__main__":
         assert recommend_quantity(D('7.8'), None, increasing=False) == 7
         params, sources = fixture()
         rows = history([10, 20, 10, 30])
-        sources['order_history'] = pd.DataFrame([{**r, '제품코드': '00001', '발주거래처코드': '00100'} for r in rows])
+        sources['order_history'] = pd.DataFrame([
+            {**r, '제품코드': '00001', '발주거래처코드': '00100'} for r in rows
+        ])
+        sources['order_history_unit'] = sources['order_history'].copy()
+        sources['order_price_3m'] = {('00001', '00007'): D(100)}
+        sources['order_price_1y'] = {}
         sources['order_history_complete'] = True
         row = assemble_result(params, sources).iloc[0]
         assert row['발주단위'] == 10 and row['계산 발주수량'] == 32 and row['추천 발주수량'] == 30
@@ -615,11 +839,37 @@ if __name__ == "__main__":
         assert assemble_result(params, sources).iloc[0]['추천 발주수량'] == 40
         sources['demand']['최근3개월평균수요수량'] = D(100)
         sources['order_history']['발주수량'] = 100
+        sources['order_history_unit']['발주수량'] = 100
         zero = assemble_result(params, sources).iloc[0]
         assert zero['계산 발주수량'] == 32 and zero['추천 발주수량'] == 100
         assert '최소 발주단위' in zero['조달주의']
         assert assemble_result({**params, 'only_needed': True}, sources).iloc[0]['추천 발주수량'] == 100
     tests += (test_order_unit_repetition,)
+    def test_price_and_unit_history_roles_are_separate():
+        params, sources = fixture()
+        minimal_price_history = pd.DataFrame([{
+            '발주일자': '20260920', '제품코드': '00001', '단가적용처코드': '00007',
+            '단가': D(100), '발주상태코드': '1', '발주거래처코드': '00100',
+            '발주순번': '1', '상세순번': '1',
+        }])
+        unit_history = pd.DataFrame([
+            {'제품코드': '00001', '발주거래처코드': '00100', '발주일자': f'202609{day:02d}', '발주수량': D(quantity)}
+            for day, quantity in ((20, 10), (19, 20), (18, 10), (17, 30))
+        ])
+        assert '발주수량' not in minimal_price_history.columns
+        sources.update({
+            'order_history': minimal_price_history,
+            'order_history_3m': minimal_price_history,
+            'order_history_1y': pd.DataFrame(),
+            'order_history_unit': unit_history,
+            'order_history_complete': True,
+            'order_price_3m': {('00001', '00007'): D(100)},
+            'order_price_1y': {},
+        })
+        row = assemble_result(params, sources).iloc[0]
+        assert row['발주단가'] == 100 and row['단가출처'] == '최근3개월발주단가'
+        assert row['발주단위'] == 10
+    tests += (test_price_and_unit_history_roles_are_separate,)
     def test_order_response_timing():
         from app.ui import chat_middleware as chat
         payload = {'meta': {'order_calculation_editable': True,
@@ -720,6 +970,8 @@ if __name__ == "__main__":
         explicit = apply_application_defaults({'cost_apply_cd': '12345', 'stock_apply_nm': '지정처'})
         assert explicit['cost_apply_cd'] == '12345' and 'stock_apply_cd' not in explicit
         params, sources = fixture()
+        params['cost_apply_cd'] = '50002'
+        params['stock_apply_cd'] = '50001'
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
             result = get_order_calculation_result(params, source_loader=lambda q: sources)
         primary_front = ['제품코드', '제품명', '추세', '계산 발주수량', '추천 발주수량', '실제 발주수량',

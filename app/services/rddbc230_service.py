@@ -107,10 +107,17 @@ def _numeric_range(value: Any, *, label: str) -> tuple[float, float] | None:
 
 def normalize_rddbc230_params(params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     out = dict(params or {})
+    order_product_codes = out.get("order_product_code_list")
     product_filters = normalize_product_master_filters(out)
     for key in _UNSUPPORTED_PRODUCT_FILTER_KEYS:
         product_filters[key] = ""
     out.update(product_filters)
+    if isinstance(order_product_codes, (list, tuple, set)):
+        out["order_product_code_list"] = [
+            str(code).strip() for code in order_product_codes if str(code).strip()
+        ]
+    else:
+        out["order_product_code_list"] = []
     for key in (
         "physic_nm", "buy_cd", "buy_nm", "stock_cd", "stock_nm",
         "stock_apply_cd", "stock_apply_nm", "cost_apply_cd", "cost_apply_nm",
@@ -140,6 +147,11 @@ def _filters(params: dict[str, Any]) -> tuple[list[str], list[Any]]:
         if params.get(key):
             clauses.append(f"{expression} = ?")
             values.append(params[key])
+
+    order_product_codes = params.get("order_product_code_list") or []
+    if order_product_codes:
+        clauses.append("S.Rd23_Physic_Cd IN (" + ", ".join("?" for _ in order_product_codes) + ")")
+        values.extend(order_product_codes)
 
     like_filters = (
         ("physic_nm", "P.Rd04_Physic_Nm"),

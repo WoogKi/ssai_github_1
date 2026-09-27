@@ -28,11 +28,22 @@ class OrderConditions:
 
 def horizon_dates(conditions: OrderConditions, business_dates: Sequence[date]) -> tuple[date, ...]:
     future = sorted(set(d for d in business_dates if d > conditions.reference_date))
-    before_close = conditions.closing_day and conditions.reference_date.day < conditions.closing_day
+    before_close = closing_day_relation(conditions) == "BEFORE"
     if before_close:
         future = [d for d in future if (d.year, d.month) ==
                   (conditions.reference_date.year, conditions.reference_date.month)]
     return tuple(future[:conditions.target_days])
+
+
+def closing_day_relation(conditions: OrderConditions) -> str:
+    """Classify the calendar-day payment boundary without shifting non-business days."""
+    if not conditions.closing_day:
+        return "CASH"
+    if conditions.reference_date.day < conditions.closing_day:
+        return "BEFORE"
+    if conditions.reference_date.day == conditions.closing_day:
+        return "ON"
+    return "AFTER"
 
 
 def demand_for_dates(

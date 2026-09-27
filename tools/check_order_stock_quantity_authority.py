@@ -8,6 +8,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -212,10 +213,33 @@ def _offline_result() -> dict[str, Any]:
         assert "monthly_current" in month_end_sql
         assert "Rddbc110" not in month_end_sql and "Rddbc120" not in month_end_sql
         assert month_end_binds["month_to"] == "202608"
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def fake_query(sql: str, params: dict[str, Any]) -> pd.DataFrame:
+        captured.append((sql, dict(params)))
+        return pd.DataFrame([
+            {"제품코드": "P001", "실재고수량": 3.0, "실재고평가단가": 2.0, "실재고금액": 6.0},
+            {"제품코드": "OUTSIDE", "실재고수량": 9.0, "실재고평가단가": 1.0, "실재고금액": 9.0},
+        ])
+
+    with patch.object(stock_service, "query_to_df", side_effect=fake_query):
+        scoped = stock_service._load_product_current_stock(
+            ["P001", "P002"], stock_mode="real", month_to="202609",
+            stock_cd_list=["00001"],
+            product_scope_params={"dashboard_product_group_list": ["0013:9998"]},
+        )
+    assert len(captured) == 1
+    assert "EXISTS" in captured[0][0] and "P_SCOPE.Rd04_Physic_Group_Gcode" in captured[0][0]
+    assert "M.Rd21_Physic_Cd IN" not in captured[0][0]
+    assert scoped["제품코드"].tolist() == ["P001"]
+    assert scoped.attrs["stock_query_mode"] == "profile_scope_single_query"
+    assert scoped.attrs["stock_query_batches"] == 1
     return {
         "status": "PASS",
         "mode": "offline",
         "period_policies": ["current_monthly", "historical_midmonth", "historical_month_end"],
+        "profile_scope_single_query": True,
         "write_count": 0,
     }
 

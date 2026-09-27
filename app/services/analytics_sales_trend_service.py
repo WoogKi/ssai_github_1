@@ -16,7 +16,7 @@ import re
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 import pandas as pd
@@ -748,6 +748,13 @@ def _build_filters(params: Dict[str, Any]) -> str:
     # 제품
     if clean_text(params.get("physic_cd")):
         _add_filter(clauses, "Out_Put.Rd12_Physic_Cd = %(physic_cd)s")
+    _add_in_filter(
+        clauses,
+        params,
+        "Out_Put.Rd12_Physic_Cd",
+        "order_product_code",
+        _clean_list_param(params.get("order_product_code_list")),
+    )
     supplier_scope_sql = build_product_supplier_scope_sql(
         params, params, product_code_sql="Out_Put.Rd12_Physic_Cd", bind_prefix="detail_supplier"
     )
@@ -1044,6 +1051,13 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
 
     if clean_text(params.get("physic_cd")):
         _add_filter(clauses, f"{a}.{p}_Physic_Cd = %(physic_cd)s")
+    _add_in_filter(
+        clauses,
+        params,
+        f"{a}.{p}_Physic_Cd",
+        "order_product_code_monthly",
+        _clean_list_param(params.get("order_product_code_list")),
+    )
     if _add_in_filter(
         clauses,
         params,
@@ -1329,6 +1343,13 @@ def _build_dashboard_monthly_common_predicates(
 
     if clean_text(bind_params.get("physic_cd")):
         _add_filter(clauses, f"{a}.{p}_Physic_Cd = %(physic_cd)s")
+    _add_in_filter(
+        clauses,
+        bind_params,
+        f"{a}.{p}_Physic_Cd",
+        "order_product_code_fast",
+        _clean_list_param(bind_params.get("order_product_code_list")),
+    )
 
     supplier_scope_sql = build_product_supplier_scope_sql(
         bind_params, bind_params, product_code_sql=f"{a}.{p}_Physic_Cd", bind_prefix=supplier_bind_prefix
@@ -3205,6 +3226,73 @@ ORDER BY
     df = _add_trend_columns(df)
     df = _normalize_analytics_numeric_columns(df)
     return df
+
+
+def get_outbound_customer_counts_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """Return the exact detail-query customer authority at product grain.
+
+    Order calculation only consumes the distinct current-month customer count.
+    Aggregating that projection in SQL avoids transferring and regrouping the
+    full product/customer detail frame while retaining the established filters.
+    """
+    params = _apply_month_or_date_params(coalesce_params(params))
+    requested_codes = _clean_list_param(params.get("order_product_code_list"))
+    safe_bind_limit = SQL_SERVER_PARAMETER_LIMIT - SQL_PARAMETER_SAFETY_MARGIN
+    full_authority_post_filter = len(requested_codes) > safe_bind_limit
+    query_params = dict(params)
+    if full_authority_post_filter:
+        query_params["order_product_code_list"] = []
+    where_sql = _build_filters(query_params)
+    sql = f"""
+SELECT
+    LTRIM(RTRIM(Out_Put.Rd12_Physic_Cd)) AS [제품코드],
+    COUNT(DISTINCT NULLIF(LTRIM(RTRIM(Out_Put.Rd12_Ven_Cd)), '')) AS [거래처수]
+FROM dbo.Rddbc120 AS Out_Put WITH (NOLOCK)
+LEFT JOIN dbo.Rddbc030 AS Ven_Cd WITH (NOLOCK)
+    ON Out_Put.Rd12_Ven_Cd = Ven_Cd.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS In_Ven_Cd WITH (NOLOCK)
+    ON Out_Put.Rd12_In_Ven_Cd = In_Ven_Cd.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc030 AS Real_Ven_Cd WITH (NOLOCK)
+    ON Out_Put.Rd12_Real_Ven_Cd = Real_Ven_Cd.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc040 AS Physic_Cd WITH (NOLOCK)
+    ON Out_Put.Rd12_Physic_Cd = Physic_Cd.Rd04_Physic_Cd
+LEFT JOIN dbo.Rddbc030 AS Make_Ven WITH (NOLOCK)
+    ON Physic_Cd.Rd04_Ven_Cd = Make_Ven.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc010 AS Physic_Group_Nm WITH (NOLOCK)
+    ON Physic_Group_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Group_Gcode
+   AND Physic_Group_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Group
+LEFT JOIN dbo.Rddbc010 AS Physic_Di_Nm WITH (NOLOCK)
+    ON Physic_Di_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Di_Gcode
+   AND Physic_Di_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Di
+LEFT JOIN dbo.Rddbc010 AS Physic_Tax_Nm WITH (NOLOCK)
+    ON Physic_Tax_Nm.Rd01_Gcode = Physic_Cd.Rd04_Physic_Tax_Gcode
+   AND Physic_Tax_Nm.Rd01_Tcode = Physic_Cd.Rd04_Physic_Tax
+LEFT JOIN dbo.Rddbc010 AS Stock_Cd WITH (NOLOCK)
+    ON Out_Put.Rd12_Stock_Cd_Gcode = Stock_Cd.Rd01_Gcode
+   AND Out_Put.Rd12_Stock_Cd = Stock_Cd.Rd01_Tcode
+LEFT JOIN dbo.Rddbc060 AS Sales_Man WITH (NOLOCK)
+    ON Out_Put.Rd12_Sales_Man = Sales_Man.Rd06_User_Cd
+LEFT JOIN dbo.Rddbc021 AS Road1 WITH (NOLOCK)
+    ON LTRIM(RTRIM(Road1.Rd021_RoadCd)) = LTRIM(RTRIM(Ven_Cd.Rd03_RoadCd))
+   AND LTRIM(RTRIM(Road1.Rd021_DongSeq)) = LTRIM(RTRIM(Ven_Cd.Rd03_DongSeq))
+WHERE 1 = 1
+{where_sql}
+GROUP BY LTRIM(RTRIM(Out_Put.Rd12_Physic_Cd))
+"""
+    result = query_to_df(sql, query_params)
+    if result is None or result.empty:
+        return pd.DataFrame(columns=["제품코드", "거래처수"])
+    result = result.reindex(columns=["제품코드", "거래처수"]).copy()
+    result["제품코드"] = result["제품코드"].fillna("").astype(str).str.strip()
+    result["거래처수"] = pd.to_numeric(result["거래처수"], errors="coerce").fillna(0).astype(int)
+    if full_authority_post_filter:
+        result = result.loc[result["제품코드"].isin(set(requested_codes))].copy()
+    result.attrs["order_product_scope_mode"] = (
+        "full_authority_post_filter" if full_authority_post_filter else "bounded_product_in"
+        if requested_codes else "full_authority"
+    )
+    result.attrs["order_product_scope_count"] = len(requested_codes)
+    return result
 
 
 def _apply_monthly_current_detail_mix(
@@ -5348,12 +5436,14 @@ def _load_product_current_stock(
     stock_cd: Any = None,
     stock_apply_cd: Any = None,
     ignored_io_gu_count: int = 0,
+    product_scope_params: Optional[Mapping[str, Any]] = None,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황의 현재고를 월집계 누계로 가져온다.
 
-    SQL Server parameter limit을 피하기 위해 product code를 batch로 나누되,
-    전체 product code를 조회한다.
+    Dashboard 제품 scope가 있으면 DB에서 그 scope를 한 번 적용한 뒤
+    요청 product code 집합을 Python에서 정확히 다시 제한한다. Scope가 없으면
+    SQL Server parameter limit을 피하는 기존 product-code batch 경로를 유지한다.
     """
     # Compatibility input only: stock application does not scope stock quantity.
     _ = stock_apply_cd
@@ -5368,6 +5458,13 @@ def _load_product_current_stock(
     stock_codes = [clean_text(x) for x in stock_codes if clean_text(x)]
     batch_plan_started = time.perf_counter()
     batch_plan = _stock_query_batch_plan(stock_cd_count=len(stock_codes), io_gu_count=0)
+    scope_bind_params = dict(product_scope_params or {})
+    scope_clauses = build_dashboard_product_dimension_scope_predicates(
+        scope_bind_params,
+        scope_bind_params,
+        product_alias="P_SCOPE",
+    )
+    use_profile_scope_query = bool(scope_clauses)
     if measurement is not None:
         measurement.add_phase(
             phase="stock_batch_plan",
@@ -5426,6 +5523,8 @@ def _load_product_current_stock(
         df.attrs["current_stock_io_filter_applied"] = False
         df.attrs["current_stock_io_tcode_parameter_count"] = 0
         df.attrs["selected_io_count_ignored"] = max(0, int(ignored_io_gu_count or 0))
+        df.attrs["stock_query_mode"] = "profile_scope_single_query" if use_profile_scope_query else "product_code_batches"
+        df.attrs["stock_profile_scope_applied"] = use_profile_scope_query
         df.attrs.update(batch_plan)
         return df
 
@@ -5556,10 +5655,72 @@ OPTION (RECOMPILE)
             return pd.DataFrame()
         return batch_df
 
+    def _query_profile_scope() -> pd.DataFrame:
+        bind_params: Dict[str, Any] = dict(scope_bind_params)
+        bind_params.update({
+            "stock_month_to": monthly_stock_month_to,
+            "io_gu_gcode": "0012",
+        })
+        stock_filter_sql = ""
+        if stock_codes:
+            stock_names: list[str] = []
+            for i, cd in enumerate(stock_codes):
+                key = f"stock_cd_{i}"
+                bind_params[key] = cd
+                stock_names.append(f"%({key})s")
+            stock_filter_sql = f"\n      AND M.{pfx}_Stock_Cd IN ({', '.join(stock_names)})"
+        scope_filter_sql = "\n      AND " + "\n      AND ".join(scope_clauses)
+        sql = f"""
+WITH StockAgg AS (
+    SELECT
+        M.{pfx}_Physic_Cd AS [제품코드_RAW],
+        SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
+                 THEN {in_qty_expr} ELSE 0 END) AS [입고총수량],
+        SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
+                 THEN {out_qty_expr} ELSE 0 END) AS [출고총수량],
+        SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
+                 THEN {in_qty_expr} ELSE 0 END
+          - CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
+                 THEN {out_qty_expr} ELSE 0 END) AS [현재재고수량원본],
+        SUM(CAST(ISNULL(M.{pfx}_In_Supply_Price, 0) AS FLOAT)) AS [입고공급가액합계]
+    FROM {table} AS M WITH (NOLOCK)
+    WHERE M.{pfx}_Stock_YyMm <= %(stock_month_to)s
+      AND M.{pfx}_Io_Gu_Gcode = %(io_gu_gcode)s
+      AND LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql}, {outbound_prefix_sql})
+      {stock_filter_sql}
+      AND EXISTS (
+          SELECT 1
+          FROM dbo.Rddbc040 AS P_SCOPE WITH (NOLOCK)
+          WHERE P_SCOPE.Rd04_Physic_Cd = M.{pfx}_Physic_Cd
+            {scope_filter_sql}
+      )
+    GROUP BY M.{pfx}_Physic_Cd
+)
+SELECT
+    LTRIM(RTRIM(S.[제품코드_RAW])) AS [제품코드],
+    CAST(ISNULL(S.[현재재고수량원본], 0) AS FLOAT) AS [{qty_col}],
+    CAST(CASE WHEN ABS(ISNULL(S.[입고총수량], 0)) > 0
+              THEN ISNULL(S.[입고공급가액합계], 0) / NULLIF(S.[입고총수량], 0)
+              ELSE ISNULL(P.{fallback_unit_col}, 0) END AS FLOAT) AS [{unit_col}],
+    CAST(ISNULL(S.[현재재고수량원본], 0)
+         * CASE WHEN ABS(ISNULL(S.[입고총수량], 0)) > 0
+                THEN ISNULL(S.[입고공급가액합계], 0) / NULLIF(S.[입고총수량], 0)
+                ELSE ISNULL(P.{fallback_unit_col}, 0) END AS FLOAT) AS [{amt_col}]
+FROM StockAgg AS S
+LEFT JOIN dbo.Rddbc040 AS P WITH (NOLOCK)
+    ON S.[제품코드_RAW] = P.Rd04_Physic_Cd
+OPTION (RECOMPILE)
+"""
+        scoped_df = query_to_df(sql, bind_params)
+        if scoped_df is None or scoped_df.empty:
+            return pd.DataFrame()
+        normalized = scoped_df["제품코드"].fillna("").astype(str).str.strip()
+        return scoped_df.loc[normalized.isin(set(codes))].copy()
+
     # The effective size accounts for every non-product parameter in the
     # statement, rather than assuming a fixed product-only chunk size.
     chunk_size = batch_plan["effective_chunk_size"]
-    batches = list(_chunks(codes, chunk_size))
+    batches = [codes] if use_profile_scope_query else list(_chunks(codes, chunk_size))
     frames: list[pd.DataFrame] = []
 
     sql_started_at = time.perf_counter()
@@ -5570,10 +5731,15 @@ OPTION (RECOMPILE)
         source_mode=str(stock_mode or ""),
         input_rows=len(codes),
     ) if measurement is not None else nullcontext({}) as phase_state:
-        for batch in batches:
-            batch_df = _query_batch(batch)
+        if use_profile_scope_query:
+            batch_df = _query_profile_scope()
             if batch_df is not None and not batch_df.empty:
                 frames.append(batch_df)
+        else:
+            for batch in batches:
+                batch_df = _query_batch(batch)
+                if batch_df is not None and not batch_df.empty:
+                    frames.append(batch_df)
         if isinstance(phase_state, dict):
             phase_state["result_rows"] = sum(len(frame) for frame in frames)
             phase_state["result_cols"] = max((len(frame.columns) for frame in frames), default=0)
@@ -5848,7 +6014,23 @@ def get_stock_shortage_df(
     _record_stock_phase("stock_params_prepare", params_started)
 
     universe_started = time.perf_counter()
-    base = sales_forecast_df.copy() if isinstance(sales_forecast_df, pd.DataFrame) else get_sales_forecast_df(params, raw_df=sales_raw_df)
+    forecast_raw = sales_raw_df
+    if (
+        not isinstance(sales_forecast_df, pd.DataFrame)
+        and not isinstance(forecast_raw, pd.DataFrame)
+        and bool(params.get("_order_product_month_forecast"))
+    ):
+        from app.services.dashboard_narrow_sales_candidate_service import (
+            load_order_product_month_sales,
+        )
+
+        forecast_raw = load_order_product_month_sales(params)
+    base = (
+        sales_forecast_df.copy()
+        if isinstance(sales_forecast_df, pd.DataFrame)
+        else get_sales_forecast_df(params, raw_df=forecast_raw)
+    )
+    forecast_attrs = dict(getattr(base, "attrs", {}) or {})
     t_base = time.perf_counter()
     # ``None`` means normal Dashboard scope.  An explicit DataFrame, including
     # an empty one, is a supplier-filtered master universe and must constrain
@@ -5870,6 +6052,7 @@ def get_stock_shortage_df(
             base = universe.copy()
         elif "제품코드" in base.columns:
             base = universe.merge(base, on="제품코드", how="left", suffixes=("", "_sales"))
+            base.attrs.update(forecast_attrs)
     _record_stock_phase("stock_product_universe_prepare", universe_started, input_df=sales_forecast_df if isinstance(sales_forecast_df, pd.DataFrame) else sales_raw_df, result_df=base)
     if base is None or base.empty:
         log.info(
@@ -5899,6 +6082,7 @@ def get_stock_shortage_df(
         stock_cd_list=current_stock_params.get("stock_cd_list"),
         stock_cd=current_stock_params.get("stock_cd"),
         ignored_io_gu_count=ignored_io_count,
+        product_scope_params=current_stock_params,
     )
     t_stock = time.perf_counter()
     log.info(
@@ -6301,6 +6485,12 @@ def get_stock_shortage_df(
     t_done = time.perf_counter()
     out.attrs["stock_shortage_build_ms"] = int((t_done - t_stock) * 1000)
     out.attrs["stock_shortage_total_ms"] = int((t_done - t0) * 1000)
+    out.attrs["forecast_source_rows"] = int(getattr(base, "attrs", {}).get("forecast_source_rows") or 0)
+    out.attrs["forecast_source_sql_ms"] = int(getattr(base, "attrs", {}).get("forecast_source_sql_ms") or 0)
+    out.attrs["forecast_source_query_count"] = int(getattr(base, "attrs", {}).get("forecast_source_query_count") or 0)
+    out.attrs["forecast_source_representation"] = str(
+        getattr(base, "attrs", {}).get("forecast_source_representation") or "legacy"
+    )
     log.info(
         "[analytics.stock_shortage.perf] base_rows=%s stock_rows=%s out_rows=%s base=%.3fs stock=%.3fs build=%.3fs total=%.3fs stock_mode=%s stock_cutoff_month=%s",
         len(base),

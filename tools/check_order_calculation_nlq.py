@@ -1,6 +1,7 @@
 """Offline routing and production-dispatch parity checks; no ERP access."""
 from datetime import date
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import json
 import logging
@@ -10,7 +11,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.erp_table_nlq import resolve_registered_erp_table_nlq, is_order_calculation_request
 from app.services.io_nlq import resolve_io_nlq
 from app.sims.nlq.nlq_router import _try_handle_io_nlq, resolve_new_sims_nlq_candidate
-from app.services.order_calculation_service import get_order_calculation_result
+from app.services.order_calculation_service import (
+    build_manual_validation_evidence,
+    filter_base_by_order_scope,
+    get_order_calculation_result,
+    order_calculation_performance_summary,
+    order_scope_row_matches,
+    write_manual_validation_evidence,
+)
 from tools.check_order_calculation_contract import fixture
 
 
@@ -35,7 +43,156 @@ def staff_fixture():
     return params, sources
 
 
+def _legacy_order_scope_matches(params, supplier):
+    """The pre-early-scope assemble predicate, kept only as a regression oracle."""
+    order_code = str(supplier.get("recent_inbound_vendor_staff_code") or "").strip()
+    order_name = str(supplier.get("recent_inbound_vendor_staff_name") or "").strip()
+    pharma_code = str(supplier.get("manufacturer_staff_code") or "").strip()
+    pharma_name = str(supplier.get("manufacturer_staff_name") or "").strip()
+    vendor_code = str(supplier.get("recent_inbound_vendor_code") or "").strip()
+    vendor_name = str(supplier.get("recent_inbound_vendor_name") or "").strip()
+    order_filter = str(params.get("order_staff_nm") or "").strip()
+    pharma_filter = str(params.get("pharma_staff_nm") or "").strip()
+    return not (
+        (order_filter and order_filter != order_code and order_filter not in order_name)
+        or (pharma_filter and pharma_filter != pharma_code and pharma_filter not in pharma_name)
+        or (params.get("order_vendor_cd") and params["order_vendor_cd"] != vendor_code)
+        or (params.get("order_vendor_nm") and params["order_vendor_nm"] not in vendor_name)
+    )
+
+
+def _assert_early_scope_exact_set():
+    _, sources = staff_fixture()
+    base = sources["base"].copy()
+    base["재고적용처코드"] = "50001"
+    base["단가적용처코드"] = "50002"
+    suppliers = sources["suppliers"]
+    supplier_index = {
+        str(row["product_code"]).strip(): row
+        for row in suppliers.to_dict("records")
+    }
+    cases = (
+        {"order_staff_nm": "신"},
+        {"order_staff_nm": "U002"},
+        {"pharma_staff_nm": "김"},
+        {"pharma_staff_nm": "P001"},
+        {"order_staff_nm": "없는이름"},
+        {"order_staff_nm": "신", "pharma_staff_nm": "이"},
+        {"order_vendor_cd": "V001"},
+        {"order_vendor_nm": "윤정아"},
+        {},
+    )
+    for params in cases:
+        expected = [
+            str(row["제품코드"]).strip()
+            for row in base.to_dict("records")
+            if _legacy_order_scope_matches(params, supplier_index[str(row["제품코드"]).strip()])
+        ]
+        actual = filter_base_by_order_scope(base, suppliers, params)
+        assert actual["제품코드"].astype(str).tolist() == expected, params
+        assert [
+            order_scope_row_matches(params, supplier_index[code]) for code in expected
+        ] == [True] * len(expected), params
+        if expected:
+            assert actual["재고적용처코드"].eq("50001").all()
+            assert actual["단가적용처코드"].eq("50002").all()
+    print("PASS early-scope exact product-set and application-authority preservation; ERP calls 0")
+
+
+def _assert_snapshot_error_precedes_early_scope():
+    sources = {
+        "snapshot": {
+            "meta": {"snapshot_status": "query_error", "snapshot_reason": "fixture_snapshot_failure"},
+            "message": "fixture snapshot failure",
+        }
+    }
+    with TemporaryDirectory() as artifact_dir, \
+         patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+        result = get_order_calculation_result(
+            {"company_id": 7, "order_staff_nm": "김", "_original_question": "제약담당자 김 발주계산",
+             "_order_calculation_diagnostic_dir": artifact_dir},
+            source_loader=lambda _: sources,
+        )
+        artifact_path = Path(result["meta"]["manual_validation_artifact_path"])
+        assert artifact_path.is_file()
+    evidence = result["meta"]["manual_validation_evidence"]
+    assert result["meta"]["snapshot_status"] == "query_error"
+    assert result["meta"]["snapshot_reason"] == "fixture_snapshot_failure"
+    assert evidence["error"] == {
+        "error_stage": "snapshot_validation", "exception_class": "fixture_snapshot_failure",
+        "exception_message": "fixture snapshot failure",
+    }
+    assert evidence["source_call_count"] == 0
+    print("PASS snapshot query_error evidence exits before early-scope source handling; ERP calls 0")
+
+
+def _assert_manual_validation_evidence():
+    frame = pd.DataFrame([
+        {"제품코드": "00002", "발주담당자": "김", "제약담당자": "이", "발주처코드": "V002",
+         "단가적용처": "단가처", "재고적용처": "재고처", "적용 필요예정수량": 4.0, "재고수량": 1,
+         "입고예정수량": 2, "추천 발주수량": 3, "발주단가": 12.50, "발주금액(부가세포함)": 37.5},
+        {"제품코드": "00001", "발주담당자": "김", "제약담당자": "박", "발주처코드": "V001",
+         "단가적용처": "단가처", "재고적용처": "재고처", "적용 필요예정수량": 5, "재고수량": 2,
+         "입고예정수량": 0, "추천 발주수량": 3, "발주단가": 10, "발주금액(부가세포함)": 30},
+    ])
+    common = {
+        "params": {"company_id": 7, "order_date": "2026-09-23", "order_staff_nm": "김",
+                   "_original_question": "발주담당자 김 발주계산"},
+        "sources": {"base": frame, "diagnostic_candidate_product_codes": ["00003", "00001", "00002"],
+                    "diagnostic_scoped_product_codes": ["00002", "00001"],
+                    "diagnostic_stage_evidence": {"early_scope": {"elapsed_ms": 1, "rows": 2, "source_call_count": 0},
+                                                  "forecast_stock": {"elapsed_ms": 2, "rows": 2, "source_call_count": 1}}},
+        "measurement": {"queries": [{"sql": "fixture"}]}, "elapsed_ms": 12.3, "result_status": "success",
+    }
+    evidence = build_manual_validation_evidence(result_frame=frame, **common)
+    reordered = build_manual_validation_evidence(result_frame=frame.iloc[::-1].reset_index(drop=True), **common)
+    assert evidence["canonical_result"]["sha256"] == reordered["canonical_result"]["sha256"]
+    assert evidence["product_sets"]["candidate_product_codes"]["codes"] == ["00001", "00002", "00003"]
+    assert evidence["product_sets"]["scoped_product_codes"]["codes"] == ["00001", "00002"]
+    assert evidence["product_sets"]["final_result_product_codes"]["codes"] == ["00001", "00002"]
+    summary = order_calculation_performance_summary({
+        "snapshot_master": 10, "representative_vendor": 20, "forecast_stock": 30,
+        "current_customer_source": 40, "current_customer_mapping": 2,
+        "order_history_3m_source": 35, "order_history_1y_source": 15, "pending_four_business_days": 60,
+        "prices_code_names": 70, "contract_prices": 80, "post_source_total": 90,
+    })
+    assert summary == {
+        "snapshot_ms": 10.0, "representative_vendor_ms": 20.0, "forecast_stock_ms": 30.0,
+        "current_customer_ms": 42.0, "history_ms": 50.0, "pending_ms": 60.0,
+        "r230_ms": 70.0, "contract_ms": 80.0, "post_source_assembly_ms": 90.0,
+    }
+    with TemporaryDirectory() as artifact_dir:
+        path = Path(write_manual_validation_evidence({"_order_calculation_diagnostic_dir": artifact_dir}, evidence))
+        assert path.is_file()
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["canonical_result"]["sha256"] == evidence["canonical_result"]["sha256"]
+        assert saved["question"] == "발주담당자 김 발주계산"
+    print("PASS canonical/raw-product-set/error diagnostic artifact is deterministic; ERP calls 0")
+
+
+def _assert_r230_scoped_source_call_contract():
+    from app.services import rddbc230_service as r230
+
+    source = pd.DataFrame(
+        [{"제품코드": "00001", "재고위치": "00001", "실입고단가": 100}]
+    )
+    with patch.object(r230, "execute_bound_select", return_value=source) as select:
+        result = r230.get_rddbc230_result(
+            {"order_product_code_list": ["00002", "00001", "00001"]}
+        )
+    assert select.call_count == 1
+    sql, values = select.call_args.args
+    assert "S.Rd23_Physic_Cd IN (?, ?, ?)" in sql
+    assert tuple(values[:3]) == ("00002", "00001", "00001")
+    assert result["meta"]["source_call_count"] == 1
+    print("PASS R230 scoped final-price source has one physical service query; ERP calls 0")
+
+
 def run():
+    _assert_early_scope_exact_set()
+    _assert_snapshot_error_precedes_early_scope()
+    _assert_manual_validation_evidence()
+    _assert_r230_scoped_source_call_contract()
     mode_cases = [
         ('한림 안전재고 5일 적정재고 20일 마감일자 25일 조회구분 해당 발주 계산', '한림', True),
         ('환인 조회구분 발주해당자료만 발주 계산', '환인', True),
@@ -133,15 +290,16 @@ def run():
             assert _try_handle_io_nlq(text, room={}, session_state={}, make_ts=lambda: 'fixture',
                 next_seq=lambda: 1, logger=logging.getLogger('fixture'))
         assert len(requests) == len(sent) == 1
+        assert requests[0]["_original_question"] == text
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
             panel = get_order_calculation_result(requests[0], source_loader=lambda p: sources)
         pd.testing.assert_frame_equal(sent[0]['df'], panel['df'])
         assert sent[0]['meta']['source_call_count'] == 0
 
     staff_cases = {
-        '발주담당자 신민우 발주계산': ['신민우'],
-        '발주담당자 신 발주계산': ['신민우'],
-        '발주담당자 윤 발주계산': ['윤정아'],
+        '발주담당자 신민우 조회구분 전체 발주계산': ['신민우'],
+        '발주담당자 신 조회구분 전체 발주계산': ['신민우'],
+        '발주담당자 윤 조회구분 전체 발주계산': ['윤정아'],
         '발주담당자 없는이름 발주계산': [],
     }
     for text, expected_names in staff_cases.items():
@@ -157,6 +315,7 @@ def run():
                 next_seq=lambda: 1, logger=logging.getLogger('fixture'))
         assert len(requests) == len(sent) == 1
         assert requests[0]['order_staff_nm'] in text
+        assert requests[0]["_original_question"] == text
         if expected_names:
             assert sorted(sent[0]['df']['발주담당자'].drop_duplicates().tolist()) == expected_names
         else:
@@ -180,6 +339,7 @@ def run():
             assert _try_handle_io_nlq(text, room={}, session_state={}, make_ts=lambda: 'fixture',
                 next_seq=lambda: 1, logger=logging.getLogger('fixture'))
         assert requests[0]['pharma_staff_nm'] in text
+        assert requests[0]["_original_question"] == text
         if expected_names:
             assert sorted(sent[0]['df']['제약담당자'].drop_duplicates().tolist()) == expected_names
         else:

@@ -419,12 +419,24 @@ def extract_nlq_natural_period(
         current_day = today
 
     # A user-written absolute date range must win over list-detail defaults.
-    # "YYYYMMDD 이후" is open-ended through the current policy day, not a
-    # same-day lookup and not a rolling-month hint.
+    # Keep the open-ended candidate for a single date such as "20260101 이후",
+    # but never let it consume the first half of an explicit "부터 ... 까지" range.
     open_started = re.search(
         r"((?:19|20)\d{2}(?:\s*[-./]\s*\d{1,2}){2}|(?:19|20)\d{6})\s*(?:이후|부터)",
         raw,
     )
+    absolute_period = _extract_date_range(raw)
+    if (
+        absolute_period.get("date_from")
+        and absolute_period.get("date_to")
+        and absolute_period["date_from"] != absolute_period["date_to"]
+    ):
+        return {
+            "date_from": absolute_period["date_from"],
+            "date_to": absolute_period["date_to"],
+            _NLQ_PERIOD_KIND_KEY: "explicit_period",
+        }
+
     if open_started:
         started = _extract_date_range(open_started.group(1)).get("date_from", "")
         if started:
@@ -434,7 +446,6 @@ def extract_nlq_natural_period(
                 _NLQ_PERIOD_KIND_KEY: "explicit_period",
             }
 
-    absolute_period = _extract_date_range(raw)
     if absolute_period.get("date_from"):
         return {
             "date_from": absolute_period["date_from"],
@@ -452,6 +463,17 @@ def extract_nlq_natural_period(
             "month_from": month_from,
             "month_to": month_to,
             _NLQ_PERIOD_KIND_KEY: "calendar_month" if month_from == month_to else "explicit_period",
+        }
+
+    # Detail actions and product-flow actions share this year contract.  A
+    # standalone year must be explicit, not silently replaced by a rolling
+    # list-detail default after another filter such as a product code exists.
+    explicit_year = _extract_year_range_as_months(raw)
+    if explicit_year.get("month_from"):
+        return {
+            "month_from": explicit_year["month_from"],
+            "month_to": explicit_year.get("month_to") or explicit_year["month_from"],
+            _NLQ_PERIOD_KIND_KEY: "explicit_period",
         }
 
     if re.search(r"(?:최근\s*)?(?:한\s*달|1\s*개월)", raw):
@@ -544,6 +566,7 @@ def strip_nlq_period_expressions(text: str) -> str:
         r"(?:이번|지난)\s*(?:달|월)",
         r"(?<!\d)(?:19|20)\d{4}(?!\d)",
         r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
+        r"(?<!\d)(?:19|20)\d{2}\s*년?(?!\d)",
         r"(?<!\d)\d{1,2}\s*월(?!\s*\d)",
     )
     for pattern in patterns:
@@ -715,6 +738,12 @@ def apply_nlq_default_period_policy(
         return out, policy
 
     if explicit_period_present and action_class != "current_inventory_analysis":
+        # For order lookup a calendar month is still a user-specified order
+        # period, never a list-detail default.  Keep the common month parser
+        # intact while making the action policy explicit for downstream NLQ
+        # provenance and default-overwrite protection.
+        if str(action or "").strip() == "발주조회" and explicit_period_kind == "calendar_month":
+            policy["default_policy"] = "explicit_period"
         return out, policy
 
     if action_class == "explicit_only":

@@ -68,9 +68,10 @@ def view_order_calculation(params=None):
                 application['stock_nm'] = st.text_input("재고위치명", value=str(defaults.get("stock_nm") or ""), key=f"{prefix}_stock_nm").strip()
         submitted = st.form_submit_button("발주 계산", type="primary", width="stretch", on_click=_trigger_panel_run)
     request = {**defaults, **vendor, **product, **application, "order_date": reference.isoformat(),
-               "safety_days": int(safety), "target_days": int(target), "closing_day": int(closing),
-               "only_needed": mode == "발주해당자료만", "staff_nm": staff.strip(),
-               "maker_cd": maker_code.strip(), "query_mode": mode, "_display_context": "panel"}
+                "safety_days": int(safety), "target_days": int(target), "closing_day": int(closing),
+                "only_needed": mode == "발주해당자료만", "staff_nm": staff.strip(),
+                "maker_cd": maker_code.strip(), "query_mode": mode, "_display_context": "panel",
+                "_original_question": "발주 계산 화면 실행"}
     if submitted:
         try:
             def source_loader(query):

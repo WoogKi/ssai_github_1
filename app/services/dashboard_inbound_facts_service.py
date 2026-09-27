@@ -24,6 +24,7 @@ log = logging.getLogger("ssai.sims.dashboard_inbound")
 INBOUND_GCODE = "0012"
 NORMAL_INBOUND_TCODES = ("001", "002")
 INBOUND_RETURN_TCODES = ("101", "102", "193")
+MAX_PRODUCT_SCOPE_BINDS = 1800
 
 
 def _codes(value: Any) -> list[str]:
@@ -39,6 +40,11 @@ def _pairs(value: Any, expected_gcode: str) -> list[str]:
         gcode, sep, tcode = pair.partition(":")
         if sep and gcode == expected_gcode and tcode:
             out.append(tcode)
+        elif not sep:
+            # Production dashboard scope objects expose Tcodes because the
+            # Gcode is fixed by each profile field.  Preserve explicit pair
+            # support while binding those authoritative raw Tcodes as well.
+            out.append(pair)
     return out
 
 
@@ -124,6 +130,9 @@ def _sql(params: Mapping[str, Any], *, start_date: str, cutoff_date: str) -> tup
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Group_Gcode", tcode_column="P.Rd04_Physic_Group", bind_key="product_group", values=params.get("dashboard_product_group_list") or params.get("product_group_list"), expected_gcode="0013")
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Di_Gcode", tcode_column="P.Rd04_Physic_Di", bind_key="product_di", values=params.get("dashboard_product_di_list") or params.get("product_di_list"), expected_gcode="0004")
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Tax_Gcode", tcode_column="P.Rd04_Physic_Tax", bind_key="product_class", values=params.get("dashboard_product_class_list") or params.get("product_class_list"), expected_gcode="0031")
+    scope_codes = sorted(set(_codes(params.get("inbound_product_code_list"))))
+    if 0 < len(scope_codes) <= MAX_PRODUCT_SCOPE_BINDS:
+        _add_in(product_filters, binds, "P.Rd04_Physic_Cd", "inbound_product_code", scope_codes)
 
     transaction_filters = [
         "I.Rd11_Io_Gu_Gcode = '0012'",
@@ -185,6 +194,185 @@ LEFT JOIN dbo.Rddbc060 AS ManufacturerStaff WITH (NOLOCK)
     ON ManufacturerStaff.Rd06_User_Cd = ManufacturerVendor.Rd03_Sales_Man
 WHERE {where_sql}
 """, binds
+
+
+def _scope_authority_sql(
+    params: Mapping[str, Any],
+    *,
+    cutoff_date: str,
+    vendor_lookback_days: int,
+) -> tuple[str, dict[str, Any]]:
+    """Return the representative-vendor authority at product grain.
+
+    Order staff/vendor predicates depend on the winning recent inbound vendor,
+    so they cannot be applied to raw R110 rows.  This query resolves that
+    authority first without transferring the full 365-day event stream.
+    """
+    cutoff = _parse_cutoff(cutoff_date)
+    vendor_start = (cutoff - timedelta(days=max(1, int(vendor_lookback_days)) - 1)).strftime("%Y%m%d")
+    vendor_count_start = (cutoff - timedelta(days=89)).strftime("%Y%m%d")
+    aggregate_start = min(vendor_start, vendor_count_start)
+    binds: dict[str, Any] = {
+        "vendor_start": vendor_start,
+        "vendor_count_start": vendor_count_start,
+        "aggregate_start": aggregate_start,
+        "inbound_cutoff": cutoff.strftime("%Y%m%d"),
+    }
+    product_filters: list[str] = []
+    supplier_scope_sql = build_product_supplier_scope_sql(
+        params, binds, product_code_sql="P.Rd04_Physic_Cd", bind_prefix="inbound_scope_supplier"
+    )
+    if supplier_scope_sql:
+        product_filters.append(supplier_scope_sql)
+    _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Group_Gcode", tcode_column="P.Rd04_Physic_Group", bind_key="scope_product_group", values=params.get("dashboard_product_group_list") or params.get("product_group_list"), expected_gcode="0013")
+    _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Di_Gcode", tcode_column="P.Rd04_Physic_Di", bind_key="scope_product_di", values=params.get("dashboard_product_di_list") or params.get("product_di_list"), expected_gcode="0004")
+    _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Tax_Gcode", tcode_column="P.Rd04_Physic_Tax", bind_key="scope_product_class", values=params.get("dashboard_product_class_list") or params.get("product_class_list"), expected_gcode="0031")
+
+    transaction_filters = [
+        "I.Rd11_Io_Gu_Gcode = '0012'",
+        "I.Rd11_In_YyMmDd >= %(aggregate_start)s",
+        "I.Rd11_In_YyMmDd <= %(inbound_cutoff)s",
+        "I.Rd11_Io_Gu IN ('001', '002')",
+        "COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0",
+        "LTRIM(RTRIM(I.Rd11_Ven_Cd)) <> ''",
+    ]
+    stock_codes = _codes(params.get("stock_cd_list"))
+    if stock_codes:
+        transaction_filters.append("I.Rd11_Stock_Cd_Gcode = '0018'")
+        _add_in(transaction_filters, binds, "I.Rd11_Stock_Cd", "scope_stock_cd", stock_codes)
+    vendor_filters: list[str] = []
+    _add_pair_filter(vendor_filters, binds, gcode_column="FilterVendor.Rd03_Ven_Group_Gcode", tcode_column="FilterVendor.Rd03_Ven_Group", bind_key="scope_vendor_group", values=params.get("vendor_group_list"), expected_gcode="0019")
+    _add_pair_filter(vendor_filters, binds, gcode_column="FilterVendor.Rd03_Ven_Kind_Gcode", tcode_column="FilterVendor.Rd03_Ven_Kind", bind_key="scope_vendor_kind", values=params.get("vendor_kind_list"), expected_gcode="0009")
+    if vendor_filters:
+        transaction_filters.append(
+            "EXISTS (SELECT 1 FROM dbo.Rddbc030 AS FilterVendor WITH (NOLOCK) "
+            "WHERE FilterVendor.Rd03_Ven_Cd = I.Rd11_Ven_Cd AND "
+            + " AND ".join(vendor_filters)
+            + ")"
+        )
+    where_sql = "\n      AND ".join(product_filters) if product_filters else "1 = 1"
+    on_sql = "\n       AND ".join(transaction_filters)
+    return f"""
+WITH ProductUniverse AS (
+    SELECT
+        LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code,
+        LTRIM(RTRIM(P.Rd04_Ven_Cd)) AS manufacturer_vendor_code,
+        LTRIM(RTRIM(ManufacturerVendor.Rd03_Ven_Nm)) AS manufacturer_vendor_name,
+        LTRIM(RTRIM(ManufacturerVendor.Rd03_Sales_Man)) AS manufacturer_staff_code,
+        LTRIM(RTRIM(ManufacturerStaff.Rd06_User_Nm)) AS manufacturer_staff_name,
+        LTRIM(RTRIM(P.Rd04_Orven_Cd)) AS master_order_vendor_code,
+        LTRIM(RTRIM(MasterVendor.Rd03_Ven_Nm)) AS master_order_vendor_name,
+        LTRIM(RTRIM(MasterVendor.Rd03_Sales_Man)) AS master_order_staff_code,
+        LTRIM(RTRIM(MasterStaff.Rd06_User_Nm)) AS master_order_staff_name
+    FROM dbo.Rddbc040 AS P WITH (NOLOCK)
+    LEFT JOIN dbo.Rddbc030 AS MasterVendor WITH (NOLOCK)
+        ON MasterVendor.Rd03_Ven_Cd = P.Rd04_Orven_Cd
+    LEFT JOIN dbo.Rddbc060 AS MasterStaff WITH (NOLOCK)
+        ON MasterStaff.Rd06_User_Cd = MasterVendor.Rd03_Sales_Man
+    LEFT JOIN dbo.Rddbc030 AS ManufacturerVendor WITH (NOLOCK)
+        ON ManufacturerVendor.Rd03_Ven_Cd = P.Rd04_Ven_Cd
+    LEFT JOIN dbo.Rddbc060 AS ManufacturerStaff WITH (NOLOCK)
+        ON ManufacturerStaff.Rd06_User_Cd = ManufacturerVendor.Rd03_Sales_Man
+    WHERE {where_sql}
+), VendorAggregate AS (
+    SELECT
+        U.product_code,
+        LTRIM(RTRIM(I.Rd11_Ven_Cd)) AS vendor_code,
+        SUM(CASE WHEN I.Rd11_In_YyMmDd >= %(vendor_start)s
+                 THEN COALESCE(I.Rd11_Quantity, 0) ELSE 0 END) AS vendor_quantity,
+        SUM(CASE WHEN I.Rd11_In_YyMmDd >= %(vendor_start)s
+                 THEN COALESCE(I.Rd11_Supply_Price, 0) ELSE 0 END) AS vendor_supply_price,
+        MAX(CASE WHEN I.Rd11_In_YyMmDd >= %(vendor_start)s
+                 THEN LTRIM(RTRIM(I.Rd11_In_YyMmDd)) END) AS vendor_last_date,
+        SUM(CASE WHEN I.Rd11_In_YyMmDd >= %(vendor_start)s THEN 1 ELSE 0 END) AS vendor_event_count,
+        SUM(CASE WHEN I.Rd11_In_YyMmDd >= %(vendor_count_start)s THEN 1 ELSE 0 END) AS vendor_count_90_event_count
+    FROM ProductUniverse AS U
+    INNER JOIN dbo.Rddbc110 AS I WITH (NOLOCK)
+        ON I.Rd11_Physic_Cd = U.product_code
+       AND {on_sql}
+    GROUP BY U.product_code, LTRIM(RTRIM(I.Rd11_Ven_Cd))
+), RankedVendor AS (
+    SELECT
+        product_code, vendor_code, vendor_quantity, vendor_supply_price, vendor_last_date,
+        ROW_NUMBER() OVER (
+            PARTITION BY product_code
+            ORDER BY vendor_quantity DESC, vendor_supply_price DESC,
+                     vendor_last_date DESC, vendor_code ASC
+        ) AS vendor_rank
+    FROM VendorAggregate
+    WHERE vendor_event_count > 0
+), VendorCount90 AS (
+    SELECT
+        product_code,
+        SUM(CASE WHEN vendor_count_90_event_count > 0 THEN 1 ELSE 0 END) AS recent_inbound_vendor_count_90
+    FROM VendorAggregate
+    GROUP BY product_code
+)
+SELECT
+    U.product_code,
+    CASE WHEN R.vendor_code IS NOT NULL THEN R.vendor_code
+         ELSE COALESCE(U.master_order_vendor_code, '') END AS recent_inbound_vendor_code,
+    CASE WHEN R.vendor_code IS NOT NULL THEN COALESCE(LTRIM(RTRIM(InboundVendor.Rd03_Ven_Nm)), '')
+         ELSE COALESCE(U.master_order_vendor_name, '') END AS recent_inbound_vendor_name,
+    CASE WHEN R.vendor_code IS NOT NULL THEN COALESCE(LTRIM(RTRIM(InboundVendor.Rd03_Sales_Man)), '')
+         ELSE COALESCE(U.master_order_staff_code, '') END AS recent_inbound_vendor_staff_code,
+    CASE WHEN R.vendor_code IS NOT NULL THEN COALESCE(LTRIM(RTRIM(InboundStaff.Rd06_User_Nm)), '')
+         ELSE COALESCE(U.master_order_staff_name, '') END AS recent_inbound_vendor_staff_name,
+    U.manufacturer_vendor_code,
+    U.manufacturer_vendor_name,
+    U.manufacturer_staff_code,
+    U.manufacturer_staff_name,
+    COALESCE(C.recent_inbound_vendor_count_90, 0) AS recent_inbound_vendor_count_90,
+    CASE WHEN R.vendor_code IS NOT NULL THEN 'actual_inbound'
+         WHEN NULLIF(U.master_order_vendor_code, '') IS NOT NULL THEN 'master_order_vendor'
+         ELSE 'none' END AS recent_inbound_vendor_source
+FROM ProductUniverse AS U
+LEFT JOIN RankedVendor AS R
+    ON R.product_code = U.product_code AND R.vendor_rank = 1
+LEFT JOIN VendorCount90 AS C
+    ON C.product_code = U.product_code
+LEFT JOIN dbo.Rddbc030 AS InboundVendor WITH (NOLOCK)
+    ON InboundVendor.Rd03_Ven_Cd = R.vendor_code
+LEFT JOIN dbo.Rddbc060 AS InboundStaff WITH (NOLOCK)
+    ON InboundStaff.Rd06_User_Cd = InboundVendor.Rd03_Sales_Man
+""", binds
+
+
+def get_dashboard_inbound_scope_authority(
+    params: dict,
+    *,
+    data_cutoff_date: str,
+    vendor_lookback_days: int = 90,
+) -> pd.DataFrame:
+    """Resolve order staff/vendor scope without loading detailed R110 facts."""
+    started = time.perf_counter()
+    sql, binds = _scope_authority_sql(
+        params or {}, cutoff_date=data_cutoff_date, vendor_lookback_days=vendor_lookback_days
+    )
+    query_started = time.perf_counter()
+    authority = query_to_df(sql, binds)
+    query_elapsed_ms = int((time.perf_counter() - query_started) * 1000)
+    if authority is None:
+        authority = pd.DataFrame()
+    source_rows = len(authority)
+    for column in authority.columns:
+        if column != "product_code" and authority[column].dtype == object:
+            authority[column] = authority[column].fillna("").astype(str).str.strip()
+    if "product_code" in authority:
+        authority["product_code"] = authority["product_code"].fillna("").astype(str).str.strip()
+        authority = authority.drop_duplicates("product_code", keep="last").reset_index(drop=True)
+    if "recent_inbound_vendor_count_90" in authority:
+        authority["recent_inbound_vendor_count_90"] = (
+            pd.to_numeric(authority["recent_inbound_vendor_count_90"], errors="coerce").fillna(0).astype(int)
+        )
+    authority.attrs["inbound_scope_authority_rows"] = len(authority)
+    authority.attrs["inbound_scope_authority_elapsed_ms"] = int((time.perf_counter() - started) * 1000)
+    authority.attrs["inbound_source_rows"] = source_rows
+    authority.attrs["inbound_query_elapsed_ms"] = query_elapsed_ms
+    authority.attrs["inbound_query_count"] = 1
+    authority.attrs["inbound_product_scope_sql_mode"] = "profile_compact_authority"
+    authority.attrs["inbound_product_scope_bind_count"] = 0
+    return authority
 
 
 def build_dashboard_inbound_facts_frame(
@@ -449,10 +637,20 @@ def get_dashboard_inbound_facts(
     facts.attrs["inbound_build_elapsed_ms"] = int((time.perf_counter() - build_started) * 1000)
     facts.attrs["inbound_source_elapsed_ms"] = int((time.perf_counter() - started) * 1000)
     facts.attrs["inbound_query_count"] = 1
+    scope_codes = sorted(set(_codes((params or {}).get("inbound_product_code_list"))))
+    facts.attrs["inbound_product_scope_count"] = len(scope_codes)
+    scope_is_bound = 0 < len(scope_codes) <= MAX_PRODUCT_SCOPE_BINDS
+    facts.attrs["inbound_product_scope_sql_mode"] = (
+        "bounded_product_in" if scope_is_bound else "oversized_profile_scope" if scope_codes else "none"
+    )
+    facts.attrs["inbound_product_scope_bind_count"] = len(scope_codes) if scope_is_bound else 0
+    facts.attrs["inbound_product_scope_payload_count"] = len(scope_codes) if scope_is_bound else 0
     facts.attrs["inbound_sql"] = sql
     facts.attrs["inbound_binds"] = dict(binds)
     log.info(
-        "[dashboard.inbound.source] cycle_days=%s vendor_days=%s source_rows=%s product_rows=%s query_elapsed_ms=%s query_count=1 cache_used=False",
-        cycle_days, vendor_days, len(source), len(facts), query_elapsed_ms,
+        "[dashboard.inbound.source] cycle_days=%s vendor_days=%s product_scope_count=%s scope_sql_mode=%s bind_count=%s source_rows=%s product_rows=%s query_elapsed_ms=%s query_count=1 cache_used=False",
+        cycle_days, vendor_days, facts.attrs["inbound_product_scope_count"],
+        facts.attrs["inbound_product_scope_sql_mode"], facts.attrs["inbound_product_scope_bind_count"],
+        len(source), len(facts), query_elapsed_ms,
     )
     return facts

@@ -9,7 +9,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.services.business_calendar_service import is_business_day, recent_business_days
+from app.services.business_calendar_service import is_business_day, next_business_day_on_or_after, recent_business_days
 from app.services.ssai_business_calendar_repository import CalendarAuthorityRead, initial_calendar_years, upsert_official_holiday_years
 from app.services.ssai_korean_holiday_openapi import OfficialSpecialDay, fetch_special_days_for_month, holiday_api_settings, parse_special_day_xml
 
@@ -137,6 +137,20 @@ def main() -> None:
     assert is_business_day(date(2026, 9, 14), calendar_loader=_calendar_loader).is_business_day is False
     assert is_business_day(date(2026, 10, 1), calendar_loader=_calendar_loader).is_business_day is False
     assert is_business_day(date(2026, 9, 7), calendar_loader=_unavailable_loader).status == "unavailable"
+    effective_cases = (
+        (date(2026, 9, 7), "20260907", False, 0),
+        (date(2026, 9, 5), "20260907", True, 2),
+        (date(2026, 9, 6), "20260907", True, 1),
+        (date(2026, 9, 14), "20260915", True, 1),
+        (date(2026, 10, 1), "20261002", True, 1),
+        (date(2026, 10, 31), "20261102", True, 2),
+    )
+    for input_date, expected, shifted, shift_days in effective_cases:
+        resolved = next_business_day_on_or_after(input_date, calendar_loader=_calendar_loader)
+        assert resolved.status == "ready"
+        assert (resolved.effective_date, resolved.shifted, resolved.shift_days) == (expected, shifted, shift_days)
+    unavailable = next_business_day_on_or_after(date(2026, 9, 7), calendar_loader=_unavailable_loader)
+    assert unavailable.status == "unavailable" and unavailable.effective_date == ""
     recent = recent_business_days(base_date=date(2026, 9, 15), count=4, calendar_loader=_calendar_loader)
     assert recent.status == "ready"
     assert recent.dates == ("20260915", "20260911", "20260910", "20260909")

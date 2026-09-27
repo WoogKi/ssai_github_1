@@ -439,3 +439,54 @@ def load_dashboard_narrow_sales_candidate(params: Dict[str, Any]) -> dict[str, A
     manufacturer_reconstruction_ms = int((time.perf_counter() - manufacturer_started) * 1000)
     bundle = build_dashboard_narrow_bundle_from_projections(frames["product_identity"], _sales_facts(frames["product_month_sales"].copy(), frames["product_identity"], manufacturer), frames["purchase_facts"])
     return {"bundle": bundle, "vendor_relation_df": frames["manufacturer_vendor_relation"], "perf": {"representation": "narrow_monthly_v1", "source_mode": meta["source_mode"], "physical_query_count": len(queries), "projection_results": details, "manufacturer_reconstruction_ms": manufacturer_reconstruction_ms, "bundle_assembly_ms": int((time.perf_counter() - assembly_started) * 1000), "elapsed_ms": int((time.perf_counter() - started) * 1000)}}
+
+
+def load_order_product_month_sales(params: Dict[str, Any]) -> pd.DataFrame:
+    """Load only the verified product-month projection used by order demand.
+
+    Order calculation consumes quantity forecast at product-month grain.  It
+    does not consume Dashboard manufacturer, vendor-relation, or purchase
+    projections, so loading those companion projections would add physical
+    queries without changing the order result.
+    """
+    started = time.perf_counter()
+    requested_codes = _dimension_values(params, "order_product_code_list")
+    safe_bind_limit = 2100 - 32
+    full_authority_post_filter = len(requested_codes) > safe_bind_limit
+    query_params = dict(params)
+    if full_authority_post_filter:
+        query_params["order_product_code_list"] = []
+    queries, meta = _queries(query_params)
+    sql, bind = queries["product_month_sales"]
+    measurement = get_active_dashboard_query_measurement()
+    if measurement is not None:
+        with dashboard_measurement_phase(
+            measurement,
+            phase="order_product_month_sales",
+            source="sales",
+            source_mode=meta["source_mode"],
+        ) as state:
+            frame = query_to_df(sql, bind)
+            frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+            state["result_rows"] = len(frame)
+            state["result_cols"] = len(frame.columns)
+    else:
+        frame = query_to_df(sql, bind)
+        frame = frame if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+
+    if full_authority_post_filter and "제품코드" in frame.columns:
+        normalized_codes = frame["제품코드"].fillna("").astype(str).str.strip()
+        frame = frame.loc[normalized_codes.isin(set(requested_codes))].copy()
+    frame.attrs.update({
+        "forecast_source_rows": int(len(frame)),
+        "forecast_source_sql_ms": int((time.perf_counter() - started) * 1000),
+        "forecast_source_query_count": 1,
+        "forecast_source_representation": "product_month_narrow_v1",
+        "forecast_source_representation_reason": "order_product_month_contract",
+        "forecast_product_scope_mode": (
+            "full_authority_post_filter" if full_authority_post_filter else "bounded_product_in"
+            if requested_codes else "full_authority"
+        ),
+        "forecast_product_scope_count": len(requested_codes),
+    })
+    return frame

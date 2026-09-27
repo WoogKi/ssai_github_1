@@ -7,6 +7,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import logging
 import re
+import time
 from typing import Any, Optional
 
 import pandas as pd
@@ -27,6 +28,15 @@ TABLE = "rddbc070"
 HISTORY_ACTION = "계약단가 이력 조회"
 CURRENT_ACTION = "최종 계약단가 조회"
 log = logging.getLogger("ssai.sims.rddbc070")
+
+
+# SQL Server accepts at most 2,100 bound parameters.  R070 deliberately uses
+# only the existing safety margin as its early-IN performance window: actual
+# company-8 evidence showed that an 893-code IN was slower than the one-query
+# compact authority, while a three-code lookup remained beneficial.
+SQL_SERVER_PARAMETER_LIMIT = 2100
+SQL_PARAMETER_SAFETY_MARGIN = 32
+R070_EARLY_PRODUCT_SCOPE_MAX = SQL_PARAMETER_SAFETY_MARGIN
 
 
 _PRICE_COLUMNS: tuple[tuple[str, str], ...] = (
@@ -65,6 +75,11 @@ _CONTRACT_PRICE_COLUMN = {
     ("outbound", "book"): "장부출고단가",
     ("outbound", "otc"): "otc 출고단가",
 }
+
+_ORDER_CONTRACT_PRICE_COLUMNS = (
+    "단가적용거래처", "제품코드", "계약시작일자",
+    *(column for column, _label in _PRICE_COLUMNS),
+)
 
 
 @dataclass(frozen=True)
@@ -296,6 +311,23 @@ LEFT JOIN dbo.Rddbc060 AS MU WITH (NOLOCK)
     ON C.Rd07_Mod_Cd = MU.Rd06_User_Cd
 {_PRODUCT_MASTER_JOINS}
 """.strip()
+
+
+# Order calculation consumes only the latest-grain keys and six contract prices.
+# Keep the registered R070 query above intact for its display/filter authority.
+_ORDER_CONTRACT_PRICE_SELECT_COLUMNS = """
+    LTRIM(RTRIM(CAST(C.Rd07_Cost_Apply_Cd AS VARCHAR(50)))) AS [단가적용거래처],
+    C.Rd07_Physic_Cd AS [제품코드],
+    C.Rd07_Start_Date AS [계약시작일자],
+    C.Rd07_In_Amt AS [실입고단가],
+    C.Rd07_In_Ramt AS [장부입고단가],
+    C.Rd07_In_Oamt AS [otc 입고단가],
+    C.Rd07_Out_Amt AS [실줄고단가],
+    C.Rd07_Out_Ramt AS [장부출고단가],
+    C.Rd07_Out_Oamt AS [otc 출고단가]
+""".strip()
+
+_ORDER_CONTRACT_PRICE_JOINS = "FROM dbo.Rddbc070 AS C WITH (NOLOCK)"
 
 
 def _clean(value: Any) -> str:
@@ -537,6 +569,14 @@ def normalize_rddbc070_params(
         out.pop("as_of", None)
     product_filters = normalize_product_master_filters(out)
     out.update(product_filters)
+    order_product_codes = out.get("order_product_code_list")
+    out["order_product_code_list"] = (
+        sorted({str(code).strip() for code in order_product_codes if str(code).strip()})
+        if isinstance(order_product_codes, (list, tuple, set)) else []
+    )
+    out["_order_contract_projection_only"] = bool(
+        out.get("_order_contract_projection_only")
+    )
     limits = registered_query_limits(out)
     out["display_top"] = limits.display_top
     out["source_top"] = limits.source_top
@@ -558,6 +598,12 @@ def _entity_filters(params: dict[str, Any]) -> tuple[list[str], list[Any]]:
     if _clean(params.get("physic_nm")):
         clauses.append("P.Rd04_Physic_Nm LIKE ?")
         values.append(f"%{_clean(params['physic_nm'])}%")
+    order_product_codes = params.get("order_product_code_list") or []
+    if order_product_codes:
+        clauses.append(
+            "C.Rd07_Physic_Cd IN (" + ", ".join("?" for _ in order_product_codes) + ")"
+        )
+        values.extend(order_product_codes)
     append_product_master_filter_clauses(
         clauses,
         values,
@@ -565,6 +611,74 @@ def _entity_filters(params: dict[str, Any]) -> tuple[list[str], list[Any]]:
         expressions={**_PRODUCT_MASTER_EXPRESSIONS, "physic_cd": "C.Rd07_Physic_Cd"},
     )
     return clauses, values
+
+
+def _use_order_contract_price_minimal_sql(params: dict[str, Any]) -> bool:
+    """Use a join-free R070 path only for the exact order-calculation contract."""
+    return bool(
+        params.get("_order_contract_projection_only")
+        and _clean(params.get("ven_cd"))
+        and not _clean(params.get("ven_nm"))
+        and not _clean(params.get("physic_nm"))
+    )
+
+
+def _order_contract_product_scope_plan(params: dict[str, Any]) -> dict[str, Any]:
+    product_codes = list(params.get("order_product_code_list") or [])
+    # Cost-apply and as-of are always bound by the order-only current query.
+    fixed_bind_count = 2
+    safe_bind_limit = max(
+        0,
+        SQL_SERVER_PARAMETER_LIMIT - fixed_bind_count - SQL_PARAMETER_SAFETY_MARGIN,
+    )
+    early_scope_limit = min(R070_EARLY_PRODUCT_SCOPE_MAX, safe_bind_limit)
+    if not product_codes:
+        strategy = "full_authority"
+    elif len(product_codes) <= early_scope_limit:
+        strategy = "bounded_product_in"
+    else:
+        strategy = "full_authority_post_filter"
+    return {
+        "strategy": strategy,
+        "product_codes": product_codes,
+        "safe_bind_limit": safe_bind_limit,
+        "early_scope_limit": early_scope_limit,
+    }
+
+
+def _order_contract_price_minimal_filters(
+    params: dict[str, Any],
+    *,
+    apply_product_scope: bool = True,
+) -> tuple[list[str], list[Any]]:
+    """Preserve the exact R070 eligibility predicates without display-only joins."""
+    product_codes = list(params.get("order_product_code_list") or [])
+    clauses = [
+        "C.Rd07_Del_Flag <> 'E'",
+        *_GARBAGE_CANDIDATE_SQL,
+        "C.Rd07_Cost_Apply_Cd = ?",
+    ]
+    values: list[Any] = [_clean(params["ven_cd"])]
+    if apply_product_scope and product_codes:
+        clauses.append(
+            "C.Rd07_Physic_Cd IN (" + ", ".join("?" for _ in product_codes) + ")"
+        )
+        values.extend(product_codes)
+    return clauses, values
+
+
+def _filter_order_contract_price_products(
+    frame: pd.DataFrame,
+    product_codes: list[str],
+) -> pd.DataFrame:
+    """Filter an already-latest compact authority by exact normalized code."""
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return frame
+    selected = {str(code).strip() for code in product_codes if str(code).strip()}
+    if not selected:
+        return frame
+    normalized = frame["제품코드"].fillna("").astype(str).str.strip()
+    return frame.loc[normalized.isin(selected)].copy()
 
 
 def _date_filters(params: dict[str, Any], *, alias: str = "C") -> tuple[list[str], list[Any]]:
@@ -583,29 +697,36 @@ def _add_contract_status(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
     out = df.copy()
-    ended_labels: list[str] = []
-    overall: list[str] = []
-    for _, row in out.iterrows():
-        ended: list[str] = []
-        nonzero = 0
-        for column, label in _PRICE_COLUMNS:
-            value = pd.to_numeric(pd.Series([row.get(column)]), errors="coerce").iloc[0]
-            if pd.isna(value):
-                continue
-            if float(value) == 0.0:
-                ended.append(label)
-            else:
-                nonzero += 1
-        ended_labels.append(", ".join(ended))
-        if ended and nonzero == 0:
-            overall.append("계약 종료(전체 단가 0)")
-        elif ended:
-            overall.append("일부 단가 0(해석 미확정)")
-        else:
-            overall.append("단가 있음")
-    out["계약상태"] = overall
+    price_columns = [column for column, _label in _PRICE_COLUMNS if column in out]
+    if not price_columns:
+        out["계약상태"] = "단가 있음"
+        out["종료단가"] = ""
+        return out
+    numeric = out.loc[:, price_columns].apply(pd.to_numeric, errors="coerce")
+    zero = numeric.eq(0)
+    ended_labels = pd.Series("", index=out.index, dtype="object")
+    for column, label in _PRICE_COLUMNS:
+        if column not in zero:
+            continue
+        prefix = ended_labels.mask(ended_labels.eq(""), "").mask(
+            ended_labels.ne(""), ended_labels + ", "
+        )
+        ended_labels = ended_labels.mask(zero[column], prefix + label)
+    has_ended = zero.any(axis=1)
+    nonzero_count = numeric.notna().mul(numeric.ne(0)).sum(axis=1)
+    status = pd.Series("단가 있음", index=out.index, dtype="object")
+    status.loc[has_ended & nonzero_count.eq(0)] = "계약 종료(전체 단가 0)"
+    status.loc[has_ended & nonzero_count.gt(0)] = "일부 단가 0(해석 미확정)"
+    out["계약상태"] = status
     out["종료단가"] = ended_labels
     return out
+
+
+def _order_contract_price_projection(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep only the exact latest-grain price fields used by order calculation."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    return df.loc[:, [column for column in _ORDER_CONTRACT_PRICE_COLUMNS if column in df]].copy()
 
 
 def _prepare_result_projection(df: pd.DataFrame) -> pd.DataFrame:
@@ -638,7 +759,42 @@ ORDER BY C.Rd07_Start_Date DESC, C.Rd07_Cost_Apply_Cd, C.Rd07_Physic_Cd
 
 def get_rddbc070_current_df(params: Optional[dict[str, Any]] = None) -> pd.DataFrame:
     qparams = normalize_rddbc070_params(params, mode="current")
-    clauses, values = _entity_filters(qparams)
+    profile_started = time.perf_counter()
+    profile: dict[str, Any] = {
+        "input_product_code_count": len(qparams.get("order_product_code_list") or []),
+        "cost_apply_code": _clean(qparams.get("ven_cd")),
+    }
+    order_contract_minimal = _use_order_contract_price_minimal_sql(qparams)
+    order_scope_plan: dict[str, Any] = {}
+    if order_contract_minimal:
+        order_scope_plan = _order_contract_product_scope_plan(qparams)
+        scope_strategy = str(order_scope_plan["strategy"])
+        clauses, values = _order_contract_price_minimal_filters(
+            qparams,
+            apply_product_scope=scope_strategy == "bounded_product_in",
+        )
+        select_columns = _ORDER_CONTRACT_PRICE_SELECT_COLUMNS
+        joins = _ORDER_CONTRACT_PRICE_JOINS
+        profile["r070_sql_mode"] = {
+            "bounded_product_in": "order_contract_minimal_bounded_product_in",
+            "full_authority_post_filter": "order_contract_minimal_full_authority_post_filter",
+            "full_authority": "order_contract_minimal_full_authority",
+        }[scope_strategy]
+        profile["r070_sql_tables"] = ["Rddbc070"]
+        profile["latest_selection_mode"] = "eligible_max_start_then_tie_rank"
+        profile["product_scope_strategy"] = scope_strategy
+        profile["product_scope_safe_bind_limit"] = int(order_scope_plan["safe_bind_limit"])
+        profile["product_scope_early_in_limit"] = int(order_scope_plan["early_scope_limit"])
+        profile["product_scope_bind_count"] = (
+            len(order_scope_plan["product_codes"])
+            if scope_strategy == "bounded_product_in" else 0
+        )
+    else:
+        clauses, values = _entity_filters(qparams)
+        select_columns = _SELECT_COLUMNS
+        joins = _JOINS
+        profile["r070_sql_mode"] = "registered_r070_full"
+        profile["r070_sql_tables"] = ["Rddbc070", "Rddbc030", "Rddbc040", "Rddbc060", "Rddbc010"]
     clauses.append("C.Rd07_Start_Date <= ?")
     values.append(qparams["as_of"])
     outer_clauses = ["R.__rn = 1"]
@@ -648,15 +804,46 @@ def get_rddbc070_current_df(params: Optional[dict[str, Any]] = None) -> pd.DataF
     if qparams.get("date_to"):
         outer_clauses.append("R.[계약시작일자] <= ?")
         values.append(qparams["date_to"])
-    sql = f"""
-WITH R AS (
+    if order_contract_minimal:
+        sql = f"""
+WITH LatestStart AS (
     SELECT
-{_SELECT_COLUMNS},
+        C.Rd07_Cost_Apply_Cd,
+        C.Rd07_Physic_Cd,
+        MAX(C.Rd07_Start_Date) AS Rd07_Start_Date
+    FROM dbo.Rddbc070 AS C WITH (NOLOCK)
+    WHERE {' AND '.join(clauses)}
+    GROUP BY C.Rd07_Cost_Apply_Cd, C.Rd07_Physic_Cd
+),
+R AS (
+    SELECT
+{select_columns},
         ROW_NUMBER() OVER (
             PARTITION BY C.Rd07_Cost_Apply_Cd, C.Rd07_Physic_Cd
             ORDER BY C.Rd07_Start_Date DESC
         ) AS __rn
-    {_JOINS}
+    {joins}
+    INNER JOIN LatestStart AS L
+        ON C.Rd07_Cost_Apply_Cd = L.Rd07_Cost_Apply_Cd
+       AND C.Rd07_Physic_Cd = L.Rd07_Physic_Cd
+       AND C.Rd07_Start_Date = L.Rd07_Start_Date
+)
+SELECT TOP {int(qparams['top'])}
+    R.*
+FROM R
+WHERE {' AND '.join(outer_clauses)}
+ORDER BY R.[단가적용거래처], R.[제품코드]
+""".strip()
+    else:
+        sql = f"""
+WITH R AS (
+    SELECT
+{select_columns},
+        ROW_NUMBER() OVER (
+            PARTITION BY C.Rd07_Cost_Apply_Cd, C.Rd07_Physic_Cd
+            ORDER BY C.Rd07_Start_Date DESC
+        ) AS __rn
+    {joins}
     WHERE {' AND '.join(clauses)}
 )
 SELECT TOP {int(qparams['top'])}
@@ -665,10 +852,61 @@ FROM R
 WHERE {' AND '.join(outer_clauses)}
 ORDER BY R.[단가적용거래처], R.[제품코드]
 """.strip()
+    fetch_started = time.perf_counter()
     df = execute_bound_select(sql, values)
+    profile["r070_sql_fetch_ms"] = round((time.perf_counter() - fetch_started) * 1000, 3)
+    profile["r070_sql_rows"] = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    if (
+        order_contract_minimal
+        and order_scope_plan.get("strategy") == "full_authority_post_filter"
+        and isinstance(df, pd.DataFrame)
+        and len(df) >= int(qparams["top"])
+    ):
+        raise ValueError("R070 compact authority가 source 안전 한도에 도달해 대량 제품 범위를 검증할 수 없습니다.")
+    normalize_started = time.perf_counter()
     if isinstance(df, pd.DataFrame) and "__rn" in df.columns:
         df = df.drop(columns=["__rn"])
-    return _prepare_result_projection(df)
+    profile["pre_product_filter_rows"] = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    filter_started = time.perf_counter()
+    if (
+        order_contract_minimal
+        and order_scope_plan.get("strategy") == "full_authority_post_filter"
+    ):
+        df = _filter_order_contract_price_products(
+            df,
+            list(order_scope_plan.get("product_codes") or []),
+        )
+    profile["product_scope_filter_ms"] = round((time.perf_counter() - filter_started) * 1000, 3)
+    profile["post_product_filter_rows"] = int(len(df)) if isinstance(df, pd.DataFrame) else 0
+    profile["result_dataframe_normalize_ms"] = round((time.perf_counter() - normalize_started) * 1000, 3)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        empty = df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        empty.attrs["order_contract_price_profile"] = profile
+        return empty
+    latest_started = time.perf_counter()
+    keys = df.loc[:, [column for column in ("단가적용거래처", "제품코드") if column in df]]
+    profile["latest_duplicate_count"] = int(len(keys) - len(keys.drop_duplicates()))
+    profile["unique_key_count"] = int(len(keys.drop_duplicates()))
+    profile["latest_duplicate_handling_ms"] = round((time.perf_counter() - latest_started) * 1000, 3)
+    profile["input_shape"] = list(df.shape)
+    finalize_started = time.perf_counter()
+    if qparams.get("_order_contract_projection_only"):
+        out = _order_contract_price_projection(df)
+        profile["projection_mode"] = "order_contract_price_only"
+        profile["contract_status_mode"] = "not_required_by_order_calculation"
+    else:
+        out = _prepare_result_projection(df)
+        profile["projection_mode"] = "registered_r070_full"
+        profile["contract_status_mode"] = "registered_r070_display"
+    profile["final_price_dataframe_ms"] = round((time.perf_counter() - finalize_started) * 1000, 3)
+    profile["code_name_normalize_ms"] = 0.0
+    profile["cost_apply_mapping_ms"] = 0.0
+    profile["output_shape"] = list(out.shape)
+    profile["total_python_ms"] = round((time.perf_counter() - profile_started) * 1000 - profile["r070_sql_fetch_ms"], 3)
+    out.attrs["order_contract_price_profile"] = profile
+    if qparams.get("_order_contract_projection_only"):
+        log.info("[order_calculation.perf] contract_prices_profile=%s", profile)
+    return out
 
 
 def _query_summary(params: dict[str, Any], *, mode: str, row_count: int, df: pd.DataFrame) -> str:

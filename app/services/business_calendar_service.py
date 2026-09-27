@@ -36,6 +36,17 @@ class BusinessDayResult:
 
 
 @dataclass(frozen=True)
+class EffectiveBusinessDayResult:
+    status: str
+    input_date: str
+    effective_date: str = ""
+    shifted: bool = False
+    shift_days: int = 0
+    reason_code: str = ""
+    authority: str = "ssai_common_calendar"
+
+
+@dataclass(frozen=True)
 class RecentBusinessDaysResult:
     status: str
     dates: tuple[str, ...] = ()
@@ -81,6 +92,50 @@ def is_business_day(
         return BusinessDayResult(status="unavailable", reason_code=authority.reason_code, authority=authority.authority)
     value = target_date.weekday() < 5 and _yyyymmdd(target_date) not in authority.holiday_dates
     return BusinessDayResult(status="ready", is_business_day=value, authority=authority.authority)
+
+
+def next_business_day_on_or_after(
+    input_date: date,
+    *,
+    calendar_loader: CalendarLoader = load_official_holidays,
+    lookahead_days: int = 62,
+) -> EffectiveBusinessDayResult:
+    """Resolve the first official business day on or after ``input_date``."""
+    window = max(1, int(lookahead_days))
+    upper = input_date + timedelta(days=window)
+    authority = _official_calendar(
+        start_date=input_date,
+        end_date=upper,
+        calendar_loader=calendar_loader,
+    )
+    input_key = _yyyymmdd(input_date)
+    if authority.status != "ready":
+        return EffectiveBusinessDayResult(
+            status="unavailable",
+            input_date=input_key,
+            reason_code=authority.reason_code,
+            authority=authority.authority,
+        )
+    cursor = input_date
+    while cursor <= upper:
+        key = _yyyymmdd(cursor)
+        if cursor.weekday() < 5 and key not in authority.holiday_dates:
+            shift_days = (cursor - input_date).days
+            return EffectiveBusinessDayResult(
+                status="ready",
+                input_date=input_key,
+                effective_date=key,
+                shifted=shift_days > 0,
+                shift_days=shift_days,
+                authority=authority.authority,
+            )
+        cursor += timedelta(days=1)
+    return EffectiveBusinessDayResult(
+        status="unavailable",
+        input_date=input_key,
+        reason_code="calendar_lookahead_insufficient",
+        authority=authority.authority,
+    )
 
 
 def recent_business_days(

@@ -114,6 +114,44 @@ LEFT JOIN dbo.Rddbc060 AS U ON H.Rd17_DamDang = U.Rd06_User_Cd
 {_PRODUCT_JOINS}
 """.strip()
 
+# Price fallback needs only the R170/R180 detail grain.  Keep this separate
+# from the user-facing order lookup so its projection never inherits names or
+# product-master joins used exclusively for display and NLQ filters.
+_ORDER_PRICE_HISTORY_MINIMAL_COLUMNS = """
+    RTRIM(H.Rd17_Or_YyMmDd) AS [발주일자],
+    RTRIM(D.Rd18_Physic_Cd) AS [제품코드],
+    RTRIM(D.Rd18_Cost_Apply_Cd) AS [단가적용처코드],
+    D.Rd18_Unit_Cost AS [단가],
+    RTRIM(D.Rd18_Or_Di) AS [발주상태코드],
+    RTRIM(D.Rd18_OrVen_Cd) AS [발주거래처코드],
+    D.Rd18_Or_Seq AS [발주순번],
+    D.Rd18_Orsub_Seq AS [상세순번]
+""".strip()
+
+_ORDER_PRICE_HISTORY_MINIMAL_OUTPUT_COLUMNS = """
+    [발주일자], [제품코드], [단가적용처코드], [단가],
+    [발주상태코드], [발주거래처코드], [발주순번], [상세순번]
+""".strip()
+
+_ORDER_PRICE_HISTORY_MINIMAL_JOINS = """
+FROM dbo.Rddbc180 AS D
+INNER JOIN dbo.Rddbc170 AS H
+    ON H.Rd17_Or_YyMmDd = D.Rd18_Or_YyMmDd
+   AND H.Rd17_Orven_Cd = D.Rd18_OrVen_Cd
+   AND H.Rd17_Or_Seq = D.Rd18_Or_Seq
+""".strip()
+
+_ORDER_UNIT_HISTORY_MINIMAL_COLUMNS = """
+    RTRIM(H.Rd17_Or_YyMmDd) AS [발주일자],
+    RTRIM(D.Rd18_OrVen_Cd) AS [발주거래처코드],
+    RTRIM(D.Rd18_Physic_Cd) AS [제품코드],
+    D.Rd18_Quantity AS [발주수량],
+    D.Rd18_Or_Seq AS [발주순번],
+    D.Rd18_Orsub_Seq AS [상세순번]
+""".strip()
+
+_ORDER_PRICE_SCOPE_MAX_CODES = 200
+
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
@@ -210,6 +248,9 @@ def normalize_order_params(params: Optional[dict[str, Any]] = None, *, mode: str
     if len(out["status_codes"]) == 1:
         out["status_code"] = out["status_codes"][0]
     out["stock_cd_list"] = _clean_codes(source.get("stock_cd_list") or source.get("stock_cds"))
+    out["order_price_product_code_list"] = _clean_codes(source.get("order_price_product_code_list"))
+    out["_order_price_history_minimal"] = bool(source.get("_order_price_history_minimal", False))
+    out["_order_unit_history_minimal"] = bool(source.get("_order_unit_history_minimal", False))
     out["include_blank_stock_cd"] = bool(source.get("include_blank_stock_cd", False))
     if mode == "order":
         out["date_from"] = _date_value(source.get("date_from"), default=(today - timedelta(days=30)).strftime("%Y%m%d"))
@@ -240,6 +281,10 @@ def normalize_order_params(params: Optional[dict[str, Any]] = None, *, mode: str
 
 
 def _filters(params: dict[str, Any], *, mode: str) -> tuple[list[str], list[Any]]:
+    if mode == "order" and params.get("_order_price_history_minimal"):
+        return _order_price_history_minimal_filters(params)
+    if mode == "order" and _use_order_unit_history_minimal(params):
+        return _order_unit_history_minimal_filters(params)
     clauses = [_NORMAL_ORDER_PREDICATE]
     values: list[Any] = []
     if mode == "expected":
@@ -263,6 +308,11 @@ def _filters(params: dict[str, Any], *, mode: str) -> tuple[list[str], list[Any]
     else:
         clauses.extend(("H.Rd17_Or_YyMmDd >= ?", "H.Rd17_Or_YyMmDd <= ?"))
         values.extend((params["date_from"], params["date_to"]))
+        if params.get("_order_price_history"):
+            # Order calculation price history accepts only the established normal states.
+            status_codes = _order_status_codes(params.get("status_codes")) or ("1", "2", "3")
+            clauses.append(f"D.Rd18_Or_Di IN ({','.join('?' for _ in status_codes)})")
+            values.extend(status_codes)
     exact = (
         ("order_vendor_cd", "D.Rd18_OrVen_Cd"),
         ("cost_apply_cd", "D.Rd18_Cost_Apply_Cd"), ("stock_apply_cd", "D.Rd18_Stock_Apply_Cd"),
@@ -317,6 +367,82 @@ def _filters(params: dict[str, Any], *, mode: str) -> tuple[list[str], list[Any]
     return clauses, values
 
 
+def _order_price_history_minimal_filters(params: dict[str, Any]) -> tuple[list[str], list[Any]]:
+    """Filters whose aliases are available in the R170/R180-only price path."""
+    clauses = [
+        _NORMAL_ORDER_PREDICATE,
+        "H.Rd17_Or_YyMmDd >= ?",
+        "H.Rd17_Or_YyMmDd <= ?",
+    ]
+    values: list[Any] = [params["date_from"], params["date_to"]]
+    status_codes = _order_status_codes(params.get("status_codes")) or ("1", "2", "3")
+    clauses.append(f"D.Rd18_Or_Di IN ({','.join('?' for _ in status_codes)})")
+    values.extend(status_codes)
+    # Price fallback cannot use zero or blank prices. Filtering here preserves
+    # the existing "latest positive normal order" selection contract.
+    clauses.append("D.Rd18_Unit_Cost > 0")
+    if params.get("cost_apply_cd"):
+        clauses.append("D.Rd18_Cost_Apply_Cd = ?")
+        values.append(params["cost_apply_cd"])
+    product_codes = _clean_codes(params.get("order_price_product_code_list"))
+    if product_codes and len(product_codes) <= _ORDER_PRICE_SCOPE_MAX_CODES:
+        clauses.append(
+            "D.Rd18_Physic_Cd IN (" + ",".join("?" for _ in product_codes) + ")"
+        )
+        values.extend(product_codes)
+    return clauses, values
+
+
+def _use_order_unit_history_minimal(params: dict[str, Any]) -> bool:
+    """Keep display/name filters on the registered query and optimize exact-code full scope only."""
+    unsupported = (
+        "physic_cd", "physic_nm", "order_vendor_nm", "cost_apply_nm", "stock_apply_nm", "stock_nm",
+        "expected_vendor_nm", "real_vendor_nm", "order_staff_nm", "pharma_staff_nm",
+        "maker_cd", "maker_nm", "product_keyword", "insu_cd", "barcode",
+        "product_group_nm", "product_di_nm", "product_di_semantic_group", "product_class_nm",
+        "product_unit_price", "product_final_price_date", "product_add_user_nm", "product_mod_user_nm",
+        "product_add_date_from", "product_add_date_to", "product_mod_date_from", "product_mod_date_to",
+    )
+    return bool(
+        params.get("_order_unit_history_minimal")
+        and not any(_clean(params.get(key)) for key in unsupported)
+        and not params.get("has_outstanding")
+        and not params.get("due_date_from")
+        and not params.get("due_date_to")
+    )
+
+
+def _order_unit_history_minimal_filters(params: dict[str, Any]) -> tuple[list[str], list[Any]]:
+    """Preserve the full-scope unit-inference filters using only R170/R180 columns."""
+    clauses = [
+        _NORMAL_ORDER_PREDICATE,
+        "H.Rd17_Or_YyMmDd >= ?",
+        "H.Rd17_Or_YyMmDd <= ?",
+    ]
+    values: list[Any] = [params["date_from"], params["date_to"]]
+    for key, expression in (
+        ("order_vendor_cd", "D.Rd18_OrVen_Cd"),
+        ("cost_apply_cd", "D.Rd18_Cost_Apply_Cd"),
+        ("stock_apply_cd", "D.Rd18_Stock_Apply_Cd"),
+        ("expected_vendor_cd", "D.Rd18_Pro_Ven_Cd"),
+        ("real_vendor_cd", "D.Rd18_Real_Ven_Cd"),
+    ):
+        if params.get(key):
+            clauses.append(f"{expression} = ?")
+            values.append(params[key])
+    stock_codes = _clean_codes(params.get("stock_cd_list"))
+    if stock_codes:
+        stock_clause = f"D.Rd18_Stock_Cd IN ({','.join('?' for _ in stock_codes)})"
+        if params.get("include_blank_stock_cd"):
+            stock_clause = f"({stock_clause} OR NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL)"
+        clauses.append(stock_clause)
+        values.extend(stock_codes)
+    elif params.get("stock_cd"):
+        clauses.append("D.Rd18_Stock_Cd = ?")
+        values.append(params["stock_cd"])
+    return clauses, values
+
+
 def _prepare(df: pd.DataFrame, *, mode: str) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
@@ -333,8 +459,45 @@ def _prepare(df: pd.DataFrame, *, mode: str) -> pd.DataFrame:
 def get_order_df(params: Optional[dict[str, Any]] = None, *, mode: str = "order") -> pd.DataFrame:
     qparams = normalize_order_params(params, mode=mode)
     clauses, values = _filters(qparams, mode=mode)
-    sql = f"""SELECT TOP {int(qparams['top'])}\n{_SELECT_COLUMNS}\n{_JOINS}\nWHERE {' AND '.join(clauses)}\nORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"""
-    return _prepare(execute_bound_select(sql, values), mode=mode)
+    minimal_history = mode == "order" and qparams.get("_order_price_history_minimal")
+    minimal_unit_history = mode == "order" and _use_order_unit_history_minimal(qparams)
+    if minimal_history:
+        sql = f"""WITH PriceHistory AS (
+SELECT
+{_ORDER_PRICE_HISTORY_MINIMAL_COLUMNS},
+    ROW_NUMBER() OVER (
+        PARTITION BY D.Rd18_Physic_Cd, D.Rd18_Cost_Apply_Cd
+        ORDER BY H.Rd17_Or_YyMmDd DESC, D.Rd18_OrVen_Cd, D.Rd18_Or_Seq, D.Rd18_Orsub_Seq
+    ) AS [__order_price_rank]
+{_ORDER_PRICE_HISTORY_MINIMAL_JOINS}
+WHERE {' AND '.join(clauses)}
+)
+SELECT TOP {int(qparams['top'])}
+{_ORDER_PRICE_HISTORY_MINIMAL_OUTPUT_COLUMNS}
+FROM PriceHistory
+WHERE [__order_price_rank] = 1
+ORDER BY [발주일자] DESC, [발주거래처코드], [발주순번], [상세순번]"""
+    elif minimal_unit_history:
+        sql = f"""SELECT TOP {int(qparams['top'])}
+{_ORDER_UNIT_HISTORY_MINIMAL_COLUMNS}
+{_ORDER_PRICE_HISTORY_MINIMAL_JOINS}
+WHERE {' AND '.join(clauses)}
+ORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"""
+    else:
+        sql = f"""SELECT TOP {int(qparams['top'])}\n{_SELECT_COLUMNS}\n{_JOINS}\nWHERE {' AND '.join(clauses)}\nORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"""
+    out = _prepare(execute_bound_select(sql, values), mode=mode)
+    if isinstance(out, pd.DataFrame):
+        out.attrs["order_history_query_mode"] = (
+            "price_fallback_bounded_minimal" if minimal_history
+            else "unit_inference_r170_r180_minimal" if minimal_unit_history
+            else "registered_order_display"
+        )
+        out.attrs["order_price_scope_bind_count"] = (
+            len(qparams.get("order_price_product_code_list") or ())
+            if minimal_history and len(qparams.get("order_price_product_code_list") or ()) <= _ORDER_PRICE_SCOPE_MAX_CODES
+            else 0
+        )
+    return out
 
 
 def get_expected_inbound_product_totals(
