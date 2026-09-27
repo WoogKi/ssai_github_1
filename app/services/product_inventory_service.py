@@ -43,6 +43,7 @@ log = logging.getLogger("ssai")
 
 SQL_SERVER_PARAMETER_LIMIT = 2100
 SQL_PARAMETER_SAFETY_MARGIN = 32
+UNLABELED_NAME_SCOPE_LIMIT = 1800
 
 
 # -----------------------------------------------------------------------------
@@ -586,6 +587,7 @@ def _resolve_frequency_snapshot_grade_product_scope(
         "snapshot_status": "",
         "snapshot_reason": "",
         "fallback_reason": "",
+        "_attachment_cache": None,
     }
     if not grade:
         meta["fallback_reason"] = "frequency_grade_missing"
@@ -631,13 +633,9 @@ def _resolve_frequency_snapshot_grade_product_scope(
     meta["snapshot_status"] = clean_text(projection.status)
     meta["snapshot_reason"] = clean_text(projection.reason)
     if projection.usable:
-        product_codes = list(
-            dict.fromkeys(
-                clean_text(row.get("product_code"))
-                for row in projection.rows
-                if clean_text(row.get("product_code"))
-            )
-        )
+        frequency_rows = tuple(dict(row) for row in projection.rows)
+        generation_no = projection.generation_no
+        checksum = clean_text(projection.checksum)
     elif projection.status == "legacy":
         snapshot_kwargs = {
             "company_id": company_id,
@@ -654,22 +652,42 @@ def _resolve_frequency_snapshot_grade_product_scope(
         if not snapshot.usable:
             meta["fallback_reason"] = f"snapshot_{clean_text(snapshot.status) or 'missing'}"
             return [], meta
-        product_codes = list(
-            dict.fromkeys(
-                clean_text(row.get("product_code"))
-                for row in list((snapshot.payload or {}).get("product_frequency") or [])
-                if isinstance(row, Mapping)
-                and clean_text(row.get("frequency_grade")) == grade
-                and clean_text(row.get("product_code"))
-            )
+        frequency_rows = tuple(
+            dict(row)
+            for row in list((snapshot.payload or {}).get("product_frequency") or [])
+            if isinstance(row, Mapping)
+            and clean_text(row.get("frequency_grade")) == grade
+            and clean_text(row.get("product_code"))
         )
+        generation_no = snapshot.generation_no
+        checksum = clean_text(snapshot.checksum)
     else:
         meta["fallback_reason"] = f"projection_{clean_text(projection.status) or 'missing'}"
         return [], meta
 
+    product_codes = list(
+        dict.fromkeys(
+            clean_text(row.get("product_code"))
+            for row in frequency_rows
+            if clean_text(row.get("product_code"))
+        )
+    )
     meta["product_code_count"] = len(product_codes)
     if not product_codes:
         meta["fallback_reason"] = f"snapshot_grade_{grade.lower()}_empty"
+    else:
+        meta["_attachment_cache"] = {
+            "company_id": company_id,
+            "evaluation_month": evaluation_month,
+            "as_of_date": as_of_date or "",
+            "requested_grade": grade,
+            "stock_codes": tuple(scope.stock_codes),
+            "rows": frequency_rows,
+            "snapshot_status": clean_text(meta.get("snapshot_status")),
+            "snapshot_reason": clean_text(meta.get("snapshot_reason")),
+            "generation_no": generation_no,
+            "checksum": checksum,
+        }
     return product_codes, meta
 
 
@@ -715,76 +733,103 @@ def attach_dashboard_frequency_snapshot(
         "frequency_snapshot_checksum": "",
         "frequency_missing_product_count": len(detail_product_codes),
         "frequency_additional_erp_source_call_count": 0,
+        "frequency_snapshot_request_cache_used": False,
     }
     if not detail_mask.any() or context_reason:
         if detail_mask.any():
             out.loc[detail_mask, _FREQUENCY_GRADE_COLUMN] = FREQUENCY_INSUFFICIENT_GRADE
         return _place_frequency_columns(out), base_meta
 
-    try:
-        scope = profile_scope_resolver(company_id=company_id)
-        requested_codes = product_codes.loc[detail_mask].drop_duplicates().tolist()
-        active_projection_reader = projection_reader
-        if active_projection_reader is None and snapshot_reader is read_approved_frequency_snapshot:
-            active_projection_reader = read_approved_frequency_projection
-        as_of_date = _frequency_snapshot_as_of_date(params)
-        projection_kwargs = {
-            "company_id": company_id,
-            "evaluation_month": evaluation_month,
-            "stock_codes": list(scope.stock_codes),
-            "product_codes": requested_codes,
-        }
-        if active_projection_reader is read_approved_frequency_projection and as_of_date:
-            projection_kwargs["as_of_date"] = as_of_date
-        if active_projection_reader is read_approved_frequency_projection:
-            projection_kwargs.update(
-                product_group_codes=list(scope.product_group_codes),
-                product_di_codes=list(scope.product_di_codes),
-                product_class_codes=list(scope.product_class_codes),
-                stock_mode=scope.stock_mode,
-            )
-        projection = (
-            active_projection_reader(**projection_kwargs)
-            if active_projection_reader is not None
-            else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
-        )
-        if projection.usable:
-            frequency_rows = list(projection.rows)
-            snapshot_status = projection.status
-            snapshot_reason = projection.reason
-            snapshot_generation_no = projection.generation_no
-            snapshot_checksum = projection.checksum
-        elif projection.status == "legacy":
-            snapshot_kwargs = {
+    requested_codes = product_codes.loc[detail_mask].drop_duplicates().tolist()
+    request_cache = params.get("_frequency_snapshot_grade_scope_cache")
+    cache_rows = tuple(request_cache.get("rows") or ()) if isinstance(request_cache, Mapping) else ()
+    cache_product_codes = {
+        clean_text(row.get("product_code"))
+        for row in cache_rows
+        if isinstance(row, Mapping) and clean_text(row.get("product_code"))
+    }
+    cache_matches = bool(
+        isinstance(request_cache, Mapping)
+        and request_cache.get("company_id") == company_id
+        and clean_text(request_cache.get("evaluation_month")) == evaluation_month
+        and clean_text(request_cache.get("as_of_date")) == clean_text(_frequency_snapshot_as_of_date(params))
+        and _normalize_product_inventory_frequency_filter(request_cache.get("requested_grade"))
+        == _normalize_product_inventory_frequency_filter(params.get("frequency_grade"))
+        and set(requested_codes).issubset(cache_product_codes)
+    )
+    if cache_matches:
+        frequency_rows = [row for row in cache_rows if clean_text(row.get("product_code")) in set(requested_codes)]
+        snapshot_status = clean_text(request_cache.get("snapshot_status"))
+        snapshot_reason = clean_text(request_cache.get("snapshot_reason"))
+        snapshot_generation_no = request_cache.get("generation_no")
+        snapshot_checksum = clean_text(request_cache.get("checksum"))
+        snapshot_scope_codes = list(request_cache.get("stock_codes") or ())
+        base_meta["frequency_snapshot_request_cache_used"] = True
+    else:
+        try:
+            scope = profile_scope_resolver(company_id=company_id)
+            snapshot_scope_codes = list(scope.stock_codes)
+            active_projection_reader = projection_reader
+            if active_projection_reader is None and snapshot_reader is read_approved_frequency_snapshot:
+                active_projection_reader = read_approved_frequency_projection
+            as_of_date = _frequency_snapshot_as_of_date(params)
+            projection_kwargs = {
                 "company_id": company_id,
                 "evaluation_month": evaluation_month,
                 "stock_codes": list(scope.stock_codes),
+                "product_codes": requested_codes,
             }
-            if snapshot_reader is read_approved_frequency_snapshot and as_of_date:
-                snapshot_kwargs["as_of_date"] = as_of_date
-            snapshot = snapshot_reader(**snapshot_kwargs)
-            frequency_rows = frequency_rows_for_product_subset(snapshot, requested_codes)
-            snapshot_status = str(snapshot.status or "missing")
-            snapshot_reason = str(snapshot.reason or "")
-            snapshot_generation_no = snapshot.generation_no
-            snapshot_checksum = str(snapshot.checksum or "")
-        else:
-            frequency_rows = []
-            snapshot_status = str(projection.status or "missing")
-            snapshot_reason = str(projection.reason or "")
-            snapshot_generation_no = projection.generation_no
-            snapshot_checksum = str(projection.checksum or "")
-    except Exception as exc:
-        base_meta["frequency_snapshot_reason"] = f"frequency_snapshot_unavailable:{type(exc).__name__}"
-        out.loc[detail_mask, _FREQUENCY_GRADE_COLUMN] = FREQUENCY_INSUFFICIENT_GRADE
-        return _place_frequency_columns(out), base_meta
+            if active_projection_reader is read_approved_frequency_projection and as_of_date:
+                projection_kwargs["as_of_date"] = as_of_date
+            if active_projection_reader is read_approved_frequency_projection:
+                projection_kwargs.update(
+                    product_group_codes=list(scope.product_group_codes),
+                    product_di_codes=list(scope.product_di_codes),
+                    product_class_codes=list(scope.product_class_codes),
+                    stock_mode=scope.stock_mode,
+                )
+            projection = (
+                active_projection_reader(**projection_kwargs)
+                if active_projection_reader is not None
+                else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
+            )
+            if projection.usable:
+                frequency_rows = list(projection.rows)
+                snapshot_status = projection.status
+                snapshot_reason = projection.reason
+                snapshot_generation_no = projection.generation_no
+                snapshot_checksum = projection.checksum
+            elif projection.status == "legacy":
+                snapshot_kwargs = {
+                    "company_id": company_id,
+                    "evaluation_month": evaluation_month,
+                    "stock_codes": list(scope.stock_codes),
+                }
+                if snapshot_reader is read_approved_frequency_snapshot and as_of_date:
+                    snapshot_kwargs["as_of_date"] = as_of_date
+                snapshot = snapshot_reader(**snapshot_kwargs)
+                frequency_rows = frequency_rows_for_product_subset(snapshot, requested_codes)
+                snapshot_status = str(snapshot.status or "missing")
+                snapshot_reason = str(snapshot.reason or "")
+                snapshot_generation_no = snapshot.generation_no
+                snapshot_checksum = str(snapshot.checksum or "")
+            else:
+                frequency_rows = []
+                snapshot_status = str(projection.status or "missing")
+                snapshot_reason = str(projection.reason or "")
+                snapshot_generation_no = projection.generation_no
+                snapshot_checksum = str(projection.checksum or "")
+        except Exception as exc:
+            base_meta["frequency_snapshot_reason"] = f"frequency_snapshot_unavailable:{type(exc).__name__}"
+            out.loc[detail_mask, _FREQUENCY_GRADE_COLUMN] = FREQUENCY_INSUFFICIENT_GRADE
+            return _place_frequency_columns(out), base_meta
 
     base_meta.update(
         {
             "frequency_snapshot_status": snapshot_status,
             "frequency_snapshot_reason": snapshot_reason,
-            "frequency_snapshot_scope": list(scope.stock_codes),
-            "frequency_snapshot_scope_fingerprint": scope_fingerprint(scope.stock_codes),
+            "frequency_snapshot_scope": snapshot_scope_codes,
+            "frequency_snapshot_scope_fingerprint": scope_fingerprint(snapshot_scope_codes),
             "frequency_snapshot_generation_no": snapshot_generation_no,
             "frequency_snapshot_checksum": snapshot_checksum,
         }
@@ -867,9 +912,17 @@ def _current_stock_product_scope_safe_limit(
     ]
     limits = []
     for sql in sqls:
-        bind_count = len(re.findall(r"%\(([^)]+)\)s", sql))
-        # The probe represents one product-code bind in this statement.
-        limits.append(max(0, SQL_SERVER_PARAMETER_LIMIT - (bind_count - 1) - SQL_PARAMETER_SAFETY_MARGIN))
+        bind_names = re.findall(r"%\(([^)]+)\)s", sql)
+        scope_occurrences = max(1, sum(
+            1 for name in bind_names
+            if "current_stock_product_" in name or "source_product_" in name
+        ))
+        fixed_bind_count = len(bind_names) - scope_occurrences
+        limits.append(max(
+            0,
+            (SQL_SERVER_PARAMETER_LIMIT - fixed_bind_count - SQL_PARAMETER_SAFETY_MARGIN)
+            // scope_occurrences,
+        ))
     return min(limits) if limits else 0
 
 
@@ -933,6 +986,7 @@ def _apply_current_stock_frequency_a_snapshot_scope(
     params["current_stock_product_filter_mode"] = "code_in"
     params["current_stock_code_in_used"] = True
     params["current_stock_predicate_mode"] = "frequency_snapshot_a_code_in"
+    params["_frequency_snapshot_grade_scope_cache"] = scope_meta.get("_attachment_cache")
     meta["applied"] = True
     meta["fallback_reason"] = ""
     return meta
@@ -963,9 +1017,17 @@ def _product_inventory_frequency_scope_safe_limit(params: Dict[str, Any], cfg: D
     ]
     limits = []
     for sql in sqls:
-        bind_count = len(re.findall(r"%\(([^)]+)\)s", sql))
-        # The probe represents one product-code bind in this statement.
-        limits.append(max(0, SQL_SERVER_PARAMETER_LIMIT - (bind_count - 1) - SQL_PARAMETER_SAFETY_MARGIN))
+        bind_names = re.findall(r"%\(([^)]+)\)s", sql)
+        scope_occurrences = max(1, sum(
+            1 for name in bind_names
+            if "explicit_product_" in name or "source_product_" in name
+        ))
+        fixed_bind_count = len(bind_names) - scope_occurrences
+        limits.append(max(
+            0,
+            (SQL_SERVER_PARAMETER_LIMIT - fixed_bind_count - SQL_PARAMETER_SAFETY_MARGIN)
+            // scope_occurrences,
+        ))
     return min(limits) if limits else 0
 
 
@@ -1027,6 +1089,7 @@ def _apply_product_inventory_frequency_snapshot_scope(
     params["_product_inventory_frequency_snapshot_prefilter_grade"] = requested_grade
     params["_product_inventory_frequency_snapshot_prefilter_code_in_used"] = True
     params["_product_inventory_frequency_snapshot_prefilter"] = meta
+    params["_frequency_snapshot_grade_scope_cache"] = scope_meta.get("_attachment_cache")
     meta["applied"] = True
     meta["fallback_reason"] = ""
     return meta
@@ -1330,6 +1393,84 @@ def _append_in_clause(where: list[str], sql_params: Dict[str, Any], field_expr: 
     where.append(f"{field_expr} IN ({', '.join(bind_keys)})")
 
 
+def _append_early_product_scope(
+    where: list[str],
+    sql_params: Dict[str, Any],
+    params: Mapping[str, Any],
+    field_expr: str,
+    prefix: str,
+) -> int:
+    """Repeat a validated product scope on the physical movement source."""
+    explicit_codes = list(dict.fromkeys(
+        clean_text(value)
+        for value in (params.get("_product_inventory_explicit_product_codes") or [])
+        if clean_text(value)
+    ))
+    current_codes = list(dict.fromkeys(
+        clean_text(value)
+        for value in (params.get("current_stock_product_codes") or [])
+        if clean_text(value)
+    ))
+    codes = explicit_codes if params.get("_product_inventory_explicit_product_scope_applied") else []
+    if (
+        not codes
+        and clean_text(params.get("current_stock_entity_scope")) == "product"
+        and params.get("current_stock_product_filter_mode") == "code_in"
+    ):
+        codes = current_codes
+    if codes:
+        _append_in_clause(where, sql_params, field_expr, codes, prefix)
+    return len(codes)
+
+
+def _append_early_unlabeled_scope(
+    where: list[str],
+    sql_params: Dict[str, Any],
+    params: Mapping[str, Any],
+    *,
+    product_field_expr: str,
+    purchase_vendor_field_expr: str,
+    prefix: str,
+) -> int:
+    """Apply the resolved four-role OR as physical movement key predicates."""
+    if not params.get("_product_inventory_unlabeled_scope_applied"):
+        return 0
+    product_codes = list(dict.fromkeys(
+        clean_text(value)
+        for value in (params.get("_product_inventory_unlabeled_product_codes") or [])
+        if clean_text(value)
+    ))
+    purchase_vendor_codes = list(dict.fromkeys(
+        clean_text(value)
+        for value in (params.get("_product_inventory_unlabeled_purchase_vendor_codes") or [])
+        if clean_text(value)
+    ))
+    predicates: list[str] = []
+    if product_codes:
+        product_where: list[str] = []
+        _append_in_clause(
+            product_where,
+            sql_params,
+            product_field_expr,
+            product_codes,
+            f"{prefix}_product",
+        )
+        predicates.extend(product_where)
+    if purchase_vendor_codes:
+        vendor_where: list[str] = []
+        _append_in_clause(
+            vendor_where,
+            sql_params,
+            purchase_vendor_field_expr,
+            purchase_vendor_codes,
+            f"{prefix}_purchase_vendor",
+        )
+        predicates.extend(vendor_where)
+    if predicates:
+        where.append("(" + " OR ".join(predicates) + ")")
+    return len(product_codes) + len(purchase_vendor_codes)
+
+
 def _bounded_product_scope_safe_limit(base_sql: str, *, bind_occurrences: int = 2) -> int:
     fixed_bind_count = len(re.findall(r"%\(([^)]+)\)s", base_sql))
     return max(
@@ -1410,6 +1551,140 @@ ORDER BY LTRIM(RTRIM(P.Rd04_Physic_Cd))
 
     meta["scope_applied"] = True
     return product_codes, meta
+
+
+def _classify_unlabeled_candidate_rows(
+    product_candidates: pd.DataFrame,
+    vendor_candidates: pd.DataFrame,
+    *,
+    safe_limit: int,
+) -> tuple[list[str], list[str], Dict[str, int], str]:
+    """Normalize complete resolver rows without changing their OR semantics."""
+    required_product_columns = {"physic_cd", "product_match", "manufacturer_match", "order_vendor_match"}
+    if not isinstance(product_candidates, pd.DataFrame) or not required_product_columns.issubset(product_candidates.columns):
+        return [], [], {}, "candidate_result_unavailable"
+    if not isinstance(vendor_candidates, pd.DataFrame) or "vendor_cd" not in vendor_candidates.columns:
+        return [], [], {}, "candidate_result_unavailable"
+
+    product_codes = list(dict.fromkeys(
+        clean_text(value) for value in product_candidates["physic_cd"].tolist() if clean_text(value)
+    ))
+    vendor_codes = list(dict.fromkeys(
+        clean_text(value) for value in vendor_candidates["vendor_cd"].tolist() if clean_text(value)
+    ))
+    counts = {
+        "product": int(pd.to_numeric(product_candidates["product_match"], errors="coerce").fillna(0).ne(0).sum()),
+        "manufacturer": int(pd.to_numeric(product_candidates["manufacturer_match"], errors="coerce").fillna(0).ne(0).sum()),
+        "order_vendor": int(pd.to_numeric(product_candidates["order_vendor_match"], errors="coerce").fillna(0).ne(0).sum()),
+        "purchase_vendor": len(vendor_codes),
+    }
+    if not product_codes and not vendor_codes:
+        return [], [], counts, "no_candidates"
+    if len(product_codes) + len(vendor_codes) > max(0, int(safe_limit)):
+        return [], [], counts, "sql_parameter_limit"
+    return product_codes, vendor_codes, counts, ""
+
+
+def _resolve_unlabeled_name_scope(
+    params: Dict[str, Any],
+    *,
+    safe_limit: int = UNLABELED_NAME_SCOPE_LIMIT,
+) -> tuple[list[str], list[str], Dict[str, Any]]:
+    """Resolve the legacy product/manufacturer/order/purchase OR into complete code sets."""
+    started = time.perf_counter()
+    phrase = clean_text(params.get("nlq_unlabeled_name"))
+    meta: Dict[str, Any] = {
+        "requested": bool(phrase),
+        "scope_applied": False,
+        "safe_limit": max(0, int(safe_limit)),
+        "product_code_count": 0,
+        "purchase_vendor_code_count": 0,
+        "candidate_counts": {},
+        "resolved_kinds": [],
+        "fallback_reason": "",
+        "candidate_elapsed_ms": 0.0,
+    }
+    if not phrase or bool(params.get("current_stock_query")):
+        meta["requested"] = False
+        meta["fallback_reason"] = "not_unlabeled_product_inventory"
+        return [], [], meta
+
+    candidate_sql = f"""
+WITH ProductCandidates AS (
+    SELECT DISTINCT TOP ({safe_limit + 1})
+        LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS candidate_code,
+        CASE WHEN P.Rd04_Physic_Nm LIKE %(unlabeled_scope_like)s THEN 1 ELSE 0 END AS product_match,
+        CASE WHEN MakerVen.Rd03_Ven_Nm LIKE %(unlabeled_scope_like)s THEN 1 ELSE 0 END AS manufacturer_match,
+        CASE WHEN OrderVen.Rd03_Ven_Nm LIKE %(unlabeled_scope_like)s THEN 1 ELSE 0 END AS order_vendor_match
+    FROM dbo.Rddbc040 AS P WITH (NOLOCK)
+    LEFT JOIN dbo.Rddbc030 AS MakerVen WITH (NOLOCK)
+           ON P.Rd04_Ven_Cd = MakerVen.Rd03_Ven_Cd
+    LEFT JOIN dbo.Rddbc030 AS OrderVen WITH (NOLOCK)
+           ON P.Rd04_OrVen_Cd = OrderVen.Rd03_Ven_Cd
+    WHERE ISNULL(P.Rd04_Del_Flag, '') <> 'E'
+      AND (
+          P.Rd04_Physic_Nm LIKE %(unlabeled_scope_like)s
+          OR MakerVen.Rd03_Ven_Nm LIKE %(unlabeled_scope_like)s
+          OR OrderVen.Rd03_Ven_Nm LIKE %(unlabeled_scope_like)s
+      )
+    ORDER BY LTRIM(RTRIM(P.Rd04_Physic_Cd))
+),
+VendorCandidates AS (
+    SELECT DISTINCT TOP ({safe_limit + 1})
+        LTRIM(RTRIM(V.Rd03_Ven_Cd)) AS candidate_code
+    FROM dbo.Rddbc030 AS V WITH (NOLOCK)
+    WHERE V.Rd03_Ven_Nm LIKE %(unlabeled_scope_like)s
+    ORDER BY LTRIM(RTRIM(V.Rd03_Ven_Cd))
+)
+SELECT
+    'product' AS candidate_type,
+    candidate_code,
+    product_match,
+    manufacturer_match,
+    order_vendor_match
+FROM ProductCandidates
+UNION ALL
+SELECT
+    'purchase_vendor' AS candidate_type,
+    candidate_code,
+    0 AS product_match,
+    0 AS manufacturer_match,
+    0 AS order_vendor_match
+FROM VendorCandidates
+"""
+    binds = {"unlabeled_scope_like": f"%{phrase}%"}
+    try:
+        candidates = query_to_df(candidate_sql, binds)
+    except Exception as exc:
+        meta["fallback_reason"] = f"candidate_query_failed:{type(exc).__name__}"
+        meta["candidate_elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
+        return [], [], meta
+
+    if not isinstance(candidates, pd.DataFrame) or not {"candidate_type", "candidate_code"}.issubset(candidates.columns):
+        candidates = pd.DataFrame()
+    candidate_types = candidates.get("candidate_type", pd.Series(dtype="object")).astype(str)
+    product_candidates = candidates.loc[candidate_types.eq("product")].rename(
+        columns={"candidate_code": "physic_cd"}
+    )
+    vendor_candidates = candidates.loc[candidate_types.eq("purchase_vendor")].rename(
+        columns={"candidate_code": "vendor_cd"}
+    )
+    product_codes, vendor_codes, counts, fallback_reason = _classify_unlabeled_candidate_rows(
+        product_candidates,
+        vendor_candidates,
+        safe_limit=safe_limit,
+    )
+    meta.update({
+        "product_code_count": len(product_codes),
+        "purchase_vendor_code_count": len(vendor_codes),
+        "candidate_counts": counts,
+        "resolved_kinds": [kind for kind, count in counts.items() if count],
+        "fallback_reason": fallback_reason,
+        "candidate_elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+    })
+    if not fallback_reason:
+        meta["scope_applied"] = True
+    return product_codes, vendor_codes, meta
 
 
 def _last_cost_product_scope_plan(
@@ -1564,7 +1839,11 @@ def _inventory_predicate_mode(params: Dict[str, Any]) -> str:
     if bool(params.get("_product_inventory_frequency_snapshot_prefilter_applied")):
         return "frequency_snapshot_grade_code_in"
     if clean_text(params.get("nlq_unlabeled_name")):
-        return "unlabeled_like_or"
+        return (
+            "unlabeled_code_or"
+            if params.get("_product_inventory_unlabeled_scope_applied")
+            else "unlabeled_like_or"
+        )
     if clean_text(params.get("maker_cd")):
         return "manufacturer_code"
     if clean_text(params.get("maker_nm")):
@@ -1772,14 +2051,29 @@ def _build_month_carry_baseline_sql(params: Dict[str, Any], cfg: Dict[str, Any])
         "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
     ]
     _append_in_clause(where, sql_params, stock_field, stock_codes, "carry_stock")
+    _append_early_product_scope(
+        where,
+        sql_params,
+        params,
+        f"M.{cfg['month_alias']}_Physic_Cd",
+        "carry_source_product",
+    )
+    _append_early_unlabeled_scope(
+        where,
+        sql_params,
+        params,
+        product_field_expr=f"M.{cfg['month_alias']}_Physic_Cd",
+        purchase_vendor_field_expr=f"M.{cfg['month_alias']}_Ven_Cd",
+        prefix="carry_source_unlabeled",
+    )
     unlabeled_name = clean_text(params.get("nlq_unlabeled_name"))
     master_params = dict(params)
-    if unlabeled_name:
+    if unlabeled_name and not params.get("_product_inventory_unlabeled_scope_applied"):
         # Preserve the shared four-role OR-LIKE contract and add equivalent
         # semi-joins as a redundant optimizer scope for the month aggregate.
         master_params["nlq_unlabeled_name"] = ""
     _apply_master_filters(where, sql_params, master_params, f"M.{cfg['month_alias']}_Ven_Cd")
-    if unlabeled_name:
+    if unlabeled_name and not params.get("_product_inventory_unlabeled_scope_applied"):
         sql_params["nlq_unlabeled_name_like"] = f"%{unlabeled_name}%"
         where.append(
             "(P.Rd04_Physic_Nm LIKE %(nlq_unlabeled_name_like)s "
@@ -1852,22 +2146,38 @@ HAVING
     return sql, sql_params
 
 
-def _month_carry_has_master_filter(params: Dict[str, Any]) -> bool:
-    """Keep the established master-filter SQL when its aliases are required."""
+def _month_carry_requires_master_filter(params: Dict[str, Any]) -> bool:
+    """Return whether R210 must retain master joins before aggregation."""
     text_filters = (
         "physic_cd", "physic_nm", "ven_nm", "maker_cd", "maker_nm",
         "order_cd", "order_nm", "buy_cd", "buy_nm", "product_group_nm",
-        "product_di_nm", "product_class_nm", "nlq_unlabeled_name",
-        "current_stock_entity_scope", "current_stock_entity_phrase",
+        "product_di_nm", "product_class_nm",
+        "current_stock_entity_phrase",
     )
     if any(clean_text(params.get(key)) not in {"", "전체"} for key in text_filters):
         return True
-    if bool(params.get("_product_inventory_explicit_product_scope_applied")):
+    if clean_text(params.get("nlq_unlabeled_name")) and not params.get(
+        "_product_inventory_unlabeled_scope_applied"
+    ):
         return True
-    return bool(
-        params.get("current_stock_manufacturer_codes")
-        or params.get("current_stock_product_codes")
-    )
+
+    manufacturer_codes = list(params.get("current_stock_manufacturer_codes") or [])
+    if manufacturer_codes:
+        return True
+
+    current_scope = clean_text(params.get("current_stock_entity_scope"))
+    if current_scope:
+        product_code_scope = bool(
+            current_scope == "product"
+            and params.get("current_stock_product_filter_mode") == "code_in"
+            and params.get("current_stock_product_codes")
+        )
+        if not product_code_scope:
+            return True
+
+    # A validated explicit/current product-code scope is a physical R210 key
+    # predicate, not a master filter. It is safe to apply before aggregation.
+    return False
 
 
 def _build_month_carry_monthagg_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -1886,6 +2196,30 @@ def _build_month_carry_monthagg_sql(params: Dict[str, Any], cfg: Dict[str, Any])
         "ISNULL(PFilter.Rd04_Del_Flag, '') <> 'E'",
     ]
     _append_in_clause(where, sql_params, stock_field, stock_codes, "carry_stock")
+    _append_early_product_scope(
+        where,
+        sql_params,
+        params,
+        f"M.{month_alias}_Physic_Cd",
+        "carry_source_product",
+    )
+    _append_early_unlabeled_scope(
+        where,
+        sql_params,
+        params,
+        product_field_expr=f"M.{month_alias}_Physic_Cd",
+        purchase_vendor_field_expr=f"M.{month_alias}_Ven_Cd",
+        prefix="carry_source_unlabeled",
+    )
+    outer_where: list[str] = []
+    if clean_text(params.get("nlq_unlabeled_name")):
+        _apply_master_filters(
+            outer_where,
+            sql_params,
+            {"nlq_unlabeled_name": params.get("nlq_unlabeled_name")},
+            "A.month_ven_cd",
+        )
+    outer_where_sql = f"WHERE {' AND '.join(outer_where)}" if outer_where else ""
 
     sql = f"""
 WITH MonthAgg AS (
@@ -1941,6 +2275,7 @@ LEFT JOIN dbo.Rddbc030 AS MakerVen
        ON P.Rd04_Ven_Cd = MakerVen.Rd03_Ven_Cd
 LEFT JOIN dbo.Rddbc030 AS OrderVen
        ON P.Rd04_OrVen_Cd = OrderVen.Rd03_Ven_Cd
+{outer_where_sql}
 GROUP BY
     {group_cd_expr},
     {group_nm_expr},
@@ -1963,7 +2298,7 @@ HAVING
 
 def _build_month_carry_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     """Build month carry without changing established master-filter semantics."""
-    if _month_carry_has_master_filter(params):
+    if _month_carry_requires_master_filter(params):
         return _build_month_carry_baseline_sql(params, cfg)
     return _build_month_carry_monthagg_sql(params, cfg)
 
@@ -1993,6 +2328,21 @@ def _build_month_period_sql(params: Dict[str, Any], cfg: Dict[str, Any]) -> tupl
         "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
     ]
     _append_in_clause(where, sql_params, stock_field, stock_codes, "period_stock")
+    _append_early_product_scope(
+        where,
+        sql_params,
+        params,
+        f"M.{month_alias}_Physic_Cd",
+        "period_source_product",
+    )
+    _append_early_unlabeled_scope(
+        where,
+        sql_params,
+        params,
+        product_field_expr=f"M.{month_alias}_Physic_Cd",
+        purchase_vendor_field_expr=f"M.{month_alias}_Ven_Cd",
+        prefix="period_source_unlabeled",
+    )
     _apply_master_filters(where, sql_params, params, f"M.{month_alias}_Ven_Cd")
 
     sql = f"""
@@ -2077,7 +2427,6 @@ def _build_detail_sql(direction: str, params: Dict[str, Any], cfg: Dict[str, Any
             "1 = 1",
             f"NULLIF(LTRIM(RTRIM({date_field})), '') IS NOT NULL",
             _prefix_not_in(io_field, cfg["in_exclude_prefix"]),
-            "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
         ]
     else:
         table = "dbo.Rddbc120"
@@ -2093,7 +2442,6 @@ def _build_detail_sql(direction: str, params: Dict[str, Any], cfg: Dict[str, Any
             "1 = 1",
             f"NULLIF(LTRIM(RTRIM({date_field})), '') IS NOT NULL",
             _prefix_not_in(io_field, cfg["out_exclude_prefix"]),
-            "ISNULL(P.Rd04_Del_Flag, '') <> 'E'",
         ]
 
     sql_params["bucket_from"] = date_from
@@ -2102,7 +2450,58 @@ def _build_detail_sql(direction: str, params: Dict[str, Any], cfg: Dict[str, Any
     where.append(f"{date_field} <= %(bucket_to)s")
 
     _append_in_clause(where, sql_params, stock_field, stock_codes, f"{direction}_{bucket}_stock")
+    early_product_count = _append_early_product_scope(
+        where,
+        sql_params,
+        params,
+        "T.Rd11_Physic_Cd" if direction == "in" else "T.Rd12_Physic_Cd",
+        f"{direction}_{bucket}_source_product",
+    )
+    _append_early_unlabeled_scope(
+        where,
+        sql_params,
+        params,
+        product_field_expr="T.Rd11_Physic_Cd" if direction == "in" else "T.Rd12_Physic_Cd",
+        purchase_vendor_field_expr=buy_field,
+        prefix=f"{direction}_{bucket}_source_unlabeled",
+    )
+    movement_where = list(where)
+    where.append("ISNULL(P.Rd04_Del_Flag, '') <> 'E'")
     _apply_master_filters(where, sql_params, params, buy_field)
+
+    source_prefix = ""
+    source_table = f"{table} AS T"
+    if (
+        direction == "out"
+        and bucket == "period"
+        and bool(cfg.get("current_stock_query"))
+        and early_product_count > 0
+    ):
+        # Aggregate the scoped R120 movement grain before display/master joins.
+        # The outer descriptor joins and grouping remain unchanged.
+        source_prefix = f"""
+WITH AggregatedDetail AS (
+    SELECT
+        T.Rd12_Physic_Cd,
+        T.Rd12_Stock_Cd,
+        T.Rd12_In_Ven_Cd,
+        SUM(ISNULL(T.Rd12_Quantity, 0)) AS Rd12_Quantity,
+        SUM(ISNULL(T.Rd12_Oquantity, 0)) AS Rd12_Oquantity,
+        SUM(ISNULL(T.Rd12_Supply_Price, 0)) AS Rd12_Supply_Price,
+        SUM(ISNULL(T.Rd12_Tax_Price, 0)) AS Rd12_Tax_Price
+    FROM dbo.Rddbc120 AS T
+    WHERE {" AND ".join(movement_where)}
+    GROUP BY
+        T.Rd12_Physic_Cd,
+        T.Rd12_Stock_Cd,
+        T.Rd12_In_Ven_Cd
+    HAVING
+        SUM(ISNULL(T.Rd12_Quantity, 0) + ISNULL(T.Rd12_Oquantity, 0)) <> 0
+        OR SUM(ISNULL(T.Rd12_Supply_Price, 0) + ISNULL(T.Rd12_Tax_Price, 0)) <> 0
+)
+"""
+        source_table = "AggregatedDetail AS T"
+        where = where[len(movement_where):]
 
     group_cd_expr, group_nm_expr = _vendor_group_expr(cfg["group_basis"], buy_field, stock_field)
 
@@ -2124,6 +2523,7 @@ def _build_detail_sql(direction: str, params: Dict[str, Any], cfg: Dict[str, Any
         now_out_amt_sql = f"CAST(SUM({amount_expr}) AS decimal(18, 4))" if direction == "out" else "CAST(0 AS decimal(18, 4))"
 
     sql = f"""
+{source_prefix}
 SELECT
     {_common_descriptor_sql(group_cd_expr, group_nm_expr)},
     {old_in_qty_sql} AS old_in_qty,
@@ -2133,7 +2533,7 @@ SELECT
     {now_in_amt_sql} AS now_in_amt,
     {now_out_qty_sql} AS now_out_qty,
     {now_out_amt_sql} AS now_out_amt
-FROM {table} AS T
+FROM {source_table}
 LEFT JOIN dbo.Rddbc040 AS P
        ON {"T.Rd11_Physic_Cd = P.Rd04_Physic_Cd" if direction == "in" else "T.Rd12_Physic_Cd = P.Rd04_Physic_Cd"}
 
@@ -2397,10 +2797,17 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
         started = time.perf_counter()
         df = _query_df_safe(sql, sql_params)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+        if "WITH MonthAgg AS" in sql:
+            sql_shape = "r210_scoped_movement_preaggregate"
+        elif "WITH AggregatedDetail AS" in sql:
+            sql_shape = "r120_scoped_preaggregate"
+        else:
+            sql_shape = "legacy_descriptor_aggregate"
         query_perf[stage] = {
             "rows": int(len(df)),
             "sql_fetch_ms": elapsed_ms,
             "predicate_mode": predicate_mode,
+            "sql_shape": sql_shape,
         }
         if current_stock_query:
             query_perf[stage].update({
@@ -2408,11 +2815,12 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
                 "product_code_count": int(len(params.get("current_stock_product_codes") or [])),
             })
             log.info(
-                "[current_stock.perf] stage=%s rows=%s sql_fetch_ms=%s predicate_mode=%s manufacturer_code_count=%s product_code_count=%s code_in_used=%s fallback_to_like_or=%s fallback_reason=%s",
+                "[current_stock.perf] stage=%s rows=%s sql_fetch_ms=%s predicate_mode=%s sql_shape=%s manufacturer_code_count=%s product_code_count=%s code_in_used=%s fallback_to_like_or=%s fallback_reason=%s",
                 stage,
                 int(len(df)),
                 elapsed_ms,
                 predicate_mode,
+                query_perf[stage]["sql_shape"],
                 int(len(params.get("current_stock_manufacturer_codes") or [])),
                 int(len(params.get("current_stock_product_codes") or [])),
                 bool(params.get("current_stock_code_in_used")),
@@ -2423,12 +2831,14 @@ def _collect_source_df(params: Dict[str, Any], cfg: Dict[str, Any]) -> tuple[pd.
             frequency_prefilter = dict(params.get("_product_inventory_frequency_snapshot_prefilter") or {})
             log.info(
                 "[product_inventory.perf] stage=sql sql_stage=%s rows=%s elapsed_ms=%s predicate_mode=%s "
+                "sql_shape=%s "
                 "frequency_prefilter_applied=%s frequency_prefilter_grade=%s "
                 "frequency_prefilter_product_code_count=%s code_in_used=%s fallback_reason=%s",
                 stage,
                 int(len(df)),
                 elapsed_ms,
                 predicate_mode,
+                query_perf[stage]["sql_shape"],
                 bool(frequency_prefilter.get("applied")),
                 clean_text(frequency_prefilter.get("frequency_grade")),
                 int(frequency_prefilter.get("product_code_count") or 0),
@@ -3387,6 +3797,38 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
             clean_text(product_inventory_frequency_prefilter_meta.get("fallback_reason")),
         )
 
+        unlabeled_product_codes, unlabeled_vendor_codes, unlabeled_scope_meta = _resolve_unlabeled_name_scope(
+            work_params
+        )
+        if unlabeled_scope_meta.get("scope_applied"):
+            if product_inventory_frequency_prefilter_meta.get("applied"):
+                snapshot_codes = set(work_params.get("_product_inventory_explicit_product_codes") or [])
+                unlabeled_product_codes = [code for code in unlabeled_product_codes if code in snapshot_codes]
+                unlabeled_scope_meta["frequency_snapshot_product_intersection_count"] = len(
+                    unlabeled_product_codes
+                )
+            if unlabeled_product_codes or unlabeled_vendor_codes:
+                work_params["_product_inventory_unlabeled_product_codes"] = unlabeled_product_codes
+                work_params["_product_inventory_unlabeled_purchase_vendor_codes"] = unlabeled_vendor_codes
+                work_params["_product_inventory_unlabeled_scope_applied"] = True
+            else:
+                unlabeled_scope_meta["scope_applied"] = False
+                unlabeled_scope_meta["fallback_reason"] = "frequency_snapshot_intersection_empty"
+        work_params["_product_inventory_unlabeled_name_scope"] = unlabeled_scope_meta
+        log.info(
+            "[product_inventory.perf] stage=unlabeled_name_scope requested=%s scope_applied=%s "
+            "resolved_kinds=%s candidate_counts=%s product_code_count=%s "
+            "purchase_vendor_code_count=%s candidate_elapsed_ms=%s fallback_reason=%s",
+            bool(unlabeled_scope_meta.get("requested")),
+            bool(unlabeled_scope_meta.get("scope_applied")),
+            ",".join(unlabeled_scope_meta.get("resolved_kinds") or []),
+            unlabeled_scope_meta.get("candidate_counts") or {},
+            int(unlabeled_scope_meta.get("product_code_count") or 0),
+            int(unlabeled_scope_meta.get("purchase_vendor_code_count") or 0),
+            unlabeled_scope_meta.get("candidate_elapsed_ms", 0),
+            clean_text(unlabeled_scope_meta.get("fallback_reason")),
+        )
+
         product_scope_meta: Dict[str, Any] = {
             "product_name_scope": False,
             "candidate_count": 0,
@@ -3494,7 +3936,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 grp,
                 cfg,
                 perf=display_perf,
-                frequency_params=params,
+                frequency_params=work_params,
                 frequency_date_to=date_to,
             )
             df_full = df_display
@@ -3510,6 +3952,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                 "display": display_perf,
                 "last_cost_scope": dict(work_params.get("_product_inventory_last_cost_scope") or {}),
                 "product_name_scope": dict(work_params.get("_product_inventory_product_name_scope") or {}),
+                "unlabeled_name_scope": dict(work_params.get("_product_inventory_unlabeled_name_scope") or {}),
                 "frequency_snapshot_prefilter": dict(work_params.get("_product_inventory_frequency_snapshot_prefilter") or {}),
                 "service_total_ms": service_total_ms,
             }

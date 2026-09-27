@@ -493,6 +493,16 @@ def test_current_stock_frequency_a_snapshot_prefilter() -> None:
         )[1],
     )
     _assert(direct_meta["applied"] and direct_params["current_stock_product_codes"] == ["A1"], "A prefilter must use the direct projection rows")
+    cached_source = pd.DataFrame({"제품코드": ["A1"], "재고수량": [3.0]})
+    cached_attached, cached_meta = attach_dashboard_frequency_snapshot(
+        cached_source,
+        params=direct_params,
+        date_to="20260131",
+        profile_scope_resolver=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("request cache must avoid a second profile read")),
+        projection_reader=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("request cache must avoid a second projection read")),
+    )
+    _assert(cached_meta["frequency_snapshot_request_cache_used"], "current-stock attachment must reuse the validated request projection")
+    _assert(cached_attached.loc[0, "출고빈도등급"] == "A", "cached current-stock grade must equal the projection grade")
 
     calls: list[dict[str, Any]] = []
     original_query = product_inventory_service._query_df_safe
@@ -502,7 +512,49 @@ def test_current_stock_frequency_a_snapshot_prefilter() -> None:
     finally:
         product_inventory_service._query_df_safe = original_query
     _assert(len(calls) == 3, "current-stock first-day path must keep month_carry/period_in/period_out at one call each")
-    _assert(all(call.get("current_stock_product_0") == "A1" for call in calls), "all three ERP sources must receive the same A product scope")
+    _assert(
+        calls[0].get("current_stock_product_0") is None
+        and all(call.get("current_stock_product_0") == "A1" for call in calls[1:]),
+        "R210 must bind A scope once on its raw source while detail sources retain the master predicate",
+    )
+    _assert(calls[0].get("carry_source_product_0") == "A1", "R210 must receive the A scope before its R040 display join")
+    _assert(calls[1].get("in_period_source_product_0") == "A1", "R110 must receive the A scope before its R040 display join")
+    _assert(calls[2].get("out_period_source_product_0") == "A1", "R120 must receive the A scope before its R040 display join")
+    carry_sql, _carry_params = product_inventory_service._build_month_carry_sql(params, cfg)
+    _assert("WITH MonthAgg AS" in carry_sql, "scoped current-stock R210 must aggregate before descriptor joins")
+    _assert(
+        carry_sql.index("FROM dbo.Rddbc210 AS M") < carry_sql.index("LEFT JOIN dbo.Rddbc040 AS P"),
+        "R210 movement aggregation must precede display/master joins",
+    )
+    _assert(
+        carry_sql.count("carry_source_product_0") == 1,
+        "R210 product predicate must be applied once inside the movement aggregation",
+    )
+    period_out_sql, _period_out_params = product_inventory_service._build_detail_sql(
+        "out", params, cfg, "20260101", "20260131", "period"
+    )
+    _assert("WITH AggregatedDetail AS" in period_out_sql, "scoped current-stock R120 must aggregate before descriptor joins")
+    _assert(
+        period_out_sql.index("FROM dbo.Rddbc120 AS T") < period_out_sql.index("LEFT JOIN dbo.Rddbc040 AS P"),
+        "R120 scoped aggregation must precede the R040/master joins",
+    )
+    _assert(
+        period_out_sql.count("out_period_source_product_0") == 1,
+        "R120 product predicate must be applied once inside the pre-aggregation",
+    )
+    period_in_sql, _period_in_params = product_inventory_service._build_detail_sql(
+        "in", params, cfg, "20260101", "20260131", "period"
+    )
+    _assert("WITH AggregatedDetail AS" not in period_in_sql, "R110 period-in SQL must remain unchanged")
+    unscoped_out_sql, _unscoped_out_params = product_inventory_service._build_detail_sql(
+        "out",
+        {"current_stock_query": True, "stock_cds": ["00001"]},
+        cfg,
+        "20260101",
+        "20260131",
+        "period",
+    )
+    _assert("WITH AggregatedDetail AS" not in unscoped_out_sql, "unscoped R120 must retain the established SQL path")
 
     full_source = pd.DataFrame(
         {
@@ -607,6 +659,16 @@ def test_product_inventory_frequency_a_snapshot_prefilter() -> None:
     _assert(params["_product_inventory_explicit_product_codes"] == ["A1", "A2"], "product inventory must reuse the shared explicit product-code scope")
     _assert(meta["safe_limit"] >= 2, "A projection must fit both monthly source bounds")
     _assert(product_inventory_service._inventory_predicate_mode(params) == "frequency_snapshot_grade_code_in", "prefilter must expose its distinct predicate mode")
+    cached_source = pd.DataFrame({"제품코드": ["A1", "A2"], "재고수량": [3.0, 4.0]})
+    cached_attached, cached_meta = attach_dashboard_frequency_snapshot(
+        cached_source,
+        params=params,
+        date_to="20260131",
+        profile_scope_resolver=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("request cache must avoid a second profile read")),
+        projection_reader=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("request cache must avoid a second projection read")),
+    )
+    _assert(cached_meta["frequency_snapshot_request_cache_used"], "product-inventory attachment must reuse the validated request projection")
+    _assert(cached_attached["출고빈도등급"].tolist() == ["A", "A"], "cached product-inventory grades must equal the projection grades")
 
     calls: list[dict[str, Any]] = []
     original_query = product_inventory_service._query_df_safe
@@ -616,11 +678,53 @@ def test_product_inventory_frequency_a_snapshot_prefilter() -> None:
     finally:
         product_inventory_service._query_df_safe = original_query
     _assert(len(calls) == 2, "monthly product inventory must keep one month_carry and one month_period query")
-    _assert(all(call.get("explicit_product_0") == "A1" and call.get("explicit_product_1") == "A2" for call in calls), "both monthly sources must receive the same A code IN scope")
+    _assert(
+        calls[0].get("explicit_product_0") is None
+        and calls[1].get("explicit_product_0") == "A1"
+        and calls[1].get("explicit_product_1") == "A2",
+        "R210 must bind A scope once on its raw source while month-period retains the master predicate",
+    )
+    _assert(calls[0].get("carry_source_product_0") == "A1", "product-inventory carry source must be restricted before display joins")
+    _assert(calls[1].get("period_source_product_1") == "A2", "product-inventory period source must be restricted before display joins")
+    scoped_carry_sql, _scoped_carry_params = product_inventory_service._build_month_carry_sql(params, cfg)
+    _assert("WITH MonthAgg AS" in scoped_carry_sql, "scoped product-inventory R210 must reuse movement pre-aggregation")
+
+    movement_fixture = pd.DataFrame(
+        [
+            ("A1", "00001", "V1", "202507", "50001", "0", "0012", 10, 100, 2),
+            ("A1", "00001", "V1", "202508", "50002", "5", "0099", -3, -30, 1),
+            ("A1", "00001", "V2", "202508", "50001", "0", "0012", 4, 40, 0),
+            ("A1", "00008", "V1", "202508", "50001", "5", "0012", 7, 70, 5),
+            ("A2", "00001", "V1", "202507", "50001", "0", "0012", 5, 50, 5),
+            ("A2", "00001", "V1", "202508", "50002", "5", "0099", -5, -50, -5),
+        ],
+        columns=[
+            "product", "stock", "vendor", "month", "stock_apply", "io_gu",
+            "io_gcode", "in_qty", "in_amt", "out_qty",
+        ],
+    )
+    safe_keys = ["product", "stock", "vendor"]
+    measures = ["in_qty", "in_amt", "out_qty"]
+    baseline = movement_fixture.groupby(safe_keys, as_index=False)[measures].sum()
+    candidate = (
+        movement_fixture.groupby(safe_keys, as_index=False)[measures].sum()
+        .groupby(safe_keys, as_index=False)[measures].sum()
+    )
+    pd.testing.assert_frame_equal(
+        baseline.sort_values(safe_keys).reset_index(drop=True),
+        candidate.sort_values(safe_keys).reset_index(drop=True),
+        check_dtype=True,
+    )
+    _assert(
+        len(baseline) == 4
+        and float(baseline.loc[(baseline["product"] == "A2") & (baseline["stock"] == "00001"), "in_qty"].iloc[0]) == 0.0,
+        "R210 semantic fixture must preserve vendor/location grain, negative values, and zero-sum combinations",
+    )
 
     name_params = dict(params, physic_nm="테스트")
     carry_sql, carry_bindings = product_inventory_service._build_month_carry_sql(name_params, cfg)
     period_sql, period_bindings = product_inventory_service._build_month_period_sql(name_params, cfg)
+    _assert("WITH MonthAgg AS" not in carry_sql, "product-name master filter must retain the established R210 SQL")
     _assert("P.Rd04_Physic_Cd IN" in carry_sql and "P.Rd04_Physic_Cd IN" in period_sql, "A scope must be present in both monthly SQL statements")
     _assert(carry_bindings["explicit_product_0"] == "A1" and period_bindings["explicit_product_1"] == "A2", "monthly bindings must retain all Snapshot A codes")
     _assert("physic_nm_like" in carry_bindings and "physic_nm_like" in period_bindings, "A plus product-name must remain an AND intersection")
@@ -669,6 +773,96 @@ def test_product_inventory_frequency_a_snapshot_prefilter() -> None:
         profile_scope_resolver=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("B rollout must not read Snapshot")),
     )
     _assert(not other_grade_meta["requested"] and not other_grade_meta["applied"], "only A may prefilter in this rollout")
+
+
+def test_product_inventory_unlabeled_name_code_scope() -> None:
+    """Resolved movement keys must preserve the legacy four-role OR exactly."""
+    product_candidates = pd.DataFrame(
+        [
+            ("P_PRODUCT", 1, 0, 0),
+            ("P_MAKER", 0, 1, 0),
+            ("P_ORDER", 0, 0, 1),
+            ("P_PRODUCT_MAKER", 1, 1, 0),
+            ("P_MAKER_ORDER", 0, 1, 1),
+            ("P_ALL", 1, 1, 1),
+            ("P_SIMILAR_1", 1, 0, 0),
+            ("P_SIMILAR_2", 1, 0, 0),
+        ],
+        columns=["physic_cd", "product_match", "manufacturer_match", "order_vendor_match"],
+    )
+    vendor_candidates = pd.DataFrame({"vendor_cd": ["V_PURCHASE", "V_SHARED"]})
+    product_codes, vendor_codes, counts, fallback = product_inventory_service._classify_unlabeled_candidate_rows(
+        product_candidates,
+        vendor_candidates,
+        safe_limit=20,
+    )
+    _assert(not fallback, "complete product/vendor candidates must be eligible for code scope")
+    _assert(counts == {"product": 5, "manufacturer": 4, "order_vendor": 3, "purchase_vendor": 2}, "candidate kinds must retain overlaps")
+
+    movements = pd.DataFrame(
+        [
+            ("P_PRODUCT", "V0", "product only"),
+            ("P_MAKER", "V0", "manufacturer only"),
+            ("P_ORDER", "V0", "order vendor only"),
+            ("P_NONE", "V_PURCHASE", "purchase vendor only"),
+            ("P_PRODUCT_MAKER", "V_SHARED", "product and manufacturer"),
+            ("P_MAKER_ORDER", "V0", "manufacturer and order vendor"),
+            ("P_ALL", "V_SHARED", "all roles"),
+            ("P_SIMILAR_1", "V0", "partial match one"),
+            ("P_SIMILAR_2", "V0", "partial match two"),
+            ("P_NONE", "V0", "zero candidate"),
+        ],
+        columns=["physic_cd", "purchase_vendor_cd", "fixture"],
+    )
+    legacy_product_matches = set(product_candidates.loc[
+        product_candidates[["product_match", "manufacturer_match", "order_vendor_match"]].ne(0).any(axis=1),
+        "physic_cd",
+    ])
+    legacy = movements.loc[
+        movements["physic_cd"].isin(legacy_product_matches)
+        | movements["purchase_vendor_cd"].isin(set(vendor_candidates["vendor_cd"]))
+    ].reset_index(drop=True)
+    candidate = movements.loc[
+        movements["physic_cd"].isin(product_codes)
+        | movements["purchase_vendor_cd"].isin(vendor_codes)
+    ].reset_index(drop=True)
+    pd.testing.assert_frame_equal(legacy, candidate, check_dtype=True)
+
+    params = {
+        "date_from": "20260101",
+        "date_to": "20260131",
+        "month_from": "202601",
+        "month_to": "202601",
+        "stock_cds": ["00001"],
+        "nlq_unlabeled_name": "삼진제약",
+        "_product_inventory_unlabeled_scope_applied": True,
+        "_product_inventory_unlabeled_product_codes": product_codes,
+        "_product_inventory_unlabeled_purchase_vendor_codes": vendor_codes,
+    }
+    cfg = product_inventory_service._settings(params)
+    carry_sql, carry_params = product_inventory_service._build_month_carry_sql(params, cfg)
+    period_sql, period_params = product_inventory_service._build_month_period_sql(params, cfg)
+    _assert("WITH MonthAgg AS" in carry_sql, "resolved unlabeled scope must enable the safe R210 pre-aggregation")
+    _assert("nlq_unlabeled_name_like" in carry_params and "nlq_unlabeled_name_like" in period_params, "row-level legacy OR must remain as the exactness guard")
+    _assert("carry_source_unlabeled_product_0" in carry_params and "carry_source_unlabeled_purchase_vendor_0" in carry_params, "R210 must receive both sides of the OR as early key predicates")
+    _assert("period_source_unlabeled_product_0" in period_params and "period_source_unlabeled_purchase_vendor_0" in period_params, "period SQL must retain the same OR key scope")
+    _assert(carry_sql.index("WITH MonthAgg AS") < carry_sql.index("WHERE (BuyVen.Rd03_Ven_Nm LIKE"), "R210 name exactness filter must run after movement pre-aggregation")
+    _assert(product_inventory_service._inventory_predicate_mode(params) == "unlabeled_code_or", "logs must distinguish code scope from legacy LIKE")
+
+    empty_product = pd.DataFrame(columns=product_candidates.columns)
+    empty_vendor = pd.DataFrame(columns=vendor_candidates.columns)
+    _, _, _, empty_fallback = product_inventory_service._classify_unlabeled_candidate_rows(
+        empty_product,
+        empty_vendor,
+        safe_limit=20,
+    )
+    _assert(empty_fallback == "no_candidates", "zero candidates must fall back instead of broadening the result")
+    _, _, _, limit_fallback = product_inventory_service._classify_unlabeled_candidate_rows(
+        product_candidates,
+        vendor_candidates,
+        safe_limit=2,
+    )
+    _assert(limit_fallback == "sql_parameter_limit", "incomplete candidate scopes must retain legacy LIKE")
 
 
 def test_frequency_projection_integrity_contract() -> None:
@@ -1028,6 +1222,7 @@ def main() -> int:
         test_product_inventory_snapshot_attachment,
         test_current_stock_frequency_a_snapshot_prefilter,
         test_product_inventory_frequency_a_snapshot_prefilter,
+        test_product_inventory_unlabeled_name_code_scope,
         test_frequency_projection_integrity_contract,
         test_projection_consumer_attachment_equality,
         test_product_inventory_frequency_filter_totals_and_summary,
