@@ -2375,6 +2375,27 @@ def resolve_unlabeled_io_entity_condition(
     if not phrase:
         return {"status": "not_applicable", "params": out, "candidates": []}
 
+    if action == "입고예정조회":
+        # The registered R170/R180 expected-inbound query already applies its
+        # product-name LIKE filter. A partial product name need not resolve to
+        # one exact master row before that existing condition is used.
+        out["physic_nm"] = phrase
+        _log_entity_resolver(
+            action=action,
+            resolver_type="expected_inbound_product_name_like",
+            status="success",
+            candidate_count=0,
+            elapsed_ms=0,
+            final_decision="resolved_like",
+        )
+        return {
+            "status": "resolved",
+            "params": out,
+            "phrase": phrase,
+            "resolved_kind": "product_name_like",
+            "candidates": [],
+        }
+
     # Detail and inventory lists are multi-result searches.  They must not
     # resolve a name through master candidates: the service applies one OR LIKE
     # predicate over transaction vendor, product, and manufacturer names.

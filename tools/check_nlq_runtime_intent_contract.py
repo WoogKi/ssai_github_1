@@ -64,6 +64,7 @@ def _run_router(question: str) -> tuple[bool, list[dict[str, Any]], list[dict[st
         patch("app.services.rddbc120_service.get_rddbc120_result", service),
         patch("app.services.product_inventory_service.get_product_inventory_result", service),
         patch("app.services.rddbc170_rddbc180_order_service.get_order_result", service),
+        patch("app.services.rddbc170_rddbc180_order_service.get_expected_inbound_result", service),
         patch("app.services.io_nlq.resolve_current_stock_entity_condition", current_stock_entity),
         patch("app.sims.views.rddbc_io_shared._load_stock_code_options", return_value=[]),
         patch("app.ui.chat_middleware.push_sims_result_to_chat", push),
@@ -116,6 +117,10 @@ def main() -> int:
     checks.append(_handler_case("이가탄 매출 202609", "이가탄 매출 202609", "출고명세 조회", {"nlq_unlabeled_name": "이가탄", "date_from": "20260901", "date_to": "20260930"}))
     checks.append(_handler_case("메트로 매출", "메트로 매출", "출고명세 조회", {"nlq_unlabeled_name": "메트로"}))
     checks.append(_handler_case("메트로 매출 202609", "메트로 매출 202609", "출고명세 조회", {"nlq_unlabeled_name": "메트로", "date_from": "20260901", "date_to": "20260930"}))
+    checks.append(_handler_case("이가탄 입고예정조회", "이가탄 입고예정조회", "입고예정조회", {"physic_nm": "이가탄"}))
+    checks.append(_handler_case("이가탄 입고예정 조회", "이가탄 입고예정 조회", "입고예정조회", {"physic_nm": "이가탄"}))
+    checks.append(_handler_case("메트로 입고예정조회", "메트로 입고예정조회", "입고예정조회", {"physic_nm": "메트로"}))
+    checks.append(_handler_case("일반 입고예정조회", "입고예정조회", "입고예정조회", {"mode": "expected"}))
     checks.append(_handler_case("지난주 입고현황", "지난주 입고현황 조회", "입고명세 조회", {"date_from": "20260914", "date_to": "20260920"}))
     checks.append(_handler_case("발주담당자 김 발주 조회", "발주담당자 김 발주 조회", "발주조회", {"order_staff_nm": "김"}))
     checks.append(_handler_case("발주담당자 김 발주 조회 202609", "발주담당자 김 발주 조회 202609", "발주조회", {"order_staff_nm": "김", "month_from": "202609", "month_to": "202609"}))

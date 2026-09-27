@@ -1262,6 +1262,29 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
             )
         )
 
+    for query, expected_product in (
+        ("이가탄 입고예정조회", "이가탄"),
+        ("이가탄 입고예정 조회", "이가탄"),
+        ("메트로 입고예정조회", "메트로"),
+    ):
+        parsed_expected = io_nlq.resolve_io_nlq(query) or {}
+        parsed_params = dict(parsed_expected.get("params") or {})
+        resolved_expected = io_nlq.resolve_unlabeled_io_entity_condition(
+            query,
+            action=str(parsed_expected.get("action") or ""),
+            params=parsed_params,
+            residual_phrase=str(parsed_params.get("_registered_unlabeled_entity") or ""),
+        )
+        results.append(
+            CheckResult(
+                f"expected-inbound product name remains an existing LIKE condition: {query}",
+                parsed_expected.get("action") == "입고예정조회"
+                and resolved_expected.get("status") == "resolved"
+                and resolved_expected.get("params", {}).get("physic_nm") == expected_product,
+                f"parsed={parsed_expected!r}, resolved={resolved_expected!r}",
+            )
+        )
+
     for query in ("입고명세 조회", "오늘 입고명세 조회"):
         parsed_inbound_detail = io_nlq.resolve_io_nlq(query) or {}
         results.append(
