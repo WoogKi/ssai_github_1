@@ -311,7 +311,9 @@ def _get_snapshot_product_information_result(
     master_loader: Callable[..., pd.DataFrame] = load_product_information_master,
     viewer_user: Any = None,
     apply_viewer_projection: bool = True,
+    materialize_presentation: bool = True,
 ) -> dict[str, Any]:
+    performance_ms: dict[str, float] = {}
     qparams = normalize_product_information_params(params)
     company_id = _company_id(qparams)
     if company_id is None:
@@ -323,6 +325,7 @@ def _get_snapshot_product_information_result(
             snapshot_read_call_count=0,
         )
     evaluation_month = _evaluation_month(qparams)
+    snapshot_started = time.perf_counter()
     try:
         scope = profile_resolver(company_id=company_id)
         projection = projection_reader(
@@ -343,6 +346,7 @@ def _get_snapshot_product_information_result(
             reason=f"snapshot_authority_unavailable:{type(exc).__name__}",
             message="승인된 제품정보 Snapshot을 확인하지 못했습니다.",
         )
+    performance_ms["snapshot_load"] = (time.perf_counter() - snapshot_started) * 1000
     if projection.status != "ready":
         return _empty_or_error_payload(
             params=qparams,
@@ -361,8 +365,12 @@ def _get_snapshot_product_information_result(
             stock_mode=scope.stock_mode,
         ),
     }
-    frame = pd.DataFrame(list(projection.rows))
+    materialize_started = time.perf_counter()
+    snapshot_columns = [column for column in _COLUMN_LABELS if projection.rows and column in projection.rows[0]]
+    frame = pd.DataFrame.from_records(projection.rows, columns=snapshot_columns)
+    performance_ms["snapshot_projection"] = (time.perf_counter() - materialize_started) * 1000
     master_read = not frame.empty
+    master_started = time.perf_counter()
     try:
         master = master_loader(qparams) if not frame.empty else pd.DataFrame()
     except Exception:
@@ -371,6 +379,7 @@ def _get_snapshot_product_information_result(
             message="제품 기본정보를 확인하지 못했습니다.",
             source_call_count=1,
         )
+    performance_ms["erp_master"] = (time.perf_counter() - master_started) * 1000
     unlabeled_name = qparams.get("_product_information_unlabeled_name", "")
     if unlabeled_name and not master.empty:
         token = str(unlabeled_name).strip()
@@ -390,12 +399,16 @@ def _get_snapshot_product_information_result(
                 ),
                 source_call_count=1,
             )
+    finalize_started = time.perf_counter()
     if not frame.empty:
+        snapshot_filter_applied = False
         for key in ("profit_grade", "contribution_grade", "lifecycle_status"):
             if qparams[key] and key in frame.columns:
                 frame = frame.loc[frame[key].fillna("").astype(str).eq(qparams[key])]
-        available = [column for column in _COLUMN_LABELS if column in frame.columns]
-        frame = frame.loc[:, available].rename(columns=_COLUMN_LABELS).reset_index(drop=True)
+                snapshot_filter_applied = True
+        if snapshot_filter_applied:
+            frame = frame.reset_index(drop=True)
+        frame.rename(columns=_COLUMN_LABELS, inplace=True)
         frame = frame.merge(master, on="제품코드", how="inner", validate="one_to_one")
         leading = [key for key in ("제품코드", "제품명", "제약사", "규격") if key in frame]
         basic = [key for key in master.columns if key not in leading]
@@ -408,6 +421,7 @@ def _get_snapshot_product_information_result(
             if column in frame:
                 frame[column] = frame[column].map(lambda value: "" if pd.isna(value) else str(value))
         frame.insert(0, "조회순번", range(1, len(frame) + 1))
+    performance_ms["merge_finalize"] = (time.perf_counter() - finalize_started) * 1000
 
     filters = []
     for key, label in (
@@ -438,19 +452,26 @@ def _get_snapshot_product_information_result(
         )
         return payload
 
-    display = frame.head(qparams["top"]).copy()
+    presentation_started = time.perf_counter()
+    display = frame.head(qparams["top"]).copy() if materialize_presentation else frame.iloc[:0]
     summary = f"조회조건: {condition}\n\n결과: {len(frame):,}건"
     grade_lines = []
-    for column in ("출고빈도등급", "품목손익등급", "품목기여등급", "제품수명주기"):
-        if column in frame:
-            counts = frame[column].fillna("자료 부족").value_counts().to_dict()
-            grade_lines.append(f"{column}: " + ", ".join(f"{key} {value}개" for key, value in counts.items()))
-    llm_summary = summary + "\n\n" + "\n".join(grade_lines) + (
-        "\n출고빈도/품목손익/품목기여 등급은 서로 독립입니다. F는 신규품목, X는 최근 정상출고 없음입니다."
-        " 자료 부족을 E/X 또는 손실로 해석하지 마세요. 추정손익률 원자료는 비율(0.1=10%)입니다."
-        " 추정단위손익/추정기여금액은 관리용 추정치이며 회계 확정손익이 아닙니다."
-        " 전체 등급 분포는 위 집계를 근거로 하고 일부 표 샘플을 전체로 일반화하지 마세요."
-    )
+    if materialize_presentation:
+        for column in ("출고빈도등급", "품목손익등급", "품목기여등급", "제품수명주기"):
+            if column in frame:
+                counts = frame[column].fillna("자료 부족").value_counts().to_dict()
+                grade_lines.append(f"{column}: " + ", ".join(f"{key} {value}개" for key, value in counts.items()))
+        llm_summary = summary + "\n\n" + "\n".join(grade_lines) + (
+            "\n출고빈도/품목손익/품목기여 등급은 서로 독립입니다. F는 신규품목, X는 최근 정상출고 없음입니다."
+            " 자료 부족을 E/X 또는 손실로 해석하지 마세요. 추정손익률 원자료는 비율(0.1=10%)입니다."
+            " 추정단위손익/추정기여금액은 관리용 추정치이며 회계 확정손익이 아닙니다."
+            " 전체 등급 분포는 위 집계를 근거로 하고 일부 표 샘플을 전체로 일반화하지 마세요."
+        )
+        records = display.to_dict(orient="records")
+    else:
+        llm_summary = summary
+        records = []
+    performance_ms["presentation"] = (time.perf_counter() - presentation_started) * 1000
     payload = {
         "table": TABLE,
         "title": ACTION,
@@ -458,8 +479,8 @@ def _get_snapshot_product_information_result(
         "params": {**qparams, "company_id": company_id, "evaluation_month": evaluation_month},
         "df": frame,
         "df_display": display,
-        "records": display.to_dict(orient="records"),
-        "columns": list(display.columns),
+        "records": records,
+        "columns": list(frame.columns),
         "data": summary,
         "message": summary,
         "final": True,
@@ -481,6 +502,8 @@ def _get_snapshot_product_information_result(
             "snapshot_status": "ready",
             "snapshot_reason": "",
             "snapshot_checksum": projection.checksum,
+            "presentation_materialized": materialize_presentation,
+            "performance_ms": performance_ms,
             **snapshot_meta,
             "semantic_styled_max_rows": 300,
         },
@@ -500,6 +523,7 @@ def get_snapshot_product_information_result(
     master_loader: Callable[..., pd.DataFrame] = load_product_information_master,
     viewer_user: Any = None,
     apply_viewer_projection: bool = True,
+    materialize_presentation: bool = True,
 ) -> dict[str, Any]:
     """Emit one safe provenance/performance record for each query execution."""
     started = time.perf_counter()
@@ -508,8 +532,12 @@ def get_snapshot_product_information_result(
         projection_reader=projection_reader, master_loader=master_loader,
         viewer_user=viewer_user,
         apply_viewer_projection=apply_viewer_projection,
+        materialize_presentation=materialize_presentation,
     )
     meta = payload.get("meta") or {}
+    performance_ms = dict(meta.get("performance_ms") or {})
+    performance_ms["total"] = (time.perf_counter() - started) * 1000
+    meta["performance_ms"] = performance_ms
     query = payload.get("params") or {}
     filters = {key: str(query[key])[:120] for key in (
         "physic_cd", "physic_nm", "product_keyword", "insu_cd", "barcode", "maker_nm", "frequency_grade", "profit_grade",
