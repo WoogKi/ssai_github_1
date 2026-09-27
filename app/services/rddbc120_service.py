@@ -891,9 +891,22 @@ def get_rddbc120_analysis_summary(params: Optional[Dict[str, Any]] = None) -> Di
     - 화면 조회 TOP 200과 분리한다.
     - 동일 조회조건 전체 기준으로 건수/수량/금액/매출처/실납처/제품/영업사원 집계를 만든다.
     """
+    started = time.perf_counter()
     qparams = coalesce_params(dict(params or {}))
     where_sql = _base_filters(qparams)
     validation_join_sql = _validation_join_sql(qparams) if _requires_validation_projection(qparams) else ""
+    summary_filter_joins: list[str] = []
+    # These descriptors are only required when their name filters are present.
+    # The detail query still keeps its full display projection independently.
+    if like_value(qparams.get("add_nm")):
+        summary_filter_joins.append("""
+    LEFT JOIN dbo.Rddbc060 AS Add_Cd
+        ON Out_Put.Rd12_Add_Cd = Add_Cd.Rd06_User_Cd""")
+    if like_value(qparams.get("mod_nm")):
+        summary_filter_joins.append("""
+    LEFT JOIN dbo.Rddbc060 AS Mod_Cd
+        ON Out_Put.Rd12_Mod_Cd = Mod_Cd.Rd06_User_Cd""")
+    summary_filter_join_sql = "\n".join(summary_filter_joins)
 
     sql = f"""
 WITH base AS (
@@ -915,10 +928,6 @@ WITH base AS (
         CAST(COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0) AS float) AS supply_amt,
         CAST(COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0) AS float) AS tax_amt
     FROM dbo.Rddbc120 AS Out_Put
-    LEFT JOIN dbo.Rddbc060 AS Add_Cd
-        ON Out_Put.Rd12_Add_Cd = Add_Cd.Rd06_User_Cd
-    LEFT JOIN dbo.Rddbc060 AS Mod_Cd
-        ON Out_Put.Rd12_Mod_Cd = Mod_Cd.Rd06_User_Cd
     LEFT JOIN dbo.Rddbc030 AS Ven_Cd
         ON Out_Put.Rd12_Ven_Cd = Ven_Cd.Rd03_Ven_Cd
     LEFT JOIN dbo.Rddbc030 AS In_Ven_Cd
@@ -930,16 +939,34 @@ WITH base AS (
     LEFT JOIN dbo.Rddbc010 AS Stock_Cd
         ON Out_Put.Rd12_Stock_Cd_Gcode = Stock_Cd.Rd01_Gcode
        AND Out_Put.Rd12_Stock_Cd = Stock_Cd.Rd01_Tcode
-    LEFT JOIN dbo.Rddbc010 AS Io_Gu
-        ON Out_Put.Rd12_Io_Gu_Gcode = Io_Gu.Rd01_Gcode
-       AND Out_Put.Rd12_Io_Gu = Io_Gu.Rd01_Tcode
     LEFT JOIN dbo.Rddbc060 AS Sales_Man
         ON Out_Put.Rd12_Sales_Man = Sales_Man.Rd06_User_Cd
+    {summary_filter_join_sql}
     {validation_join_sql}
     WHERE 1 = 1
     {where_sql}
 ),
 grouped AS (
+    SELECT
+        Grouped.section,
+        Grouped.name,
+        COUNT_BIG(*) AS row_count,
+        SUM(base.qty) AS qty_sum,
+        SUM(base.supply_amt) AS supply_sum,
+        SUM(base.tax_amt) AS tax_sum,
+        SUM(base.supply_amt + base.tax_amt) AS amount_sum
+    FROM base
+    CROSS APPLY (VALUES
+        ('top_sales_vendors', base.vendor_nm),
+        ('top_real_vendors', base.real_vendor_nm),
+        ('top_buy_vendors', base.buy_vendor_nm),
+        ('top_products', base.product_nm),
+        ('top_sales_staff', base.sales_staff_nm),
+        ('top_stock_locations', base.stock_nm)
+    ) AS Grouped(section, name)
+    GROUP BY Grouped.section, Grouped.name
+),
+overall AS (
     SELECT
         'overall' AS section,
         '전체' AS name,
@@ -951,59 +978,66 @@ grouped AS (
         COUNT(DISTINCT vendor_cd) AS vendor_count,
         COUNT(DISTINCT product_cd) AS product_count,
         COUNT(DISTINCT stock_cd) AS stock_location_count,
-        COUNT(DISTINCT sales_staff_cd) AS staff_count
+        COUNT(DISTINCT sales_staff_cd) AS staff_count,
+        CAST(1 AS int) AS rn
     FROM base
-
-    UNION ALL
-
-    SELECT 'top_sales_vendors', vendor_nm, COUNT_BIG(*), SUM(qty), SUM(supply_amt), SUM(tax_amt), SUM(supply_amt + tax_amt),
-           CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int)
-    FROM base
-    GROUP BY vendor_nm
-
-    UNION ALL
-
-    SELECT 'top_real_vendors', real_vendor_nm, COUNT_BIG(*), SUM(qty), SUM(supply_amt), SUM(tax_amt), SUM(supply_amt + tax_amt),
-           CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int)
-    FROM base
-    GROUP BY real_vendor_nm
-
-    UNION ALL
-
-    SELECT 'top_buy_vendors', buy_vendor_nm, COUNT_BIG(*), SUM(qty), SUM(supply_amt), SUM(tax_amt), SUM(supply_amt + tax_amt),
-           CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int)
-    FROM base
-    GROUP BY buy_vendor_nm
-
-    UNION ALL
-
-    SELECT 'top_products', product_nm, COUNT_BIG(*), SUM(qty), SUM(supply_amt), SUM(tax_amt), SUM(supply_amt + tax_amt),
-           CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int)
-    FROM base
-    GROUP BY product_nm
-
-    UNION ALL
-
-    SELECT 'top_sales_staff', sales_staff_nm, COUNT_BIG(*), SUM(qty), SUM(supply_amt), SUM(tax_amt), SUM(supply_amt + tax_amt),
-           CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int)
-    FROM base
-    GROUP BY sales_staff_nm
-
-    UNION ALL
-
-    SELECT 'top_stock_locations', stock_nm, COUNT_BIG(*), SUM(qty), SUM(supply_amt), SUM(tax_amt), SUM(supply_amt + tax_amt),
-           CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int), CAST(NULL AS int)
-    FROM base
-    GROUP BY stock_nm
 ),
 ranked AS (
     SELECT
-        *,
+        section,
+        name,
+        row_count,
+        qty_sum,
+        supply_sum,
+        tax_sum,
+        amount_sum,
         ROW_NUMBER() OVER (
             PARTITION BY section
-            ORDER BY amount_sum DESC, qty_sum DESC, row_count DESC
+            ORDER BY amount_sum DESC, qty_sum DESC, row_count DESC, name ASC
         ) AS rn
     FROM grouped
+),
+combined AS (
+    SELECT
+        section,
+        name,
+        row_count,
+        qty_sum,
+        supply_sum,
+        tax_sum,
+        amount_sum,
+        CAST(NULL AS int) AS vendor_count,
+        CAST(NULL AS int) AS product_count,
+        CAST(NULL AS int) AS stock_location_count,
+        CAST(NULL AS int) AS staff_count,
+        CASE section
+            WHEN 'top_sales_vendors' THEN 1
+            WHEN 'top_real_vendors' THEN 2
+            WHEN 'top_buy_vendors' THEN 3
+            WHEN 'top_products' THEN 4
+            WHEN 'top_sales_staff' THEN 5
+            WHEN 'top_stock_locations' THEN 6
+            ELSE 9
+        END AS section_sort,
+        rn
+    FROM ranked
+    WHERE rn <= 10
+    UNION ALL
+    SELECT
+        section,
+        name,
+        row_count,
+        qty_sum,
+        supply_sum,
+        tax_sum,
+        amount_sum,
+        vendor_count,
+        product_count,
+        stock_location_count,
+        staff_count,
+        CAST(0 AS int) AS section_sort,
+        rn
+    FROM overall
 )
 SELECT
     section,
@@ -1017,23 +1051,18 @@ SELECT
     product_count,
     stock_location_count,
     staff_count
-FROM ranked
-WHERE section = 'overall'
-   OR rn <= 10
+FROM combined
 ORDER BY
-    CASE section
-        WHEN 'overall' THEN 0
-        WHEN 'top_sales_vendors' THEN 1
-        WHEN 'top_real_vendors' THEN 2
-        WHEN 'top_buy_vendors' THEN 3
-        WHEN 'top_products' THEN 4
-        WHEN 'top_sales_staff' THEN 5
-        WHEN 'top_stock_locations' THEN 6
-        ELSE 9
-    END,
+    section_sort,
     rn
 """
     df = query_to_df(sql, qparams)
+    log.info(
+        "[io.detail.summary_perf] action=출고명세 조회 stage=summary_query "
+        "result_rows=%s elapsed_ms=%s sql_shape=base_overall_plus_cross_apply_groups",
+        0 if df is None else len(df),
+        int((time.perf_counter() - started) * 1000),
+    )
     if df is None or df.empty:
         return {
             "row_count_total": 0,
