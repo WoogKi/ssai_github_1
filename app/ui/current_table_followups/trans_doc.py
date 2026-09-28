@@ -10,6 +10,7 @@ import re
 import pandas as pd
 
 from app.ui.current_table_followups.generic import semantic_boolean_mask
+from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
 
 
 def handle_trans_doc_followup(
@@ -43,7 +44,7 @@ def handle_trans_doc_followup(
 
     col_names = [str(c).strip() for c in df.columns]
 
-    date_col = find_col(
+    date_col = str(helpers.get("_resolved_date_column") or "").strip() or find_col(
         df,
         exact=("거래명세서일자", "거래일자", "일자", "Rd13_Trans_YyMmDd"),
         include_any=("거래명세서일자", "거래일자", "Trans_YyMmDd", "일자"),
@@ -551,8 +552,7 @@ def handle_trans_doc_followup(
             )
 
         work = _base_work()
-        raw_month = _text_series(date_col).str.replace(r"\D", "", regex=True).str[:6]
-        work["월"] = raw_month.str[:4] + "-" + raw_month.str[4:6]
+        work["월"] = derive_current_table_time_grouping(df.loc[work.index, date_col], "month")
         work = work[work["월"].str.len() == 7].copy()
         if work.empty:
             return push_notice(
@@ -615,6 +615,7 @@ def handle_trans_doc_followup(
             query_summary = f"현재표 / 월별 {amount_title_word} 요약 / {split_label} / 전체 {len(df):,}건 기준"
             display_limit = None
 
+        out["월"] = out["월"].astype("string")
         out.insert(0, "순번", range(1, len(out) + 1))
 
         log.info(
@@ -704,8 +705,7 @@ def handle_trans_doc_followup(
             )
 
         work = _base_work()
-        raw_day = _text_series(date_col).str.replace(r"\D", "", regex=True).str[:8]
-        work["일자"] = raw_day.str[:4] + "-" + raw_day.str[4:6] + "-" + raw_day.str[6:8]
+        work["일자"] = derive_current_table_time_grouping(df.loc[work.index, date_col], "day")
         work = work[work["일자"].str.len() == 10].copy()
         if work.empty:
             return False
@@ -729,17 +729,7 @@ def handle_trans_doc_followup(
             split_label = "통합"
             title = "현재표 일자별 거래금액 통합"
 
-        dt = pd.to_datetime(work["일자"], errors="coerce")
-        week_map = {
-            0: "월요일",
-            1: "화요일",
-            2: "수요일",
-            3: "목요일",
-            4: "금요일",
-            5: "토요일",
-            6: "일요일",
-        }
-        work["요일"] = dt.dt.dayofweek.map(week_map).fillna("(일자없음)")
+        work["요일"] = derive_current_table_time_grouping(df.loc[work.index, date_col], "weekday").replace("", "(일자없음)")
 
         asks_best_weekday_only = requested_grouping == "weekday" and wants_first
         wants_weekday_amount = (

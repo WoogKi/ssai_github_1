@@ -18322,7 +18322,7 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
                 ),
                 "purchase_amount",
                 "입고금액",
-                [("202607", 33), ("202608", 165)],
+                [("2026-07", 33), ("2026-08", 165)],
             ),
             (
                 "출고명세 조회",
@@ -18336,7 +18336,7 @@ def run_current_table_source_contract_checks() -> list[CheckResult]:
                 ),
                 "sales",
                 "매출금액",
-                [("202607", 44), ("202608", 275)],
+                [("2026-07", 44), ("2026-08", 275)],
             ),
             (
                 "거래명세서 공통 조회",

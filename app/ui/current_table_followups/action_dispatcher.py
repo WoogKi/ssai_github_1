@@ -39,6 +39,7 @@ from typing import Any, Callable
 
 import pandas as pd
 from app.ui.current_table_followups.analysis_facts import build_whole_table_facts
+from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
 
 from app.ui.current_table_followups.monthly_stock import handle_monthly_stock_followup
 from app.ui.current_table_followups.validation import handle_validation_followup
@@ -49,6 +50,7 @@ from app.ui.current_table_followups.inventory import (
 from app.ui.current_table_followups.stock_ledger import handle_stock_ledger_followup
 from app.ui.current_table_followups.sales_detail import handle_sales_detail_followup
 from app.ui.current_table_followups.purchase_detail import handle_purchase_detail_followup
+from app.ui.current_table_followups.order import handle_order_followup
 from app.ui.current_table_followups.tax_doc import handle_tax_doc_followup
 from app.ui.current_table_followups.trans_doc import handle_trans_doc_followup
 from app.ui.current_table_followups.analytics_kpi import handle_analytics_kpi_followup
@@ -360,6 +362,9 @@ def detect_current_table_kind(source_action: str) -> str:
     if "입고명세" in s:
         return "purchase_detail"
 
+    if "발주조회" in s:
+        return "order"
+
     if "세금계산서" in s:
         return "tax_doc"
 
@@ -576,6 +581,12 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
 # Canonical follow-up fields can be derived from native source columns even
 # when the canonical result label does not yet exist in the current table.
 _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "order": {
+        "month": ("발주일자",),
+        "day": ("발주일자",),
+        "weekday": ("발주일자",),
+        "order_vendor": ("발주거래처명", "발주처명", "발주처"),
+    },
     "purchase_detail": {
         "month": ("입고일자", "매입일자", "일자"),
         "day": ("입고일자", "매입일자", "일자"),
@@ -593,6 +604,31 @@ _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = 
         "day": ("거래명세서일자", "거래일자", "일자"),
         "weekday": ("거래명세서일자", "거래일자", "일자"),
         "customer": ("거래처명", "매입처명", "매출처명"),
+    },
+}
+
+# Source-specific date meanings are declared once so deterministic aggregation
+# and interpretive facts resolve the same business date.  Explicit date labels
+# take precedence; a bare day/month/weekday request uses the source default.
+_CURRENT_TABLE_SOURCE_DATE_AUTHORITIES: dict[str, dict[str, Any]] = {
+    "order": {
+        "default": ("발주일자",),
+        "explicit": (("납기일자", ("납기일자",)), ("발주일자", ("발주일자",))),
+    },
+    "purchase_detail": {
+        "default": ("입고일자", "매입일자", "일자"),
+        "explicit": (("입고일자", ("입고일자",)), ("매입일자", ("매입일자",))),
+    },
+    "sales_detail": {
+        "default": ("출고일자", "매출일자", "일자"),
+        "explicit": (("출고일자", ("출고일자",)), ("매출일자", ("매출일자",))),
+    },
+    "trans_doc": {
+        "default": ("거래명세서일자", "거래일자", "일자"),
+        "explicit": (("거래명세서일자", ("거래명세서일자",)), ("거래일자", ("거래일자",))),
+        # Existing transaction direction shorthand: these phrases mean
+        # purchase/sales direction plus canonical day, not a different source column.
+        "contextual_default": ("입고일자", "매입일자", "출고일자", "매출일자"),
     },
 }
 
@@ -706,18 +742,122 @@ def _resolve_current_table_column(df: pd.DataFrame, aliases: tuple[str, ...]) ->
     return ""
 
 
+def _current_table_source_date_terms(kind: str) -> tuple[str, ...]:
+    authority = _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES.get(kind, {})
+    terms = {
+        re.sub(r"\s+", "", str(term))
+        for term in (
+            *authority.get("default", ()),
+            *authority.get("contextual_default", ()),
+            *(label for label, _aliases in authority.get("explicit", ())),
+            *(alias for _label, aliases in authority.get("explicit", ()) for alias in aliases),
+        )
+        if str(term).strip()
+    }
+    return tuple(sorted(terms, key=len, reverse=True))
+
+
+def _requested_current_table_date_label(query: str) -> str:
+    """Return an explicitly named date column, excluding bare canonical time words."""
+    text = re.sub(r"\s+", " ", str(query or "")).strip()
+    known_terms = {
+        term
+        for source_kind in _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES
+        for term in _current_table_source_date_terms(source_kind)
+        if term not in {"일자", "날짜"}
+    }
+    for term in sorted(known_terms, key=len, reverse=True):
+        if term in text:
+            return term
+
+    body = _strip_current_table_referents(text)
+    match = re.search(
+        r"([가-힣A-Za-z0-9_]+?(?:일자|날짜))(?=\s|별|기준|요일|월|집계|합계|분석|요약|조회|보여|$)",
+        body,
+    )
+    if not match:
+        return ""
+    label = re.sub(r"\s+", "", match.group(1))
+    return "" if label in {"일자", "날짜"} else label
+
+
+def _current_table_source_requested_date_aliases(kind: str, label: str) -> tuple[str, ...]:
+    normalized = re.sub(r"\s+", "", str(label or ""))
+    authority = _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES.get(kind, {})
+    for declared_label, aliases in authority.get("explicit", ()):
+        terms = {
+            re.sub(r"\s+", "", str(term))
+            for term in (declared_label, *aliases)
+        }
+        if normalized in terms:
+            return tuple(aliases)
+    contextual_default = {
+        re.sub(r"\s+", "", str(term))
+        for term in authority.get("contextual_default", ())
+    }
+    if normalized in contextual_default:
+        return tuple(authority.get("default", ()))
+    return ()
+
+
 def _resolve_current_table_dimension_column(
     df: pd.DataFrame,
     *,
     grouping: str,
     kind: str,
+    query: str = "",
 ) -> str:
+    if grouping in {"month", "day", "weekday"}:
+        authority = _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES.get(kind, {})
+        requested_date_label = _requested_current_table_date_label(query)
+        if requested_date_label:
+            explicit_aliases = _current_table_source_requested_date_aliases(
+                kind,
+                requested_date_label,
+            )
+            if not explicit_aliases:
+                return ""
+            return _resolve_current_table_column(df, explicit_aliases)
+        default_aliases = tuple(authority.get("default", ()))
+        if default_aliases:
+            resolved = _resolve_current_table_column(df, default_aliases)
+            if resolved:
+                return resolved
     source_aliases = _CURRENT_TABLE_SOURCE_GROUPING_ALIASES.get(kind, {}).get(grouping, ())
     aliases = source_aliases or next(
         (spec_aliases for key, _label, _phrases, spec_aliases in _CURRENT_TABLE_DIMENSION_SPECS if key == grouping),
         (),
     )
     return _resolve_current_table_column(df, aliases)
+
+
+def _current_table_time_grouping_facts_frame(
+    df: pd.DataFrame,
+    *,
+    grouping: str,
+    kind: str,
+    query: str,
+) -> tuple[pd.DataFrame, str, str]:
+    """Build an analysis-only time dimension from the source's date authority."""
+    source_column = _resolve_current_table_dimension_column(
+        df,
+        grouping=grouping,
+        kind=kind,
+        query=query,
+    )
+    if (
+        grouping not in {"day", "month", "weekday"}
+        or kind not in _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES
+        or not source_column
+    ):
+        return df, source_column, ""
+    derived_column = {"day": "일자", "month": "월", "weekday": "요일"}[grouping]
+    analysis_df = df.copy()
+    analysis_df[derived_column] = derive_current_table_time_grouping(
+        analysis_df[source_column],
+        grouping,
+    )
+    return analysis_df, derived_column, source_column
 
 
 def _current_table_metric_columns(
@@ -800,6 +940,7 @@ def _current_table_unresolved_request_labels(
     *,
     metrics: list[str],
     groupings: list[str],
+    kind: str = "",
 ) -> tuple[str, str]:
     """Return explicit unknown metric/dimension labels without inventing a substitute column."""
     compact = re.sub(r"\s+", "", str(query or ""))
@@ -821,18 +962,30 @@ def _current_table_unresolved_request_labels(
         key=len,
         reverse=True,
     )
-    for term in dimension_terms:
+    source_date_terms = _current_table_source_date_terms(kind)
+    known_dimension_terms = sorted(
+        {*dimension_terms, *source_date_terms},
+        key=len,
+        reverse=True,
+    )
+    for term in known_dimension_terms:
         body = body.replace(term, "")
     for _key, label, aliases in _CURRENT_TABLE_METRIC_SPECS:
         for term in (label, *aliases):
             body = body.replace(re.sub(r"\s+", "", term), "")
     body = body.replace("별", "").replace("기준", "").replace("으로", "").replace("로", "")
 
-    unknown_dimension = ""
+    requested_date_label = _requested_current_table_date_label(query)
+    unknown_dimension = (
+        requested_date_label
+        if requested_date_label
+        and not _current_table_source_requested_date_aliases(kind, requested_date_label)
+        else ""
+    )
     unknown_metric = ""
     if interpretive_body is not None:
         residual = _strip_current_table_referents(interpretive_body)
-        for term in dimension_terms:
+        for term in known_dimension_terms:
             residual = residual.replace(term, "")
         for _key, label, aliases in _CURRENT_TABLE_METRIC_SPECS:
             for term in sorted({label, *aliases}, key=len, reverse=True):
@@ -840,13 +993,13 @@ def _current_table_unresolved_request_labels(
         residual = re.sub(r"^(?:별|기준|과|와|및|그리고)+|(?:별|기준)$", "", residual)
         # A named unknown dimension, including a conjunction with a known one,
         # must not silently disappear into a broad whole-table interpretation.
-        if len(residual) >= 2 and (
+        if not unknown_dimension and len(residual) >= 2 and (
             re.search(r"차원|등급|판정|분류|유형|명$", residual)
             or (groupings and re.search(r"과|와|및|그리고", interpretive_body))
         ):
             unknown_dimension = residual
-    if dimension_body.endswith("별"):
-        for term in dimension_terms:
+    if not unknown_dimension and dimension_body.endswith("별"):
+        for term in known_dimension_terms:
             dimension_body = dimension_body.replace(term, "")
         dimension_body = re.sub(r"(?:별|기준|으로|로|과|와|및|그리고)+", "", dimension_body)
         if len(dimension_body) >= 2:
@@ -951,6 +1104,7 @@ def _current_table_source_metric_hint(
             query,
             metrics=[],
             groupings=requested_groupings,
+            kind="trans_doc",
         )
         # 거래명세서 header의 합계금액은 방향을 지정하지 않은 기본 집계에서만
         # 공식 거래금액이다. 명시하지 않은 수수료/비용 등은 대체하지 않는다.
@@ -984,6 +1138,7 @@ def _current_table_followup_intent(
 ) -> dict[str, Any]:
     requested_dimensions = _requested_current_table_dimensions(query)
     metrics = _current_table_requested_metrics(query)
+    kind = detect_current_table_kind(source_action)
     source_is_trans_doc = "거래명세서" in re.sub(r"\s+", "", str(source_action or ""))
     # 거래명세서 공통은 매입/매출 별도의 금액 컬럼을 만들지 않는다. 시간 단위
     # 집계에서 명시한 매입/매출 방향은 header의 공식 합계금액을 구분으로 좁힌다.
@@ -1019,6 +1174,7 @@ def _current_table_followup_intent(
             query,
             metrics=metrics,
             groupings=groupings,
+            kind=kind,
         )
         # The source name can precede a real time dimension in an interpretive
         # request ("현재표 거래명세서 일자별 분석"). It is not an unknown
@@ -1141,12 +1297,22 @@ def _current_table_followup_capability(
     unresolved_metric = str(intent.get("unresolved_metric_label") or "")
     missing_columns: list[str] = []
     available_columns: list[str] = []
+    requested_date_label = _requested_current_table_date_label(query)
     for grouping_key, label, aliases in requested:
-        resolved = _resolve_current_table_dimension_column(df, grouping=grouping_key, kind=kind)
+        resolved = _resolve_current_table_dimension_column(
+            df,
+            grouping=grouping_key,
+            kind=kind,
+            query=query,
+        )
         if resolved:
             available_columns.append(resolved)
         else:
-            missing_columns.append(label)
+            missing_columns.append(
+                requested_date_label
+                if grouping_key in {"month", "day", "weekday"} and requested_date_label
+                else label
+            )
 
     resolved_metric = _resolve_current_table_metric_column(df, metric, kind)
     metric_columns = [resolved_metric] if resolved_metric else []
@@ -1362,12 +1528,23 @@ def build_current_table_interpretive_facts(
         detail = df.loc[detail_mask].reset_index(drop=True)
         if detail.empty:
             return {"status": "no_data", "capability": capability, "facts": []}
-        group_column = _resolve_current_table_dimension_column(df, grouping=grouping, kind=kind) if grouping else ""
-        whole = build_whole_table_facts(detail, action=source_action, query=query, group_column=group_column or "")
+        facts_detail, group_column, date_source_column = _current_table_time_grouping_facts_frame(
+            detail,
+            grouping=grouping,
+            kind=kind,
+            query=query,
+        ) if grouping else (detail, "", "")
+        whole = build_whole_table_facts(
+            facts_detail,
+            action=source_action,
+            query=query,
+            group_column=group_column or "",
+        )
         return {"status": "success", "capability": capability,
                 "whole_table_facts": whole, "input_row_count": len(df),
                 "source_row_count": len(detail), "excluded_summary_row_count": int((~detail_mask).sum()),
                 "fact_row_count": whole.get("group_count", 0), "facts": [],
+                "date_source_column": date_source_column,
                 **_current_table_source_limit_contract(df, source_meta)}
     if capability.get("status") != "success":
         return {
@@ -1377,7 +1554,12 @@ def build_current_table_interpretive_facts(
             "available_columns": [str(column) for column in df.columns],
         }
 
-    group_column = _resolve_current_table_dimension_column(df, grouping=grouping, kind=kind)
+    facts_source_df, group_column, date_source_column = _current_table_time_grouping_facts_frame(
+        df,
+        grouping=grouping,
+        kind=kind,
+        query=query,
+    )
     metric_column = _resolve_current_table_metric_column(df, metric, kind)
     if not group_column or not metric_column:
         missing_columns = list((capability.get("missing_columns") or []))
@@ -1404,7 +1586,7 @@ def build_current_table_interpretive_facts(
     elif kind == "trans_doc":
         detail_mask, _type_column = _current_table_trans_doc_direction_mask(df, query)
 
-    detail_df = df.loc[detail_mask]
+    detail_df = facts_source_df.loc[detail_mask]
     work = pd.DataFrame(
         {
             group_column: detail_df[group_column].astype("string").fillna("").str.strip(),
@@ -1499,6 +1681,7 @@ def build_current_table_interpretive_facts(
         "facts_compacted": facts_compacted,
         "summary_bucket_label": "기타합산" if facts_compacted else "",
         "available_columns": [str(column) for column in df.columns],
+        "date_source_column": date_source_column,
         **source_limit_contract,
     }
 
@@ -1705,6 +1888,7 @@ def _known_action_handlers() -> dict[str, Callable[..., Any]]:
         "stock_ledger": handle_stock_ledger_followup,
         "sales_detail": handle_sales_detail_followup,
         "purchase_detail": handle_purchase_detail_followup,
+        "order": handle_order_followup,
         "tax_doc": handle_tax_doc_followup,
         "trans_doc": handle_trans_doc_followup,
         "analytics_kpi": handle_analytics_kpi_followup,
@@ -1799,6 +1983,7 @@ def handle_current_table_followup_by_action(
             dispatch_df,
             grouping=requested_grouping,
             kind=kind,
+            query=query,
         )
         if actual_group_column and actual_group_column not in dispatch_query:
             dimension_spec = next(
@@ -1922,6 +2107,12 @@ def handle_current_table_followup_by_action(
     dispatch_helpers["_is_deterministic_request"] = (
         classify_current_table_followup_intent(query) == "dataframe_table"
     )
+    dispatch_helpers["_resolved_date_column"] = _resolve_current_table_dimension_column(
+        dispatch_df,
+        grouping=requested_grouping,
+        kind=kind,
+        query=query,
+    ) if requested_grouping in {"month", "day", "weekday"} else ""
     source_table_name = str((source_meta or {}).get("source_table") or "").strip().lower()
     if source_table_name == "rddbc070" or "계약단가" in str(source_action or ""):
         # Contract-price columns have no safe implicit sum metric. Literal

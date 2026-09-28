@@ -9,6 +9,8 @@ from typing import Any, Callable
 import re
 import pandas as pd
 
+from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
+
 
 def handle_purchase_detail_followup(
     *,
@@ -71,7 +73,7 @@ def handle_purchase_detail_followup(
         exclude_any=("그룹", "분류", "구분"),
     )
 
-    date_col = find_col(
+    date_col = str(helpers.get("_resolved_date_column") or "").strip() or find_col(
         df,
         exact=("입고일자", "매입일자", "일자"),
         include_any=("입고일자", "매입일자", "일자", "날짜"),
@@ -310,29 +312,10 @@ def handle_purchase_detail_followup(
         if not col or col not in df.columns:
             return pd.Series([""] * len(df), index=df.index, dtype="object")
 
-        s = (
-            df[col]
-            .fillna("")
-            .astype(str)
-            .str.strip()
-            .str.replace("-", "", regex=False)
-            .str.replace("/", "", regex=False)
-            .str.replace(".", "", regex=False)
-        )
-        return s.str.extract(r"(\d{8})", expand=False).fillna("").astype(str)
+        return derive_current_table_time_grouping(df[col], "ymd")
 
     def _weekday_kr_series(ymd_s: pd.Series) -> pd.Series:
-        dt = pd.to_datetime(ymd_s, format="%Y%m%d", errors="coerce")
-        week_map = {
-            0: "월요일",
-            1: "화요일",
-            2: "수요일",
-            3: "목요일",
-            4: "금요일",
-            5: "토요일",
-            6: "일요일",
-        }
-        return dt.dt.dayofweek.map(week_map).fillna("(일자없음)")
+        return derive_current_table_time_grouping(ymd_s, "weekday").replace("", "(일자없음)")
 
 
     # 2) 거래처/매입처/입고처별 매입금액 분석
@@ -428,7 +411,13 @@ def handle_purchase_detail_followup(
     # - 현재표 일자별 입고금액 TOP 5
     # - 현재표 입고금액 최고 일자
     # - 현재표에서 입고금액이 가장 많은 일자와 요일
+    requested_grouping = str(helpers.get("_requested_grouping") or "").strip()
+    deterministic_time_grouping = bool(helpers.get("_is_deterministic_request")) and (
+        requested_grouping in {"day", "weekday", "month"}
+    )
     wants_purchase_date_group = (
+        (deterministic_time_grouping and requested_grouping in {"day", "weekday"})
+        or
         any(
             w in compact
             for w in (
@@ -602,6 +591,12 @@ def handle_purchase_detail_followup(
             out.insert(0, "순번", range(1, len(out) + 1))
             display_limit = None
 
+        elif deterministic_time_grouping and requested_grouping == "weekday":
+            out = weekday.reset_index(drop=True)
+            out.insert(0, "순번", range(1, len(out) + 1))
+            title = "현재표 요일별 입고금액"
+            query_summary = f"현재표 / 요일별 입고금액 / 전체 {len(df):,}건 기준"
+            display_limit = None
         else:
             out = daily.reset_index(drop=True)
             out.insert(0, "순번", range(1, len(out) + 1))
@@ -638,6 +633,8 @@ def handle_purchase_detail_followup(
         
     # 2-3) 월별 입고 요약
     wants_monthly_purchase = (
+        (deterministic_time_grouping and requested_grouping == "month")
+        or
         any(w in compact for w in ("월별입고", "월별입고요약", "월별입고금액", "월별매입", "월별매입금액"))
         or ("월별" in t and any(w in t for w in ("입고", "매입", "금액", "요약", "집계")))
     )
@@ -653,7 +650,7 @@ def handle_purchase_detail_followup(
             )
 
         ymd_s = _date_ymd_series(date_col)
-        month_s = ymd_s.str.slice(0, 6)
+        month_s = derive_current_table_time_grouping(ymd_s, "month")
 
         work = pd.DataFrame(
             {
@@ -665,7 +662,7 @@ def handle_purchase_detail_followup(
             },
             index=df.index,
         )
-        work = work[work["월"].astype(str).str.len().eq(6)].copy()
+        work = work[work["월"].astype(str).str.len().eq(7)].copy()
 
         if work.empty:
             return push_notice(
@@ -689,6 +686,7 @@ def handle_purchase_detail_followup(
             .reset_index()
             .sort_values("월")
         )
+        out["월"] = out["월"].astype("string")
         out.insert(0, "순번", range(1, len(out) + 1))
 
         explicit_top = bool(re.search(r"(?:TOP|top|상위)\s*(\d{1,4})", t))
