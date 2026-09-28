@@ -366,26 +366,37 @@ def _first_series_for_column(df: pd.DataFrame, col: str) -> pd.Series:
         return pd.Series(dtype="object")
 
 
-def _strip_common_filter_value(value: str) -> str:
+def _strip_common_filter_value(value: str, *, known_values: pd.Series | None = None) -> str:
     """컬럼명 뒤에 붙은 값에서 실행어/조사/구분자를 제거한다."""
-    v = _norm_col_name(value)
+    raw = str(value or "").strip()
+    raw = re.sub(r"^[=:：]+\s*", "", raw)
+    # A particle after the column label has a token boundary. Never strip
+    # particle-like syllables from the beginning of an entity name.
+    raw = re.sub(r"^(?:은|는|이|가|을|를|의)(?=\s)", "", raw).strip()
+    v = _norm_col_name(raw)
     if not v:
         return ""
 
-    v = re.sub(r"^[=:：은는이가을를의]+", "", v).strip()
-
     changed = True
+    command_removed = False
     while changed and v:
         changed = False
         for suffix in sorted(_COMMON_FILTER_VALUE_SUFFIXES, key=len, reverse=True):
             sx = _norm_col_name(suffix)
             if sx and v.endswith(sx):
                 v = v[: -len(sx)].strip()
+                command_removed = True
                 changed = True
                 break
 
-    v = re.sub(r"^[=:：은는이가을를의]+", "", v).strip()
     v = re.sub(r"[?？!！,.。]+$", "", v).strip()
+    if command_removed and v:
+        # Prefer the literal source value when a name itself ends in a particle.
+        literal_match = known_values is not None and _series_compact_for_filter(known_values).str.contains(
+            re.escape(v), na=False, regex=True,
+        ).any()
+        if not literal_match:
+            v = re.sub(r"(?:에서|은|는|이|가|을|를|에|의)$", "", v)
     return v
 
 
@@ -642,7 +653,18 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
         tail = q_norm[pos + len(alias):]
         if tail.startswith("별") or tail.startswith("명별"):
             continue
-        value = _strip_common_filter_value(tail)
+        # Locate the normalized alias end in the original query so whitespace
+        # between a column particle and its value survives value extraction.
+        normalized_end = pos + len(alias)
+        consumed = 0
+        raw_end = 0
+        for raw_end, character in enumerate(str(query or ""), start=1):
+            consumed += len(_norm_col_name(character))
+            if consumed >= normalized_end:
+                break
+        value = _strip_common_filter_value(
+            str(query or "")[raw_end:], known_values=_first_series_for_column(df, col),
+        )
         if not value:
             continue
         if value in {"요약", "분석", "집계", "현황"}:
