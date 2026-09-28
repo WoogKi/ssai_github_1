@@ -2100,9 +2100,46 @@ def _has_bare_current_stock_intent(text: str) -> bool:
     ))
 
 
-_DOCUMENT_DIRECTION_RESIDUAL_TOKENS = frozenset({
-    "매입", "매입분", "매출", "매출분",
-})
+_TRANSACTION_STATEMENT_DIRECTION_TOKENS = {
+    "입고": "1",
+    "입고분": "1",
+    "입고만": "1",
+    "매입": "1",
+    "매입분": "1",
+    "매입만": "1",
+    "출고": "3",
+    "출고분": "3",
+    "출고만": "3",
+    "매출": "3",
+    "매출분": "3",
+    "매출만": "3",
+}
+_DOCUMENT_DIRECTION_RESIDUAL_TOKENS = frozenset(_TRANSACTION_STATEMENT_DIRECTION_TOKENS)
+
+
+def _extract_transaction_statement_direction(text: str) -> str:
+    """Return one explicit transaction-statement direction from syntax tokens.
+
+    Direction words belong to the statement condition, not to an unlabeled
+    entity.  Match standalone tokens plus the compact ``출고거래명세서`` form;
+    never inspect arbitrary substrings in a vendor or product name.
+    """
+    source = _norm(text)
+    if not source:
+        return ""
+
+    directions: set[str] = set()
+    for token, trans_di in _TRANSACTION_STATEMENT_DIRECTION_TOKENS.items():
+        if re.search(rf"(?:^|\s){re.escape(token)}\s*거래\s*명세서", source):
+            directions.add(trans_di)
+
+    for part in source.split():
+        token = re.sub(r"^[^가-힣A-Za-z0-9]+|[^가-힣A-Za-z0-9]+$", "", part)
+        trans_di = _TRANSACTION_STATEMENT_DIRECTION_TOKENS.get(token)
+        if trans_di:
+            directions.add(trans_di)
+
+    return next(iter(directions)) if len(directions) == 1 else ""
 
 
 def _consume_document_query_syntax_residual(text: str, action: str) -> str:
@@ -2989,28 +3026,9 @@ def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
             break
 
     if "거래명세서" in text:
-        if (
-            "매입분" in text
-            or "매입만" in text
-            or "입고분" in text
-            or "입고만" in text
-            or "입고거래명세서" in text
-            or "입고 거래명세서" in text
-        ):
-            params.setdefault("trans_di", "1")
-        elif (
-            "매출분" in text
-            or "매출만" in text
-            or "출고분" in text
-            or "출고만" in text
-            or "출고거래명세서" in text
-            or "출고 거래명세서" in text
-        ):
-            params.setdefault("trans_di", "3")
-        elif "매입" in text:
-            params.setdefault("trans_di", "1")
-        elif "매출" in text:
-            params.setdefault("trans_di", "3")
+        trans_di = _extract_transaction_statement_direction(text)
+        if trans_di:
+            params.setdefault("trans_di", trans_di)
 
 
     if "세금계산서" in text:
