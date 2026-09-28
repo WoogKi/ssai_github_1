@@ -640,6 +640,8 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
 
     for _, col, alias, pos in candidates:
         tail = q_norm[pos + len(alias):]
+        if tail.startswith("별") or tail.startswith("명별"):
+            continue
         value = _strip_common_filter_value(tail)
         if not value:
             continue

@@ -177,13 +177,13 @@ def _cases() -> tuple[Case, ...]:
     sales = _sales_frame()
     trans = _trans_frame()
     return (
-        Case("NLQ-0022", "제품재고장", "현재표 제조사명별 분석", "현재표 제조사명별 분석", inventory, "table", "success", 2, "PASS", "제조사 group"),
+        Case("NLQ-0022", "제품재고장", "현재표 제조사명별 집계", "현재표 제조사명별 집계", inventory, "table", "success", 2, "PASS", "제조사 group"),
         Case("NLQ-0023", "제품재고장", "현재표 제조사명 한미약품 상세히 보여줘", "현재표 제조사명 한미약품 상세히 보여줘", inventory, "table", "success", 2, "PASS", "제조사 filter"),
         Case("NLQ-0025", "제품재고장", "현재표 재고수량이 가장 많은 제품", "현재표 재고수량이 가장 많은 제품", inventory, "table", "success", 1, "PASS", "재고수량 rank"),
         Case("NLQ-0026", "제품재고장", "현재표 재고수량 0 이하 목록", "현재표 재고수량 0 이하 목록", inventory, "table", "success", 2, "PASS", "재고수량 filter"),
         Case("NLQ-0027", "제품재고장", "현재표 재고수량 0 이상 목록", "현재표 재고수량 0 이상 목록", inventory, "table", "success", 2, "PASS", "재고수량 filter"),
         Case("NLQ-0031", "제품재고장", "현재표 재고금액이 가장 많은 제품", "현재표 재고금액이 가장 많은 제품", inventory, "table", "success", 1, "PASS", "재고금액 rank"),
-        Case("NLQ-0063", "품목별 매출 예상", "현재표 예상등급 분석", "현재표 예상등급 분석", forecast, "table", "success", 2, "PASS", "예상등급 group"),
+        Case("NLQ-0063", "품목별 매출 예상", "현재표 예상등급별 집계", "현재표 예상등급별 집계", forecast, "table", "success", 2, "PASS", "예상등급 group"),
         Case("NLQ-0064", "품목별 매출 예상", "예상등급 감소예상 상세히 보여줘", "현재표 예상등급 감소예상 상세히 보여줘", forecast, "table", "success", 2, "PASS", "implicit current-table filter normalization"),
         Case("NLQ-0076", "지역별 매출현황", "추세판정 요약", "현재표 추세판정 요약", trend, "table", "success", 2, "PASS", "implicit current-table group normalization"),
         Case("NLQ-0081", "품목별 재고부족현황", "현재표 적용증감율 < 10", "현재표 적용증감율 < 10", shortage, "table", "success", 2, "PASS", "적용증감율 numeric filter"),
@@ -199,8 +199,23 @@ def _cases() -> tuple[Case, ...]:
 def main() -> int:
     failures: list[str] = []
     intent_cases = (
-        ("현재표 제조사명별 분석", "dataframe_table"),
-        ("현재표 예상등급 분석", "dataframe_table"),
+        ("현재표 제조사명별 집계", "dataframe_table"),
+        ("현재표 예상등급별 집계", "dataframe_table"),
+        ("현재표 제조사명별 요약표", "dataframe_table"),
+        ("현재표 추세판정 요약", "dataframe_table"),
+        ("현재표 제조사명별 요약해줘", "llm_analysis"),
+        ("현재표 제조사명별 요약 해줘", "llm_analysis"),
+        ("현재표 제조사명별 요약 좀 해줘", "llm_analysis"),
+        ("현재표 제조사명별 요약해주세요", "llm_analysis"),
+        ("현재표 제조사명별 요약해 주세요", "llm_analysis"),
+        ("현재표 제조사명별 요약을 해줘", "llm_analysis"),
+        ("현재표 제조사명별 분석해줘", "llm_analysis"),
+        ("현재표 제조사명별 의미가 뭐야", "llm_analysis"),
+        ("현재표 제조사명별 추세 설명해줘", "llm_analysis"),
+        ("현재표 예상등급 요약해줘", "llm_analysis"),
+        ("현재표 예상등급 분석해줘", "llm_analysis"),
+        ("현재표 제조사명별 분석", "llm_analysis"),
+        ("현재표 예상등급 분석", "llm_analysis"),
         ("현재표 제조사명별 임의없는차원별 분석", "llm_analysis"),
         ("현재표 임의없는차원별 분석", "llm_analysis"),
     )
@@ -210,6 +225,19 @@ def main() -> int:
             failures.append(
                 f"FAIL intent {query}: actual={actual_intent!r}, expected={expected_intent!r}"
             )
+    for query, frame, source_action in (
+        ("현재표 제조사명별 분석", _inventory_frame(), "제품재고장"),
+        ("현재표 제조사명별 요약해줘", _inventory_frame(), "제품재고장"),
+        ("현재표 예상등급 요약해줘", _forecast_frame(), "품목별 매출 예상"),
+    ):
+        llm_analysis_facts = build_current_table_interpretive_facts(
+            df=frame,
+            query=query,
+            source_action=source_action,
+            source_meta={"result_status": "success"},
+        )
+        if llm_analysis_facts.get("status") != "success" or not llm_analysis_facts.get("whole_table_facts"):
+            failures.append(f"FAIL dimension analysis must preserve LLM context: {query}: {llm_analysis_facts!r}")
     unknown_dimension_facts = build_current_table_interpretive_facts(
         df=_inventory_frame(),
         query="현재표 제조사명별 임의없는차원별 분석",

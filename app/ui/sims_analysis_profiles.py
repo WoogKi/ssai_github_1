@@ -508,8 +508,23 @@ def wants_opinion(user_text: str) -> bool:
     return any(token in compact for token in ("의견", "문제점", "주의사항", "확인할점", "이상항목", "분석"))
 
 
-def build_response_format_instruction(user_text: str, *, default_include_opinion: bool = True) -> str:
+def build_response_format_instruction(user_text: str, *, default_include_opinion: bool = True,
+                                      current_table_analysis: bool = False) -> str:
     """Return a compact Korean response-shape instruction for SIMS analysis."""
+    if current_table_analysis:
+        return (
+            "현재표 분석에서는 일반 SIMS 답변의 짧게 정리/고정 섹션 지침보다 이 지침을 우선하세요. "
+            "사용자의 질문에 직접 답하고, 전체 표 분석자료에서 중요한 차이·분포·집중도·확인할 항목을 스스로 선별하세요. "
+            "요약 요청은 간결하게, 자세히/상세히/점검/분석 요청은 자료의 복잡도에 맞게 충분히 설명하세요. "
+            "고정 줄수, 수치 개수, 의견 문장수, 필수 섹션은 없습니다. 반복으로 길이를 늘리지 마세요. "
+            "중요 판단에는 실제 그룹·항목·수치를 근거로 제시하고, 현재 자료에서 확인 가능한 내용을 먼저 설명하세요. "
+            "지표별 집계 방식과 단위를 구분하고 평균을 합계처럼 해석하지 마세요. "
+            "전체 통계와 일부 참고 행을 구분하고, 생략된 그룹의 순위를 추정하지 마세요. "
+            "음수·결측·큰 값은 확인 항목이지 오류나 원인의 확정이 아닙니다. 데이터에 없는 사실·원인은 추측하지 마세요."
+            " 수치의 부호나 크기만으로 충분/부족/부채를 판정하지 마세요. 판단 기준 컬럼이 있어야 합니다. "
+            "제공되지 않은 반품·미결제·납기·수요 같은 원인을 가능성 목록으로 제시하는 것도 금지합니다. "
+            "원인 자료가 없으면 확인된 값과 그룹 차이만 설명하고 원인은 이 표로 판단할 수 없다고 명시하세요."
+        )
     summary_only = wants_summary_only(user_text)
     include_opinion = (not summary_only) and (default_include_opinion or wants_opinion(user_text))
     if summary_only:

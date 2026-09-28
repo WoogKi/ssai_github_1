@@ -38,6 +38,7 @@ import re
 from typing import Any, Callable
 
 import pandas as pd
+from app.ui.current_table_followups.analysis_facts import build_whole_table_facts
 
 from app.ui.current_table_followups.monthly_stock import handle_monthly_stock_followup
 from app.ui.current_table_followups.validation import handle_validation_followup
@@ -187,23 +188,9 @@ def classify_current_table_followup_intent(query: str) -> str:
     if "집계" in intent_compact:
         return "dataframe_table"
 
-    # A requested existing dimension makes "...별 분석" a deterministic
-    # current-table aggregation. Narrative analysis remains on the LLM path.
+    # "분석"은 현재표에 연결된 facts/context를 사용한 LLM 분석이다.
+    # 표 집계가 필요하면 위의 명시적 "집계"/"목록"/"정렬" 요청이 처리한다.
     if "분석" in intent_compact:
-        requested_dimensions = _requested_current_table_dimensions(text)
-        requested_metrics = _current_table_requested_metrics(text)
-        unknown_dimension, unknown_metric = _current_table_unresolved_request_labels(
-            text,
-            metrics=requested_metrics,
-            groupings=[key for key, _label, _aliases in requested_dimensions],
-        )
-        if (
-            requested_dimensions
-            and not requested_metrics
-            and not unknown_dimension
-            and not unknown_metric
-        ):
-            return "dataframe_table"
         return "llm_analysis"
 
     # "의미가 뭐야/추세 설명"은 현재표의 숫자를 먼저 pandas로 확정한 뒤
@@ -217,7 +204,10 @@ def classify_current_table_followup_intent(query: str) -> str:
     if any(marker in intent_compact for marker in interpretive_analysis_markers):
         return "llm_analysis"
 
-    current_table_summary_requests = ("요약", "집계", "분석", "매출")
+    if re.search(r"요약(?:을)?(?:좀)?해", intent_compact):
+        return "llm_analysis"
+
+    current_table_summary_requests = ("요약", "매출")
     if (
         _requested_current_table_dimensions(text)
         and any(request in intent_compact for request in current_table_summary_requests)
@@ -258,6 +248,7 @@ def classify_current_table_followup_intent(query: str) -> str:
 
     analysis_markers = (
         "분석",
+        "점검",
         "요약",
         "요약해",
         "특징",
@@ -429,7 +420,7 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
         ("품목기여등급별", "품목기여등급분석", "품목기여등급", "기여등급별", "기여등급분석", "기여등급", "기여도등급별", "기여도등급분석", "기여도등급"),
         ("품목기여등급", "기여등급", "기여도등급"),
     ),
-    ("frequency_grade", "출고빈도등급", ("출고빈도등급별", "출고빈도등급분석"), ("출고빈도등급",)),
+    ("frequency_grade", "출고빈도등급", ("출고빈도등급별", "출고빈도등급분석", "출고빈도별"), ("출고빈도등급", "출고빈도")),
     ("trend_judgement", "추세판정", ("추세판정별",), ("추세판정",)),
     ("judgement_result", "판정결과", ("판정결과별",), ("판정결과",)),
 )
@@ -640,8 +631,24 @@ def _requested_source_semantic_filter(kind: str, query: str) -> str:
     return ""
 
 
+def _current_table_interpretive_dimension_body(query: str) -> str | None:
+    """Strip grammatical suffixes before an interpretation verb, not entity values."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    if any(marker in compact for marker in ("요약표", "집계", "목록", "상세표", "정렬", "필터", "TOP", "top")):
+        return None
+    verb = re.search(r"분석|요약(?:을)?(?:좀)?해|의미|설명|점검", compact)
+    if not verb:
+        return None
+    body = compact[:verb.start()]
+    return re.sub(
+        r"(?:을|를|에대해서|에대해|에관해서|에관해|자세히|상세히|상세하게|자세하게|좀|한번|기준으로)+$",
+        "", body,
+    )
+
+
 def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tuple[str, ...]]]:
     compact = re.sub(r"\s+", "", str(query or ""))
+    interpretive_body = _current_table_interpretive_dimension_body(query)
     candidates: list[tuple[int, int, str, str, tuple[str, ...]]] = []
     for key, label, phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS:
         field_terms = (label, *aliases)
@@ -654,6 +661,10 @@ def _requested_current_table_dimensions(query: str) -> list[tuple[str, str, tupl
             position = compact.find(phrase)
             if position >= 0:
                 candidates.append((position, position + len(phrase), key, label, aliases))
+        if interpretive_body is not None:
+            for alias in field_terms:
+                for match in re.finditer(re.escape(alias) + r"(?=별|기준|과|와|및|그리고|$)", interpretive_body):
+                    candidates.append((match.start(), match.end(), key, label, aliases))
 
     selected: list[tuple[int, int, str, str, tuple[str, ...]]] = []
     selected_keys: set[str] = set()
@@ -799,6 +810,7 @@ def _current_table_unresolved_request_labels(
             break
     body = body.replace("현재표", "").replace("현재결과", "")
     dimension_body = body
+    interpretive_body = _current_table_interpretive_dimension_body(query)
 
     dimension_terms = sorted(
         {
@@ -818,6 +830,21 @@ def _current_table_unresolved_request_labels(
 
     unknown_dimension = ""
     unknown_metric = ""
+    if interpretive_body is not None:
+        residual = _strip_current_table_referents(interpretive_body)
+        for term in dimension_terms:
+            residual = residual.replace(term, "")
+        for _key, label, aliases in _CURRENT_TABLE_METRIC_SPECS:
+            for term in sorted({label, *aliases}, key=len, reverse=True):
+                residual = residual.replace(re.sub(r"\s+", "", term), "")
+        residual = re.sub(r"^(?:별|기준|과|와|및|그리고)+|(?:별|기준)$", "", residual)
+        # A named unknown dimension, including a conjunction with a known one,
+        # must not silently disappear into a broad whole-table interpretation.
+        if len(residual) >= 2 and (
+            re.search(r"차원|등급|판정|분류|유형|명$", residual)
+            or (groupings and re.search(r"과|와|및|그리고", interpretive_body))
+        ):
+            unknown_dimension = residual
     if dimension_body.endswith("별"):
         for term in dimension_terms:
             dimension_body = dimension_body.replace(term, "")
@@ -1281,11 +1308,15 @@ def build_current_table_interpretive_facts(
 ) -> dict[str, Any]:
     """Build the exact, compact facts an LLM may interpret for a current-table analysis.
 
-    This deliberately returns only the requested grouping and metric. It never
-    exposes the raw current-table rows to the analysis context.
+    Explicit dimension/metric requests retain their exact aggregation contract.
+    Other interpretations scan safe detail rows and deliver bounded statistics.
     """
     if not isinstance(df, pd.DataFrame) or df.empty:
         return {"status": "no_data", "facts": [], "available_columns": []}
+
+    if str(source_action or "").strip() == "제품정보 조회":
+        from app.services.snapshot_product_information_service import project_product_information_frame_for_viewer
+        df = project_product_information_frame_for_viewer(df)
 
     kind = detect_current_table_kind(source_action)
     capability = _current_table_followup_capability(
@@ -1306,10 +1337,28 @@ def build_current_table_interpretive_facts(
             "available_columns": [str(column) for column in df.columns],
         }
 
-    # Broad "현재표 분석해줘" continues to use its existing compact analysis
-    # context. This helper only owns an explicitly requested dimension + metric.
     if not metric or not grouping:
-        return {"status": "not_applicable", "capability": capability, "facts": []}
+        if capability.get("status") != "success":
+            return {"status": capability.get("status"), "capability": capability, "facts": []}
+        detail_mask = pd.Series(True, index=df.index, dtype="bool")
+        if kind == "inventory":
+            product_column = _resolve_current_table_column(df, ("제품명", "품목명", "상품명"))
+            detail_mask = inventory_detail_row_mask(df, product_column=product_column)
+            location_column = _resolve_current_table_column(df, ("재고위치명",))
+            if location_column:
+                detail_mask &= ~df[location_column].astype("string").eq("제품 합계").fillna(False)
+        elif kind == "trans_doc":
+            detail_mask, _ = _current_table_trans_doc_direction_mask(df, query)
+        detail = df.loc[detail_mask].reset_index(drop=True)
+        if detail.empty:
+            return {"status": "no_data", "capability": capability, "facts": []}
+        group_column = _resolve_current_table_dimension_column(df, grouping=grouping, kind=kind) if grouping else ""
+        whole = build_whole_table_facts(detail, action=source_action, query=query, group_column=group_column or "")
+        return {"status": "success", "capability": capability,
+                "whole_table_facts": whole, "input_row_count": len(df),
+                "source_row_count": len(detail), "excluded_summary_row_count": int((~detail_mask).sum()),
+                "fact_row_count": whole.get("group_count", 0), "facts": [],
+                **_current_table_source_limit_contract(df, source_meta)}
     if capability.get("status") != "success":
         return {
             "status": str(capability.get("status") or "unsupported"),
@@ -1735,7 +1784,7 @@ def handle_current_table_followup_by_action(
         source_meta=source_meta,
     )
     requested_grouping = str(capability.get("requested_grouping") or "")
-    if requested_grouping in {"profit_grade", "contribution_grade"}:
+    if requested_grouping in {"profit_grade", "contribution_grade", "frequency_grade"}:
         actual_group_column = _resolve_current_table_dimension_column(
             dispatch_df,
             grouping=requested_grouping,
@@ -2306,7 +2355,7 @@ def handle_current_table_followup_by_action(
     try:
         if handle_common_column_group_followup(
             df=df,
-            query=query,
+            query=dispatch_query,
             top_n=top_n,
             table_key=table_key,
             source_action=source_action,

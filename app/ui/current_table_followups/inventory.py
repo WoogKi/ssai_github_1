@@ -177,7 +177,7 @@ def handle_inventory_followup(
         ]
 
         for keyword, label, exact, include_any, exclude_any in group_specs:
-            if keyword in t:
+            if keyword in compact or keyword.removesuffix("별") + "명별" in compact:
                 col = find_col(
                     df,
                     exact=exact,

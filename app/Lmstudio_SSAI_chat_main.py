@@ -274,6 +274,10 @@ from app.ui.current_table_followups.action_dispatcher import (
     select_current_table_analysis_context,
 )
 from app.ui.sims_analysis_profiles import build_response_format_instruction
+from app.ui.current_table_followups.analysis_facts import (
+    fit_analysis_context,
+    sanitize_current_table_analysis_output,
+)
 
 from app.services.ssai_permission_policy import (
     describe_permission,
@@ -4535,6 +4539,25 @@ def _prepare_current_table_analysis_override(source_query: str) -> bool:
             return False
 
         if facts_status == "success":
+            if "whole_table_facts" in facts:
+                analysis_ctx = {
+                    "kind": "SIMS_ANALYSIS_CONTEXT_V1",
+                    "analysis_target": "current_table_whole_facts",
+                    "analysis_key": str(uuid.uuid4()),
+                    "table_key": current_table_key, "source_table_key": current_table_key,
+                    "action": current_action, "row_count": facts["source_row_count"],
+                    "input_row_count": facts["input_row_count"],
+                    "excluded_summary_row_count": facts["excluded_summary_row_count"],
+                    "whole_table_facts": facts["whole_table_facts"],
+                    "query_scope_summary": ctx.get("query_scope_summary") or "",
+                    "analysis_scope": facts.get("analysis_scope", "full_source"),
+                    "analysis_scope_label": facts.get("analysis_scope_label", ""),
+                    "summary": {key: (ctx.get("summary") or {}).get(key)
+                                for key in ("stock_basis_label", "source_table_label", "stock_mode")},
+                }
+                ss["__current_table_analysis_ctx_override"] = analysis_ctx
+                ss["__current_table_analysis_query"] = str(source_query or "").strip()
+                return True
             analysis_scope_label = str(facts.get("analysis_scope_label") or "").strip()
             facts_payload = {
                 "grouping_label": facts["grouping_label"],
@@ -6411,6 +6434,8 @@ def build_messages_with_system(
 
             def _shrink_analysis_ctx_for_limit(ctx: dict, limit: int) -> dict:
                 """분석 컨텍스트는 JSON 유효성을 유지하면서 대표 목록만 단계적으로 축소한다."""
+                if ctx.get("analysis_target") == "current_table_whole_facts":
+                    return fit_analysis_context(ctx, limit)
                 base = dict(ctx)
 
                 def _with_limits(risk_n: int, grade_n: int) -> dict:
@@ -6447,7 +6472,15 @@ def build_messages_with_system(
             deterministic_current_table_facts = (
                 llm_sims_data.get("analysis_target") == "current_table_deterministic_facts"
             )
-            if deterministic_current_table_facts:
+            if llm_sims_data.get("analysis_target") == "current_table_whole_facts":
+                analysis_data_rule = (
+                    "[CURRENT_TABLE_ANALYSIS_OUTPUT]\n"
+                    "- 전체 판단은 whole_table_facts의 통계와 그룹별 집계를 사용하세요. 참고 행은 전체가 아닐 수 있습니다.\n"
+                    "- analysis_scope가 limited_source이면 조회 한도 내 자료라는 제한을 반드시 함께 알리세요.\n"
+                    "- 지표별 aggregation, 누락된 지표/그룹 수, 전달된 상하위 깊이를 확인하세요. 없는 수치나 원인을 만들지 마세요.\n"
+                    "- JSON의 영문 또는 밑줄 key는 구현용입니다. 답변에는 어떤 key도 그대로 쓰지 말고 한국어 업무 용어로 바꾸세요. 예를 들어 top5_group_share_pct는 '상위 5개 집계 차원 점유율'로 설명하세요.\n"
+                )
+            elif deterministic_current_table_facts:
                 analysis_data_rule = (
                     "- 이 JSON은 현재표 원본을 pandas로 결정적으로 집계한 facts만 담고 있습니다.\n"
                     "- 제공된 facts의 수치를 다시 계산하거나 원본 행/없는 컬럼을 추정하지 말고, facts의 의미만 설명하세요.\n"
@@ -6937,6 +6970,12 @@ def build_messages_with_system(
         response_format_instruction = build_response_format_instruction(
             current_question,
             default_include_opinion=True,
+            current_table_analysis=bool(
+                isinstance(analysis_ctx, dict)
+                and analysis_ctx.get("analysis_target") in {
+                    "current_table_whole_facts", "current_table_deterministic_facts"
+                }
+            ),
         )
 
         deterministic_current_table_facts = bool(
@@ -10813,6 +10852,27 @@ def stream_and_append_assistant(
     finish_reason = None
     assistant_time = ""
 
+    current_table_analysis = any(
+        message.get("role") == "system"
+        and "[CURRENT_TABLE_ANALYSIS_OUTPUT]" in str(message.get("content") or "")
+        for message in messages_for_ai
+        if isinstance(message, dict)
+    )
+    current_table_context_text = "\n".join(
+        str(message.get("content") or "")
+        for message in messages_for_ai
+        if isinstance(message, dict)
+    )
+
+    def _display_text(text: str) -> str:
+        if not current_table_analysis:
+            return text
+        group_match = re.search(r'"group_column"\\s*:\\s*"([^"]+)"', current_table_context_text)
+        return sanitize_current_table_analysis_output(
+            text,
+            group_label=group_match.group(1) if group_match else "",
+        )
+
     import time as _time, random as _random
 
     ready, ready_message = _llm_request_config_ready(model_id)
@@ -10901,7 +10961,7 @@ def stream_and_append_assistant(
 
                     now_ts = _time.perf_counter()
                     if (now_ts - last_render) >= render_interval and collected:
-                        container.markdown("".join(collected) + "▌")
+                        container.markdown(_display_text("".join(collected)) + "▌")
                         last_render = now_ts
 
                 final_text = "".join(collected).strip()
@@ -10912,6 +10972,7 @@ def stream_and_append_assistant(
                     final_text = LLM_SAFE_MESSAGES["reasoning_only"]
                 elif not final_text:
                     final_text = LLM_SAFE_MESSAGES["empty_response"]
+                final_text = _display_text(final_text)
 
                 log.info(
                     "[llm.stream] done model=%s attempt=%s/%s first_content=%s ttft_ms=%s finish_reason=%s elapsed_ms=%s reasoning_seen=%s",
@@ -10948,7 +11009,8 @@ def stream_and_append_assistant(
                     err_info.get("exception_type"),
                 )
                 if collected:
-                    final_text = "".join(collected).strip() + "\n\n_※ 응답 생성 중 연결이 중단되었습니다. 이미 생성된 내용만 표시합니다._"
+                    final_text = "".join(collected).strip()
+                    final_text = _display_text(final_text) + "\n\n_※ 응답 생성 중 연결이 중단되었습니다. 이미 생성된 내용만 표시합니다._"
                     assistant_time = make_ts()
                     _clear_wait_notice()
                     container.markdown(final_text)
