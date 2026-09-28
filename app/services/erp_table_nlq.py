@@ -11,7 +11,7 @@ from app.services.business_calendar_service import kst_today
 from app.services.io_nlq import (
     extract_nlq_natural_period,
     nlq_period_to_date_range,
-    strip_nlq_period_expressions,
+    strip_nlq_period_tokens_for_entity_residual,
 )
 from app.services.product_master_filter_contract import (
     extract_product_di_semantic_group,
@@ -88,14 +88,16 @@ def _extract_name(text: str, labels: tuple[str, ...]) -> str:
         value = value.replace(action_word, " ")
     value = re.sub(r"\s+(?:조회|검색|확인|보여줘|알려줘)\s*$", "", value)
     # Period syntax belongs to the shared period authority, not to a labelled
-    # business-name value.  Keep this generic for every registry label so the
-    # staff, vendor, product, and manufacturer parsers share the same boundary.
+    # business-name value. A label value may itself contain date-like digits,
+    # so consume only a whitespace-separated terminal period expression.
     value = re.sub(
-        r"\s+(?:(?:19|20)\d{4}(?:\d{2})?|(?:19|20)\d{2}\s*년(?:\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?)?)\s*$",
+        r"\s+(?:(?:19|20)\d{4}\s*(?:~|-)\s*(?:19|20)\d{4}|"
+        r"(?:19|20)\d{4}(?:\d{2})?|"
+        r"(?:19|20)\d{2}\s*년(?:\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?)?)\s*$",
         "",
         value,
     )
-    return re.sub(r"\s+", " ", value).strip()
+    return re.sub(r"\s+", " ", value).strip(" ,:/-~")
 
 
 def _extract_unlabeled_product_prefix(text: str, *, explicit_labels: tuple[str, ...]) -> str:
@@ -294,7 +296,7 @@ def _extract_unlabeled_order_vendor(
     action_spec: Any,
 ) -> str:
     """Return only a residual business entity after registry syntax is consumed."""
-    candidate = strip_nlq_period_expressions(raw)
+    candidate = strip_nlq_period_tokens_for_entity_residual(raw)
     action_words = (*_ACTION_WORDS, action_spec.action, *action_spec.aliases)
     for word in sorted(dict.fromkeys(action_words), key=len, reverse=True):
         candidate = candidate.replace(word, " ")
@@ -302,7 +304,7 @@ def _extract_unlabeled_order_vendor(
         for label in sorted((spec.label, *spec.aliases), key=len, reverse=True):
             candidate = candidate.replace(label, " ")
     candidate = re.sub(r"\b(?:입고중|입고완료|미입고|발주|조회|검색|확인|보여줘|알려줘)\b", " ", candidate)
-    candidate = re.sub(r"\s+", " ", candidate).strip()
+    candidate = re.sub(r"\s+", " ", candidate).strip(" ,:/-~")
     return candidate if re.fullmatch(r"[0-9A-Za-z가-힣().&·_-]+", candidate) else ""
 
 
@@ -407,9 +409,9 @@ def _resolve_order_nlq(
                 params.update(nlq_period_to_date_range(extract_nlq_natural_period(period_raw, today=today)))
     else:
         # Expected inbound keeps the Business Calendar default for ordinary
-        # questions. Only an absolute user-written order period replaces it.
+        # questions. A user-written calendar month or absolute range replaces it.
         period = extract_nlq_natural_period(raw, today=today)
-        if str(period.get("_nlq_period_kind") or "") == "explicit_period":
+        if str(period.get("_nlq_period_kind") or "") in {"calendar_month", "explicit_period"}:
             params.update(nlq_period_to_date_range(period))
 
     if (

@@ -599,6 +599,40 @@ def _strip_nlq_period_expressions(text: str) -> str:
     return strip_nlq_period_expressions(text)
 
 
+def strip_nlq_period_tokens_for_entity_residual(text: str) -> str:
+    """Consume only standalone period tokens before resolving an unlabeled entity.
+
+    The common period parser deliberately recognizes date-shaped digits inside a
+    larger string. Entity residuals need a narrower boundary: protect an
+    embedded-name token before applying the common parser to the full phrase.
+    This preserves multi-token natural periods such as ``최근 한달``.
+    """
+    protected: dict[str, str] = {}
+    tokens: list[str] = []
+    for index, token in enumerate(str(text or "").split()):
+        token_core = token.strip(" ,:/-~()[]{}")
+        if re.fullmatch(
+            r"(?:(?:19|20)\d{6}|(?:19|20)\d{4}|(?:19|20)\d{2}|"
+            r"(?:19|20)\d{4}\s*(?:~|-)\s*(?:19|20)\d{4})",
+            token_core,
+        ):
+            continue
+        remainder = strip_nlq_period_expressions(token)
+        if (
+            remainder != token
+            and re.search(r"[0-9A-Za-z가-힣]", remainder)
+        ):
+            placeholder = f"__entitytoken{index}__"
+            protected[placeholder] = token
+            tokens.append(placeholder)
+        else:
+            tokens.append(token)
+    out = strip_nlq_period_expressions(" ".join(tokens))
+    for placeholder, token in protected.items():
+        out = out.replace(placeholder, token)
+    return out
+
+
 def get_nlq_period_action_class(action: str) -> str:
     """Return the canonical NLQ period policy class without importing UI code."""
     try:
@@ -2115,7 +2149,9 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     of truth, and a phrase is considered only when it is the sole residual token
     around a resolved IO action.
     """
-    candidate = _norm(_strip_nlq_period_expressions(_consume_io_action_text(text, action)))
+    candidate = _norm(strip_nlq_period_tokens_for_entity_residual(
+        _consume_io_action_text(text, action)
+    ))
     if not candidate:
         return ""
 
@@ -2139,7 +2175,9 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
         if pattern:
             candidate = re.sub(pattern, " ", candidate)
 
-    candidate = re.sub(r"(?<!\d)(?:(?:19|20)\d{6}|(?:19|20)\d{4}|(?:19|20)\d{2})(?!\d)", " ", candidate)
+    # Standalone date syntax was consumed before action cleanup. Do not run a
+    # second substring matcher here: it would remove date-like digits from a
+    # retained entity token such as ``ABC202609정``.
     candidate = re.sub(r"(?:실\s*재고|장부\s*재고|실\s*수불|장부\s*수불)", " ", candidate)
     candidate = _ALL_STOCK_LOCATIONS_RE.sub(" ", candidate)
     candidate = _consume_document_query_syntax_residual(candidate, action)

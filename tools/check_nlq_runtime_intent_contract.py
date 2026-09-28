@@ -120,6 +120,8 @@ def main() -> int:
     checks.append(_handler_case("이가탄 입고예정조회", "이가탄 입고예정조회", "입고예정조회", {"physic_nm": "이가탄"}))
     checks.append(_handler_case("이가탄 입고예정 조회", "이가탄 입고예정 조회", "입고예정조회", {"physic_nm": "이가탄"}))
     checks.append(_handler_case("메트로 입고예정조회", "메트로 입고예정조회", "입고예정조회", {"physic_nm": "메트로"}))
+    checks.append(_handler_case("바레탄 입고예정조회 202609", "바레탄 입고예정조회 202609", "입고예정조회", {"physic_nm": "바레탄", "date_from": "20260901", "date_to": "20260930", "_expected_inbound_auto_period": False}))
+    checks.append(_handler_case("제품명 바레탄 입고예정조회 202608~202609", "제품명 바레탄 입고예정조회 202608~202609", "입고예정조회", {"physic_nm": "바레탄", "date_from": "20260801", "date_to": "20260930", "_expected_inbound_auto_period": False}))
     checks.append(_handler_case("일반 입고예정조회", "입고예정조회", "입고예정조회", {"mode": "expected"}))
     checks.append(_handler_case("지난주 입고현황", "지난주 입고현황 조회", "입고명세 조회", {"date_from": "20260914", "date_to": "20260920"}))
     checks.append(_handler_case("발주담당자 김 발주 조회", "발주담당자 김 발주 조회", "발주조회", {"order_staff_nm": "김"}))
