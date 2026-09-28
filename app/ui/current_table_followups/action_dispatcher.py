@@ -985,15 +985,20 @@ def _current_table_followup_intent(
     requested_dimensions = _requested_current_table_dimensions(query)
     metrics = _current_table_requested_metrics(query)
     source_is_trans_doc = "거래명세서" in re.sub(r"\s+", "", str(source_action or ""))
-    # 거래명세서 공통은 매입/매출 별도의 금액 컬럼을 만들지 않는다. 명시적인
-    # 매출/출고 금액은 header의 공식 합계금액을 거래명세서구분으로 좁힌다.
+    # 거래명세서 공통은 매입/매출 별도의 금액 컬럼을 만들지 않는다. 시간 단위
+    # 집계에서 명시한 매입/매출 방향은 header의 공식 합계금액을 구분으로 좁힌다.
     # 다른 source의 전역 sales metric 해석에는 영향을 주지 않는다.
     compact_query = re.sub(r"\s+", "", str(query or ""))
-    if (
-        source_is_trans_doc
-        and _current_table_trans_doc_direction(query) == "sales"
+    is_trans_doc_sales_amount = (
+        _current_table_trans_doc_direction(query) == "sales"
         and any(term in compact_query for term in ("매출금액", "출고금액"))
-    ):
+    )
+    is_trans_doc_directional_time_aggregate = (
+        any(key in {"month", "day", "weekday"} for key, _label, _aliases in requested_dimensions)
+        and any(term in compact_query for term in ("매입", "입고", "매출", "출고"))
+        and any(term in compact_query for term in ("집계", "합계"))
+    )
+    if source_is_trans_doc and (is_trans_doc_sales_amount or is_trans_doc_directional_time_aggregate):
         metrics = ["transaction_amount"]
     source_metric = _current_table_source_metric_hint(source_action, df, source_meta, query)
     if not metrics and source_metric and (
@@ -1015,6 +1020,11 @@ def _current_table_followup_intent(
             metrics=metrics,
             groupings=groupings,
         )
+        # The source name can precede a real time dimension in an interpretive
+        # request ("현재표 거래명세서 일자별 분석"). It is not an unknown
+        # DataFrame column when this current table is already transaction docs.
+        if source_is_trans_doc and unresolved_dimension in {"거래명세서", "거래명세서공통"}:
+            unresolved_dimension = ""
     return {
         "requested_metrics": metrics,
         "requested_groupings": groupings,
@@ -1909,6 +1919,9 @@ def handle_current_table_followup_by_action(
 
     dispatch_helpers = dict(helpers)
     dispatch_helpers["_requested_grouping"] = capability["requested_grouping"]
+    dispatch_helpers["_is_deterministic_request"] = (
+        classify_current_table_followup_intent(query) == "dataframe_table"
+    )
     source_table_name = str((source_meta or {}).get("source_table") or "").strip().lower()
     if source_table_name == "rddbc070" or "계약단가" in str(source_action or ""):
         # Contract-price columns have no safe implicit sum metric. Literal

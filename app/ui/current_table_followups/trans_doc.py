@@ -298,6 +298,9 @@ def handle_trans_doc_followup(
     explicit_top = bool(re.search(r"(?:TOP|top|상위)\s*(\d{1,4})", t))
     wants_first = any(w in compact for w in ("1위", "최고", "가장많은", "가장큰"))
     requested_grouping = str(helpers.get("_requested_grouping") or "").strip()
+    deterministic_time_grouping = bool(helpers.get("_is_deterministic_request")) and (
+        requested_grouping in {"month", "day", "weekday"}
+    )
 
     amount_title_word = (
         "매입금액" if ("매입" in t or "입고" in t)
@@ -511,7 +514,9 @@ def handle_trans_doc_followup(
 
     # 4) 월별 거래금액
     wants_month_amount = (
-        "월별" in t
+        (deterministic_time_grouping and requested_grouping == "month")
+        or (
+            "월별" in t
         and any(
             w in t
             for w in (
@@ -523,12 +528,15 @@ def handle_trans_doc_followup(
                 "금액",
                 "공급가액",
                 "세액",
+                "집계",
+                "합계",
                 "분석",
                 "요약",
                 "TOP",
                 "top",
                 "상위",
             )
+        )
         )
     )
 
@@ -633,7 +641,8 @@ def handle_trans_doc_followup(
     # - 현재표 거래금액이 가장 많은 일자와 요일
     # - 현재표 거래금액 최고 일자
     wants_date_amount = (
-        (
+        (deterministic_time_grouping and requested_grouping in {"day", "weekday"})
+        or (
             ("일자별" in t or "날짜별" in t or "일별" in t)
             and any(
                 w in t
@@ -646,6 +655,8 @@ def handle_trans_doc_followup(
                     "금액",
                     "공급가액",
                     "세액",
+                    "집계",
+                    "합계",
                     "분석",
                     "요약",
                     "TOP",
@@ -677,7 +688,7 @@ def handle_trans_doc_followup(
         )
         or (
             "요일" in t
-            and any(w in t for w in ("거래금액", "매입금액", "매출금액", "입고금액", "출고금액", "금액"))
+            and any(w in t for w in ("거래금액", "매입금액", "매출금액", "입고금액", "출고금액", "금액", "집계"))
             and any(w in t for w in ("최고", "가장", "많은", "제일", "큰"))
         )
     )
@@ -734,22 +745,27 @@ def handle_trans_doc_followup(
         wants_weekday_amount = (
             requested_grouping == "weekday"
             and not asks_best_weekday_only
-            and any(
-                w in t or w in compact
-                for w in (
-                    "거래금액",
-                    "매입금액",
-                    "매출금액",
-                    "입고금액",
-                    "출고금액",
-                    "금액",
-                    "공급가액",
-                    "세액",
-                    "분석",
-                    "요약",
-                    "TOP",
-                    "top",
-                    "상위",
+            and (
+                deterministic_time_grouping
+                or any(
+                    w in t or w in compact
+                    for w in (
+                        "거래금액",
+                        "매입금액",
+                        "매출금액",
+                        "입고금액",
+                        "출고금액",
+                        "금액",
+                        "공급가액",
+                        "세액",
+                        "집계",
+                        "합계",
+                        "분석",
+                        "요약",
+                        "TOP",
+                        "top",
+                        "상위",
+                    )
                 )
             )
             and not any(w in compact for w in ("최고요일", "가장많은요일"))
@@ -784,7 +800,14 @@ def handle_trans_doc_followup(
         if split_rows:
             work["거래명세서구분"] = work["_type"].astype(str).str.strip().replace("", "(구분없음)")
 
-        metric_output_col = amount_title_word
+        # 매입/매출 방향은 원본 업무행을 먼저 좁히는 조건이다. 이번 정형
+        # 집계/합계 요청은 거래명세서 공통 결과 계약대로 거래금액을 쓴다.
+        # 기존 방향별 금액 TOP/최고 요청은 해당 금액 열 이름을 유지한다.
+        metric_output_col = (
+            "거래금액"
+            if any(term in compact for term in ("집계", "합계"))
+            else amount_title_word
+        )
 
         def _agg_by(keys: list[str]) -> pd.DataFrame:
             aggregations: dict[str, tuple[str, str]] = {
