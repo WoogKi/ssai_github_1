@@ -19,7 +19,7 @@ def handle_order_followup(
     helpers: dict[str, Callable[..., Any]],
     log: Any,
 ) -> bool:
-    """Aggregate the current order table using the dispatcher-selected date."""
+    """Aggregate an order-like current table using the dispatcher-selected date."""
     requested_grouping = str(helpers.get("_requested_grouping") or "").strip()
     if not (
         bool(helpers.get("_is_deterministic_request"))
@@ -30,13 +30,17 @@ def handle_order_followup(
     date_col = str(helpers.get("_resolved_date_column") or "").strip()
     push_table = helpers["push_table"]
     push_notice = helpers["push_notice"]
-    to_num = helpers["to_num"]
+    to_num = helpers.get("to_num") or (
+        lambda values: pd.to_numeric(values, errors="coerce").fillna(0)
+    )
+    is_expected_inbound = "입고예정" in str(source_action or "").replace(" ", "")
+    source_label = "입고예정" if is_expected_inbound else "발주"
     if not date_col or date_col not in df.columns:
         return bool(push_notice(
-            title="현재표 발주 일자 집계 불가",
-            action="현재표 발주 일자 집계 불가",
-            message="현재표에는 발주 일자 집계에 필요한 날짜 컬럼이 없습니다.",
-            query_summary="현재표 / 발주 일자 집계 불가",
+            title=f"현재표 {source_label} 일자 집계 불가",
+            action=f"현재표 {source_label} 일자 집계 불가",
+            message=f"현재표에는 {source_label} 일자 집계에 필요한 날짜 컬럼이 없습니다.",
+            query_summary=f"현재표 / {source_label} 일자 집계 불가",
             source_query=query,
         ))
 
@@ -46,10 +50,10 @@ def handle_order_followup(
     work = work[work[group_column].ne("")].copy()
     if work.empty:
         return bool(push_notice(
-            title="현재표 발주 일자 집계 결과 없음",
-            action="현재표 발주 일자 집계 결과 없음",
+            title=f"현재표 {source_label} 일자 집계 결과 없음",
+            action=f"현재표 {source_label} 일자 집계 결과 없음",
             message=f"현재표에서 유효한 {date_col} 값을 찾지 못했습니다.",
-            query_summary="현재표 / 발주 일자 집계 결과 없음 / 0건",
+            query_summary=f"현재표 / {source_label} 일자 집계 결과 없음 / 0건",
             source_query=query,
             extra_meta={"execution_status": "no_data", "result_status": "no_data"},
         ))
@@ -72,10 +76,11 @@ def handle_order_followup(
     result = result.reset_index(drop=True)
     result.insert(0, "순번", range(1, len(result) + 1))
 
-    title = f"현재표 {date_col} 기준 {group_column}별 발주 집계"
+    title = f"현재표 {date_col} 기준 {group_column}별 {source_label} 집계"
     try:
         log.info(
-            "[chat.followup_table] order time aggregate built date_col=%s grouping=%s source_rows=%s rows=%s table_key=%s",
+            "[chat.followup_table] %s time aggregate built date_col=%s grouping=%s source_rows=%s rows=%s table_key=%s",
+            source_label,
             date_col,
             requested_grouping,
             len(df),
@@ -88,7 +93,7 @@ def handle_order_followup(
         title=title,
         action=title,
         df=result,
-        query_summary=f"현재표 / {date_col} 기준 {group_column}별 발주 집계 / 전체 {len(df):,}건 기준",
+        query_summary=f"현재표 / {date_col} 기준 {group_column}별 {source_label} 집계 / 전체 {len(df):,}건 기준",
         source_query=query,
         source_table_key=table_key,
         source_rows=len(df),

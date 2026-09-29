@@ -236,6 +236,21 @@ def main() -> int:
     _assert_llm("현재표 납기일자 요일별 분석", order, "발주조회", grouping="weekday", date_column="납기일자")
     _assert_llm("현재표 월별 분석", order, "발주조회", grouping="month", date_column="발주일자")
 
+    expected_inbound = _order_frame()
+    expected_default_day = _assert_table("현재표 입고예정 일자별 집계", expected_inbound, "입고예정조회", grouping="day", date_column="발주일자")
+    _assert_table("현재표 입고예정 월별 집계", expected_inbound, "입고예정조회", grouping="month", date_column="발주일자")
+    _assert_table("현재표 입고예정 요일별 집계", expected_inbound, "입고예정조회", grouping="weekday", date_column="발주일자")
+    expected_order_day = _assert_table("현재표 입고예정 발주일자별 집계", expected_inbound, "입고예정조회", grouping="day", date_column="발주일자")
+    expected_due_day = _assert_table("현재표 입고예정 납기일자별 집계", expected_inbound, "입고예정조회", grouping="day", date_column="납기일자")
+    _assert_table("현재표 입고예정 납기일자 기준 집계", expected_inbound, "입고예정조회", grouping="day", date_column="납기일자")
+    if not expected_default_day[["일자", "건수"]].equals(expected_order_day[["일자", "건수"]]):
+        raise AssertionError("입고예정 기본 일자 authority가 발주일자와 다릅니다.")
+    if expected_default_day[["일자", "건수"]].equals(expected_due_day[["일자", "건수"]]):
+        raise AssertionError("입고예정 발주일자와 납기일자 grouping이 서로 달라야 합니다.")
+    _assert_llm("현재표 일자 분석해줘", expected_inbound, "입고예정조회", grouping="day", date_column="발주일자")
+    _assert_llm("현재표 납기일자 분석해줘", expected_inbound, "입고예정조회", grouping="day", date_column="납기일자")
+    _assert_llm("현재표 요일별 분석", expected_inbound, "입고예정조회", grouping="weekday", date_column="발주일자")
+
     inbound = _detail_frame("입고일자")
     for query, grouping in (("현재표 일자 집계", "day"), ("현재표 일자별 집계", "day"), ("현재표 입고일자 집계", "day"), ("현재표 요일 집계", "weekday")):
         _assert_table(query, inbound, "입고명세 조회", grouping=grouping, date_column="입고일자")
@@ -280,7 +295,7 @@ def main() -> int:
     print("PASS no-authority source remains column_unavailable")
     no_date = pd.DataFrame({"거래처명": ["A"], "수량": [1]})
     _assert_unavailable("현재표 등록일자 집계", no_date, "거래처 목록", missing_column="등록일자")
-    print("RESULT: PASS (47 cases)")
+    print("RESULT: PASS (56 cases)")
     return 0
 
 

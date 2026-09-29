@@ -362,6 +362,9 @@ def detect_current_table_kind(source_action: str) -> str:
     if "입고명세" in s:
         return "purchase_detail"
 
+    if "입고예정" in s:
+        return "expected_inbound"
+
     if "발주조회" in s:
         return "order"
 
@@ -580,13 +583,23 @@ _CURRENT_TABLE_METRIC_GROUPING_SUPPORT: dict[str, frozenset[str]] = {
 
 # Canonical follow-up fields can be derived from native source columns even
 # when the canonical result label does not yet exist in the current table.
+_ORDER_TIME_GROUPING_ALIASES: dict[str, tuple[str, ...]] = {
+    "month": ("발주일자",),
+    "day": ("발주일자",),
+    "weekday": ("발주일자",),
+}
+
+_ORDER_DATE_AUTHORITY: dict[str, Any] = {
+    "default": ("발주일자",),
+    "explicit": (("납기일자", ("납기일자",)), ("발주일자", ("발주일자",))),
+}
+
 _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
     "order": {
-        "month": ("발주일자",),
-        "day": ("발주일자",),
-        "weekday": ("발주일자",),
+        **_ORDER_TIME_GROUPING_ALIASES,
         "order_vendor": ("발주거래처명", "발주처명", "발주처"),
     },
+    "expected_inbound": _ORDER_TIME_GROUPING_ALIASES,
     "purchase_detail": {
         "month": ("입고일자", "매입일자", "일자"),
         "day": ("입고일자", "매입일자", "일자"),
@@ -611,10 +624,8 @@ _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = 
 # and interpretive facts resolve the same business date.  Explicit date labels
 # take precedence; a bare day/month/weekday request uses the source default.
 _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES: dict[str, dict[str, Any]] = {
-    "order": {
-        "default": ("발주일자",),
-        "explicit": (("납기일자", ("납기일자",)), ("발주일자", ("발주일자",))),
-    },
+    "order": _ORDER_DATE_AUTHORITY,
+    "expected_inbound": _ORDER_DATE_AUTHORITY,
     "purchase_detail": {
         "default": ("입고일자", "매입일자", "일자"),
         "explicit": (("입고일자", ("입고일자",)), ("매입일자", ("매입일자",))),
@@ -1806,6 +1817,7 @@ def _current_followup_kind_label(kind: str, source_action: str) -> str:
         "stock_ledger": "제품수불현황",
         "sales_detail": "출고명세",
         "purchase_detail": "입고명세",
+        "expected_inbound": "입고예정",
         "tax_doc": "세금계산서 공통",
         "trans_doc": "거래명세서 공통",
         "analytics_kpi": "분석/KPI",
@@ -1889,6 +1901,7 @@ def _known_action_handlers() -> dict[str, Callable[..., Any]]:
         "sales_detail": handle_sales_detail_followup,
         "purchase_detail": handle_purchase_detail_followup,
         "order": handle_order_followup,
+        "expected_inbound": handle_order_followup,
         "tax_doc": handle_tax_doc_followup,
         "trans_doc": handle_trans_doc_followup,
         "analytics_kpi": handle_analytics_kpi_followup,
