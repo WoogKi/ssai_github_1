@@ -17,8 +17,9 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     FREQUENCY_INSUFFICIENT_GRADE,
 )
 from app.services.product_master_filter_contract import (
-    extract_product_di_semantic_group,
-    strip_product_di_semantic_terms,
+    extract_product_prescription_semantic,
+    has_product_prescription_semantic_conflict,
+    strip_product_prescription_semantic_terms,
 )
 
 
@@ -688,6 +689,7 @@ _NLQ_EXPLICIT_CONDITION_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "product_group_cd", "product_group_nm", "product_di", "product_di_list",
         "dashboard_product_di_list", "product_class", "product_class_list",
         "dashboard_product_class_list", "product_di_nm", "product_di_semantic_group",
+        "product_prescription_semantic",
     )),
     ("manufacturer", ("maker_cd", "maker_nm", "product_ven_cd", "product_ven_nm")),
     ("vendor", (
@@ -1666,7 +1668,7 @@ def _extract_named_text(text: str, labels: tuple[str, ...]) -> Optional[str]:
     labels_pat = "|".join(_named_filter_label_pattern(x) for x in labels_sorted)
 
     patterns = [
-        rf"(?:{labels_pat})\s*[:=]?\s*([^\n,]+)",
+        rf"(?:{labels_pat})\s*[:：=]?\s*([^\n,]+)",
         rf"(?:{labels_pat})\s+([^\n,]+)",
     ]
 
@@ -2187,7 +2189,7 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     around a resolved IO action.
     """
     candidate = _norm(strip_nlq_period_tokens_for_entity_residual(
-        _consume_io_action_text(text, action)
+        _consume_io_action_text(strip_product_prescription_semantic_terms(text), action)
     ))
     if not candidate:
         return ""
@@ -2715,6 +2717,30 @@ def get_current_stock_location_name_map() -> dict[str, str]:
     return stock_location_name_map
 
 
+def has_current_stock_executable_structured_filter(params: Optional[Mapping[str, Any]]) -> bool:
+    """Return whether current stock can run without an entity-name lookup."""
+    values = dict(params or {})
+    scalar_keys = (
+        "product_group_nm",
+        "product_di_nm",
+        "product_di_semantic_group",
+        "product_prescription_semantic",
+        "product_class_nm",
+        "frequency_grade",
+        "profit_grade",
+        "contribution_grade",
+        "stock_cd",
+        "stock_nm",
+    )
+    if any(clean_text(values.get(key)) for key in scalar_keys):
+        return True
+    return any(
+        any(clean_text(item) for item in (values.get(key) or []))
+        for key in ("stock_cds", "stock_cd_list", "stock_names")
+        if isinstance(values.get(key), (list, tuple, set))
+    )
+
+
 def resolve_current_stock_entity_condition(
     text: str,
     *,
@@ -2723,6 +2749,34 @@ def resolve_current_stock_entity_condition(
     """Resolve the required manufacturer-or-product scope for current stock."""
     out = dict(params or {})
     lookup_text = str(text or "")
+    if (
+        has_current_stock_executable_structured_filter(out)
+        and not any(
+            clean_text(out.get(key))
+            for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm", "nlq_unlabeled_name")
+        )
+        and not _extract_unlabeled_entity_phrase(lookup_text, "현재고 조회")
+    ):
+        return {
+            "status": "resolved",
+            "params": out,
+            "resolved_kind": "structured_filters",
+            "candidates": [],
+        }
+    if (
+        not any(
+            clean_text(out.get(key))
+            for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm", "nlq_unlabeled_name")
+        )
+        and "재고위치" not in lookup_text
+        and not _extract_unlabeled_entity_phrase(lookup_text, "현재고 조회")
+    ):
+        return {
+            "status": "resolved",
+            "params": out,
+            "resolved_kind": "unfiltered_current_stock",
+            "candidates": [],
+        }
     stock_location_name_map = get_current_stock_location_name_map()
     if stock_location_name_map:
         out["stock_location_name_map"] = stock_location_name_map
@@ -2752,7 +2806,16 @@ def resolve_current_stock_entity_condition(
         out.pop("physic_nm", None)
     phrase = explicit_maker or explicit_product or _extract_unlabeled_entity_phrase(lookup_text, "현재고 조회")
     if not phrase:
-        return {"status": "input_required", "params": out, "candidates": []}
+        return {
+            "status": "resolved",
+            "params": out,
+            "resolved_kind": (
+                "structured_filters"
+                if has_current_stock_executable_structured_filter(out)
+                else "unfiltered_current_stock"
+            ),
+            "candidates": [],
+        }
 
     # Explicit labels are independent AND conditions.  They must never be
     # reinterpreted through the unlabeled manufacturer-or-product resolver.
@@ -3283,8 +3346,15 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
     if is_io_validation_explanation_request(raw):
         return None
 
-    grade_filters = extract_product_inventory_grade_filters(raw) if _has_any(raw, (*_CURRENT_STOCK_WORDS, *_PRODUCT_INVENTORY_WORDS)) else {}
-    params = extract_params(remove_product_inventory_grade_phrases(raw) if grade_filters else raw, today=today)
+    semantic_group = extract_product_prescription_semantic(raw)
+    semantic_conflict = has_product_prescription_semantic_conflict(raw)
+    semantic_source = strip_product_prescription_semantic_terms(raw) if (semantic_group or semantic_conflict) else raw
+    grade_filters = extract_product_inventory_grade_filters(semantic_source) if _has_any(raw, (*_CURRENT_STOCK_WORDS, *_PRODUCT_INVENTORY_WORDS)) else {}
+    params = extract_params(remove_product_inventory_grade_phrases(semantic_source) if grade_filters else semantic_source, today=today)
+    if semantic_group:
+        params["product_prescription_semantic"] = semantic_group
+    if semantic_conflict:
+        params["_product_prescription_semantic_conflict"] = True
     frequency_grade = _extract_product_inventory_frequency_grade(raw)
 
     def _result(action: str, params_in: Dict[str, Any]) -> Dict[str, Any]:
@@ -3337,10 +3407,12 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             value = _extract_code(entity_text, filter_labels(RDDBC230, key))
             if value:
                 params[key] = value
-        semantic_group = extract_product_di_semantic_group(raw)
+        semantic_group = extract_product_prescription_semantic(raw)
         if semantic_group:
-            params["product_di_semantic_group"] = semantic_group
-        unlabeled_source = strip_product_di_semantic_terms(raw) if semantic_group else raw
+            params["product_prescription_semantic"] = semantic_group
+        if semantic_conflict:
+            params["_product_prescription_semantic_conflict"] = True
+        unlabeled_source = strip_product_prescription_semantic_terms(raw) if semantic_group else raw
         unlabeled_name = _extract_unlabeled_entity_phrase(unlabeled_source, "제품정보 조회")
         if (
             unlabeled_name

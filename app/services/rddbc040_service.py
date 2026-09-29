@@ -172,6 +172,7 @@ LEFT JOIN {T010} d   ON a.{di_g}    = d.{gcode} AND a.{di_t}    = d.{tcode}
 LEFT JOIN {T010} f   ON a.{flag_g}  = f.{gcode} AND a.{flag_t}  = f.{tcode}
 LEFT JOIN {T010} c   ON a.{cons_g}  = c.{gcode} AND a.{cons_t}  = c.{tcode}
 LEFT JOIN {T010} pg  ON a.{pg_g}    = pg.{gcode} AND a.{pg_t}   = pg.{tcode}
+LEFT JOIN dbo.Rddbc046 std ON a.{physic_cd} = std.Rd046_Physic_Cd
 """.strip()
 
     extra = {
@@ -184,6 +185,7 @@ LEFT JOIN {T010} pg  ON a.{pg_g}    = pg.{gcode} AND a.{pg_t}   = pg.{tcode}
         "add_user_nm": f"au.{user_nm}",
         "mod_user_nm": f"mu.{user_nm}",
         "order_key": f"a.{physic_cd}",
+        "standard_alias": "std",
     }
     return from_join, extra
 
@@ -200,6 +202,7 @@ def search_goods_full(
     ven_nm_kw: str = "",
     group_name_kw: str = "",
     di_name_kw: str = "",
+    product_prescription_semantic: str = "",
 
     physic_gu_name_kw: str = "",
     add_user_nm_kw: str = "",
@@ -238,6 +241,7 @@ def search_goods_full(
     ven_nm_kw = (ven_nm_kw or "").strip()
     group_name_kw = (group_name_kw or "").strip()
     di_name_kw = (di_name_kw or "").strip()
+    product_prescription_semantic = (product_prescription_semantic or "").strip()
 
     physic_gu_name_kw = (physic_gu_name_kw or "").strip()
     add_user_nm_kw = (add_user_nm_kw or "").strip()
@@ -254,6 +258,7 @@ def search_goods_full(
     params: list[Any] = []
 
     col_physic_cd = _al(C040, "physic_cd", "Rd04_Physic_Cd")
+    col_product_di = _al(C040, "di", "Rd04_Physic_Di")
     col_insu_cd = _al(C040, "insu_cd", "Rd04_Insu_Cd")
     col_nm = _al(C040, "physic_nm", "Rd04_Physic_Nm")
     
@@ -312,6 +317,7 @@ CROSS APPLY (
             "maker_nm": ven_nm_kw,
             "product_group_nm": group_name_kw,
             "product_di_nm": di_name_kw,
+            "product_prescription_semantic": product_prescription_semantic,
             "product_class_nm": physic_gu_name_kw,
             "product_add_user_nm": add_user_nm_kw,
             "product_add_date_from": add_date_from,
@@ -333,6 +339,7 @@ CROSS APPLY (
             "maker_nm": extra["ven_nm"],
             "product_group_nm": extra["group_name"],
             "product_di_nm": extra["di_name"],
+            "product_di_cd": f"a.{col_product_di}",
             "product_class_nm": extra["physic_gu_name"],
             "product_add_user_nm": extra["add_user_nm"],
             "product_add_date": f"a.{col_add_date}",
@@ -360,6 +367,24 @@ SELECT {top_clause}
     {extra['physic_gu_name']} AS physic_gu_name,
     {extra['add_user_nm']} AS add_user_nm,
     {extra['mod_user_nm']} AS mod_user_nm,
+    std.Rd046_Standard_Nm AS [표준코드제품명],
+    std.Rd046_Standard_Cd AS [표준코드],
+    std.Rd046_Standard_Cd_Mod_Date AS [표준코드수정일시],
+    std.Rd046_Main_Standard_Cd AS [대표코드],
+    std.Rd046_Main_Standard_Cd_Mod_Date AS [대표코드수정일시],
+    std.Rd046_Insu_Cd AS [Rddbc046 보험코드],
+    std.Rd046_Insu_Cd_Mod_Date AS [보험코드수정일시],
+    std.Rd046_Web_Stock_Flag AS [WEB 재고사용여부],
+    std.Rd046_Insu_Price_Reason AS [보험수가변경사유],
+    std.Rd046_Insu_Cd_Reason AS [보험코드변경사유],
+    std.Rd046_Add_Cd AS [Rddbc046 등록자코드],
+    std.Rd046_Add_Date AS [Rddbc046 등록일자],
+    std.Rd046_Mod_Cd AS [Rddbc046 수정자코드],
+    std.Rd046_Mod_Date AS [Rddbc046 수정일자],
+    std.Rd046_Mod_Gu AS [표준코드정리사용여부],
+    std.Rd046_Notice_Unit AS [신고계산단위],
+    std.Rd046_Notice_Acc_Unit AS [신고환산단위],
+    std.Rd046_Notice_Acc_Gu AS [신고환산단위사용구분],
 
     a.{col_acc_unit} AS [계산단위],
     calc.norm_insu_date AS [보험수가변경일자],
@@ -462,6 +487,24 @@ SELECT TOP 1
     {extra['physic_gu_name']} AS physic_gu_name,
     {extra['add_user_nm']} AS add_user_nm,
     {extra['mod_user_nm']} AS mod_user_nm,
+    std.Rd046_Standard_Nm AS [표준코드제품명],
+    std.Rd046_Standard_Cd AS [표준코드],
+    std.Rd046_Standard_Cd_Mod_Date AS [표준코드수정일시],
+    std.Rd046_Main_Standard_Cd AS [대표코드],
+    std.Rd046_Main_Standard_Cd_Mod_Date AS [대표코드수정일시],
+    std.Rd046_Insu_Cd AS [Rddbc046 보험코드],
+    std.Rd046_Insu_Cd_Mod_Date AS [보험코드수정일시],
+    std.Rd046_Web_Stock_Flag AS [WEB 재고사용여부],
+    std.Rd046_Insu_Price_Reason AS [보험수가변경사유],
+    std.Rd046_Insu_Cd_Reason AS [보험코드변경사유],
+    std.Rd046_Add_Cd AS [Rddbc046 등록자코드],
+    std.Rd046_Add_Date AS [Rddbc046 등록일자],
+    std.Rd046_Mod_Cd AS [Rddbc046 수정자코드],
+    std.Rd046_Mod_Date AS [Rddbc046 수정일자],
+    std.Rd046_Mod_Gu AS [표준코드정리사용여부],
+    std.Rd046_Notice_Unit AS [신고계산단위],
+    std.Rd046_Notice_Acc_Unit AS [신고환산단위],
+    std.Rd046_Notice_Acc_Gu AS [신고환산단위사용구분],
 
     a.{col_acc_unit} AS [계산단위],
     a.{col_insu_date} AS [보험수가변경일자],

@@ -924,6 +924,7 @@ def _query_summary(params: dict[str, Any], *, mode: str, row_count: int, df: pd.
         ("product_group_nm", "제품그룹"),
         ("product_di_nm", "제품구분"),
         ("product_di_semantic_group", "상위 제품구분"),
+        ("product_prescription_semantic", "전문/일반"),
         ("product_class_nm", "제품분류"),
         ("insu_cd", "보험코드"),
         ("barcode", "바코드"),

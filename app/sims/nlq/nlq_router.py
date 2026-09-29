@@ -710,6 +710,7 @@ _ANALYTICS_ACTION_SPECS = (
         "service": "get_stock_shortage_result",
         "phrases": (
             "품목별 재고부족현황",
+            "품목별부족현황",
             "품목별 재고 부족 현황",
             "재고부족현황",
             "재고 부족 현황",
@@ -1233,10 +1234,12 @@ def _resolve_analytics_action(txt: str) -> str | None:
         and explicit_intent.get("requested_metric") in {"sales_trend", "sales_trend_summary"}
         and explicit_intent.get("requested_grouping") in {"product", "manufacturer"}
     )
+    stock_shortage_shorthand = "품목별부족현황" in compact_t
     if ("추세" in compact_t and "매출" not in compact_t and not grouped_sales_trend_shorthand) or (
         "부족" in compact_t
         and "재고" not in compact_t
         and not allows_sales_data_shortage
+        and not stock_shortage_shorthand
     ):
         return None
     if explicit_intent and explicit_intent["requested_grouping"]:
@@ -1882,13 +1885,25 @@ def _extract_analytics_shortage_grade(txt: str) -> str:
 
 
 def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
+    from app.services.product_master_filter_contract import (
+        extract_product_prescription_semantic,
+        has_product_prescription_semantic_conflict,
+        strip_product_prescription_semantic_terms,
+    )
+    semantic_group = extract_product_prescription_semantic(txt)
+    semantic_conflict = has_product_prescription_semantic_conflict(txt)
+    semantic_text = strip_product_prescription_semantic_terms(txt) if (semantic_group or semantic_conflict) else txt
     try:
         from app.services.io_nlq import extract_params
-        params = extract_params(txt)
+        params = extract_params(semantic_text)
     except Exception:
         params = {}
 
     params = _cleanup_analytics_named_params(params, text=txt, action=action)
+    if semantic_group:
+        params["product_prescription_semantic"] = semantic_group
+    if semantic_conflict:
+        params["_product_prescription_semantic_conflict"] = True
     params = _apply_analytics_condition_aliases(params, txt)
     params = _clear_analytics_grouping_artifacts(params, txt)
     params = _apply_analytics_period_defaults(params, txt)
@@ -2256,8 +2271,14 @@ def _apply_company_default_to_analytics_nlq(
         out["io_gu_list"] = _profile_tcodes(explicit_io_values)
     product_di_code_values = _analytics_nlq_code_values(out, "product_di_list")
     product_di_name_values = _analytics_nlq_name_values(out, "product_di_list")
+    semantic_product_di = str(out.get("product_prescription_semantic") or "").strip()
     explicit_product_di_pairs = _resolve_explicit_product_di_contract(text)
-    if explicit_product_di_pairs:
+    if semantic_product_di:
+        explicit_keys.add("product_di_list")
+        out["product_di_list"] = []
+        out["dashboard_product_di_list"] = []
+        out["product_di"] = ""
+    elif explicit_product_di_pairs:
         explicit_keys.add("product_di_list")
         out["product_di_list"] = [pair.rsplit(":", 1)[-1] for pair in explicit_product_di_pairs]
         out["dashboard_product_di_list"] = list(explicit_product_di_pairs)
@@ -2528,8 +2549,8 @@ def _analytics_manufacturer_filter_text(
         " ",
         residual,
     )
-    from app.services.product_master_filter_contract import PRODUCT_DI_SEMANTIC_GROUP_TERMS
-    for term in PRODUCT_DI_SEMANTIC_GROUP_TERMS:
+    from app.services.product_master_filter_contract import PRODUCT_PRESCRIPTION_SEMANTIC_TERMS
+    for term in PRODUCT_PRESCRIPTION_SEMANTIC_TERMS:
         residual = re.sub(rf"(?:^|\s){re.escape(term)}(?=\s|$)", " ", residual, flags=re.IGNORECASE)
     tokens = re.findall(r"[가-힣A-Za-z][가-힣A-Za-z0-9_-]*", residual)
     return tokens[0] if len(tokens) == 1 else ""
@@ -2557,7 +2578,8 @@ def _resolve_analytics_manufacturer_filter(
             "real_ven_cd", "real_ven_nm", "cost_apply_cd", "cost_apply_nm",
             "stock_apply_cd", "stock_apply_nm", "stock_cd", "stock_nm",
             "product_group", "product_group_nm", "product_di", "product_di_nm",
-            "product_di_semantic_group", "product_class", "product_class_nm",
+            "product_di_semantic_group", "product_prescription_semantic",
+            "product_class", "product_class_nm",
         )
     ) or any(out.get(key) for key in (
         "stock_cds", "stock_cd_list", "product_di_list", "product_class_list",
@@ -2827,6 +2849,29 @@ def _try_handle_analytics_nlq(
         return False
 
     params = _build_analytics_params(t, action)
+    if params.pop("_product_prescription_semantic_conflict", False):
+        message = "전문약과 일반약 제품구분이 함께 지정되었습니다. 한 가지 제품구분만 지정해 다시 조회해 주세요."
+        payload = {
+            "final": True,
+            "type": "text",
+            "title": "제품구분 조건 확인 필요",
+            "action": action,
+            "params": params,
+            "data": message,
+            "message": message,
+            "meta": {
+                "nlq": True,
+                "analysis_nlq": True,
+                "result_status": "input_required",
+                "input_required": True,
+                "service_call_skipped": True,
+                "notice_codes": ["product_prescription_semantic_conflict"],
+                "row_count": 0,
+                "row_count_total": 0,
+            },
+        }
+        push_sims_result_to_chat(payload, action)
+        return True
     analytics_intent = _analytics_intent_for_action(action, t)
     manufacturer_resolution = _resolve_analytics_manufacturer_filter(
         t,
@@ -6057,6 +6102,7 @@ def _try_handle_io_nlq(
     try:
         from app.services.io_nlq import (
             _extract_unlabeled_entity_phrase,
+            has_current_stock_executable_structured_filter,
             remove_outbound_frequency_phrase,
             remove_product_inventory_grade_phrases,
             resolve_io_nlq,
@@ -6204,6 +6250,16 @@ def _try_handle_io_nlq(
     inventory_entity_text = remove_product_inventory_grade_phrases(txt_for_io)
     if action == "현재고 조회" and params.get("frequency_grade"):
         inventory_entity_text = remove_outbound_frequency_phrase(inventory_entity_text)
+    inventory_entity_phrase = _extract_unlabeled_entity_phrase(inventory_entity_text, action)
+    current_stock_structured_only = (
+        action == "현재고 조회"
+        and has_current_stock_executable_structured_filter(params)
+        and not any(
+            str(params.get(key) or "").strip()
+            for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm", "nlq_unlabeled_name")
+        )
+        and not inventory_entity_phrase
+    )
     inventory_grade_only = (
         action in {"현재고 조회", "제품재고현황 조회"}
         and any(str(params.get(key) or "").strip() for key in ("frequency_grade", "profit_grade", "contribution_grade"))
@@ -6211,9 +6267,15 @@ def _try_handle_io_nlq(
             str(params.get(key) or "").strip()
             for key in ("physic_cd", "physic_nm", "maker_cd", "maker_nm", "nlq_unlabeled_name")
         )
-        and not _extract_unlabeled_entity_phrase(inventory_entity_text, action)
+        and not inventory_entity_phrase
     )
-    if action == "제품정보 조회":
+    if params.pop("_product_prescription_semantic_conflict", False):
+        entity_resolution = {
+            "status": "product_prescription_semantic_conflict",
+            "params": params,
+            "resolved_kind": "product_prescription_semantic_conflict",
+        }
+    elif action == "제품정보 조회":
         # 제품정보는 제품코드/제품명/제조사와 제품구분 조건을 한 번의
         # 제품 master 조회 안에서 판정한다. 공통 entity resolver를 먼저
         # 실행하면 추가 ERP round trip 뒤에 전용 service가 차단된다.
@@ -6258,6 +6320,15 @@ def _try_handle_io_nlq(
             "params": params,
             "resolved_kind": "registered_filters",
         }
+    elif current_stock_structured_only:
+        # Product group/division/class, grade, and explicit stock-location
+        # filters are complete current-stock conditions. They do not need a
+        # manufacturer-or-product master lookup before the inventory service.
+        entity_resolution = {
+            "status": "resolved",
+            "params": params,
+            "resolved_kind": "current_stock_structured_filters",
+        }
     elif inventory_grade_only:
         # An explicitly labelled grade is already a complete local filter.
         # Do not reinterpret its grade token as a product/manufacturer name.
@@ -6278,7 +6349,10 @@ def _try_handle_io_nlq(
         parsed["params"] = params
 
     entity_status = str(entity_resolution.get("status") or "")
-    if entity_status in {"input_required", "candidate_required", "not_found", "resolution_unavailable"}:
+    if entity_status in {
+        "input_required", "candidate_required", "not_found", "resolution_unavailable",
+        "product_prescription_semantic_conflict",
+    }:
         candidates = list(entity_resolution.get("candidates") or [])
         show_candidates = entity_status == "candidate_required"
         candidate_labels = {
@@ -6294,7 +6368,9 @@ def _try_handle_io_nlq(
             }
             for row in candidates
         ]) if show_candidates else pd.DataFrame()
-        if entity_status == "candidate_required":
+        if entity_status == "product_prescription_semantic_conflict":
+            message = "전문약과 일반약 제품구분이 함께 지정되었습니다. 한 가지 제품구분만 지정해 다시 조회해 주세요."
+        elif entity_status == "candidate_required":
             if action == "현재고 조회":
                 message = "후보가 여러 개입니다. 제조사 또는 제품 후보 중 하나를 선택해 다시 조회해 주세요."
             elif action in {"최종 계약단가 조회", "계약단가 이력 조회"}:
@@ -6335,13 +6411,16 @@ def _try_handle_io_nlq(
                     else "no_data" if entity_status == "not_found"
                     else "input_required"
                 ),
-                "input_required": entity_status in {"input_required", "resolution_unavailable"},
+                "input_required": entity_status in {
+                    "input_required", "resolution_unavailable", "product_prescription_semantic_conflict",
+                },
                 "candidate_table": show_candidates,
                 "entity_resolution_status": entity_status,
                 "candidate_count": int(len(candidates)),
                 "notice_codes": [
                     "candidate_required" if entity_status == "candidate_required"
                     else "resolution_unavailable" if entity_status == "resolution_unavailable"
+                    else "product_prescription_semantic_conflict" if entity_status == "product_prescription_semantic_conflict"
                     else "entity_not_found"
                 ],
                 "row_count": int(len(candidate_df)),

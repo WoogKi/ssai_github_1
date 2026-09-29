@@ -14,8 +14,9 @@ from app.services.io_nlq import (
     strip_nlq_period_tokens_for_entity_residual,
 )
 from app.services.product_master_filter_contract import (
-    extract_product_di_semantic_group,
-    strip_product_di_semantic_terms,
+    extract_product_prescription_semantic,
+    has_product_prescription_semantic_conflict,
+    strip_product_prescription_semantic_terms,
 )
 
 
@@ -190,7 +191,7 @@ def _resolve_rddbc230_nlq(
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
     labels = lambda key: filter_labels(feature, key)
 
-    entity_raw = strip_product_di_semantic_terms(raw)
+    entity_raw = strip_product_prescription_semantic_terms(raw)
     params.update(_extract_registered_roles(entity_raw, feature, (
         ("buy_cd", "buy_nm"),
         ("stock_cd", "stock_nm"),
@@ -207,18 +208,18 @@ def _resolve_rddbc230_nlq(
             params[key] = value
 
     product_di_nm = _extract_name(raw, labels("product_di_nm"))
-    product_di_semantic_group = (
-        "" if product_di_nm else extract_product_di_semantic_group(raw)
+    product_prescription_semantic = (
+        "" if product_di_nm else extract_product_prescription_semantic(raw)
     )
     if product_di_nm:
         params["product_di_nm"] = product_di_nm
-    if product_di_semantic_group:
-        params["product_di_semantic_group"] = product_di_semantic_group
+    if product_prescription_semantic:
+        params["product_prescription_semantic"] = product_prescription_semantic
 
     if (
         not params.get("physic_cd")
         and not params.get("physic_nm")
-        and not product_di_semantic_group
+        and not product_prescription_semantic
     ):
         explicit_labels = tuple(
             dict.fromkeys(
@@ -380,11 +381,11 @@ def _resolve_order_nlq(
             params["physic_nm"] = physic_nm
 
     product_di_nm = _extract_name(raw, filter_labels(feature, "product_di_nm"))
-    semantic_group = "" if product_di_nm else extract_product_di_semantic_group(raw)
+    semantic_group = "" if product_di_nm else extract_product_prescription_semantic(raw)
     if product_di_nm:
         params["product_di_nm"] = product_di_nm
     if semantic_group:
-        params["product_di_semantic_group"] = semantic_group
+        params["product_prescription_semantic"] = semantic_group
 
     status_codes = _extract_order_status_codes(raw)
     if status_codes:
@@ -456,6 +457,16 @@ def resolve_registered_erp_table_nlq(
     *,
     today: date | None = None,
 ) -> Optional[dict[str, Any]]:
+    semantic_conflict = has_product_prescription_semantic_conflict(text)
+
+    def finalize(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if semantic_conflict and isinstance(result, dict):
+            params = dict(result.get("params") or {})
+            params.pop("product_prescription_semantic", None)
+            params["_product_prescription_semantic_conflict"] = True
+            result["params"] = params
+        return result
+
     if is_order_calculation_request(text):
         from app.sims.meta.erp_table_feature_registry import ORDER_CALCULATION
         action_spec = ORDER_CALCULATION.actions[0]
@@ -482,31 +493,31 @@ def resolve_registered_erp_table_nlq(
         params.update(query_mode=mode, only_needed=mode == "발주해당자료만")
         from app.services.order_calculation_service import apply_application_defaults
         resolved["params"] = apply_application_defaults(params)
-        return resolved
+        return finalize(resolved)
     matched = match_action_in_text(text)
     if matched is None:
         return None
     feature, action_spec = matched
     raw = re.sub(r"\s+", " ", _clean(text))
     if feature.table_key == "rddbc230":
-        return _resolve_rddbc230_nlq(raw, feature, action_spec)
+        return finalize(_resolve_rddbc230_nlq(raw, feature, action_spec))
     if feature.table_key == "rddbc170_rddbc180":
-        return _resolve_order_nlq(raw, feature, action_spec, today=today or kst_today())
+        return finalize(_resolve_order_nlq(raw, feature, action_spec, today=today or kst_today()))
     if feature.table_key != "rddbc070":
         return None
 
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
 
     labels = lambda key: filter_labels(feature, key)
-    entity_raw = strip_product_di_semantic_terms(raw)
+    entity_raw = strip_product_prescription_semantic_terms(raw)
     params.update(_extract_registered_roles(entity_raw, feature, (("ven_cd", "ven_nm"),)))
     physic_cd = _extract_code(raw, labels("physic_cd"))
     physic_nm = _extract_name(entity_raw, labels("physic_nm"))
     product_di_nm = _extract_name(raw, labels("product_di_nm"))
-    product_di_semantic_group = (
-        "" if product_di_nm else extract_product_di_semantic_group(raw)
+    product_prescription_semantic = (
+        "" if product_di_nm else extract_product_prescription_semantic(raw)
     )
-    if not physic_cd and not physic_nm and not product_di_semantic_group:
+    if not physic_cd and not physic_nm and not product_prescription_semantic:
         explicit_labels = tuple(
             dict.fromkeys(
                 label
@@ -531,8 +542,8 @@ def resolve_registered_erp_table_nlq(
         params["physic_nm"] = physic_nm
     if product_di_nm:
         params["product_di_nm"] = product_di_nm
-    if product_di_semantic_group:
-        params["product_di_semantic_group"] = product_di_semantic_group
+    if product_prescription_semantic:
+        params["product_prescription_semantic"] = product_prescription_semantic
 
     for key in ("insu_cd", "barcode"):
         value = _extract_code(raw, labels(key))
@@ -590,4 +601,4 @@ def resolve_registered_erp_table_nlq(
     if top_match:
         params["display_top"] = int(top_match.group(1))
 
-    return {"action": action_spec.action, "params": params}
+    return finalize({"action": action_spec.action, "params": params})

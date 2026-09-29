@@ -23,6 +23,7 @@ from app.services.rddbc_io_common import (
     normalize_top,
     query_to_df,
 )
+from app.services.product_master_filter_contract import add_named_product_prescription_filter
 
 
 TABLE = "rddbc120"
@@ -146,6 +147,14 @@ def _base_filters(params: Dict[str, Any], *, include_validation_filters: bool = 
                   AND Physic_Di_Nm.Rd01_Hnm LIKE %(product_di_nm_like)s
             )""",
         )
+
+    add_named_product_prescription_filter(
+        clauses,
+        params,
+        product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+        product_di_code_expression="Physic_Cd.Rd04_Physic_Di",
+        bind_prefix="out_product_prescription",
+    )
 
     if like_value(params.get("product_class_nm")):
         params["product_class_nm_like"] = like_value(params.get("product_class_nm"))

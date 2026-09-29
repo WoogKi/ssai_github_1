@@ -9,6 +9,11 @@ import uuid
 import pandas as pd
 
 from app.services.rddbc040_service import search_goods_full, get_goods_detail_full
+from app.services.product_master_filter_contract import (
+    extract_product_prescription_semantic,
+    has_product_prescription_semantic_conflict,
+    strip_product_prescription_semantic_terms,
+)
 from app.sims.nlq.master_source_limit import resolve_chat_source_limit
 from app.ui.chat_middleware import push_sims_result_to_chat
 from app.services.utils import apply_labels
@@ -21,7 +26,7 @@ _Q_PHYSIC = re.compile(r"(?:제품코드|상품코드)\s*([0-9A-Za-z]{3,})")
 _Q_INSU = re.compile(r"(?:보험코드)\s*([0-9A-Za-z]{4,})")
 _Q_BAR = re.compile(r"(?:바코드)\s*([0-9A-Za-z\-]{6,})")
 _Q_NAME = re.compile(
-    r"(?:제품명|상품명)\s*(?:은|는|이|가|을|를)?\s*"
+    r"(?:제품명|상품명)\s*(?::|：|=)?\s*(?:은|는|이|가|을|를)?\s*"
     r"(.+?)"
     r"(?=\s*(?:제품|상품)?\s*(?:조회|검색|목록|찾아줘|찾아봐줘|찾아봐|찾아|보여줘|알려줘|해줘|$))"
 )
@@ -30,9 +35,9 @@ _GROUP_LABEL_PATTERNS = r"(?:제품그룹명|제품그룹|품목그룹명|품목
 _DI_LABEL_PATTERNS = r"(?:구분명|제품구분명|제품구분|구분)"
 _CLASS_LABEL_PATTERNS = r"(?:제품분류명|제품분류|품목분류명|품목분류|분류명|카테고리)"
 
-_Q_GROUP_NAME = re.compile(rf"{_GROUP_LABEL_PATTERNS}\s*([^\s,?.!]+)")
-_Q_DI_NAME = re.compile(rf"{_DI_LABEL_PATTERNS}\s*([^\s,?.!]+)")
-_Q_CLASS_NAME = re.compile(rf"{_CLASS_LABEL_PATTERNS}\s*([^\s,?.!]+)")
+_Q_GROUP_NAME = re.compile(rf"{_GROUP_LABEL_PATTERNS}\s*(?::|：|=)?\s*([^\s,?.!]+)")
+_Q_DI_NAME = re.compile(rf"{_DI_LABEL_PATTERNS}\s*(?::|：|=)?\s*([^\s,?.!]+)")
+_Q_CLASS_NAME = re.compile(rf"{_CLASS_LABEL_PATTERNS}\s*(?::|：|=)?\s*([^\s,?.!]+)")
 _Q_MOD_USER = re.compile(r"(?:수정자명|수정자|수정한사람|수정한 사람|변경자)\s*([^\s,?.!]+)")
 _Q_UNIT_PRICE = re.compile(r"(?:단가)\s*([0-9][0-9,]*(?:\s*(?:~|-)\s*[0-9][0-9,]*)?)")
 _Q_FINAL_PRICE_DATE = re.compile(r"(?:최종단가변경일자)\s*([0-9]{6,8}(?:\s*(?:~|-)\s*[0-9]{6,8})?)")
@@ -158,7 +163,7 @@ def _extract_vendor_keyword(txt: str) -> str:
     return ""
 
 def _extract_labeled_keyword(txt: str, label_patterns: str) -> str:
-    m = re.search(rf"{label_patterns}\s*([^\s,?.!]+)", txt)
+    m = re.search(rf"{label_patterns}\s*(?::|：|=)?\s*([^\s,?.!]+)", txt)
     if m:
         v = _clean_goods_token(m.group(1) or "")
         if v:
@@ -565,6 +570,12 @@ def _build_goods_display_df(df: pd.DataFrame, *, detail: bool = False) -> pd.Dat
     for col in ["보험수가변경일자", "이전보험수가변경일자", "최종단가변경일자", "등록일자", "수정일자"]:
         if col in out.columns:
             out[col] = _fmt_char8_date(out[col])
+    for col in [
+        "표준코드수정일시", "대표코드수정일시", "보험코드수정일시",
+        "Rddbc046 등록일자", "Rddbc046 수정일자",
+    ]:
+        if col in out.columns:
+            out[col] = _fmt_datetime(out[col])
 
 
     if "계산단위" in out.columns:
@@ -589,6 +600,11 @@ def _build_goods_display_df(df: pd.DataFrame, *, detail: bool = False) -> pd.Dat
             "보험수가변경일자", "보험가격", "보험단가",
             "이전보험수가변경일자", "이전보험가격", "이전보험단가",
             "최종단가변경일자", "단가",
+            "표준코드제품명", "표준코드", "표준코드수정일시",
+            "대표코드", "대표코드수정일시", "Rddbc046 보험코드", "보험코드수정일시",
+            "WEB 재고사용여부", "보험수가변경사유", "보험코드변경사유",
+            "Rddbc046 등록자코드", "Rddbc046 등록일자", "Rddbc046 수정자코드", "Rddbc046 수정일자",
+            "표준코드정리사용여부", "신고계산단위", "신고환산단위", "신고환산단위사용구분",
             "특수관리제품코드", "특수관리제품",
             "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
             "사용구분", "삭제/사용여부",
@@ -603,6 +619,11 @@ def _build_goods_display_df(df: pd.DataFrame, *, detail: bool = False) -> pd.Dat
             "보험수가변경일자", "보험가격", "보험단가",
             "이전보험수가변경일자", "이전보험가격", "이전보험단가",
             "최종단가변경일자", "단가",
+            "표준코드제품명", "표준코드", "표준코드수정일시",
+            "대표코드", "대표코드수정일시", "Rddbc046 보험코드", "보험코드수정일시",
+            "WEB 재고사용여부", "보험수가변경사유", "보험코드변경사유",
+            "Rddbc046 등록자코드", "Rddbc046 등록일자", "Rddbc046 수정자코드", "Rddbc046 수정일자",
+            "표준코드정리사용여부", "신고계산단위", "신고환산단위", "신고환산단위사용구분",
             "특수관리제품코드", "특수관리제품",
             "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
             "사용구분", "삭제/사용여부",
@@ -621,6 +642,7 @@ def _build_goods_params(
     ven_nm_kw: str = "",
     group_name_kw: str = "",
     di_name_kw: str = "",
+    product_prescription_semantic: str = "",
     physic_gu_name_kw: str = "",
     add_user_nm_kw: str = "",
     add_date_from: str = "",
@@ -641,6 +663,7 @@ def _build_goods_params(
         "제약사명": ven_nm_kw,
         "제품그룹명": group_name_kw,
         "구분명": di_name_kw,
+        "product_prescription_semantic": product_prescription_semantic,
         "제품분류명": physic_gu_name_kw,
         "등록자": add_user_nm_kw,
         "등록일자": (
@@ -673,6 +696,7 @@ def _build_goods_query_summary(
     ven_nm_kw: str = "",
     group_name_kw: str = "",
     di_name_kw: str = "",
+    product_prescription_semantic: str = "",
     physic_gu_name_kw: str = "",
     add_user_nm_kw: str = "",
     add_date_from: str = "",
@@ -699,6 +723,8 @@ def _build_goods_query_summary(
         parts.append(f"제품그룹명 {group_name_kw}")
     if di_name_kw:
         parts.append(f"구분명 {di_name_kw}")
+    if product_prescription_semantic:
+        parts.append("전문약" if product_prescription_semantic == "prescription" else "일반약")
     if physic_gu_name_kw:
         parts.append(f"제품분류명 {physic_gu_name_kw}")
 
@@ -1115,6 +1141,19 @@ def try_handle_goods_nlq(
     group_name_kw = ""
     di_name_kw = ""
     physic_gu_name_kw = ""
+    product_prescription_semantic = extract_product_prescription_semantic(t)
+    semantic_text = strip_product_prescription_semantic_terms(t)
+
+    if has_product_prescription_semantic_conflict(t):
+        return _push_goods_text(
+            txt=txt,
+            title="제품구분 조건 충돌",
+            action="제품코드 목록",
+            params_out=_build_goods_params(),
+            query_summary="전문약/일반약 조건 충돌",
+            source="제품코드마스터(Rddbc040)",
+            message="전문약과 일반약 조건이 함께 지정되었습니다. 한 가지 조건만 지정해 주세요.",
+        )
 
     add_user_nm_kw = ""
     add_date_from = ""
@@ -1158,6 +1197,7 @@ def try_handle_goods_nlq(
         physic_cd or insu_cd or barcode
         or ven_nm_kw
         or group_name_kw or di_name_kw or physic_gu_name_kw
+        or product_prescription_semantic
         or add_user_nm_kw or add_date_from or add_date_to
         or mod_user_nm_kw or mod_date_from or mod_date_to
         or unit_price_kw or final_price_date_kw
@@ -1165,7 +1205,7 @@ def try_handle_goods_nlq(
     ):
         keyword = ""
     else:
-        keyword = _extract_name_keyword(t)
+        keyword = _extract_name_keyword(semantic_text)
 
 
 
@@ -1175,6 +1215,7 @@ def try_handle_goods_nlq(
         add_user_nm_kw, add_date_from, add_date_to,
         mod_user_nm_kw, mod_date_from, mod_date_to,
         unit_price_kw, final_price_date_kw,
+        product_prescription_semantic,
     ]):
         residual = re.sub(
             r"(알려줘|조회|검색|찾아줘|찾아봐줘|찾아봐|찾아|보여줘|어떤|있어|있는지|목록|"
@@ -1186,7 +1227,7 @@ def try_handle_goods_nlq(
             r"작성자|작성일자|작성일|작성한|작성된|"
             r"수정자명|수정자|수정일자|단가|최종단가변경일자)",
             " ",
-            t,
+            semantic_text,
         )
         residual = re.sub(r"\s+", " ", residual).strip()
         keyword = _clean_goods_token(residual)
@@ -1200,7 +1241,7 @@ def try_handle_goods_nlq(
         # 등록자/등록일자는 서비스 SQL 조건으로 전달한다.
         top = 2000
 
-    elif group_name_kw or di_name_kw or physic_gu_name_kw:
+    elif group_name_kw or di_name_kw or physic_gu_name_kw or product_prescription_semantic:
         # 제품그룹/구분/분류 wide filter의 기존 성능 보호 상한.
         top = 1000
         action_cap = 1000
@@ -1222,6 +1263,7 @@ def try_handle_goods_nlq(
         ven_nm_kw=ven_nm_kw,
         group_name_kw=group_name_kw,
         di_name_kw=di_name_kw,
+        product_prescription_semantic=product_prescription_semantic,
         physic_gu_name_kw=physic_gu_name_kw,
         add_user_nm_kw=add_user_nm_kw,
         add_date_from=add_date_from,
@@ -1242,6 +1284,7 @@ def try_handle_goods_nlq(
         ven_nm_kw=ven_nm_kw,
         group_name_kw=group_name_kw,
         di_name_kw=di_name_kw,
+        product_prescription_semantic=product_prescription_semantic,
         physic_gu_name_kw=physic_gu_name_kw,
         add_user_nm_kw=add_user_nm_kw,
         add_date_from=add_date_from,
@@ -1297,6 +1340,7 @@ def try_handle_goods_nlq(
         ven_nm_kw=ven_nm_kw,
         group_name_kw=group_name_kw,
         di_name_kw=di_name_kw,
+        product_prescription_semantic=product_prescription_semantic,
         physic_gu_name_kw=physic_gu_name_kw,
         add_user_nm_kw=add_user_nm_kw,
         add_date_from=add_date_from,

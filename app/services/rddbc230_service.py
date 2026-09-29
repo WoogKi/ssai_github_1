@@ -231,6 +231,7 @@ def _query_summary(params: dict[str, Any], row_count: int) -> str:
         ("maker_nm", "제약사"), ("product_group_nm", "제품그룹"),
         ("product_di_nm", "제품구분"),
         ("product_di_semantic_group", "상위 제품구분"),
+        ("product_prescription_semantic", "전문/일반"),
         ("product_class_nm", "제품분류"),
     ):
         if params.get(key):

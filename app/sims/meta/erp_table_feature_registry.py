@@ -86,10 +86,11 @@ RDDBC070 = ErpTableFeatureSpec(
         ErpFilterSpec("product_di_nm", "제품구분명", "Rd01_Hnm", "text", ("제품구분", "구분명")),
         ErpFilterSpec(
             "product_di_semantic_group", "상위 제품구분", "Rd04_Physic_Di", "semantic_group",
-            (
-                "전문약", "전문제품", "보험약", "보험제품", "ETC",
-                "일반약", "일반제품", "비보험약", "비보험제품", "OTC",
-            ),
+            ("보험약", "보험제품", "비보험약", "비보험제품"),
+        ),
+        ErpFilterSpec(
+            "product_prescription_semantic", "전문/일반 의미", "Rddbc046 + Rd04_Physic_Di",
+            "semantic_group", ("전문약", "전문약품", "전문의약품", "ETC", "일반약", "일반약품", "일반의약품", "OTC"),
         ),
         ErpFilterSpec("product_class_nm", "제품분류명", "Rd01_Hnm", "text", ("제품분류",)),
         ErpFilterSpec("product_unit_price", "제품마스터 단가", "calculated unit_price", "range", ("제품단가",)),
@@ -161,10 +162,11 @@ RDDBC230 = ErpTableFeatureSpec(
         ErpFilterSpec("product_di_nm", "제품구분명", "Rd01_Hnm", "text", ("제품구분", "구분명")),
         ErpFilterSpec(
             "product_di_semantic_group", "상위 제품구분", "Rd04_Physic_Di", "semantic_group",
-            (
-                "전문약", "전문제품", "보험약", "보험제품", "ETC",
-                "일반약", "일반제품", "비보험약", "비보험제품", "OTC",
-            ),
+            ("보험약", "보험제품", "비보험약", "비보험제품"),
+        ),
+        ErpFilterSpec(
+            "product_prescription_semantic", "전문/일반 의미", "Rddbc046 + Rd04_Physic_Di",
+            "semantic_group", ("전문약", "전문약품", "전문의약품", "ETC", "일반약", "일반약품", "일반의약품", "OTC"),
         ),
         ErpFilterSpec("product_class_nm", "제품분류명", "Rd01_Hnm", "text", ("제품분류",)),
         ErpFilterSpec("buy_cd", "매입처코드", "Rd23_Ven_Cd", "code", ("매입처코드",)),
@@ -225,7 +227,8 @@ RDDBC170_RDDBC180 = ErpTableFeatureSpec(
         ErpFilterSpec("maker_nm", "제약사명", "Rd03_Ven_Nm", "text", ("제약사", "제조사")),
         ErpFilterSpec("product_group_nm", "제품그룹명", "Rd01_Hnm", "text", ("제품그룹",)),
         ErpFilterSpec("product_di_nm", "제품구분명", "Rd01_Hnm", "text", ("제품구분", "구분명")),
-        ErpFilterSpec("product_di_semantic_group", "상위 제품구분", "Rd04_Physic_Di", "semantic_group", ("전문약", "전문제품", "전문의약품", "보험약", "보험제품", "ETC", "일반약", "일반제품", "일반의약품", "비보험약", "비보험제품", "OTC")),
+        ErpFilterSpec("product_di_semantic_group", "상위 제품구분", "Rd04_Physic_Di", "semantic_group", ("보험약", "보험제품", "비보험약", "비보험제품")),
+        ErpFilterSpec("product_prescription_semantic", "전문/일반 의미", "Rddbc046 + Rd04_Physic_Di", "semantic_group", ("전문약", "전문약품", "전문의약품", "ETC", "일반약", "일반약품", "일반의약품", "OTC")),
         ErpFilterSpec("product_class_nm", "제품분류명", "Rd01_Hnm", "text", ("제품분류",)),
         ErpFilterSpec("status_code", "발주상태", "Rd18_Or_Di", "code", ("발주상태코드",)),
         ErpFilterSpec("cost_apply_cd", "단가적용처코드", "Rd18_Cost_Apply_Cd", "code", ("단가적용코드",)),

@@ -1242,10 +1242,10 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
     expected_inbound_cases = (
         ("입고예정", ""),
         ("입고 예정", ""),
-        ("전문약 입고예정", "insurance"),
-        ("일반약 입고예정", "non_insurance"),
-        ("ETC 입고예정", "insurance"),
-        ("OTC 입고예정", "non_insurance"),
+        ("전문약 입고예정", "prescription"),
+        ("일반약 입고예정", "otc"),
+        ("ETC 입고예정", "prescription"),
+        ("OTC 입고예정", "otc"),
     )
     for query, expected_semantic_group in expected_inbound_cases:
         parsed_expected = io_nlq.resolve_io_nlq(query) or {}
@@ -1256,7 +1256,7 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
                 parsed_expected.get("action") == "입고예정조회"
                 and (
                     not expected_semantic_group
-                    or parsed_params.get("product_di_semantic_group") == expected_semantic_group
+                    or parsed_params.get("product_prescription_semantic") == expected_semantic_group
                 ),
                 f"parsed={parsed_expected!r}",
             )
@@ -7209,7 +7209,12 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
         shared._load_stock_code_options = lambda: [(".본사 창고 (00001)", "00001", ".본사 창고"), (".지점 창고 (00002)", "00002", ".지점 창고")]
 
         empty = io_nlq.resolve_current_stock_entity_condition("현재고", params={})
-        results.append(_ok("current stock requires manufacturer/product", "input_required") if empty.get("status") == "input_required" else _fail("current stock requires manufacturer/product", repr(empty)))
+        results.append(
+            _ok("bare current stock allows full query", "unfiltered_current_stock")
+            if empty.get("status") == "resolved"
+            and empty.get("resolved_kind") == "unfiltered_current_stock"
+            else _fail("bare current stock allows full query", repr(empty))
+        )
 
         maker = io_nlq.resolve_current_stock_entity_condition("현재고 한미", params={})
         maker_params = dict(maker.get("params") or {})
@@ -7480,9 +7485,18 @@ def run_current_stock_nlq_contract_checks() -> list[CheckResult]:
             if current_stock_fast_path_ok
             else _fail("current stock skips last-cost and unit/DC calculations", "fast path missing")
         )
+        current_stock_frame_separation_ok = (
+            "source_details =" in current_stock_display_builder
+            and "display_details = source_details.copy()" in current_stock_display_builder
+            and "source_subtotals =" in current_stock_display_builder
+            and "display_subtotals =" in current_stock_display_builder
+            and "display_frame = interleave_subtotals" in current_stock_display_builder
+            and "source_frame = interleave_subtotals" in current_stock_display_builder
+            and "return out, source_out," in current_stock_display_builder
+        )
         results.append(
-            _ok("current stock display keeps source frame separate", "display-only numeric empty cells")
-            if "source_parts.append" in current_stock_display_builder and "df_full" not in current_stock_display_builder
+            _ok("current stock display keeps source frame separate", "display/source vector frames remain separate")
+            if current_stock_frame_separation_ok
             else _fail("current stock display keeps source frame separate", "source/display separation missing")
         )
 

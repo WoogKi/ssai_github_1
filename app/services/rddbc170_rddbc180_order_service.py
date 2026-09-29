@@ -399,7 +399,8 @@ def _use_order_unit_history_minimal(params: dict[str, Any]) -> bool:
         "physic_cd", "physic_nm", "order_vendor_nm", "cost_apply_nm", "stock_apply_nm", "stock_nm",
         "expected_vendor_nm", "real_vendor_nm", "order_staff_nm", "pharma_staff_nm",
         "maker_cd", "maker_nm", "product_keyword", "insu_cd", "barcode",
-        "product_group_nm", "product_di_nm", "product_di_semantic_group", "product_class_nm",
+        "product_group_nm", "product_di_nm", "product_di_semantic_group",
+        "product_prescription_semantic", "product_class_nm",
         "product_unit_price", "product_final_price_date", "product_add_user_nm", "product_mod_user_nm",
         "product_add_date_from", "product_add_date_to", "product_mod_date_from", "product_mod_date_to",
     )

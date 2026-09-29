@@ -28,6 +28,10 @@ from app.db.mssql_client import (
     get_current_company_id,
 )
 from app.services.product_supplier_scope_service import apply_product_supplier_scope, build_product_supplier_scope_sql
+from app.services.product_master_filter_contract import (
+    add_named_management_only_exclusion,
+    add_named_product_prescription_filter,
+)
 
 from app.services.rddbc_io_common import (
     build_result_payload,
@@ -819,6 +823,18 @@ def _build_filters(params: Dict[str, Any]) -> str:
         params["product_di_nm_like"] = like_value(params.get("product_di_nm"))
         _add_filter(clauses, "Physic_Di_Nm.Rd01_Hnm LIKE %(product_di_nm_like)s")
 
+    add_named_product_prescription_filter(
+        clauses,
+        params,
+        product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+        product_di_code_expression="Physic_Cd.Rd04_Physic_Di",
+        bind_prefix="analytics_product_prescription",
+    )
+    add_named_management_only_exclusion(
+        clauses,
+        product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+    )
+
     if _add_in_filter(
         clauses,
         params,
@@ -1098,6 +1114,18 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
     elif like_value(params.get("product_di_nm")):
         params["product_di_nm_like"] = like_value(params.get("product_di_nm"))
         _add_filter(clauses, "Physic_Di_Nm.Rd01_Hnm LIKE %(product_di_nm_like)s")
+
+    add_named_product_prescription_filter(
+        clauses,
+        params,
+        product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+        product_di_code_expression="Physic_Cd.Rd04_Physic_Di",
+        bind_prefix="analytics_month_product_prescription",
+    )
+    add_named_management_only_exclusion(
+        clauses,
+        product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+    )
 
     if _add_in_filter(
         clauses,

@@ -363,11 +363,17 @@ def decimal_or_none(value: Any) -> Decimal | None:
 
 def _master(params):
     from app.services.product_master_filter_contract import (
-        append_product_master_filter_clauses, build_product_master_enrichment_sql,
+        add_named_management_only_exclusion,
+        append_product_master_filter_clauses,
+        build_product_master_enrichment_sql,
     )
     joins, expressions = build_product_master_enrichment_sql(product_alias="P", include_audit_price=False)
     clauses, binds = [], []
     append_product_master_filter_clauses(clauses, binds, params, expressions=expressions)
+    add_named_management_only_exclusion(
+        clauses,
+        product_code_expression="P.Rd04_Physic_Cd",
+    )
     if params.get("physic_nm"):
         clauses.append("P.Rd04_Physic_Nm LIKE ?")
         binds.append(f"%{params['physic_nm']}%")

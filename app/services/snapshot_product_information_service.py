@@ -62,6 +62,8 @@ def load_product_information_master(params: Mapping[str, Any]) -> pd.DataFrame:
 SELECT LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS [제품코드],
        P.Rd04_Physic_Nm AS [제품명], PV.Rd03_Ven_Nm AS [제약사],
        P.Rd04_Standard AS [규격], P.Rd04_Insu_Cd AS [보험코드],
+       PSTD.Rd046_Standard_Cd AS [표준코드],
+       PSTD.Rd046_Main_Standard_Cd AS [대표코드],
        PG.Rd01_Hnm AS [제품그룹명], PD.Rd01_Hnm AS [구분명],
        PC.Rd01_Hnm AS [제품분류명]
 FROM dbo.Rddbc040 AS P WITH (NOLOCK)
