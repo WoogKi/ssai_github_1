@@ -1383,13 +1383,18 @@ def _get_user_active_company_ids(
     conn: pyodbc.Connection,
     *,
     user_id: int,
+    include_inactive_companies: bool = False,
 ) -> list[int]:
     """
-    사용자가 연결된 활성 회사 ID 목록.
+    사용자가 연결된 관리 가능 회사 ID 목록.
+
+    조회 화면에서 비활성 회사를 포함할 때에도 관리자의 활성 회사 연결은
+    권한 경계로 유지한다. 회사 상태만 선택적으로 완화한다.
     """
+    company_active_where = "" if include_inactive_companies else "\n          AND c.is_active = 1"
     rows = _fetch_all_dicts(
         conn,
-        """
+        f"""
         SELECT
             uc.company_id
         FROM dbo.SSAI_USER_COMPANIES uc
@@ -1397,7 +1402,7 @@ def _get_user_active_company_ids(
             ON c.company_id = uc.company_id
         WHERE uc.user_id = ?
           AND uc.is_active = 1
-          AND c.is_active = 1
+          {company_active_where}
         ORDER BY uc.is_default DESC, uc.company_id
         """,
         (int(user_id),),
@@ -1432,6 +1437,7 @@ def list_managed_company_users(
             allowed_company_ids = _get_user_active_company_ids(
                 conn,
                 user_id=int(manager_user_id),
+                include_inactive_companies=include_inactive,
             )
 
             if not allowed_company_ids:
@@ -1540,18 +1546,22 @@ def get_manageable_companies(
     *,
     manager_user_id: int,
     allow_all_companies: bool = False,
+    include_inactive: bool = False,
 ) -> list[dict[str, Any]]:
     """
     현재 관리자가 관리 가능한 회사 목록.
 
-    - 신성아트컴 관리자: 전체 활성 회사
-    - 도매 관리자: 본인에게 연결된 활성 회사
+    - 신성아트컴 관리자: 전체 회사(기본은 활성만)
+    - 도매 관리자: 본인에게 활성 연결된 회사(선택 시 비활성 회사 포함)
     """
+    company_active_where = "" if include_inactive else "WHERE is_active = 1"
+    member_company_active_where = "" if include_inactive else "\n              AND c.is_active = 1"
+
     with connect_ssai_db() as conn:
         if allow_all_companies:
             return _fetch_all_dicts(
                 conn,
-                """
+                f"""
                 SELECT
                     company_id,
                     company_code,
@@ -1561,14 +1571,14 @@ def get_manageable_companies(
                     is_test_company,
                     is_active
                 FROM dbo.SSAI_COMPANIES
-                WHERE is_active = 1
+                {company_active_where}
                 ORDER BY is_test_company DESC, company_id
                 """,
             )
 
         return _fetch_all_dicts(
             conn,
-            """
+            f"""
             SELECT
                 c.company_id,
                 c.company_code,
@@ -1583,7 +1593,7 @@ def get_manageable_companies(
                 ON c.company_id = uc.company_id
             WHERE uc.user_id = ?
               AND uc.is_active = 1
-              AND c.is_active = 1
+              {member_company_active_where}
             ORDER BY uc.is_default DESC, c.company_id
             """,
             (int(manager_user_id),),

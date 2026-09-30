@@ -1320,10 +1320,17 @@ def render_company_user_management_page() -> None:
 
     allow_all_companies = _can_manage_all_companies()
 
+    include_inactive = st.checkbox(
+        "비활성 회원사 ERP DB 연결 포함",
+        value=False,
+        key="__admin_company_user_include_inactive",
+    )
+
     try:
         companies = get_manageable_companies(
             manager_user_id=current_user.user_id,
             allow_all_companies=allow_all_companies,
+            include_inactive=include_inactive,
         )
 
         roles = list_active_roles(top=500)
@@ -1372,15 +1379,7 @@ def render_company_user_management_page() -> None:
         selected_company_key = str(selected_company_id)
         selected_company_code = str(selected_company.get("company_code") or "")
 
-    col_filter, col_refresh = st.columns([4, 1])
-
-    with col_filter:
-        include_inactive = st.checkbox(
-            "비활성 회원사 ERP DB 연결 포함",
-            value=False,
-            key="__admin_company_user_include_inactive",
-        )
-
+    _, col_refresh = st.columns([4, 1])
     with col_refresh:
         st.write("")
         if st.button(
