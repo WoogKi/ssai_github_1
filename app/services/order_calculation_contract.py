@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from calendar import monthrange
 from dataclasses import dataclass
 from collections import Counter
 from datetime import date
@@ -21,9 +22,12 @@ class OrderConditions:
             raise ValueError("재고일수는 음수일 수 없습니다.")
         if not 0 <= self.closing_day <= 31:
             raise ValueError("마감일은 0~31일입니다.")
-        if self.closing_day:
-            # Do not silently clamp a nonexistent date to month-end.
-            date(self.reference_date.year, self.reference_date.month, self.closing_day)
+    @property
+    def effective_closing_day(self) -> int:
+        """Return the calendar-safe settlement boundary for the reference month."""
+        if not self.closing_day:
+            return 0
+        return min(self.closing_day, monthrange(self.reference_date.year, self.reference_date.month)[1])
 
 
 def horizon_dates(conditions: OrderConditions, business_dates: Sequence[date]) -> tuple[date, ...]:
@@ -39,9 +43,10 @@ def closing_day_relation(conditions: OrderConditions) -> str:
     """Classify the calendar-day payment boundary without shifting non-business days."""
     if not conditions.closing_day:
         return "CASH"
-    if conditions.reference_date.day < conditions.closing_day:
+    effective_day = conditions.effective_closing_day
+    if conditions.reference_date.day < effective_day:
         return "BEFORE"
-    if conditions.reference_date.day == conditions.closing_day:
+    if conditions.reference_date.day == effective_day:
         return "ON"
     return "AFTER"
 

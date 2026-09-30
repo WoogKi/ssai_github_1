@@ -43,6 +43,13 @@ def test_horizon_settlement_boundary():
     assert horizon_dates(OrderConditions(date(2026, 9, 12)), dates)[0] == date(2026, 9, 14)
     assert len(horizon_dates(OrderConditions(date(2026, 9, 25), closing_day=0), dates)) == 15
     assert len(horizon_dates(OrderConditions(date(2026, 9, 25), closing_day=30), dates)) == 3
+    september_31 = OrderConditions(date(2026, 9, 25), closing_day=31)
+    february_30 = OrderConditions(date(2026, 2, 20), closing_day=30)
+    february_31 = OrderConditions(date(2024, 2, 20), closing_day=31)
+    assert september_31.effective_closing_day == 30
+    assert february_30.effective_closing_day == 28
+    assert february_31.effective_closing_day == 29
+    assert closing_day_relation(september_31) == "BEFORE"
 
 
 def test_monthly_allocation():

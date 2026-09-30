@@ -7206,6 +7206,8 @@ def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_com
         "__knowledge_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
+        "__chat_composer_pending_submission",
+        "__chat_composer_callback_text",
         "__chat_room_nav_request",
         "__chat_room_pending_to_persisted_room_id",
         "__chat_room_select_render_ready",
@@ -10050,6 +10052,8 @@ def _reset_chat_session_when_user_changed() -> None:
         "__knowledge_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
+        "__chat_composer_pending_submission",
+        "__chat_composer_callback_text",
     ]:
         st.session_state.pop(key, None)
     _clear_chat_room_selector_request_state(st.session_state)
@@ -12496,6 +12500,15 @@ st.markdown(
 if isinstance(st.session_state.get("chat_rooms"), list):
     st.session_state.pop("messages", None)
 
+# Keep the history location stable even when a submitted text message is
+# rendered before a long-running route starts below.
+chat_history_container = st.container()
+chat_immediate_user_slot = st.empty()
+# The current-turn answer must stay after the immediate user bubble, rather
+# than inside the earlier history container.
+chat_pending_area_slot = st.empty()
+immediate_echo_message_id = ""
+
 # =========================
 # 1) 입력 처리
 # =========================
@@ -12601,14 +12614,24 @@ if user_input and user_input.strip():
 
 
     # ✅ 1-현재 방에도 저장(원본 그대로, 히스토리 분리 전)
-    current_room.setdefault("messages", []).append({
+    user_message = {
         "id": str(uuid.uuid4()),
         "role": "user",
         "content": user_input,
         "time": make_ts(),
         "seq": _next_seq(),
         **_message_meta("chat"),
-    })
+    }
+    current_room.setdefault("messages", []).append(user_message)
+
+    # A long SIMS/LLM route must not hide the submitted question until its
+    # response is ready. The history container is filled later in this run,
+    # so reserve its normal position and suppress this one duplicate there.
+    if auto_user_input:
+        with chat_immediate_user_slot.container():
+            with st.chat_message("user"):
+                st.markdown(user_input)
+        immediate_echo_message_id = user_message["id"]
 
     _sync_room_meta(current_room, materialize=True)
 
@@ -13106,7 +13129,7 @@ DEFAULT_MODE = "Panel (A)"
 # =========================
 # 2) 채팅 렌더 + 파일/SIMS
 # =========================
-with st.container():
+with chat_history_container:
 
 
     # ===== SIMS 버튼 프리패스 (결과 렌더보다 위에서 상태 선반영) =====
@@ -13271,6 +13294,9 @@ with st.container():
     def _render_message(m: dict) -> bool:
         meta = (m.get("meta") or {})
 
+        if immediate_echo_message_id and str(m.get("id") or "") == immediate_echo_message_id:
+            return True
+
         if str(m.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE:
             return _render_knowledge_answer_message(
                 m,
@@ -13426,6 +13452,7 @@ with st.container():
             "chat_room_change": 2,
             "download_prepare": 2,
             "sims_panel_open": 1,
+            "chat_input": 0,
             "normal_chat": 0,
         }
         raw_reason = str(st.session_state.pop("__ui_rerun_reason", "") or "").strip()
@@ -13690,8 +13717,8 @@ with st.container():
     except Exception:
         log.exception("[ui.rerun.perf] logging failed")
 
-    # (C) 채팅 바로 아래에 '이번 턴 답변' 표시 영역 예약 (✅ 딱 1곳에서만 생성/지정)
-    pending_area = st.container()
+    # (C) 현재 턴 답변은 history와 immediate user bubble 뒤에 렌더한다.
+    pending_area = chat_pending_area_slot.container()
 
     # ✅ (1) NLQ/백엔드 푸시 테이블 렌더 타겟 지정 (반드시 wire_chat_context()보다 먼저)
     try:
@@ -14455,15 +14482,49 @@ if isinstance(pending_stt, dict):
                 st.rerun()
 
 can_upload_file = require_permission("UPLOAD_FILE", show_error=False)
+composer_key = f"__chat_composer_{int(st.session_state.get('__attachment_uploader_nonce', 0))}"
+
+
+def _queue_chat_composer_submission(widget_key: str) -> None:
+    """Route a submitted composer value before the next script body starts."""
+    submission = st.session_state.get(widget_key)
+    if submission is None:
+        return
+
+    if isinstance(submission, str):
+        composer_text = submission.strip()
+        uploaded_files = []
+        recorded_audio = None
+    else:
+        composer_text = str(getattr(submission, "text", "") or "").strip()
+        uploaded_files = list(getattr(submission, "files", ()) or ())
+        recorded_audio = getattr(submission, "audio", None)
+
+    # File and microphone submissions must keep the established bottom-of-page
+    # processing path. Text-only submissions can be dispatched at the top of
+    # this rerun, before historical chat content is rendered.
+    if uploaded_files or recorded_audio is not None:
+        st.session_state["__chat_composer_pending_submission"] = submission
+        return
+    if composer_text:
+        st.session_state["__sims_auto_user_input"] = composer_text
+        st.session_state["__chat_composer_callback_text"] = composer_text
+        st.session_state["__ui_rerun_reason"] = "chat_input"
+
+
 composer_submission = st.chat_input(
     "메시지를 입력하세요...",
-    key=f"__chat_composer_{int(st.session_state.get('__attachment_uploader_nonce', 0))}",
+    key=composer_key,
     accept_file="multiple" if can_upload_file else False,
     file_type=["pdf", "csv", "xlsx", "xls", "txt", "docx", "png", "jpg", "jpeg"],
     accept_audio=True,
     audio_sample_rate=16000,
     disabled=st.session_state.get("__an_busy", False),
+    on_submit=_queue_chat_composer_submission,
+    args=(composer_key,),
 )
+if composer_submission is None:
+    composer_submission = st.session_state.pop("__chat_composer_pending_submission", None)
 uploaded_files = []
 recorded_audio = None
 attachment_file_source = "chat_composer"
@@ -14475,17 +14536,19 @@ if composer_submission is not None:
         uploaded_files = list(getattr(composer_submission, "files", ()) or ())
         recorded_audio = getattr(composer_submission, "audio", None)
     if composer_text:
-        st.session_state["__sims_auto_user_input"] = composer_text
+        callback_text = str(st.session_state.pop("__chat_composer_callback_text", "") or "").strip()
+        if composer_text != callback_text:
+            st.session_state["__sims_auto_user_input"] = composer_text
+            st.session_state["__ui_rerun_reason"] = "chat_input"
+            st.rerun()
     if uploaded_files:
         log.info(
             "[attachment.analysis] phase=composer_submit file_source=%s file_count=%s",
             attachment_file_source,
             len(uploaded_files),
         )
-    elif composer_text:
-        # chat_input returns after the top-of-run input dispatcher. Queue one
-        # clean rerun so ordinary text keeps the former Enter-send behavior.
-        st.rerun()
+else:
+    st.session_state.pop("__chat_composer_callback_text", None)
 
 if recorded_audio is not None:
     audio_token = str(getattr(recorded_audio, "file_id", "") or "").strip()

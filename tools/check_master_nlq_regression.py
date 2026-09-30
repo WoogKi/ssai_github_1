@@ -355,6 +355,41 @@ def run_basic_checks() -> list[CheckResult]:
     except Exception as e:
         results.append(_fail("general explanation bypasses loose master handlers", f"{type(e).__name__}: {e}"))
 
+    # 거래처 마스터 속성인 "재고적용처명"의 "재고"는 IO 조회 신호가 아니다.
+    try:
+        router = importlib.import_module("app.sims.nlq.nlq_router")
+        vendors = importlib.import_module("app.sims.nlq.nlq_vendors")
+        calls: list[str] = []
+
+        with (
+            patch.object(
+                vendors,
+                "try_handle_vendors_nlq",
+                side_effect=lambda text, **_kwargs: calls.append(f"vendor:{text}") or True,
+            ),
+            patch.object(
+                router,
+                "_try_handle_io_nlq",
+                side_effect=lambda text, **_kwargs: calls.append(f"io:{text}") or True,
+            ),
+        ):
+            handled = router.try_handle_nlq(
+                "재고적용처명 재고적용 거래처 조회",
+                room={},
+                session_state={},
+                make_ts=lambda: "fixture",
+                next_seq=lambda: 1,
+                logger=log,
+            )
+        vendor_attribute_ok = handled and calls == ["vendor:재고적용처명 재고적용 거래처 조회"]
+        results.append(
+            _ok("vendor inventory-application attribute precedes IO", "vendor master route")
+            if vendor_attribute_ok
+            else _fail("vendor inventory-application attribute precedes IO", repr(calls))
+        )
+    except Exception as e:
+        results.append(_fail("vendor inventory-application attribute precedes IO", f"{type(e).__name__}: {e}"))
+
     # 명시 업무코드 intent는 입출고 라벨과 충돌해도 IO보다 먼저 codes로 간다.
     try:
         router = importlib.import_module("app.sims.nlq.nlq_router")

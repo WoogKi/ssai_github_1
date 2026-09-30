@@ -238,9 +238,11 @@ def run():
         ('제약사 환인 마감일 20 발주할 수량', 3, 15, 20),
         ('제품코드 64063 조회구분 발주해당자료만 단가적용처코드 12345 재고적용처코드 23456 발주 계산', 3, 15, 25),
         ('제약사 한림 조회구분 확인 필요 발주 계산', 3, 15, 25),
+        ('제약사 피엠지 발주수량 조회조건 전체 뽑아줘', 3, 15, 25),
         ('발주담당자 홍길동 발주 계산', 3, 15, 25),
         ('발주담당자 신민우 발주계산', 3, 15, 25),
         ('발주담당자 신민우 발주 계산 적정재고 30일로 해줘', 3, 30, 25),
+        ('발주담당자 신민우 발주계산 안전재고 5일 적정재고 15일 결제일 31일', 5, 15, 31),
         ('제약담당자 이기재 발주계산', 3, 15, 25),
     ]
     for text, safety, target, closing in calculations:
@@ -258,6 +260,9 @@ def run():
         if '12345' in text:
             assert p['cost_apply_cd'] == '12345' and p['stock_apply_cd'] == '23456'
             assert p['query_mode'] == '발주해당자료만' and p['only_needed']
+        elif '피엠지' in text:
+            assert p['maker_nm'] == '피엠지'
+            assert p['query_mode'] == '전체' and not p['only_needed']
         else:
             assert p['cost_apply_cd'] == '50002' and p['stock_apply_cd'] == '50001'
         if text.startswith('제조사'):
@@ -280,6 +285,7 @@ def run():
         if '제약담당자' in text:
             assert p['pharma_staff_nm'] == '이기재'
         cases.append({'text': text, **result})
+    assert not is_order_calculation_request('제품 조회조건 전체')
     # Dispatch through the real router and service, using the same captured authority fixture.
     for text in ('제약사 환인 조회구분 전체 발주 계산',
                  '제약사 환인 안전재고 3일 적정재고 15일 결제일 25일 조회구분 전체 발주 계산',

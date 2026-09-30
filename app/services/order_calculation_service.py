@@ -1414,7 +1414,14 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
     conditions = OrderConditions(reference, int(q["safety_days"]), int(q["target_days"]), int(q["closing_day"]))
     needed_days = len(horizon_dates(conditions, calendar_dates))
     mode = q.get('query_mode') or ('발주해당자료만' if q.get('only_needed') else '전체')
-    payment = f"결제일 {conditions.closing_day}일" if conditions.closing_day else "결제일 현금/당일결제"
+    payment = (
+        f"결제일 {conditions.closing_day}일"
+        + (
+            f"(적용 {conditions.effective_closing_day}일)"
+            if conditions.closing_day != conditions.effective_closing_day else ""
+        )
+        if conditions.closing_day else "결제일 현금/당일결제"
+    )
     query_summary = (f"입력 발주일 {input_order_date}"
                      + (f" | 유효 발주일 {effective_order_date}" if effective_order_date != input_order_date else "")
                      + f" | 조회구분 {mode}"
@@ -1436,7 +1443,7 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
     next_cycle_policy = closing_relation in {"ON", "AFTER"}
     next_month = (reference.replace(day=1) + timedelta(days=32)).replace(day=1).strftime("%Y%m")
     calculation_basis = (
-        f"계산기준: 결제일 {conditions.closing_day}일 | {next_month} 예상수요 | "
+        f"계산기준: {payment} | {next_month} 예상수요 | "
         f"안전 {conditions.safety_days}영업일 | 목표 {conditions.target_days}영업일"
         if calendar_ready and next_cycle_policy else
         f"계산기준: {reference.month}월 영업일 {month_days}일 | 적용 필요 {needed_days}영업일"
@@ -1465,6 +1472,7 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
                                      "query_mode": mode, "inbound_business_days": 4,
                                      "order_date": input_order_date, "safety_days": conditions.safety_days,
                                      "target_days": conditions.target_days, "closing_day": conditions.closing_day,
+                                     "effective_closing_day": conditions.effective_closing_day,
                                      "effective_business_date": effective_order_date,
                                      "business_date_shifted": bool(sources.get("business_date_shifted", False)),
                                      "business_date_shift_days": int(sources.get("business_date_shift_days") or 0),

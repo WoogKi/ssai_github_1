@@ -498,7 +498,19 @@ def _should_try_goods_before_users(txt: str) -> bool:
 def _has_vendor_txn_signal(txt: str) -> bool:
     from app.services.io_nlq import has_transaction_query_signal
 
-    return has_transaction_query_signal(txt)
+    text = (txt or "").strip()
+    has_vendor_master_label = "거래처" in text and any(
+        word in text for word in _VENDOR_MASTER_ATTR_WORDS
+    )
+    has_explicit_transaction_action = any(
+        word in text for word in ("입고", "출고", "명세", "전표", "수불", "현황", "집계", "검증")
+    )
+    # "재고적용처명" is a vendor-master attribute. Its embedded "재고"
+    # must not turn a labeled vendor lookup into an IO request.
+    if has_vendor_master_label and not has_explicit_transaction_action:
+        return False
+
+    return has_transaction_query_signal(text)
 
 def _should_try_vendors_before_goods(txt: str) -> bool:
     """
@@ -716,6 +728,8 @@ _ANALYTICS_ACTION_SPECS = (
             "재고 부족 현황",
             "품목별 재고부족",
             "품목별 재고 부족",
+            "부족품목",
+            "부족 품목",
             "부족현황",
             "부족 현황",
             "재고부족",
@@ -858,6 +872,8 @@ _ANALYTICS_ACTION_SPECS = (
 
 
 _ANALYTICS_TAIL_PATTERNS = (
+    r"\s*매입처별\s*부족\s*예상.*$",
+    r"\s*부족\s*품목.*$",
     r"\s*제품별\s*매출\s*분석.*$",
     r"\s*제품별\s*매출분석.*$",
     r"\s*품목별\s*추세\s*분석\s*요약표.*$",
@@ -1234,7 +1250,9 @@ def _resolve_analytics_action(txt: str) -> str | None:
         and explicit_intent.get("requested_metric") in {"sales_trend", "sales_trend_summary"}
         and explicit_intent.get("requested_grouping") in {"product", "manufacturer"}
     )
-    stock_shortage_shorthand = "품목별부족현황" in compact_t
+    stock_shortage_shorthand = any(
+        phrase in compact_t for phrase in ("품목별부족현황", "매입처별부족예상", "부족품목")
+    )
     if ("추세" in compact_t and "매출" not in compact_t and not grouped_sales_trend_shorthand) or (
         "부족" in compact_t
         and "재고" not in compact_t
