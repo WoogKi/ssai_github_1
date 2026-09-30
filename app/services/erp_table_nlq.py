@@ -486,6 +486,14 @@ def resolve_registered_erp_table_nlq(
         # Capture mode before replacing an intent that itself contains '것만'.
         condition_text = _ORDER_CALCULATION_INTENT.sub("발주 조회", condition_text)
         condition_text = _ORDER_CALCULATION_QUERY_MODE.sub(" ", condition_text)
+        # The days-expression substitution leaves a natural command tail such
+        # as "로 해줘" behind. The IO router may append "조회" after that
+        # tail; neither token is part of an explicitly labelled staff name.
+        condition_text = re.sub(
+            r"\s+(?:로\s*)?(?:해\s*줘|해\s*주세요|해\s*줘요)(?:\s*(?:조회|검색))?\s*$",
+            " ",
+            condition_text,
+        )
         resolved = _resolve_order_nlq(condition_text, ORDER_CALCULATION, action_spec, today=today or kst_today())
         params = resolved["params"]
         params["order_date"] = (today or kst_today()).isoformat()

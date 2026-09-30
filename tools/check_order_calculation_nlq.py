@@ -240,6 +240,7 @@ def run():
         ('제약사 한림 조회구분 확인 필요 발주 계산', 3, 15, 25),
         ('발주담당자 홍길동 발주 계산', 3, 15, 25),
         ('발주담당자 신민우 발주계산', 3, 15, 25),
+        ('발주담당자 신민우 발주 계산 적정재고 30일로 해줘', 3, 30, 25),
         ('제약담당자 이기재 발주계산', 3, 15, 25),
     ]
     for text, safety, target, closing in calculations:
@@ -249,6 +250,11 @@ def run():
         assert (p['safety_days'], p['target_days'], p['closing_day']) == (safety, target, closing)
         assert resolve_io_nlq(text)['action'] == '발주 계산'
         assert resolve_new_sims_nlq_candidate(text)['action'] == '발주 계산'
+        if text.endswith('해줘'):
+            from app.sims.nlq.nlq_router import _append_lookup_verb_for_io, _normalize_io_action_spacing
+            routed = resolve_io_nlq(_append_lookup_verb_for_io(_normalize_io_action_spacing(text)))
+            assert routed['params']['order_staff_nm'] == '신민우'
+            assert routed['params']['target_days'] == 30
         if '12345' in text:
             assert p['cost_apply_cd'] == '12345' and p['stock_apply_cd'] == '23456'
             assert p['query_mode'] == '발주해당자료만' and p['only_needed']
