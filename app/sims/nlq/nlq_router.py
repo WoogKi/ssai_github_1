@@ -29,6 +29,18 @@ _DASHBOARD_NLQ_PHRASES = (
     "오늘의 경영점검",
     "SIMS 운영점검",
 )
+
+
+def _dashboard_nlq_phrase_pattern(phrase: str) -> re.Pattern[str]:
+    """Match one Dashboard phrase with zero or more whitespace separators."""
+    tokens = [token for token in re.split(r"\s+", str(phrase or "").strip()) if token]
+    return re.compile(r"\s*".join(map(re.escape, tokens)), flags=re.IGNORECASE)
+
+
+_DASHBOARD_NLQ_PHRASE_PATTERNS = tuple(
+    _dashboard_nlq_phrase_pattern(phrase)
+    for phrase in _DASHBOARD_NLQ_PHRASES
+)
 _DASHBOARD_NLQ_CONDITION_LABELS = (
     "발주담당자", "제약담당자", "제약사", "제조사", "발주처", "담당자",
     "재고기준", "재고위치", "제품그룹", "제품구분", "제품분류",
@@ -37,11 +49,11 @@ _DASHBOARD_NLQ_CONDITION_LABELS = (
 
 
 def _resolve_dashboard_nlq_action(text: str) -> str:
-    compact = re.sub(r"\s+", "", str(text or "")).lower()
-    for phrase in _DASHBOARD_NLQ_PHRASES:
-        if re.sub(r"\s+", "", phrase).lower() in compact:
-            return _DASHBOARD_NLQ_ACTION
-    return ""
+    return (
+        _DASHBOARD_NLQ_ACTION
+        if any(pattern.search(str(text or "")) for pattern in _DASHBOARD_NLQ_PHRASE_PATTERNS)
+        else ""
+    )
  
 # =============================================================================
 # 키보드 보정(2벌식): 영문으로 잘못 입력된 한글을 한글로 변환
@@ -5403,8 +5415,8 @@ def _ensure_io_summary_meta(
 
 def _dashboard_nlq_residual(text: str) -> str:
     residual = str(text or "")
-    for phrase in sorted(_DASHBOARD_NLQ_PHRASES, key=len, reverse=True):
-        residual = re.sub(re.escape(phrase), " ", residual, flags=re.IGNORECASE)
+    for pattern in _DASHBOARD_NLQ_PHRASE_PATTERNS:
+        residual = pattern.sub(" ", residual)
     residual = re.sub(r"(?:19|20)\d{2}\s*년(?:\s*(?:부터|~|-)\s*(?:19|20)\d{2}\s*년?)?", " ", residual)
     residual = re.sub(r"(?:19|20)\d{2}\s*년(?:\s*\d{1,2}\s*월)?", " ", residual)
     residual = re.sub(r"(?:19|20)\d{4,6}", " ", residual)
