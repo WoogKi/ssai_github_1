@@ -249,28 +249,33 @@ def _assert_contract_price_entity_contract() -> None:
     assert (labeled_numeric.get("params") or {}).get("ven_cd") == "50002"
 
     semantic_only = resolve_registered_erp_table_nlq("전문약 계약단가 조회") or {}
-    assert (semantic_only.get("params") or {}).get("product_di_semantic_group") == "insurance"
+    assert (semantic_only.get("params") or {}).get("product_prescription_semantic") == "prescription"
+    assert not (semantic_only.get("params") or {}).get("product_di_semantic_group")
     assert not (semantic_only.get("params") or {}).get("ven_nm")
 
     missing_vendor_value = resolve_registered_erp_table_nlq("단가적용거래처 전문약 계약단가 조회") or {}
     missing_params = dict(missing_vendor_value.get("params") or {})
-    assert missing_params.get("product_di_semantic_group") == "insurance"
+    assert missing_params.get("product_prescription_semantic") == "prescription"
+    assert not missing_params.get("product_di_semantic_group")
     assert not missing_params.get("ven_nm")
 
     vendor_and_semantic = resolve_registered_erp_table_nlq("단가적용거래처 보덕 전문약 계약단가 조회") or {}
     vendor_params = dict(vendor_and_semantic.get("params") or {})
     assert vendor_params.get("ven_nm") == "보덕"
-    assert vendor_params.get("product_di_semantic_group") == "insurance"
+    assert vendor_params.get("product_prescription_semantic") == "prescription"
+    assert not vendor_params.get("product_di_semantic_group")
 
     maker_and_semantic = resolve_registered_erp_table_nlq("제조사 한미 전문약 계약단가 조회") or {}
     maker_params = dict(maker_and_semantic.get("params") or {})
     assert maker_params.get("maker_nm") == "한미"
-    assert maker_params.get("product_di_semantic_group") == "insurance"
+    assert maker_params.get("product_prescription_semantic") == "prescription"
+    assert not maker_params.get("product_di_semantic_group")
 
     product_and_semantic = resolve_registered_erp_table_nlq("제품명 이가탄 전문약 계약단가 조회") or {}
     product_params = dict(product_and_semantic.get("params") or {})
     assert product_params.get("physic_nm") == "이가탄"
-    assert product_params.get("product_di_semantic_group") == "insurance"
+    assert product_params.get("product_prescription_semantic") == "prescription"
+    assert not product_params.get("product_di_semantic_group")
 
     parsed = resolve_registered_erp_table_nlq("태응약품 계약단가 조회") or {}
     params = dict(parsed.get("params") or {})

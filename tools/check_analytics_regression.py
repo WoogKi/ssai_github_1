@@ -17946,11 +17946,11 @@ def run_general_current_table_rule_checks() -> list[CheckResult]:
             or 'current_table_intent == "llm_analysis"' not in handoff_source
             or "stage=immediate_llm_handoff" not in handoff_source
             or "handled = not prepared" not in handoff_source
-            or handoff_source.find("_prepare_current_table_analysis_override(")
-            > handoff_source.find('st.session_state["__deferred_current_table_followup"]')
+            or "_push_current_table_followup_help(current_table_followup_input)" not in handoff_source
+            or 'st.session_state["__deferred_current_table_followup"] = {' in handoff_source
             or "or '요청 컬럼'" in chat_main_source
         ):
-            errors.append("current-table llm analysis handoff still depends on deferred panel rendering")
+            errors.append("current-table immediate handoff/clarification route still depends on deferred panel rendering")
 
         generic = importlib.import_module("app.ui.current_table_followups.generic")
         generic_ratio_df = pd.DataFrame(

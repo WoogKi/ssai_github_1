@@ -31,12 +31,12 @@ from tools.knowledge_document_manage_cli import apply_plan, validate_plan  # noq
 
 
 CASES = (
-    ("일반의약품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}, "PASS"),
-    ("전문약 제약사 삼진 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance", "maker_nm": "삼진"}, "PASS"),
+    ("일반의약품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}, "PASS"),
+    ("전문약 제약사 삼진 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription", "maker_nm": "삼진"}, "PASS"),
     ("제품 아라바정 계약단가 조회", "최종 계약단가 조회", {"physic_nm": "아라바정"}, "PASS"),
     ("단가적용처 50002 계약단가 조회", "최종 계약단가 조회", {"ven_cd": "50002"}, "PASS"),
-    ("전문약 최종 매입단가 조회", "최종 매입단가 조회", {"product_di_semantic_group": "insurance"}, "PASS"),
-    ("OTC 최종 매입가 조회", "최종 매입단가 조회", {"product_di_semantic_group": "non_insurance"}, "PASS"),
+    ("전문약 최종 매입단가 조회", "최종 매입단가 조회", {"product_prescription_semantic": "prescription"}, "PASS"),
+    ("OTC 최종 매입가 조회", "최종 매입단가 조회", {"product_prescription_semantic": "otc"}, "PASS"),
     ("제품 아라바정 최종 매입단가 조회", "최종 매입단가 조회", {"physic_nm": "아라바정"}, "PASS"),
     ("재고적용처 50001 최종 매입단가 조회", "최종 매입단가 조회", {"stock_apply_cd": "50001"}, "PASS"),
     ("어제 발주 조회", "발주조회", {"date_from": "20260907", "date_to": "20260907"}, "PASS"),
@@ -44,14 +44,14 @@ CASES = (
     ("아라바정 제품 발주 조회", "발주조회", {"physic_nm": "아라바정"}, "PASS"),
     ("입고중 발주조회", "발주조회", {"status_code": "2"}, "PASS"),
     ("발주상태 입고중 조회", "발주조회", {"status_code": "2"}, "PASS"),
-    ("종근당 전문약 발주 조회", "발주조회", {"order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}, "PASS"),
-    ("9월 종근당 전문약 발주 조회", "발주조회", {"date_from": "20260901", "date_to": "20260930", "order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}, "PASS"),
+    ("종근당 전문약 발주 조회", "발주조회", {"order_vendor_nm": "종근당", "product_prescription_semantic": "prescription"}, "PASS"),
+    ("9월 종근당 전문약 발주 조회", "발주조회", {"date_from": "20260901", "date_to": "20260930", "order_vendor_nm": "종근당", "product_prescription_semantic": "prescription"}, "PASS"),
     ("단가적용처 50002 발주 조회", "발주조회", {"cost_apply_cd": "50002"}, "PASS"),
     ("재고적용처 50001 발주 조회", "발주조회", {"stock_apply_cd": "50001"}, "PASS"),
     ("입고 예정 조회", "입고예정조회", {}, "PASS"),
-    ("전문약 입고 예정 조회", "입고예정조회", {"product_di_semantic_group": "insurance"}, "PASS"),
+    ("전문약 입고 예정 조회", "입고예정조회", {"product_prescription_semantic": "prescription"}, "PASS"),
     ("종근당 입고예정 조회", "입고예정조회", {"order_vendor_nm": "종근당"}, "PASS"),
-    ("종근당 전문약 입고예정 조회", "입고예정조회", {"order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}, "PASS"),
+    ("종근당 전문약 입고예정 조회", "입고예정조회", {"order_vendor_nm": "종근당", "product_prescription_semantic": "prescription"}, "PASS"),
 )
 
 EXPECTED_SECTION_COUNTS = {

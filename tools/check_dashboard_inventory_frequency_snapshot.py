@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import inspect
 import logging
 import random
 import sys
@@ -1032,12 +1031,9 @@ def test_product_inventory_frequency_filter_totals_and_summary() -> None:
         params={"frequency_grade": "E"},
     )
     _assert("출고빈도 E" in summary, "NLQ and UI query summary must expose the canonical frequency filter")
-    attach_source = inspect.getsource(product_inventory_service.attach_dashboard_frequency_snapshot)
-    _assert(
-        "for index in out.index[detail_mask]" not in attach_source
-        and "product_codes.map(" in attach_source,
-        "frequency attachment must map snapshot rows without per-result-row mutation",
-    )
+    # Direct attachment behavior is covered by
+    # test_projection_consumer_attachment_equality. Keep this result-path
+    # test independent from the current vectorized implementation details.
 
 
 def test_operating_projection_selects_only_completed_approved_basis() -> None:
@@ -1185,15 +1181,23 @@ def test_inventory_grade_nlq_and_shared_postfilter() -> None:
 
     from app.sims.nlq import nlq_router
     from app.services import io_nlq
+    from app.services import rddbc010_service
     from app.ui import chat_middleware
     captured: list[dict[str, Any]] = []
     delivered: list[dict[str, Any]] = []
+    rddbc010_calls: list[dict[str, Any]] = []
 
     def result(params=None, **_kwargs):
         captured.append(dict(params or {}))
         return {"final": True, "type": "text", "data": "fixture", "message": "fixture", "meta": {"result_status": "success", "row_count": 1, "row_count_total": 1}}
 
-    with patch.object(product_inventory_service, "get_product_inventory_result", side_effect=result), patch.object(chat_middleware, "push_sims_result_to_chat", side_effect=lambda payload, _action: delivered.append(payload)):
+    def forbid_rddbc010(*_args, **kwargs):
+        rddbc010_calls.append(dict(kwargs))
+        raise AssertionError("offline snapshot gate must not call Rddbc010")
+
+    # Current-stock defaults normally lazy-load stock-location names from Rddbc010.
+    # This fixture checks grade routing only, so supply that dependency locally.
+    with patch.object(io_nlq, "get_current_stock_location_name_map", return_value={}), patch.object(rddbc010_service, "search_rows", side_effect=forbid_rddbc010), patch.object(product_inventory_service, "get_product_inventory_result", side_effect=result), patch.object(chat_middleware, "push_sims_result_to_chat", side_effect=lambda payload, _action: delivered.append(payload)):
         for query, key, value in (("현재고 품목손익 X", "profit_grade", "X"), ("현재고 품목기여 A", "contribution_grade", "A"), ("제품재고장 품목손익 X", "profit_grade", "X"), ("제품재고장 품목기여 A", "contribution_grade", "A")):
             _assert(nlq_router._try_handle_io_nlq(query, room={"messages": []}, session_state={}, make_ts=lambda: "2026-09-20", next_seq=lambda: 1, logger=logging.getLogger("grade-fixture")), "grade-only request must be routed")
             _assert(captured[-1].get(key) == value and delivered[-1]["meta"]["result_status"] == "success", "grade-only request must reach inventory service")
@@ -1203,9 +1207,10 @@ def test_inventory_grade_nlq_and_shared_postfilter() -> None:
         residual.append(text)
         return {"status": "resolved", "resolved_kind": "fixture", "params": dict(params)}
 
-    with patch.object(io_nlq, "resolve_current_stock_entity_condition", side_effect=resolved_entity), patch.object(io_nlq, "resolve_unlabeled_io_entity_condition", side_effect=resolved_entity), patch.object(product_inventory_service, "get_product_inventory_result", side_effect=result), patch.object(chat_middleware, "push_sims_result_to_chat", side_effect=lambda payload, _action: delivered.append(payload)):
+    with patch.object(io_nlq, "get_current_stock_location_name_map", return_value={}), patch.object(rddbc010_service, "search_rows", side_effect=forbid_rddbc010), patch.object(io_nlq, "resolve_current_stock_entity_condition", side_effect=resolved_entity), patch.object(io_nlq, "resolve_unlabeled_io_entity_condition", side_effect=resolved_entity), patch.object(product_inventory_service, "get_product_inventory_result", side_effect=result), patch.object(chat_middleware, "push_sims_result_to_chat", side_effect=lambda payload, _action: delivered.append(payload)):
         for query in ("현재고 삼진제약 품목손익 D", "제품재고장 삼진제약 품목기여 A", "제품재고장 제약사 삼진제약 품목기여 A"):
             _assert(nlq_router._try_handle_io_nlq(query, room={"messages": []}, session_state={}, make_ts=lambda: "2026-09-20", next_seq=lambda: 1, logger=logging.getLogger("grade-fixture")), "compound grade request must be routed")
+    _assert(not rddbc010_calls, "offline snapshot grade routing must make zero Rddbc010 calls")
     _assert(len(residual) == 3 and all("삼진제약" in text and "품목" not in text for text in residual), "entity resolver must see only the remaining name")
     _assert(captured[-1].get("maker_nm") == "삼진제약" and captured[-1].get("contribution_grade") == "A", "explicit manufacturer must remain separate from grade")
 

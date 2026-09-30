@@ -269,6 +269,7 @@ from app.ui.current_table_followups.action_dispatcher import (
     classify_current_table_followup_intent,
     current_table_analysis_query_matches,
     handle_current_table_followup_by_action,
+    is_explicit_current_table_followup_reference,
     is_explicit_current_trans_doc_validation_request,
     parse_current_table_rank_request,
     select_current_table_analysis_context,
@@ -4628,6 +4629,24 @@ def _push_no_current_table_notice(source_query: str) -> bool:
         message="현재표가 없습니다. 먼저 SSAI 조회를 실행한 뒤 다시 질문해 주세요.",
         query_summary="현재표 / 후속분석 불가 / 현재표 원본 없음",
         source_query=str(source_query or ""),
+    )
+
+
+def _push_current_table_followup_help(source_query: str) -> bool:
+    """현재표는 있으나 표/분석 의도를 확정하지 못한 경우의 공통 종료 안내다."""
+    return _current_table_push_notice(
+        title="현재표 후속질문 안내",
+        action="현재표 후속질문 안내",
+        message=(
+            "현재표가 준비되어 있습니다. 확인할 기준을 함께 입력해 주세요.\n\n"
+            "예: 제품명별 집계, 제조사별 집계, 출고빈도 집계, 현재표 제품명 상세조회, 현재표 제조사별 분석"
+        ),
+        query_summary="현재표 / 후속질문 안내 / 의도 확인 필요",
+        source_query=str(source_query or ""),
+        extra_meta={
+            "execution_status": "clarification",
+            "result_status": "clarification",
+        },
     )
 
 
@@ -12548,8 +12567,17 @@ if user_input and user_input.strip():
     st.session_state["__did_user_input"] = True
 
     is_pending_product_pick = _is_pending_product_pick_text(user_input)
-    is_sims_result_followup = is_sims_result_followup_question(user_input)
-    is_sims_input = is_sims_related_question(user_input) or is_sims_result_followup or is_pending_product_pick
+    explicit_current_table_reference = is_explicit_current_table_followup_reference(user_input)
+    is_sims_result_followup = (
+        is_sims_result_followup_question(user_input)
+        or explicit_current_table_reference
+    )
+    is_sims_input = (
+        is_sims_related_question(user_input)
+        or is_sims_result_followup
+        or explicit_current_table_reference
+        or is_pending_product_pick
+    )
 
     # ------------------------------------------------------------
     # 패널 B단계 성능 패치 신호
@@ -12731,13 +12759,8 @@ if user_input and user_input.strip():
     current_table_followup_input = _normalize_current_table_followup_input(user_input)
     compact_current = re.sub(r"\s+", "", str(current_table_followup_input or ""))
 
-    has_explicit_current_table_reference = (
-        "현재표" in compact_current
-        or "현재조회결과" in compact_current
-        or "현재조회자료" in compact_current
-        # 거래명세서라는 현재 source를 명시한 validation 표현도 동일한
-        # deterministic current-table entrance를 사용한다.
-        or "현재거래명세서" in compact_current
+    has_explicit_current_table_reference = is_explicit_current_table_followup_reference(
+        current_table_followup_input
     )
     new_sims_candidate = None
     if not has_explicit_current_table_reference:
@@ -12906,18 +12929,16 @@ if user_input and user_input.strip():
                 # 기존 __queue_ai runner가 같은 rerun에서 override를 소비한다.
                 handled = not prepared
             else:
-                # 조회 화면에서는 현재표 stash가 panel render 이후에 완료될 수 있다.
-                # 따라서 여기서 바로 LLM fallback으로 보내지 말고,
-                # panel render 이후 한 번 더 현재표 후속분석을 재시도한다.
-                st.session_state["__deferred_current_table_followup"] = {
-                    "user_input": current_table_followup_input,
-                    "ts": time.time(),
-                    "retry": 0,
-                }
-                deferred_current_followup = True
-                log.debug(
-                    "[chat.followup_table] defer current-table followup until after panel render: %r",
-                    current_table_followup_input[:80],
+                # 위에서 현재표 원본 존재를 이미 확인하고 handler까지 실행했다.
+                # 이 시점의 미처리 요청은 panel render를 기다려도 새 source가 생기지 않으므로
+                # defer만 남기지 않고, 모든 follow-up의 응답 종료 계약을 즉시 안내로 닫는다.
+                st.session_state.pop("__deferred_current_table_followup", None)
+                handled = _push_current_table_followup_help(current_table_followup_input)
+                log.info(
+                    "[current_table.route] intent=%s stage=immediate_clarification table_key=%s action=%s",
+                    current_table_intent,
+                    st.session_state.get("__sims_current_table_source_key") or "",
+                    st.session_state.get("__sims_current_table_source_action") or "",
                 )
 
         elif (
@@ -13991,6 +14012,10 @@ with st.container():
                             except Exception:
                                 st.session_state.pop("__deferred_current_table_followup", None)
                                 log.exception("[chat.followup_table] deferred current-table followup retry failed")
+                                _push_current_table_followup_help(deferred_query)
+                                st.session_state["__queue_ai"] = False
+                                save_chat_rooms()
+                                st.rerun()
 
                     st.session_state["__sims_run_flag"] = False
                     st.session_state["__sims_inner_submit"] = False

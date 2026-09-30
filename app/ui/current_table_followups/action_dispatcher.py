@@ -38,6 +38,9 @@ import re
 from typing import Any, Callable
 
 import pandas as pd
+from app.services.dashboard_inventory_frequency_snapshot import (
+    EXTENDED_FREQUENCY_PROJECTION_GRADES,
+)
 from app.ui.current_table_followups.analysis_facts import build_whole_table_facts
 from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
 
@@ -73,6 +76,17 @@ def is_explicit_current_trans_doc_validation_request(query: Any) -> bool:
     return bool(
         "현재거래명세서" in compact
         and any(marker in compact for marker in ("검증", "상세합계", "불일치"))
+    )
+
+
+def is_explicit_current_table_followup_reference(query: Any) -> bool:
+    """Identify a direct reference to the current in-memory table."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    return bool(
+        "현재표" in compact
+        or "현재조회결과" in compact
+        or "현재조회자료" in compact
+        or "현재거래명세서" in compact
     )
 
 
@@ -419,14 +433,14 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
     (
         "profit_grade",
         "품목손익등급",
-        ("품목손익등급별", "품목손익등급분석", "품목손익등급", "손익등급별", "손익등급분석", "손익등급"),
-        ("품목손익등급", "손익등급"),
+        ("품목손익등급별", "품목손익등급분석", "품목손익등급", "품목손익별", "품목손익분석", "품목손익", "손익등급별", "손익등급분석", "손익등급"),
+        ("품목손익등급", "품목손익", "손익등급"),
     ),
     (
         "contribution_grade",
         "품목기여등급",
-        ("품목기여등급별", "품목기여등급분석", "품목기여등급", "기여등급별", "기여등급분석", "기여등급", "기여도등급별", "기여도등급분석", "기여도등급"),
-        ("품목기여등급", "기여등급", "기여도등급"),
+        ("품목기여등급별", "품목기여등급분석", "품목기여등급", "품목기여별", "품목기여분석", "품목기여", "기여등급별", "기여등급분석", "기여등급", "기여도등급별", "기여도등급분석", "기여도등급"),
+        ("품목기여등급", "품목기여", "기여등급", "기여도등급"),
     ),
     ("frequency_grade", "출고빈도등급", ("출고빈도등급별", "출고빈도등급분석", "출고빈도별"), ("출고빈도등급", "출고빈도")),
     ("trend_judgement", "추세판정", ("추세판정별",), ("추세판정",)),
@@ -1402,6 +1416,29 @@ def _current_table_followup_capability(
             "metric_columns": [],
             "requires_result_contract": True,
         }
+
+    if grouping == "frequency_grade":
+        frequency_column = _resolve_current_table_dimension_column(
+            df,
+            grouping=grouping,
+            kind=kind,
+            query=query,
+        )
+        frequency_values = (
+            df[frequency_column].fillna("").astype(str).str.strip()
+            if frequency_column
+            else pd.Series(dtype="object")
+        )
+        # The common grouping contract intentionally aggregates only approved
+        # A~F/X projection grades. Snapshot-unavailable labels must not become
+        # a fabricated business bucket or an empty success table.
+        if not frequency_values.isin(EXTENDED_FREQUENCY_PROJECTION_GRADES).any():
+            return {
+                **base,
+                "status": "no_data",
+                "issue_codes": ["frequency_projection_grades_unavailable"],
+                "requires_result_contract": bool(metric and grouping),
+            }
 
     if requested and not any(
         df[column].notna().astype(bool).any()
