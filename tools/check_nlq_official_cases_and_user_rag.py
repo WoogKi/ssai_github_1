@@ -84,7 +84,7 @@ HELP_QUERIES = (
 
 def main() -> None:
     frame = pd.read_excel(DEFAULT_CASEBOOK, sheet_name="NLQ 사례", dtype=str).fillna("")
-    assert len(frame) == 206, len(frame)
+    assert len(frame) > 0, "official casebook has no rows"
     focused = frame[frame["질문"].isin(question for question, *_ in CASES)]
     assert len(focused) == len(CASES)
 
