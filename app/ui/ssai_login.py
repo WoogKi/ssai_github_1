@@ -152,6 +152,14 @@ def _clear_company_dependent_state() -> None:
         pass
 
     try:
+        from app.services.dashboard_request_coordinator import invalidate_dashboard_session_state
+
+        invalidated = invalidate_dashboard_session_state(st.session_state)
+        log.info("[dashboard.request_guard] action=invalidate active_request_count=%s", invalidated)
+    except Exception:
+        log.warning("[auth.company] dashboard request invalidation failed error_type=DashboardRequestGuardError")
+
+    try:
         from app.sims.views.dashboard_lite import clear_dashboard_lite_session_state
 
         clear_dashboard_lite_session_state(st.session_state)

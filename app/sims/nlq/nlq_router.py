@@ -5767,17 +5767,31 @@ def _try_handle_dashboard_nlq(
     if not _resolve_dashboard_nlq_action(text):
         return False
     from app.ui.chat_middleware import get_current_chat_room_id, push_sims_result_to_chat
+    from app.services.dashboard_request_coordinator import (
+        DashboardRequestAlreadyRunning,
+        DashboardRequestStale,
+    )
+    from app.sims.views.dashboard_lite import (
+        build_dashboard_lite_result_payload,
+        dashboard_request_publish_allowed,
+        is_dashboard_query_timeout,
+    )
     try:
-        from app.sims.views.dashboard_lite import build_dashboard_lite_result_payload
-
         params, notice = _build_dashboard_nlq_params(text, session_state=session_state, logger=logger)
         if notice is not None:
             push_sims_result_to_chat(notice, _DASHBOARD_NLQ_ACTION)
             return True
         room_id = str(get_current_chat_room_id() or room.get("id") or "").strip()
         payload, cache = build_dashboard_lite_result_payload(
-            params, room_id=room_id, company_id=str(params.get("company_id") or ""), action=_DASHBOARD_NLQ_ACTION
+            params,
+            room_id=room_id,
+            company_id=str(params.get("company_id") or ""),
+            action=_DASHBOARD_NLQ_ACTION,
+            session_state=session_state,
         )
+        if not dashboard_request_publish_allowed(cache, current_room_id=get_current_chat_room_id() or room.get("id") or ""):
+            logger.info("[dashboard.nlq.guard] action=skip_stale_publish")
+            return True
         facts_params = dict(cache.get("params") or {})
         facts = dict(cache.get("facts") or {})
         source_call_count = int(facts.get("source_call_count") or 0)
@@ -5806,6 +5820,7 @@ def _try_handle_dashboard_nlq(
             )
             return True
         meta = dict(payload.get("meta") or {})
+        meta.pop("_dashboard_request_guard", None)
         meta.update({
             "nlq": True, "nlq_query": text, "canonical_action": _DASHBOARD_NLQ_ACTION,
             "_force_push": True, "_nlq_nonce": str(uuid.uuid4()),
@@ -5815,11 +5830,31 @@ def _try_handle_dashboard_nlq(
         session_state["__dashboard_lite_result"] = cache
         push_sims_result_to_chat(payload, _DASHBOARD_NLQ_ACTION)
         return True
+    except DashboardRequestAlreadyRunning:
+        push_sims_result_to_chat(
+            _dashboard_nlq_text_payload(
+                "SIMS 일일점검이 이미 조회 중입니다. 기존 조회가 끝날 때까지 기다려 주세요.",
+                status="already_running",
+                params={},
+                question=text,
+                source_call_count=0,
+            ),
+            _DASHBOARD_NLQ_ACTION,
+        )
+        return True
+    except DashboardRequestStale:
+        logger.info("[dashboard.nlq.guard] action=stop_stale_request")
+        return True
     except Exception as exc:
         logger.exception("[nlq.router] dashboard-nlq deterministic handler failed error_type=%s", type(exc).__name__)
+        timeout = is_dashboard_query_timeout(exc)
         error_payload = _dashboard_nlq_text_payload(
-            "SIMS 일일점검을 완료하지 못했습니다. 조회 조건을 확인한 뒤 다시 시도해 주세요.",
-            status="routing_error",
+            (
+                "SIMS 일일점검 쿼리가 120초 제한시간을 초과했습니다. 자동 재시도하지 않았습니다."
+                if timeout
+                else "SIMS 일일점검을 완료하지 못했습니다. 조회 조건을 확인한 뒤 다시 시도해 주세요."
+            ),
+            status="query_timeout" if timeout else "routing_error",
             params={},
             question=text,
         )

@@ -10861,7 +10861,7 @@ def run_basic_checks() -> list[CheckResult]:
                 self.container_calls += 1
                 return _FakeCtx()
 
-        def _fake_build(params=None):
+        def _fake_build(params=None, **_kwargs):
             build_calls.append(dict(params or {}))
             return dict(facts)
 
@@ -12805,7 +12805,7 @@ def run_basic_checks() -> list[CheckResult]:
             or 'build_dashboard_lite_chat_snapshot' not in view_src
             or 'manufacturer_codes = _clean_list(option_cache.get("manufacturer_codes"))' in view_src
             or 'form_submit_button("대시보드 조회"' not in view_src
-            or 'build_dashboard_lite_facts(work_params)' not in view_src
+            or 'build_dashboard_lite_facts(work_params, request_checkpoint=_checkpoint)' not in view_src
             or '"type": "dashboard_lite"' not in view_src
             or 'render_dashboard_lite_chat_item' not in chat_middleware_dashboard_src
             or 'elif str(payload.get("type") or "").strip().lower() != "dashboard_lite"' not in chat_middleware_dashboard_src
@@ -17265,7 +17265,7 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
         results.append(_ok("dashboard NLQ aliases", "canonical=SIMS 일일점검") if route_ok else _fail("dashboard NLQ aliases", "alias mismatch"))
 
         facts_calls: list[dict[str, Any]] = []
-        def _facts_fixture(params):
+        def _facts_fixture(params, **_kwargs):
             facts_calls.append(dict(params or {}))
             return {
                 "kind": "SIMS_DASHBOARD_FACTS_V01", "source_call_count": 3,
@@ -17356,7 +17356,7 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
         )
         results.append(_ok("dashboard NLQ facts receives separated runtime conditions", repr(facts_params)) if facts_scope_ok else _fail("dashboard NLQ facts receives separated runtime conditions", repr(facts_params)))
 
-        dashboard_view.build_dashboard_lite_facts = lambda _params: {
+        dashboard_view.build_dashboard_lite_facts = lambda _params, **_kwargs: {
             "kind": "SIMS_DASHBOARD_FACTS_V01", "source_call_count": 3,
             "filters": {}, "today_actions": [], "inventory": {"readiness_rows": []},
         }
@@ -17456,7 +17456,7 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
                 if fact_mode_ok else _fail(f"dashboard NLQ facts supplier-mode contract: {query}", f"handled={handled}, facts={facts_params!r}, pushed={pushed!r}")
             )
 
-        dashboard_view.build_dashboard_lite_facts = lambda _params: (_ for _ in ()).throw(RuntimeError("fixture"))
+        dashboard_view.build_dashboard_lite_facts = lambda _params, **_kwargs: (_ for _ in ()).throw(RuntimeError("fixture"))
         pushed.clear()
         handled = router._try_handle_dashboard_nlq(
             "SIMS 일일점검", room={"id": "room-fixture"}, session_state={}, logger=log

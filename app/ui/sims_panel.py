@@ -3390,6 +3390,14 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
             log.warning("[dashboard.chat_push] room_resolved=False pushed=False")
             ss["__sims_inner_submit"] = False
             return
+        guard_receipt = meta.pop("_dashboard_request_guard", None)
+        if not dashboard_lite.dashboard_request_publish_allowed(
+            {"_dashboard_request_guard": guard_receipt},
+            current_room_id=room_id,
+        ):
+            log.info("[dashboard.chat_push] action=skip_stale_publish pushed=False")
+            ss["__sims_inner_submit"] = False
+            return
         duplicate_skip = _dashboard_chat_push_is_duplicate(
             ss,
             company_id=company_id,

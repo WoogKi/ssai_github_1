@@ -3623,8 +3623,13 @@ def build_dashboard_lite_facts(
     frequency_projection_reader: Callable[..., FrequencyProjectionReadResult] | None = None,
     today: date | None = None,
     business_day_context_loader: Callable[..., BusinessDayMonthContext] = business_day_month_context,
+    request_checkpoint: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Build Dashboard Lite v0.1 facts from existing analytics payloads."""
+    def _checkpoint(phase: str) -> None:
+        if request_checkpoint is not None:
+            request_checkpoint(phase)
+
     today = today or kst_today()
     t0 = time.perf_counter()
     needs_sales_source = manufacturer_summary_payload is None
@@ -3745,6 +3750,7 @@ def build_dashboard_lite_facts(
     sales_cycle_physical_query_count = 0
     sales_cycle_source_mode = "reused_daily_facts"
     inbound_cutoff_date = _dashboard_inbound_cutoff_date(service_params, today=today)
+    _checkpoint("before_inbound")
     if needs_inbound_source:
         from app.services.dashboard_inbound_facts_service import get_dashboard_inbound_facts
 
@@ -3769,6 +3775,7 @@ def build_dashboard_lite_facts(
         inbound_source_rows = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_source_rows") or len(inbound_facts_df))
         inbound_query_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_query_elapsed_ms") or 0)
         inbound_build_elapsed_ms = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_build_elapsed_ms") or 0)
+    _checkpoint("after_inbound")
     inbound_facts_df = filter_dashboard_inbound_facts_by_staff(inbound_facts_df, service_params)
     staff_product_codes = {
         str(value).strip()
@@ -3789,6 +3796,7 @@ def build_dashboard_lite_facts(
         inbound_build_elapsed_ms,
         inbound_source_elapsed_ms,
     )
+    _checkpoint("before_sales")
     if needs_sales_source or needs_stock_source:
         from app.services.analytics_sales_trend_service import (
             adapt_dashboard_narrow_bundle_for_forecast,
@@ -3918,6 +3926,7 @@ def build_dashboard_lite_facts(
             sales_source_elapsed_ms,
         )
 
+    _checkpoint("after_sales")
     if manufacturer_summary_payload is None:
         from app.services.analytics_manufacturer_sales_trend_service import get_manufacturer_sales_trend_summary_result
         from app.services.analytics_sales_trend_service import adapt_dashboard_narrow_bundle_for_manufacturer
@@ -3941,6 +3950,7 @@ def build_dashboard_lite_facts(
         filter_diagnostics.extend(list(payload_df.attrs.get("dashboard_filter_diagnostics") or []))
     future_forecast_df = pd.DataFrame()
     future_forecast_elapsed_ms = 0
+    _checkpoint("before_stock")
     if stock_shortage_payload is None:
         from app.services.analytics_sales_trend_service import (
             get_sales_forecast_df,
@@ -4066,6 +4076,7 @@ def build_dashboard_lite_facts(
     )
     t_stock = time.perf_counter()
     stock_codes = list(service_params.get("stock_cd_list") or [])
+    _checkpoint("after_stock")
     stock_frequency_source = _payload_df(stock_shortage_payload)
     projection_product_codes = (
         stock_frequency_source["제품코드"].fillna("").astype(str).str.strip().loc[
@@ -4157,6 +4168,7 @@ def build_dashboard_lite_facts(
         previous_frequency_evaluation_month=previous_frequency_evaluation_month,
         measurement=physical_measurement,
         business_day_context=inventory_business_context,
+        today=today,
     )
     def _product_codes(frame: Any, *columns: str) -> set[str]:
         if not isinstance(frame, pd.DataFrame) or frame.empty:
@@ -4378,4 +4390,5 @@ def build_dashboard_lite_facts(
         total_elapsed_ms,
         total_elapsed_ms,
     )
+    _checkpoint("before_return")
     return facts

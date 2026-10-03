@@ -50,7 +50,13 @@ from app.services.ssai_analysis_profile_service import (
     save_dashboard_profile,
 )
 from app.services import rddbc010_service as C01
-from app.db.mssql_client import query_to_df
+from app.db.mssql_client import query_to_df, read_only_request
+from app.services.dashboard_request_coordinator import (
+    DashboardRequestAlreadyRunning,
+    DashboardRequestStale,
+    dashboard_request_coordinator,
+    ensure_dashboard_session_token,
+)
 from app.sims.views.rddbc_io_shared import _load_stock_code_options
 from app.ui.chat_middleware import get_current_chat_room_id
 from app.ui.ssai_login import require_permission
@@ -5827,13 +5833,35 @@ def build_dashboard_lite_result_payload(
     company_id: str = "",
     cache_key: str = "",
     action: str = "Dashboard Lite v0.1",
+    session_state: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Build one Dashboard result through the same facts/snapshot contract as the panel."""
+    state = session_state if session_state is not None else st.session_state
     work_params = dict(params or {})
     if company_id:
         work_params["company_id"] = str(company_id)
+    identity = _dashboard_context_identity()
+    resolved_company_id = str(identity.get("company_id") or company_id or work_params.get("company_id") or "")
+    resolved_user_id = str(identity.get("user_id") or "")
+    session_token = ensure_dashboard_session_token(state)
+    lease = dashboard_request_coordinator.acquire(
+        session_token=session_token,
+        user_id=resolved_user_id,
+        company_id=resolved_company_id,
+        room_id=room_id,
+    )
     started = time.perf_counter()
-    facts = build_dashboard_lite_facts(work_params)
+    try:
+        def _checkpoint(_phase: str) -> None:
+            dashboard_request_coordinator.checkpoint(lease)
+
+        with read_only_request(timeout_seconds=120):
+            facts = build_dashboard_lite_facts(work_params, request_checkpoint=_checkpoint)
+        dashboard_request_coordinator.checkpoint(lease)
+        guard_receipt = lease.receipt()
+        guard_receipt["identity_required"] = bool(identity.get("user_id") or identity.get("company_id"))
+    finally:
+        dashboard_request_coordinator.release(lease)
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     requested_amount_unit = str(work_params.get("amount_display_unit") or "auto").strip().lower()
     resolved_amount_unit = _resolved_dashboard_amount_unit(facts, requested_amount_unit)
@@ -5857,6 +5885,7 @@ def build_dashboard_lite_result_payload(
         "elapsed_seconds": round(elapsed_ms / 1000.0, 3),
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "dashboard_event_id": event_id,
+        "_dashboard_request_guard": guard_receipt,
     }
     for today_action in facts.get("today_actions") or []:
         if isinstance(today_action, dict):
@@ -5874,12 +5903,45 @@ def build_dashboard_lite_result_payload(
             "facts_kind": facts.get("kind"),
             "room_id": result_cache["room_id"],
             "dashboard_event_id": event_id,
+            "_dashboard_request_guard": dict(guard_receipt),
             "dashboard_cache": build_dashboard_lite_chat_snapshot(result_cache),
             "query_summary": _dashboard_scope_header(work_params),
             "source_call_count": int(facts.get("source_call_count") or 0),
         },
     }
     return payload, result_cache
+
+
+def dashboard_request_publish_allowed(cache: Any, *, current_room_id: Any) -> bool:
+    source = cache if isinstance(cache, dict) else {}
+    receipt = source.get("_dashboard_request_guard")
+    if not isinstance(receipt, dict):
+        return False
+    identity = _dashboard_context_identity()
+    if bool(receipt.get("identity_required")):
+        user_id = str(identity.get("user_id") or "")
+        company_id = str(identity.get("company_id") or "")
+    else:
+        user_id = str(receipt.get("user_id") or "")
+        company_id = str(receipt.get("company_id") or "")
+    return dashboard_request_coordinator.publish_allowed(
+        receipt,
+        user_id=user_id,
+        company_id=company_id,
+        room_id=current_room_id,
+    )
+
+
+def is_dashboard_query_timeout(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if "timeout" in message or "hyt00" in message or "hyt01" in message:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def render_dashboard_lite() -> dict[str, Any]:
@@ -5981,17 +6043,54 @@ def render_dashboard_lite() -> dict[str, Any]:
                 company_id=identity.get("company_id") or "",
                 cache_key=cache_key,
             )
-    except Exception as exc:
-        st.error("Dashboard Lite facts를 생성하지 못했습니다. 기존 상세 조회 화면을 사용해 주세요.")
+    except DashboardRequestAlreadyRunning:
+        st.info("SIMS 일일점검이 이미 조회 중입니다. 기존 조회가 끝날 때까지 기다려 주세요.")
         return {
             "final": False,
             "type": "text",
             "title": "Dashboard Lite v0.1",
             "action": "Dashboard Lite v0.1",
-            "data": "Dashboard Lite facts 생성 실패",
-            "meta": {"analysis_type": "dashboard_lite", "error_type": type(exc).__name__},
+            "data": "SIMS 일일점검이 이미 조회 중입니다.",
+            "meta": {"analysis_type": "dashboard_lite", "status": "already_running", "source_call_count": 0},
+        }
+    except DashboardRequestStale:
+        return {
+            "final": False,
+            "type": "text",
+            "title": "Dashboard Lite v0.1",
+            "action": "Dashboard Lite v0.1",
+            "data": "Dashboard 조회 컨텍스트가 변경되어 이전 결과를 반영하지 않았습니다.",
+            "meta": {"analysis_type": "dashboard_lite", "status": "stale", "source_call_count": 0},
+        }
+    except Exception as exc:
+        timeout = is_dashboard_query_timeout(exc)
+        st.error(
+            "Dashboard 조회가 120초 쿼리 제한시간을 초과했습니다. 자동 재시도하지 않았습니다."
+            if timeout
+            else "Dashboard Lite facts를 생성하지 못했습니다. 기존 상세 조회 화면을 사용해 주세요."
+        )
+        return {
+            "final": False,
+            "type": "text",
+            "title": "Dashboard Lite v0.1",
+            "action": "Dashboard Lite v0.1",
+            "data": "Dashboard 쿼리 제한시간 초과" if timeout else "Dashboard Lite facts 생성 실패",
+            "meta": {
+                "analysis_type": "dashboard_lite",
+                "status": "query_timeout" if timeout else "error",
+                "error_type": type(exc).__name__,
+            },
         }
 
+    if not dashboard_request_publish_allowed(result_cache, current_room_id=get_current_chat_room_id()):
+        return {
+            "final": False,
+            "type": "text",
+            "title": "Dashboard Lite v0.1",
+            "action": "Dashboard Lite v0.1",
+            "data": "Dashboard 조회 컨텍스트가 변경되어 이전 결과를 반영하지 않았습니다.",
+            "meta": {"analysis_type": "dashboard_lite", "status": "stale", "source_call_count": 0},
+        }
     st.session_state["__dashboard_lite_result"] = result_cache
     st.session_state["__dashboard_lite_applied_params"] = dict(result_cache.get("params") or params)
     _mark_dashboard_room_title()
