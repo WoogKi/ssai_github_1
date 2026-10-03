@@ -393,6 +393,16 @@ def _is_ssart_user(user: AuthUser | None) -> bool:
     return user.user_type in ("SSART_ADMIN", "SSART_USER")
 
 
+def _can_bypass_company_sims_password(user: AuthUser | None) -> bool:
+    """Allow only the built-in SSART admin to skip company-change SIMS auth."""
+    if not user:
+        return False
+    return (
+        str(user.login_id or "").strip() == "admin"
+        and str(user.user_type or "").strip().upper() == "SSART_ADMIN"
+    )
+
+
 def _is_wholesale_user(user: AuthUser | None) -> bool:
     if not user:
         return False
@@ -731,6 +741,7 @@ def render_company_selector() -> bool:
     if not user:
         return False
 
+    bypass_sims_password = _can_bypass_company_sims_password(user)
     password_key = "__ssai_company_change_sims_password"
     clear_password_key = "__ssai_clear_company_change_sims_password"
 
@@ -747,10 +758,13 @@ def render_company_selector() -> bool:
         return False
 
     st.title("회원사 / ERP DB 선택")
-    st.caption(
-        "사용할 회원사 ERP DB를 선택한 뒤 SIMS Password를 입력하고 "
-        "Enter를 누르거나 [이 회원사 ERP DB로 접속] 버튼을 누르세요."
-    )
+    if bypass_sims_password:
+        st.caption("사용할 회원사 ERP DB를 선택한 뒤 [이 회원사 ERP DB로 접속] 버튼을 누르세요.")
+    else:
+        st.caption(
+            "사용할 회원사 ERP DB를 선택한 뒤 SIMS Password를 입력하고 "
+            "Enter를 누르거나 [이 회원사 ERP DB로 접속] 버튼을 누르세요."
+        )
 
 
     current_company = get_selected_company()
@@ -798,7 +812,7 @@ def render_company_selector() -> bool:
     company_change_submitted = False
     company_change_cancelled = False
 
-    # 모든 사용자는 자신의 SIMS 사용자 ID로 선택한 ERP DB의 비밀번호를 확인한다.
+    # 모든 사용자는 자신의 SIMS 사용자 ID로 선택한 ERP DB의 사용자 상태를 확인한다.
     sims_user_id_for_change = str(user.sims_user_id or "").strip()
 
     # 신성아트컴 사용자는 SIMS 사용자 ID가 없을 때만 기존 admin 기본값을 사용한다.
@@ -812,24 +826,28 @@ def render_company_selector() -> bool:
         )
         return False
 
-    st.warning(
-        "회원사/ERP DB 변경은 선택한 ERP DB의 "
-        "SIMS Password 확인 후 적용합니다."
-    )
+    if bypass_sims_password:
+        st.warning("회원사/ERP DB 변경은 선택한 ERP DB의 SIMS 사용자 확인 후 적용합니다.")
+    else:
+        st.warning(
+            "회원사/ERP DB 변경은 선택한 ERP DB의 "
+            "SIMS Password 확인 후 적용합니다."
+        )
     st.caption(f"확인할 SIMS 사용자 ID: `{sims_user_id_for_change}`")
 
-    # 모든 사용자가 Password 입력 후 Enter 또는 버튼으로 제출
+    # 일반 사용자는 Password+Enter, bypass 대상은 접속 버튼으로 제출한다.
     _log_form_lifecycle("__ssai_company_change_form", "form_enter", company=selected_company)
     with st.form(
         "__ssai_company_change_form",
         clear_on_submit=False,
         enter_to_submit=True,
     ):
-        sims_change_password = st.text_input(
-            "SIMS Password 확인",
-            type="password",
-            key=password_key,
-        )
+        if not bypass_sims_password:
+            sims_change_password = st.text_input(
+                "SIMS Password 확인",
+                type="password",
+                key=password_key,
+            )
 
         col1, col2 = st.columns([1, 1])
 
@@ -864,10 +882,16 @@ def render_company_selector() -> bool:
 
         selected_id = selected_company.get("company_id")
 
+        log.info(
+            "[auth.company] change authentication company_id=%s sims_password_bypass=%s",
+            selected_id,
+            bypass_sims_password,
+        )
 
-        if not sims_change_password:
-            st.error("회원사/ERP DB 변경을 위해 SIMS Password를 입력하세요.")
-            return False
+        if not bypass_sims_password:
+            if not sims_change_password:
+                st.error("회원사/ERP DB 변경을 위해 SIMS Password를 입력하세요.")
+                return False
 
         try:
             sims_user = get_sims_user_for_login(
@@ -876,7 +900,7 @@ def render_company_selector() -> bool:
             )
         except Exception as e:
             log.warning(
-                "[auth.company] sims password check failed company_id=%s error_type=%s",
+                "[auth.company] sims user check failed company_id=%s error_type=%s",
                 selected_id,
                 type(e).__name__,
             )
@@ -895,12 +919,13 @@ def render_company_selector() -> bool:
             st.error("선택한 회원사 ERP DB의 SIMS 사용자가 삭제/비활성 상태입니다.")
             return False
 
-        if not verify_sims_plain_password(
-            sims_change_password,
-            str(sims_user.get("sims_password") or ""),
-        ):
-            st.error("SIMS Password가 일치하지 않습니다.")
-            return False
+        if not bypass_sims_password:
+            if not verify_sims_plain_password(
+                sims_change_password,
+                str(sims_user.get("sims_password") or ""),
+            ):
+                st.error("SIMS Password가 일치하지 않습니다.")
+                return False
 
         if str(current_id or "") != str(selected_id or ""):
             _clear_company_dependent_state()
