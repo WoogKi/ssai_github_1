@@ -26,6 +26,20 @@ from app.services.product_master_filter_contract import add_named_product_prescr
 TABLE = "rddbc110"
 log = logging.getLogger("ssai.sims.rddbc110")
 
+
+def _inbound_date_filters(field: str, params: Dict[str, Any]) -> list[str]:
+    """Keep the R110 clustered date key directly searchable.
+
+    A single-day request is the common NLQ path (for example, yesterday).  Use
+    one equality predicate there; retain the existing inclusive range contract
+    for every other request.
+    """
+    date_from = clean_text(params.get("date_from"))
+    date_to = clean_text(params.get("date_to"))
+    if date_from and date_to and date_from == date_to:
+        return [f"{field} = %(date_from)s"]
+    return make_date_filters(field, params)
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(str(os.getenv(name, str(default))).strip())
@@ -66,7 +80,7 @@ def _io_export_top() -> int:
 def _base_filters(params: Dict[str, Any]) -> str:
 
     clauses: list[str] = []
-    clauses += make_date_filters("In_Put.Rd11_In_YyMmDd", params)
+    clauses += _inbound_date_filters("In_Put.Rd11_In_YyMmDd", params)
 
     if clean_text(params.get("in_seq")):
         add_filter(clauses, "In_Put.Rd11_In_Seq = %(in_seq)s")
@@ -311,7 +325,7 @@ def _detail_aggregate_ctes(params: Dict[str, Any]) -> str:
     the displayed validation totals identical while avoiding full-history scans
     for the normal date-bounded detail screen and NLQ paths.
     """
-    date_clauses = make_date_filters("Key_Row.Rd11_In_YyMmDd", params)
+    date_clauses = _inbound_date_filters("Key_Row.Rd11_In_YyMmDd", params)
     date_where_sql = "\n      AND ".join(date_clauses)
     if date_where_sql:
         date_where_sql = "\n      AND " + date_where_sql

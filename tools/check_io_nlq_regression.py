@@ -1675,6 +1675,18 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
             "date-window document keys drive both validation aggregates",
         )
     )
+    inbound_exact_ctes = rddbc110_service._detail_aggregate_ctes({
+        "date_from": "20260701",
+        "date_to": "20260701",
+    })
+    results.append(
+        CheckResult(
+            "inbound single-day detail uses the bare clustered date key equality",
+            "Key_Row.Rd11_In_YyMmDd = %(date_from)s" in inbound_exact_ctes
+            and "LTRIM(RTRIM(Key_Row.Rd11_In_YyMmDd))" not in inbound_exact_ctes,
+            "single-day document keys use one sargable Rd11_In_YyMmDd predicate",
+        )
+    )
     results.append(
         CheckResult(
             "inbound detail keeps all document-detail rows after key selection",
