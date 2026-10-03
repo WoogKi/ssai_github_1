@@ -5469,9 +5469,10 @@ def _load_product_current_stock(
     """
     품목별 재고부족현황의 현재고를 월집계 누계로 가져온다.
 
-    Dashboard 제품 scope가 있으면 DB에서 그 scope를 한 번 적용한 뒤
-    요청 product code 집합을 Python에서 정확히 다시 제한한다. Scope가 없으면
-    SQL Server parameter limit을 피하는 기존 product-code batch 경로를 유지한다.
+    요청 product code 집합은 현재고를 붙일 authoritative product universe다.
+    Dashboard 제품 scope가 있더라도 이 집합이 한 safe batch에 들어가면 exact
+    code query를 사용한다. 그보다 크면 DB에서 profile scope를 한 번 적용하고
+    Python에서 authoritative code 집합으로 다시 제한한다.
     """
     # Compatibility input only: stock application does not scope stock quantity.
     _ = stock_apply_cd
@@ -5492,7 +5493,19 @@ def _load_product_current_stock(
         scope_bind_params,
         product_alias="P_SCOPE",
     )
-    use_profile_scope_query = bool(scope_clauses)
+    exact_product_single_batch = (
+        bool(scope_clauses)
+        and bool(codes)
+        and len(codes) <= batch_plan["effective_chunk_size"]
+    )
+    use_profile_scope_query = bool(scope_clauses) and not exact_product_single_batch
+    stock_query_strategy = (
+        "exact_product_single_batch"
+        if exact_product_single_batch
+        else "profile_scope_single_query"
+        if use_profile_scope_query
+        else "product_code_batches"
+    )
     if measurement is not None:
         measurement.add_phase(
             phase="stock_batch_plan",
@@ -5551,7 +5564,7 @@ def _load_product_current_stock(
         df.attrs["current_stock_io_filter_applied"] = False
         df.attrs["current_stock_io_tcode_parameter_count"] = 0
         df.attrs["selected_io_count_ignored"] = max(0, int(ignored_io_gu_count or 0))
-        df.attrs["stock_query_mode"] = "profile_scope_single_query" if use_profile_scope_query else "product_code_batches"
+        df.attrs["stock_query_mode"] = stock_query_strategy
         df.attrs["stock_profile_scope_applied"] = use_profile_scope_query
         df.attrs.update(batch_plan)
         return df
@@ -5845,7 +5858,8 @@ OPTION (RECOMPILE)
         aggregate_elapsed=aggregate_elapsed,
     )
     log.info(
-        "[analytics.stock.load.perf] codes=%s batches=%s rows=%s elapsed=%.3fs sql_ms=%s aggregate_ms=%s stock_mode=%s stock_cutoff_month=%s configured_batch_size=%s effective_chunk_size=%s fixed_parameter_count=%s stock_cd_parameter_count=%s io_gu_parameter_count=%s total_parameter_count=%s",
+        "[analytics.stock.load.perf] strategy=%s codes=%s batches=%s rows=%s elapsed=%.3fs sql_ms=%s aggregate_ms=%s stock_mode=%s stock_cutoff_month=%s configured_batch_size=%s effective_chunk_size=%s fixed_parameter_count=%s stock_cd_parameter_count=%s io_gu_parameter_count=%s total_parameter_count=%s",
+        stock_query_strategy,
         len(codes),
         len(batches),
         len(stock_df),

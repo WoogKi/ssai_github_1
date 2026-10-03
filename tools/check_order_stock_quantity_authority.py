@@ -218,9 +218,10 @@ def _offline_result() -> dict[str, Any]:
 
     def fake_query(sql: str, params: dict[str, Any]) -> pd.DataFrame:
         captured.append((sql, dict(params)))
+        requested = sorted(str(value) for key, value in params.items() if key.startswith("cd"))
         return pd.DataFrame([
-            {"제품코드": "P001", "실재고수량": 3.0, "실재고평가단가": 2.0, "실재고금액": 6.0},
-            {"제품코드": "OUTSIDE", "실재고수량": 9.0, "실재고평가단가": 1.0, "실재고금액": 9.0},
+            {"제품코드": code, "실재고수량": 3.0, "실재고평가단가": 2.0, "실재고금액": 6.0}
+            for code in requested
         ])
 
     with patch.object(stock_service, "query_to_df", side_effect=fake_query):
@@ -230,16 +231,16 @@ def _offline_result() -> dict[str, Any]:
             product_scope_params={"dashboard_product_group_list": ["0013:9998"]},
         )
     assert len(captured) == 1
-    assert "EXISTS" in captured[0][0] and "P_SCOPE.Rd04_Physic_Group_Gcode" in captured[0][0]
-    assert "M.Rd21_Physic_Cd IN" not in captured[0][0]
-    assert scoped["제품코드"].tolist() == ["P001"]
-    assert scoped.attrs["stock_query_mode"] == "profile_scope_single_query"
+    assert "EXISTS" not in captured[0][0] and "P_SCOPE" not in captured[0][0]
+    assert "M.Rd21_Physic_Cd IN" in captured[0][0]
+    assert scoped["제품코드"].tolist() == ["P001", "P002"]
+    assert scoped.attrs["stock_query_mode"] == "exact_product_single_batch"
     assert scoped.attrs["stock_query_batches"] == 1
     return {
         "status": "PASS",
         "mode": "offline",
         "period_policies": ["current_monthly", "historical_midmonth", "historical_month_end"],
-        "profile_scope_single_query": True,
+        "exact_product_single_batch": True,
         "write_count": 0,
     }
 
