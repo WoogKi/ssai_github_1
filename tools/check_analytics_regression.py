@@ -8484,11 +8484,11 @@ def run_basic_checks() -> list[CheckResult]:
             fact_errors.append("trend_count_wrong")
 
         inv_metrics = facts["inventory"]["metrics"]
-        if int(inv_metrics["ready_sku_count"]["value"]) != 1:
+        if int(inv_metrics["ready_sku_count"]["value"]) != 0:
             fact_errors.append("ready_sku_count_wrong")
-        if int(inv_metrics["shortage_sku_count"]["value"]) != 1:
+        if int(inv_metrics["shortage_sku_count"]["value"]) != 2:
             fact_errors.append("shortage_sku_count_wrong")
-        if round(float(inv_metrics["sku_readiness_pct"]["value"]), 2) != 50.0:
+        if round(float(inv_metrics["sku_readiness_pct"]["value"]), 2) != 0.0:
             fact_errors.append("sku_readiness_pct_wrong")
         expected_stock_meta_terms = {"위험보정 잔여예상수요", "수요급증", "진행속도 보정"}
         for metric_name in ("ready_sku_count", "shortage_sku_count", "sku_readiness_pct", "shortage_qty"):
@@ -8507,7 +8507,7 @@ def run_basic_checks() -> list[CheckResult]:
         ):
             fact_errors.append(f"stock_readiness_provenance={stock_readiness_meta!r}")
         risk_names = [r.get("product_name") for r in facts["inventory"]["risk_targets"]]
-        if risk_names != ["부족품목"]:
+        if risk_names != ["부족품목", "충분품목"]:
             fact_errors.append(f"risk_names={risk_names!r}")
         risk = facts["inventory"]["risk_targets"][0] if facts["inventory"]["risk_targets"] else {}
         if round(float(risk.get("current_stock_qty") or 0), 2) != 60.0 or round(float(risk.get("remaining_expected_demand_qty") or 0), 2) != 130.0:
@@ -8577,18 +8577,18 @@ def run_basic_checks() -> list[CheckResult]:
         threshold_rows = [
             {"product_code": "THRESHOLD", "current_stock_qty": 90, "current_stock_amt": 900, "remaining_expected_demand_qty": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 90, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
         ]
-        dash_mod._classify_stock_risk_rows([dict(row) for row in threshold_rows], readiness_warning_pct=98.0)
-        threshold_at_98 = dash_mod._classify_stock_risk_rows(threshold_rows, readiness_warning_pct=98.0)
-        threshold_at_80_rows = [dict(row) for row in threshold_rows]
-        dash_mod._classify_stock_risk_rows(threshold_at_80_rows, readiness_warning_pct=80.0)
-        if threshold_rows[0].get("재고위험상태") != "부족 주의" or threshold_at_80_rows[0].get("재고위험상태") != "적정":
-            fact_errors.append(f"stock_risk_warning_threshold={threshold_rows!r}/{threshold_at_80_rows!r}/{threshold_at_98!r}")
+        threshold_at_30_rows = [dict(row) for row in threshold_rows]
+        dash_mod._classify_stock_risk_rows(threshold_rows, readiness_warning_pct=98.0)
+        dash_mod._classify_stock_risk_rows(threshold_at_30_rows, readiness_warning_pct=30.0)
+        if threshold_rows[0].get("재고위험상태") != "부족 주의" or threshold_at_30_rows[0].get("재고위험상태") != "부족 주의":
+            fact_errors.append(f"stock_risk_fixed_warning_band={threshold_rows!r}/{threshold_at_30_rows!r}")
         boundary_rows = [
             {"product_code": "EMERGENCY_40", "current_stock_qty": 40, "current_stock_amt": 400, "remaining_expected_demand_qty": 100, "shortage_qty": 60, "shortage_amt": 600, "stock_readiness_pct": 40, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
             {"product_code": "EMERGENCY_49_9", "current_stock_qty": 49.9, "current_stock_amt": 499, "remaining_expected_demand_qty": 100, "shortage_qty": 50.1, "shortage_amt": 501, "stock_readiness_pct": 49.9, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
             {"product_code": "WARNING_50", "current_stock_qty": 50, "current_stock_amt": 500, "remaining_expected_demand_qty": 100, "shortage_qty": 50, "shortage_amt": 500, "stock_readiness_pct": 50, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
             {"product_code": "WARNING_97_9", "current_stock_qty": 97.9, "current_stock_amt": 979, "remaining_expected_demand_qty": 100, "shortage_qty": 2.1, "shortage_amt": 21, "stock_readiness_pct": 97.9, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
-            {"product_code": "NORMAL_98", "current_stock_qty": 98, "current_stock_amt": 980, "remaining_expected_demand_qty": 100, "shortage_qty": 2, "shortage_amt": 20, "stock_readiness_pct": 98, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "WARNING_99_99", "current_stock_qty": 99.99, "current_stock_amt": 999.9, "remaining_expected_demand_qty": 100, "shortage_qty": 0.01, "shortage_amt": 0.1, "stock_readiness_pct": 99.99, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
+            {"product_code": "NORMAL_100", "current_stock_qty": 100, "current_stock_amt": 1000, "remaining_expected_demand_qty": 100, "shortage_qty": 0, "shortage_amt": 0, "stock_readiness_pct": 100, "stock_valuation_unit_price": 10, "_stock_risk_required_values_present": True},
         ]
         dash_mod._classify_stock_risk_rows(boundary_rows, readiness_warning_pct=98.0)
         expected_boundary_statuses = {
@@ -8596,7 +8596,8 @@ def run_basic_checks() -> list[CheckResult]:
             "EMERGENCY_49_9": "긴급 부족",
             "WARNING_50": "부족 주의",
             "WARNING_97_9": "부족 주의",
-            "NORMAL_98": "적정",
+            "WARNING_99_99": "부족 주의",
+            "NORMAL_100": "적정",
         }
         if {row.get("product_code"): row.get("재고위험상태") for row in boundary_rows} != expected_boundary_statuses:
             fact_errors.append(f"stock_risk_boundaries={boundary_rows!r}")
@@ -8684,7 +8685,7 @@ def run_basic_checks() -> list[CheckResult]:
         )
         surge_action = next((item for item in surge_actions if item.get("product_code") == "SURGE_EMERGENCY"), {})
         if (
-            surge_emergency.get("재고위험사유") != "수요급증 후 잔여수요 절반 미만"
+            surge_emergency.get("재고위험사유") != "수요급증 후 위험보정 준비율 50% 미만"
             or float(surge_action.get("remaining_expected_demand_qty") or 0) != 225
             or float(surge_action.get("shortage_qty") or 0) != 135
             or float(surge_action.get("shortage_amt") or 0) != 1350
@@ -11809,7 +11810,7 @@ def run_basic_checks() -> list[CheckResult]:
             chart_json = json.dumps(chart_spec, ensure_ascii=False)
             if '"P10"' in chart_json or '"P11"' in chart_json:
                 inventory_visual_errors.append("readiness_top10_not_limited")
-            if not all(token in chart_json for token in ("#dc2626", "#f59e0b", "97.5", "display_readiness_label")):
+            if not all(token in chart_json for token in ("#dc2626", "#f59e0b", "50.0", "display_readiness_label")):
                 inventory_visual_errors.append("readiness_chart_status_or_threshold_missing")
             threshold_30_chart_facts = {
                 "stock_readiness": {"threshold_pct": 30.0},
@@ -11820,7 +11821,7 @@ def run_basic_checks() -> list[CheckResult]:
             }
             threshold_30_chart = view_mod._build_stock_readiness_chart(threshold_30_chart_facts)
             threshold_30_json = json.dumps(threshold_30_chart.to_dict(), ensure_ascii=False) if threshold_30_chart else ""
-            if not all(token in threshold_30_json for token in ("긴급31.7", "긴급42.0", "31.7", "42.0", "30.0")):
+            if not all(token in threshold_30_json for token in ("긴급31.7", "긴급42.0", "31.7", "42.0", "50.0")):
                 inventory_visual_errors.append("readiness_risk_top10_threshold_30_rows_changed")
             display_summary = view_mod._stock_risk_display_summary(inventory_visual_facts)
             if display_summary["긴급 부족"] != {"count": 4, "amount": 40_000_000.0}:
@@ -12835,7 +12836,7 @@ def run_basic_checks() -> list[CheckResult]:
             or '"위험보정부족예상금액", r.get("shortage_amt")' not in dashboard_facts_src
             or '"위험보정부족예상수량", r.get("shortage_qty")' not in dashboard_facts_src
             or '"위험보정재고준비율", r.get("stock_readiness_pct")' not in dashboard_facts_src
-            or '"수요급증 후 잔여수요 절반 미만"' not in dashboard_facts_src
+            or '"수요급증 후 위험보정 준비율 50% 미만"' not in dashboard_facts_src
             or 'Dashboard facts / 비교 금지 규칙' in view_src
             or 'with st.expander("추가 확인사항"' in view_src
         ):
@@ -14136,8 +14137,8 @@ def run_basic_checks() -> list[CheckResult]:
                     {"stock_readiness": {"threshold_pct": 30.0}},
                     {"readiness_warning_pct": 40.0},
                 )
-                != 30.0
-                or view_mod._dashboard_readiness_threshold({}, {"readiness_warning_pct": 40.0}) != 40.0
+                != 50.0
+                or view_mod._dashboard_readiness_threshold({}, {"readiness_warning_pct": 40.0}) != 50.0
                 or view_mod._dashboard_readiness_threshold({}, {}) != 50.0
             ):
                 profile_restore_errors.append("readiness_facts_screen_profile_default_precedence")
@@ -19464,7 +19465,7 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
                 errors.append(f"inventory_detail_empty_contract={detail_st.info_messages!r}|frames={len(detail_st.dataframes)}|buttons={detail_st.button_calls}|downloads={detail_st.download_calls}")
             if len(set(detail_st.form_keys)) != 1 or not detail_st.form_keys[0].endswith("detail-fixture"):
                 errors.append(f"inventory_detail_form_namespace_contract={detail_st.form_keys!r}")
-            if (1.2, 1, 1, 1, 1.2) not in detail_st.column_specs or (1.8, 1.5, 2, 1.2) not in detail_st.column_specs:
+            if (1.1, 1.35, 0.9, 0.9, 0.9, 1.1) not in detail_st.column_specs or (1.8, 1.5, 2, 1.2) not in detail_st.column_specs:
                 errors.append(f"inventory_detail_submit_inline_layout={detail_st.column_specs!r}")
         finally:
             view_mod.st = old_detail_st

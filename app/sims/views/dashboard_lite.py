@@ -21,6 +21,7 @@ import streamlit as st
 
 from app.services.dashboard_lite_facts import (
     INVENTORY_STATUS_ORDER,
+    STOCK_RISK_EMERGENCY_PCT,
     build_dashboard_lite_facts,
     default_dashboard_lite_settings,
     default_dashboard_lite_scope,
@@ -332,13 +333,8 @@ def _dashboard_readiness_threshold(
     facts: dict[str, Any] | None,
     params: dict[str, Any] | None = None,
 ) -> float:
-    """Resolve facts, request, and central-default threshold in that order."""
-    raw = ((facts or {}).get("stock_readiness") or {}).get("threshold_pct")
-    if raw is None:
-        raw = (params or {}).get("readiness_warning_pct")
-    if raw is None:
-        raw = _DASHBOARD_PROFILE_SCALAR_DEFAULTS["readiness_warning_pct"]
-    return float(raw)
+    """The risk chart uses the fixed emergency boundary, not the legacy display setting."""
+    return STOCK_RISK_EMERGENCY_PCT
 
 
 def _amount_display_spec(unit: str, value: Any) -> tuple[float, str]:
@@ -1959,7 +1955,7 @@ def _render_stock_chart(facts: dict[str, Any]) -> None:
     threshold_text = _fmt_threshold_pct(threshold_value)
     chart = _build_stock_readiness_chart(facts)
     if chart is None:
-        st.info(f"준비율 경고기준 {threshold_text}% 미만 재고준비율 조치 대상이 없습니다.")
+        st.info(f"위험보정 준비율 {threshold_text}% 미만 긴급 부족 품목이 없습니다.")
         return
     st.altair_chart(chart, width="stretch")
 
@@ -1991,6 +1987,109 @@ _INVENTORY_STATUS_COLORS = {
     "적정 재고": ("#16a34a", "#ffffff"),
     "과다 재고": ("#7c3aed", "#ffffff"),
 }
+
+_MONTHLY_DEPLETION_STATUS_ORDER = (
+    "월예상 초과 달성", "월예상 달성", "예상외 출고", "재고로 월말 충족 가능",
+    "입고예정 반영 시 충족", "월말 부족 예상", "월예상 미달 종료", "월예상 수요 없음",
+)
+_MONTHLY_DEPLETION_COLORS = {
+    "월예상 초과 달성": "#2563eb",
+    "월예상 달성": "#0f766e",
+    "예상외 출고": "#7c3aed",
+    "재고로 월말 충족 가능": "#16a34a",
+    "입고예정 반영 시 충족": "#65a30d",
+    "월말 부족 예상": "#dc2626",
+    "월예상 미달 종료": "#f97316",
+    "월예상 수요 없음": "#94a3b8",
+}
+
+
+def _monthly_depletion_summary(facts: Mapping[str, Any]) -> Mapping[str, Any]:
+    return ((facts.get("inventory") or {}).get("monthly_depletion_summary") or {})
+
+
+def _monthly_depletion_rows(facts: Mapping[str, Any]) -> list[dict[str, Any]]:
+    summary = _monthly_depletion_summary(facts)
+    counts = summary.get("status_counts") or {}
+    return [
+        {
+            "label": label,
+            "count": int(counts.get(label) or 0),
+            "color": _MONTHLY_DEPLETION_COLORS[label],
+        }
+        for label in _MONTHLY_DEPLETION_STATUS_ORDER
+        if int(counts.get(label) or 0) > 0
+    ]
+
+
+def _render_monthly_depletion_summary(facts: Mapping[str, Any]) -> None:
+    summary = _monthly_depletion_summary(facts)
+    rows = _monthly_depletion_rows(facts)
+    total = int(summary.get("total_product_count") or 0)
+    if total <= 0 or sum(int(row["count"]) for row in rows) != total:
+        st.info("월간 소진상태를 계산할 전체 제품 facts가 없습니다.")
+        return
+    st.markdown("### 월간 소진상태")
+    st.caption("월 예상출고 기준")
+    st.caption("재고상태는 현재 보유일수, 월간 소진상태는 평가월 예상출고 대비 달성 및 잔여수요 충족 여부를 나타냅니다.")
+    segments = []
+    legend = []
+    for row in rows:
+        pct = int(row["count"]) / total * 100.0
+        segments.append(
+            '<div title="{title}" style="flex:{count} 1 0;min-width:2px;height:36px;background:{color}"></div>'.format(
+                title=html.escape(f'{row["label"]}: {int(row["count"]):,}개 ({pct:.1f}%)'),
+                count=max(1, int(row["count"])),
+                color=row["color"],
+            )
+        )
+        legend.append(
+            '<div style="display:flex;align-items:center;gap:6px;white-space:nowrap">'
+            f'<span style="width:9px;height:9px;border-radius:2px;background:{row["color"]}"></span>'
+            f'<span>{html.escape(str(row["label"]))}</span>'
+            f'<strong>{int(row["count"]):,}개 · {pct:.1f}%</strong></div>'
+        )
+    st.markdown(
+        '<div style="display:flex;overflow:hidden;border-radius:4px;background:#e5e7eb">' + ''.join(segments) + '</div>'
+        '<div style="display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:9px;font-size:0.82rem;color:#475569">'
+        + ''.join(legend) + '</div>',
+        unsafe_allow_html=True,
+    )
+    status = str(summary.get("evaluation_status") or "")
+    elapsed = summary.get("elapsed_business_days")
+    total_days = summary.get("business_days_total")
+    st.caption(f"평가월 상태 {status or '자료부족'} · 영업일 {elapsed if elapsed is not None else '-'} / {total_days if total_days is not None else '-'}")
+
+
+def _monthly_depletion_cross_table(facts: Mapping[str, Any]) -> pd.DataFrame:
+    rows = list(_monthly_depletion_summary(facts).get("inventory_status_cross_rows") or [])
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    cross = frame.pivot_table(
+        index="재고상태", columns="월간 소진상태", values="품목수", aggfunc="sum", fill_value=0,
+    )
+    cross = cross.reindex(index=[label for label in INVENTORY_STATUS_ORDER if label in cross.index])
+    cross = cross.reindex(columns=[label for label in _MONTHLY_DEPLETION_STATUS_ORDER if label in cross.columns])
+    cross = cross.astype(int)
+    cross["합계"] = cross.sum(axis=1)
+    cross.loc["합계"] = cross.sum(axis=0)
+    return cross
+
+
+def _render_monthly_depletion_cross_distribution(facts: Mapping[str, Any]) -> None:
+    cross = _monthly_depletion_cross_table(facts)
+    if cross.empty:
+        return
+    def cell_styles(frame: pd.DataFrame) -> pd.DataFrame:
+        styles = pd.DataFrame("background-color:#ffffff;color:#334155", index=frame.index, columns=frame.columns)
+        styles = styles.where(frame.eq(0), "background-color:#f0f5fa;color:#24364a")
+        styles.loc["합계", :] = "background-color:#dce8f2;color:#1e3a52;font-weight:600"
+        styles.loc[:, "합계"] = "background-color:#dce8f2;color:#1e3a52;font-weight:600"
+        styles.loc["합계", "합계"] = "background-color:#c8d9e9;color:#17324a;font-weight:700"
+        return styles
+    st.markdown("#### 재고상태 × 월간 소진상태")
+    st.dataframe(cross.style.apply(cell_styles, axis=None).format("{:,.0f}"), width="stretch")
 
 
 def _inventory_status_rows(facts: Mapping[str, Any], *, pending: bool = False) -> list[dict[str, Any]]:
@@ -2367,30 +2466,52 @@ def _valid_profit_contribution_grade_matrix(summary: Mapping[str, Any]) -> Mappi
     return matrix
 
 
-def _build_profit_contribution_grade_heatmap(facts: dict[str, Any]) -> alt.Chart | None:
-    summary = _inventory_status_summary(facts)
+def _profit_contribution_heatmap_rows(summary: Mapping[str, Any]) -> list[dict[str, Any]]:
     matrix = _valid_profit_contribution_grade_matrix(summary)
     if matrix is None:
-        return None
+        return []
     grades = ("A", "B", "C", "D", "E", "X")
     total = int(summary.get("total_product_count") or 0)
-    rows = [
-        {
-            "profit": profit,
-            "contribution": contribution,
-            "count": matrix[profit][contribution],
-        }
+    body = [
+        {"profit": profit, "contribution": contribution, "count": matrix[profit][contribution], "is_total": False}
         for profit in grades for contribution in grades
     ]
-    maximum = max(1, *(row["count"] for row in rows))
-    for row in rows:
+    maximum = max(1, *(row["count"] for row in body))
+    for row in body:
         row["percent"] = row["count"] / total * 100 if total else 0.0
         row["visual_intensity"] = (row["count"] / maximum) ** 0.38
-        row["count_label"] = f'{row["count"]:,}'
         row["percent_label"] = f'{row["percent"]:.1f}%'
+    row_totals = [
+        {"profit": profit, "contribution": "합계", "count": sum(matrix[profit].values()), "is_total": True}
+        for profit in grades
+    ]
+    column_totals = [
+        {"profit": "합계", "contribution": contribution,
+         "count": sum(matrix[profit][contribution] for profit in grades), "is_total": True}
+        for contribution in grades
+    ]
+    margins = row_totals + column_totals + [{
+        "profit": "합계", "contribution": "합계", "count": sum(row["count"] for row in body), "is_total": True,
+    }]
+    for row in margins:
+        row["percent"] = row["count"] / total * 100 if total else 0.0
+        row["visual_intensity"] = None
+        row["percent_label"] = ""
+    for row in body + margins:
+        row["count_label"] = f'{row["count"]:,}'
+    return body + margins
+
+
+def _build_profit_contribution_grade_heatmap(facts: dict[str, Any]) -> alt.Chart | None:
+    summary = _inventory_status_summary(facts)
+    rows = _profit_contribution_heatmap_rows(summary)
+    if not rows:
+        return None
+    grades = ("A", "B", "C", "D", "E", "X")
+    frame = pd.DataFrame(rows)
     base = alt.Chart(pd.DataFrame(rows)).encode(
-        x=alt.X("contribution:N", sort=list(grades), title="품목기여등급", axis=alt.Axis(labelAngle=0)),
-        y=alt.Y("profit:N", sort=list(grades), title="품목손익등급"),
+        x=alt.X("contribution:N", sort=[*grades, "합계"], title="품목기여등급", axis=alt.Axis(labelAngle=0)),
+        y=alt.Y("profit:N", sort=[*grades, "합계"], title="품목손익등급"),
         tooltip=[
             alt.Tooltip("profit:N", title="손익"), alt.Tooltip("contribution:N", title="기여"),
             alt.Tooltip("count:Q", title="제품수", format=",.0f"),
@@ -2398,15 +2519,18 @@ def _build_profit_contribution_grade_heatmap(facts: dict[str, Any]) -> alt.Chart
         ],
     )
     text_color = alt.condition(alt.datum.visual_intensity >= 0.7, alt.value("#ffffff"), alt.value("#24364a"))
-    cells = base.mark_rect(cornerRadius=3).encode(
+    cells = alt.Chart(frame.loc[~frame["is_total"]]).encode(x=base.encoding.x, y=base.encoding.y).mark_rect(cornerRadius=3).encode(
         color=alt.Color("visual_intensity:Q", legend=None, scale=alt.Scale(
             domain=[0, 0.2, 0.4, 0.6, 0.8, 1],
             range=["#f5f7fa", "#e7edf4", "#b9cadb", "#7899b8", "#4f759b", "#355d83"],
         ))
     )
+    margins = alt.Chart(frame.loc[frame["is_total"]]).encode(x=base.encoding.x, y=base.encoding.y).mark_rect(cornerRadius=3).encode(
+        color=alt.condition((alt.datum.profit == "합계") & (alt.datum.contribution == "합계"), alt.value("#c8d9e9"), alt.value("#e3ecf4"))
+    )
     counts = base.mark_text(dy=-7, fontSize=12, fontWeight="bold").encode(text="count_label:N", color=text_color)
     percents = base.mark_text(dy=9, fontSize=10).encode(text="percent_label:N", color=text_color)
-    return (cells + counts + percents).properties(height=312).configure(background="transparent").configure_view(stroke=None)
+    return (cells + margins + counts + percents).properties(height=360).configure(background="transparent").configure_view(stroke=None)
 
 
 def _build_outbound_frequency_distribution_chart(facts: dict[str, Any]) -> alt.Chart | None:
@@ -2509,9 +2633,10 @@ def _render_inventory_cover_days(facts: dict[str, Any]) -> None:
 
 
 _INVENTORY_DETAIL_COLUMNS = (
-    "재고상태", "위험 품목 여부", "위험 유형", "출고빈도등급", "품목손익등급", "품목기여등급", "3개월 출고발생수",
+    "재고상태", "월간 소진상태", "월간 소진상태 사유", "위험 품목 여부", "위험 유형", "출고빈도등급", "품목손익등급", "품목기여등급", "3개월 출고발생수",
     "제품코드", "제품명", "규격", "제조사명", "제품그룹명", "제품구분명", "제품분류명",
-    "주요매입처명", "현재재고수량", "평가월 예상수요", "재고보유영업일", "입고예정수량", "입고예정 포함 재고상태", "재고 커버일",
+    "주요매입처명", "현재재고수량", "당월현재출고수량", "당월기준예상출고수량", "월예상 달성률", "월잔여예상수요",
+    "입고예정수량", "입고예정 반영 가용재고", "평가월", "판단기준일", "평가월 예상수요", "재고보유영업일", "입고예정 포함 재고상태", "재고 커버일",
     "위험사유", "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액",
     "위험보정재고준비율", "재고커버 자료상태", "수요급증상위분류", "수요급증세부분류", "수요급증세부분류사유", "최근 정상 입고일",
     "입고 경과일", "정상 입고 거래일수", "평균 입고간격일", "입고 자료상태", "입고 지연후보",
@@ -2540,6 +2665,7 @@ def _inventory_detail_filter_values(
     search_text: str,
     profit_grade: str = "전체",
     contribution_grade: str = "전체",
+    monthly_depletion_status: str = "전체",
 ) -> dict[str, str]:
     """Keep editable widget values separate from the last submitted local query."""
     return {
@@ -2547,6 +2673,7 @@ def _inventory_detail_filter_values(
         "frequency_grade": str(frequency_grade or "전체"),
         "profit_grade": str(profit_grade or "전체"),
         "contribution_grade": str(contribution_grade or "전체"),
+        "monthly_depletion_status": str(monthly_depletion_status or "전체"),
         "risk_filter": str(risk_filter or "전체"),
         "demand_surge_filter": str(demand_surge_filter or "전체"),
         "vendor_key": str(vendor_key or "전체"),
@@ -2613,6 +2740,9 @@ def _build_integrated_inventory_detail_frame(inventory: Mapping[str, Any]) -> pd
                 if column not in {
                     "제품코드", "제품명", "제조사명", "현재재고수량", "재고커버일",
                     "수요급증여부", "수요급증상위분류", "수요급증세부분류", "수요급증세부분류사유",
+                    "월간 소진상태", "월간 소진상태 사유", "당월현재출고수량", "당월기준예상출고수량",
+                    "월예상 달성률", "월잔여예상수요", "입고예정수량", "입고예정 반영 가용재고",
+                    "평가월", "판단기준일", "경과영업일", "전체영업일", "영업일진행률", "평가월 상태",
                 }:
                     merged[column] = value
         merged_rows.append(merged)
@@ -2630,6 +2760,7 @@ def _filter_integrated_inventory_detail_rows(
     demand_surge_filter: str = "전체",
     profit_grade: str = "전체",
     contribution_grade: str = "전체",
+    monthly_depletion_status: str = "전체",
 ) -> pd.DataFrame:
     filtered = frame.copy()
     if inventory_status != "전체":
@@ -2640,6 +2771,8 @@ def _filter_integrated_inventory_detail_rows(
         filtered = filtered.loc[filtered["품목손익등급"].eq(profit_grade)]
     if contribution_grade != "전체":
         filtered = filtered.loc[filtered["품목기여등급"].eq(contribution_grade)]
+    if monthly_depletion_status != "전체":
+        filtered = filtered.loc[filtered["월간 소진상태"].eq(monthly_depletion_status)]
     if risk_filter == "위험 품목":
         filtered = filtered.loc[filtered["위험 품목 여부"].eq("위험 품목")]
     elif risk_filter in {"긴급 부족", "부족 주의"}:
@@ -2695,24 +2828,28 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     if frame.empty:
         st.caption("표시할 재고 현황 품목이 없습니다.")
         return
+    _render_monthly_depletion_cross_distribution(facts)
     namespace = _dashboard_render_namespace(dict(cache), render_mode="inventory-status-detail")
     risk_rows = [dict(row) for row in (inventory.get("risk_detail_rows") or []) if isinstance(row, Mapping)]
     vendor_options, vendor_labels = _risk_detail_vendor_options(risk_rows)
     status_options = ["전체", *INVENTORY_STATUS_ORDER]
+    depletion_options = ["전체", *[row["label"] for row in _monthly_depletion_rows(facts)]]
     frequency_options = ["전체", "F", "A", "B", "C", "D", "E", "X", "빈도자료 부족"]
     grade_options = ["전체", "A", "B", "C", "D", "E", "X", "등급자료 부족"]
     applied_key = f"__dashboard_lite_inventory_detail_applied::{namespace}"
     with st.form(key=f"dashboard_inventory_detail_form::{namespace}", clear_on_submit=False, enter_to_submit=False):
-        filter_cols = st.columns((1.2, 1, 1, 1, 1.2))
+        filter_cols = st.columns((1.1, 1.35, 0.9, 0.9, 0.9, 1.1))
         with filter_cols[0]:
             selected_status = st.selectbox("재고 상태", status_options, key=f"dashboard_inventory_detail::{namespace}::state")
         with filter_cols[1]:
-            selected_frequency = st.selectbox("출고빈도 등급", frequency_options, key=f"dashboard_inventory_detail::{namespace}::frequency")
+            selected_depletion = st.selectbox("월간 소진상태", depletion_options, key=f"dashboard_inventory_detail::{namespace}::depletion")
         with filter_cols[2]:
-            selected_profit = st.selectbox("품목손익등급", grade_options, key=f"dashboard_inventory_detail::{namespace}::profit")
+            selected_frequency = st.selectbox("출고빈도 등급", frequency_options, key=f"dashboard_inventory_detail::{namespace}::frequency")
         with filter_cols[3]:
-            selected_contribution = st.selectbox("품목기여등급", grade_options, key=f"dashboard_inventory_detail::{namespace}::contribution")
+            selected_profit = st.selectbox("품목손익등급", grade_options, key=f"dashboard_inventory_detail::{namespace}::profit")
         with filter_cols[4]:
+            selected_contribution = st.selectbox("품목기여등급", grade_options, key=f"dashboard_inventory_detail::{namespace}::contribution")
+        with filter_cols[5]:
             selected_risk = st.selectbox("위험 품목", ["전체", "위험 품목", "긴급 부족", "부족 주의", "비위험 품목"], key=f"dashboard_inventory_detail::{namespace}::risk")
         lower_filter_cols = st.columns((1.8, 1.5, 2, 1.2), gap="small", vertical_alignment="bottom")
         with lower_filter_cols[0]:
@@ -2733,6 +2870,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
             frequency_grade=selected_frequency,
             profit_grade=selected_profit,
             contribution_grade=selected_contribution,
+            monthly_depletion_status=selected_depletion,
             risk_filter=selected_risk,
             demand_surge_filter=selected_surge,
             vendor_key=vendor_key,
@@ -2748,6 +2886,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
         frequency_grade=str(applied.get("frequency_grade") or "전체"),
         profit_grade=str(applied.get("profit_grade") or "전체"),
         contribution_grade=str(applied.get("contribution_grade") or "전체"),
+        monthly_depletion_status=str(applied.get("monthly_depletion_status") or "전체"),
         risk_filter=str(applied.get("risk_filter") or "전체"),
         demand_surge_filter=str(applied.get("demand_surge_filter") or "전체"),
         vendor_key=str(applied.get("vendor_key") or "전체"),
@@ -2757,6 +2896,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     applied_frequency = str(applied.get("frequency_grade") or "전체")
     applied_profit = str(applied.get("profit_grade") or "전체")
     applied_contribution = str(applied.get("contribution_grade") or "전체")
+    applied_depletion = str(applied.get("monthly_depletion_status") or "전체")
     applied_risk = str(applied.get("risk_filter") or "전체")
     applied_surge = str(applied.get("demand_surge_filter") or "전체")
     applied_vendor = str(applied.get("vendor_key") or "전체")
@@ -2793,6 +2933,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
             **common_column_config,
             **risk_text_column_config,
             "재고상태": st.column_config.TextColumn("재고 상태", width=110, pinned=True, alignment="center"),
+            "월간 소진상태": st.column_config.TextColumn("월간 소진상태", width=150, pinned=True, alignment="center"),
             "위험 품목 여부": st.column_config.TextColumn("위험 품목", width=100, pinned=True, alignment="center"),
             "위험 유형": st.column_config.TextColumn("위험 유형", width=100, pinned=True, alignment="center"),
             "출고빈도등급": st.column_config.TextColumn("출고빈도", width=90, alignment="center"),
@@ -2804,7 +2945,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
         st.warning("다운로드 권한이 없습니다. 필요 권한: EXPORT_EXCEL (엑셀/CSV 다운로드)")
         return
     filter_signature = hashlib.sha256(
-        "|".join((applied_status, applied_frequency, applied_profit, applied_contribution, applied_risk, applied_surge, applied_vendor, applied_search)).encode("utf-8")
+        "|".join((applied_status, applied_depletion, applied_frequency, applied_profit, applied_contribution, applied_risk, applied_surge, applied_vendor, applied_search)).encode("utf-8")
     ).hexdigest()[:12]
     excel_key = f"__dashboard_lite_inventory_detail_excel::{namespace}::{filter_signature}"
     cache_entry = st.session_state.get(excel_key)
@@ -2815,6 +2956,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
             )
             conditions.extend([
                 {"조건명": "재고 상태", "값": applied_status},
+                {"조건명": "월간 소진상태", "값": applied_depletion},
                 {"조건명": "출고빈도 등급", "값": applied_frequency},
                 {"조건명": "품목손익등급", "값": applied_profit},
                 {"조건명": "품목기여등급", "값": applied_contribution},
@@ -3057,6 +3199,7 @@ def _render_stock_risk_summary(facts: dict[str, Any]) -> None:
     st.caption(f"과잉 후보 {summary['과잉 후보']['count']:,}개 / {_fmt_dashboard_amount(summary['과잉 후보']['amount'], amount_unit)}")
     st.caption(f"최근 매입 없음 {summary['최근 매입 없음']['count']:,}개 / {_fmt_dashboard_amount(summary['최근 매입 없음']['amount'], amount_unit)}")
     st.caption(f"매입처 미확인 {summary['매입처 미확인']['count']:,}개")
+    st.caption("재고상태 긴급 부족은 보유영업일 1일 미만, 위험분석 긴급 부족은 위험보정 준비율 50% 미만입니다. 부족 주의는 50% 이상 100% 미만입니다.")
     st.caption("과잉 후보는 적정 품목의 보조 관찰지표이며 기본 재고위험 합계에는 중복 반영하지 않습니다.")
     demand_surge = (facts.get("inventory") or {}).get("stock_demand_surge_summary") or {}
     if int(demand_surge.get("품목수") or 0) > 0:
@@ -4204,7 +4347,8 @@ def _risk_detail_query_conditions(
         *supplier_conditions,
         {"조건명": "재고기준", "값": stock_mode},
         {"조건명": "대상 재고위치", "값": ", ".join(stock_labels) if stock_labels else "전체"},
-        {"조건명": "재고준비율 경고기준", "값": f"{threshold}%"},
+        {"조건명": "위험분석 준비율 기준", "값": f"긴급 {threshold}% 미만 / 주의 {threshold}% 이상 100% 미만"},
+        {"조건명": "재고준비 상태기준(기존)", "값": f"{_fmt_threshold_pct(params.get('readiness_warning_pct'))}%"},
         {"조건명": "주요매입처 기준기간", "값": f"최근 {int(vendor_summary.get('basis_days') or params.get('major_purchase_vendor_days') or _DASHBOARD_PROFILE_SCALAR_DEFAULTS['major_purchase_vendor_days'])}일"},
         {"조건명": "주요매입처 판단 기준일", "값": str(vendor_summary.get("basis_cutoff_date") or "")},
         {"조건명": "주요매입처 기준", "값": "정상 입고수량 최대, 기간 내 입고 없음 시 제품마스터 발주처"},
@@ -4922,7 +5066,7 @@ def _render_dashboard_scope_form_contents() -> tuple[bool, bool, dict[str, Any] 
         with row4[1]:
             overstock_inactive_days = st.number_input("과잉·저활성 기준(일)", min_value=1, step=1, key="__dashboard_lite_overstock_inactive_days")
         with row4[2]:
-            readiness_warning_pct = st.number_input("준비율 경고기준(%)", min_value=0.1, max_value=100.0, step=0.1, key="__dashboard_lite_readiness_warning_pct")
+            readiness_warning_pct = st.number_input("재고준비 상태기준(%)", min_value=0.1, max_value=100.0, step=0.1, key="__dashboard_lite_readiness_warning_pct", help="기존 제품별 충분/조치 필요 표시용입니다. 위험분석은 50% 미만 긴급, 50~100% 미만 주의로 고정됩니다.")
         with row4[3]:
             risk_quick_view_count = st.number_input("위험품목 바로보기", min_value=1, step=1, key="__dashboard_lite_risk_quick_view_count")
     submitted = st.form_submit_button("대시보드 조회", type="primary", width="stretch")
@@ -5158,6 +5302,15 @@ def build_dashboard_lite_chat_snapshot(cache: Any) -> dict[str, Any]:
                     "grade_missing_both_count", "grade_missing_profit_only_count", "grade_missing_contribution_only_count",
                     "snapshot_status", "snapshot_generation_no",
                     "snapshot_checksum", "snapshot_reason", "missing_frequency_product_count",
+                )
+            },
+            "monthly_depletion_summary": {
+                key: (inventory.get("monthly_depletion_summary") or {}).get(key)
+                for key in (
+                    "status_counts", "total_product_count", "evaluation_month", "judgement_date",
+                    "evaluation_status", "elapsed_business_days", "business_days_total",
+                    "business_day_progress_pct", "business_day_basis", "pending_available",
+                    "additional_source_call_count", "inventory_status_cross_rows",
                 )
             },
             "stock_overstock_summary": dict(inventory.get("stock_overstock_summary") or {}),
@@ -5598,6 +5751,7 @@ def _render_dashboard_facts_v2(facts: dict[str, Any], cache: dict[str, Any], *, 
         with chart_col:
             _render_stock_chart(facts)
         _render_vendor_stock_risk(facts)
+        _render_monthly_depletion_summary(facts)
         if render_mode == "primary":
             st.button("위험 품목 보기", key=f"{_dashboard_analysis_detail_key(cache)}::open-risk", on_click=_set_dashboard_analysis_detail_context, args=(cache, "risk"))
     with followup_tab:
@@ -5693,6 +5847,9 @@ def _render_dashboard_facts(
                             st.markdown('<div class="dashboard-lite-status-change-title">재고 변화 요약</div>', unsafe_allow_html=True)
                             st.markdown(change_summary, unsafe_allow_html=True)
                             st.markdown('<div class="dashboard-lite-status-change-note">상태별 제품수의 순증감이며, 개별 제품 상태전환 수가 아님</div>', unsafe_allow_html=True)
+
+        with st.container(key=f"dashboard_monthly_depletion__{render_namespace}"):
+            _render_monthly_depletion_summary(facts)
 
         frequency_column, matrix_column = st.columns((1, 2), gap="medium", vertical_alignment="top")
         with frequency_column:

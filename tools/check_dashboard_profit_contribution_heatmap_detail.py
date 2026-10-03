@@ -112,7 +112,7 @@ def main() -> None:
         "_CHAT_PARTITION_TEXT_LIMIT": 20000,
         "_clip_partition_text": lambda value, _limit: value,
         "_compact_partition_value": lambda value: value,
-        "log": type("Log", (), {"info": staticmethod(lambda *_a, **_k: None), "warning": staticmethod(lambda *_a, **_k: None)})(),
+        "log": type("Log", (), {"debug": staticmethod(lambda *_a, **_k: None), "info": staticmethod(lambda *_a, **_k: None), "warning": staticmethod(lambda *_a, **_k: None)})(),
     }
     exec(compile(ast.Module(body=partition_nodes, type_ignores=[]), "dashboard_partition", "exec"), partition_ns)
     published_summary = {

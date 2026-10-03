@@ -44,7 +44,10 @@ DASHBOARD_LITE_SETTING_DEFAULTS = {
 }
 # Compatibility name for callers that use the service-level fallback directly.
 STOCK_READY_THRESHOLD_PCT = float(DASHBOARD_LITE_SETTING_DEFAULTS["readiness_warning_pct"])
+STOCK_RISK_EMERGENCY_PCT = 50.0
+STOCK_RISK_FULL_PCT = 100.0
 MAX_DASHBOARD_MONTHS = 13
+DASHBOARD_DEMAND_EPSILON = 1e-9
 INVENTORY_STATUS_ORDER = (
     "자료 부족", "신제품 재고", "예상수요 없음", "수요없는 재고", "긴급 부족",
     "재고 부족", "안전재고 확보", "적정 재고", "과다 재고",
@@ -419,7 +422,7 @@ def _apply_demand_surge_detail(
     evaluation_month: str,
 ) -> dict[str, Any]:
     """Attach mutually exclusive detail reasons to already-adjusted surge rows."""
-    epsilon = 1e-9
+    epsilon = DASHBOARD_DEMAND_EPSILON
     history_month_from = str(history.get("history_month_from") or "")
     history_month_to = str(history.get("history_month_to") or "")
     source_ready = bool(history.get("source_ready"))
@@ -1338,7 +1341,9 @@ def _classify_stock_risk_rows(
             for status in STOCK_RISK_STATUS_ORDER
         ]
         log.info(
-            "[dashboard.stock_risk] total_rows=0 emergency_rows=0 warning_rows=0 normal_rows=0 excluded_rows=0 overstock_candidate_rows=0 emergency_amount=0 warning_shortage_amount=0 overstock_candidate_amount=0 demand_surge_rows=0 demand_surge_emergency_rows=0 demand_surge_warning_rows=0 demand_surge_normal_rows=0 adjusted_remaining_demand_qty=0 adjusted_shortage_qty=0 adjusted_shortage_amount=0 evaluation_elapsed_days=0 evaluation_total_days=0 readiness_warning_pct=%s elapsed_ms=%s",
+            "[dashboard.stock_risk] total_rows=0 emergency_rows=0 warning_rows=0 normal_rows=0 excluded_rows=0 overstock_candidate_rows=0 emergency_amount=0 warning_shortage_amount=0 overstock_candidate_amount=0 demand_surge_rows=0 demand_surge_emergency_rows=0 demand_surge_warning_rows=0 demand_surge_normal_rows=0 adjusted_remaining_demand_qty=0 adjusted_shortage_qty=0 adjusted_shortage_amount=0 evaluation_elapsed_days=0 evaluation_total_days=0 risk_emergency_pct=%s risk_full_pct=%s legacy_readiness_warning_pct=%s elapsed_ms=%s",
+            STOCK_RISK_EMERGENCY_PCT,
+            STOCK_RISK_FULL_PCT,
             float(readiness_warning_pct),
             int((time.perf_counter() - started) * 1000),
         )
@@ -1405,23 +1410,23 @@ def _classify_stock_risk_rows(
     status.loc[no_demand] = "판정 제외"
     reason.loc[no_demand] = "수요없음"
 
-    eligible = required_present & demand.gt(0)
-    emergency = eligible & stock.lt(demand / 2.0)
+    eligible = required_present & demand.gt(0) & coverage.notna()
+    emergency = eligible & coverage.lt(STOCK_RISK_EMERGENCY_PCT)
     status.loc[emergency] = "긴급 부족"
     emergency_reasons = pd.Series("", index=work.index, dtype="object")
     emergency_reasons.loc[emergency & stock.le(0)] = "재고없음"
-    emergency_reasons.loc[emergency & stock.gt(0) & demand_surge] = "수요급증 후 잔여수요 절반 미만"
-    emergency_reasons.loc[emergency & emergency_reasons.eq("")] = "잔여수요 절반 미만"
+    emergency_reasons.loc[emergency & stock.gt(0) & demand_surge] = "수요급증 후 위험보정 준비율 50% 미만"
+    emergency_reasons.loc[emergency & emergency_reasons.eq("")] = "위험보정 준비율 50% 미만"
     reason.loc[emergency] = emergency_reasons.loc[emergency]
 
-    warning = eligible & ~emergency & coverage.lt(float(readiness_warning_pct))
+    warning = eligible & coverage.ge(STOCK_RISK_EMERGENCY_PCT) & coverage.lt(STOCK_RISK_FULL_PCT)
     status.loc[warning] = "부족 주의"
-    reason.loc[warning] = "준비율 경고기준 미만"
-    reason.loc[warning & demand_surge] = "수요급증 후 준비율 경고기준 미만"
+    reason.loc[warning] = "위험보정 준비율 50% 이상 100% 미만"
+    reason.loc[warning & demand_surge] = "수요급증 후 위험보정 준비율 50% 이상 100% 미만"
 
-    normal = eligible & ~emergency & ~warning
+    normal = eligible & coverage.ge(STOCK_RISK_FULL_PCT)
     status.loc[normal] = "적정"
-    reason.loc[normal] = "준비율 경고기준 이상"
+    reason.loc[normal] = "위험보정 준비율 100% 이상"
 
     cover_days = numeric["stock_cover_days"]
     daily_demand = numeric["stock_cover_daily_demand_qty"]
@@ -1471,7 +1476,7 @@ def _classify_stock_risk_rows(
             work[adjusted_col] = 0.0
 
     log.info(
-        "[dashboard.stock_risk] total_rows=%s emergency_rows=%s warning_rows=%s normal_rows=%s excluded_rows=%s overstock_candidate_rows=%s emergency_amount=%s warning_shortage_amount=%s overstock_candidate_amount=%s demand_surge_rows=%s demand_surge_emergency_rows=%s demand_surge_warning_rows=%s demand_surge_normal_rows=%s adjusted_remaining_demand_qty=%s adjusted_shortage_qty=%s adjusted_shortage_amount=%s evaluation_elapsed_days=%s evaluation_total_days=%s readiness_warning_pct=%s elapsed_ms=%s",
+        "[dashboard.stock_risk] total_rows=%s emergency_rows=%s warning_rows=%s normal_rows=%s excluded_rows=%s overstock_candidate_rows=%s emergency_amount=%s warning_shortage_amount=%s overstock_candidate_amount=%s demand_surge_rows=%s demand_surge_emergency_rows=%s demand_surge_warning_rows=%s demand_surge_normal_rows=%s adjusted_remaining_demand_qty=%s adjusted_shortage_qty=%s adjusted_shortage_amount=%s evaluation_elapsed_days=%s evaluation_total_days=%s risk_emergency_pct=%s risk_full_pct=%s legacy_readiness_warning_pct=%s elapsed_ms=%s",
         len(work),
         int(status.eq("긴급 부족").sum()),
         int(status.eq("부족 주의").sum()),
@@ -1490,6 +1495,8 @@ def _classify_stock_risk_rows(
         float(pd.to_numeric(work.loc[demand_surge, "위험보정부족예상금액"], errors="coerce").fillna(0).sum()),
         int(pd.to_numeric(work.get("평가월경과일수", pd.Series(0, index=work.index)), errors="coerce").fillna(0).max()),
         int(pd.to_numeric(work.get("평가월총일수", pd.Series(0, index=work.index)), errors="coerce").fillna(0).max()),
+        STOCK_RISK_EMERGENCY_PCT,
+        STOCK_RISK_FULL_PCT,
         float(readiness_warning_pct),
         int((time.perf_counter() - started) * 1000),
     )
@@ -1662,6 +1669,8 @@ def _attach_inventory_status_and_frequency(
         detail_rows.append(
             {
                 "재고상태": status,
+                "월간 소진상태": str(row.get("월간 소진상태") or ""),
+                "월간 소진상태 사유": str(row.get("월간 소진상태 사유") or ""),
                 "재고보유영업일": row["inventory_status_cover_business_days"],
                 "입고예정 포함 재고상태": pending_status,
                 "입고예정수량": dashboard_pending,
@@ -1673,6 +1682,17 @@ def _attach_inventory_status_and_frequency(
                 "제품분류명": str(row.get("제품분류명") or ""),
                 "현재재고수량": stock,
                 "평가월 예상수요": demand if demand_present else None,
+                "당월현재출고수량": row.get("당월현재출고수량"),
+                "당월기준예상출고수량": row.get("당월기준예상출고수량"),
+                "월예상 달성률": row.get("월예상 달성률"),
+                "월잔여예상수요": row.get("월잔여예상수요"),
+                "입고예정 반영 가용재고": row.get("입고예정 반영 가용재고"),
+                "평가월": row.get("평가월"),
+                "판단기준일": row.get("판단기준일"),
+                "경과영업일": row.get("경과영업일"),
+                "전체영업일": row.get("전체영업일"),
+                "영업일진행률": row.get("영업일진행률"),
+                "평가월 상태": row.get("평가월 상태"),
                 "재고 커버일": row.get("stock_cover_days"),
                 "출고빈도등급": grade,
                 "품목손익등급": profit_grade if profit_ready else "등급자료 부족",
@@ -1772,6 +1792,110 @@ def _attach_inventory_status_and_frequency(
     }
 
 
+def _attach_monthly_depletion_facts(
+    rows: list[dict[str, Any]],
+    *,
+    evaluation_month: str,
+    policy_date: str,
+    pending_available: bool,
+    business_day_context: BusinessDayMonthContext | None,
+    today: date | None = None,
+) -> dict[str, Any]:
+    """Attach mutually exclusive monthly depletion facts without reading a source."""
+    time_progress = _dashboard_time_progress(
+        evaluation_month,
+        policy_date=policy_date,
+        today=today or kst_today(),
+        business_day_context=business_day_context,
+    )
+    evaluation_status = str(time_progress.get("status") or "자료부족")
+    completed = evaluation_status == "완료월"
+    status_counts: dict[str, int] = {}
+
+    for row in rows:
+        current = float(row.get("당월현재출고수량") or 0.0)
+        forecast = float(row.get("당월기준예상출고수량") or 0.0)
+        stock = max(float(row.get("current_stock_qty") or 0.0), 0.0)
+        raw_pending = float(row.get("raw_pending_inbound_qty") or 0.0)
+        pending = max(raw_pending, 0.0) if pending_available else None
+        effective_stock = stock + pending if pending is not None else None
+        remaining = max(forecast - current, 0.0)
+        achievement = (current / forecast * 100.0) if forecast > DASHBOARD_DEMAND_EPSILON else None
+
+        if forecast <= DASHBOARD_DEMAND_EPSILON:
+            if current > DASHBOARD_DEMAND_EPSILON:
+                status = "예상외 출고"
+                reason = "기준예상수요는 없으나 당월 출고 발생"
+            else:
+                status = "월예상 수요 없음"
+                reason = "기준예상수요와 당월 출고가 모두 없음"
+        elif current > forecast + DASHBOARD_DEMAND_EPSILON:
+            status = "월예상 초과 달성"
+            reason = "당월 출고가 기준예상수요 초과"
+        elif abs(current - forecast) <= DASHBOARD_DEMAND_EPSILON:
+            status = "월예상 달성"
+            reason = "당월 출고가 기준예상수요와 동일"
+        elif completed:
+            status = "월예상 미달 종료"
+            reason = "완료월 실제 출고가 기준예상수요 미달"
+        elif stock + DASHBOARD_DEMAND_EPSILON >= remaining:
+            status = "재고로 월말 충족 가능"
+            reason = "현재가용재고로 월잔여예상수요 충족 가능"
+        elif effective_stock is not None and effective_stock + DASHBOARD_DEMAND_EPSILON >= remaining:
+            status = "입고예정 반영 시 충족"
+            reason = "현재재고만으로 부족하나 유효 입고예정 반영 시 충족 가능"
+        else:
+            status = "월말 부족 예상"
+            reason = (
+                "입고예정 반영 후에도 월잔여예상수요 미충족"
+                if effective_stock is not None
+                else "현재가용재고가 월잔여예상수요 미충족; 입고예정 자료 없음"
+            )
+
+        row.update(
+            {
+                "월간 소진상태": status,
+                "월간 소진상태 사유": reason,
+                "월예상 달성률": achievement,
+                "월잔여예상수요": remaining,
+                "입고예정수량": pending,
+                "입고예정 반영 가용재고": effective_stock,
+                "평가월": _normalize_yyyymm(evaluation_month),
+                "판단기준일": str(policy_date or ""),
+                "경과영업일": time_progress.get("elapsed_days"),
+                "전체영업일": time_progress.get("total_days"),
+                "영업일진행률": time_progress.get("pct"),
+                "평가월 상태": evaluation_status,
+            }
+        )
+        status_counts[status] = int(status_counts.get(status) or 0) + 1
+
+    return {
+        "status_counts": status_counts,
+        "total_product_count": len(rows),
+        "evaluation_month": _normalize_yyyymm(evaluation_month),
+        "judgement_date": str(policy_date or ""),
+        "evaluation_status": evaluation_status,
+        "elapsed_business_days": time_progress.get("elapsed_days"),
+        "business_days_total": time_progress.get("total_days"),
+        "business_day_progress_pct": time_progress.get("pct"),
+        "business_day_basis": time_progress.get("basis"),
+        "pending_available": bool(pending_available),
+        "additional_source_call_count": 0,
+    }
+
+
+def _monthly_depletion_cross_distribution(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[tuple[str, str], int] = {}
+    for row in rows:
+        key = (str(row.get("inventory_status") or "자료 부족"), str(row.get("월간 소진상태") or ""))
+        counts[key] = int(counts.get(key) or 0) + 1
+    return [
+        {"재고상태": inventory_status, "월간 소진상태": depletion_status, "품목수": count}
+        for (inventory_status, depletion_status), count in counts.items()
+    ]
+
+
 def _build_sales_facts(
     payload: Mapping[str, Any] | None,
     *,
@@ -1826,11 +1950,8 @@ def _build_sales_facts(
         if forecast_sales not in (None, 0)
         else None
     )
-    source_remaining_sales = _sum_col(df, "당월 잔여예상") or _num(meta.get("sum_current_month_remaining_expected_amt"))
     if evaluation_completed:
         remaining_sales = 0.0 if forecast_sales is not None else None
-    elif "당월 잔여예상" in df.columns or "sum_current_month_remaining_expected_amt" in meta:
-        remaining_sales = source_remaining_sales
     else:
         remaining_sales = max(float(forecast_sales or 0.0) - current_sales, 0.0)
     expected_to_date_sales = (
@@ -2084,10 +2205,10 @@ def _build_sales_facts(
                 "월말 예상 잔여",
                 remaining_sales,
                 unit="원",
-                aggregation="forecast - current when source value is unavailable",
-                grain="제약사",
+                aggregation="max(sum(forecast) - sum(current), 0)",
+                grain="회사 전체",
                 time_basis="평가월 말일 잔여 예상 매출" if evaluation_completed else "평가월 잔여 예상 매출",
-                source_columns=["당월 잔여예상", "당월 예상매출", "당월 현재매출"],
+                source_columns=["당월 예상매출", "당월 현재매출"],
                 partial_period=not evaluation_completed,
             ),
             "next_month_forecast_sales": _fact(
@@ -2954,6 +3075,7 @@ def _build_inventory_facts(
     previous_frequency_evaluation_month: str = "",
     measurement: DashboardQueryMeasurement | None = None,
     business_day_context: BusinessDayMonthContext | None = None,
+    today: date | None = None,
 ) -> dict[str, Any]:
     started = time.perf_counter()
     phase_measurement = measurement or get_active_dashboard_query_measurement()
@@ -3240,6 +3362,21 @@ def _build_inventory_facts(
         input_rows=len(rows),
         result_rows=len(rows),
     )
+    monthly_depletion_started = time.perf_counter()
+    monthly_depletion_summary = _attach_monthly_depletion_facts(
+        rows,
+        evaluation_month=evaluation_month,
+        policy_date=policy_date,
+        pending_available=pending_available,
+        business_day_context=business_day_context,
+        today=today,
+    )
+    _record_inventory_phase(
+        "inventory_monthly_depletion",
+        monthly_depletion_started,
+        input_rows=len(rows),
+        result_rows=len(rows),
+    )
     inventory_status_started = time.perf_counter()
     inventory_status = _attach_inventory_status_and_frequency(
         rows,
@@ -3265,6 +3402,7 @@ def _build_inventory_facts(
         input_rows=len(rows),
         result_rows=len(inventory_status["detail_rows"]),
     )
+    monthly_depletion_summary["inventory_status_cross_rows"] = _monthly_depletion_cross_distribution(rows)
     log.info(
         "[dashboard.inventory_status_frequency] inventory_rows=%s snapshot_status=%s generation_no=%s frequency_missing_rows=%s elapsed_ms=%s",
         len(rows),
@@ -3411,6 +3549,7 @@ def _build_inventory_facts(
         "risk_detail_rows": risk_detail_rows,
         "inventory_status_summary": inventory_status["summary"],
         "inventory_status_detail_rows": inventory_status["detail_rows"],
+        "monthly_depletion_summary": monthly_depletion_summary,
         "data_quality": [] if rows else ["재고준비율 산정 자료 없음"],
     }
 
