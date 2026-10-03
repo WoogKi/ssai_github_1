@@ -654,6 +654,8 @@ def get_dashboard_inbound_facts(
     facts.attrs["inbound_build_elapsed_ms"] = int((time.perf_counter() - build_started) * 1000)
     facts.attrs["inbound_source_elapsed_ms"] = int((time.perf_counter() - started) * 1000)
     facts.attrs["inbound_query_count"] = 1
+    facts.attrs["inbound_sql_shape"] = "r110_event_grain_single_scan"
+    facts.attrs["inbound_access_mode"] = "date_pk_range_single_scan_python_facts"
     scope_codes = sorted(set(_codes((params or {}).get("inbound_product_code_list"))))
     facts.attrs["inbound_product_scope_count"] = len(scope_codes)
     scope_is_bound = 0 < len(scope_codes) <= MAX_PRODUCT_SCOPE_BINDS
@@ -665,7 +667,7 @@ def get_dashboard_inbound_facts(
     facts.attrs["inbound_sql"] = sql
     facts.attrs["inbound_binds"] = dict(binds)
     log.info(
-        "[dashboard.inbound.source] cycle_days=%s vendor_days=%s product_scope_count=%s scope_sql_mode=%s bind_count=%s source_rows=%s product_rows=%s query_elapsed_ms=%s query_count=1 cache_used=False",
+        "[dashboard.inbound.source] sql_shape=r110_event_grain_single_scan access_mode=date_pk_range_single_scan_python_facts cycle_days=%s vendor_days=%s product_scope_count=%s scope_sql_mode=%s bind_count=%s source_rows=%s product_rows=%s query_elapsed_ms=%s query_count=1 cache_used=False",
         cycle_days, vendor_days, facts.attrs["inbound_product_scope_count"],
         facts.attrs["inbound_product_scope_sql_mode"], facts.attrs["inbound_product_scope_bind_count"],
         len(source), len(facts), query_elapsed_ms,

@@ -211,6 +211,7 @@ def main() -> int:
     unscoped_sql, unscoped_binds = _sql({}, start_date="20250826", cutoff_date=CUTOFF)
     assert "WITH InboundEvents AS" in unscoped_sql
     assert "LEFT JOIN InboundEvents AS I" in unscoped_sql
+    assert unscoped_sql.count("dbo.Rddbc110 AS I") == 1
     assert "CASE WHEN COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0" in unscoped_sql
     assert "LEFT JOIN dbo.Rddbc110 AS I" not in unscoped_sql
     assert scoped_sql != unscoped_sql
@@ -273,6 +274,9 @@ def main() -> int:
     assert large_facts.attrs["inbound_product_scope_sql_mode"] == "oversized_profile_scope"
     assert large_facts.attrs["inbound_product_scope_bind_count"] == 0
     assert large_facts.attrs["inbound_product_scope_payload_count"] == 0
+    assert large_facts.attrs["inbound_query_count"] == 1
+    assert large_facts.attrs["inbound_sql_shape"] == "r110_event_grain_single_scan"
+    assert large_facts.attrs["inbound_access_mode"] == "date_pk_range_single_scan_python_facts"
 
     # R110 facts remain unscoped; only the final order predicate changed from
     # a record loop to aligned Series.  Every staff/vendor authority branch
