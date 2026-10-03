@@ -6,13 +6,12 @@ import re
 
 DEFAULT_FALLBACK_TARGET = 1200
 _MIN_TARGET = 300
-_MAX_TARGET = 12000
 
 
 @dataclass(frozen=True)
 class AttachmentSummaryPlan:
     mode: str
-    target_chars: int
+    target_chars: int | None
     chunk_chars: int
     merge_batch_chars: int
     source_chars: int
@@ -20,8 +19,8 @@ class AttachmentSummaryPlan:
     user_override: str = ""
 
 
-def _clamp_target(value: int) -> int:
-    return max(_MIN_TARGET, min(_MAX_TARGET, int(value)))
+def _normalize_explicit_target(value: int) -> int:
+    return max(_MIN_TARGET, int(value))
 
 
 def _request_target(user_request: str) -> tuple[int | None, str]:
@@ -30,9 +29,12 @@ def _request_target(user_request: str) -> tuple[int | None, str]:
         return None, ""
     match = re.search(r"(?<!\d)(\d{3,5})\s*자(?:로|로만|정도|내외)?", request)
     if match:
-        return _clamp_target(int(match.group(1))), "request_chars"
+        return _normalize_explicit_target(int(match.group(1))), "request_chars"
     compact = bool(re.search(r"간단히|짧게|핵심만|요약만", request))
-    detailed = bool(re.search(r"자세히|상세히|충분히|상세", request))
+    detailed = bool(re.search(
+        r"자세히|상세히|충분히(?:\s*설명)?|전체\s*분석|이\s*파일\s*전체\s*검토|파일을\s*근거로\s*질문",
+        request,
+    ))
     if compact and not detailed:
         return 900, "request_compact"
     if detailed and not compact:
@@ -64,19 +66,18 @@ def build_attachment_summary_plan(
     if request_target is not None:
         return AttachmentSummaryPlan(mode, request_target, 6000, 30000, source_chars, sections, request_mode)
     if requested_target is not None:
-        return AttachmentSummaryPlan(mode, _clamp_target(requested_target), 6000, 30000, source_chars, sections, "widget_chars")
+        return AttachmentSummaryPlan(mode, _normalize_explicit_target(requested_target), 6000, 30000, source_chars, sections, "widget_chars")
 
     structured_floor = min(3600, 1200 + min(sections, 20) * 120)
     if request_mode == "request_detailed":
-        target = _clamp_target(max(structured_floor, min(8000, max(2400, source_chars // 2))))
-        return AttachmentSummaryPlan(mode, target, 6000, 30000, source_chars, sections, request_mode)
+        return AttachmentSummaryPlan(mode, None, 6000, 30000, source_chars, sections, request_mode)
     if source_chars <= 2500:
         return AttachmentSummaryPlan("preserve", max(source_chars, _MIN_TARGET), 6000, 30000, source_chars, sections)
     if source_chars <= 14000:
-        target = _clamp_target(max(structured_floor, min(5000, int(source_chars * 0.55))))
+        target = max(structured_floor, min(5000, int(source_chars * 0.55)))
         return AttachmentSummaryPlan(mode, target, 6000, 30000, source_chars, sections)
     if source_chars <= 80000:
-        target = _clamp_target(max(structured_floor, min(7000, max(2400, int(source_chars * 0.22)))))
+        target = max(structured_floor, min(7000, max(2400, int(source_chars * 0.22))))
         return AttachmentSummaryPlan(mode, target, 6000, 30000, source_chars, sections)
-    target = _clamp_target(max(structured_floor, min(10000, max(5000, int(source_chars * 0.08)))))
+    target = max(structured_floor, min(10000, max(5000, int(source_chars * 0.08))))
     return AttachmentSummaryPlan(mode, target, 6000, 30000, source_chars, sections)

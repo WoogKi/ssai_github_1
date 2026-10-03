@@ -10,8 +10,8 @@ def main() -> None:
     source = (ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
     required = (
         'st.session_state.setdefault("__attachment_uploader_nonce", 0)',
-        'key=f"file_upload_below_input_{int(st.session_state.get(\'__attachment_uploader_nonce\', 0))}"',
-        'uploaded_files = list(uploaded_files or [])',
+        'accept_file="multiple" if can_upload_file else False',
+        'select_composer_submission(',
         'analysis_target_files = list(uploaded_files or [])',
         'for idx, uf in enumerate(analysis_target_files, start=1):',
         'st.session_state["__attachment_uploader_nonce"] = int(st.session_state.get("__attachment_uploader_nonce", 0)) + 1',

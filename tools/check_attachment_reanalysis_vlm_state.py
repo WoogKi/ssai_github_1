@@ -15,10 +15,13 @@ def main() -> None:
         'uploaded_files = list(getattr(composer_submission, "files", ()) or ())',
         'attachment_file_source = "chat_composer"',
         'analysis_target_files = list(uploaded_files or [])',
+        'queue_attachment_submission_event(',
+        'select_composer_submission(',
+        'attachment_submission_event_id',
         'def _claim_attachment_auto_analysis(',
         '"__attachment_auto_analysis_claim"',
         'auto_analysis_ready = bool(',
-        'and _claim_attachment_auto_analysis(analysis_target_files, current_room)',
+        'and _claim_attachment_auto_analysis(',
         'elif auto_analysis_ready:',
         '[attachment.analysis] phase=auto_queued',
         'st.session_state.pop("__attachment_auto_analysis_claim", None)',
@@ -51,7 +54,7 @@ def main() -> None:
     sims_call_index = source.index('_render_sims_sidebar_fragment()', search_index)
     attachment_index = source.index('st.markdown("### 📎 첨부 옵션")')
     ocr_index = source.index('st.markdown("### 🖼️ OCR 옵션")')
-    assert 'st.markdown("### 🧩 SIMS 모드")' in source
+    assert "_render_sims_sidebar_fragment()" in source
     assert search_index < sims_call_index < attachment_index < ocr_index
     assert 'if use_image_vlm and _is_image_attachment(uf):' in source
     assert '"type": "image_url"' in source

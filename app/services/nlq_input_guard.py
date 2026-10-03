@@ -38,11 +38,12 @@ def looks_like_attachment_followup(
 
     explicit_reference = bool(
         re.search(
-            r"(?:이|그|첨부)?\s*(?:사진|이미지|화면|그림|캡처|스크린샷|처방전|문서|파일)",
+            r"(?:이|그|첨부)?\s*(?:사진|이미지|화면|그림|캡처|스크린샷|처방전)",
             value,
             flags=re.IGNORECASE,
         )
     )
+    document_reference = bool(re.search(r"첨부파일|파일|문서|Excel|xlsx|PDF|docx", value, re.IGNORECASE))
     visual_detail = bool(
         re.search(
             r"(?:작업자.*(?:어디|무엇)|물건.*(?:이동|흐름)|상부.*하부.*구조|중요한\s*부분.*(?:설명|알려)|무엇을\s*뜻|어떻게\s*다른)",
@@ -54,7 +55,9 @@ def looks_like_attachment_followup(
         re.search(r"(?:추출|읽어|판독|분석|설명|알려|찾아|확인|보여)", value)
     )
 
-    if visual_detail:
+    if document_reference and not explicit_reference:
+        return False
+    if visual_detail and has_active_image_reference:
         return True
     if explicit_reference and analysis_intent:
         return True

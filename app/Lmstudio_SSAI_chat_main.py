@@ -317,6 +317,16 @@ from app.services.mcp_adapter import (
     run_mcp_resource_poc,
 )
 from app.services.attachment_summary_policy import build_attachment_summary_plan
+from app.services.attachment_document_followup import (
+    add_document_analysis_context,
+    latest_document_analysis,
+    looks_like_document_followup,
+)
+from app.services.chat_composer_submission import (
+    attachment_request_text,
+    queue_attachment_submission_event,
+    select_composer_submission,
+)
 from app.services.web_search_service import (
     build_web_search_prompt,
     latest_ready_web_search_message,
@@ -582,14 +592,18 @@ def _attachment_reanalysis_context(room: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _claim_attachment_auto_analysis(files, room: dict[str, Any]) -> bool:
-    """Claim one uploader batch once; a rerun must not analyse it again."""
-    if not files:
+def _claim_attachment_auto_analysis(
+    files,
+    room: dict[str, Any],
+    submission_event_id: str,
+) -> bool:
+    """Claim one composer submission event once; a rerun must not analyse it again."""
+    normalized_event_id = str(submission_event_id or "").strip()
+    if not files or not normalized_event_id:
         return False
     claim = {
         **_attachment_reanalysis_context(room),
-        "uploader_nonce": int(st.session_state.get("__attachment_uploader_nonce", 0)),
-        "signature": _sig_of_uploads(files),
+        "submission_event_id": normalized_event_id,
     }
     if st.session_state.get("__attachment_auto_analysis_claim") == claim:
         return False
@@ -2877,7 +2891,6 @@ def _run_attachment_image_followup(*, room: dict[str, Any], question: str) -> bo
         response = client.chat.completions.create(
             model=model_id,
             temperature=0.2,
-            max_tokens=700,
             messages=[{
                 "role": "user",
                 "content": [
@@ -2954,7 +2967,6 @@ def analyze_attachment_image_vlm(*, file: Any, source_content_hash: str) -> tupl
     response = client.chat.completions.create(
         model=model_id,
         temperature=0,
-        max_tokens=600,
         messages=[{
             "role": "user",
             "content": [
@@ -3223,11 +3235,12 @@ def summarize_text_long(
 
     model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
 
-    def _request_summary(source: str, target: int, instruction: str) -> str:
+    def _request_summary(source: str, target: int | None, instruction: str) -> str:
+        length_instruction = f"\n최종 길이는 약 {target}자 내외." if target is not None else ""
         messages = [{
             "role": "user",
             "content": (
-                f"{instruction}\n최종 길이는 약 {target}자 내외. "
+                f"{instruction}{length_instruction}\n"
                 "섹션 구조를 유지하고 숫자·날짜·단위·표의 핵심값을 임의 변경하지 마라.\n\n"
                 f"{source}"
             ),
@@ -3249,7 +3262,11 @@ def summarize_text_long(
         return _request_summary(normalized, plan.target_chars, f"아래 첨부 문서를 구조적으로 요약해줘. {request_note}".strip())
 
     chunks = _split_into_chunks(normalized, chunk_size=plan.chunk_chars)
-    part_target = max(700, min(2200, plan.target_chars // max(1, len(chunks))))
+    part_target = (
+        None
+        if plan.target_chars is None
+        else max(700, min(2200, plan.target_chars // max(1, len(chunks))))
+    )
     parts = [
         _request_summary(chunk, part_target, f"첨부 문서 청크 {idx}의 핵심을 보존해 요약해줘.")
         for idx, chunk in enumerate(chunks, start=1)
@@ -3259,12 +3276,20 @@ def summarize_text_long(
         grouped, batch, batch_len = [], [], 0
         for part in parts:
             if batch and batch_len + len(part) > plan.merge_batch_chars:
-                grouped.append(_request_summary("\n\n".join(batch), min(plan.target_chars, 3000), "부분 요약들을 구조를 잃지 않게 통합해줘."))
+                grouped.append(_request_summary(
+                    "\n\n".join(batch),
+                    None if plan.target_chars is None else min(plan.target_chars, 3000),
+                    "부분 요약들을 구조를 잃지 않게 통합해줘.",
+                ))
                 batch, batch_len = [], 0
             batch.append(part)
             batch_len += len(part)
         if batch:
-            grouped.append(_request_summary("\n\n".join(batch), min(plan.target_chars, 3000), "부분 요약들을 구조를 잃지 않게 통합해줘."))
+            grouped.append(_request_summary(
+                "\n\n".join(batch),
+                None if plan.target_chars is None else min(plan.target_chars, 3000),
+                "부분 요약들을 구조를 잃지 않게 통합해줘.",
+            ))
         if len(grouped) >= len(parts):
             break
         parts = grouped
@@ -7203,6 +7228,7 @@ def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_com
         "__attachment_image_followup_candidates",
         "__attachment_image_followup_target_id",
         "__attachment_image_followup_request",
+        "__attachment_document_followup_request",
         "__knowledge_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
@@ -10049,6 +10075,7 @@ def _reset_chat_session_when_user_changed() -> None:
         "__attachment_image_followup_candidates",
         "__attachment_image_followup_target_id",
         "__attachment_image_followup_request",
+        "__attachment_document_followup_request",
         "__knowledge_followup_request",
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
@@ -12085,7 +12112,7 @@ with st.sidebar:
         summary_target = st.number_input(
             "요약 목표 길이(문자)",
             min_value=300,
-            max_value=12000,
+            max_value=100000,
             value=1200,
             step=100,
             key="__attach_summary_target",
@@ -12739,6 +12766,28 @@ if user_input and user_input.strip():
         )
         st.rerun()
 
+    if looks_like_document_followup(user_input):
+        document_context = _attachment_reanalysis_context(current_room)
+        if latest_document_analysis(current_room, context=document_context) is None:
+            notice = {
+                "id": str(uuid.uuid4()),
+                "role": "assistant",
+                "content": "현재 대화방에서 분석한 첨부 문서를 찾지 못했습니다. 파일을 첨부해 분석한 뒤 질문해 주세요.",
+                "time": make_ts(),
+                "seq": _next_seq(),
+                **_message_meta("document_followup_unavailable"),
+            }
+            current_room.setdefault("messages", []).append(notice)
+            current_room.setdefault("gen_messages", []).append(notice.copy())
+            _sync_room_meta(current_room, materialize=True)
+            save_chat_rooms()
+            st.rerun()
+        st.session_state["__attachment_document_followup_request"] = document_context
+        st.session_state["__queue_ai"] = True
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        st.rerun()
+
     if _looks_like_attachment_image_followup(
         user_input,
         has_active_image_reference=(
@@ -13313,6 +13362,10 @@ with chat_history_container:
                 st.markdown(m.get("content") or "📎 첨부 분석 완료")
                 if isinstance(detail, dict):
                     with st.expander("추출·관찰 상세", expanded=False):
+                        full_summary = str(detail.get("summary") or "").strip()
+                        if full_summary:
+                            st.markdown("#### 전체 분석 결과")
+                            st.markdown(full_summary)
                         ocr_text = str(detail.get("ocr_text") or "").strip()
                         if ocr_text:
                             st.markdown("#### OCR 결과")
@@ -14333,6 +14386,15 @@ with chat_history_container:
             if not msgs:
                 msgs = [{"role": "user", "content": "You are a helpful assistant."}]
 
+        document_request = st.session_state.pop("__attachment_document_followup_request", None)
+        if isinstance(document_request, dict) and all(
+            document_request.get(key) == value
+            for key, value in _attachment_reanalysis_context(current_room).items()
+        ):
+            document_detail = latest_document_analysis(current_room, context=document_request)
+            if document_detail is not None:
+                msgs = add_document_analysis_context(msgs, document_detail)
+
         # A UI-created Knowledge follow-up owns this turn before every ordinary
         # route. Invalid queue state fails closed and is never reinterpreted.
         raw_knowledge_followup = st.session_state.pop("__knowledge_followup_request", None)
@@ -14504,7 +14566,12 @@ def _queue_chat_composer_submission(widget_key: str) -> None:
     # processing path. Text-only submissions can be dispatched at the top of
     # this rerun, before historical chat content is rendered.
     if uploaded_files or recorded_audio is not None:
-        st.session_state["__chat_composer_pending_submission"] = submission
+        queue_attachment_submission_event(
+            st.session_state,
+            submission=submission,
+            event_id=_new_ui_event_id("attachment_submission"),
+            context=_attachment_reanalysis_context(current_room),
+        )
         return
     if composer_text:
         st.session_state["__sims_auto_user_input"] = composer_text
@@ -14523,8 +14590,18 @@ composer_submission = st.chat_input(
     on_submit=_queue_chat_composer_submission,
     args=(composer_key,),
 )
-if composer_submission is None:
-    composer_submission = st.session_state.pop("__chat_composer_pending_submission", None)
+composer_submission, attachment_submission_event_id, attachment_submission_status = (
+    select_composer_submission(
+        st.session_state,
+        widget_submission=composer_submission,
+        context=_attachment_reanalysis_context(current_room),
+    )
+)
+if attachment_submission_status.endswith("_binary_ignored"):
+    log.debug(
+        "[attachment.analysis] phase=stale_widget_ignored pending_status=%s",
+        attachment_submission_status,
+    )
 uploaded_files = []
 recorded_audio = None
 attachment_file_source = "chat_composer"
@@ -14535,7 +14612,7 @@ if composer_submission is not None:
         composer_text = str(getattr(composer_submission, "text", "") or "").strip()
         uploaded_files = list(getattr(composer_submission, "files", ()) or ())
         recorded_audio = getattr(composer_submission, "audio", None)
-    if composer_text:
+    if composer_text and not uploaded_files and recorded_audio is None:
         callback_text = str(st.session_state.pop("__chat_composer_callback_text", "") or "").strip()
         if composer_text != callback_text:
             st.session_state["__sims_auto_user_input"] = composer_text
@@ -14600,7 +14677,11 @@ auto_analysis_ready = bool(
     can_upload_file
     and analysis_target_files
     and not st.session_state.get("__an_busy", False)
-    and _claim_attachment_auto_analysis(analysis_target_files, current_room)
+    and _claim_attachment_auto_analysis(
+        analysis_target_files,
+        current_room,
+        attachment_submission_event_id,
+    )
 )
 if auto_analysis_ready:
     log.info(
@@ -14767,7 +14848,7 @@ if uploaded_files:
                         combined_input,
                         target_chars=explicit_target,
                         section_count=attached_section_count,
-                        user_request=attachment_analysis_request,
+                        user_request=attachment_request_text(composer_text, attachment_analysis_request),
                     )
                 except Exception as e:
                     summary = _clip_for_model(combined_input, limit=12000)
@@ -14785,8 +14866,10 @@ if uploaded_files:
                 f"📎 첨부 파일 분석 요청({len(attached_saved_names)}개)\n\n"
                 f"{file_list_md}"
             )
+            if composer_text:
+                request_msg += f"\n\n{composer_text}"
 
-            summary_preview = _clip_for_model(str(summary or "").strip(), limit=700)
+            summary_preview = str(summary or "").strip()
             has_image_attachment = bool(image_analysis_candidates)
             primary_observation = next(
                 (str(item.get("text") or "").strip() for item in image_vlm_results if item.get("text")),
