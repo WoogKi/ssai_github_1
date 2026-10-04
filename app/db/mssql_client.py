@@ -3,7 +3,7 @@
 
 VERSION = "chat_middleware/2025-11-01T-v1"
 
-import os, logging, re, time
+import os, logging, re, sys, time
 from contextlib import contextmanager
 from urllib.parse import quote_plus
 import pyodbc
@@ -441,9 +441,14 @@ def get_conn():
             driver.timeout = state["timeout_seconds"]
         yield conn
     finally:
+        active_error = sys.exc_info()[0] is not None
         try:
             if driver is not None:
-                driver.timeout = previous_timeout
+                try:
+                    driver.timeout = previous_timeout
+                except Exception:
+                    if not active_error:
+                        raise
         finally:
             try: conn.close()
             except Exception: pass
