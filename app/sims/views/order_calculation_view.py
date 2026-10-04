@@ -47,7 +47,7 @@ def view_order_calculation(params=None):
             closing = st.number_input("결제일자/마감일자", min_value=0, max_value=31, value=int(defaults.get("closing_day", 25)))
         c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            staff = st.text_input("발주담당자", value=str(defaults.get("staff_nm") or ""))
+            staff = st.text_input("발주담당자", value=str(defaults.get("order_staff_nm") or ""))
         with c2:
             vendor_cd = st.text_input("발주처코드", value=str(defaults.get("order_vendor_cd") or ""))
         with c3:
@@ -69,7 +69,7 @@ def view_order_calculation(params=None):
         submitted = st.form_submit_button("발주 계산", type="primary", width="stretch", on_click=_trigger_panel_run)
     request = {**defaults, **vendor, **product, **application, "order_date": reference.isoformat(),
                 "safety_days": int(safety), "target_days": int(target), "closing_day": int(closing),
-                "only_needed": mode == "발주해당자료만", "staff_nm": staff.strip(),
+                "only_needed": mode == "발주해당자료만", "order_staff_nm": staff.strip(),
                 "maker_cd": maker_code.strip(), "query_mode": mode, "_display_context": "panel",
                 "_original_question": "발주 계산 화면 실행"}
     if submitted:

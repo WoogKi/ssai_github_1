@@ -324,7 +324,9 @@ from app.services.attachment_document_followup import (
 )
 from app.services.chat_composer_submission import (
     attachment_request_text,
+    consume_text_dispatch_after_echo,
     queue_attachment_submission_event,
+    queue_text_dispatch_after_echo,
     select_composer_submission,
 )
 from app.services.web_search_service import (
@@ -349,9 +351,14 @@ def _render_assistant_message_controls(message: dict[str, Any], *, room: dict[st
 from app.ui.knowledge_chat_adapter import (
     build_knowledge_followup_queue_request,
     build_knowledge_prompt,
+    build_sims_help_choice_prompt,
     parse_business_help_knowledge_request,
+    parse_incomplete_sims_help_request,
     parse_knowledge_followup_queue_request,
     parse_explicit_knowledge_request,
+    parse_sims_help_choice,
+    verified_sims_help_examples,
+    verified_sims_help_text,
 )
 from app.ui.mcp_chat_adapter import (
     build_mcp_chat_message,
@@ -3180,6 +3187,44 @@ def _build_current_room_compact_context(limit_chars: int = 5000, *, include_sims
         log.exception("[chat.room.compact_context] build failed")
         return ""
 
+
+def _completed_general_history(history_msgs: list[dict], *, include_sims: bool = False) -> list[dict]:
+    """Pair room turns by response provenance; optionally keep completed SIMS turns."""
+    completed: list[dict] = []
+    pending_users: list[dict] = []
+
+    def preserve_background(users: list[dict]) -> None:
+        for user in users:
+            if not is_sims_related_question(str(user.get("content") or "")):
+                completed.append({**user, "_prior_unanswered_background": True})
+
+    for message in history_msgs:
+        if message.get("role") == "user":
+            pending_users.append(message)
+        elif message.get("role") == "assistant" and pending_users:
+            if (_is_sims_owned_history_message(message)
+                    or str(message.get("type") or "").strip().lower() == KNOWLEDGE_ANSWER_MESSAGE_TYPE):
+                owner = pending_users.pop()
+                if include_sims and _is_sims_owned_history_message(message):
+                    preserve_background(pending_users)
+                    pending_users.clear()
+                    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+                    action = str(message.get("action") or meta.get("action") or message.get("title") or "업무 조회").strip()
+                    status = str(message.get("result_status") or meta.get("result_status") or "응답 완료").strip()
+                    completed.extend((owner, {
+                        "role": "assistant",
+                        "content": f"{action}: {status}",
+                        "_completed_sims_turn": True,
+                    }))
+            else:
+                preserve_background(pending_users[:-1])
+                completed.extend((pending_users[-1], message))
+                pending_users.clear()
+    if pending_users:
+        preserve_background(pending_users[:-1])
+        completed.append(pending_users[-1])
+    return completed
+
 # =========================
 # 첨부 공통 요약 파이프라인
 # =========================
@@ -5920,6 +5965,24 @@ def _should_dispatch_current_table_followup(
     )
 
 
+def _current_result_analysis_reference(
+    query: str, *, candidate_action: str, source_key: str,
+    latest_assistant: dict | None,
+) -> tuple[bool, bool]:
+    """Resolve an analysis reference without treating it as a fresh lookup."""
+    if classify_current_table_followup_intent(query) != "llm_analysis":
+        return False, False
+    compact = re.sub(r"\s+", "", str(query or ""))
+    named = bool(candidate_action and "결과" in compact
+                 and re.sub(r"\s+", "", candidate_action) in compact)
+    meta = (latest_assistant or {}).get("meta")
+    meta = meta if isinstance(meta, dict) else {}
+    recent_key = str(meta.get("table_key") or (latest_assistant or {}).get("table_key") or "").strip()
+    brief = bool(not candidate_action and source_key and recent_key == source_key
+                 and compact.startswith("왜"))
+    return named, brief
+
+
 def is_sims_related_question(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -6326,12 +6389,17 @@ def build_messages_with_system(
     - SIMS JSON이 있으면 [SIMS_JSON] 블록으로, 없으면 텍스트 컨텍스트를 주입.
     - 규칙 문구는 최소화하고, JSON 데이터 자체를 보고 추론하도록 유도한다.
     """
+    from app.services.datetime_tool import operating_llm_context
+
     # ✅ 질문이 SIMS 관련이면 SIMS 시스템프롬프트, 아니면 일반 시스템프롬프트
-    attach_sims = is_sims_related_question(user_text or "")
+    attach_sims = is_sims_related_question(user_text or "") or bool(
+        isinstance(analysis_ctx_override, dict)
+        and analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"
+    )
     independent_writing = is_general_writing_request(user_text or "") and not attach_sims
     base_system = system_prompt or (BASE_SYSTEM_PROMPT if attach_sims else GENERAL_SYSTEM_PROMPT)
 
-    msgs: list[dict] = [{"role": "system", "content": base_system}]
+    msgs: list[dict] = [{"role": "system", "content": base_system + "\n" + operating_llm_context()}]
 
     # 1) 최신 SIMS 컨텍스트 조회
     sims_block: str | None = None
@@ -6520,6 +6588,9 @@ def build_messages_with_system(
                 analysis_data_rule = (
                     "[CURRENT_TABLE_ANALYSIS_OUTPUT]\n"
                     "- 전체 판단은 whole_table_facts의 통계와 그룹별 집계를 사용하세요. 참고 행은 전체가 아닐 수 있습니다.\n"
+                    "- order_decision_facts가 있으면 그 단일 발주행의 적용 필요량, 재고·입고예정 차감, "
+                    "원계산·단위·반올림 근거, 추천·사용자 입력·수정차이를 구분해 설명하세요. "
+                    "새 계산식을 만들지 말고 ERP 미등록 상태를 유지하세요.\n"
                     "- analysis_scope가 limited_source이면 조회 한도 내 자료라는 제한을 반드시 함께 알리세요.\n"
                     "- 지표별 aggregation, 누락된 지표/그룹 수, 전달된 상하위 깊이를 확인하세요. 없는 수치나 원인을 만들지 마세요.\n"
                     "- JSON의 영문 또는 밑줄 key는 구현용입니다. 답변에는 어떤 key도 그대로 쓰지 말고 한국어 업무 용어로 바꾸세요. 예를 들어 top5_group_share_pct는 '상위 5개 집계 차원 점유율'로 설명하세요.\n"
@@ -7069,6 +7140,7 @@ def build_messages_with_system(
             len(msgs),
             sims_context_kind,
         )
+        log.info("[chat.history_boundary] mode=table_analysis prior_turns=0 current_count=1")
         return msgs
 
     # 5) 히스토리 user/assistant 메시지 이어 붙이기
@@ -7081,10 +7153,7 @@ def build_messages_with_system(
     used = 0
     tail: list[dict] = []
 
-    # ✅ 일반 질문일 때는 SIMS 관련 히스토리를 제외해 "SIMS에 없다" 답변을 방지
-    sims_noise = re.compile(r"(SIMS|ERP|\[SIMS_|컨텍스트|거래처|사용자목록|부서별|Rddbc0\d+)", re.IGNORECASE)
-
-    if not attach_sims:
+    if not attach_sims and is_sims_result_followup_question(user_text or ""):
         t_ctx = time.perf_counter()
         compact_room_ctx = _build_current_room_compact_context(include_sims=not independent_writing)
         try:
@@ -7105,20 +7174,50 @@ def build_messages_with_system(
                 }
             )
 
-    for m in reversed(history_msgs):
-        if m.get("role") not in ("user", "assistant"):
+    dialogue_history = _completed_general_history(history_msgs, include_sims=attach_sims)
+    unanswered_background: list[str] = []
+    current = dialogue_history[-1] if dialogue_history and dialogue_history[-1].get("role") == "user" else None
+    if current is not None:
+        tail.append({"role": "user", "content": _clip_for_model(current.get("content", "") or "")})
+    cursor = len(dialogue_history) - (2 if current is not None else 1)
+    while cursor >= 0:
+        message = dialogue_history[cursor]
+        if (message.get("role") == "assistant" and cursor > 0
+                and dialogue_history[cursor - 1].get("role") == "user"):
+            group = dialogue_history[cursor - 1:cursor + 1]
+            cursor -= 2
+        else:
+            group = [message]
+            cursor -= 1
+        if any(_is_sims_owned_history_message(item) and not item.get("_completed_sims_turn") for item in group):
             continue
-        if independent_writing and _is_sims_owned_history_message(m):
-            continue
-        txt = (m.get("content", "") or "")
-        if not attach_sims and not independent_writing and sims_noise.search(txt):
-            continue
-        txt = _clip_for_model(txt)  # 각 메시지 자체가 너무 길면 컷
-        if used + len(txt) > HISTORY_CHAR_BUDGET:
+        clipped = [_clip_for_model(item.get("content", "") or "") for item in group]
+        group_chars = sum(map(len, clipped))
+        if used + group_chars > HISTORY_CHAR_BUDGET:
             break
-        tail.append({"role": m["role"], "content": txt})
-        used += len(txt)
+        for item, txt in reversed(list(zip(group, clipped))):
+            if item.get("_prior_unanswered_background"):
+                unanswered_background.append(txt)
+            elif item.get("role") in ("user", "assistant"):
+                tail.append({"role": item["role"], "content": txt})
+        used += group_chars
+    if unanswered_background:
+        msgs.append({"role": "system", "content": (
+            "[PRIOR_USER_CONTEXT] Earlier unanswered user messages are background only. "
+            "Answer only the latest user question.\n"
+            + "\n".join(reversed(unanswered_background)) + "\n[/PRIOR_USER_CONTEXT]"
+        )})
+    if attach_sims and any(item.get("_completed_sims_turn") for item in dialogue_history):
+        msgs.append({"role": "system", "content": (
+            "Earlier business requests in the dialogue have already received their shown result status. "
+            "Use their conditions only as context; do not execute or answer them again. "
+            "Answer only the latest user question."
+        )})
     msgs.extend(reversed(tail))
+    log.info("[chat.history_boundary] mode=%s completed_sims=%s prior_messages=%s current_count=%s",
+             "sims" if attach_sims else "general",
+             sum(bool(item.get("_completed_sims_turn")) for item in dialogue_history),
+             max(0, len(tail) - int(current is not None)), int(current is not None))
 
     return msgs
 
@@ -8394,6 +8493,35 @@ def _run_business_help_knowledge_chat(route, *, room: dict[str, Any]) -> bool:
         log_kind="knowledge.business_help",
         fall_through_on_no_match=True,
     )
+
+
+def _select_approved_sims_help_action(intent, *, examples, room: dict[str, Any]) -> tuple[str, int]:
+    """Use the existing scoped Knowledge path only to rank verified help actions."""
+    if not examples:
+        return "", 0
+    attempted = 0
+    try:
+        context = _knowledge_request_context_for_room(room, technical_detail_mode=False)
+        packet = _knowledge_repository_for_chat().retrieve_for_chat(
+            query="업무질문 도움말", request_context=context,
+        )
+        if packet.reason_code != "ready" or not packet.text or not packet.citations:
+            log.info("[sims.help] knowledge=unavailable reason=%s", packet.reason_code)
+            return "", 0
+        attempted = 1
+        response = call_chat_protected(
+            messages=build_sims_help_choice_prompt(intent=intent, examples=examples, packet=packet),
+            model=EXPECTED_LM_MODEL or st.session_state.get("selected_model") or "",
+            temperature=0.2, stream=False, max_retry=0,
+        )
+        selected = parse_sims_help_choice(
+            str(extract_chat_completion_text(response).get("content") or ""), examples=examples,
+        )
+        log.info("[sims.help] knowledge=ready choice=%s", "verified" if selected else "rejected")
+        return selected, attempted
+    except Exception as exc:
+        log.warning("[sims.help] knowledge=failed error_type=%s", type(exc).__name__)
+        return "", attempted
 
 
 def _run_knowledge_chat_route(
@@ -12542,7 +12670,24 @@ immediate_echo_message_id = ""
 # 메시지 입력 UI는 채팅 결과 바로 아래, 파일 첨부 바로 위에 별도 inline form으로 렌더한다.
 # 여기서는 이전 run에서 inline form이 넘긴 값을 먼저 처리한다.
 typed_user_input = None
+pending_text_dispatch = consume_text_dispatch_after_echo(
+    st.session_state, context=_attachment_reanalysis_context(current_room)
+)
 auto_user_input = st.session_state.pop("__sims_auto_user_input", None)
+staged_text_submission = ""
+if pending_text_dispatch:
+    auto_user_input = pending_text_dispatch
+elif auto_user_input and auto_user_input.strip():
+    staged_text_submission = auto_user_input.strip()
+    queue_text_dispatch_after_echo(
+        st.session_state,
+        text=staged_text_submission,
+        context=_attachment_reanalysis_context(current_room),
+    )
+    with chat_immediate_user_slot.container():
+        with st.chat_message("user"):
+            st.markdown(staged_text_submission)
+    auto_user_input = None
 
 user_input = auto_user_input or typed_user_input
 
@@ -12553,8 +12698,12 @@ if user_input and user_input.strip():
     # Knowledge-owned requests keep their query bytes. The normal Korean/English
     # keyboard correction stays on every ordinary Chat path.
     raw_knowledge_route = parse_explicit_knowledge_request(user_input)
+    incomplete_sims_help = (
+        None if raw_knowledge_route is not None else parse_incomplete_sims_help_request(user_input)
+    )
     business_help_knowledge_route = (
-        None if raw_knowledge_route is not None else parse_business_help_knowledge_request(user_input)
+        None if raw_knowledge_route is not None or incomplete_sims_help is not None
+        else parse_business_help_knowledge_request(user_input)
     )
     raw_mcp_route = (
         None
@@ -12718,6 +12867,41 @@ if user_input and user_input.strip():
             datetime_answer.timezone_name,
         )
         st.rerun()
+    if incomplete_sims_help is not None:
+        from app.sims.nlq.action_inventory import implemented_actions
+        from app.services.ssai_permission_policy import get_required_permission
+
+        allowed_help_actions = set()
+        for action_spec in implemented_actions():
+            permission = get_required_permission(
+                category=action_spec.panel_category, action=action_spec.canonical_action,
+            )
+            if permission and require_permission(permission, show_error=False):
+                allowed_help_actions.add(action_spec.canonical_action)
+        help_examples = verified_sims_help_examples(
+            incomplete_sims_help, allowed_actions=allowed_help_actions,
+        )
+        knowledge_allowed = require_permission("RAG_USE", show_error=False)
+        selected_help_action, help_llm_calls = (
+            _select_approved_sims_help_action(incomplete_sims_help, examples=help_examples, room=current_room)
+            if knowledge_allowed else ("", 0)
+        )
+        help_message = {
+            "id": str(uuid.uuid4()), "role": "assistant",
+            "content": verified_sims_help_text(
+                incomplete_sims_help, allowed_actions=allowed_help_actions,
+                allow_knowledge_help=knowledge_allowed,
+                selected_action=selected_help_action,
+            ),
+            "time": make_ts(), "seq": _next_seq(),
+            **_message_meta("sims_help"),
+        }
+        current_room.setdefault("messages", []).append(help_message)
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        log.info("[sims.help] reason=%s erp_call_count=0 llm_call_count=%s", incomplete_sims_help.reason,
+                 help_llm_calls)
+        st.rerun()
     # A valid slash command is already persisted in its room. Queue its
     # dedicated adapter now, before any current-table, SIMS, NLQ, or ERP
     # router can inspect query payload words.
@@ -12843,6 +13027,19 @@ if user_input and user_input.strip():
     new_sims_action = str((new_sims_candidate or {}).get("action") or "").strip()
     new_sims_route = str((new_sims_candidate or {}).get("route") or "").strip()
     is_new_sims_nlq = bool(new_sims_action)
+    source_action = str(st.session_state.get("__sims_current_table_source_action") or "").strip()
+    source_key = str(st.session_state.get("__sims_current_table_source_key") or "").strip()
+    latest_assistant = next((item for item in reversed(current_room.get("messages") or [])
+                             if isinstance(item, dict) and item.get("role") == "assistant"), None)
+    named_result_analysis, brief_result_reason = _current_result_analysis_reference(
+        current_table_followup_input, candidate_action=new_sims_action,
+        source_key=source_key, latest_assistant=latest_assistant,
+    )
+    result_analysis_reference = named_result_analysis or brief_result_reason
+    if result_analysis_reference:
+        log.info("[chat.current_result_analysis] target=%s source_match=%s table_bound=%s",
+                 new_sims_action or source_action, not named_result_analysis or source_action == new_sims_action,
+                 bool(source_key))
 
     # ✅ 분석/KPI 명시 조회는 최근 SIMS 결과가 있어도 LLM 후속질문으로 보내지 않는다.
     # 예:
@@ -12889,7 +13086,7 @@ if user_input and user_input.strip():
         current_table_followup_input
     )
     is_current_table_forced_followup = (
-        has_explicit_current_table_reference
+        (has_explicit_current_table_reference or result_analysis_reference)
         and not is_explicit_current_table_writing
     )
 
@@ -12899,7 +13096,7 @@ if user_input and user_input.strip():
     )
     is_current_table_dispatch_candidate = _should_dispatch_current_table_followup(
         current_table_followup_input,
-        explicit_reference=has_explicit_current_table_reference,
+        explicit_reference=has_explicit_current_table_reference or result_analysis_reference,
         implicit_analytics=is_implicit_analytics_current_followup,
     )
 
@@ -12956,7 +13153,7 @@ if user_input and user_input.strip():
         # - 현재표 제품별 매출 TOP 20 표로 만들어줘
         # - 현재표 거래처별 매출 TOP 20 표로 만들어줘
         if is_current_table_forced_followup or is_implicit_analytics_current_followup:
-            if not _has_current_table_source_df():
+            if (named_result_analysis and source_action != new_sims_action) or not _has_current_table_source_df():
                 st.session_state.pop("__deferred_current_table_followup", None)
                 st.session_state["__sims_panel_active"] = False
                 st.session_state["__sims_force_open"] = False
@@ -14319,9 +14516,8 @@ with chat_history_container:
         st.session_state["__queue_ai"] = False   # pop 대신 안전하게 리셋
         log.debug("[chat] __queue_ai detected → AI block start")
         
-        # ✅ 2-채널 히스토리: LLM에 넣을 히스토리 선택
-        # - SIMS 패널 ON + SIMS 질문이면 sims_messages
-        # - 그 외는 gen_messages
+        # The canonical room channel contains the user and deterministic result
+        # together; sims_messages may contain only the user side of that turn.
         history_msgs_all = current_room.get("messages", [])
         last_user_text = ""
         for mm in reversed(history_msgs_all):
@@ -14334,7 +14530,9 @@ with chat_history_container:
         )
         use_sims_hist = bool(st.session_state.get("__sims_open", False) and last_user_is_sims)
 
-        history_msgs = current_room.get("sims_messages" if use_sims_hist else "gen_messages", []) or []
+        # Canonical room messages include completed deterministic results, unlike
+        # gen_messages, which can contain only their user-side requests.
+        history_msgs = current_room.get("messages", []) or []
 
         try:
             analysis_ctx_override = st.session_state.pop("__current_table_analysis_ctx_override", None)
@@ -14613,9 +14811,10 @@ if composer_submission is not None:
     if composer_text and not uploaded_files and recorded_audio is None:
         callback_text = str(st.session_state.pop("__chat_composer_callback_text", "") or "").strip()
         if composer_text != callback_text:
-            st.session_state["__sims_auto_user_input"] = composer_text
-            st.session_state["__ui_rerun_reason"] = "chat_input"
-            st.rerun()
+            if composer_text not in (staged_text_submission, pending_text_dispatch):
+                st.session_state["__sims_auto_user_input"] = composer_text
+                st.session_state["__ui_rerun_reason"] = "chat_input"
+                st.rerun()
     if uploaded_files:
         log.info(
             "[attachment.analysis] phase=composer_submit file_source=%s file_count=%s",
@@ -14982,5 +15181,8 @@ if uploaded_files:
         st.session_state["__an_job"] = None
         st.session_state["__an_cancel"] = False
         st.session_state.pop("__attachment_auto_analysis_claim", None)
+
+if staged_text_submission:
+    st.rerun()
 
 # 페이지 끝

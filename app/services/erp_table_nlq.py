@@ -45,7 +45,7 @@ _VALUE_BOUNDARY = (
     r"제품(?:코드|명|키워드|그룹명?|구분명?|분류명?|단가|등록자|수정자)?|"
     r"품목(?:코드|명|키워드)?|보험코드|바코드|제약사명?|제조사|키워드|발주담당자|제약담당자|담당자|"
     r"실입고단가|장부입고단가|입고수량|출고수량|최종단가변경일자|"
-    r"제품등록일|제품수정일|계약시작일(?:자)?|기준일|조회건수|TOP)\b|$)"
+    r"제품등록일|제품수정일|계약시작일(?:자)?|기준일|조회(?:구분|조건)|조회건수|TOP)\b|$)"
 )
 _HISTORY_WORDS = ("이력", "과거", "변경내역")
 
@@ -71,7 +71,10 @@ def _extract_code(text: str, labels: tuple[str, ...]) -> str:
     return _clean(match.group(1)) if match else ""
 
 
-def _extract_name(text: str, labels: tuple[str, ...]) -> str:
+def _extract_name(
+    text: str, labels: tuple[str, ...], *, preserve_period_tokens: bool = False,
+    stop_at_action: bool = False,
+) -> str:
     generic_labels = {
         "거래처", "매입처", "발주처", "재고적용처", "단가적용처", "단가적용거래처",
         "제품", "품목",
@@ -85,19 +88,21 @@ def _extract_name(text: str, labels: tuple[str, ...]) -> str:
     if not match:
         return ""
     value = _clean(match.group(1))
+    if stop_at_action:
+        action_starts = (
+            found.start() for word in _ACTION_WORDS
+            if (found := re.search(
+                rf"(?<![0-9A-Za-z가-힣]){re.escape(word)}(?=\s|$)", value
+            )) is not None
+        )
+        value = value[:min(action_starts, default=len(value))]
     for action_word in _ACTION_WORDS:
         value = value.replace(action_word, " ")
     value = re.sub(r"\s+(?:조회|검색|확인|보여줘|알려줘)\s*$", "", value)
-    # Period syntax belongs to the shared period authority, not to a labelled
-    # business-name value. A label value may itself contain date-like digits,
-    # so consume only a whitespace-separated terminal period expression.
-    value = re.sub(
-        r"\s+(?:(?:19|20)\d{4}\s*(?:~|-)\s*(?:19|20)\d{4}|"
-        r"(?:19|20)\d{4}(?:\d{2})?|"
-        r"(?:19|20)\d{2}\s*년(?:\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?)?)\s*$",
-        "",
-        value,
-    )
+    # The shared period authority removes standalone dates while protecting
+    # date-shaped substrings embedded in a registered business name.
+    if not preserve_period_tokens:
+        value = strip_nlq_period_tokens_for_entity_residual(value)
     return re.sub(r"\s+", " ", value).strip(" ,:/-~")
 
 
@@ -370,7 +375,7 @@ def _resolve_order_nlq(
     for key in ("order_staff_nm", "pharma_staff_nm"):
         labels = filter_labels(feature, key)
         staff_labels.append(labels)
-        staff_name = _extract_name(raw, labels) if labels else ""
+        staff_name = _extract_name(raw, labels, preserve_period_tokens=True, stop_at_action=True) if labels else ""
         if staff_name:
             params[key] = staff_name
     if re.search(r"(?<!발주)(?<!제약)(?<!영업)담당자(?:명)?\s*[:=]?\s*\S+", raw):
@@ -443,9 +448,11 @@ _ORDER_CALCULATION_INTENT = re.compile(
 )
 
 _ORDER_CALCULATION_QUERY_MODE = re.compile(
-    r"(?<![가-힣A-Za-z0-9])(?:조회\s*(?:구분|조건)\s*[:=]?\s*)?"
+    r"(?<![가-힣A-Za-z0-9])(?:"
+    r"(?:조회\s*(?:구분|조건)\s*[:=]?\s*)?"
     r"(?P<value>발주\s*해당\s*자료(?:만)?|발주\s*해당|해당|"
     r"발주할\s*것만|발주\s*대상만|확인\s*필요|전체)"
+    r"|조회\s*(?:구분|조건)\s*[:=]?\s*(?P<short_value>확인))"
     r"(?![가-힣A-Za-z0-9])"
 )
 
@@ -484,8 +491,8 @@ def resolve_registered_erp_table_nlq(
                 calculation_params[key] = int(matches[-1].group(1))
                 condition_text = pattern.sub(" ", condition_text)
         mode_matches = list(_ORDER_CALCULATION_QUERY_MODE.finditer(condition_text))
-        value = re.sub(r"\s+", "", mode_matches[-1].group("value")) if mode_matches else "발주해당자료만"
-        mode = "전체" if value == "전체" else "확인 필요" if value == "확인필요" else "발주해당자료만"
+        value = re.sub(r"\s+", "", mode_matches[-1].group("value") or mode_matches[-1].group("short_value")) if mode_matches else "발주해당자료만"
+        mode = "전체" if value == "전체" else "확인 필요" if value in ("확인필요", "확인") else "발주해당자료만"
         # Capture mode before replacing an intent that itself contains '것만'.
         condition_text = _ORDER_CALCULATION_INTENT.sub("발주 조회", condition_text)
         condition_text = _ORDER_CALCULATION_QUERY_MODE.sub(" ", condition_text)

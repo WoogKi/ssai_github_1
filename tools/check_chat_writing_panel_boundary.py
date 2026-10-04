@@ -19,7 +19,7 @@ def main() -> None:
     from app.sims.nlq.nlq_router import is_general_writing_request
     source = (ROOT / "app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
     names = {
-        "_is_sims_owned_history_message", "_build_current_room_compact_context",
+        "_is_sims_owned_history_message", "_completed_general_history", "_build_current_room_compact_context",
         "_has_explicit_sims_context_reference", "_is_explicit_current_table_writing_request",
         "_should_dispatch_current_table_followup",
         "is_sims_related_question",
@@ -29,9 +29,11 @@ def main() -> None:
     assert len(nodes) == len(names)
     query = "신규 거래처에 보낼 제품 소개 이메일 초안을 작성해줘"
     ordinary = {"role": "user", "content": "거래처 안내문은 정중하게 써줘"}
+    ordinary_reply = {"role": "assistant", "content": "정중한 안내문으로 작성하겠습니다."}
+    business_user = {"role": "user", "content": "입고예정조회"}
     result = {"role": "assistant", "action": "입고예정조회", "content": "STALE_SUMMARY", "meta": {"nlq": True}}
     unsupported = {"role": "assistant", "content": "STALE_UNSUPPORTED", "meta": {"action": "unsupported"}}
-    room = {"id": "room", "company_id": "7", "messages": [ordinary, result, unsupported]}
+    room = {"id": "room", "company_id": "7", "messages": [ordinary, ordinary_reply, business_user, result, unsupported]}
     state = {"current_room": "room", "chat_rooms": [room]}
     ns = dict(re=re, time=time, Optional=Optional, st=SimpleNamespace(session_state=state),
               log=logging.getLogger("boundary"), is_general_writing_request=is_general_writing_request,
@@ -46,13 +48,13 @@ def main() -> None:
               _clip_partition_text=lambda text, limit: text[:limit],
               _clip_for_model=lambda text: text, _script_perf_add=lambda *args: None)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "production_prompt", "exec"), ns)
-    history = [ordinary, result, unsupported, {"role": "user", "content": query}]
+    history = [ordinary, ordinary_reply, business_user, result, unsupported, {"role": "user", "content": query}]
     for _ in range(2):
         prompt = ns["build_messages_with_system"](history, user_text=query)
         content = str(prompt)
         assert "STALE_" not in content, content
         assert ordinary["content"] in content and query in content
-    assert room["messages"] == [ordinary, result, unsupported]
+    assert room["messages"] == [ordinary, ordinary_reply, business_user, result, unsupported]
     for explicit in ("현재표를 참고해서 이메일 작성", "위 결과를 바탕으로 이메일 작성", "방금 조회한 자료로 이메일 작성"):
         assert ns["is_sims_related_question"](explicit)
         prompt = ns["build_messages_with_system"]([], user_text=explicit)

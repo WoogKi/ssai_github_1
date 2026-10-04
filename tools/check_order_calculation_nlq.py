@@ -219,6 +219,41 @@ def run():
         p = resolve_registered_erp_table_nlq(f'환인 {expression} 발주 계산')['params']
         assert p['_registered_unlabeled_entity'] == '환인' and p['only_needed']
     print('PASS query mode phrases 4/4; aliases 6/6')
+    staff_mode_cases = (
+        ('발주담당자 신 발주계산', '발주해당자료만'),
+        ('발주담당자 신 조회구분 전체 발주계산', '전체'),
+        ('발주담당자 신 조회구분 확인필요 발주계산', '확인 필요'),
+        ('발주담당자 신 조회구분 확인 필요 발주계산', '확인 필요'),
+        ('발주담당자 신 조회구분 확인 발주계산', '확인 필요'),
+    )
+    for question, expected_mode in staff_mode_cases:
+        parsed = resolve_registered_erp_table_nlq(question, today=date(2026, 10, 3))
+        assert parsed['action'] == '발주 계산'
+        assert parsed['params']['order_staff_nm'] == '신', parsed
+        assert parsed['params']['query_mode'] == expected_mode, parsed
+        assert '조회구분' not in parsed['params']['order_staff_nm']
+    typo = resolve_registered_erp_table_nlq('발주담당자 신 조회구분 전채 발주계산', today=date(2026, 10, 3))
+    assert typo['params']['order_staff_nm'] == '신', typo
+    assert typo['params']['query_mode'] != '전체', typo
+    unlabeled = resolve_registered_erp_table_nlq('발주담당자 신 발주계산 확인', today=date(2026, 10, 3))
+    assert unlabeled['params']['query_mode'] == '발주해당자료만', unlabeled
+    print('PASS order-staff label boundary and query modes 6/6')
+    staff_period_cases = (
+        ('발주담당자 윤정아 발주조회 202609', 'order_staff_nm', '윤정아', '20260901', '20260930'),
+        ('발주담당자 202609 발주조회', 'order_staff_nm', '202609', None, None),
+        ('발주담당자 202609 발주조회 202608', 'order_staff_nm', '202609', '20260801', '20260831'),
+        ('제약담당자 김철수 발주조회 202609', 'pharma_staff_nm', '김철수', '20260901', '20260930'),
+        ('제약담당자 202609 발주조회', 'pharma_staff_nm', '202609', None, None),
+        ('발주조회 202609 발주담당자 윤정아', 'order_staff_nm', '윤정아', '20260901', '20260930'),
+    )
+    for question, key, name, date_from, date_to in staff_period_cases:
+        for resolver in (resolve_registered_erp_table_nlq, resolve_io_nlq):
+            parsed = resolver(question, today=date(2026, 10, 3))
+            assert parsed['action'] == '발주조회', parsed
+            assert parsed['params'][key] == name, parsed
+            if date_from:
+                assert (parsed['params']['date_from'], parsed['params']['date_to']) == (date_from, date_to), parsed
+    print('PASS order/pharma staff action and period boundary 6/6')
     cases = []
     ordinary = ['발주 조회', '발주 내역', '발주 현황', '발주 보여줘', '환인 발주 보여줘',
                 '제품코드 27656 발주 조회', '제약사 중외제약 발주 보여줘']
@@ -293,7 +328,8 @@ def run():
                  '제품코드 64063 조회구분 전체 발주 수량 계산'):
         _, sources = fixture()
         sent, requests = [], []
-        def service(q):
+        def service(params=None):
+            q = params
             requests.append(q)
             return get_order_calculation_result(q, source_loader=lambda p: sources)
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7), \
@@ -317,7 +353,8 @@ def run():
     for text, expected_names in staff_cases.items():
         _, sources = staff_fixture()
         sent, requests = [], []
-        def staff_service(q):
+        def staff_service(params=None):
+            q = params
             requests.append(q)
             return get_order_calculation_result(q, source_loader=lambda p: sources)
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7), \
@@ -342,7 +379,8 @@ def run():
     for text, expected_names in pharma_cases.items():
         _, sources = staff_fixture()
         sent, requests = [], []
-        def pharma_service(q):
+        def pharma_service(params=None):
+            q = params
             requests.append(q)
             return get_order_calculation_result(q, source_loader=lambda p: sources)
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7), \

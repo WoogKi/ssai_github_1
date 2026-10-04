@@ -6,6 +6,7 @@ from datetime import date
 import inspect
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -49,12 +50,13 @@ def _check(query: str, expected_name: str, expected_from: str, expected_to: str)
     consumed = io_nlq._consume_io_action_text(query, action)
     residual_after_period = io_nlq.strip_nlq_period_tokens_for_entity_residual(consumed)
     residual = str(params.pop("_registered_unlabeled_entity", "") or "")
-    resolved = io_nlq.resolve_unlabeled_io_entity_condition(
-        query,
-        action=action,
-        params=params,
-        residual_phrase=residual,
-    )
+    with patch.object(io_nlq, "_lookup_unlabeled_io_entity_candidates", return_value=[]):
+        resolved = io_nlq.resolve_unlabeled_io_entity_condition(
+            query,
+            action=action,
+            params=params,
+            residual_phrase=residual,
+        )
     final_params, policy = io_nlq.apply_nlq_default_period_policy(
         dict(resolved.get("params") or {}),
         action,

@@ -28,6 +28,8 @@ _FINAL_STATUSES = frozenset(
         "candidate_required",
         "unsupported",
         "routing_error",
+        "query_error",
+        "timeout",
         "not_found",
         "resolution_unavailable",
         "error",

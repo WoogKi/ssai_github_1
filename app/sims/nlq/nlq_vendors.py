@@ -1097,6 +1097,7 @@ def try_handle_vendors_nlq(
     def _push_vendor_text_local(
         *,
         message: str,
+        result_status: str = "no_data",
         owner_kw: str | None,
         ven_nm_kw: str | None,
         addr_kw: str | None,
@@ -1208,6 +1209,7 @@ def try_handle_vendors_nlq(
                 "master_nlq": True,
                 "domain": "vendors",
                 "nlq_query": txt,
+                "result_status": result_status,
                 "_force_push": True,
                 "_nlq_nonce": str(uuid.uuid4()),
                 "row_count": 0,
@@ -1807,6 +1809,7 @@ def try_handle_vendors_nlq(
                 "master_nlq": True,
                 "domain": "vendors",
                 "nlq_query": txt,
+                "result_status": "success",
                 "condition": query_summary or "전체",
                 "note": note,
                 "_force_push": True,
@@ -1850,6 +1853,7 @@ def try_handle_vendors_nlq(
         logger.exception("[nlq.vendors] failed")
         return _push_vendor_text_local(
             message="거래처 조회 중 오류가 발생했습니다. 조회조건을 다시 확인해 주세요.",
+            result_status="query_error",
             owner_kw=owner_kw,
             ven_nm_kw=ven_nm_kw,
             addr_kw=addr_kw,

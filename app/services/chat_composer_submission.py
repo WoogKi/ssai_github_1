@@ -5,6 +5,28 @@ from typing import Any
 
 
 PENDING_ATTACHMENT_SUBMISSION_KEY = "__chat_composer_pending_submission"
+PENDING_TEXT_DISPATCH_KEY = "__chat_composer_pending_text_dispatch"
+
+
+def queue_text_dispatch_after_echo(
+    state: MutableMapping[str, Any], *, text: str, context: Mapping[str, str]
+) -> None:
+    state[PENDING_TEXT_DISPATCH_KEY] = {
+        "text": str(text).strip(),
+        "context": {str(key): str(value or "") for key, value in context.items()},
+    }
+
+
+def consume_text_dispatch_after_echo(
+    state: MutableMapping[str, Any], *, context: Mapping[str, str]
+) -> str:
+    pending = state.pop(PENDING_TEXT_DISPATCH_KEY, None)
+    if not isinstance(pending, Mapping):
+        return ""
+    expected = {str(key): str(value or "") for key, value in context.items()}
+    if pending.get("context") != expected:
+        return ""
+    return str(pending.get("text") or "").strip()
 
 
 def queue_attachment_submission_event(

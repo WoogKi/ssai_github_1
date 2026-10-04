@@ -31,6 +31,19 @@ def operating_now(*, now: datetime | None = None) -> datetime:
         raise ValueError("Date/Time Tool reference time must be timezone-aware")
     return now.astimezone(OPERATING_TIMEZONE)
 
+
+def operating_llm_context(*, now: datetime | None = None) -> str:
+    """Anchor relative dates in ordinary model answers to this request's KST clock."""
+    reference = operating_now(now=now)
+    yesterday = reference.date() - timedelta(days=1)
+    tomorrow = reference.date() + timedelta(days=1)
+    return (
+        f"현재 기준시각: {reference:%Y-%m-%d %H:%M:%S} KST (Asia/Seoul). "
+        f"어제 {yesterday:%Y-%m-%d}, 오늘 {reference:%Y-%m-%d}, 내일 {tomorrow:%Y-%m-%d}. "
+        "실시간 날씨 등 연결된 조회 기능이 없는 정보는 확인한 것처럼 말하지 마세요."
+    )
+
+
 def week_range(reference: date, *, offset_weeks: int = 0) -> DateRange:
     start = reference - timedelta(days=reference.weekday()) + timedelta(weeks=offset_weeks)
     return DateRange(start=start, end=start + timedelta(days=6))

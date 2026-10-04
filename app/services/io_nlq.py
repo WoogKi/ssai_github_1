@@ -518,13 +518,13 @@ def extract_nlq_natural_period(
             _NLQ_PERIOD_KIND_KEY: period_kind,
         }
 
-    relative_month = re.search(r"(이번|지난)\s*(?:달|월)", raw)
+    relative_month = re.search(r"(?<![가-힣A-Za-z0-9])(이달|(?:이번|지난)\s*(?:달|월))(?![가-힣A-Za-z0-9])", raw)
     if relative_month:
         from app.services.datetime_tool import month_range
 
         period = month_range(
             current_day,
-            offset_months=-1 if relative_month.group(1) == "지난" else 0,
+            offset_months=-1 if relative_month.group(1).startswith("지난") else 0,
         )
         yyyymm = period.start.strftime("%Y%m")
         return {
@@ -581,10 +581,12 @@ def strip_nlq_period_expressions(text: str) -> str:
     """Remove period syntax before extracting an unlabeled business entity."""
     out = str(text or "")
     patterns = (
+        r"(?<![가-힣A-Za-z0-9])(?:19|20)\d{6}(?:\s*[~-]\s*(?:19|20)\d{6})?(?![가-힣A-Za-z0-9])",
+        r"(?<![가-힣A-Za-z0-9])(?:19|20)\d{2}[-./]\d{1,2}[-./]\d{1,2}(?:\s*[~-]\s*(?:19|20)\d{2}[-./]\d{1,2}[-./]\d{1,2})?(?![가-힣A-Za-z0-9])",
         r"(?:최근\s*)?(?:한\s*달|1\s*개월)",
         r"(?:오늘|어제|그저께|당일|하루|최근\s*1\s*일)",
         r"(?:이번|지난)\s*주(?:간)?",
-        r"(?:이번|지난)\s*(?:달|월)",
+        r"(?<![가-힣A-Za-z0-9])(?:이달|(?:이번|지난)\s*(?:달|월))(?![가-힣A-Za-z0-9])",
         r"(?<!\d)(?:19|20)\d{4}(?!\d)",
         r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
         r"(?<!\d)(?:19|20)\d{2}\s*년?(?!\d)",
@@ -1501,7 +1503,9 @@ def _trim_named_value(value: str) -> str:
 
     parts = v.split()
     kept: list[str] = []
-    for p in parts:
+    for index, p in enumerate(parts):
+        if re.match(r"^(?:이달|(?:이번|지난)\s*(?:달|월)|오늘|어제|그저께)(?:\s|$)", " ".join(parts[index:])):
+            break
         if _looks_like_date_token(p):
             break
         if p in _NAME_STOP_WORDS:
@@ -2228,18 +2232,80 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
     return candidate
 
 
+def has_unconsumed_detail_condition(text: str, action: str, params: Dict[str, Any]) -> bool:
+    """Reject an unbound detail subject before an unfiltered source query."""
+    if action not in {"입고명세 조회", "출고명세 조회"}:
+        return False
+    action_roots = ("입고", "매입") if action == "입고명세 조회" else ("출고", "매출")
+    if not any(root in text for root in action_roots):
+        return False
+    has_bound_name = any(clean_text(params.get(key)) for key in (
+        "ven_cd", "ven_nm", "physic_cd", "physic_nm", "maker_cd", "maker_nm",
+        "product_ven_cd", "product_ven_nm", "order_cd", "order_nm",
+        "buy_cd", "buy_nm", "nlq_unlabeled_name",
+        "stock_cd", "stock_cds", "stock_nm",
+    ))
+    if not has_bound_name and _extract_unlabeled_entity_phrase(text, action):
+        return False
+    residual = strip_nlq_period_tokens_for_entity_residual(_consume_io_action_text(text, action))
+    if has_bound_name:
+        # A detail label is consumed only when the existing parser bound its
+        # value. Keep unsupported labels in the residual so they still block.
+        product_code = clean_text(params.get("physic_cd"))
+        if product_code:
+            residual = re.sub(
+                rf"(?<![가-힣A-Za-z0-9])제품코드\s*[:=]?\s*{re.escape(product_code)}(?![가-힣A-Za-z0-9])",
+                " ", residual,
+            )
+        stock_codes = list(params.get("stock_cds") or [])
+        if len(stock_codes) == 1 and clean_text(params.get("stock_cd")) == clean_text(stock_codes[0]):
+            stock_clause = re.compile(
+                r"(?<![가-힣A-Za-z0-9])(?:재고위치코드|재고위치)\s*[:=]?\s*\d{1,6}(?:\s*[,/]\s*\d{1,6})*"
+            )
+            residual = stock_clause.sub(
+                lambda match: " " if _extract_stock_codes(match.group(0)) == stock_codes else match.group(0),
+                residual,
+            )
+        stock_name = clean_text(params.get("stock_nm"))
+        if stock_name and not stock_codes:
+            residual = re.sub(
+                rf"(?<![가-힣A-Za-z0-9])(?:재고위치명|재고위치|재고명)\s*[:=]?\s*{re.escape(stock_name)}(?![가-힣A-Za-z0-9])",
+                " ", residual,
+            )
+        for key in (
+            "ven_cd", "ven_nm", "physic_cd", "physic_nm", "maker_cd", "maker_nm",
+            "product_ven_cd", "product_ven_nm", "order_cd", "order_nm",
+            "buy_cd", "buy_nm", "nlq_unlabeled_name", "stock_nm",
+        ):
+            value = clean_text(params.get(key))
+            if value:
+                # A second action can be swallowed into a labelled name.
+                # Reuse the pure action parser on later value tokens before
+                # accepting that entire captured value as one condition.
+                for token in value.split()[1:]:
+                    other_action = resolve_io_nlq(token)
+                    if other_action and other_action.get("action"):
+                        return True
+                residual = re.sub(rf"(?<![가-힣A-Za-z0-9]){re.escape(value)}(?![가-힣A-Za-z0-9])", " ", residual)
+        residual = _EXPLICIT_NAME_LABEL_RE.sub(" ", residual)
+    residual = re.sub(r"(?:^|\s)(?:조회|검색|확인|보여줘|알려줘|전체|모든)(?=\s|$)", " ", residual)
+    return bool(re.search(r"[가-힣A-Za-z0-9]", residual))
+
+
+_EXPLICIT_NAME_LABEL_RE = re.compile(
+    r"(?:거래처(?:명|코드)?|매입처(?:명|코드)?|매출처(?:명|코드)?|실납처(?:명|코드)?|"
+    r"제조사(?:명|코드)?|제약사(?:명|코드)?|발주처(?:명|코드)?|"
+    r"제품명|품목명|상품명|제품(?!수불|재고|코드|명|그룹|구분|분류))\s*(?:[:=]|\s)"
+)
+
+
 def _has_explicit_name_label(text: str) -> bool:
     """Return whether the user explicitly chose one name-search semantic."""
     t = _norm(text)
     if not t:
         return False
 
-    return bool(re.search(
-        r"(?:거래처(?:명|코드)?|매입처(?:명|코드)?|매출처(?:명|코드)?|실납처(?:명|코드)?|"
-        r"제조사(?:명|코드)?|제약사(?:명|코드)?|발주처(?:명|코드)?|"
-        r"제품명|품목명|상품명|제품(?!수불|재고|코드|명|그룹|구분|분류))\s*(?:[:=]|\s)",
-        t,
-    ))
+    return bool(_EXPLICIT_NAME_LABEL_RE.search(t))
 
 
 def _log_entity_resolver(
@@ -2452,27 +2518,6 @@ def resolve_unlabeled_io_entity_condition(
     if not phrase:
         return {"status": "not_applicable", "params": out, "candidates": []}
 
-    if action == "입고예정조회":
-        # The registered R170/R180 expected-inbound query already applies its
-        # product-name LIKE filter. A partial product name need not resolve to
-        # one exact master row before that existing condition is used.
-        out["physic_nm"] = phrase
-        _log_entity_resolver(
-            action=action,
-            resolver_type="expected_inbound_product_name_like",
-            status="success",
-            candidate_count=0,
-            elapsed_ms=0,
-            final_decision="resolved_like",
-        )
-        return {
-            "status": "resolved",
-            "params": out,
-            "phrase": phrase,
-            "resolved_kind": "product_name_like",
-            "candidates": [],
-        }
-
     # Detail and inventory lists are multi-result searches.  They must not
     # resolve a name through master candidates: the service applies one OR LIKE
     # predicate over transaction vendor, product, and manufacturer names.
@@ -2530,6 +2575,21 @@ def resolve_unlabeled_io_entity_condition(
             "params": out,
             "phrase": phrase,
             "candidates": candidates,
+            "resolver_outcomes": outcomes,
+        }
+
+    if action == "입고예정조회" and not candidate_keys:
+        # Keep partial product-name search only when exact master candidates
+        # are absent; a verified vendor must retain its vendor role.
+        out["physic_nm"] = phrase
+        _log_entity_resolver(
+            action=action, resolver_type="expected_inbound_product_name_like",
+            status="success", candidate_count=0, elapsed_ms=0,
+            final_decision="resolved_like",
+        )
+        return {
+            "status": "resolved", "params": out, "phrase": phrase,
+            "resolved_kind": "product_name_like", "candidates": [],
             "resolver_outcomes": outcomes,
         }
 
@@ -2996,6 +3056,9 @@ def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
     if _has_explicit_all_stock_locations(text):
         stock_nm = ""
     stock_nm = _trim_io_named_value_at_next_label(stock_nm)
+    if stock_cds and stock_nm in stock_cds:
+        # A numeric stock code is not a location-name LIKE condition.
+        stock_nm = ""
 
     if ven_cd:
         params["ven_cd"] = ven_cd

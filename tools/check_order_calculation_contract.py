@@ -479,6 +479,48 @@ def test_panel_submission():
         assert len(calls) == 2
 
 
+def test_panel_nlq_order_staff_parity():
+    from streamlit.testing.v1 import AppTest
+    from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
+
+    script = "from app.sims.views.order_calculation_view import view_order_calculation\nview_order_calculation()"
+    calls = []
+    with patch("app.sims.views.order_calculation_view.render_product_master_filters", return_value={}), \
+         patch("app.sims.views.order_calculation_view.get_order_calculation_result",
+               side_effect=lambda params, **kwargs: calls.append(params) or {"action": "발주 계산", "final": True}):
+        app = AppTest.from_string(script).run()
+        staff_input = next(widget for widget in app.text_input if widget.label == "발주담당자")
+        staff_input.input("홍길동").run()
+        app.button[0].click().run()
+        assert not app.exception and len(calls) == 1
+
+    panel_params = calls[0]
+    nlq_params = resolve_registered_erp_table_nlq(
+        "발주담당자 홍길동 조회구분 전체 발주계산", today=date(2026, 9, 24)
+    )["params"]
+    assert panel_params["order_staff_nm"] == nlq_params["order_staff_nm"] == "홍길동"
+    assert "staff_nm" not in panel_params
+
+    params, sources = fixture()
+    other_base = sources["base"].copy()
+    other_base["제품코드"] = "00002"
+    sources["base"] = pd.concat([sources["base"], other_base], ignore_index=True)
+    other_demand = sources["demand"].copy()
+    other_demand["제품코드"] = "00002"
+    sources["demand"] = pd.concat([sources["demand"], other_demand], ignore_index=True)
+    other_supplier = sources["suppliers"].copy()
+    other_supplier["product_code"] = "00002"
+    other_supplier["recent_inbound_vendor_staff_name"] = "다른담당자"
+    sources["suppliers"] = pd.concat([sources["suppliers"], other_supplier], ignore_index=True)
+
+    panel_result = assemble_result({**params, **panel_params, "company_id": 7,
+                                    "order_date": params["order_date"], "query_mode": "전체",
+                                    "only_needed": False}, sources)
+    nlq_result = assemble_result({**params, **nlq_params, "company_id": 7}, sources)
+    assert panel_result["제품코드"].tolist() == nlq_result["제품코드"].tolist() == ["00001"]
+    pd.testing.assert_frame_equal(panel_result, nlq_result)
+
+
 def test_price_conflict_and_field_status():
     def history(*rows):
         return pd.DataFrame([{
@@ -624,6 +666,40 @@ def test_production_nlq_dispatch():
             make_ts=lambda: "fixture", next_seq=lambda: 1, logger=logging.getLogger("fixture"))
     assert handled and service.call_count == 1 and len(captured) == 1
     assert captured[0][1] == "발주 계산"
+    def internal_failure(*_args, **_kwargs):
+        error = TypeError("internal fixture failure")
+        error.source_call_count = 5
+        raise error
+    captured.clear()
+    with patch("app.services.order_calculation_service.get_order_calculation_result",
+               side_effect=internal_failure) as service, \
+         patch("app.ui.chat_middleware.push_sims_result_to_chat",
+               side_effect=lambda p, a: captured.append((p, a)) or p.get("meta", {})):
+        handled = _try_handle_io_nlq("발주 계산", room={}, session_state={},
+            make_ts=lambda: "fixture", next_seq=lambda: 1, logger=logging.getLogger("fixture"))
+    assert handled and service.call_count == 1 and len(captured) == 1
+    assert captured[0][0]["meta"]["source_call_count"] == 5
+    assert captured[0][0]["meta"]["result_status"] == "query_error"
+
+
+def test_failed_source_count_survives():
+    from contextlib import contextmanager
+
+    @contextmanager
+    def measured_request(**_kwargs):
+        yield {"queries": [{"status": "ready"}, {"status": "ready"}, {"status": "error"}]}
+
+    def fail(_params):
+        raise TypeError("execution failure")
+
+    with patch("app.services.order_calculation_service.get_current_company_id", return_value=7), \
+         patch("app.services.order_calculation_service.read_only_request", side_effect=measured_request):
+        try:
+            get_order_calculation_result({"company_id": 7, "order_date": "2026-09-14"}, source_loader=fail)
+        except TypeError as error:
+            assert error.source_call_count == 3
+        else:
+            raise AssertionError("source execution error was hidden")
 
 
 def test_editor_callback_ownership_and_cache():
@@ -816,7 +892,7 @@ def test_code_lookup_company_cache():
 
 
 if __name__ == "__main__":
-    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_closing_boundary_business_day_policy, test_full_scope_compact_representative_vendor_equality, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_editor_callback_ownership_and_cache)
+    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_closing_boundary_business_day_policy, test_full_scope_compact_representative_vendor_equality, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_panel_nlq_order_staff_parity, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_failed_source_count_survives, test_editor_callback_ownership_and_cache)
     tests += (test_empty_parameter_bridge_and_check_mode, test_snapshot_scope_to_demand_scope)
     tests += (test_code_lookup_company_cache,)
     tests += (test_excel_numeric_round_trip, test_production_editor_render_boundary)

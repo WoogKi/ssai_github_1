@@ -41,6 +41,7 @@ import warnings as py_warnings
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from unittest.mock import patch
 from typing import Any, Callable
 
 import pandas as pd
@@ -1269,12 +1270,13 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
     ):
         parsed_expected = io_nlq.resolve_io_nlq(query) or {}
         parsed_params = dict(parsed_expected.get("params") or {})
-        resolved_expected = io_nlq.resolve_unlabeled_io_entity_condition(
-            query,
-            action=str(parsed_expected.get("action") or ""),
-            params=parsed_params,
-            residual_phrase=str(parsed_params.get("_registered_unlabeled_entity") or ""),
-        )
+        with patch.object(io_nlq, "_lookup_unlabeled_io_entity_candidates", return_value=[]):
+            resolved_expected = io_nlq.resolve_unlabeled_io_entity_condition(
+                query,
+                action=str(parsed_expected.get("action") or ""),
+                params=parsed_params,
+                residual_phrase=str(parsed_params.get("_registered_unlabeled_entity") or ""),
+            )
         results.append(
             CheckResult(
                 f"expected-inbound product name remains an existing LIKE condition: {query}",

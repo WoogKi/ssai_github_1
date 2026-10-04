@@ -8,6 +8,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.services.erp_table_nlq import is_order_calculation_request, resolve_registered_erp_table_nlq
 from app.services.order_calculation_contract import OrderConditions, closing_day_relation
+from app.services.chat_composer_submission import (
+    consume_text_dispatch_after_echo,
+    queue_text_dispatch_after_echo,
+)
 from app.sims.nlq.nlq_router import (
     _build_analytics_params,
     _resolve_analytics_action,
@@ -84,6 +88,37 @@ def test_text_composer_callback_dedup_contract() -> None:
         "if immediate_echo_message_id and str(m.get(\"id\") or \"\") == immediate_echo_message_id:" in source,
         "same-run history duplicate guard missing",
     )
+    preflight = source.index("pending_text_dispatch = consume_text_dispatch_after_echo(")
+    dispatch = source.index("if user_input and user_input.strip():")
+    _assert(preflight < dispatch, "text must render in a completed pass before dispatch")
+    _assert(
+        source.index("if staged_text_submission:\n    st.rerun()") > source.index("composer_submission = st.chat_input("),
+        "preflight rerun must follow the first-pass chat render",
+    )
+    _assert(
+        "if composer_text not in (staged_text_submission, pending_text_dispatch):" in source,
+        "returned composer text must not requeue the active submission",
+    )
+
+
+def test_text_preflight_one_shot() -> None:
+    context = {"room_id": "room-a", "company_id": "4", "user_id": "1"}
+    state = {}
+    events = []
+    queue_text_dispatch_after_echo(state, text="발주담당자 신 발주계산", context=context)
+    events.append("user_bubble")
+    assert not state.get("messages") and not state.get("assistant_messages")
+    claimed = consume_text_dispatch_after_echo(state, context=context)
+    assert claimed == "발주담당자 신 발주계산"
+    events.append("service")
+    events.append("assistant")
+    assert consume_text_dispatch_after_echo(state, context=context) == ""
+    assert events == ["user_bubble", "service", "assistant"]
+    queue_text_dispatch_after_echo(state, text=claimed, context=context)
+    assert consume_text_dispatch_after_echo(state, context={**context, "company_id": "3"}) == ""
+    assert consume_text_dispatch_after_echo(state, context=context) == ""
+    queue_text_dispatch_after_echo(state, text=claimed, context=context)
+    assert consume_text_dispatch_after_echo(state, context=context) == claimed
 
 
 def main() -> None:
@@ -91,6 +126,7 @@ def main() -> None:
     test_order_calculation_natural_phrases()
     test_closing_day_month_end_boundary()
     test_text_composer_callback_dedup_contract()
+    test_text_preflight_one_shot()
     print("PASS: user-log routing and chat echo contract")
 
 

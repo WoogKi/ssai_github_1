@@ -278,8 +278,8 @@ def main() -> int:
         ("발주담당자 김 발주조회", "발주조회", {"order_staff_nm": "김"}),
         ("제약담당자 김 발주조회", "발주조회", {"pharma_staff_nm": "김"}),
         ("발주담당자 202609 발주조회", "발주조회", {"order_staff_nm": "202609"}),
-        ("종근당 전문약 발주 조회", "발주조회", {"order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}),
-        ("9월 종근당 전문약 발주 조회", "발주조회", {"date_from": "20260901", "date_to": "20260930", "order_vendor_nm": "종근당", "product_di_semantic_group": "insurance"}),
+        ("종근당 전문약 발주 조회", "발주조회", {"order_vendor_nm": "종근당", "product_prescription_semantic": "prescription"}),
+        ("9월 종근당 전문약 발주 조회", "발주조회", {"date_from": "20260901", "date_to": "20260930", "order_vendor_nm": "종근당", "product_prescription_semantic": "prescription"}),
         ("단가적용처 한미 발주 조회", "발주조회", {"cost_apply_nm": "한미"}),
         ("재고적용처 한미 입고예정 조회", "입고예정조회", {"stock_apply_nm": "한미"}),
         ("입고예정", "입고예정조회", {}),
@@ -289,12 +289,12 @@ def main() -> int:
         ("입고예정자료 조회", "입고예정조회", {}),
         ("입고예정자료조회", "입고예정조회", {}),
         ("입고예정 자료 조회", "입고예정조회", {}),
-        ("전문약 입고예정", "입고예정조회", {"product_di_semantic_group": "insurance"}),
-        ("일반약 입고예정", "입고예정조회", {"product_di_semantic_group": "non_insurance"}),
-        ("ETC 입고예정", "입고예정조회", {"product_di_semantic_group": "insurance"}),
-        ("OTC 입고예정", "입고예정조회", {"product_di_semantic_group": "non_insurance"}),
-        ("전문의약품 입고예정", "입고예정조회", {"product_di_semantic_group": "insurance"}),
-        ("일반의약품 입고예정", "입고예정조회", {"product_di_semantic_group": "non_insurance"}),
+        ("전문약 입고예정", "입고예정조회", {"product_prescription_semantic": "prescription"}),
+        ("일반약 입고예정", "입고예정조회", {"product_prescription_semantic": "otc"}),
+        ("ETC 입고예정", "입고예정조회", {"product_prescription_semantic": "prescription"}),
+        ("OTC 입고예정", "입고예정조회", {"product_prescription_semantic": "otc"}),
+        ("전문의약품 입고예정", "입고예정조회", {"product_prescription_semantic": "prescription"}),
+        ("일반의약품 입고예정", "입고예정조회", {"product_prescription_semantic": "otc"}),
         ("삼진 입고예정 조회", "입고예정조회", {}),
         ("입고중 제품 조회", "입고예정조회", {"status_code": "2"}),
     )
@@ -418,6 +418,11 @@ def main() -> int:
             params={"mode": "expected"},
             residual_phrase="아리바정",
         )
+    with patch("app.services.io_nlq._lookup_unlabeled_io_entity_candidates", return_value=[]):
+        partial_resolution = resolve_unlabeled_io_entity_condition(
+            "아리바 입고예정 조회", action="입고예정조회",
+            params={"mode": "expected"}, residual_phrase="아리바",
+        )
     if (
         vendor_resolution.get("params", {}).get("order_vendor_cd") != "00001"
         or vendor_resolution.get("params", {}).get("order_vendor_nm") != "하나제약"
@@ -425,6 +430,8 @@ def main() -> int:
         failures.append(f"unlabelled expected-inbound vendor role changed: {vendor_resolution}")
     if product_resolution.get("params", {}).get("physic_nm") != "아리바정" or product_resolution.get("params", {}).get("order_vendor_nm"):
         failures.append(f"unlabelled expected-inbound product became a vendor: {product_resolution}")
+    if partial_resolution.get("resolved_kind") != "product_name_like" or partial_resolution.get("params", {}).get("physic_nm") != "아리바":
+        failures.append(f"unlabelled partial product fallback changed: {partial_resolution}")
 
     for text in ("입고예정", "입고예정 조회", "입고예정자료 조회", "입고예정자료조회", "입고예정 자료 조회"):
         parsed = resolve_registered_erp_table_nlq(text, today=monday) or {}

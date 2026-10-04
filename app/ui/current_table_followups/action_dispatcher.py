@@ -204,6 +204,9 @@ def classify_current_table_followup_intent(query: str) -> str:
     if "집계" in intent_compact:
         return "dataframe_table"
 
+    if intent_compact.startswith("왜") and any(word in intent_compact for word in ("나왔", "계산됐", "산정됐")):
+        return "llm_analysis"
+
     # "분석"은 현재표에 연결된 facts/context를 사용한 LLM 분석이다.
     # 표 집계가 필요하면 위의 명시적 "집계"/"목록"/"정렬" 요청이 처리한다.
     if "분석" in intent_compact:

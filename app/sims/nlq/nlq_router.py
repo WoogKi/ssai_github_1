@@ -6167,6 +6167,7 @@ def _try_handle_io_nlq(
     try:
         from app.services.io_nlq import (
             _extract_unlabeled_entity_phrase,
+            has_unconsumed_detail_condition,
             has_current_stock_executable_structured_filter,
             remove_outbound_frequency_phrase,
             remove_product_inventory_grade_phrases,
@@ -6301,6 +6302,26 @@ def _try_handle_io_nlq(
     parsed_condition_keys = set(params)
 
     _trace("parsed", trace_action=action, trace_params=params)
+
+    if has_unconsumed_detail_condition(txt_for_io, action, params):
+        message = (
+            "조회 대상이나 분석 종류를 확정하지 못했습니다. 조건 없는 전체 조회는 실행하지 않았습니다. "
+            "거래처·제약사·제품 중 대상 종류와 원하는 조회를 지정해 주세요."
+        )
+        payload = {
+            "final": True, "type": "text", "title": "SIMS 조회조건 확인",
+            "action": action, "params": params, "data": message, "message": message,
+            "meta": {"nlq": True, "nlq_query": txt, "result_status": "input_required",
+                     "service_call_skipped": True, "source_call_count": 0,
+                     "nlq_trace_request_id": trace_request_id, "_force_push": True,
+                     "_nlq_nonce": str(uuid.uuid4())},
+        }
+        push_sims_result_to_chat(payload, action)
+        _trace("finish", trace_action=action, trace_params=params,
+               result_status="input_required", rows=0, source_stage="condition_unresolved",
+               source_call_count=0)
+        logger.info("[sims.help] reason=unconsumed_detail_condition action=%s erp_call_count=0", action)
+        return True
 
     try:
         from app.sims.meta.erp_table_feature_registry import get_action_spec
@@ -6643,16 +6664,19 @@ def _try_handle_io_nlq(
         return False
 
     def _call_any(fn, params):
+        from inspect import signature
+
         try:
+            sig = signature(fn)
+        except (TypeError, ValueError):
             return fn(params=params)
-        except TypeError:
+        for args, kwargs in (((), {"params": params}), ((params,), {}), ((), params), ((), {})):
             try:
-                return fn(params)
+                sig.bind(*args, **kwargs)
             except TypeError:
-                try:
-                    return fn(**params)
-                except TypeError:
-                    return fn()
+                continue
+            return fn(*args, **kwargs)
+        raise TypeError("등록된 조회 서비스의 인자 계약이 일치하지 않습니다.")
 
     def _wrap_df_payload(df: pd.DataFrame, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if df is None:
@@ -6887,7 +6911,11 @@ def _try_handle_io_nlq(
                 payload["params"] = params
 
         except Exception as exc:
-            _trace("error", trace_action=action, trace_params=params, error=exc, source_stage="display")
+            _trace(
+                "error", trace_action=action, trace_params=params, error=exc,
+                source_stage="display",
+                source_call_count=int(getattr(exc, "source_call_count", 0) or 0),
+            )
             logger.exception("[nlq.router] io service failed action=%r module=%r", action, module_name)
             payload = {
                 "final": True,
@@ -6902,7 +6930,7 @@ def _try_handle_io_nlq(
                     "execution_status": "query_error",
                     "row_count": 0,
                     "row_count_total": 0,
-                    "source_call_count": 0,
+                    "source_call_count": int(getattr(exc, "source_call_count", 0) or 0),
                     "source_call_attempt_count": 1,
                     "tableless_result": True,
                     "notice_codes": ["query_error"],
@@ -7366,7 +7394,12 @@ def try_handle_nlq(
     - 성공하면: room.messages에 assistant 메시지(표/텍스트)를 추가하고 True
     - 실패/미해당이면: False (기존 LLM 흐름 진행)
     """
-    raw = (user_text or "").strip()
+    original = (user_text or "").strip()
+    # A leading invocation word is not an entity value. Keep the caller's
+    # original text in chat history; only the executable NLQ text is normalized.
+    raw = re.sub(r"(?i)^sims\s+", "", original).strip()
+    if raw != original:
+        logger.info("[nlq.router] invocation_prefix_removed original_chars=%s", len(original))
     if not raw:
         return False
     from app.services.erp_table_nlq import is_order_calculation_request
