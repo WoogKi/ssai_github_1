@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from typing import Any, Optional
+from xml.etree import ElementTree
 
 import pandas as pd
 
@@ -151,6 +152,8 @@ _ORDER_UNIT_HISTORY_MINIMAL_COLUMNS = """
 """.strip()
 
 _ORDER_PRICE_SCOPE_MAX_CODES = 200
+_ORDER_UNIT_SCOPE_CHUNK_SIZE = 1000
+_ORDER_UNIT_SCOPE_MAX_CHUNKS = 25  # Retained for the historical chunk-baseline diagnostic.
 
 
 def _clean(value: Any) -> str:
@@ -249,6 +252,9 @@ def normalize_order_params(params: Optional[dict[str, Any]] = None, *, mode: str
         out["status_code"] = out["status_codes"][0]
     out["stock_cd_list"] = _clean_codes(source.get("stock_cd_list") or source.get("stock_cds"))
     out["order_price_product_code_list"] = _clean_codes(source.get("order_price_product_code_list"))
+    out["order_unit_product_code_list"] = _clean_codes(source.get("order_unit_product_code_list"))
+    out["_order_unit_selected_scope"] = bool(source.get("_order_unit_selected_scope", False))
+    out["pending_product_code_list"] = _clean_codes(source.get("pending_product_code_list"))
     out["_order_price_history_minimal"] = bool(source.get("_order_price_history_minimal", False))
     out["_order_unit_history_minimal"] = bool(source.get("_order_unit_history_minimal", False))
     out["include_blank_stock_cd"] = bool(source.get("include_blank_stock_cd", False))
@@ -305,10 +311,14 @@ def _filters(params: dict[str, Any], *, mode: str) -> tuple[list[str], list[Any]
             business_dates = _expected_business_dates(params)
             clauses.append(f"H.Rd17_Or_YyMmDd IN ({','.join('?' for _ in business_dates)})")
             values.extend(business_dates)
+        pending_codes = params.get("pending_product_code_list") or ()
+        if pending_codes and len(pending_codes) <= _ORDER_PRICE_SCOPE_MAX_CODES:
+            clauses.append("D.Rd18_Physic_Cd IN (" + ",".join("?" for _ in pending_codes) + ")")
+            values.extend(pending_codes)
     else:
         clauses.extend(("H.Rd17_Or_YyMmDd >= ?", "H.Rd17_Or_YyMmDd <= ?"))
         values.extend((params["date_from"], params["date_to"]))
-        if params.get("_order_price_history"):
+        if params.get("_order_price_history") or params.get("_order_unit_history_minimal"):
             # Order calculation price history accepts only the established normal states.
             status_codes = _order_status_codes(params.get("status_codes")) or ("1", "2", "3")
             clauses.append(f"D.Rd18_Or_Di IN ({','.join('?' for _ in status_codes)})")
@@ -404,9 +414,17 @@ def _use_order_unit_history_minimal(params: dict[str, Any]) -> bool:
         "product_unit_price", "product_final_price_date", "product_add_user_nm", "product_mod_user_nm",
         "product_add_date_from", "product_add_date_to", "product_mod_date_from", "product_mod_date_to",
     )
+    selected_scope = bool(params.get("_order_unit_selected_scope") and params.get("order_unit_product_code_list"))
+    master_only = {
+        "physic_cd", "physic_nm", "maker_cd", "maker_nm", "product_keyword", "insu_cd", "barcode",
+        "product_group_nm", "product_di_nm", "product_di_semantic_group",
+        "product_prescription_semantic", "product_class_nm", "product_unit_price",
+        "product_final_price_date", "product_add_user_nm", "product_mod_user_nm",
+        "product_add_date_from", "product_add_date_to", "product_mod_date_from", "product_mod_date_to",
+    }
     return bool(
         params.get("_order_unit_history_minimal")
-        and not any(_clean(params.get(key)) for key in unsupported)
+        and not any(_clean(params.get(key)) for key in unsupported if not selected_scope or key not in master_only)
         and not params.get("has_outstanding")
         and not params.get("due_date_from")
         and not params.get("due_date_to")
@@ -421,6 +439,22 @@ def _order_unit_history_minimal_filters(params: dict[str, Any]) -> tuple[list[st
         "H.Rd17_Or_YyMmDd <= ?",
     ]
     values: list[Any] = [params["date_from"], params["date_to"]]
+    status_codes = _order_status_codes(params.get("status_codes")) or ("1", "2", "3")
+    clauses.append(f"D.Rd18_Or_Di IN ({','.join('?' for _ in status_codes)})")
+    values.extend(status_codes)
+    if params.get("_order_unit_selected_scope"):
+        codes = params.get("order_unit_product_code_list") or ()
+        if not codes:
+            raise ValueError("단위이력 선택 제품 범위가 비어 있습니다.")
+        scope_xml = ElementTree.Element("codes")
+        for code in codes:
+            ElementTree.SubElement(scope_xml, "c").text = code
+        clauses.append(
+            "D.Rd18_Physic_Cd IN (SELECT X.C.value('(text())[1]', 'varchar(32)') "
+            "FROM (SELECT CAST(? AS xml) AS [scope]) AS S "
+            "CROSS APPLY S.[scope].nodes('/codes/c') AS X(C))"
+        )
+        values.append(ElementTree.tostring(scope_xml, encoding="unicode"))
     for key, expression in (
         ("order_vendor_cd", "D.Rd18_OrVen_Cd"),
         ("cost_apply_cd", "D.Rd18_Cost_Apply_Cd"),
@@ -444,10 +478,10 @@ def _order_unit_history_minimal_filters(params: dict[str, Any]) -> tuple[list[st
     return clauses, values
 
 
-def _prepare(df: pd.DataFrame, *, mode: str) -> pd.DataFrame:
+def _prepare(df: pd.DataFrame, *, mode: str, copy_frame: bool = True) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return df
-    out = df.copy()
+    out = df.copy() if copy_frame else df
     def quality(value: Any) -> str:
         return "정상" if _date_value(value) else "비정상"
     out["발주일자 품질상태"] = out["발주일자"].map(quality)
@@ -459,9 +493,12 @@ def _prepare(df: pd.DataFrame, *, mode: str) -> pd.DataFrame:
 
 def get_order_df(params: Optional[dict[str, Any]] = None, *, mode: str = "order") -> pd.DataFrame:
     qparams = normalize_order_params(params, mode=mode)
+    unit_codes = qparams.get("order_unit_product_code_list") or ()
     clauses, values = _filters(qparams, mode=mode)
     minimal_history = mode == "order" and qparams.get("_order_price_history_minimal")
     minimal_unit_history = mode == "order" and _use_order_unit_history_minimal(qparams)
+    selected_unit_scope = bool(minimal_unit_history and qparams.get("_order_unit_selected_scope") and unit_codes)
+    large_unit_scope = selected_unit_scope and len(unit_codes) > _ORDER_UNIT_SCOPE_CHUNK_SIZE
     if minimal_history:
         sql = f"""WITH PriceHistory AS (
 SELECT
@@ -479,17 +516,31 @@ FROM PriceHistory
 WHERE [__order_price_rank] = 1
 ORDER BY [발주일자] DESC, [발주거래처코드], [발주순번], [상세순번]"""
     elif minimal_unit_history:
-        sql = f"""SELECT TOP {int(qparams['top'])}
+        if large_unit_scope:
+            clauses, values = _order_unit_history_minimal_filters({**qparams, "_order_unit_selected_scope": False})
+        top = "" if selected_unit_scope else f"TOP {int(qparams['top'])}"
+        order_by = "" if large_unit_scope else "ORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"
+        sql = f"""SELECT {top}
 {_ORDER_UNIT_HISTORY_MINIMAL_COLUMNS}
 {_ORDER_PRICE_HISTORY_MINIMAL_JOINS}
 WHERE {' AND '.join(clauses)}
-ORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"""
+{order_by}"""
     else:
         sql = f"""SELECT TOP {int(qparams['top'])}\n{_SELECT_COLUMNS}\n{_JOINS}\nWHERE {' AND '.join(clauses)}\nORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"""
-    out = _prepare(execute_bound_select(sql, values), mode=mode)
+    source = execute_bound_select(sql, values)
+    raw_source_rows = len(source)
+    if large_unit_scope:
+        selected = set(unit_codes)
+        normalized_codes = source["제품코드"].fillna("").astype(str).str.strip()
+        source = source.loc[normalized_codes.isin(selected)].copy()
+        del normalized_codes
+    out = _prepare(source, mode=mode, copy_frame=not large_unit_scope)
+    del source
     if isinstance(out, pd.DataFrame):
         out.attrs["order_history_query_mode"] = (
             "price_fallback_bounded_minimal" if minimal_history
+            else "unit_inference_r170_r180_unscoped_python" if large_unit_scope
+            else "unit_inference_r170_r180_scoped_sql" if selected_unit_scope
             else "unit_inference_r170_r180_minimal" if minimal_unit_history
             else "registered_order_display"
         )
@@ -498,6 +549,19 @@ ORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"""
             if minimal_history and len(qparams.get("order_price_product_code_list") or ()) <= _ORDER_PRICE_SCOPE_MAX_CODES
             else 0
         )
+        if selected_unit_scope:
+            key = ["제품코드", "발주일자", "발주거래처코드", "발주순번", "상세순번"]
+            duplicate_count = int(out.duplicated(key).sum()) if not out.empty else 0
+            out.attrs["order_unit_history_complete_scope"] = duplicate_count == 0
+            out.attrs["order_unit_scope_applied"] = True
+            out.attrs["order_unit_scope_duplicate_count"] = duplicate_count
+            out.attrs["order_unit_raw_source_rows"] = raw_source_rows
+            out.attrs["order_unit_scope_out_rows"] = raw_source_rows - len(out)
+            out.attrs["order_unit_physical_source_calls"] = 1
+        else:
+            out.attrs["order_unit_history_complete_scope"] = False
+        out.attrs["order_unit_scope_product_count"] = len(unit_codes)
+        out.attrs["order_unit_scope_chunk_count"] = 0
     return out
 
 

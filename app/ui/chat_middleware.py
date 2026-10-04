@@ -774,7 +774,7 @@ def _chat_log_nlq_table_render(
     fast: bool,
 ) -> None:
     try:
-        log.info(
+        log.debug(
             "[chat.nlq.table] render action=%s rows=%s table_key=%s small=%s fast=%s",
             action_name,
             rows,
@@ -783,7 +783,7 @@ def _chat_log_nlq_table_render(
             fast,
         )
         if fast:
-            log.info(
+            log.debug(
                 "[chat.nlq.table] fast table mode action=%s rows=%s cols=%s cells=%s",
                 action_name,
                 rows,
@@ -791,7 +791,7 @@ def _chat_log_nlq_table_render(
                 rows * cols,
             )
         else:
-            log.info(
+            log.debug(
                 "[chat.nlq.table] small table style enabled action=%s rows=%s cols=%s",
                 action_name,
                 rows,
@@ -6622,7 +6622,7 @@ def _should_full_render_sims_table(item: Dict[str, Any], meta: Dict[str, Any], u
     render_path = str(st.session_state.get("__sims_table_render_path") or "").strip()
     if _is_old_sims_table_force_rendered(item, meta, uid):
         try:
-            log.info(
+            log.debug(
                 "[old_table.render] message_id=%s table_key=%s mode=full reason=forced current_source_key=%s current_source_action=%s",
                 str(item.get("id") or ""),
                 str(meta.get("table_key") or item.get("table_key") or "").strip(),
@@ -6699,7 +6699,7 @@ def _render_old_sims_table_placeholder(
     try:
         table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
         reason = _ui_rerun_reason() or "old_table"
-        log.info(
+        log.debug(
             "[chat.history.table_skip] reason=%s action=%s table_key=%s rows=%s",
             reason,
             action_name,
@@ -6712,7 +6712,7 @@ def _render_old_sims_table_placeholder(
 
     force_key = _old_sims_table_force_key(item, meta, uid)
     try:
-        log.info(
+        log.debug(
             "[old_table.render] message_id=%s table_key=%s mode=placeholder current_source_key=%s current_source_action=%s",
             str(item.get("id") or ""),
             str(meta.get("table_key") or item.get("table_key") or "").strip(),
@@ -7016,7 +7016,7 @@ def _prune_old_sims_table_history(
                     removed,
                 )
             if input_keys or removed:
-                log.info(
+                log.debug(
                     "[old_table.prune] container=%s new_table_key=%s previous_current_source_key=%s input=%s protected=%s removed=%s",
                     container_name,
                     str(new_table_key or ""),
@@ -7253,7 +7253,9 @@ def render_pending_chat_items(area, room: Optional[Dict[str, Any]] = None) -> No
 
     with area:
         for item in pending:
+            previous_render_path = ss.get("__sims_table_render_path")
             try:
+                ss["__sims_table_render_path"] = "live"
                 _render_chat_item(item, target=area)
                 room_obj = room or _get_current_room_from_session()
                 if isinstance(room_obj, dict):
@@ -7271,6 +7273,11 @@ def render_pending_chat_items(area, room: Optional[Dict[str, Any]] = None) -> No
                     )
             except Exception as exc:
                 log.warning("[chat.render.pending] item render failed error_type=%s", type(exc).__name__)
+            finally:
+                if previous_render_path is None:
+                    ss.pop("__sims_table_render_path", None)
+                else:
+                    ss["__sims_table_render_path"] = previous_render_path
 
 def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     """
@@ -7629,7 +7636,7 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                         action_name,
                     )
                     if _chat_is_nlq_table_meta(meta):
-                        log.info(
+                        log.debug(
                             "[chat.nlq.table] stash export table_key=%s rows=%s",
                             table_key,
                             len(df_full_for_export),
@@ -7740,7 +7747,7 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                     try:
                         source_key_now = str(ss.get("__sims_current_table_source_key") or "").strip()
                         if source_key_now == str(table_key):
-                            log.info(
+                            log.debug(
                                 "[chat.nlq.table] promoted current source action=%s table_key=%s rows=%s",
                                 action_name,
                                 table_key,
@@ -9699,7 +9706,7 @@ def _should_render_sims_message_once(item: Dict[str, Any], meta: Dict[str, Any],
     matched_key = next((k for k in candidate_keys if k in rendered), "")
     if matched_key:
         try:
-            log.info(
+            log.debug(
                 "[chat.render.dedupe] skip duplicate sims message key=%s action=%s table_key=%s",
                 matched_key,
                 action,
@@ -9713,7 +9720,7 @@ def _should_render_sims_message_once(item: Dict[str, Any], meta: Dict[str, Any],
         if k:
             rendered.add(k)
     try:
-        log.info(
+        log.debug(
             "[chat.render.dedupe] render sims message key=%s action=%s table_key=%s",
             key,
             action,

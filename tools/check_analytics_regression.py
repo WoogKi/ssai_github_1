@@ -6662,7 +6662,29 @@ def run_basic_checks() -> list[CheckResult]:
             has_no_open_assignment = '"__sims_open",\n            "__sims_open_ui"' not in main_src and 'ss["__sims_open"] = False' not in main_src
             room_switch_block = main_src[main_src.find("if picked and picked != ss.current_room:"):main_src.find("cur_name = id_to_name.get", main_src.find("if picked and picked != ss.current_room:"))]
             has_no_direct_close_in_room_switch = "_close_sims_panel_for_room_change()" not in room_switch_block
-            has_render_block = 'reason == "chat_room_change"' in main_src and 'reason == "download_prepare" and selected_now.get("action") != "발주 계산"' in main_src and "should_render = False" in main_src
+            render_gate_nodes = [
+                node for node in ast.walk(ast.parse(main_src))
+                if isinstance(node, ast.If)
+                and len(node.body) == 1
+                and isinstance(node.body[0], ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "should_render"
+                        for target in node.body[0].targets)
+                and isinstance(node.body[0].value, ast.Constant)
+                and node.body[0].value.value is False
+                and "reason" in ast.unparse(node.test)
+            ]
+            def _render_allowed_on(reason_value: str) -> bool:
+                namespace = {"reason": reason_value, "should_render": True}
+                for gate in render_gate_nodes:
+                    exec(compile(ast.fix_missing_locations(ast.Module(body=[gate], type_ignores=[])),
+                                 "<panel-render-gate>", "exec"), namespace)
+                return namespace["should_render"]
+            has_render_block = (
+                bool(render_gate_nodes)
+                and not _render_allowed_on("chat_room_change")
+                and not _render_allowed_on("download_prepare")
+                and _render_allowed_on("sims_panel_open")
+            )
             has_room_reason = '"chat_room_change"' in main_src
             has_switch_total = 'switch_total = float(stats.get("event_to_main_elapsed") or 0.0) + float(stats.get("history_elapsed") or 0.0)' in main_src
             has_switch_event_id = '"__chat_room_switch_event_id"' in main_src and "event_id=%s" in room_switch_block

@@ -361,6 +361,108 @@ def decimal_or_none(value: Any) -> Decimal | None:
         return None
 
 
+def _exact_three_month_averages(demand: Mapping[str, Any], reference: date,
+                                recent: Decimal | None, previous: Decimal | None,
+                                completed_months: int) -> tuple[Decimal | None, Decimal | None]:
+    """Recover exact thirds from the six existing integral monthly quantities."""
+    if completed_months < 6 or recent is None or previous is None:
+        return recent, previous
+    year, month = reference.year, reference.month
+    values: list[Decimal] = []
+    for _ in range(6):
+        month -= 1
+        if month == 0:
+            year, month = year - 1, 12
+        value = decimal_or_none(demand.get(f"{year:04d}-{month:02d} 수량"))
+        if value is None or value != value.to_integral_value():
+            return recent, previous
+        values.append(value)
+    exact_recent = sum(values[:3], Decimal(0)) / Decimal(3)
+    exact_previous = sum(values[3:], Decimal(0)) / Decimal(3)
+    if float(exact_recent) != float(recent) or float(exact_previous) != float(previous):
+        return recent, previous
+    return exact_recent, exact_previous
+
+
+def _trend_display_label(adjustment: Decimal, reason: str) -> str:
+    labels = {
+        "current_month_actual_pace": "판정불가(당월실적기반)",
+        "frequency_F_new_product_excluded": "판정불가(신규품목)",
+        "frequency_X_no_recent_outbound_excluded": "판정불가(최근출고없음)",
+        "insufficient_six_completed_months": "판정불가(이전3개월자료없음)",
+        "previous_3m_non_positive": "판정불가(이전3개월자료없음)",
+    }
+    if reason in labels:
+        return labels[reason]
+    return "증가" if adjustment > 0 else "감소" if adjustment < 0 else "유지"
+
+
+def _display_quantity(value: Any) -> str:
+    number = decimal_or_none(value)
+    return format(number, ",f").rstrip("0").rstrip(".") if number is not None and number % 1 else (
+        format(number, ",.0f") if number is not None else "자료 없음"
+    )
+
+
+def _order_reason(row: Mapping[str, Any], horizon_days: int) -> str:
+    missing = []
+    if row["계산상태"] == "수요/재고 사용자확인":
+        if row["수요근거"] == "수요근거 없음":
+            missing.append("수요근거 없음")
+        if row["추세판정"] in {"판정불가(신규품목)", "판정불가(최근출고없음)"}:
+            missing.append({"판정불가(신규품목)": "신규품목 출고이력 부족",
+                            "판정불가(최근출고없음)": "최근 3개월 정상출고 없음"}[row["추세판정"]])
+        if row["적용 필요예정수량"] is None and not missing:
+            missing.append("적용기간 수요자료 확인 필요")
+        if row["재고수량"] is None:
+            missing.append("현재고 자료 확인 필요")
+        if row["입고예정수량"] is None:
+            missing.append("입고예정 자료 확인 필요")
+    parts = [row["계산상태"], *missing]
+    trigger = row.get("발주trigger")
+    triggered = trigger is not None and not pd.isna(trigger) and bool(trigger)
+    raw = decimal_or_none(row.get("계산 발주수량"))
+    recommended = decimal_or_none(row.get("추천 발주수량"))
+    unit = decimal_or_none(row.get("발주단위"))
+    policy = str(row.get("수량조정정책") or "")
+    if trigger is not None and not pd.isna(trigger) and not triggered:
+        parts.append("안전재고 초과—발주 대기")
+    elif triggered and recommended is not None:
+        parts.append("안전재고 이하—발주 판단")
+    if row["안전재고 기준수량"] is not None:
+        parts.append(f"안전기준 {_display_quantity(row['안전재고 기준수량'])}")
+    if row["적용 필요예정수량"] is not None:
+        parts.append(f"적용 필요 {horizon_days}영업일 {_display_quantity(row['적용 필요예정수량'])}")
+    parts.extend((f"현재고 {_display_quantity(row['재고수량'])}",
+                  f"입고예정 {_display_quantity(row['입고예정수량'])}"))
+    if raw is not None:
+        parts.append(f"가용재고 차감 원계산 {_display_quantity(raw)}")
+    if recommended is not None:
+        if triggered and raw is not None and raw > 0 and policy and policy != "미적용":
+            if policy == "고가 조정단위1":
+                policy_reason = "고가 정책으로 조정단위1 적용"
+            elif policy == "기본 조정단위10":
+                policy_reason = "기본 조정단위10 적용"
+            elif policy == "확정 이력단위":
+                policy_reason = "확정 이력단위 적용"
+            else:
+                policy_reason = "발주이력 완전성 확인 중"
+            rounding = str(row.get("수량정수화") or "")
+            if rounding in {"올림", "내림"}:
+                policy_reason += f" / {'증가 추세' if rounding == '올림' else '증가 외'} {rounding}"
+            minimum = row.get("최소수량 적용")
+            if minimum is not None and not pd.isna(minimum) and bool(minimum):
+                policy_reason += " / " + ("구색 확보 최소10" if policy == "기본 조정단위10" else "최소 조정단위 1회분")
+            parts.append(f"{policy_reason} / 발주단위 {_display_quantity(unit) if unit is not None else '미확정'}")
+        parts.append(f"추천 {_display_quantity(recommended)}")
+        parts.append(f"사용자 입력 {_display_quantity(row.get('실제 발주수량'))}")
+        difference = decimal_or_none(row.get("추천대비수정수량"))
+        if difference is not None:
+            parts.append(f"추천대비 수정차이 {_display_quantity(difference)}")
+        parts.append("ERP 미등록")
+    return " / ".join(parts)
+
+
 def _master(params):
     from app.services.product_master_filter_contract import (
         add_named_management_only_exclusion,
@@ -436,7 +538,7 @@ def build_order_price_history_params(source_params: dict, *, reference: date) ->
 
 
 def build_order_unit_history_params(source_params: dict, *, reference: date) -> dict:
-    """Preserve the established one-month R170/R180 source for order-unit inference."""
+    """Read one three-calendar-month unit source; select recent evidence in Python."""
     history = build_pending_params(source_params)
     # Staff scope selects the products being calculated.  The historical
     # ordering unit remains valid regardless of which staff member entered an
@@ -444,12 +546,61 @@ def build_order_unit_history_params(source_params: dict, *, reference: date) -> 
     history.pop("order_staff_nm", None)
     history.pop("pharma_staff_nm", None)
     history.update({
-        "date_from": (pd.Timestamp(reference) - pd.DateOffset(months=1)).strftime("%Y%m%d"),
+        "date_from": (pd.Timestamp(reference) - pd.DateOffset(months=3)).strftime("%Y%m%d"),
         "date_to": reference.strftime("%Y%m%d"),
         "status_codes": ["1", "2", "3"],
         "_order_unit_history_minimal": True,
     })
     return history
+
+
+def _infer_unit_from_windows(history: list[dict], *, recent_start: str, period: list[str],
+                             recent_complete: bool = True, full_complete: bool = True) -> tuple[Decimal | None, str, int]:
+    """Keep one-month authority when confirmed; expand only insufficient evidence."""
+    recent = [row for row in history if recent_start <= str(row.get('발주일자') or '').strip() <= period[1]]
+    if not recent_complete:
+        return None, f"발주이력 완전성 사용자확인 / 기간 {recent_start}~{period[1]}", len(recent)
+    unit, reason = infer_order_unit(recent)
+    adopted = [recent_start, period[1]]
+    considered = recent
+    if unit is None and reason in {
+        '단위 산정기간 내 발주이력 없음', '반복 발주일 부족', '최소 발주수량 반복 부족',
+    }:
+        if not full_complete:
+            return None, f"발주이력 완전성 사용자확인 / 기간 {period[0]}~{period[1]}", len(recent)
+        unit, reason = infer_order_unit(history, period_label='최근3개월')
+        adopted = period
+        considered = history
+        if unit is not None and recent:
+            recent_min = min(Decimal(str(row['발주수량'])) for row in recent)
+            recent_min_days = {str(row.get('발주일자') or '').strip() for row in recent
+                               if Decimal(str(row['발주수량'])) == recent_min}
+            if len(recent_min_days) >= 2 and recent_min != unit:
+                unit, reason = None, '최근 최소 발주수량 변화 사용자확인'
+    order_days = len({str(row.get('발주일자') or '').strip() for row in considered})
+    repeat_days = (
+        len({str(row.get('발주일자') or '').strip() for row in considered
+             if Decimal(str(row.get('발주수량'))) == unit}) if unit is not None else 0
+    )
+    evidence = f"기간 {adopted[0]}~{adopted[1]} / 발주일 {order_days}일"
+    if unit is not None:
+        evidence += f" / 관측최소 {unit} ({repeat_days}일 반복)"
+    return unit, f"{reason} / {evidence}", len(recent)
+
+
+def _unit_history_completeness(frame: pd.DataFrame, *, recent_start: str, top: int) -> tuple[bool, bool]:
+    """A capped newest-first read may still contain the whole recent month."""
+    if frame.attrs.get('order_unit_scope_duplicate_count', 0):
+        return False, False
+    if frame.empty:
+        return True, True
+    key = ['제품코드', '발주일자', '발주거래처코드', '발주순번', '상세순번']
+    dates = frame['발주일자'].fillna('').astype(str).str.strip()
+    recent = frame.loc[dates.ge(recent_start)]
+    limit_hit = len(frame) >= top and not frame.attrs.get('order_unit_history_complete_scope', False)
+    full_complete = not limit_hit and not frame.duplicated(key).any()
+    recent_complete = (not limit_hit or dates.min() < recent_start) and not recent.duplicated(key).any()
+    return recent_complete, full_complete
 
 
 def build_order_price_history_window_params(
@@ -477,6 +628,13 @@ def _filter_order_price_history_products(frame: pd.DataFrame, product_codes: lis
         return frame.iloc[0:0].copy()
     normalized_codes = frame["제품코드"].fillna("").astype(str).str.strip()
     return frame.loc[normalized_codes.isin(selected)].copy()
+
+
+def _without_master_resolved_semantics(query: dict, *, enabled: bool) -> dict:
+    if not enabled:
+        return query
+    return {key: value for key, value in query.items()
+            if key not in {"product_prescription_semantic", "product_di_semantic_group"}}
 
 
 def _contract_purchase_price_map(frame: pd.DataFrame) -> dict[tuple[str, str], Decimal]:
@@ -622,6 +780,10 @@ def load_sources(params: dict) -> dict:
     profile = load_dashboard_profile_checked(company_id=params["company_id"])
     defaults = normalize_company_default_conditions(profile.profile)
     vendor_lookback_days = int(defaults.get("major_purchase_vendor_days", 90))
+    vendor_period = [
+        (reference - timedelta(days=max(1, vendor_lookback_days) + 1)).strftime('%Y%m%d'),
+        reference.strftime('%Y%m%d'),
+    ]
     scope_started = time.perf_counter()
     scope_authority = None
     if order_scope_active(params):
@@ -632,6 +794,10 @@ def load_sources(params: dict) -> dict:
         )
         frame = filter_base_by_order_scope(frame, scope_authority, params)
     selected_codes = _normalized_product_codes(frame)
+    master_semantics_resolved = bool(
+        source_params.get("product_prescription_semantic")
+        or source_params.get("product_di_semantic_group")
+    )
     timings['representative_vendor_scope_filter'] = (time.perf_counter() - scope_started) * 1000
     stage_evidence['early_scope'] = {
         "label": _EVIDENCE_STAGE_LABELS['early_scope'],
@@ -684,6 +850,8 @@ def load_sources(params: dict) -> dict:
             vendor_lookback_days=vendor_lookback_days, input_rows=len(selected_codes))
     if isinstance(suppliers, pd.DataFrame):
         stage_evidence['representative_vendor'].update({
+            "configured_days": vendor_lookback_days,
+            "source_period": vendor_period,
             "input_rows": len(candidate_codes),
             "source_rows": int(suppliers.attrs.get("inbound_source_rows", 0)),
             "query_elapsed_ms": int(suppliers.attrs.get("inbound_query_elapsed_ms", 0)),
@@ -708,9 +876,12 @@ def load_sources(params: dict) -> dict:
     timings['forecast_source_representation'] = demand.attrs.get('forecast_source_representation', 'legacy')
     from app.services.analytics_sales_trend_service import get_outbound_customer_counts_df
     from app.services.rddbc170_rddbc180_order_service import get_order_df, normalize_order_params
-    current_customer_counts = call('current_customer_source', get_outbound_customer_counts_df, {**demand_params,
+    customer_params = _without_master_resolved_semantics({**demand_params,
         'date_from': reference.replace(day=1).strftime('%Y%m%d'),
-        'date_to': reference.strftime('%Y%m%d')}, input_rows=len(selected_codes))
+        'date_to': reference.strftime('%Y%m%d')}, enabled=master_semantics_resolved)
+    customer_params['order_product_code_list'] = selected_codes
+    current_customer_counts = call('current_customer_source', get_outbound_customer_counts_df,
+                                   customer_params, input_rows=len(selected_codes))
     processing_started = time.perf_counter()
     customer_counts = (
         current_customer_counts.set_index('제품코드')['거래처수'].astype(int).to_dict()
@@ -756,23 +927,37 @@ def load_sources(params: dict) -> dict:
             )
     contract_prices = _contract_purchase_price_map(contracts.get("df", pd.DataFrame()))
     cost_apply_code = str(params.get("cost_apply_cd") or "").strip()
-    unit_history_params = build_order_unit_history_params(source_params, reference=reference)
-    order_history_unit = call(
+    unit_history_params = _without_master_resolved_semantics(
+        build_order_unit_history_params(source_params, reference=reference),
+        enabled=master_semantics_resolved,
+    )
+    unit_history_params['order_unit_product_code_list'] = selected_codes
+    unit_history_params['_order_unit_selected_scope'] = True
+    unit_recent_start = (pd.Timestamp(reference) - pd.DateOffset(months=1)).strftime('%Y%m%d')
+    order_history_unit_source = call(
         'order_history_unit_source', get_order_df, unit_history_params,
         mode='order', input_rows=len(selected_codes),
     )
-    order_history_unit_complete = len(order_history_unit) < normalize_order_params(
-        unit_history_params, mode='order'
-    )['top']
-    if (
-        not order_history_unit.empty
-        and order_history_unit.duplicated(['발주일자', '발주거래처코드', '발주순번', '상세순번']).any()
-    ):
-        order_history_unit_complete = False
+    order_history_recent_complete, order_history_unit_complete = _unit_history_completeness(
+        order_history_unit_source, recent_start=unit_recent_start,
+        top=normalize_order_params(unit_history_params, mode='order')['top'],
+    )
+    order_history_unit = (
+        _filter_order_price_history_products(order_history_unit_source, selected_codes)
+        if master_semantics_resolved and not order_history_unit_source.attrs.get('order_unit_scope_applied')
+        else order_history_unit_source
+    )
     if isinstance(order_history_unit, pd.DataFrame):
         stage_evidence['order_history_unit_source'].update({
             'query_mode': order_history_unit.attrs.get('order_history_query_mode', 'registered_order_display'),
             'dataframe_shape': list(order_history_unit.shape),
+            'source_rows': int(order_history_unit_source.attrs.get('order_unit_raw_source_rows', len(order_history_unit_source))),
+            'scoped_rows': len(order_history_unit),
+            'scope_out_rows': int(order_history_unit_source.attrs.get('order_unit_scope_out_rows', 0)),
+            'duplicate_count': int(order_history_unit_source.attrs.get('order_unit_scope_duplicate_count', 0)),
+            'selected_scope_complete': bool(order_history_unit_source.attrs.get('order_unit_history_complete_scope')),
+            'selected_scope_product_count': int(order_history_unit_source.attrs.get('order_unit_scope_product_count', 0)),
+            'physical_source_calls': int(order_history_unit_source.attrs.get('order_unit_physical_source_calls', 0)),
         })
     unresolved_after_contract = _unresolved_order_price_codes(
         selected_codes,
@@ -873,8 +1058,33 @@ def load_sources(params: dict) -> dict:
     )
     if any(not frame.empty and frame.duplicated(['발주일자', '발주거래처코드', '발주순번', '상세순번']).any() for frame in history_source_frames):
         order_price_history_complete = False
-    pending_params = build_pending_params(source_params)
-    pending = call('pending_four_business_days', get_expected_inbound_product_totals, pending_params, input_rows=len(selected_codes))
+    pending_params = _without_master_resolved_semantics(
+        build_pending_params(source_params), enabled=master_semantics_resolved,
+    )
+    pending_params['pending_product_code_list'] = selected_codes
+    pending_source = call('pending_four_business_days', get_expected_inbound_product_totals,
+                          pending_params, input_rows=len(selected_codes))
+    pending = (_filter_order_price_history_products(pending_source, selected_codes)
+               if master_semantics_resolved else pending_source)
+    stage_evidence['pending_four_business_days'].update({
+        'source_rows': len(pending_source), 'scoped_rows': len(pending),
+    })
+    log.info(
+        '[order_calculation.downstream_scope] company_id=%s selected_products=%s semantic_resolved=%s '
+        'customer_scope_mode=%s unit_query_mode=%s raw_source_rows=%s scoped_rows=%s scope_out_rows=%s '
+        'duplicate_count=%s complete=%s physical_source_calls=%s unit_elapsed_ms=%s '
+        'pending_source_rows=%s pending_scoped_rows=%s',
+        params['company_id'], len(selected_codes), master_semantics_resolved,
+        current_customer_counts.attrs.get('order_product_scope_mode', 'unknown'),
+        order_history_unit_source.attrs.get('order_history_query_mode', 'unknown'),
+        int(order_history_unit_source.attrs.get('order_unit_raw_source_rows', len(order_history_unit_source))),
+        len(order_history_unit), int(order_history_unit_source.attrs.get('order_unit_scope_out_rows', 0)),
+        int(order_history_unit_source.attrs.get('order_unit_scope_duplicate_count', 0)),
+        order_history_unit_complete,
+        stage_evidence['order_history_unit_source']['source_call_count'],
+        stage_evidence['order_history_unit_source']['elapsed_ms'],
+        len(pending_source), len(pending),
+    )
     end = reference + timedelta(days=max(120, int(params["target_days"]) * 4 + 62))
     end = end.replace(day=monthrange(end.year, end.month)[1])
     authority = call('official_calendar', load_official_holidays, start_date=reference.replace(day=1), end_date=end, input_rows=0)
@@ -903,6 +1113,7 @@ def load_sources(params: dict) -> dict:
             "order_history_1y": order_history_1y,
             "order_history_unit": order_history_unit,
             "order_history_complete": order_history_unit_complete,
+            "order_history_recent_complete": order_history_recent_complete,
             "order_history_price_complete": order_price_history_complete,
             "order_history_price_truncated": not order_price_history_complete,
             "order_price_3m": order_price_3m, "order_price_1y": order_price_1y,
@@ -913,6 +1124,9 @@ def load_sources(params: dict) -> dict:
             "order_history_1y_period": ([history_1y_params['date_from'], history_1y_params['date_to']]
                                         if history_1y_params else []),
             "order_history_unit_period": [unit_history_params['date_from'], unit_history_params['date_to']],
+            "order_history_unit_recent_period": [unit_recent_start, unit_history_params['date_to']],
+            "representative_vendor_period": vendor_period,
+            "representative_vendor_days": vendor_lookback_days,
             "diagnostic_candidate_product_codes": candidate_codes,
             "diagnostic_scoped_product_codes": selected_codes,
             "diagnostic_stage_evidence": stage_evidence}
@@ -1096,6 +1310,9 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
             recent_3m_avg = decimal_or_none(demand.get("최근3개월평균출고수량"))
         previous_3m_avg = decimal_or_none(demand.get("직전3개월평균수요수량"))
         completed_months = int(decimal_or_none(demand.get("완료월수")) or 0)
+        recent_3m_avg, previous_3m_avg = _exact_three_month_averages(
+            demand, reference, recent_3m_avg, previous_3m_avg, completed_months,
+        )
         frequency_grade = str(basic.get("출고빈도등급") or demand.get("출고빈도등급") or "").strip().upper()
         trend_rate, trend_adjustment, trend_reason = demand_trend_adjustment(
             recent_3m_avg=recent_3m_avg,
@@ -1120,8 +1337,10 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
             else None
         )
         if closing_cycle_next_month_policy:
-            hd = next_month_daily * Decimal(conditions.target_days) if next_month_daily is not None else None
-            sd = next_month_daily * Decimal(conditions.safety_days) if next_month_daily is not None else None
+            hd = (max(Decimal(0), next_month_plan) * conditions.target_days / next_month_business_days
+                  if next_month_daily is not None else None)
+            sd = (max(Decimal(0), next_month_plan) * conditions.safety_days / next_month_business_days
+                  if next_month_daily is not None else None)
             missing = () if next_month_daily is not None else (next_month_key,)
             safety_missing = missing
         else:
@@ -1147,8 +1366,10 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
                 and current_actual is not None and current_actual > 0 and elapsed):
             daily = current_actual / Decimal(elapsed)
             # Actual-pace fallback is allowed only within the known current month.
-            hd = daily * len(horizon) if all(d.month == reference.month for d in horizon) else None
-            sd = daily * len(safety) if all(d.month == reference.month for d in safety) else None
+            hd = (current_actual * len(horizon) / Decimal(elapsed)
+                  if all(d.month == reference.month for d in horizon) else None)
+            sd = (current_actual * len(safety) / Decimal(elapsed)
+                  if all(d.month == reference.month for d in safety) else None)
             basis = "실적기반"
             fallback_reason = "current_month_actual_pace"
             missing = tuple(m for m in missing if m != reference.strftime("%Y%m"))
@@ -1162,15 +1383,22 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         demand_ms += (time.perf_counter() - demand_started) * 1000
         unit_started = time.perf_counter()
         selected_history = history_groups.get((code, vendor_code), [])
-        unit, unit_reason = infer_order_unit(selected_history) if vendor_code else (None, '대표매입처 사용자확인')
-        if not sources.get('order_history_complete', False):
+        unit_period = sources.get('order_history_unit_period') or []
+        recent_period = sources.get('order_history_unit_recent_period') or []
+        if vendor_code and len(unit_period) == 2 and len(recent_period) == 2:
+            unit, unit_reason, recent_order_count = _infer_unit_from_windows(
+                selected_history, recent_start=recent_period[0], period=unit_period,
+                recent_complete=bool(sources.get('order_history_recent_complete', sources.get('order_history_complete', False))),
+                full_complete=bool(sources.get('order_history_complete', False)),
+            )
+        elif vendor_code:
+            unit, unit_reason = infer_order_unit(selected_history)
+            recent_order_count = len(selected_history)
+        else:
+            unit, unit_reason, recent_order_count = None, '대표매입처 사용자확인', 0
+        if len(unit_period) != 2 and not sources.get('order_history_complete', False):
             unit, unit_reason = None, '발주이력 완전성 사용자확인'
         unit_ms += (time.perf_counter() - unit_started) * 1000
-        quantity_started = time.perf_counter()
-        quantity = calculate_quantities(stock=stock if stock is not None else Decimal(0),
-                                       pending=pending_qty, safety_demand=sd if stock is not None else None,
-                                       horizon_demand=hd, unit=unit, increasing=increasing)
-        quantity_ms += (time.perf_counter() - quantity_started) * 1000
         price_started = time.perf_counter()
         price = None
         price_source = "미확정"
@@ -1195,6 +1423,13 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         if price is None:
             price_source, price_decision = "미확정", "REVIEW"
         price_ms += (time.perf_counter() - price_started) * 1000
+        quantity_started = time.perf_counter()
+        default_unit_allowed = "완전성 사용자확인" not in unit_reason
+        quantity = calculate_quantities(stock=stock if stock is not None else Decimal(0),
+                                       pending=pending_qty, safety_demand=sd if stock is not None else None,
+                                       horizon_demand=hd, unit=unit, increasing=increasing,
+                                       default_unit_allowed=default_unit_allowed, price=price)
+        quantity_ms += (time.perf_counter() - quantity_started) * 1000
         row = {**basic, **quantity, "회사": params["company_id"], "발주일자": effective_order_date,
                "입력 발주일자": input_order_date,
                "영업일 보정 여부": bool(sources.get("business_date_shifted", False)),
@@ -1219,7 +1454,8 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
                "경과 영업일수": elapsed, "기준 1영업일 예상수량": daily,
                "horizon 필요예정수량": hd,
                "수요 사용자확인월": ",".join(sorted(set(missing + safety_missing))),
-               "발주단위": unit, "추세": "증가" if increasing else "유지/감소/증가근거 부족", "최근 발주횟수": len(selected_history),
+               "발주단위": unit,
+               "추세": "증가" if increasing else "유지/감소/증가근거 부족", "최근 발주횟수": recent_order_count,
                "당월 출고 거래처수": sources.get('current_customer_counts', {}).get(code, 0) if 'current_customer_counts' in sources else None,
                "발주단위 근거": unit_reason,
                "조달주의": '' if unit is not None else unit_reason, "발주단가": price, "단가출처": price_source,
@@ -1235,13 +1471,19 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
                "raw_order_qty": quantity.get("계산 발주수량"),
                "final_recommended_qty": quantity.get("추천 발주수량"),
                "fallback_reason": fallback_reason}
+        row["추세판정"] = _trend_display_label(trend_adjustment, fallback_reason)
+        row["최근3개월평균"] = recent_3m_avg
+        row["이전3개월평균"] = previous_3m_avg
+        row["추세증감률"] = trend_rate * 100 if trend_rate is not None else None
+        row["수요조정률"] = trend_adjustment * 100
+        row["가용예정재고"] = stock + pending_qty if stock is not None and pending_qty is not None else None
         row["추천대비수정수량"] = Decimal(0) if quantity["추천 발주수량"] is not None else None
         actual = quantity["실제 발주수량"]
         row.update(amounts(actual if actual is not None else Decimal(0), price) if actual is not None else amounts(Decimal(0), None))
         row["계산상태"] = "수요/재고 사용자확인" if actual is None else (
             "발주해당" if actual > 0 else "발주 필요 없음")
-        row["발주사유/계산근거"] = f"{row['계산상태']} / 안전기준 {sd} / 적용 필요 {len(horizon)}영업일 {hd} / 현재고 {stock} / 입고예정 {pending_qty}"
-        if unit is not None and quantity['발주trigger'] and quantity['계산 발주수량'] is not None and 0 < quantity['계산 발주수량'] < unit:
+        row["발주사유/계산근거"] = _order_reason(row, len(horizon))
+        if quantity['수량조정정책'] == '확정 이력단위' and quantity['최소수량 적용']:
             row['조달주의'] = '최소 발주단위 1회분 적용/원 필요수량보다 큰 추천수량 확인'
         if not vendor_code:
             row["조달주의"] += " / 대표매입처 사용자확인"
@@ -1331,7 +1573,15 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
         token = _source_measurement.set(measurement)
         try:
             source_query = {k: v for k, v in q.items() if k not in ("query_mode", "only_needed")}
-            sources = source_loader(source_query)
+            try:
+                sources = source_loader(source_query)
+            except Exception as exc:
+                exc.source_call_count = len(measurement["queries"])
+                log.error(
+                    "[order_calculation.source_error] company_id=%s source_call_count=%s error_class=%s",
+                    q["company_id"], exc.source_call_count, type(exc).__name__,
+                )
+                raise
             for field in ("cost_apply", "stock_apply"):
                 if source_query.get(field + "_nm"):
                     q[field + "_nm"] = source_query[field + "_nm"]
@@ -1375,26 +1625,34 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
         frame = assemble_result(q, sources)
         order_filter_diagnostics = dict(frame.attrs.get("order_filter_diagnostics") or {})
     timings = sources.setdefault("performance_ms", {})
-    primary = ["제품코드", "제품명", "규격", "추세", "계산 발주수량", "추천 발주수량", "실제 발주수량",
-               "재고수량", "입고예정수량", "발주처", "발주담당자", "제약담당자", "매입거래처수",
-               "발주단가", "발주금액(부가세포함)",
-               "월 기준 예상수량", "안전재고 기준수량", "적용 필요예정수량",
-               "수요근거", "기준 1영업일 예상수량", "발주단위",
-               "당월 출고 거래처수", "3개월출고거래처수", "당월 정상출고수량", "3개월출고수량", "품목기여등급", "품목손익등급", "출고빈도등급",
-               "제약사", "계산상태", "단가출처", "조달주의"]
+    primary = ["제품코드", "제품명", "규격", "발주처", "출고빈도등급", "추세판정", "발주단위",
+               "계산 발주수량", "추천 발주수량", "실제 발주수량", "입고예정수량", "재고수량",
+               "당월 정상출고수량", "최근3개월평균", "이전3개월평균", "추세증감률", "수요조정률",
+               "월 기준 예상수량", "가용예정재고", "안전재고 기준수량", "적용 필요예정수량",
+               "발주단위 근거", "제약사", "발주담당자", "단가적용처", "재고적용처",
+               "발주단가", "단가출처", "단가판정",
+               "발주금액(부가세포함)", "계산상태", "조달주의", "발주사유/계산근거"]
     detail = ["기준 1영업일 예상수량", "당월 정상출고수량", "당월 출고 거래처수", "3개월출고수량",
               "3개월출고거래처수", "매입거래처수", "발주담당자코드", "발주담당자",
               "제약담당자코드", "제약담당자",
               "발주단위", "발주단위 근거", "단가출처",
               "단가적용처코드", "단가적용처", "재고적용처코드", "재고적용처", "계산상태", "조달주의",
               "품목기여등급", "품목손익등급", "출고빈도등급"]
-    # Keep the compact business header deterministic even when optional 규격 is absent.
-    export_order = list(dict.fromkeys(primary[:16] + detail + list(frame.columns)))
+    if frame.empty and not len(frame.columns):
+        frame = pd.DataFrame(columns=primary)
+    else:
+        required = [column for column in primary if column != "규격"]
+        missing_columns = [column for column in required if column not in frame]
+        if missing_columns:
+            raise ValueError(f"발주 계산 결과 필수 컬럼 누락: {', '.join(missing_columns)}")
+        if "규격" not in frame:
+            frame["규격"] = ""
+    export_order = list(dict.fromkeys(primary + detail + list(frame.columns)))
     result_projection_started = time.perf_counter()
     frame = frame.loc[:, [c for c in export_order if c in frame]]
     timings["result_projection"] = (time.perf_counter() - result_projection_started) * 1000
     projection_started = time.perf_counter()
-    display = frame.head(300).loc[:, [c for c in primary if c in frame]].copy()
+    display = frame.head(300).loc[:, primary].copy()
     timings['display_projection'] = (time.perf_counter() - projection_started) * 1000
     summary = f"결과: 발주 계산 {len(frame):,}건 | 화면 {len(display):,}건 | Excel/CSV 전체 {len(frame):,}건\n수량은 추천이며 ERP 등록되지 않습니다."
     if frame.empty and int(order_filter_diagnostics.get("only_needed_before_rows") or 0) > 0:
@@ -1458,9 +1716,12 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
             "expected_inbound_source": dict(sources.get("pending", pd.DataFrame()).attrs),
             "current_outbound_customer_authority": "Analytics R120 정상출고 상세/당월/제품별 distinct 거래처코드",
             "outbound_customer_3m_authority": "approved profile-exact Snapshot 2.1",
-            "order_unit_authority": "R170/R180 최근1개월 대표매입처/반복발주 v1",
+            "order_unit_authority": "R170/R180 최근1개월 확정 우선/근거부족 시 최근3개월 대표매입처/반복발주 v2",
             "order_history_period": sources.get('order_history_period'),
             "order_history_unit_period": sources.get('order_history_unit_period'),
+            "order_history_unit_recent_period": sources.get('order_history_unit_recent_period'),
+            "representative_vendor_period": sources.get('representative_vendor_period'),
+            "representative_vendor_days": sources.get('representative_vendor_days'),
             "order_price_authority": "R170/R180 정상상태(1,2,3)/단가적용처+제품/최근3개월 후 최근1년/latest order grain",
             "order_demand_contract": "monthly_forecast_full_business_days_v1",
             "closing_day_demand_contract": "before_current_month_on_after_next_month_product_quantity_forecast_v2",

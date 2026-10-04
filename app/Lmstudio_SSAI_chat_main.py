@@ -908,7 +908,7 @@ def _log_chat_room_selector(
     widget_value_type: str = "",
     value_in_room_ids: bool = False,
 ) -> None:
-    log.info(
+    log.debug(
         "[chat.room.selector] phase=%s widget_key=%s widget_room_id=%s canonical_room_id=%s requested_room_id=%s previous_room_id=%s page=%s room_kind=%s rerun_reason=%s request_token=%s stale_value_corrected=%s mismatch_detected=%s widget_value_type=%s value_in_room_ids=%s",
         phase,
         widget_key,
@@ -13670,7 +13670,7 @@ with chat_history_container:
         stats["history_elapsed"] = history_elapsed
         stats["total_elapsed"] = history_elapsed + float(stats.get("panel_elapsed") or 0.0)
         log.info(
-            "[ui.rerun.perf] reason=%s history_messages=%s history_tables_rendered=%s history_tables_skipped=%s history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
+            "[ui.rerun.summary] reason=%s history_messages=%s history_tables_rendered=%s history_tables_skipped=%s history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
             stats.get("reason"),
             stats.get("history_messages"),
             stats.get("history_tables_rendered"),
@@ -13680,7 +13680,7 @@ with chat_history_container:
             float(stats.get("total_elapsed") or 0.0),
         )
         if stats.get("event"):
-            log.info(
+            log.debug(
                 "[ui.event_to_rerun] event_id=%s event=%s event_to_main_elapsed=%.3fs history_elapsed=%.3fs panel_elapsed=%.3fs total_elapsed=%.3fs",
                 stats.get("event_id") or "",
                 stats.get("event"),
@@ -13716,7 +13716,7 @@ with chat_history_container:
                 + session_compact_elapsed
             )
             unattributed = max(0.0, total_script - measured_total)
-            log.info(
+            log.debug(
                 "[ui.script_path.perf] event_id=%s reason=%s bootstrap=%.3fs require_login=%.3fs sidebar=%.3fs chat_rooms=%.3fs room_selector=%.3fs sims_fragment=%.3fs prepass=%.3fs main_gate=%.3fs session_compact=%.3fs render_list=%.3fs chat_context=%.3fs unattributed=%.3fs total=%.3fs",
                 stats.get("event_id") or "",
                 stats.get("reason"),
@@ -13881,9 +13881,7 @@ with chat_history_container:
                     or ((run_flag or inner_submit) and not already_rendered_this_run)
                 )
                 reason = st.session_state.get("__ui_rerun_reason_current")
-                if reason == "chat_room_change" or (
-                    reason == "download_prepare" and selected_now.get("action") != "발주 계산"
-                ):
+                if reason in {"chat_room_change", "download_prepare"}:
                     should_render = False
 
                 if should_render:

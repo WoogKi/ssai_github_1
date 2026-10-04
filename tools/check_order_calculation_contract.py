@@ -64,8 +64,25 @@ def test_monthly_allocation():
 
 
 def test_quantities():
+    for raw, increasing, expected in (
+        ("0", False, 0), ("0.7", False, 10), ("4", False, 10),
+        ("9.9", False, 10), ("10", False, 10), ("10.1", False, 10),
+        ("14", False, 10), ("53.04", False, 50), ("60", False, 60),
+        ("66", False, 60), ("0.7", True, 10), ("10", True, 10),
+        ("10.1", True, 20), ("53.04", True, 60), ("66", True, 70),
+    ):
+        assert recommend_quantity(D(raw), None, increasing=increasing) == expected
+    for unit in (1, 5, 10, 14, 96):
+        assert recommend_quantity(D("53.04"), D(unit), increasing=True) == (
+            ((D("53.04") / D(unit)).to_integral_value(rounding="ROUND_CEILING")) * D(unit)
+        )
+    assert recommend_quantity(D("0.25"), None, increasing=False) == 10
+    assert recommend_quantity(D("0.25"), None, increasing=False,
+                              default_unit_allowed=False) == 0
+    assert calculate_quantities(stock=D(1), pending=D(0), safety_demand=D(1),
+                                horizon_demand=D(5))["추천 발주수량"] == 10
     result = calculate_quantities(stock=D(-2), pending=D(10), safety_demand=D(3), horizon_demand=D(50))
-    assert result["계산 발주수량"] == 42 and result["추천 발주수량"] == 42
+    assert result["계산 발주수량"] == 42 and result["추천 발주수량"] == 40
     assert recommend_quantity(D(43), D(10), increasing=True) == 50
     assert recommend_quantity(D(43), D(10), increasing=False) == 40
     assert recommend_quantity(D(3), D(10), increasing=False) == 10
@@ -75,7 +92,7 @@ def test_quantities():
     assert recommend_quantity(D(26), D(10), increasing=True) == 30
     assert calculate_quantities(stock=D(100), pending=D(0), safety_demand=D(3), horizon_demand=D(150), unit=D(100))['추천 발주수량'] == 0
     assert recommend_quantity(D(3), D(10), increasing=True) == 10
-    for raw, expected_up, expected_down in (("12.4", 13, 12), ("0.7", 1, 0)):
+    for raw, expected_up, expected_down in (("12.4", 20, 10), ("0.7", 10, 10)):
         assert recommend_quantity(D(raw), None, increasing=True) == expected_up
         assert recommend_quantity(D(raw), None, increasing=False) == expected_down
     try:
@@ -83,7 +100,7 @@ def test_quantities():
         raise AssertionError("fractional actual quantity accepted")
     except ValueError:
         pass
-    assert recommend_quantity(D(43), None, increasing=False) == 43
+    assert recommend_quantity(D(43), None, increasing=False) == 40
     assert calculate_quantities(stock=D(100), pending=D(0), safety_demand=D(3), horizon_demand=D(50))["추천 발주수량"] == 0
 
 
@@ -159,7 +176,7 @@ def test_full_month_forecast_and_blank_pending():
     pace = assemble_result(params, sources).iloc[0]
     assert pace["수요근거"] == "실적기반" and pace["기준 1영업일 예상수량"] == 8
     assert pace["horizon 필요예정수량"] == 96 and pace["안전재고 기준수량"] == 24
-    assert pace["계산 발주수량"] == 74 and pace["추천 발주수량"] == 74
+    assert pace["계산 발주수량"] == 74 and pace["추천 발주수량"] == 70
     sources["demand"]["당월 현재출고수량"] = D(0)
     missing = assemble_result(params, sources).iloc[0]
     assert missing["수요근거"] == "수요근거 없음" and missing["추천 발주수량"] is None
@@ -194,12 +211,12 @@ def test_full_month_forecast_and_blank_pending():
         total, missing = demand_for_dates(calendar, reference_date=date(2026, 8, 31),
                                          business_dates=calendar, monthly_forecast={"202609": plan})
         assert total == plan and not missing
-        assert recommend_quantity(total, None, increasing=True) == plan
-        assert recommend_quantity(total, None, increasing=False) == plan
+        assert recommend_quantity(total, None, increasing=True) == (D(10) if plan <= 10 else D(50))
+        assert recommend_quantity(total, None, increasing=False) == (D(10) if plan <= 10 else D(40))
 
 
 def fixture():
-    base = pd.DataFrame({"제품코드": ["00001"], "제품명": ["fixture"], "출고빈도등급": ["F"],
+    base = pd.DataFrame({"제품코드": ["00001"], "제품명": ["fixture"], "제약사": ["fixture-maker"], "출고빈도등급": ["F"],
                          "품목손익등급": ["B"], "품목기여등급": ["A"],
                          "추정단위손익": [D(10)], "추정손익률": [D("0.1")], "추정기여금액": [D(300)],
                          "제품등록실단가": [D(100)]})
@@ -227,6 +244,7 @@ def fixture():
             "발주거래처코드": "00100", "발주순번": "1", "상세순번": "1",
             "발주상태코드": "1", "발주수량": D(10), "단가": D(100),
         }]),
+        "order_history_complete": True,
         "calendar_status": "ready", "business_dates": [date(2026, 9, d) for d in (28, 29, 30)]}
     return params, sources
 
@@ -372,11 +390,11 @@ def test_assembly_edit_export():
     }])
     frame = assemble_result(params, sources)
     assert frame.iloc[0]["출고빈도등급"] == "F" and frame.iloc[0]["제품코드"] == "00001"
-    assert frame.iloc[0]["추천 발주수량"] == 32
+    assert frame.iloc[0]["추천 발주수량"] == 30
     updated = apply_actual_edits(frame, frame, {0: {"실제 발주수량": "50"}})
-    assert updated.iloc[0]["계산 발주수량"] == 32 and updated.iloc[0]["추천 발주수량"] == 32
+    assert updated.iloc[0]["계산 발주수량"] == 32 and updated.iloc[0]["추천 발주수량"] == 30
     assert updated.iloc[0]["실제 발주수량"] == 50 and updated.iloc[0]["발주금액(부가세포함)"] == 5500
-    assert frame.iloc[0]["실제 발주수량"] == 32
+    assert frame.iloc[0]["실제 발주수량"] == 30
     assert "50" in updated.to_csv(index=False)
     try:
         apply_actual_edits(frame, frame, {0: {"실제 발주수량": "-1"}})
@@ -622,9 +640,11 @@ def test_editor_callback_ownership_and_cache():
     captured = {}
     def editor(frame, **kwargs):
         captured.update(kwargs)
-        captured["frame"] = frame
+        captured["frame"] = frame.data
+        captured["styler"] = frame
     fake = SimpleNamespace(session_state=state, selectbox=lambda *a, **kw: 1,
-        expander=lambda *a, **kw: nullcontext(), data_editor=editor, error=lambda *a: None,
+        expander=lambda *a, **kw: nullcontext(),
+        data_editor=editor, error=lambda *a: None,
         column_config=SimpleNamespace(TextColumn=lambda *a, **kw: None, NumberColumn=lambda *a, **kw: None))
     with patch.object(ui, "st", fake), patch("app.ui.chat_middleware._build_sims_context_from_result") as context, patch("app.db.mssql_client.get_current_company_id", return_value=7) as company:
         ui.render_actual_quantity_editor(item, meta, download_uid="uid")
@@ -636,12 +656,12 @@ def test_editor_callback_ownership_and_cache():
         state[captured["key"]] = {"edited_rows": {0: {"실제 발주수량": "55"}}}
         company.return_value = 4
         captured["on_change"]()
-        assert state["sims_export_tables"]["fixture-key"].iloc[0]["실제 발주수량"] == 32
+        assert state["sims_export_tables"]["fixture-key"].iloc[0]["실제 발주수량"] == 30
         company.return_value = 7
         captured["on_change"]()
         assert state["sims_export_tables"]["fixture-key"].iloc[0]["실제 발주수량"] == 55
         assert state["__sims_export_tables_by_key"]["fixture-key"].iloc[0]["발주금액(부가세포함)"] == 6050
-        assert item["df"].iloc[0]["추천 발주수량"] == 32
+        assert item["df"].iloc[0]["추천 발주수량"] == 30
         assert item["df"].iloc[0]["계산 발주수량"] == D("-12")
         assert state["__sims_current_table_source_key"] == "fixture-key"
         assert "__sims_download_bytes::uid" not in state
@@ -702,6 +722,7 @@ from app.ui.order_calculation_editor import render_actual_quantity_editor
 set_current_company_id(7)
 p, s = fixture()
 f = assemble_result(p, s)
+f['규격'] = ''
 st.session_state.setdefault('sims_export_tables', {'widget': f})
 st.session_state.setdefault('sims_tables', {'widget': f})
 st.session_state['__sims_current_table_source_key'] = 'widget'
@@ -712,12 +733,15 @@ render_actual_quantity_editor({'meta': {'table_key': 'widget'}}, {'table_key': '
     assert len(at.dataframe) == 1
     proto = at.dataframe[0].proto
     assert proto.editing_mode != 0
+    assert not at.toggle
     import json
     config = json.loads(proto.columns)
     for column in ('계산 발주수량', '추천 발주수량', '재고수량', '입고예정수량', '발주단가', '발주금액(부가세포함)', '월 기준 예상수량', '안전재고 기준수량', '적용 필요예정수량'):
         assert config[column]['type_config']['type'] == 'number'
     assert not config["실제 발주수량"].get("disabled", False)
     assert config["추천 발주수량"]["disabled"] and config["계산 발주수량"]["disabled"]
+    assert all(config[col].get('pinned') for col in ('제품코드', '제품명', '규격'))
+    assert config['실제 발주수량']['label'].endswith('발주수량')
     assert not at.selectbox
     first_id = proto.id
     updated = at.session_state['sims_export_tables']['widget'].copy()
@@ -729,8 +753,11 @@ render_actual_quantity_editor({'meta': {'table_key': 'widget'}}, {'table_key': '
     many['제품코드'] = [f'{i:05d}' for i in range(301)]
     at.session_state['sims_export_tables'] = {'widget': many}
     at.run()
-    assert not at.exception and len(at.selectbox) == 1
-    assert list(at.selectbox[0].options) == ['1', '2']
+    assert not at.exception and not at.button and len(at.selectbox) == 1
+    assert list(at.selectbox[0].options) == ['1 / 2', '2 / 2']
+    at.selectbox[0].select(2).run()
+    assert not at.exception and len(at.dataframe[0].value) == 1
+    assert at.selectbox[0].value == 2
 
 
 def test_panel_download_render_policy():
@@ -738,9 +765,12 @@ def test_panel_download_render_policy():
     from pathlib import Path
     tree = ast.parse(Path('app/Lmstudio_SSAI_chat_main.py').read_text(encoding='utf-8-sig'))
     branch = next(n for n in ast.walk(tree) if isinstance(n, ast.If) and
-        'reason == \'download_prepare\'' in ast.unparse(n.test) and 'selected_now' in ast.unparse(n.test))
+        isinstance(n.test, ast.Compare) and
+        isinstance(n.test.left, ast.Name) and n.test.left.id == 'reason' and
+        any(isinstance(c, ast.Set) and {v.value for v in c.elts if isinstance(v, ast.Constant)} ==
+            {'chat_room_change', 'download_prepare'} for c in n.test.comparators))
     expression = compile(ast.Expression(branch.test), 'panel-policy', 'eval')
-    for reason, action, blocked in [('download_prepare', '발주 계산', False), ('download_prepare', '제품정보 조회', True), ('chat_room_change', '발주 계산', True), ('order_edit', '발주 계산', False)]:
+    for reason, action, blocked in [('download_prepare', '발주 계산', True), ('download_prepare', '제품정보 조회', True), ('chat_room_change', '발주 계산', True), ('order_edit', '발주 계산', False)]:
         assert eval(expression, {'reason': reason, 'selected_now': {'action': action}}) == blocked
 
 
@@ -801,12 +831,11 @@ if __name__ == "__main__":
         full, display = result['df'], result['df_display']
         common = {'안전재고일수', '적정재고일수', '결제일자', '해당 월 전체 영업일수', '적용 필요 영업일수'}
         assert common.issubset(full.columns) and not common.intersection(display.columns)
-        sequence = ['계산 발주수량', '추천 발주수량', '실제 발주수량', '재고수량', '입고예정수량']
-        offset = list(display).index(sequence[0])
-        assert list(display)[offset:offset + 5] == sequence
+        assert len(display.columns) == 33
+        assert list(display.columns)[7:14] == ['계산 발주수량', '추천 발주수량', '실제 발주수량',
+                                                '입고예정수량', '재고수량', '당월 정상출고수량', '최근3개월평균']
         assert '{' not in result['meta']['query_summary']
-        assert list(display).index('추세') + 1 == list(display).index('계산 발주수량')
-        assert list(display).count('추세') == 1
+        assert list(display).count('추세판정') == 1
         assert result['meta']['elapsed_ms'] >= 0
         assert result['meta']['calculation_basis'].startswith('계산기준:')
         assert '계산기준:' in result['meta']['summary_md']
@@ -823,8 +852,8 @@ if __name__ == "__main__":
         assert infer_order_unit([])[0] is None
         assert recommend_quantity(D('23.4'), D(10), increasing=True) == 30
         assert recommend_quantity(D('23.4'), D(10), increasing=False) == 20
-        assert recommend_quantity(D('7.8'), None, increasing=True) == 8
-        assert recommend_quantity(D('7.8'), None, increasing=False) == 7
+        assert recommend_quantity(D('7.8'), None, increasing=True) == 10
+        assert recommend_quantity(D('7.8'), None, increasing=False) == 10
         params, sources = fixture()
         rows = history([10, 20, 10, 30])
         sources['order_history'] = pd.DataFrame([
@@ -889,10 +918,10 @@ if __name__ == "__main__":
         chat._attach_sims_response_timing(payload, {})
         assert payload['meta'] == saved
     tests += (test_order_response_timing,)
-    def test_editor_shared_fast_display():
+    def test_editor_shared_formatter():
         from types import SimpleNamespace
         from app.ui import order_calculation_editor as ui
-        from app.ui.sims_table_display import build_sims_table_display_config
+        from app.ui.sims_table_display import prepare_sims_table_display_df
         params, sources = fixture()
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
             result = get_order_calculation_result(params, source_loader=lambda q: sources)
@@ -903,8 +932,8 @@ if __name__ == "__main__":
         for column in ('월 기준 예상수량', '안전재고 기준수량', '기준 1영업일 예상수량'):
             full[column] = D('12.34567')
         display = full[result['df_display'].columns]
-        expected, config, _, height = build_sims_table_display_config(
-            display, action_name='발주 계산', meta=result['meta'], add_row_no=False, native_numeric_cells=True)
+        expected = prepare_sims_table_display_df(display, action_name='발주 계산')
+        height = min(520, max(170, 32 * (len(display) + 1) + 42))
         saved = full.copy(deep=True)
         state = {'sims_export_tables': {'shared': full}, 'sims_tables': {'shared': display},
                  '__sims_current_table_source_key': 'shared'}
@@ -913,24 +942,110 @@ if __name__ == "__main__":
             data_editor=lambda df, **kw: captured.update(df=df, **kw), error=lambda *a: None)
         with patch.object(ui, 'st', fake), patch('app.db.mssql_client.get_current_company_id', return_value=7):
             assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'shared'}, download_uid='shared')
+        shown = captured['df'].data
         for col in expected:
             if col != '실제 발주수량':
-                pd.testing.assert_series_equal(captured['df'][col], expected[col])
-                if col == '계산 발주수량' and config[col].get('type_config', {}).get('type') == 'number':
-                    config[col]['type_config']['format'] = '%.2f'
-                assert captured['column_config'][col] == config[col]
+                pd.testing.assert_series_equal(shown[col], expected[col])
+                assert captured['column_config'][col]['label'] == ui._ORDER_VIEW_LABELS.get(col, col)
+        assert captured['column_config']['계산 발주수량']['type_config']['format'] == '%.2f'
         for col in ('발주단가', '발주금액(부가세포함)'):
-            assert captured['df'][col].isna().all()
-            assert pd.api.types.is_numeric_dtype(captured['df'][col])
+            assert shown[col].isna().all()
+            assert pd.api.types.is_numeric_dtype(shown[col])
             assert captured['column_config'][col]['alignment'] == 'right'
         assert captured['column_config']['실제 발주수량']['alignment'] == 'right'
-        for col in ('월 기준 예상수량', '안전재고 기준수량', '기준 1영업일 예상수량'):
-            assert pd.api.types.is_numeric_dtype(captured['df'][col])
+        for col in ('월 기준 예상수량', '안전재고 기준수량'):
+            assert pd.api.types.is_numeric_dtype(shown[col])
             assert captured['column_config'][col]['alignment'] == 'right'
+        assert ui._ORDER_QUANTITY_COLORS['계산 발주수량'] in captured['df'].to_html()
+        assert ui._ORDER_QUANTITY_COLORS['추천 발주수량'] in captured['df'].to_html()
+        assert ui._ORDER_STOCK_COLOR in captured['df'].to_html()
+        assert ui._ORDER_QUANTITY_COLORS['실제 발주수량'] not in captured['df'].to_html()
+        assert captured['column_config']['실제 발주수량']['label'].startswith('🟩')
         assert captured['placeholder'] == ' '
         assert captured['height'] == height
         pd.testing.assert_frame_equal(full, saved)
-    tests += (test_editor_shared_fast_display,)
+    tests += (test_editor_shared_formatter,)
+    def test_order_dedicated_view_edit_history_and_full_source():
+        from types import SimpleNamespace
+        from app.ui import order_calculation_editor as ui
+        from contextlib import nullcontext
+        params, sources = fixture()
+        with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+            result = get_order_calculation_result(params, source_loader=lambda q: sources)
+        full = pd.concat([result['df']] * 16267, ignore_index=True)
+        full['제품코드'] = [f'{i:05d}' for i in range(16267)]
+        display_columns = list(result['df_display'].columns)
+        state = {'sims_export_tables': {'order': full}, 'sims_tables': {'order': full.head(300)[display_columns]},
+                 '__sims_current_table_source_key': 'order'}
+        views = []
+        edits = []
+        selected_pages = []
+        def selectbox(label, options, **kwargs):
+            selected_pages.append((kwargs['key'], len(options)))
+            return state[kwargs['key']]
+        fake = SimpleNamespace(session_state=state, columns=lambda *a, **kw: (nullcontext(), nullcontext()),
+                               selectbox=selectbox, caption=lambda *a: None, column_config=ui.st.column_config,
+                               dataframe=lambda df, **kw: views.append((df.data.copy(), kw, df)),
+                               data_editor=lambda df, **kw: edits.append((df.data.copy(), kw, df)),
+                               error=lambda *a: None)
+        with patch.object(ui, 'st', fake), patch('app.db.mssql_client.get_current_company_id', return_value=7), \
+             patch('app.ui.chat_middleware._build_sims_context_from_result') as context, \
+             patch('app.services.order_calculation_service.get_order_calculation_result') as source_query:
+            for count in (15, 290, 300):
+                state['sims_export_tables']['order'] = full.head(count).copy()
+                state['sims_tables']['order'] = full.head(count)[display_columns].copy()
+                state['__sims_table_render_path'] = 'live'
+                assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+                assert len(edits) == (15, 290, 300).index(count) + 1 and not views
+                assert len(edits[-1][0]) == count and list(edits[-1][0]) == display_columns
+                assert edits[-1][1]['column_config']['출고빈도등급']['label'] == '등급'
+                assert edits[-1][1]['column_config']['추천 발주수량']['width'] == 86
+                assert all(edits[-1][1]['column_config'][c]['pinned'] for c in ('제품코드', '제품명', '규격'))
+            state['sims_export_tables']['order'] = full
+            state['sims_tables']['order'] = full.head(300)[display_columns].copy()
+            state['__sims_table_render_path'] = 'live'
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+            assert len(edits[-1][0]) == 300 and state['order_page::order'] == 1
+            assert selected_pages[-1] == ('order_page::order', 55)
+            state['order_page::order'] = 55
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+            assert len(edits[-1][0]) == 67 and edits[-1][0].iloc[0]['제품코드'] == '16200'
+            state['order_page::order'] = 5
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+            assert edits[-1][0].iloc[0]['제품코드'] == '01200'
+            state['order_page::order'] = 1
+            item = {}
+            assert ui.render_actual_quantity_editor(item, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+            assert edits[-1][1]['disabled'] == [c for c in edits[-1][0] if c != '실제 발주수량']
+            state[edits[-1][1]['key']] = {'edited_rows': {0: {'실제 발주수량': '55'}}}
+            edits[-1][1]['on_change']()
+            assert state['sims_export_tables']['order'].iloc[0]['실제 발주수량'] == 55
+            assert context.call_args.args[3].iloc[0]['실제 발주수량'] == 55
+            state['order_page::order'] = 5
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+            state['order_page::order'] = 1
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+            assert edits[-1][0].iloc[0]['실제 발주수량'] == 55
+            state['__sims_current_table_source_key'] = 'newer'
+            state['__sims_table_render_path'] = 'history'
+            before = len(edits)
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
+            assert len(edits) == before and len(views) == 1
+            assert views[-1][0].iloc[0]['실제 발주수량'] == 55
+            assert ui._ORDER_QUANTITY_COLORS['실제 발주수량'] in views[-1][2].to_html()
+            state['sims_export_tables']['newer'] = full.head(1301).copy()
+            state['sims_tables']['newer'] = full.head(300)[display_columns].copy()
+            state['__sims_current_table_source_key'] = 'newer'
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'newer'}, download_uid='newer')
+            assert state['order_page::newer'] == 1 and selected_pages[-1] == ('order_page::newer', 5)
+            state['order_page::newer'] = 5
+            assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'newer'}, download_uid='newer')
+            assert len(edits[-1][0]) == 101
+            source_query.assert_not_called()
+        assert len(state['sims_export_tables']['order']) == 16267
+        assert list(state['sims_export_tables']['order'].columns) == list(full.columns)
+        assert list(edits[-1][0].columns) == display_columns and len(display_columns) == 33
+    tests += (test_order_dedicated_view_edit_history_and_full_source,)
     def test_compact_order_header_and_initial_values():
         from app.ui import chat_middleware as chat
         from app.ui.sims_table_display import resolve_sims_numeric_display_kind
@@ -981,14 +1096,17 @@ if __name__ == "__main__":
         params['stock_apply_cd'] = '50001'
         with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
             result = get_order_calculation_result(params, source_loader=lambda q: sources)
-        primary_front = ['제품코드', '제품명', '추세', '계산 발주수량', '추천 발주수량', '실제 발주수량',
-                '재고수량', '입고예정수량', '발주처', '발주담당자', '제약담당자', '매입거래처수',
-                '발주단가', '발주금액(부가세포함)', '월 기준 예상수량']
+        primary_front = ['제품코드', '제품명', '규격', '발주처', '출고빈도등급', '추세판정', '발주단위',
+                '계산 발주수량', '추천 발주수량', '실제 발주수량', '입고예정수량', '재고수량',
+                '당월 정상출고수량', '최근3개월평균', '이전3개월평균', '추세증감률', '수요조정률',
+                '월 기준 예상수량', '가용예정재고', '안전재고 기준수량', '적용 필요예정수량',
+                '발주단위 근거', '제약사', '발주담당자', '단가적용처', '재고적용처', '발주단가', '단가출처', '단가판정',
+                '발주금액(부가세포함)', '계산상태', '조달주의', '발주사유/계산근거']
         assert list(result['df'].columns[:len(primary_front)]) == primary_front
         assert list(result['df_display'].columns[:len(primary_front)]) == primary_front
         assert '단가출처' in result['df'] and '발주단위 근거' in result['df']
         assert {'품목손익등급', '품목기여등급'}.issubset(result['df'].columns)
-        assert {'품목손익등급', '품목기여등급'}.issubset(result['df_display'].columns)
+        assert {'품목손익등급', '품목기여등급'}.issubset(result['df'].columns)
         assert not {'손익등급', '기여도등급', '손익기여도'}.intersection(result['df'].columns)
         assert result['params']['cost_apply_cd'] == '50002'
         assert result['params']['stock_apply_cd'] == '50001'
@@ -1038,6 +1156,69 @@ if __name__ == "__main__":
             app.button[0].click().run()
             assert not app.exception and len(calls) == 2
     tests += (test_panel_mode_reuses_company_source,)
+    def test_order_display_only_enrichment():
+        from app.services.order_calculation_service import _trend_display_label
+        from app.ui.sims_table_display import resolve_sims_numeric_display_kind
+        labels = (
+            (D('0.1'), 'trend_half_capped', '증가'),
+            (D('-0.1'), 'trend_half_capped', '감소'),
+            (D(0), 'deadband', '유지'),
+            (D(0), 'frequency_F_new_product_excluded', '판정불가(신규품목)'),
+            (D(0), 'frequency_X_no_recent_outbound_excluded', '판정불가(최근출고없음)'),
+            (D(0), 'insufficient_six_completed_months', '판정불가(이전3개월자료없음)'),
+            (D(0), 'current_month_actual_pace', '판정불가(당월실적기반)'),
+        )
+        for adjustment, reason, expected in labels:
+            assert _trend_display_label(adjustment, reason) == expected
+        assert resolve_sims_numeric_display_kind('추세증감률') == 'percent2'
+        assert resolve_sims_numeric_display_kind('수요조정률') == 'percent2'
+        params, sources = fixture()
+        original = assemble_result(params, sources).iloc[0]
+        assert original['가용예정재고'] == original['재고수량'] + original['입고예정수량']
+        assert original['추세판정'] == '판정불가(신규품목)'
+        assert not any(token in original['발주사유/계산근거'].lower() for token in ('none', 'nan', 'fallback_reason'))
+        with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+            result = get_order_calculation_result(params, source_loader=lambda q: sources)
+        assert len(result['df_display'].columns) == 33
+        assert result['df_display']['당월 정상출고수량'].iloc[0] == result['df']['당월 정상출고수량'].iloc[0]
+        assert {'recent_3m_avg', 'previous_3m_avg', 'trend_rate', 'trend_adjustment',
+                'fallback_reason', '발주담당자코드', '재고적용처코드', '단가적용처코드'}.issubset(result['df'].columns)
+        row = result['df'].iloc[0]
+        for column in ('계산 발주수량', '추천 발주수량', '실제 발주수량', '발주단가', '단가판정', '계산상태'):
+            assert row[column] == original[column], column
+        assert result['meta']['source_call_count'] == 0
+        assert row['가용예정재고'] == row['재고수량'] + row['입고예정수량']
+        no_demand = {**sources, 'base': sources['base'].copy(), 'demand': sources['demand'].copy()}
+        no_demand['base']['출고빈도등급'] = 'X'
+        no_demand['demand']['당월 예상출고수량'] = D(0)
+        no_demand['demand']['현재재고수량'] = D(10)
+        no_demand_row = assemble_result(params, no_demand).iloc[0]
+        assert no_demand_row['계산상태'] == '수요/재고 사용자확인'
+        assert '최근 3개월 정상출고 없음' in no_demand_row['발주사유/계산근거']
+        assert '수요근거 없음' in no_demand_row['발주사유/계산근거']
+        assert not any(token in no_demand_row['발주사유/계산근거'].lower() for token in ('none', 'nan', 'fallback_reason'))
+        with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+            all_rows = get_order_calculation_result({**params, 'query_mode': '전체'}, source_loader=lambda q: no_demand)
+            confirm_rows = get_order_calculation_result({**params, 'query_mode': '확인 필요'}, source_loader=lambda q: no_demand)
+            needed_rows = get_order_calculation_result({**params, 'query_mode': '발주해당자료만'}, source_loader=lambda q: no_demand)
+        assert (len(all_rows['df']), len(confirm_rows['df']), len(needed_rows['df'])) == (1, 1, 0)
+        assert result['df_display']['규격'].iloc[0] == ''
+        for required_column in ('제품명', '제약사', '출고빈도등급'):
+            broken = {**sources, 'base': sources['base'].drop(columns=required_column, errors='ignore').copy()}
+            if required_column == '출고빈도등급':
+                broken['demand'] = sources['demand'].drop(columns=required_column, errors='ignore').copy()
+            with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+                try:
+                    get_order_calculation_result(params, source_loader=lambda q: broken)
+                except ValueError as error:
+                    assert required_column in str(error)
+                else:
+                    raise AssertionError(f'필수 컬럼 누락을 허용함: {required_column}')
+        empty = {**sources, 'base': sources['base'].iloc[:0].copy()}
+        with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+            empty_result = get_order_calculation_result(params, source_loader=lambda q: empty)
+        assert empty_result['df'].empty and len(empty_result['df_display'].columns) == 33
+    tests += (test_order_display_only_enrichment,)
     for test in tests:
         test()
         print("PASS", test.__name__)

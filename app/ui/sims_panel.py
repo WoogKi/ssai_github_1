@@ -3475,7 +3475,7 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
                     meta_event_id,
                     snapshot_event_id,
                 )
-                log.info(
+                log.debug(
                     "[dashboard.event_link] stage=push primary_event_present=%s payload_event_present=%s snapshot_event_present=%s partition_event_present=%s all_equal=%s",
                     bool(primary_event_id),
                     bool(payload_event_id and meta_event_id),

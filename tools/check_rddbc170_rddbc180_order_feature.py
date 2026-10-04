@@ -200,7 +200,9 @@ def main() -> int:
         or "D.Rd18_Cost_Apply_Cd = ?" not in unit_sql
         or "D.Rd18_Stock_Apply_Cd = ?" not in unit_sql
         or "NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL" not in unit_sql
-        or unit_values[:4] != ["20260825", "20260925", "50002", "50001"]
+        or unit_values[:2] != ["20260825", "20260925"]
+        or unit_values[2:5] != ["1", "2", "3"]
+        or unit_values[5:7] != ["50002", "50001"]
     ):
         failures.append("order-unit minimal R170/R180 projection/filter contract changed")
 

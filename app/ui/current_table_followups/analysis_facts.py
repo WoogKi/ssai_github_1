@@ -129,6 +129,21 @@ def build_whole_table_facts(df: pd.DataFrame, *, action: str, query: str,
                                   "수량은 서로 다른 포장단위일 수 있음",
                                   "상하위 목록은 전체 그룹 중 일부이며 전체 분포는 집계값 기준"],
     }
+    if re.sub(r"\s+", "", action) == "발주계산" and len(safe) == 1:
+        decision_columns = (
+            "제품코드", "제품명", "적용 필요예정수량", "재고수량", "입고예정수량",
+            "계산 발주수량", "안전재고 기준수량", "발주trigger", "발주단위",
+            "발주단위 근거", "수량조정정책", "수량조정단위", "수량정수화",
+            "최소수량 적용", "기본 조정단위 적용", "고가 조정단위 적용",
+            "추세판정", "추천 발주수량", "실제 발주수량",
+            "추천대비수정수량", "발주사유/계산근거", "계산상태",
+        )
+        row = safe.iloc[0]
+        result["order_decision_facts"] = {
+            column: (None if pd.isna(row[column]) else sanitize_llm_text(str(row[column]), label=column)[:500])
+            for column in decision_columns if column in safe.columns
+        }
+        result["order_registration_status"] = "추천 및 사용자 입력 수량이며 ERP 발주는 등록되지 않음"
     for c in safe.columns:
         if re.search(r"제품명|제품코드|품목명|제조사|거래처|등급|판정", str(c)):
             result["unique_counts"][str(c)] = int(safe[c].replace("", pd.NA).nunique())

@@ -73,23 +73,52 @@ def demand_for_dates(
     return (None if missing else total), tuple(sorted(missing))
 
 
-def recommend_quantity(raw: Decimal, unit: Decimal | None, *, increasing: bool) -> Decimal:
+def quantity_adjustment(raw: Decimal, unit: Decimal | None, *, increasing: bool,
+                        price: Decimal | None = None,
+                        default_unit_allowed: bool = True) -> dict:
+    """Choose one applied adjustment policy after the final unit price is known."""
+    unused = {"추천 발주수량": Decimal(0), "수량조정정책": "미적용",
+              "수량조정단위": None, "최소수량 적용": False,
+              "기본 조정단위 적용": False, "고가 조정단위 적용": False,
+              "수량정수화": "미적용"}
     if raw <= 0:
-        return Decimal(0)
-    confirmed_unit = unit is not None and unit > 0
-    if not confirmed_unit:
-        unit = Decimal(1)
-    if not unit.is_finite() or unit != unit.to_integral_value():
+        return unused
+    if unit is not None and (not unit.is_finite() or unit <= 0 or unit != unit.to_integral_value()):
         raise ValueError("발주단위는 양의 정수여야 합니다.")
-    rounding = ROUND_CEILING if increasing else ROUND_FLOOR
-    result = (raw / unit).to_integral_value(rounding=rounding) * unit
-    return unit if confirmed_unit and result == 0 else result
+    high_price = (default_unit_allowed and price is not None and price.is_finite()
+                  and price >= Decimal(1000000))
+    if high_price:
+        adjustment_unit, policy = Decimal(1), "고가 조정단위1"
+    elif unit is not None:
+        adjustment_unit, policy = unit, "확정 이력단위"
+    elif default_unit_allowed:
+        adjustment_unit, policy = Decimal(10), "기본 조정단위10"
+    else:
+        adjustment_unit, policy = Decimal(1), "이력 완전성 확인"
+    rounded = (raw / adjustment_unit).to_integral_value(
+        rounding=ROUND_CEILING if increasing else ROUND_FLOOR
+    ) * adjustment_unit
+    minimum_applied = not increasing and rounded == 0 and policy != "이력 완전성 확인"
+    recommended = adjustment_unit if minimum_applied else rounded
+    return {"추천 발주수량": recommended, "수량조정정책": policy,
+            "수량조정단위": adjustment_unit if policy != "이력 완전성 확인" else None,
+            "최소수량 적용": minimum_applied,
+            "기본 조정단위 적용": policy == "기본 조정단위10",
+            "고가 조정단위 적용": policy == "고가 조정단위1",
+            "수량정수화": "올림" if increasing else "내림"}
 
 
-def infer_order_unit(history: Sequence[Mapping]) -> tuple[Decimal | None, str]:
+def recommend_quantity(raw: Decimal, unit: Decimal | None, *, increasing: bool,
+                       default_unit_allowed: bool = True,
+                       price: Decimal | None = None) -> Decimal:
+    return quantity_adjustment(raw, unit, increasing=increasing, price=price,
+                               default_unit_allowed=default_unit_allowed)["추천 발주수량"]
+
+
+def infer_order_unit(history: Sequence[Mapping], *, period_label: str = "최근1개월") -> tuple[Decimal | None, str]:
     """Require observed repetition, not a synthetic greatest common divisor."""
     if not history:
-        return None, "발주이력 없음"
+        return None, "단위 산정기간 내 발주이력 없음"
     try:
         quantities = [Decimal(str(row['발주수량'])) for row in history]
     except (InvalidOperation, ValueError, KeyError):
@@ -103,7 +132,7 @@ def infer_order_unit(history: Sequence[Mapping]) -> tuple[Decimal | None, str]:
         return None, "최소 발주수량 반복 부족"
     if any(q % candidate for q in quantities):
         return None, "불규칙 발주수량 사용자확인"
-    return candidate, "최근1개월 3개 이상 발주일/최소수량 반복/정수배 일관"
+    return candidate, f"{period_label} 3개 이상 발주일/최소수량 반복/정수배 일관"
 
 
 def amounts(actual: Decimal, unit_price: Decimal | None) -> dict:
@@ -121,13 +150,22 @@ def amounts(actual: Decimal, unit_price: Decimal | None) -> dict:
 
 def calculate_quantities(*, stock: Decimal, pending: Decimal | None,
                          safety_demand: Decimal | None, horizon_demand: Decimal | None,
-                         unit: Decimal | None = None, increasing: bool = False) -> dict:
+                         unit: Decimal | None = None, increasing: bool = False,
+                         default_unit_allowed: bool = True,
+                         price: Decimal | None = None) -> dict:
     trigger = None if safety_demand is None else stock <= safety_demand
     raw = None if horizon_demand is None or pending is None else horizon_demand - stock - pending
-    recommended = None if trigger is None or raw is None else (
-        recommend_quantity(raw, unit, increasing=increasing) if trigger else Decimal(0))
+    if trigger is None or raw is None:
+        return {"발주trigger": trigger, "계산 발주수량": raw,
+                "추천 발주수량": None, "실제 발주수량": None,
+                "수량조정정책": "미적용", "수량조정단위": None,
+                "최소수량 적용": False, "기본 조정단위 적용": False,
+                "고가 조정단위 적용": False, "수량정수화": "미적용"}
+    adjustment = quantity_adjustment(raw if trigger else Decimal(0), unit,
+                                     increasing=increasing, price=price,
+                                     default_unit_allowed=default_unit_allowed)
     return {"발주trigger": trigger, "계산 발주수량": raw,
-            "추천 발주수량": recommended, "실제 발주수량": recommended}
+            **adjustment, "실제 발주수량": adjustment["추천 발주수량"]}
 
 
 def demand_trend_adjustment(

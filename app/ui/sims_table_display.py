@@ -54,7 +54,7 @@ def resolve_sims_table_mode(
     cols = int(len(df.columns)) if isinstance(df, pd.DataFrame) else 0
     cells = rows * cols
     path = str(render_path or "").strip().lower()
-    if path == "chat":
+    if path in {"chat", "live", "history"}:
         env_key = "SIMS_CHAT_FAST_TABLE_CELL_THRESHOLD"
         raw_value = os.getenv(env_key)
         fallback_key = "SIMS_FAST_TABLE_CELL_THRESHOLD"
@@ -859,6 +859,8 @@ def _numeric_display_kind(col: Any) -> str:
         return "decimal2"
 
     percent_cols = {
+        "추세증감률",
+        "수요조정률",
         "당월 진척률",
         "평가월 진척률",
         "최근3개월증감률",
