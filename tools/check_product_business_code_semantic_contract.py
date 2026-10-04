@@ -40,17 +40,38 @@ def main() -> int:
         ("4", "의료기기(보험)"): "insurance",
         ("05", "비보험(일반)"): "non_insurance",
         ("A", "비보험(전문)"): "non_insurance",
-        ("B", "의료기기"): "other",
-        ("A", "기타"): "other",
+        ("B", "의료기기"): "",
+        ("A", "기타"): "",
         ("", "보험(전문)"): "",
     }
     for pair, semantic in expected.items():
         if classify_product_di_business_semantic(*pair) != semantic:
             failures.append(f"business semantic mismatch: {pair}")
 
-    for group, expected_values in {
-        "insurance": ("보험", "보험(%", "%(보험)"),
-        "non_insurance": ("비보험", "비보험(%"),
+    # The screenshots show identical codes with different meanings in distinct DBs.
+    from app.services.product_master_filter_contract import classify_product_prescription_semantic
+    valid = "8801234567890"
+    for code, name, insurance, prescription in (
+        ("0", "수거품목", "", ""),
+        ("0", "보험(약가유연제)", "insurance", "prescription"),
+        ("D", "소모품1", "", ""),
+        ("D", "약가유연제", "", "prescription"),
+        ("A", "건강기능식품", "", ""),
+        ("A", "의료기기", "", ""),
+        ("B", "비보험(전문)", "non_insurance", "prescription"),
+        ("B", "불용제품", "", ""),
+        ("4", "의료기기(보험)", "insurance", ""),
+        ("4", "의료기기(비보험)", "non_insurance", ""),
+        ("4", "보험/비보험", "", ""),
+    ):
+        if classify_product_di_business_semantic(code, name) != insurance:
+            failures.append(f"company insurance axis mismatch: {code}/{name}")
+        if classify_product_prescription_semantic(code, valid, valid, name) != prescription:
+            failures.append(f"company prescription axis mismatch: {code}/{name}")
+
+    for group, expected_sql in {
+        "insurance": "LIKE N'%|보험|%'",
+        "non_insurance": "LIKE N'%|비보험|%'",
     }.items():
         clauses: list[str] = []
         values: list[object] = []
@@ -61,10 +82,25 @@ def main() -> int:
             expressions=expressions,
         )
         sql = " ".join(clauses)
-        if "PD.Rd01_Hnm" not in sql or tuple(values) != expected_values:
+        if ("PD.Rd01_Hnm" not in sql or expected_sql not in sql
+                or "NOT LIKE" not in sql or values):
             failures.append(f"code-master semantic SQL mismatch: {group}: {sql}/{values}")
         if any(token in sql.upper() for token in ("CAST(", "TRY_CONVERT", "ISNUMERIC", " < ", " >= ")):
             failures.append(f"numeric semantic leaked: {group}: {sql}")
+
+    for requested, missing in (
+        ({"product_di_semantic_group": "insurance"}, "product_di_nm"),
+        ({"product_prescription_semantic": "prescription"}, "product_di_gcode"),
+    ):
+        try:
+            append_product_master_filter_clauses(
+                [], [], requested,
+                expressions={key: value for key, value in expressions.items() if key != missing},
+            )
+        except ValueError:
+            pass
+        else:
+            failures.append(f"missing company code-master expression silently removed {requested}")
 
     expression_maps = (
         rddbc070_service._PRODUCT_MASTER_EXPRESSIONS,

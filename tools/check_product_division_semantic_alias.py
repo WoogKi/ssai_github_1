@@ -64,8 +64,8 @@ def assert_sql_contract() -> None:
         sql = builder(params)
         if "Rddbc046 AS PrescriptionStd" not in sql or "Rd046_Main_Standard_Cd" not in sql:
             fail(f"R046 authority missing: {prefix}: {sql}")
-        if not any(key.startswith(prefix + "product_prescription") for key in params):
-            fail(f"prescription binds missing: {prefix}: {params!r}")
+        if "CompanyProductDi.Rd01_Hnm" not in sql or "N'보험(전문)'" not in sql:
+            fail(f"company-specific prescription predicate missing: {prefix}: {sql}")
 
     clauses: list[str] = []
     params = {"product_prescription_semantic": "otc"}
@@ -74,12 +74,13 @@ def assert_sql_contract() -> None:
         params,
         product_code_expression="P.Rd04_Physic_Cd",
         product_di_code_expression="P.Rd04_Physic_Di",
+        product_di_gcode_expression="P.Rd04_Physic_Di_Gcode",
         bind_prefix="focused",
     )
     if not clauses or "Rddbc046" not in clauses[0] or "880%" not in clauses[0]:
         fail(f"shared R046 predicate missing: {clauses!r}")
-    if sorted(value for key, value in params.items() if key.startswith("focused_")) != ["1", "5"]:
-        fail(f"OTC code binds mismatch: {params!r}")
+    if "CompanyProductDi.Rd01_Hnm" not in clauses[0] or "N'보험(일반)'" not in clauses[0]:
+        fail(f"OTC company-name predicate missing: {clauses!r}")
 
     code_clauses: list[str] = []
     code_params = {"product_prescription_semantic": "prescription"}
@@ -87,15 +88,16 @@ def assert_sql_contract() -> None:
         code_clauses,
         code_params,
         product_di_code_expression="P.Rd04_Physic_Di",
+        product_di_gcode_expression="P.Rd04_Physic_Di_Gcode",
         bind_prefix="inventory_only",
     )
     if not code_clauses or "Rddbc046" in code_clauses[0]:
         fail(f"inventory code-only predicate contains R046: {code_clauses!r}")
 
     cfg = product_inventory_service._settings({"stock_mode": "real"})
-    for semantic, expected_codes in (
-        ("prescription", ["0", "2", "3", "6", "7"]),
-        ("otc", ["1", "5"]),
+    for semantic, expected_label in (
+        ("prescription", "N'보험(전문)'"),
+        ("otc", "N'보험(일반)'"),
     ):
         semantic_params = {
             "product_prescription_semantic": semantic,
@@ -129,12 +131,8 @@ def assert_sql_contract() -> None:
                 fail(f"inventory branch retained R046 validity predicate: {semantic}/{label}")
             if "Rd04_Physic_Di" not in sql:
                 fail(f"inventory code predicate missing: {semantic}/{label}")
-            actual_codes = sorted(
-                value for key, value in sql_params.items()
-                if "product_prescription" in key and key != "product_prescription_semantic"
-            )
-            if actual_codes != expected_codes:
-                fail(f"inventory code binds mismatch: {semantic}/{label}: {actual_codes!r}")
+            if expected_label not in sql or "CompanyProductDi.Rd01_Hnm" not in sql:
+                fail(f"inventory company-name predicate missing: {semantic}/{label}")
 
     plain_params = {
         "date_from": "20260901", "date_to": "20260930",
@@ -326,13 +324,13 @@ def main() -> None:
     invalid = "9901234567890"
     if not is_valid_drug_standard_code(valid) or is_valid_drug_standard_code(invalid):
         fail("standard-code validity boundary mismatch")
-    if classify_product_prescription_semantic("3", valid, valid) != "prescription":
+    if classify_product_prescription_semantic("3", valid, valid, "보험(전문)") != "prescription":
         fail("professional product classification mismatch")
-    if classify_product_prescription_semantic("1", valid, valid) != "otc":
+    if classify_product_prescription_semantic("1", valid, valid, "보험(일반)") != "otc":
         fail("OTC product classification mismatch")
-    if classify_product_prescription_semantic("3", invalid, valid):
+    if classify_product_prescription_semantic("3", invalid, valid, "보험(전문)"):
         fail("invalid standard code was classified")
-    if classify_product_prescription_semantic("3", valid, invalid):
+    if classify_product_prescription_semantic("3", valid, invalid, "보험(전문)"):
         fail("invalid main standard code was classified")
     if not is_management_only_standard_code(valid, valid):
         fail("management-only standard code was not detected")

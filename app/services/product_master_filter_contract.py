@@ -34,15 +34,8 @@ PRODUCT_PRESCRIPTION_SEMANTIC_TERMS: dict[str, str] = {
     "OTC": "otc",
 }
 
-PRODUCT_PRESCRIPTION_DI_CODES: dict[str, tuple[str, ...]] = {
-    "prescription": ("0", "2", "3", "6", "7"),
-    "otc": ("1", "5"),
-}
-
-PRODUCT_DI_SEMANTIC_NAME_PATTERNS: dict[str, tuple[str, ...]] = {
-    "insurance": ("0", "1", "2", "3", "4"),
-    "non_insurance": (),
-}
+PRODUCT_PRESCRIPTION_SEMANTICS = frozenset(("prescription", "otc"))
+PRODUCT_DI_SEMANTICS = frozenset(("insurance", "non_insurance"))
 
 _PRODUCT_DI_SEMANTIC_OWNER_LABELS = (
     "제품명", "품목명", "상품명", "제품그룹명", "제품그룹", "제품분류명", "제품분류",
@@ -148,24 +141,63 @@ def valid_drug_standard_code_sql(standard_expression: str, main_expression: str)
 
 def is_valid_drug_standard_code(value: Any) -> bool:
     code = _text(value)
-    return len(code) == 13 and code.isdigit() and code.startswith("880")
+    return len(code) == 13 and all("0" <= ch <= "9" for ch in code) and code.startswith("880")
 
 
 def classify_product_prescription_semantic(
     product_di_cd: Any,
     standard_cd: Any,
     main_standard_cd: Any,
+    product_di_nm: Any = "",
 ) -> str:
     if not (
         is_valid_drug_standard_code(standard_cd)
         and is_valid_drug_standard_code(main_standard_cd)
-    ):
+    ) or not _text(product_di_cd):
         return ""
-    code = _text(product_di_cd)
-    for semantic, codes in PRODUCT_PRESCRIPTION_DI_CODES.items():
-        if code in codes:
-            return semantic
+    name = _text(product_di_nm).replace(" ", "")
+    if name in {"전문", "전문의약품", "수입", "약가유연제"} or re.fullmatch(
+        r"(?:비?보험)\((?:전문|수입|약가유연제)\)", name
+    ):
+        return "prescription"
+    if name in {"일반", "일반의약품"} or re.fullmatch(r"(?:비?보험)\(일반\)", name):
+        return "otc"
     return ""
+
+
+def _product_di_name_predicate(name_expression: str, semantic: str) -> str:
+    name = f"REPLACE(LTRIM(RTRIM(ISNULL({name_expression}, N''))), N' ', N'')"
+    if semantic == "prescription":
+        labels = ("전문", "전문의약품", "수입", "약가유연제", "보험(전문)", "보험(수입)",
+                  "보험(약가유연제)", "비보험(전문)", "비보험(수입)", "비보험(약가유연제)")
+    elif semantic == "otc":
+        labels = ("일반", "일반의약품", "보험(일반)", "비보험(일반)")
+    elif semantic == "insurance":
+        tokens = _product_di_semantic_tokens_sql(name_expression)
+        return f"({tokens} LIKE N'%|보험|%' AND {tokens} NOT LIKE N'%|비보험|%')"
+    elif semantic == "non_insurance":
+        tokens = _product_di_semantic_tokens_sql(name_expression)
+        return f"({tokens} LIKE N'%|비보험|%' AND {tokens} NOT LIKE N'%|보험|%')"
+    else:
+        raise ValueError("지원하지 않는 제품구분 의미입니다.")
+    return f"{name} IN ({', '.join('N' + repr(label) for label in labels)})"
+
+
+def _product_di_semantic_tokens_sql(name_expression: str) -> str:
+    tokenized = f"ISNULL({name_expression}, N'')"
+    for delimiter in (" ", "(", ")", "/", "·", ","):
+        tokenized = f"REPLACE({tokenized}, N'{delimiter}', N'|')"
+    return f"(N'|' + {tokenized} + N'|')"
+
+
+def _company_product_di_exists_sql(product_di_code_expression: str,
+                                   product_di_gcode_expression: str, semantic: str) -> str:
+    return (
+        "EXISTS (SELECT 1 FROM dbo.Rddbc010 AS CompanyProductDi WITH (NOLOCK) "
+        f"WHERE CompanyProductDi.Rd01_Gcode = {product_di_gcode_expression} "
+        f"AND CompanyProductDi.Rd01_Tcode = {product_di_code_expression} "
+        f"AND {_product_di_name_predicate('CompanyProductDi.Rd01_Hnm', semantic)})"
+    )
 
 
 def is_management_only_standard_code(standard_cd: Any, main_standard_cd: Any) -> bool:
@@ -193,6 +225,7 @@ def add_named_product_prescription_filter(
     *,
     product_code_expression: str,
     product_di_code_expression: str,
+    product_di_gcode_expression: str,
     bind_prefix: str = "product_prescription",
 ) -> None:
     code_clauses: list[str] = []
@@ -200,6 +233,7 @@ def add_named_product_prescription_filter(
         code_clauses,
         params,
         product_di_code_expression=product_di_code_expression,
+        product_di_gcode_expression=product_di_gcode_expression,
         bind_prefix=bind_prefix,
     )
     if not code_clauses:
@@ -215,23 +249,18 @@ def add_named_product_prescription_code_filter(
     params: dict[str, Any],
     *,
     product_di_code_expression: str,
+    product_di_gcode_expression: str,
     bind_prefix: str = "product_prescription",
 ) -> None:
     """Append the R040 prescription/OTC code predicate without R046 validity."""
     semantic = _text(params.get("product_prescription_semantic"))
     if not semantic:
         return
-    codes = PRODUCT_PRESCRIPTION_DI_CODES.get(semantic)
-    if not codes:
+    if semantic not in PRODUCT_PRESCRIPTION_SEMANTICS:
         raise ValueError("지원하지 않는 전문/일반 제품 의미입니다.")
-    binds: list[str] = []
-    for index, code in enumerate(codes):
-        key = f"{bind_prefix}_{index}"
-        params[key] = code
-        binds.append(f"%({key})s")
-    clauses.append(
-        f"LTRIM(RTRIM(ISNULL({product_di_code_expression}, ''))) IN ({', '.join(binds)})"
-    )
+    clauses.append(_company_product_di_exists_sql(
+        product_di_code_expression, product_di_gcode_expression, semantic,
+    ))
 
 
 def add_named_management_only_exclusion(
@@ -239,6 +268,7 @@ def add_named_management_only_exclusion(
     *,
     product_code_expression: str,
 ) -> None:
+    """Exclude only valid matching standard/representative drug codes."""
     valid = valid_drug_standard_code_sql(
         "ManagementStd.Rd046_Standard_Cd",
         "ManagementStd.Rd046_Main_Standard_Cd",
@@ -255,26 +285,19 @@ def add_named_product_di_semantic_filter(
     clauses: MutableSequence[str],
     params: dict[str, Any],
     *,
-    product_di_code_expression: str,
+    product_di_name_expression: str,
     bind_prefix: str = "product_di_semantic",
 ) -> None:
     """Append the canonical semantic-name predicate to named-bind SQL callers."""
     group = _text(params.get("product_di_semantic_group"))
     if not group:
         return
-    if group not in PRODUCT_DI_SEMANTIC_NAME_PATTERNS:
+    if group not in PRODUCT_DI_SEMANTICS:
         raise ValueError("지원하지 않는 상위 제품구분입니다.")
-    expression = _text(product_di_code_expression)
+    expression = _text(product_di_name_expression)
     if not expression:
-        return
-    normalized_code = f"LTRIM(RTRIM(ISNULL({expression}, '')))"
-    keys: list[str] = []
-    for index, code in enumerate(PRODUCT_DI_SEMANTIC_NAME_PATTERNS["insurance"]):
-        key = f"{bind_prefix}_{index}"
-        params[key] = code
-        keys.append(f"%({key})s")
-    operator = "IN" if group == "insurance" else "NOT IN"
-    clauses.append(f"({normalized_code} <> '' AND {normalized_code} {operator} ({', '.join(keys)}))")
+        raise ValueError("제품구분 이름 조건을 적용할 수 없습니다.")
+    clauses.append(_product_di_name_predicate(expression, group))
 
 
 def strip_product_di_semantic_terms(text: Any) -> str:
@@ -293,11 +316,16 @@ def strip_product_di_semantic_terms(text: Any) -> str:
 
 def classify_product_di_business_semantic(product_di_cd: Any, product_di_nm: Any) -> str:
     """Classify a company-owned product code by its authoritative code-master name."""
-    code = _text(product_di_cd)
-    name = _text(product_di_nm)
-    if not code:
+    if not _text(product_di_cd):
         return ""
-    return "insurance" if code in PRODUCT_DI_SEMANTIC_NAME_PATTERNS["insurance"] else "non_insurance"
+    tokens = set(re.split(r"[ ()/·,]+", _text(product_di_nm)))
+    if "보험" in tokens and "비보험" in tokens:
+        return ""
+    if "비보험" in tokens:
+        return "non_insurance"
+    if "보험" in tokens:
+        return "insurance"
+    return ""
 
 
 def build_product_master_enrichment_sql(
@@ -360,6 +388,7 @@ CROSS APPLY (
         "product_group_nm": f"{names['group']}.Rd01_Hnm",
         "product_di_nm": f"{names['di']}.Rd01_Hnm",
         "product_di_cd": f"{p}.Rd04_Physic_Di",
+        "product_di_gcode": f"{p}.Rd04_Physic_Di_Gcode",
         "standard_cd": f"{names['standard']}.Rd046_Standard_Cd",
         "main_standard_cd": f"{names['standard']}.Rd046_Main_Standard_Cd",
         "product_class_nm": f"{names['class']}.Rd01_Hnm",
@@ -386,7 +415,7 @@ def normalize_product_master_filters(values: Mapping[str, Any] | None) -> dict[s
     if semantic_group and semantic_group not in {"insurance", "non_insurance"}:
         raise ValueError("지원하지 않는 상위 제품구분입니다.")
     prescription_semantic = out.get("product_prescription_semantic", "")
-    if prescription_semantic and prescription_semantic not in PRODUCT_PRESCRIPTION_DI_CODES:
+    if prescription_semantic and prescription_semantic not in PRODUCT_PRESCRIPTION_SEMANTICS:
         raise ValueError("지원하지 않는 전문/일반 제품 의미입니다.")
     return out
 
@@ -458,27 +487,24 @@ def append_product_master_filter_clauses(
     add_like("product_group_nm", "product_group_nm")
     add_like("product_di_nm", "product_di_nm")
     semantic_group = values["product_di_semantic_group"]
-    product_di_code = _text(expressions.get("product_di_cd"))
-    if semantic_group and product_di_code:
-        normalized_code = f"LTRIM(RTRIM(ISNULL({product_di_code}, '')))"
-        insurance_codes = PRODUCT_DI_SEMANTIC_NAME_PATTERNS["insurance"]
-        clauses.append(
-            f"({normalized_code} <> '' AND {normalized_code} "
-            f"{'IN' if semantic_group == 'insurance' else 'NOT IN'} "
-            f"({', '.join('?' for _ in insurance_codes)}))"
-        )
-        bind_values.extend(insurance_codes)
+    product_di_name = _text(expressions.get("product_di_nm"))
+    if semantic_group and not product_di_name:
+        raise ValueError("제품구분 이름 조건을 적용할 수 없습니다.")
+    if semantic_group:
+        clauses.append(_product_di_name_predicate(product_di_name, semantic_group))
     prescription_semantic = values["product_prescription_semantic"]
     product_code = _text(expressions.get("physic_cd"))
     product_di_code = _text(expressions.get("product_di_cd"))
-    if prescription_semantic and product_code and product_di_code:
-        codes = PRODUCT_PRESCRIPTION_DI_CODES[prescription_semantic]
+    product_di_gcode = _text(expressions.get("product_di_gcode"))
+    if prescription_semantic and not (product_code and product_di_code and product_di_gcode):
+        raise ValueError("전문/일반 제품 조건을 적용할 수 없습니다.")
+    if prescription_semantic:
         clauses.append(
             "(" + _prescription_exists_sql(product_code)
-            + f" AND LTRIM(RTRIM(ISNULL({product_di_code}, ''))) IN "
-            + "(" + ", ".join("?" for _ in codes) + "))"
+            + " AND " + _company_product_di_exists_sql(
+                product_di_code, product_di_gcode, prescription_semantic,
+            ) + ")"
         )
-        bind_values.extend(codes)
     add_like("product_class_nm", "product_class_nm")
     add_like("product_add_user_nm", "product_add_user_nm")
     add_like("product_mod_user_nm", "product_mod_user_nm")

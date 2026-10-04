@@ -236,7 +236,8 @@ def test_unlabeled_product_information() -> None:
     assert no_match["meta"]["source_call_count"] == 1
 
     category = resolve_io_nlq("전문약 제품정보 조회")
-    assert category["params"].get("product_di_semantic_group") == "insurance"
+    assert category["params"].get("product_prescription_semantic") == "prescription"
+    assert not category["params"].get("product_di_semantic_group")
     assert not category["params"].get("_product_information_unlabeled_name")
 
 
@@ -278,7 +279,8 @@ def test_product_information_router_owns_unlabeled_authority() -> None:
             )
 
     assert service_params[0].get("_product_information_unlabeled_name") == "베링거"
-    assert service_params[1].get("product_di_semantic_group") == "insurance"
+    assert service_params[1].get("product_prescription_semantic") == "prescription"
+    assert not service_params[1].get("product_di_semantic_group")
     assert "_product_information_unlabeled_name" not in service_params[1]
     assert len(delivered) == 2
     assert all((payload.get("meta") or {}).get("source_call_count") == 1 for payload in delivered)

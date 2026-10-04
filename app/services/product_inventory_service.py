@@ -2081,6 +2081,7 @@ def _apply_master_filters(
         where,
         sql_params,
         product_di_code_expression="P.Rd04_Physic_Di",
+        product_di_gcode_expression="P.Rd04_Physic_Di_Gcode",
         bind_prefix="inventory_product_prescription",
     )
 
@@ -2315,6 +2316,7 @@ def _build_month_carry_monthagg_sql(params: Dict[str, Any], cfg: Dict[str, Any])
         where,
         sql_params,
         product_di_code_expression="PFilter.Rd04_Physic_Di",
+        product_di_gcode_expression="PFilter.Rd04_Physic_Di_Gcode",
         bind_prefix="carry_product_prescription",
     )
     outer_where: list[str] = []
@@ -2431,6 +2433,7 @@ def _build_current_stock_monthagg_sql(params: Dict[str, Any], cfg: Dict[str, Any
         where,
         sql_params,
         product_di_code_expression="PFilter.Rd04_Physic_Di",
+        product_di_gcode_expression="PFilter.Rd04_Physic_Di_Gcode",
         bind_prefix="carry_product_prescription",
     )
 

@@ -151,6 +151,7 @@ def _base_filters(params: Dict[str, Any]) -> str:
         params,
         product_code_expression="Physic_Cd.Rd04_Physic_Cd",
         product_di_code_expression="Physic_Cd.Rd04_Physic_Di",
+        product_di_gcode_expression="Physic_Cd.Rd04_Physic_Di_Gcode",
         bind_prefix="in_product_prescription",
     )
 
