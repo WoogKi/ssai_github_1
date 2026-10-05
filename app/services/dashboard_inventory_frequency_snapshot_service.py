@@ -1610,6 +1610,26 @@ def _select_snapshot_product_universe(
     }
 
 
+def _filter_product_statistics_to_universe(
+    monthly_rows: Sequence[Mapping[str, Any]],
+    diagnostics: Mapping[str, Any],
+    product_code_set: set[str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep final-universe events while retaining their source-side exclusion count."""
+    accepted = int(diagnostics.get("normal_positive_accepted_row_count") or 0)
+    total = sum(int(row.get("occurrence_count") or 0) for row in monthly_rows)
+    if total != accepted:
+        raise SnapshotContractError("accepted normal events do not match monthly activity")
+    kept = [dict(row) for row in monthly_rows if str(row.get("product_code") or "").strip() in product_code_set]
+    final_count = sum(int(row.get("occurrence_count") or 0) for row in kept)
+    ignored = total - final_count
+    if ignored < 0 or ignored > accepted or accepted - ignored != final_count:
+        raise SnapshotContractError("ignored product event reconciliation is invalid")
+    updated = dict(diagnostics)
+    updated["ignored_product_event_count"] = ignored
+    return kept, updated
+
+
 def query_sqlserver_fixture(sql: str, binds: Mapping[str, Any], *, timeout_seconds: int = 30) -> pd.DataFrame:
     """Execute a parameterized VALUES CTE against SQL Server only for test equivalence."""
     from app.services.ssai_analytics_db import connect_analytics_db
@@ -1722,7 +1742,9 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
     if not product_codes:
         raise SnapshotContractError("dashboard profile product universe is empty")
     product_code_set = set(product_codes)
-    monthly_rows = [row for row in monthly_rows if str(row.get("product_code") or "").strip() in product_code_set]
+    monthly_rows, diagnostics = _filter_product_statistics_to_universe(
+        monthly_rows, diagnostics, product_code_set
+    )
     product_day_counts = {code: value for code, value in product_day_counts.items() if code in product_code_set}
     product_customer_counts = {code: value for code, value in product_customer_counts.items() if code in product_code_set}
     outbound_paid_quantities = {code: value for code, value in outbound_paid_quantities.items() if code in product_code_set}

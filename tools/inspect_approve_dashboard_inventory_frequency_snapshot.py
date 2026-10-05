@@ -88,8 +88,13 @@ def _verify_expected(payload: Mapping[str, Any], args: argparse.Namespace) -> di
         "grade_count_total": sum(actual_grades.values()) == int(summary.get("product_count") or 0),
         "source_partition_total": partition_total == args.expected_source_row_count,
         "source_row_count": int(diagnostics.get("source_row_count") or 0) == args.expected_source_row_count,
-        "accepted_normal": int(diagnostics.get("normal_positive_accepted_row_count") or 0)
-        == int(summary.get("normal_event_count") or 0),
+        "accepted_normal": (
+            0 <= int(diagnostics.get("ignored_product_event_count") or 0)
+            <= int(diagnostics.get("normal_positive_accepted_row_count") or 0)
+            and int(diagnostics.get("normal_positive_accepted_row_count") or 0)
+            - int(diagnostics.get("ignored_product_event_count") or 0)
+            == int(summary.get("normal_event_count") or 0)
+        ),
     }
     if not all(checks.values()):
         failed = ", ".join(key for key, value in checks.items() if not value)

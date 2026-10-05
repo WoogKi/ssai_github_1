@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
+    _filter_product_statistics_to_universe,
     _select_snapshot_product_universe,
     build_frequency_snapshot_plan,
     frequency_snapshot_read_keys,
@@ -435,6 +436,19 @@ def test_snapshot_management_only_universe_contract() -> None:
     )
     _assert({row["product_code"] for row in snapshot.frequency_products} == {"package"},
             "management-only product re-entered product statistics")
+    monthly_rows, diagnostics = _filter_product_statistics_to_universe(
+        (
+            {"month": "202609", "product_code": "package", "stock_code": "00001", "occurrence_count": 1},
+            {"month": "202609", "product_code": "managed", "stock_code": "00001", "occurrence_count": 2},
+        ),
+        {"normal_positive_accepted_row_count": 3},
+        set(product_codes),
+    )
+    _assert(
+        len(monthly_rows) == 1 and monthly_rows[0]["product_code"] == "package"
+        and diagnostics["ignored_product_event_count"] == 2,
+        "management-only outbound events must remain diagnostics-only after universe exclusion",
+    )
 
 
 def main() -> int:

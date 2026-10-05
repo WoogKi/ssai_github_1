@@ -5,6 +5,7 @@ import sys
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -34,6 +35,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
     _PRODUCT_STATISTICS_STREAM_COLUMNS,
     _aggregate_product_statistics_event_chunks,
+    _filter_product_statistics_to_universe,
     _python_product_statistics_projection_chunks,
     _price_status,
     build_frequency_snapshot_plan,
@@ -42,6 +44,7 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (  # noq
 )
 from app.services.ssai_analytics_snapshot_migration import MIGRATION_008_SQL, MIGRATION_009_SQL, MIGRATIONS  # noqa: E402
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
+from tools.inspect_approve_dashboard_inventory_frequency_snapshot import _verify_expected  # noqa: E402
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -576,6 +579,53 @@ def test_multi_projection_event_stream() -> None:
     _assert(split == (monthly, diagnostics, days, customers, paid, returns, prices), "chunk boundaries must not change product statistics")
 
 
+def test_final_universe_ignored_event_reconciliation() -> None:
+    rows = [
+        {"month": "202608", "product_code": "P1", "stock_code": "S1", "occurrence_count": 1},
+        {"month": "202608", "product_code": "P2", "stock_code": "S1", "occurrence_count": 1},
+    ]
+    diagnostics = {"normal_positive_accepted_row_count": 2}
+    kept, updated = _filter_product_statistics_to_universe(rows, diagnostics, {"P1", "P2"})
+    _assert(len(kept) == 2 and updated["ignored_product_event_count"] == 0, "included accepted events stay unchanged")
+    kept, updated = _filter_product_statistics_to_universe(rows, diagnostics, {"P1"})
+    _assert(len(kept) == 1 and updated["ignored_product_event_count"] == 1, "excluded product contributes one ignored event")
+    multi_rows = rows + [{"month": "202609", "product_code": "P2", "stock_code": "S1", "occurrence_count": 3}]
+    kept, updated = _filter_product_statistics_to_universe(
+        multi_rows, {"normal_positive_accepted_row_count": 5}, {"P1"}
+    )
+    _assert(len(kept) == 1 and updated["ignored_product_event_count"] == 4, "ignored count is event count, not product count")
+    try:
+        _filter_product_statistics_to_universe(rows, {"normal_positive_accepted_row_count": 1}, {"P1"})
+    except SnapshotContractError:
+        pass
+    else:
+        raise AssertionError("accepted-event mismatch must fail closed")
+
+    args = SimpleNamespace(
+        contract_version="2.1", expected_product_count=1, expected_normal_event_count=1,
+        expected_grade_counts={"F": 0, "A": 1, "B": 0, "C": 0, "D": 0, "E": 0, "X": 0},
+        expected_source_row_count=2,
+    )
+    payload = {
+        "summary": {"product_count": 1, "normal_event_count": 1, "grade_counts": args.expected_grade_counts},
+        "source_diagnostics": {
+            "source_row_count": 2, "normal_positive_accepted_row_count": 2,
+            "ignored_product_event_count": 1, "normal_positive_duplicate_row_count": 0,
+            "normal_positive_conflicting_row_count": 0, "normal_positive_missing_key_row_count": 0,
+            "normal_positive_nonintegral_row_count": 0, "normal_nonpositive_row_count": 0,
+            "return_positive_row_count": 0, "return_nonpositive_row_count": 0, "other_tcode_row_count": 0,
+        },
+    }
+    _assert(_verify_expected(payload, args)["checks"]["accepted_normal"], "inspect accepts source-to-final reconciliation")
+    payload["source_diagnostics"]["ignored_product_event_count"] = 3
+    try:
+        _verify_expected(payload, args)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("inspect must reject ignored events above accepted events")
+
+
 def test_python_source2_projection_fixture() -> None:
     raw = pd.DataFrame([
         {"outbound_date": "20250901", "vendor_code": "V0", "outbound_seq": "1", "product_code": "P1", "stock_code": "S1", "io_gcode": "0012", "io_tcode": "500", "quantity": Decimal("2"), "oquantity": 0, "supply_price": 200, "final_supply_price": None},
@@ -677,6 +727,7 @@ def main() -> int:
         test_sql_decimal_storage_collapse_matrix,
         test_repository_inserts_the_checksummed_storage_values,
         test_multi_projection_event_stream,
+        test_final_universe_ignored_event_reconciliation,
         test_python_source2_projection_fixture,
         test_sql_and_migration_contract,
         test_io_classification_candidate_a_contract,

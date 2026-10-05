@@ -1101,6 +1101,16 @@ def validate_relational_frequency_snapshot(snapshot: RelationalFrequencySnapshot
         monthly_counts[product] += occurrence
     if product_counts != {code: monthly_counts.get(code, 0) for code in sorted(product_counts)}:
         raise SnapshotContractError("relational monthly totals do not match product totals")
+    if int(diagnostics.get("diagnostic_contract_version") or 0) >= 2 and _is_product_statistics_key(snapshot.key):
+        accepted = _required_nonnegative_int(
+            diagnostics.get("normal_positive_accepted_row_count"), field="normal_positive_accepted_row_count"
+        )
+        ignored = _required_nonnegative_int(
+            diagnostics.get("ignored_product_event_count"), field="ignored_product_event_count"
+        )
+        final_events = sum(monthly_counts.values())
+        if ignored > accepted or accepted - ignored != final_events:
+            raise SnapshotContractError("relational ignored product events do not reconcile")
     expected_grades = {row["product_code"]: row["frequency_grade"] for row in assign_frequency_grades(product_counts, product_counts)}
     grade_field = "legacy_frequency_grade" if _is_extended_key(snapshot.key) else "frequency_grade"
     if expected_grades != {str(row.get("product_code")): str(row.get(grade_field)) for row in snapshot.frequency_products}:
