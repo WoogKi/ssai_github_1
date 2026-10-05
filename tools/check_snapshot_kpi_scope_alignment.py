@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 from itertools import product
 from pathlib import Path
@@ -26,6 +27,13 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     dashboard_profile_fingerprint,
 )
 from app.services.monthly_frequency_aggregate import product_lifecycle_sql  # noqa: E402
+from app.services.product_master_filter_contract import (  # noqa: E402
+    add_named_management_only_exclusion,
+    is_management_only_standard_code,
+)
+from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
+    _generate_frequency_snapshot_draft_locked,
+)
 
 
 def _assert(condition: bool, message: str) -> None:
@@ -378,6 +386,57 @@ def test_verified_char5_monthly_stock_seek_preserves_projection() -> None:
                 f"company{company_id} R210 seek changed universe or checksum")
 
 
+def test_snapshot_management_only_universe_contract() -> None:
+    options = dict(
+        stock_codes=("00001",), cutoff_date="20260930", basis_from="20260701",
+        basis_to="20260930", product_group_codes=("0013:A001",),
+        product_di_codes=("0004:01",), product_class_codes=("0031:02",),
+        snapshot_projection_only=True,
+    )
+    legacy_sql, legacy_binds = product_lifecycle_sql(**options)
+    snapshot_sql, snapshot_binds = product_lifecycle_sql(**options, exclude_management_only=True)
+    clauses: list[str] = []
+    add_named_management_only_exclusion(clauses, product_code_expression="P.Rd04_Physic_Cd")
+    universe_sql = snapshot_sql.split("WITH ProductUniverse AS (", 1)[1].split("), FirstInbound AS (", 1)[0]
+    _assert(len(clauses) == 1 and clauses[0] in universe_sql, "snapshot did not use the shared R046 predicate")
+    _assert("ManagementStd" not in legacy_sql, "non-snapshot lifecycle query changed")
+    _assert(snapshot_binds == legacy_binds, "management exclusion changed lifecycle binds")
+    _assert(snapshot_sql.count("dbo.Rddbc046 AS ManagementStd") == 1, "R046 requires a second source")
+    for marker in ("P.Rd04_Physic_Group_Gcode", "P.Rd04_Physic_Di_Gcode", "P.Rd04_Physic_Tax_Gcode"):
+        _assert(marker in universe_sql, f"profile filter lost from ProductUniverse: {marker}")
+    _assert("exclude_management_only=True" in inspect.getsource(_generate_frequency_snapshot_draft_locked),
+            "production Snapshot caller did not enable management exclusion")
+
+    valid = "8801234567890"
+    other = "8801234567891"
+    cases = (
+        (valid, valid, True), (valid, other, False), ("", "", False),
+        ("not-a-code", "not-a-code", False), ("1234567890123", "1234567890123", False),
+        (None, None, False),
+    )
+    for standard, main, expected in cases:
+        _assert(is_management_only_standard_code(standard, main) is expected,
+                f"shared R046 code validity changed: {standard!r}")
+    _assert(not is_management_only_standard_code("", valid), "blank R046 code excluded")
+
+    master_rows = pd.DataFrame((
+        {"product_code": "managed", "current_stock_present": 1, "basis_inbound_present": 0},
+        {"product_code": "package", "current_stock_present": 1, "basis_inbound_present": 0},
+    ))
+    remaining = master_rows.loc[master_rows["product_code"].ne("managed")]
+    product_codes, diagnostics = _select_snapshot_product_universe(remaining, ())
+    _assert(product_codes == ["package"] and diagnostics["eligible_product_count"] == 1,
+            "management-only product re-entered the Snapshot universe")
+    snapshot = build_product_statistics_relational_snapshot_from_aggregates(
+        company_id=3, evaluation_month="202610", monthly_rows=(),
+        product_codes=product_codes, product_day_counts={}, product_customer_counts={},
+        first_normal_inbound_months={}, outbound_paid_quantities={}, return_statistics={},
+        purchase_prices={}, sales_prices={}, stock_codes=("00001",),
+    )
+    _assert({row["product_code"] for row in snapshot.frequency_products} == {"package"},
+            "management-only product re-entered product statistics")
+
+
 def main() -> int:
     tests = (
         test_profile_contract_reaches_snapshot_plan,
@@ -387,6 +446,7 @@ def main() -> int:
         test_union_product_universe_and_leading_zero,
         test_v3_unused_lifecycle_columns_do_not_change_snapshot,
         test_verified_char5_monthly_stock_seek_preserves_projection,
+        test_snapshot_management_only_universe_contract,
     )
     for test in tests:
         test()

@@ -1673,6 +1673,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
         include_first_outbound=False,
         force_hash_join=plan.company_id == 8,
         snapshot_projection_only=True,
+        exclude_management_only=True,
         seek_char5_monthly_stock=plan.company_id in (12, 13) and plan.stock_mode == "real",
     )
     report("제품 및 최초 정상 입고 조회 중")

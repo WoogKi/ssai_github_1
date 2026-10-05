@@ -17,6 +17,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     scope_fingerprint,
     validate_relational_frequency_snapshot,
 )
+from app.services.product_master_filter_contract import add_named_management_only_exclusion
 
 
 MONTHLY_FREQUENCY_SCHEMA_VERSION = "1.0"
@@ -716,6 +717,7 @@ def product_lifecycle_sql(
     force_hash_join: bool = False,
     snapshot_projection_only: bool = False,
     seek_char5_monthly_stock: bool = False,
+    exclude_management_only: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Read profile-scoped lifecycle and product-universe evidence once."""
     cutoff = str(cutoff_date or "").strip()
@@ -784,6 +786,10 @@ def product_lifecycle_sql(
             _dimension_clause(product_class_codes, expected_gcode="0031", gcode_column="P.Rd04_Physic_Tax_Gcode", tcode_column="P.Rd04_Physic_Tax", prefix="class"),
         ) if clause
     ]
+    if exclude_management_only:
+        add_named_management_only_exclusion(
+            product_filters, product_code_expression="P.Rd04_Physic_Cd",
+        )
     product_filter_sql = "\n      AND " + "\n      AND ".join(product_filters) if product_filters else ""
     monthly_prefix = "Rd21" if mode == "real" else "Rd22"
     monthly_table = "dbo.Rddbc210" if mode == "real" else "dbo.Rddbc220"
