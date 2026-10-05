@@ -7596,7 +7596,7 @@ def try_handle_nlq(
     # through to Analytics/IO/LLM routing once the canonical phrase matches.
     try:
         if _try_handle_dashboard_nlq(
-            txt,
+            original if _resolve_dashboard_nlq_action(original) else txt,
             room=room,
             session_state=session_state,
             logger=logger,

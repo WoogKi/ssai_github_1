@@ -44,6 +44,60 @@ def main() -> None:
     assert all(router._dashboard_nlq_residual(query) == "" for query in bare_variants)
     assert router._extract_dashboard_nlq_conditions("오늘의 경영점검 담당자 김")[0]["담당자"] == "김"
 
+    candidate = router.resolve_new_sims_nlq_candidate("sims 일일점검") or {}
+    assert candidate == {"route": "dashboard", "action": action}, candidate
+    from app.sims.views import dashboard_lite
+    from app.ui import chat_middleware
+
+    for query in bare_variants:
+        for current_table in (None, {"company_id": "3", "rows": []}):
+            state = {"__sims_current_table": current_table} if current_table else {}
+            cache = {"params": {"company_id": "3"}, "facts": {"source_call_count": 0, "inventory": {"readiness_rows": [{}]}}}
+            with (
+                patch.object(router, "_build_dashboard_nlq_params", return_value=({"company_id": "3"}, None)) as params_builder,
+                patch.object(dashboard_lite, "build_dashboard_lite_result_payload", return_value=({"meta": {}}, cache)) as facts_builder,
+                patch.object(dashboard_lite, "dashboard_request_publish_allowed", return_value=True),
+                patch.object(chat_middleware, "get_current_chat_room_id", return_value="room-3"),
+                patch.object(chat_middleware, "push_sims_result_to_chat") as push,
+            ):
+                handled = router.try_handle_nlq(
+                    query, room={"id": "room-3"}, session_state=state,
+                    make_ts=lambda: "fixture", next_seq=lambda: 1,
+                    logger=logging.getLogger(__name__),
+                )
+            assert handled and params_builder.call_count == 1, query
+            assert params_builder.call_args.args[0] == query, query
+            assert facts_builder.call_count == 1 and push.call_count == 1, query
+    assert router.resolve_new_sims_nlq_candidate("일일점검") is None
+
+    from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
+    from app.services.io_nlq import resolve_io_nlq
+
+    for query, action_name in (
+        ("sims 발주담당자 윤정아 발주조회 202609", "발주조회"),
+        ("sims 발주담당자 윤정아 발주계산", "발주 계산"),
+    ):
+        routed: list[str] = []
+
+        def capture_io(text, **_kwargs):
+            routed.append(text)
+            return True
+
+        with (
+            patch.object(router, "_try_handle_io_nlq", side_effect=capture_io),
+            patch.object(router, "_try_handle_dashboard_nlq", return_value=False),
+        ):
+            assert router.try_handle_nlq(
+                query, room={}, session_state={}, make_ts=lambda: "fixture",
+                next_seq=lambda: 1, logger=logging.getLogger(__name__),
+            ), query
+        assert routed == [query[5:]], (query, routed)
+        parsed = resolve_registered_erp_table_nlq(routed[0]) or {}
+        io_parsed = resolve_io_nlq(routed[0]) or {}
+        for result in (parsed, io_parsed):
+            assert result.get("action") == action_name, (query, result)
+            assert (result.get("params") or {}).get("order_staff_nm") == "윤정아", (query, result)
+
     supplier_calls: list[tuple[str, str]] = []
 
     def resolve_supplier(text: str, *, mode: str):
