@@ -61,6 +61,7 @@ from app.ui.current_table_followups.generic import (
     handle_generic_followup,
     handle_common_column_filter_followup,
     handle_common_column_group_followup,
+    _find_common_top_numeric_column,
     parse_current_table_rank_request,
 )
 
@@ -612,6 +613,11 @@ _ORDER_DATE_AUTHORITY: dict[str, Any] = {
 }
 
 _CURRENT_TABLE_SOURCE_GROUPING_ALIASES: dict[str, dict[str, tuple[str, ...]]] = {
+    "stock_ledger": {
+        "day": ("입출고일자", "수불일자", "입고일자", "출고일자", "기준일자", "일자"),
+        "month": ("입출고일자", "수불일자", "입고일자", "출고일자", "기준일자", "일자"),
+        "weekday": ("입출고일자", "수불일자", "입고일자", "출고일자", "기준일자", "일자"),
+    },
     "order": {
         **_ORDER_TIME_GROUPING_ALIASES,
         "order_vendor": ("발주거래처명", "발주처명", "발주처"),
@@ -657,6 +663,15 @@ _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES: dict[str, dict[str, Any]] = {
         # Existing transaction direction shorthand: these phrases mean
         # purchase/sales direction plus canonical day, not a different source column.
         "contextual_default": ("입고일자", "매입일자", "출고일자", "매출일자"),
+    },
+    "stock_ledger": {
+        "default": ("입출고일자", "수불일자", "입고일자", "출고일자", "기준일자", "일자"),
+        "explicit": (
+            ("입출고일자", ("입출고일자",)),
+            ("수불일자", ("수불일자",)),
+            ("입고일자", ("입고일자",)),
+            ("출고일자", ("출고일자",)),
+        ),
     },
 }
 
@@ -1158,6 +1173,24 @@ def _is_product_top_request(query: str) -> bool:
     )
 
 
+def _current_table_has_rank_dimension_target(query: str) -> bool:
+    """Detect a standalone rank target after removing the TOP expression."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    compact = re.sub(
+        r"(TOP|top|high|low|상위|하위|최고|최저|1위|큰|작은|많은순|적은순|많은|적은|제일많은|제일적은|가장많은|가장적은)\d*",
+        "",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(r"\d+", "", compact)
+    return bool(
+        re.search(
+            r"(?:제품|품목|거래처|매입처|제조사|제약사|담당자|영업사원|부서|직책)$",
+            compact,
+        )
+    )
+
+
 def _current_table_followup_intent(
     query: str,
     source_action: str = "",
@@ -1183,6 +1216,11 @@ def _current_table_followup_intent(
     )
     if source_is_trans_doc and (is_trans_doc_sales_amount or is_trans_doc_directional_time_aggregate):
         metrics = ["transaction_amount"]
+    # A real numeric source column is the strongest interpretation for a
+    # current-table rank request.  Do this before inferred grouping so a
+    # metric such as "관련제품수" is not mistaken for a product dimension.
+    exact_rank_column = _find_common_top_numeric_column(df, query) if isinstance(df, pd.DataFrame) else ""
+    semantic_rank_target = _current_table_has_rank_dimension_target(query)
     source_metric = _current_table_source_metric_hint(source_action, df, source_meta, query)
     if not metrics and source_metric and (
         _is_product_top_request(query) or len(requested_dimensions) == 1
@@ -1191,7 +1229,7 @@ def _current_table_followup_intent(
         # 공식 지표를 확정할 때만 이를 재사용한다.
         metrics.append(source_metric)
     groupings = [key for key, _label, _aliases in requested_dimensions]
-    if not groupings and len(metrics) == 1:
+    if not groupings and (not exact_rank_column or semantic_rank_target) and len(metrics) == 1:
         inferred_grouping = _current_table_requested_grouping(query, metrics[0], source_action)
         if inferred_grouping:
             groupings.append(inferred_grouping)
@@ -1214,6 +1252,7 @@ def _current_table_followup_intent(
         "requested_groupings": groupings,
         "requested_metric": metrics[0] if len(metrics) == 1 else "",
         "requested_grouping": groupings[0] if len(groupings) == 1 else "",
+        "exact_rank_column": exact_rank_column,
         "requested_dimensions": requested_dimensions,
         "unresolved_dimension_label": unresolved_dimension,
         "unresolved_metric_label": unresolved_metric,
@@ -1235,9 +1274,12 @@ def _current_table_requested_grouping(query: str, metric: str, source_action: st
             return "weekday"
     if rank_request and any(marker in compact for marker in ("일자", "날짜", "일별")):
         return "day"
-    if metric == "shortage" and any(word in compact for word in ("제품", "품목")):
+    # An exact numeric field named 부족제품수 is a count on the source row;
+    # its embedded 제품 is not a request to regroup by product.
+    shortage_dimension_text = compact.replace("부족제품수", "")
+    if metric == "shortage" and any(word in shortage_dimension_text for word in ("제품", "품목")):
         return "product"
-    if metric == "shortage" and any(word in compact for word in ("TOP", "top", "상위")):
+    if metric == "shortage" and "부족제품수" not in compact and any(word in compact for word in ("TOP", "top", "상위")):
         return "product"
     if metric == "sales" and _is_product_top_request(query):
         return "product"
@@ -1342,7 +1384,8 @@ def _current_table_followup_capability(
                 else label
             )
 
-    resolved_metric = _resolve_current_table_metric_column(df, metric, kind)
+    exact_rank_column = str(intent.get("exact_rank_column") or "")
+    resolved_metric = exact_rank_column or _resolve_current_table_metric_column(df, metric, kind)
     metric_columns = [resolved_metric] if resolved_metric else []
     semantic_filter = _requested_source_semantic_filter(kind, query)
     if semantic_filter:
@@ -2088,6 +2131,19 @@ def handle_current_table_followup_by_action(
 
     def _push_table_with_capability(**kwargs: Any) -> bool:
         extra_meta = dict(kwargs.pop("extra_meta", {}) or {})
+        result_frame = kwargs.get("df")
+        source_total_label = {
+            ("purchase_detail", "purchase_amount"): "매입금액",
+            ("sales_detail", "sales"): "매출금액",
+        }.get((kind, capability["requested_metric"]))
+        if (
+            source_total_label
+            and isinstance(result_frame, pd.DataFrame)
+            and "합계금액" in result_frame.columns
+            and source_total_label not in result_frame.columns
+            and "합계금액" in df.columns
+        ):
+            kwargs["df"] = result_frame.rename(columns={"합계금액": source_total_label})
         contract_error = _current_table_result_contract_error(
             kwargs.get("df"),
             capability,
@@ -2205,6 +2261,14 @@ def handle_current_table_followup_by_action(
         kind in _CURRENT_TABLE_SOURCE_GROUPING_ALIASES
         and capability["requested_grouping"] in {"month", "day", "weekday", "customer"}
     ) or (
+        kind in {"sales_detail", "purchase_detail"}
+        and capability["requested_grouping"] == "product"
+        and bool(capability["requested_metric"])
+    ) or (
+        kind == "sales_detail"
+        and capability["requested_grouping"] in {"purchase_vendor", "stock_location"}
+        and capability["requested_metric"] == "sales"
+    ) or (
         bool(_requested_source_semantic_filter(kind, query))
     ))
     if source_contract_priority:
@@ -2286,12 +2350,7 @@ def handle_current_table_followup_by_action(
         query,
         default_limit=top_n,
     )
-    semantic_rank_target = bool(
-        re.search(
-            r"(?:제품|품목|거래처|매입처|제조사|제약사|담당자|영업사원|부서|직책)$",
-            normalized_query,
-        )
-    )
+    semantic_rank_target = _current_table_has_rank_dimension_target(query)
     semantic_group_rank = bool(
         common_rank_direction
         and (

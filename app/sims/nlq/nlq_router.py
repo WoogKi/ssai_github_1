@@ -24,6 +24,12 @@ _log = logging.getLogger("ssai.sims.nlq_router")
 
 
 _DASHBOARD_NLQ_ACTION = "SIMS 일일점검"
+
+
+def _normalize_sims_invocation(text: str) -> str:
+    return re.sub(r"(?<![가-힣A-Za-z0-9])심스(?=\s|$)", "SIMS", str(text or ""))
+
+
 _DASHBOARD_NLQ_PHRASES = (
     "SIMS 일일점검",
     "오늘의 경영점검",
@@ -51,7 +57,7 @@ _DASHBOARD_NLQ_CONDITION_LABELS = (
 def _resolve_dashboard_nlq_action(text: str) -> str:
     return (
         _DASHBOARD_NLQ_ACTION
-        if any(pattern.search(str(text or "")) for pattern in _DASHBOARD_NLQ_PHRASE_PATTERNS)
+        if any(pattern.search(_normalize_sims_invocation(text)) for pattern in _DASHBOARD_NLQ_PHRASE_PATTERNS)
         else ""
     )
  
@@ -537,6 +543,9 @@ def _should_try_vendors_before_goods(txt: str) -> bool:
     """
     t = (txt or "").strip()
     if not t:
+        return False
+
+    if any(label in t for label in ("계약단가", "구매원가")):
         return False
 
     # 거래/집계 신호가 있으면 거래처 마스터 우선 라우팅 금지
@@ -5414,7 +5423,7 @@ def _ensure_io_summary_meta(
     return payload
 
 def _dashboard_nlq_residual(text: str) -> str:
-    residual = str(text or "")
+    residual = _normalize_sims_invocation(text)
     for pattern in _DASHBOARD_NLQ_PHRASE_PATTERNS:
         residual = pattern.sub(" ", residual)
     residual = re.sub(r"(?:19|20)\d{2}\s*년(?:\s*(?:부터|~|-)\s*(?:19|20)\d{2}\s*년?)?", " ", residual)
@@ -5435,7 +5444,7 @@ def _dashboard_nlq_residual(text: str) -> str:
 
 def _extract_dashboard_nlq_conditions(text: str) -> tuple[dict[str, str], str]:
     """Extract labelled Dashboard conditions without depending on their order."""
-    source = str(text or "")
+    source = _normalize_sims_invocation(text)
     labels = "|".join(map(re.escape, _DASHBOARD_NLQ_CONDITION_LABELS))
     # Korean labels are word characters, so a \b boundary can fail when a
     # label is followed by punctuation or another condition.  The label list
@@ -7720,7 +7729,10 @@ def try_handle_nlq(
         if (
             not _is_explicit_io_nlq_phrase(txt)
             and not _has_vendor_txn_signal(txt)
-            and any(w in txt for w in master_vendor_words)
+            and (
+                any(w in txt for w in master_vendor_words)
+                or _should_try_vendors_before_goods(txt)
+            )
         ):
             from app.sims.nlq.nlq_vendors import try_handle_vendors_nlq
 

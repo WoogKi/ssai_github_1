@@ -90,6 +90,32 @@ def _result_frame(payload: dict[str, Any]) -> pd.DataFrame:
 
 
 def _assert_rank_contract() -> None:
+    supplier_shortage = pd.DataFrame({
+        "매입처코드": [f"V{index:03d}" for index in range(12)],
+        "매입처명": [f"매입처{index:02d}" for index in range(12)],
+        "부족제품수": [12 - index for index in range(12)],
+        "관련제품수": [24 - index for index in range(12)],
+        "재고없음제품수": [36 - index for index in range(12)],
+        "음수재고제품수": [48 - index for index in range(12)],
+        "매입처원본재고수량": [60 - index for index in range(12)],
+        "매입처원본재고금액": [7200 - index * 100 for index in range(12)],
+        "배정부족예상수량": [index + 1 for index in range(12)],
+        "배정부족예상금액": [1200 - index * 10 for index in range(12)],
+    })
+    for metric in (
+        "부족제품수", "관련제품수", "재고없음제품수", "음수재고제품수",
+        "매입처원본재고금액", "배정부족예상금액",
+    ):
+        shortage_result = _dispatch(
+            supplier_shortage, f"현재표 {metric} top 10 보여줘", "매입처별 재고부족 현황"
+        )
+        shortage_rows = _result_frame(shortage_result)
+        shortage_values = pd.to_numeric(shortage_rows[metric], errors="raise")
+        assert len(shortage_rows) == 10 and shortage_values.is_monotonic_decreasing
+        assert {"매입처코드", "매입처명"}.issubset(shortage_rows.columns)
+        assert shortage_result.get("source_table_key") == "feedback-regression-fixture"
+        assert (shortage_result.get("extra_meta") or {}).get("source_action") == "매입처별 재고부족 현황"
+
     inventory = pd.DataFrame(
         {
             "제품코드": [f"P{index:03d}" for index in range(1, 16)],
@@ -156,6 +182,26 @@ def _assert_rank_contract() -> None:
     }
     for phrase, expected in expected_ranks.items():
         assert parse_current_table_rank_request(phrase) == expected, phrase
+
+    grouping_cases = (
+        (
+            pd.DataFrame({"제품코드": ["P1", "P2", "P3"], "제품명": ["A", "B", "C"], "재고수량": [3, 1, 2]}),
+            "현재표 제품별 재고수량 top 10", "product", ("제품코드", "제품명"),
+        ),
+        (
+            pd.DataFrame({"거래처코드": ["V1", "V2", "V3"], "거래처명": ["A", "B", "C"], "매출금액": [3, 1, 2]}),
+            "현재표 거래처별 매출금액 top 10", "customer", ("거래처명",),
+        ),
+        (
+            pd.DataFrame({"제조사코드": ["M1", "M2", "M3"], "제조사명": ["A", "B", "C"], "재고금액": [3, 1, 2]}),
+            "현재표 제조사별 재고금액 top 10", "manufacturer", ("제조사명",),
+        ),
+    )
+    for group_df, query, expected_grain, group_columns in grouping_cases:
+        grouped_result = _dispatch(group_df, query, "일반 조회")
+        grouped_rows = _result_frame(grouped_result)
+        assert (grouped_result.get("extra_meta") or {}).get("result_grain") == expected_grain
+        assert any(column in grouped_rows.columns for column in group_columns) and 0 < len(grouped_rows) <= 10
 
 
 def _assert_user_group_and_projection_contract() -> None:

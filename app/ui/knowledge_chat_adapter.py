@@ -84,6 +84,85 @@ class SimsHelpIntent:
     period_fields: tuple[tuple[str, str], ...] = ()
 
 
+_SIMS_QUERY_EXAMPLE_CATALOG: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
+    ("일일점검", (
+        ("SIMS 일일점검", "SIMS 일일점검"),
+        ("SIMS 일일점검", "SIMS 일일점검 제약사 삼진"),
+        ("SIMS 일일점검", "SIMS 일일점검 발주담당자 김"),
+    )),
+    ("재고 / 제품", (
+        ("현재고 조회", "현재고 제조사명 한미"),
+        ("제품재고현황 조회", "제품재고장 제조사 한미"),
+        ("제품수불현황 조회", "제품수불현황 제품 00269 2024~2026 조회"),
+        ("제품정보 조회", "제품정보 조회"),
+    )),
+    ("입고 / 출고 / 거래명세", (
+        ("입고명세 조회", "입고명세조회 제조사 동제"),
+        ("출고명세 조회", "출고명세조회 제조사 동제"),
+        ("거래명세서 공통 조회", "거래명세서 공통 20260917 조회"),
+        ("입고예정조회", "입고 예정 조회"),
+    )),
+    ("매출 / 분석", (
+        ("품목별 매출 추세 분석", "품목별 매출추세분석 조회"),
+        ("품목별 매출 예상", "품목별 매출예상"),
+        ("지역별 매출 예상", "지역별 매출예상 영업사원 민우"),
+        ("품목별 재고부족현황", "품목별 재고부족현황 제품 아모크라"),
+    )),
+    ("마스터 조회", (
+        ("제품코드 목록", "제품코드조회"),
+        ("거래처 목록", "거래처코드조회"),
+        ("사용자목록 + 부서명", "사용자 김 조회"),
+        ("그룹코드조회", "업무코드 한글명 배송 조회"),
+    )),
+    ("계약단가 / 매입단가", (
+        ("최종 계약단가 조회", "일반의약품 계약단가 조회"),
+        ("최종 계약단가 조회", "전문약 제약사 삼진 계약단가 조회"),
+        ("최종 매입단가 조회", "전문약 최종 매입단가 조회"),
+        ("최종 매입단가 조회", "비보험약 최종 매입단가 조회"),
+    )),
+    ("발주", (
+        ("발주조회", "발주 조회"),
+        ("발주 계산", "발주계산"),
+        ("발주 계산", "발주담당자 김 발주 계산 적정재고 30일로 해줘"),
+    )),
+    ("현재표 후속 질문", (
+        ("제품수불현황 조회", "현재표 월별 집계"),
+        ("제품수불현황 조회", "현재표 일별 집계"),
+        ("제품수불현황 조회", "현재표 요일별 집계"),
+        ("현재고 조회", "현재표 제품별 재고수량 TOP 20"),
+    )),
+)
+
+
+def parse_sims_query_examples_request(value: object) -> bool:
+    """Recognize SIMS-scoped example help before invocation stripping and RAG."""
+    if not isinstance(value, str):
+        return False
+    from app.sims.nlq.nlq_router import _normalize_sims_invocation
+
+    compact = re.sub(r"\s+", "", _normalize_sims_invocation(value)).casefold()
+    return bool(re.fullmatch(
+        r"sims(?:(?:조회|사용)(?:예시|사례)|사용법)(?:알려줘|보여줘|알려주세요|보여주세요)?[?？]?",
+        compact,
+    ))
+
+
+def sims_query_examples_text(*, allowed_actions: set[str]) -> str:
+    """Render one role-filtered, DB-free catalog of currently registered actions."""
+    from app.sims.nlq.action_inventory import implemented_actions
+
+    supported = {spec.canonical_action for spec in implemented_actions()}
+    visible = supported & allowed_actions
+    sections = ["SIMS에서 아래처럼 질문할 수 있습니다."]
+    for heading, entries in _SIMS_QUERY_EXAMPLE_CATALOG:
+        examples = [example for action, example in entries if action in visible]
+        if examples:
+            lead = "조회 결과가 나온 뒤에는:\n" if heading == "현재표 후속 질문" else ""
+            sections.append(f"[{heading}]\n{lead}" + "\n".join(f"- {example}" for example in examples))
+    sections.append("원하는 업무를 말씀하시면 그 업무에 맞는 질문 예시를 더 알려드릴 수 있습니다.")
+    return "\n\n".join(sections)
+
+
 def parse_incomplete_sims_help_request(value: object, *, today: date | None = None) -> SimsHelpIntent | None:
     """Recognize incomplete business shapes without claiming an executable action."""
     if not isinstance(value, str):

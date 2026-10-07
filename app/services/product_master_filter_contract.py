@@ -27,10 +27,12 @@ PRODUCT_PRESCRIPTION_SEMANTIC_TERMS: dict[str, str] = {
     "전문의약품": "prescription",
     "전문약품": "prescription",
     "전문약": "prescription",
+    "전문제품": "prescription",
     "ETC": "prescription",
     "일반의약품": "otc",
     "일반약품": "otc",
     "일반약": "otc",
+    "일반제품": "otc",
     "OTC": "otc",
 }
 

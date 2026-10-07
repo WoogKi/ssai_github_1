@@ -323,27 +323,29 @@ def main() -> int:
         ("제품명 아모틴 계약단가 조회", "최종 계약단가 조회", {"physic_nm": "아모틴"}),
         ("신제품A 계약단가 조회", "최종 계약단가 조회", {"physic_nm": "신제품A"}),
         ("제품구분 전문 계약단가 조회", "최종 계약단가 조회", {"product_di_nm": "전문"}),
-        ("전문약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
-        ("전문제품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
+        ("전문약 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
+        ("전문제품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
         ("보험약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
         ("보험제품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
-        ("전문의약품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
-        ("ETC 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
-        ("일반약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
-        ("일반제품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
+        ("전문의약품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
+        ("ETC 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
+        ("일반약 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
+        ("일반제품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
         ("비보험약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
         ("비보험제품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
-        ("일반의약품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
-        ("OTC 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
+        ("일반의약품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
+        ("OTC 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
+        ("보험약 전문약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance", "product_prescription_semantic": "prescription"}),
+        ("비보험약 OTC 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance", "product_prescription_semantic": "otc"}),
         (
             "일반약 제약사 삼진 계약단가 조회",
             "최종 계약단가 조회",
-            {"maker_nm": "삼진", "product_di_semantic_group": "non_insurance"},
+            {"maker_nm": "삼진", "product_prescription_semantic": "otc"},
         ),
         (
             "전문약 제약사 삼진 계약단가 조회",
             "최종 계약단가 조회",
-            {"maker_nm": "삼진", "product_di_semantic_group": "insurance"},
+            {"maker_nm": "삼진", "product_prescription_semantic": "prescription"},
         ),
         ("제약사 동제 단가계약 조회", "최종 계약단가 조회", {"maker_nm": "동제"}),
         ("제약사 동제 계약단가 조회", "최종 계약단가 조회", {"maker_nm": "동제"}),
@@ -830,10 +832,10 @@ def main() -> int:
             failures.append(f"order contract-price semantic projection changed: {exc}")
 
     semantic_cases = {
-        "insurance": ("보험", "보험(%", "%(보험)"),
-        "non_insurance": ("비보험", "비보험(%"),
+        "insurance": "N'%|보험|%'",
+        "non_insurance": "N'%|비보험|%'",
     }
-    for semantic_group, expected_values in semantic_cases.items():
+    for semantic_group, expected_sql_token in semantic_cases.items():
         captured.clear()
         with patch.object(service, "execute_bound_select", side_effect=_capture):
             service.get_rddbc070_current_result(
@@ -843,13 +845,41 @@ def main() -> int:
         if (
             "LTRIM(RTRIM(ISNULL(P.Rd04_Physic_Di, ''))) AS [제품구분코드]" not in semantic_sql
             or "LTRIM(RTRIM(ISNULL(PD.Rd01_Hnm, '')))" not in semantic_sql
-            or any(value not in semantic_values for value in expected_values)
+            or expected_sql_token not in semantic_sql
             or any(token in semantic_sql for token in ("NOT LIKE '%[^0-9]%'", "THEN CAST", " < ?", " >= ?"))
         ):
             failures.append(
                 f"product-di semantic group SQL contract mismatch: {semantic_group}: "
                 f"values={semantic_values}"
             )
+
+    for prescription_semantic, expected_sql_token in {
+        "prescription": "PrescriptionStd.Rd046_Physic_Cd",
+        "otc": "CompanyProductDi.Rd01_Hnm",
+    }.items():
+        captured.clear()
+        with patch.object(service, "execute_bound_select", side_effect=_capture):
+            service.get_rddbc070_current_result(
+                {"product_prescription_semantic": prescription_semantic, "as_of": "20260907"}
+            )
+        semantic_sql, _semantic_values = captured[0]
+        if expected_sql_token not in semantic_sql:
+            failures.append(
+                f"product prescription semantic SQL contract mismatch: {prescription_semantic}"
+            )
+
+    captured.clear()
+    with patch.object(service, "execute_bound_select", side_effect=_capture):
+        service.get_rddbc070_current_result(
+            {
+                "product_di_semantic_group": "insurance",
+                "product_prescription_semantic": "prescription",
+                "as_of": "20260907",
+            }
+        )
+    combined_sql, _combined_values = captured[0]
+    if "N'%|보험|%'" not in combined_sql or "PrescriptionStd.Rd046_Physic_Cd" not in combined_sql:
+        failures.append("independent insurance and prescription SQL predicates do not combine with AND")
 
     captured.clear()
     with patch.object(service, "execute_bound_select", side_effect=_capture):

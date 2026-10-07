@@ -390,6 +390,41 @@ def run_basic_checks() -> list[CheckResult]:
     except Exception as e:
         results.append(_fail("vendor inventory-application attribute precedes IO", f"{type(e).__name__}: {e}"))
 
+    try:
+        router = importlib.import_module("app.sims.nlq.nlq_router")
+        vendors = importlib.import_module("app.sims.nlq.nlq_vendors")
+        vendor_queries = ("제약사 조회", "제약사 한미 조회")
+        product_queries = (
+            "제약사 한미 제품 조회",
+            "제약사 한미 제품재고장",
+            "제약사 한미 계약단가 조회",
+        )
+        route_ok = all(router._should_try_vendors_before_goods(query) for query in vendor_queries)
+        route_ok = route_ok and all(
+            not router._should_try_vendors_before_goods(query) for query in product_queries
+        )
+        route_ok = route_ok and all(
+            vendors._extract_vendor_scope_filter(query)[0] == "maker"
+            for query in vendor_queries
+        )
+        calls: list[str] = []
+        with patch.object(
+            vendors, "try_handle_vendors_nlq",
+            side_effect=lambda text, **_kwargs: calls.append(text) or True,
+        ):
+            for query in vendor_queries:
+                route_ok = route_ok and bool(router.try_handle_nlq(
+                    query, room={}, session_state={}, make_ts=lambda: "fixture",
+                    next_seq=lambda: 1, logger=log,
+                ))
+        route_ok = route_ok and calls == list(vendor_queries)
+        results.append(
+            _ok("maker vendor master precedes goods only in lookup context", "vendor scope route")
+            if route_ok else _fail("maker vendor master precedes goods only in lookup context", repr(calls))
+        )
+    except Exception as e:
+        results.append(_fail("maker vendor master precedes goods only in lookup context", f"{type(e).__name__}: {e}"))
+
     # 명시 업무코드 intent는 입출고 라벨과 충돌해도 IO보다 먼저 codes로 간다.
     try:
         router = importlib.import_module("app.sims.nlq.nlq_router")

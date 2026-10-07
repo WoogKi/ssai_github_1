@@ -216,6 +216,14 @@ def _detail_frame(date_column: str) -> pd.DataFrame:
     ])
 
 
+def _stock_ledger_frame() -> pd.DataFrame:
+    """Keep competing date columns to prove stock-ledger authority order."""
+    return pd.DataFrame([
+        {"입출고일자": "20260103", "수불일자": "20261203", "입고일자": "20261103", "출고일자": "20261003", "제품명": "P1", "입고수량": 10, "출고수량": 2, "재고수량": 8, "합계금액": 100},
+        {"입출고일자": "20260201", "수불일자": "20261201", "입고일자": "20261101", "출고일자": "20261001", "제품명": "P1", "입고수량": 5, "출고수량": 1, "재고수량": 12, "합계금액": 50},
+    ])
+
+
 def main() -> int:
     order = _order_frame()
     default_day = _assert_table("현재표 일자 집계", order, "발주조회", grouping="day", date_column="발주일자")
@@ -268,6 +276,17 @@ def main() -> int:
     _assert_llm("현재표 일자 분석해줘", outbound, "출고명세 조회", grouping="day", date_column="출고일자")
     _assert_llm("현재표 요일별 분석", outbound, "출고명세 조회", grouping="weekday", date_column="출고일자")
     _assert_llm("현재표 월별 분석", outbound, "출고명세 조회", grouping="month", date_column="출고일자")
+
+    ledger = _stock_ledger_frame()
+    ledger_day = _assert_table("현재표 일별 집계", ledger, "제품수불현황 조회", grouping="day", date_column="입출고일자")
+    ledger_month = _assert_table("현재표 월별 집계", ledger, "제품수불현황 조회", grouping="month", date_column="입출고일자")
+    ledger_weekday = _assert_table("현재표 요일별 집계", ledger, "제품수불현황 조회", grouping="weekday", date_column="입출고일자")
+    assert int(ledger_day["입고수량"].sum()) == 15
+    assert int(ledger_month["출고수량"].sum()) == 3
+    assert int(ledger_month["재고수량"].iloc[-1]) == 12
+    assert "재고수량" not in ledger_weekday.columns
+    if ledger_day["일자"].tolist() != ["2026-01-03", "2026-02-01"]:
+        raise AssertionError(f"stock-ledger date ordering/authority mismatch: {ledger_day!r}")
 
     trans = _detail_frame("거래명세서일자")
     trans["거래명세서구분"] = "1"

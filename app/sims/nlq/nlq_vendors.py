@@ -115,6 +115,10 @@ _VENDOR_MASTER_STOP = {
     "매입", "매출", "매입거래처", "매출거래처",
 }
 
+_MAKER_VENDOR_LOOKUP_RE = re.compile(
+    r"^(?:거래처\s+)?제약사(?:\s+(?P<name>[^\s,?.!]+))?\s+(?:조회|목록)$"
+)
+
 def _has_vendor_master_anchor(txt: str) -> bool:
     t = (txt or "").strip()
     return any(
@@ -157,6 +161,7 @@ def _has_vendor_master_anchor(txt: str) -> bool:
             "영업사원",
             "매입처",
             "매출처",
+            "제약사",
             "제조사",
             "발주처",
             "단가적용처",
@@ -235,6 +240,9 @@ def _extract_vendor_scope_filter(txt: str) -> tuple[str, str]:
       회계매입처 조회
       거래처 제약사 조회
     """
+    if _MAKER_VENDOR_LOOKUP_RE.fullmatch(str(txt or "").strip()):
+        return "maker", "제약사"
+
     t = re.sub(r"\s+", "", str(txt or ""))
 
     if not t:
@@ -1294,7 +1302,8 @@ def try_handle_vendors_nlq(
         # 거래처코드 대역 scope 조회다.
         rel_axis = None
         rel_kw = None
-        ven_nm_kw = None
+        maker_lookup = _MAKER_VENDOR_LOOKUP_RE.fullmatch(txt.strip()) if vendor_scope == "maker" else None
+        ven_nm_kw = _clean_master_token(maker_lookup.group("name")) if maker_lookup and maker_lookup.group("name") else None
 
     cost_apply_nm_kw = _extract_cost_apply_name_keyword(txt)    
     stock_apply_nm_kw = _extract_stock_apply_name_keyword(txt)
@@ -1337,7 +1346,8 @@ def try_handle_vendors_nlq(
         add_user_kw, add_date_from, add_date_to,
         mod_user_kw, mod_date_from, mod_date_to,
     ]):
-        ven_nm_kw = None
+        if not (vendor_scope == "maker" and ven_nm_kw):
+            ven_nm_kw = None
 
     has_filter = any([
         owner_kw, ven_nm_kw, phone_kw, biz_kw, sm_kw, addr_kw,

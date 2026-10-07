@@ -916,8 +916,25 @@ def _find_common_top_numeric_column(df: pd.DataFrame, query: str) -> str:
     for col in [str(c) for c in df.columns]:
         if col in _COMMON_FILTER_SKIP_COLUMNS:
             continue
-        nums = _to_numeric_for_common_filter(_first_series_for_column(df, col))
-        if int(nums.notna().sum()) <= 0:
+        series = _first_series_for_column(df, col)
+        try:
+            if pd.api.types.is_numeric_dtype(series):
+                has_numeric_value = bool(pd.to_numeric(series, errors="coerce").notna().any())
+            else:
+                normalized = (
+                    series.fillna("").astype(str)
+                    .str.replace(",", "", regex=False)
+                    .str.replace("−", "-", regex=False)
+                    .str.replace("△", "-", regex=False)
+                    .str.replace("▲", "-", regex=False)
+                    .str.strip()
+                    .str.replace(r"^\(([-+]?[0-9.]+)\)$", r"-\1", regex=True)
+                    .str.replace(r"[^0-9.\-+]", "", regex=True)
+                )
+                has_numeric_value = bool(pd.to_numeric(normalized, errors="coerce").notna().any())
+        except Exception:
+            has_numeric_value = False
+        if not has_numeric_value:
             continue
         for alias in _column_filter_aliases(col):
             alias_norm = _norm_col_name(alias)

@@ -14,6 +14,7 @@ from app.services.io_nlq import (
     strip_nlq_period_tokens_for_entity_residual,
 )
 from app.services.product_master_filter_contract import (
+    extract_product_di_semantic_group,
     extract_product_prescription_semantic,
     has_product_prescription_semantic_conflict,
     strip_product_prescription_semantic_terms,
@@ -216,15 +217,21 @@ def _resolve_rddbc230_nlq(
     product_prescription_semantic = (
         "" if product_di_nm else extract_product_prescription_semantic(raw)
     )
+    product_di_semantic_group = (
+        "" if product_di_nm else extract_product_di_semantic_group(raw)
+    )
     if product_di_nm:
         params["product_di_nm"] = product_di_nm
     if product_prescription_semantic:
         params["product_prescription_semantic"] = product_prescription_semantic
+    if product_di_semantic_group:
+        params["product_di_semantic_group"] = product_di_semantic_group
 
     if (
         not params.get("physic_cd")
         and not params.get("physic_nm")
         and not product_prescription_semantic
+        and not product_di_semantic_group
     ):
         explicit_labels = tuple(
             dict.fromkeys(
@@ -535,7 +542,15 @@ def resolve_registered_erp_table_nlq(
     product_prescription_semantic = (
         "" if product_di_nm else extract_product_prescription_semantic(raw)
     )
-    if not physic_cd and not physic_nm and not product_prescription_semantic:
+    product_di_semantic_group = (
+        "" if product_di_nm else extract_product_di_semantic_group(raw)
+    )
+    if (
+        not physic_cd
+        and not physic_nm
+        and not product_prescription_semantic
+        and not product_di_semantic_group
+    ):
         explicit_labels = tuple(
             dict.fromkeys(
                 label
@@ -562,6 +577,8 @@ def resolve_registered_erp_table_nlq(
         params["product_di_nm"] = product_di_nm
     if product_prescription_semantic:
         params["product_prescription_semantic"] = product_prescription_semantic
+    if product_di_semantic_group:
+        params["product_di_semantic_group"] = product_di_semantic_group
 
     for key in ("insu_cd", "barcode"):
         value = _extract_code(raw, labels(key))

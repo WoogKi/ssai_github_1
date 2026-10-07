@@ -1994,6 +1994,8 @@ def _action_consumed_aliases(action: str) -> tuple[str, ...]:
             phrases.add(root)
             phrases.add(f"{root}명세서")
             phrases.add(f"{root} 명세서")
+            phrases.add(f"{root}명세조회")
+            phrases.add(f"{root} 명세조회")
             for signal in (*_TRANSACTION_SIGNAL_WORDS, *_MASTER_QUERY_WORDS):
                 phrases.add(f"{root}{signal}")
                 phrases.add(f"{root} {signal}")

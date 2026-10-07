@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 import re
 import pandas as pd
+from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
 
 
 def handle_stock_ledger_followup(
@@ -123,7 +124,7 @@ def handle_stock_ledger_followup(
         name = df[product_col].fillna("").astype(str).str.strip()
         bad = (
             name.eq("")
-            | name.str.contains(r"^(합계|총계|소계|합계금액|전체|TOTAL)$", case=False, regex=True, na=False)
+            | name.str.contains(r"^(?:합계|총계|소계|합계금액|전체|TOTAL)$", case=False, regex=True, na=False)
             | name.str.contains(r"합계\s*금액", case=False, regex=True, na=False)
         )
         return ~bad
@@ -151,6 +152,49 @@ def handle_stock_ledger_followup(
             data[extra_label] = df[extra_col].fillna("").astype(str).str.strip()
 
         return pd.DataFrame(data, index=df.index)
+
+    grouping = str(helpers.get("_requested_grouping") or "")
+    if grouping in {"day", "month", "weekday"} and not any(
+        token in compact for token in ("입고수량", "출고수량", "재고수량", "수불수량")
+    ):
+        source_date = str(helpers.get("_resolved_date_column") or "")
+        if not source_date or source_date not in df.columns:
+            return False
+        group_column = {"day": "일자", "month": "월", "weekday": "요일"}[grouping]
+        work = df.loc[_valid_product_mask()].copy()
+        work[group_column] = derive_current_table_time_grouping(work[source_date], grouping)
+        work["_date_order"] = derive_current_table_time_grouping(work[source_date], "ymd")
+        work = work.loc[work[group_column].notna() & work[group_column].astype(str).ne("")].copy()
+        if work.empty:
+            return push_notice(
+                title="현재표 날짜 집계 결과 없음", action="현재표 날짜 집계 결과 없음",
+                message="집계 가능한 유효 입출고일자가 없습니다.",
+                query_summary=f"현재표 / {group_column}별 집계 결과 없음", source_query=t,
+                extra_meta={"execution_status": "no_data", "result_status": "no_data", "table_created": False},
+            )
+        work["_source_order"] = range(len(work))
+        additive = [
+            column for column in ("입고수량", "출고수량", "할증", "공급가액", "부가세", "합계금액")
+            if column in work.columns
+        ]
+        for column in additive:
+            work[column] = to_num(work[column])
+        aggregated = work.groupby(group_column, dropna=False).size().rename("건수").to_frame()
+        if additive:
+            aggregated = aggregated.join(work.groupby(group_column, dropna=False)[additive].sum())
+        if grouping in {"day", "month"} and stock_col:
+            # The stock-ledger monthly summary already defines stock as the
+            # final balance, never a sum of event balances.
+            ordered = work.sort_values(["_date_order", "_source_order"], kind="mergesort")
+            balance = ordered.groupby(group_column, dropna=False)[stock_col].last()
+            aggregated["재고수량"] = to_num(balance)
+        result = aggregated.reset_index().sort_values(group_column, kind="mergesort").reset_index(drop=True)
+        result.insert(0, "순번", range(1, len(result) + 1))
+        return push_table(
+            title=f"현재표 {group_column}별 집계", action=f"현재표 {group_column}별 집계",
+            df=result, query_summary=f"현재표 / {source_date} 기준 {group_column}별 집계 / 전체 {len(df):,}건 기준",
+            source_query=t, source_table_key=table_key, source_rows=len(df),
+        )
 
     if not in_col and not out_col and not stock_col:
         return push_notice(

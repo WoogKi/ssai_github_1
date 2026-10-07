@@ -10,6 +10,7 @@ from app.services.erp_table_nlq import is_order_calculation_request, resolve_reg
 from app.services.order_calculation_contract import OrderConditions, closing_day_relation
 from app.services.chat_composer_submission import (
     consume_text_dispatch_after_echo,
+    consume_text_dispatch_event_after_echo,
     queue_text_dispatch_after_echo,
 )
 from app.sims.nlq.nlq_router import (
@@ -71,8 +72,8 @@ def test_closing_day_month_end_boundary() -> None:
 def test_text_composer_callback_dedup_contract() -> None:
     source = (Path(__file__).resolve().parents[1] / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
     _assert("def _queue_chat_composer_submission" in source, "text composer callback missing")
-    _assert('st.session_state["__chat_composer_callback_text"] = composer_text' in source, "callback dispatch marker missing")
-    _assert("if composer_text != callback_text:" in source, "composer callback duplicate guard missing")
+    _assert('st.session_state["__chat_composer_callback_event"]' in source, "callback event marker missing")
+    _assert("if composer_text == callback_text:" in source, "composer stale-return guard missing")
     _assert('st.session_state["__sims_auto_user_input"] = composer_text' in source, "shared text dispatch queue missing")
     _assert("chat_history_container = st.container()" in source, "stable history container missing")
     _assert("chat_immediate_user_slot = st.empty()" in source, "immediate user slot missing")
@@ -88,7 +89,7 @@ def test_text_composer_callback_dedup_contract() -> None:
         "if immediate_echo_message_id and str(m.get(\"id\") or \"\") == immediate_echo_message_id:" in source,
         "same-run history duplicate guard missing",
     )
-    preflight = source.index("pending_text_dispatch = consume_text_dispatch_after_echo(")
+    preflight = source.index("pending_text_dispatch, pending_text_event_id, pending_text_dispatch_status = consume_text_dispatch_event_after_echo(")
     dispatch = source.index("if user_input and user_input.strip():")
     _assert(preflight < dispatch, "text must render in a completed pass before dispatch")
     _assert(
@@ -98,6 +99,26 @@ def test_text_composer_callback_dedup_contract() -> None:
     _assert(
         "if composer_text not in (staged_text_submission, pending_text_dispatch):" in source,
         "returned composer text must not requeue the active submission",
+    )
+
+
+def test_text_composer_event_is_consumed_once() -> None:
+    context = {"room_id": "room-1", "company_id": "3"}
+    state: dict[str, object] = {}
+    queue_text_dispatch_after_echo(
+        state,
+        text="일반약 계약단가 조회",
+        context=context,
+        event_id="text-1",
+    )
+    text, event_id, status = consume_text_dispatch_event_after_echo(state, context=context)
+    _assert(
+        (text, event_id, status) == ("일반약 계약단가 조회", "text-1", "ready"),
+        "text event claim failed",
+    )
+    _assert(
+        consume_text_dispatch_event_after_echo(state, context=context) == ("", "", "missing"),
+        "text event replayed",
     )
 
 
@@ -126,6 +147,7 @@ def main() -> None:
     test_order_calculation_natural_phrases()
     test_closing_day_month_end_boundary()
     test_text_composer_callback_dedup_contract()
+    test_text_composer_event_is_consumed_once()
     test_text_preflight_one_shot()
     print("PASS: user-log routing and chat echo contract")
 

@@ -9503,11 +9503,13 @@ def run_basic_checks() -> list[CheckResult]:
             old_profile_loader = company_profile_mod.load_dashboard_profile
             old_analytics_loader = analytics_view_mod.load_dashboard_profile
             old_analytics_st = analytics_view_mod.st
+            old_analytics_code_loader = analytics_view_mod._load_code_options
             old_company_getter = login_mod.get_selected_company
             old_nlq_option_codes = nlq_router_mod._analytics_nlq_option_codes
             try:
                 company_profile_mod.load_dashboard_profile = lambda *, company_id: dict(profile_by_company.get(str(company_id)) or {})
                 analytics_view_mod.load_dashboard_profile = company_profile_mod.load_dashboard_profile
+                analytics_view_mod._load_code_options = lambda _gcode: []
                 login_mod.get_selected_company = lambda: {"company_id": current_company["id"]}
                 nlq_router_mod._analytics_nlq_option_codes = lambda field: {
                     "stock_cd_list": ["00001", "00247", "00901"],
@@ -10309,6 +10311,7 @@ def run_basic_checks() -> list[CheckResult]:
                 company_profile_mod.load_dashboard_profile = old_profile_loader
                 analytics_view_mod.load_dashboard_profile = old_analytics_loader
                 analytics_view_mod.st = old_analytics_st
+                analytics_view_mod._load_code_options = old_analytics_code_loader
                 login_mod.get_selected_company = old_company_getter
                 nlq_router_mod._analytics_nlq_option_codes = old_nlq_option_codes
             results.append(_ok("Company Default adapter for Dashboard, KPI, and NLQ", "supported keys only; dates/manufacturer excluded; explicit override/clear and company-scoped cache verified"))

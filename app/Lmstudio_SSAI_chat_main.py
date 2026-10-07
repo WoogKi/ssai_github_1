@@ -324,7 +324,7 @@ from app.services.attachment_document_followup import (
 )
 from app.services.chat_composer_submission import (
     attachment_request_text,
-    consume_text_dispatch_after_echo,
+    consume_text_dispatch_event_after_echo,
     queue_attachment_submission_event,
     queue_text_dispatch_after_echo,
     select_composer_submission,
@@ -356,7 +356,9 @@ from app.ui.knowledge_chat_adapter import (
     parse_incomplete_sims_help_request,
     parse_knowledge_followup_queue_request,
     parse_explicit_knowledge_request,
+    parse_sims_query_examples_request,
     parse_sims_help_choice,
+    sims_query_examples_text,
     verified_sims_help_examples,
     verified_sims_help_text,
 )
@@ -7332,7 +7334,7 @@ def _clear_company_scoped_chat_runtime(*, previous_company_id: str, selected_com
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
         "__chat_composer_pending_submission",
-        "__chat_composer_callback_text",
+        "__chat_composer_callback_event",
         "__chat_room_nav_request",
         "__chat_room_pending_to_persisted_room_id",
         "__chat_room_select_render_ready",
@@ -9406,7 +9408,7 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
                         payload_event = str(value.get("dashboard_event_id") or "").strip()
                         snapshot_event = str(snapshot.get("dashboard_event_id") or "").strip()
                         linked_events = (message_event, payload_event, snapshot_event)
-                        log.info(
+                        log.debug(
                             "[dashboard.event_link] stage=partition primary_event_present=%s payload_event_present=%s snapshot_event_present=%s partition_event_present=%s all_equal=%s",
                             False,
                             bool(payload_event),
@@ -10208,7 +10210,7 @@ def _reset_chat_session_when_user_changed() -> None:
         "__deferred_current_table_followup",
         "__sims_auto_user_input",
         "__chat_composer_pending_submission",
-        "__chat_composer_callback_text",
+        "__chat_composer_callback_event",
     ]:
         st.session_state.pop(key, None)
     _clear_chat_room_selector_request_state(st.session_state)
@@ -12670,10 +12672,15 @@ immediate_echo_message_id = ""
 # 메시지 입력 UI는 채팅 결과 바로 아래, 파일 첨부 바로 위에 별도 inline form으로 렌더한다.
 # 여기서는 이전 run에서 inline form이 넘긴 값을 먼저 처리한다.
 typed_user_input = None
-pending_text_dispatch = consume_text_dispatch_after_echo(
+pending_text_dispatch, pending_text_event_id, pending_text_dispatch_status = consume_text_dispatch_event_after_echo(
     st.session_state, context=_attachment_reanalysis_context(current_room)
 )
-auto_user_input = st.session_state.pop("__sims_auto_user_input", None)
+raw_auto_user_input = st.session_state.pop("__sims_auto_user_input", None)
+auto_user_input = raw_auto_user_input
+auto_input_event_id = ""
+if isinstance(raw_auto_user_input, dict):
+    auto_user_input = str(raw_auto_user_input.get("text") or "")
+    auto_input_event_id = str(raw_auto_user_input.get("event_id") or "").strip()
 staged_text_submission = ""
 if pending_text_dispatch:
     auto_user_input = pending_text_dispatch
@@ -12683,6 +12690,7 @@ elif auto_user_input and auto_user_input.strip():
         st.session_state,
         text=staged_text_submission,
         context=_attachment_reanalysis_context(current_room),
+        event_id=auto_input_event_id,
     )
     with chat_immediate_user_slot.container():
         with st.chat_message("user"):
@@ -12698,11 +12706,15 @@ if user_input and user_input.strip():
     # Knowledge-owned requests keep their query bytes. The normal Korean/English
     # keyboard correction stays on every ordinary Chat path.
     raw_knowledge_route = parse_explicit_knowledge_request(user_input)
+    sims_query_examples_help = (
+        raw_knowledge_route is None and parse_sims_query_examples_request(user_input)
+    )
     incomplete_sims_help = (
-        None if raw_knowledge_route is not None else parse_incomplete_sims_help_request(user_input)
+        None if raw_knowledge_route is not None or sims_query_examples_help
+        else parse_incomplete_sims_help_request(user_input)
     )
     business_help_knowledge_route = (
-        None if raw_knowledge_route is not None or incomplete_sims_help is not None
+        None if raw_knowledge_route is not None or sims_query_examples_help or incomplete_sims_help is not None
         else parse_business_help_knowledge_request(user_input)
     )
     raw_mcp_route = (
@@ -12720,6 +12732,7 @@ if user_input and user_input.strip():
     )
     if (
         raw_knowledge_route is None
+        and not sims_query_examples_help
         and business_help_knowledge_route is None
         and raw_mcp_route is None
     ):
@@ -12866,6 +12879,28 @@ if user_input and user_input.strip():
             datetime_answer.intent,
             datetime_answer.timezone_name,
         )
+        st.rerun()
+    if sims_query_examples_help:
+        from app.sims.nlq.action_inventory import implemented_actions
+        from app.services.ssai_permission_policy import get_required_permission
+
+        allowed_help_actions = set()
+        for action_spec in implemented_actions():
+            permission = get_required_permission(
+                category=action_spec.panel_category, action=action_spec.canonical_action,
+            )
+            if permission and require_permission(permission, show_error=False):
+                allowed_help_actions.add(action_spec.canonical_action)
+        help_message = {
+            "id": str(uuid.uuid4()), "role": "assistant",
+            "content": sims_query_examples_text(allowed_actions=allowed_help_actions),
+            "time": make_ts(), "seq": _next_seq(),
+            **_message_meta("sims_help"),
+        }
+        current_room.setdefault("messages", []).append(help_message)
+        _sync_room_meta(current_room, materialize=True)
+        save_chat_rooms()
+        log.info("[sims.help] reason=query_examples erp_call_count=0 llm_call_count=0 knowledge_call_count=0")
         st.rerun()
     if incomplete_sims_help is not None:
         from app.sims.nlq.action_inventory import implemented_actions
@@ -14770,8 +14805,15 @@ def _queue_chat_composer_submission(widget_key: str) -> None:
         )
         return
     if composer_text:
-        st.session_state["__sims_auto_user_input"] = composer_text
-        st.session_state["__chat_composer_callback_text"] = composer_text
+        callback_event_id = _new_ui_event_id("chat_composer_text")
+        st.session_state["__sims_auto_user_input"] = {
+            "text": composer_text,
+            "event_id": callback_event_id,
+        }
+        st.session_state["__chat_composer_callback_event"] = {
+            "text": composer_text,
+            "event_id": callback_event_id,
+        }
         st.session_state["__ui_rerun_reason"] = "chat_input"
 
 
@@ -14809,8 +14851,15 @@ if composer_submission is not None:
         uploaded_files = list(getattr(composer_submission, "files", ()) or ())
         recorded_audio = getattr(composer_submission, "audio", None)
     if composer_text and not uploaded_files and recorded_audio is None:
-        callback_text = str(st.session_state.pop("__chat_composer_callback_text", "") or "").strip()
-        if composer_text != callback_text:
+        callback_event = st.session_state.get("__chat_composer_callback_event")
+        callback_text = (
+            str(callback_event.get("text") or "").strip()
+            if isinstance(callback_event, dict)
+            else ""
+        )
+        if composer_text == callback_text:
+            log.debug("[chat.composer] suppress stale callback widget return")
+        else:
             if composer_text not in (staged_text_submission, pending_text_dispatch):
                 st.session_state["__sims_auto_user_input"] = composer_text
                 st.session_state["__ui_rerun_reason"] = "chat_input"
@@ -14822,7 +14871,9 @@ if composer_submission is not None:
             len(uploaded_files),
         )
 else:
-    st.session_state.pop("__chat_composer_callback_text", None)
+    # Native chat_input can return a submitted text across multiple reruns.
+    # Retire the callback event only after that widget value has cleared.
+    st.session_state.pop("__chat_composer_callback_event", None)
 
 if recorded_audio is not None:
     audio_token = str(getattr(recorded_audio, "file_id", "") or "").strip()

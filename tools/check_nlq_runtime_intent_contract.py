@@ -19,7 +19,11 @@ if str(PROJECT_ROOT) not in sys.path:
 os.chdir(PROJECT_ROOT)
 
 from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
-from app.services.io_nlq import extract_nlq_natural_period, resolve_io_nlq
+from app.services.io_nlq import (
+    extract_nlq_natural_period,
+    resolve_io_nlq,
+    resolve_unlabeled_io_entity_condition as production_unlabeled_io_entity_condition,
+)
 from app.sims.nlq import nlq_router
 
 
@@ -40,7 +44,11 @@ def _payload(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _run_router(question: str) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
+def _run_router(
+    question: str,
+    *,
+    unresolved_status: str = "resolved",
+) -> tuple[bool, list[dict[str, Any]], list[dict[str, Any]]]:
     calls: list[dict[str, Any]] = []
     sent: list[dict[str, Any]] = []
 
@@ -58,6 +66,35 @@ def _run_router(question: str) -> tuple[bool, list[dict[str, Any]], list[dict[st
         resolved.update({"physic_cd": "00301", "physic_nm": "이가탄"})
         return {"status": "resolved", "params": resolved, "resolved_kind": "product"}
 
+    def unlabeled_io_entity(
+        _text: str,
+        *,
+        params: dict[str, Any] | None = None,
+        residual_phrase: str = "",
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        if str(_kwargs.get("action") or "") != "입고예정조회":
+            return production_unlabeled_io_entity_condition(
+                _text,
+                params=params,
+                residual_phrase=residual_phrase,
+                **_kwargs,
+            )
+        resolved = dict(params or {})
+        if not residual_phrase:
+            return {"status": "resolved", "params": resolved, "resolved_kind": "unchanged"}
+        if unresolved_status == "resolved":
+            resolved.update({"physic_cd": "00301", "physic_nm": residual_phrase})
+            return {"status": "resolved", "params": resolved, "resolved_kind": "product"}
+        if unresolved_status == "candidate_required":
+            return {
+                "status": "candidate_required",
+                "params": resolved,
+                "resolved_kind": "product",
+                "candidates": [{"제품코드": "00301", "제품명": residual_phrase}],
+            }
+        return {"status": unresolved_status, "params": resolved, "resolved_kind": "product"}
+
     with (
         patch("app.services.datetime_tool.operating_now", return_value=FIXED_NOW),
         patch("app.services.rddbc110_service.get_rddbc110_result", service),
@@ -66,6 +103,7 @@ def _run_router(question: str) -> tuple[bool, list[dict[str, Any]], list[dict[st
         patch("app.services.rddbc170_rddbc180_order_service.get_order_result", service),
         patch("app.services.rddbc170_rddbc180_order_service.get_expected_inbound_result", service),
         patch("app.services.io_nlq.resolve_current_stock_entity_condition", current_stock_entity),
+        patch("app.services.io_nlq.resolve_unlabeled_io_entity_condition", unlabeled_io_entity),
         patch("app.sims.views.rddbc_io_shared._load_stock_code_options", return_value=[]),
         patch("app.ui.chat_middleware.push_sims_result_to_chat", push),
     ):
@@ -103,6 +141,13 @@ def _handler_case(name: str, question: str, action: str, expected: dict[str, Any
     return _assert(name, ok, {"parsed": parsed, "handler": received, "sent": len(sent)})
 
 
+def _resolver_notice_case(name: str, question: str, status: str) -> bool:
+    handled, calls, sent = _run_router(question, unresolved_status=status)
+    meta = dict(sent[0].get("payload", {}).get("meta") or {}) if len(sent) == 1 else {}
+    ok = handled and not calls and len(sent) == 1 and meta.get("entity_resolution_status") == status
+    return _assert(name, ok, {"calls": len(calls), "sent": len(sent), "meta": meta})
+
+
 def main() -> int:
     checks: list[bool] = []
     checks.append(_handler_case("이가탄 재고", "이가탄 재고", "현재고 조회", {"physic_nm": "이가탄", "physic_cd": "00301"}))
@@ -121,6 +166,9 @@ def main() -> int:
     checks.append(_handler_case("이가탄 입고예정 조회", "이가탄 입고예정 조회", "입고예정조회", {"physic_nm": "이가탄"}))
     checks.append(_handler_case("메트로 입고예정조회", "메트로 입고예정조회", "입고예정조회", {"physic_nm": "메트로"}))
     checks.append(_handler_case("바레탄 입고예정조회 202609", "바레탄 입고예정조회 202609", "입고예정조회", {"physic_nm": "바레탄", "date_from": "20260901", "date_to": "20260930", "_expected_inbound_auto_period": False}))
+    checks.append(_resolver_notice_case("입고예정 후보 선택", "이가탄 입고예정조회", "candidate_required"))
+    checks.append(_resolver_notice_case("입고예정 제품 없음", "이가탄 입고예정조회", "not_found"))
+    checks.append(_resolver_notice_case("입고예정 resolver 불가", "이가탄 입고예정조회", "resolution_unavailable"))
     checks.append(_handler_case("제품명 바레탄 입고예정조회 202608~202609", "제품명 바레탄 입고예정조회 202608~202609", "입고예정조회", {"physic_nm": "바레탄", "date_from": "20260801", "date_to": "20260930", "_expected_inbound_auto_period": False}))
     checks.append(_handler_case("일반 입고예정조회", "입고예정조회", "입고예정조회", {"mode": "expected"}))
     checks.append(_handler_case("지난주 입고현황", "지난주 입고현황 조회", "입고명세 조회", {"date_from": "20260914", "date_to": "20260920"}))

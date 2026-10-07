@@ -9,24 +9,41 @@ PENDING_TEXT_DISPATCH_KEY = "__chat_composer_pending_text_dispatch"
 
 
 def queue_text_dispatch_after_echo(
-    state: MutableMapping[str, Any], *, text: str, context: Mapping[str, str]
+    state: MutableMapping[str, Any],
+    *,
+    text: str,
+    context: Mapping[str, str],
+    event_id: str = "",
 ) -> None:
     state[PENDING_TEXT_DISPATCH_KEY] = {
         "text": str(text).strip(),
         "context": {str(key): str(value or "") for key, value in context.items()},
+        "event_id": str(event_id or "").strip(),
     }
 
 
 def consume_text_dispatch_after_echo(
     state: MutableMapping[str, Any], *, context: Mapping[str, str]
 ) -> str:
+    text, _, _ = consume_text_dispatch_event_after_echo(state, context=context)
+    return text
+
+
+def consume_text_dispatch_event_after_echo(
+    state: MutableMapping[str, Any], *, context: Mapping[str, str]
+) -> tuple[str, str, str]:
+    """Atomically claim one text dispatch and retain its callback event identity."""
     pending = state.pop(PENDING_TEXT_DISPATCH_KEY, None)
     if not isinstance(pending, Mapping):
-        return ""
+        return "", "", "missing"
     expected = {str(key): str(value or "") for key, value in context.items()}
     if pending.get("context") != expected:
-        return ""
-    return str(pending.get("text") or "").strip()
+        return "", str(pending.get("event_id") or "").strip(), "stale_context"
+    return (
+        str(pending.get("text") or "").strip(),
+        str(pending.get("event_id") or "").strip(),
+        "ready",
+    )
 
 
 def queue_attachment_submission_event(

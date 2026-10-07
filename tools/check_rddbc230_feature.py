@@ -129,8 +129,8 @@ def main() -> int:
         }
         if forbidden_filter_keys.intersection(filter_keys):
             failures.append(f"R230 exposes foreign master filters: {forbidden_filter_keys.intersection(filter_keys)}")
-        if "product_di_semantic_group" not in filter_keys:
-            failures.append("R230 semantic product group metadata missing")
+        if not {"product_di_semantic_group", "product_prescription_semantic"}.issubset(filter_keys):
+            failures.append("R230 independent insurance and prescription semantic metadata missing")
         if "stock_nm" not in filter_keys:
             failures.append("R230 stock-location name filter metadata missing")
         if feature.source_limit_env != "SIMS_EXPORT_MAX_ROWS":
@@ -194,12 +194,14 @@ def main() -> int:
         ("재고위치명 본사 최종 매입단가 조회", {"stock_nm": "본사"}),
         ("실입고단가 조회", {}),
         ("장부입고단가 조회", {}),
-        ("전문약 최종 매입단가 조회", {"product_di_semantic_group": "insurance"}),
-        ("ETC 최종 매입가 조회", {"product_di_semantic_group": "insurance"}),
+        ("전문약 최종 매입단가 조회", {"product_prescription_semantic": "prescription"}),
+        ("ETC 최종 매입가 조회", {"product_prescription_semantic": "prescription"}),
         ("최종 매입가", {}),
         ("최종 매입가 조회", {}),
-        ("일반약 최종 매입단가 조회", {"product_di_semantic_group": "non_insurance"}),
-        ("OTC 최종 매입단가 조회", {"product_di_semantic_group": "non_insurance"}),
+        ("일반약 최종 매입단가 조회", {"product_prescription_semantic": "otc"}),
+        ("OTC 최종 매입단가 조회", {"product_prescription_semantic": "otc"}),
+        ("보험약 전문약 최종 매입단가 조회", {"product_di_semantic_group": "insurance", "product_prescription_semantic": "prescription"}),
+        ("비보험약 OTC 최종 매입단가 조회", {"product_di_semantic_group": "non_insurance", "product_prescription_semantic": "otc"}),
         ("제품구분 전문 최종 매입단가 조회", {"product_di_nm": "전문"}),
         ("최종 매입단가 조회 TOP 20", {"display_top": 20}),
     )
@@ -227,6 +229,8 @@ def main() -> int:
         "cost_apply_cd": "050005", "cost_apply_nm": "단가",
         "unit_cost": "1000~2000", "fin_unit_cost": "1200",
         "in_quantity": "1~20", "out_quantity": "7",
+        "product_di_semantic_group": "insurance",
+        "product_prescription_semantic": "prescription",
         "_display_context": "chat",
     }
     with patch.dict(
@@ -253,6 +257,8 @@ def main() -> int:
         )
         if any(join not in normalized_sql for join in required_joins):
             failures.append("native raw-equality JOIN contract missing")
+        if "N'%|보험|%'" not in sql or "PrescriptionStd.Rd046_Physic_Cd" not in sql:
+            failures.append("independent insurance and prescription predicates were not applied together")
         required_calculations = (
             "(S.Rd23_In_Quantity - S.Rd23_Out_Quantity) AS [재고수량]",
             "((S.Rd23_In_Quantity - S.Rd23_Out_Quantity) * S.Rd23_Unit_Cost) AS [실재고금액]",

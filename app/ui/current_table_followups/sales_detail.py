@@ -347,6 +347,38 @@ def handle_sales_detail_followup(
             display_limit=display_limit,
         )
 
+    source_dimension = str(helpers.get("_requested_grouping") or "")
+    if source_dimension in {"purchase_vendor", "stock_location"} and "매출금액" in compact:
+        dimension_col = find_col(
+            df,
+            exact=("매입처명", "매입처") if source_dimension == "purchase_vendor" else ("재고위치명", "재고위치"),
+            include_any=("매입처",) if source_dimension == "purchase_vendor" else ("재고위치",),
+            exclude_any=("코드", "번호", "분류", "구분"),
+        )
+        if not dimension_col:
+            return False
+        dimension_label = "매입처명" if source_dimension == "purchase_vendor" else "재고위치명"
+        work = _base_work(dimension_col, dimension_label)
+        out = (
+            work.groupby(dimension_label, dropna=False)
+            .agg(건수=("_amount", "size"), 수량=("_qty", "sum"),
+                 공급가액=("_supply", "sum"), 세액=("_tax", "sum"),
+                 매출금액=("_amount", "sum"))
+            .reset_index().sort_values("매출금액", ascending=False)
+        )
+        if has_explicit_top:
+            out = out.head(top_n).copy()
+        out.insert(0, "순번", range(1, len(out) + 1))
+        title = f"현재표 {dimension_label.replace('명', '')}별 매출금액"
+        if has_explicit_top:
+            title += f" TOP {top_n}"
+        return push_table(
+            title=title, action=title, df=out,
+            query_summary=f"현재표 / {dimension_label}별 매출금액 / 전체 {len(df):,}건 기준",
+            source_query=t, source_table_key=table_key, source_rows=len(df),
+            display_limit=top_n if has_explicit_top else None,
+        )
+
     # 2-1) 영업사원/담당자별 매출금액 분석
     # 예:
     # - 현재표 영업사원별 매출금액
