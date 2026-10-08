@@ -221,6 +221,17 @@ def verified_sims_help_examples(
     candidates: list[tuple[str, str, str, str]] = []
     if intent.reason == "code_role_required":
         return ()
+    elif intent.reason == "grouping_scope_required":
+        examples = (
+            ("제조사", "maker_nm"),
+            ("발주처", "order_nm"),
+        )
+        if role == "발주처":
+            examples = tuple(reversed(examples))
+        candidates.extend(
+            ("제품재고현황 조회", f"제품재고장 {label}명 {value}", key, value)
+            for label, key in examples
+        )
     elif intent.reason == "action_required":
         if role == "발주담당자":
             candidates.extend((
@@ -277,6 +288,7 @@ def verified_sims_help_text(
         "action_required": "조회할 업무 동작을 지정해 주세요.",
         "detail_role_required": "상세 조회 대상이 거래처인지 입고명세인지 확인해 주세요.",
         "stock_action_required": "월집계와 제품별 재고현황 중 필요한 조회를 선택해 주세요.",
+        "grouping_scope_required": "집계 기준과 조회 대상 중 어떤 조건인지 구분해 주세요.",
     }
     if intent.reason not in titles:
         raise ValueError("Unknown SIMS help intent")
@@ -284,7 +296,10 @@ def verified_sims_help_text(
     if intent.query:
         answer += f"\n\n입력한 요청: {intent.query}"
     if intent.subject_label and intent.subject_value:
-        answer += f"\n확인한 대상: {intent.subject_label} {intent.subject_value}"
+        if intent.reason == "grouping_scope_required":
+            answer += f"\n입력한 검색어: {intent.subject_value}"
+        else:
+            answer += f"\n확인한 대상: {intent.subject_label} {intent.subject_value}"
     elif intent.subject_value and intent.reason == "stock_action_required":
         answer += f"\n입력한 대상 표현: {intent.subject_value} (대상 종류 미확정)"
     elif intent.reason == "code_role_required":

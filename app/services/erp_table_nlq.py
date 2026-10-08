@@ -507,7 +507,7 @@ def resolve_registered_erp_table_nlq(
         # as "로 해줘" behind. The IO router may append "조회" after that
         # tail; neither token is part of an explicitly labelled staff name.
         condition_text = re.sub(
-            r"\s+(?:로\s*)?(?:해\s*줘|해\s*주세요|해\s*줘요)(?:\s*(?:조회|검색))?\s*$",
+            r"(?:(?<=조회)|\s)(?:로\s*)?(?:해\s*줘|해\s*주세요|해\s*줘요)(?:\s*(?:조회|검색))?\s*$",
             " ",
             condition_text,
         )

@@ -850,6 +850,10 @@ def _resolve_current_table_dimension_column(
     kind: str,
     query: str = "",
 ) -> str:
+    if kind == "generic" and grouping == "product_category" and "제품코드" in df.columns:
+        # The goods-master delivered label is 구분명. Treat it as the existing
+        # product division only when the source schema identifies products.
+        return _resolve_current_table_column(df, ("제품구분명", "제품구분", "구분명"))
     if grouping in {"month", "day", "weekday"}:
         authority = _CURRENT_TABLE_SOURCE_DATE_AUTHORITIES.get(kind, {})
         requested_date_label = _requested_current_table_date_label(query)

@@ -17,8 +17,10 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     FREQUENCY_INSUFFICIENT_GRADE,
 )
 from app.services.product_master_filter_contract import (
+    extract_product_di_semantic_group,
     extract_product_prescription_semantic,
     has_product_prescription_semantic_conflict,
+    strip_product_di_semantic_terms,
     strip_product_prescription_semantic_terms,
 )
 
@@ -484,7 +486,11 @@ def extract_nlq_natural_period(
             _NLQ_PERIOD_KIND_KEY: "rolling_1month",
         }
 
-    relative_day = re.search(r"(?:^|\s)(오늘|어제|그저께|당일|하루|최근\s*1\s*일)(?=\s|$)", raw)
+    relative_day = re.search(
+        r"(?:^|\s)(오늘|어제|그저께|당일|하루|최근\s*1\s*일)"
+        r"(?=\s|$|(?:거래명세서|입고현황|출고현황|입고명세|출고명세|세금계산서))",
+        raw,
+    )
     if relative_day:
         token = relative_day.group(1)
         offset_days = {"어제": 1, "그저께": 2}.get(token, 0)
@@ -610,6 +616,11 @@ def strip_nlq_period_tokens_for_entity_residual(text: str) -> str:
     embedded-name token before applying the common parser to the full phrase.
     This preserves multi-token natural periods such as ``최근 한달``.
     """
+    text = re.sub(
+        r"^(오늘|어제|그저께|당일)(?=(?:거래명세서|입고현황|출고현황|입고명세|출고명세|세금계산서))",
+        r"\1 ",
+        str(text or ""),
+    )
     protected: dict[str, str] = {}
     tokens: list[str] = []
     for index, token in enumerate(str(text or "").split()):
@@ -1202,7 +1213,10 @@ def _extract_product_code_for_io(text: str) -> Optional[str]:
             return code
 
     if _has_any(t, _PRODUCT_IO_WORDS):
-        for match in re.finditer(r"(?<![A-Za-z0-9])([A-Za-z0-9]{5})(?![A-Za-z0-9])", t):
+        # An unlabeled five-digit product code cannot be the value of a
+        # different explicit code label, notably 재고위치 00001.
+        residual = re.sub(r"재고위치(?:코드)?\s*[:=]?\s*\d{1,6}(?:\s*[,/]\s*\d{1,6})*", " ", t)
+        for match in re.finditer(r"(?<![A-Za-z0-9])([A-Za-z0-9]{5})(?![A-Za-z0-9])", residual):
             code = match.group(1)
             if _is_product_code_token(code):
                 return code
@@ -2220,11 +2234,19 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
         if pattern:
             candidate = re.sub(pattern, " ", candidate)
 
+    candidate = _ALL_STOCK_LOCATIONS_RE.sub(" ", candidate)
+    if action in {"제품재고현황 조회", "현재고 조회"}:
+        # A separately parsed stock-location condition does not consume a
+        # preceding unlabeled product/manufacturer search phrase.
+        candidate = re.sub(
+            r"(?<!\S)재고위치(?:명|코드)?\s*[:=]?\s*[^\s,]+(?:\s*[,/]\s*[^\s,]+)*",
+            " ", candidate,
+        )
+
     # Standalone date syntax was consumed before action cleanup. Do not run a
     # second substring matcher here: it would remove date-like digits from a
     # retained entity token such as ``ABC202609정``.
     candidate = re.sub(r"(?:실\s*재고|장부\s*재고|실\s*수불|장부\s*수불)", " ", candidate)
-    candidate = _ALL_STOCK_LOCATIONS_RE.sub(" ", candidate)
     candidate = _consume_document_query_syntax_residual(candidate, action)
     candidate = re.sub(r"\s+", " ", candidate).strip(" ,:/-~")
     if not candidate or _looks_like_date_token(candidate):
@@ -2249,7 +2271,10 @@ def has_unconsumed_detail_condition(text: str, action: str, params: Dict[str, An
     ))
     if not has_bound_name and _extract_unlabeled_entity_phrase(text, action):
         return False
-    residual = strip_nlq_period_tokens_for_entity_residual(_consume_io_action_text(text, action))
+    residual = _consume_io_action_text(
+        strip_nlq_period_tokens_for_entity_residual(_consume_io_action_text(text, action)),
+        action,
+    )
     if has_bound_name:
         # A detail label is consumed only when the existing parser bound its
         # value. Keep unsupported labels in the residual so they still block.
@@ -3029,15 +3054,21 @@ def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
         or _extract_code_flex(text, "세금계산서", 1, 6)
     )
     parsed_month = clean_text(params.get("month_from"))
-    if (
-        re.fullmatch(r"(?:19|20)\d{4}", clean_text(trans_seq))
-        and clean_text(params.get("month_to")) == parsed_month == clean_text(trans_seq)
-    ):
+
+    def period_consumed_as_sequence(value: Any, label: str) -> bool:
+        candidate = clean_text(value)
+        if not candidate or re.search(rf"{label}순번\s*[:=]?\s*{re.escape(candidate)}", text):
+            return False
+        if re.fullmatch(r"(?:19|20)\d{4}", candidate):
+            return clean_text(params.get("month_to")) == parsed_month == candidate
+        if re.fullmatch(r"(?:19|20)\d{2}", candidate):
+            return (parsed_month == candidate + "01"
+                    and clean_text(params.get("month_to")) == candidate + "12")
+        return False
+
+    if period_consumed_as_sequence(trans_seq, "거래명세서"):
         trans_seq = None
-    if (
-        re.fullmatch(r"(?:19|20)\d{4}", clean_text(tax_seq))
-        and clean_text(params.get("month_to")) == parsed_month == clean_text(tax_seq)
-    ):
+    if period_consumed_as_sequence(tax_seq, "세금계산서"):
         tax_seq = None
     trans_di = _extract_code(text, "거래명세서구분", 1)
     tax_di = _extract_code(text, "세금계산서구분", 1)
@@ -3442,6 +3473,12 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             action=action,
             raw=raw,
         )
+        if action == "제품재고현황 조회" and re.search(r"(?:발주처|제조사)(?:명)?별\s+\S+", raw):
+            # '<dimension>별 <name>' does not identify whether the name is a
+            # group value or an independent filter. Fail closed before ERP.
+            for key in ("order_nm", "maker_nm", "product_ven_nm"):
+                fixed_params.pop(key, None)
+            fixed_params["_ambiguous_grouping_label"] = True
         return {"action": action, "params": fixed_params}
 
     # 입고/출고/명세서/세금계산서 일자 기준 조회에서도
@@ -3458,9 +3495,13 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
         entity_text = raw
         for alias in sorted(_PRODUCT_INFORMATION_WORDS, key=len, reverse=True):
             entity_text = entity_text.replace(alias, " ")
-        info_frequency = re.search(r"출고빈도(?:등급|구분)?\s*[:=]?\s*([A-FX])(?:\s*등급)?", raw, re.IGNORECASE)
+        info_frequency = re.search(r"(?:출고)?빈도(?:등급|구분)?\s*[:=]?\s*([A-FX])(?:\s*등급)?", raw, re.IGNORECASE)
         if info_frequency:
             frequency_grade = info_frequency.group(1).upper()
+            entity_text = entity_text.replace(info_frequency.group(0), " ")
+        di_semantic = extract_product_di_semantic_group(raw)
+        if di_semantic:
+            entity_text = strip_product_di_semantic_terms(entity_text)
         params = extract_params(entity_text, today=today)
         from app.services.erp_table_nlq import _extract_name, _extract_code
         from app.sims.meta.erp_table_feature_registry import RDDBC230, filter_labels
@@ -3475,9 +3516,15 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
         semantic_group = extract_product_prescription_semantic(raw)
         if semantic_group:
             params["product_prescription_semantic"] = semantic_group
+        if di_semantic and not params.get("product_di_nm"):
+            params["product_di_semantic_group"] = di_semantic
         if semantic_conflict:
             params["_product_prescription_semantic_conflict"] = True
         unlabeled_source = strip_product_prescription_semantic_terms(raw) if semantic_group else raw
+        if di_semantic:
+            unlabeled_source = strip_product_di_semantic_terms(unlabeled_source)
+        if info_frequency:
+            unlabeled_source = unlabeled_source.replace(info_frequency.group(0), " ")
         unlabeled_name = _extract_unlabeled_entity_phrase(unlabeled_source, "제품정보 조회")
         if (
             unlabeled_name

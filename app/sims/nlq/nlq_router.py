@@ -6364,7 +6364,13 @@ def _try_handle_io_nlq(
         )
         and not inventory_entity_phrase
     )
-    if params.pop("_product_prescription_semantic_conflict", False):
+    if params.pop("_ambiguous_grouping_label", False):
+        entity_resolution = {
+            "status": "grouping_scope_required",
+            "params": params,
+            "resolved_kind": "grouping_scope_required",
+        }
+    elif params.pop("_product_prescription_semantic_conflict", False):
         entity_resolution = {
             "status": "product_prescription_semantic_conflict",
             "params": params,
@@ -6446,7 +6452,7 @@ def _try_handle_io_nlq(
     entity_status = str(entity_resolution.get("status") or "")
     if entity_status in {
         "input_required", "candidate_required", "not_found", "resolution_unavailable",
-        "product_prescription_semantic_conflict",
+        "product_prescription_semantic_conflict", "grouping_scope_required",
     }:
         candidates = list(entity_resolution.get("candidates") or [])
         show_candidates = entity_status == "candidate_required"
@@ -6463,7 +6469,19 @@ def _try_handle_io_nlq(
             }
             for row in candidates
         ]) if show_candidates else pd.DataFrame()
-        if entity_status == "product_prescription_semantic_conflict":
+        if entity_status == "grouping_scope_required":
+            from app.ui.knowledge_chat_adapter import SimsHelpIntent, verified_sims_help_text
+
+            subject_match = re.search(r"(발주처|제조사)(?:명)?별\s+([^\s,]+)", txt_for_io)
+            message = verified_sims_help_text(
+                SimsHelpIntent(
+                    "grouping_scope_required", txt,
+                    subject_match.group(1) if subject_match else "",
+                    subject_match.group(2) if subject_match else "",
+                ),
+                allowed_actions={action},
+            )
+        elif entity_status == "product_prescription_semantic_conflict":
             message = "전문약과 일반약 제품구분이 함께 지정되었습니다. 한 가지 제품구분만 지정해 다시 조회해 주세요."
         elif entity_status == "candidate_required":
             if action == "현재고 조회":
@@ -6508,6 +6526,7 @@ def _try_handle_io_nlq(
                 ),
                 "input_required": entity_status in {
                     "input_required", "resolution_unavailable", "product_prescription_semantic_conflict",
+                    "grouping_scope_required",
                 },
                 "candidate_table": show_candidates,
                 "entity_resolution_status": entity_status,
@@ -6516,12 +6535,14 @@ def _try_handle_io_nlq(
                     "candidate_required" if entity_status == "candidate_required"
                     else "resolution_unavailable" if entity_status == "resolution_unavailable"
                     else "product_prescription_semantic_conflict" if entity_status == "product_prescription_semantic_conflict"
+                    else "grouping_scope_required" if entity_status == "grouping_scope_required"
                     else "entity_not_found"
                 ],
                 "row_count": int(len(candidate_df)),
                 "row_count_total": int(len(candidate_df)),
                 "tableless_result": bool(candidate_df.empty),
                 "service_call_skipped": True,
+                "source_call_count": 0,
                 "_force_push": True,
                 "_nlq_nonce": str(uuid.uuid4()),
             },

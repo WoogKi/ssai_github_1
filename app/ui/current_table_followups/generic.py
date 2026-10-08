@@ -623,6 +623,10 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
     q_norm = _norm_col_name(query)
     if not q_norm:
         return "", ""
+    if "별" in q_norm and _find_common_group_column(df, query):
+        # An explicit existing dimension owns the request. A shorter alias
+        # such as 제품 must not consume 제품분류별 as a literal filter value.
+        return "", ""
     if any(q_norm.endswith(_norm_col_name(word)) for word in ("요약", "분석", "집계", "현황")):
         return "", ""
 
@@ -667,7 +671,7 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
         )
         if not value:
             continue
-        if value in {"요약", "분석", "집계", "현황"}:
+        if re.fullmatch(r"(?:요약|분석|집계|현황)(?:해줘|해주세요|해)?", value):
             continue
         if _looks_like_numeric_condition_value(value):
             continue

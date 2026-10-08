@@ -9449,6 +9449,13 @@ def _sims_bounded_source_limit_hit(meta: Dict[str, Any], loaded_rows: int) -> bo
     )
 
 
+def _sims_non_query_notice(meta: Dict[str, Any]) -> bool:
+    status = str(meta.get("result_status") or "").strip().lower()
+    return bool(meta.get("service_call_skipped")) or status in {
+        "input_required", "candidate_required", "routing_error", "query_error", "unsupported",
+    }
+
+
 def _build_sims_result_header_view(
     item: Dict[str, Any],
     meta: Dict[str, Any],
@@ -9472,10 +9479,13 @@ def _build_sims_result_header_view(
     full_rows, display_rows, expected_rows = _sims_table_meta_row_count(safe_meta, data)
     download_rows = _safe_int_for_download(safe_meta.get("download_row_count") or full_rows, full_rows)
     query_summary, full_condition = _sims_query_summary_for_header(item, safe_meta)
+    non_query_notice = _sims_non_query_notice(safe_meta)
 
     status_suffix = " · 표시 데이터 만료" if expired else ""
     bounded_limit_hit = _sims_bounded_source_limit_hit(safe_meta, full_rows)
-    if str(safe_meta.get("entity_resolution_status") or "") == "resolution_unavailable":
+    if non_query_notice:
+        line1 = "조회 조건 확인 필요"
+    elif str(safe_meta.get("entity_resolution_status") or "") == "resolution_unavailable":
         line1 = "조회 조건 확인 필요"
     elif bounded_limit_hit:
         line1 = f"결과: {full_rows:,}건 조회 · 안전 한도 도달 · 전체 건수 미확인"
@@ -9497,6 +9507,7 @@ def _build_sims_result_header_view(
 
     followup_available = (
         not expired
+        and not non_query_notice
         and not bool(safe_meta.get("current_table_followup"))
         and bool(str(safe_meta.get("table_key") or item.get("table_key") or "").strip())
     )
@@ -10013,6 +10024,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
         is_product_flow = _is_product_flow_action(action_name)
         is_product_inventory = _is_product_inventory_action(action_name)
         is_monthly_stock = _is_monthly_stock_action(action_name)
+        non_query_notice = _sims_non_query_notice(meta)
         is_sales_trend = (
             _is_sales_trend_action(action_name)
             or meta.get("analysis_type") in {"sales_trend", "sales_forecast", "customer_sales_forecast", "salesperson_sales_forecast", "region_sales_forecast", "stock_shortage", "supplier_stock_shortage"}
@@ -10078,7 +10090,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 """,
                 unsafe_allow_html=True,
             )
-        elif is_product_flow:
+        elif non_query_notice:
+            notice_text = _safe_user_facing_payload_text(item.get("message"))
+            if not notice_text:
+                notice_text = _safe_user_facing_payload_text(item.get("data"))
+            if notice_text:
+                st.markdown(notice_text)
+        elif is_product_flow and not non_query_notice:
             product_info_text = _build_product_flow_info_caption(meta)
             if product_info_text:
                 st.caption(product_info_text)
@@ -10089,7 +10107,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 summary_cond_text,
             )
 
-        elif is_product_inventory:            
+        elif is_product_inventory and not non_query_notice:
             product_info_text = _build_product_inventory_info_caption(meta, item)
             show_product_info = _should_show_product_inventory_info(meta, data)
             if product_info_text and show_product_info:
@@ -10102,14 +10120,14 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 drop_product_info=not show_product_info,
             )
 
-        elif is_monthly_stock:
+        elif is_monthly_stock and not non_query_notice:
             _render_monthly_stock_metrics(meta)
             _render_chat_summary_expander_v2(
                 meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
                 summary_cond_text,
             )
 
-        elif is_sales_trend:
+        elif is_sales_trend and not non_query_notice:
             _render_sales_trend_metrics(meta)
             _render_chat_summary_expander_v2(
                 meta.get("summary_md") or meta.get("summary") or _build_chat_fallback_summary_md(item, meta, data, action_name),
