@@ -199,7 +199,7 @@ def main() -> int:
         or not all(token in unit_sql for token in unit_required_columns)
         or "D.Rd18_Cost_Apply_Cd = ?" not in unit_sql
         or "D.Rd18_Stock_Apply_Cd = ?" not in unit_sql
-        or "NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL" not in unit_sql
+        or "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" not in unit_sql
         or unit_values[:2] != ["20260825", "20260925"]
         or unit_values[2:5] != ["1", "2", "3"]
         or unit_values[5:7] != ["50002", "50001"]
@@ -513,8 +513,8 @@ def main() -> int:
 
     ready_calendar = RecentBusinessDaysResult(status="ready", dates=business_dates)
     with patch.dict("os.environ", {"SIMS_CHAT_DISPLAY_MAX_ROWS": "300", "SIMS_IO_QUERY_MAX_ROWS": "100000"}), patch.object(service, "recent_business_days", return_value=ready_calendar), patch.object(service, "execute_bound_select", side_effect=fake_select):
-        order = service.get_order_result({"date_from": "20260901", "date_to": "20260907", "_display_context": "chat"})
-        expected = service.get_expected_inbound_result({"_today": "20260907", "_display_context": "chat"})
+        order = service.get_order_result({"date_from": "20260901", "date_to": "20260907", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_display_context": "chat"})
+        expected = service.get_expected_inbound_result({"_today": "20260907", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_display_context": "chat"})
     if len(captured) != 2:
         failures.append(f"one source call per request failed: {len(captured)}")
     for payload in (order, expected):
@@ -556,6 +556,7 @@ def main() -> int:
                 "_business_dates": business_dates,
                 "order_vendor_nm": "삼진",
                 "physic_nm": "테스트",
+                "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True,
             },
             mode="expected",
             title="입고예정조회",
@@ -581,7 +582,7 @@ def main() -> int:
 
     with patch.object(service, "recent_business_days", return_value=ready_calendar), patch.object(service, "execute_bound_select", return_value=pd.DataFrame()):
         expected_empty = service.get_expected_inbound_result(
-            {"_today": "20260907", "order_vendor_nm": "삼진", "physic_nm": "테스트"}
+            {"_today": "20260907", "order_vendor_nm": "삼진", "physic_nm": "테스트", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True}
         )
     empty_summary = str(expected_empty.get("meta", {}).get("query_summary") or "")
     if (
@@ -593,9 +594,14 @@ def main() -> int:
         failures.append(f"expected-inbound empty result lost Calendar query summary: {expected_empty.get('meta')}")
 
     pushed: list[dict] = []
+    notices: list[dict] = []
     calls_before_followup = len(captured)
+    order_source = order.get("df")
+    numeric_named = order_source.iloc[[0]].copy()
+    numeric_named["발주거래처명"] = "123상사"
+    mixed_order_source = pd.concat([numeric_named, order_source], ignore_index=True)
     handled = handle_current_table_followup_by_action(
-        df=order.get("df"),
+        df=mixed_order_source,
         query="현재표 발주거래처명 삼진 보여줘 TOP 1",
         top_n=1,
         table_key="sims_order_gate",
@@ -606,13 +612,19 @@ def main() -> int:
                 "",
             ),
             "push_table": lambda **kwargs: pushed.append(kwargs) or True,
-            "push_notice": lambda **_kwargs: True,
+            "push_notice": lambda **kwargs: notices.append(kwargs) or True,
         },
         log=logging.getLogger("order.gate"),
         source_meta=order.get("meta"),
     )
     if not handled or not pushed or len(pushed[-1].get("df", [])) != 1:
-        failures.append("current-table literal/TOP source reuse failed")
+        failures.append(f"current-table literal/TOP source reuse failed: handled={handled}, pushes={len(pushed)}, rows={len(pushed[-1].get('df', [])) if pushed else 0}, notices={notices}")
+    elif (
+        "삼진" not in str(pushed[-1]["df"].iloc[0]["발주거래처명"])
+        or not pd.api.types.is_object_dtype(pushed[-1]["df"]["발주거래처명"])
+        or pushed[-1].get("extra_meta", {}).get("filter_column") != "발주거래처명"
+    ):
+        failures.append("current-table text filter/TOP lost literal supplier name or string dtype")
     if len(captured) != calls_before_followup:
         failures.append("current-table follow-up re-queried the DB source")
 
@@ -754,6 +766,7 @@ def main() -> int:
     with patch.object(service, "execute_bound_select", side_effect=lambda sql, params: explicit_calls.append((sql, list(params))) or _fixture().iloc[:1].copy()):
         explicit_expected = service.get_expected_inbound_result({
             "date_from": "20260101", "date_to": "20260909", "status_codes": ("1", "2"),
+            "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True,
         })
     explicit_meta = explicit_expected.get("meta", {})
     explicit_sql = " ".join(explicit_calls[0][0].split()) if explicit_calls else ""
@@ -770,7 +783,7 @@ def main() -> int:
         failures.append(f"explicit expected-inbound period/status SQL contract failed: {explicit_meta}/{explicit_sql}/{explicit_params}")
 
     error_pushes: list[dict] = []
-    with patch.object(service, "get_expected_inbound_result", side_effect=RuntimeError("fixture database failure")), patch("app.ui.chat_middleware.push_sims_result_to_chat", side_effect=lambda payload, _action: error_pushes.append(payload) or (payload.get("meta") or {})):
+    with patch.object(service, "get_expected_inbound_result", side_effect=RuntimeError("fixture database failure")), patch("app.ui.chat_middleware.push_sims_result_to_chat", side_effect=lambda payload, _action: error_pushes.append(payload) or (payload.get("meta") or {})), patch("app.services.order_stock_location_scope.prepare_order_stock_scope", side_effect=lambda params, **kwargs: ({**params, "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True}, "", [])):
         error_handled = _try_handle_io_nlq(
             "입고예정자료 조회",
             room={}, session_state={}, make_ts=lambda: "2026-09-07T00:00:00+09:00", next_seq=lambda: 1,

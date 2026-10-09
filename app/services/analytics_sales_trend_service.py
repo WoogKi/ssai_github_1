@@ -6348,7 +6348,7 @@ def get_stock_shortage_df(
                 selected_codes=stock_scope,
                 explicit_full=bool(params.get("_stock_scope_is_full_selection", False)),
             )
-            inbound_params["include_blank_stock_cd"] = bool(scope["is_full_default_scope"])
+            inbound_params["include_blank_stock_cd"] = "00001" in stock_scope
             inbound_params["_today"] = dict(params.get("_period_source_policy") or {}).get(
                 "effective_date_to"
             ) or params.get("date_to")

@@ -102,6 +102,7 @@ def _run_router(
         patch("app.services.product_inventory_service.get_product_inventory_result", service),
         patch("app.services.rddbc170_rddbc180_order_service.get_order_result", service),
         patch("app.services.rddbc170_rddbc180_order_service.get_expected_inbound_result", service),
+        patch("app.services.order_stock_location_scope.prepare_order_stock_scope", side_effect=lambda params, **kwargs: ({**params, "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_order_stock_scope_policy": "saved" if kwargs.get("saved_only") else "registered"}, "", [])),
         patch("app.services.io_nlq.resolve_current_stock_entity_condition", current_stock_entity),
         patch("app.services.io_nlq.resolve_unlabeled_io_entity_condition", unlabeled_io_entity),
         patch("app.sims.views.rddbc_io_shared._load_stock_code_options", return_value=[]),

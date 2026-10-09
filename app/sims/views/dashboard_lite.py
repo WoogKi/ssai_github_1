@@ -69,12 +69,14 @@ from app.ui.sims_table_display import (
 
 
 log = logging.getLogger("ssai.sims.dashboard_lite")
+_COMPANY_GRADE_STOCK_STATE_KEY = "__dashboard_lite_company_grade_stock_scope"
 
 DASHBOARD_LITE_SESSION_KEYS = (
     "__dashboard_lite_result",
     "__dashboard_lite_applied_params",
     "__dashboard_lite_run_seq",
     "__dashboard_lite_profile_loaded_for",
+    _COMPANY_GRADE_STOCK_STATE_KEY,
     "__dashboard_lite_styles_loaded",
     "__dashboard_lite_stock_labels",
     "__dashboard_lite_stock_mode",
@@ -2816,6 +2818,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     inventory = facts.get("inventory") or {}
     summary = _inventory_status_summary(facts)
     st.markdown("### 재고 현황 상세")
+    st.caption("출고빈도·품목손익·품목기여등급은 회사 표준 재고범위 기준이며, 수량과 상태는 선택한 재고위치 기준입니다.")
     if render_mode != "primary":
         st.caption("통합 상세표와 Excel은 현재 Dashboard 조회 세션에서만 사용할 수 있습니다.")
         return
@@ -4572,7 +4575,12 @@ def _apply_saved_dashboard_profile_once() -> None:
         for widget_key in _DASHBOARD_PROFILE_WIDGETS.values()
         if widget_key not in st.session_state
     ]
-    if loaded_for == profile_key and not missing_widget_keys:
+    grade_state = st.session_state.get(_COMPANY_GRADE_STOCK_STATE_KEY)
+    grade_scope_loaded = (
+        isinstance(grade_state, Mapping)
+        and str(grade_state.get("company_id") or "") == profile_key
+    )
+    if loaded_for == profile_key and not missing_widget_keys and grade_scope_loaded:
         log.info(
             "[dashboard.profile_restore] company_id=%s reason=preserve_live_state "
             "profile_found=unknown restored_widget_count=0 skipped_existing_widget_count=%s",
@@ -4602,6 +4610,17 @@ def _apply_saved_dashboard_profile_once() -> None:
         supported_keys=COMPANY_DEFAULT_KEYS,
     )
     profile_values = dict(adapter.get("effective") or {})
+    st.session_state[_COMPANY_GRADE_STOCK_STATE_KEY] = {
+        "company_id": profile_key,
+        "snapshot_scope": {
+            **{key: profile_values.get(key) for key in (
+                "product_group_list", "product_di_list", "product_class_list", "stock_mode",
+            )},
+            "stock_cd_list": [
+                value.rsplit(":", 1)[-1] for value in _clean_list(profile_values.get("stock_cd_list"))
+            ],
+        },
+    }
     company_io_key = "__dashboard_lite_company_io_gu_list"
     if isinstance(profile, dict):
         st.session_state[company_io_key] = _clean_list(profile_values.get("io_gu_list"))
@@ -5851,6 +5870,7 @@ def _render_dashboard_facts(
         with st.container(key=f"dashboard_monthly_depletion__{render_namespace}"):
             _render_monthly_depletion_summary(facts)
 
+        st.caption("출고빈도·품목손익·품목기여등급: 회사 표준 재고범위 / 재고·입고예정·부족수량: 선택 재고위치")
         frequency_column, matrix_column = st.columns((1, 2), gap="medium", vertical_alignment="top")
         with frequency_column:
             with st.container(key=f"dashboard_inventory_card__frequency__{render_namespace}"):
@@ -5999,6 +6019,11 @@ def build_dashboard_lite_result_payload(
         work_params["company_id"] = str(company_id)
     identity = _dashboard_context_identity()
     resolved_company_id = str(identity.get("company_id") or company_id or work_params.get("company_id") or "")
+    grade_state = state.get(_COMPANY_GRADE_STOCK_STATE_KEY)
+    if (isinstance(grade_state, Mapping)
+            and str(grade_state.get("company_id") or "") == resolved_company_id):
+        work_params["_company_grade_snapshot_scope"] = dict(grade_state.get("snapshot_scope") or {})
+        work_params["_company_grade_scope_company_id"] = resolved_company_id
     resolved_user_id = str(identity.get("user_id") or "")
     session_token = ensure_dashboard_session_token(state)
     lease = dashboard_request_coordinator.acquire(
@@ -6138,6 +6163,15 @@ def render_dashboard_lite() -> dict[str, Any]:
                 action = save_dashboard_profile(company_id=int(identity["company_id"]), params=params, actor_user_id=int(identity["user_id"]))
                 mark_analysis_profile_saved(st.session_state, company_id=identity["company_id"])
                 st.session_state["__dashboard_lite_company_io_gu_list"] = _clean_list(params.get("io_gu_list"))
+                st.session_state[_COMPANY_GRADE_STOCK_STATE_KEY] = {
+                    "company_id": str(identity["company_id"]),
+                    "snapshot_scope": {
+                        key: params.get(key) for key in (
+                            "stock_cd_list", "product_group_list", "product_di_list",
+                            "product_class_list", "stock_mode",
+                        )
+                    },
+                }
                 st.success("조회조건을 저장했습니다." if action else "조회조건을 저장했습니다.")
             except Exception as exc:
                 log.warning("[dashboard.profile_save] user_id=%s company_id=%s saved=False error_type=%s", identity.get("user_id"), identity.get("company_id"), type(exc).__name__)

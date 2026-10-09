@@ -451,4 +451,11 @@ def run():
 
 
 if __name__ == '__main__':
-    run()
+    with patch(
+        'app.services.order_stock_location_scope.prepare_order_stock_scope',
+        side_effect=lambda params, **kwargs: (
+            {**params, 'stock_cd_list': ['00001'], '_order_stock_scope_resolved': True,
+             '_order_stock_scope_policy': 'saved' if kwargs.get('saved_only') else 'registered'}, '', [],
+        ),
+    ):
+        run()

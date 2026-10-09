@@ -182,7 +182,11 @@ def test_full_month_forecast_and_blank_pending():
     assert missing["수요근거"] == "수요근거 없음" and missing["추천 발주수량"] is None
     q = build_pending_params({"policy_date": "20260914", "stock_cd_list": ["00001"],
                               "order_vendor_cd": "different", "date_to": "20260914"})
-    assert q["include_blank_stock_cd"] and "date_to" not in q and "order_vendor_cd" not in q
+    from app.services.rddbc170_rddbc180_order_service import normalize_order_params
+    calendar_fixture = {**q, "_business_dates": ("20260914", "20260911", "20260910", "20260909")}
+    assert normalize_order_params(calendar_fixture, mode="expected")["include_blank_stock_cd"]
+    assert not normalize_order_params({**calendar_fixture, "stock_cd_list": ["00247"]}, mode="expected")["include_blank_stock_cd"]
+    assert "date_to" not in q and "order_vendor_cd" not in q
     history_q = build_order_price_history_params(
         {
             "policy_date": "20260923",
@@ -204,7 +208,7 @@ def test_full_month_forecast_and_blank_pending():
     with patch.object(pending, "execute_bound_select", return_value=pd.DataFrame()) as query:
         pending.get_expected_inbound_product_totals({**q, "_business_dates": ("20260914", "20260911", "20260910", "20260909")})
     sql = query.call_args.args[0]
-    assert "OR NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL" in sql
+    assert "OR NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql
     assert " - D.Rd18_In_Quantity" in sql
     calendar = sources["business_dates"]
     for plan in (D(1), D(10), D(43)):
@@ -661,6 +665,7 @@ def test_production_nlq_dispatch():
     payload = {"action": "발주 계산", "title": "발주 계산", "table": "order_calculation",
                "final": True, "data": "fixture", "params": {}, "meta": {"result_status": "success"}}
     with patch("app.services.order_calculation_service.get_order_calculation_result", return_value=payload) as service, \
+         patch("app.services.order_stock_location_scope.prepare_order_stock_scope", side_effect=lambda params, **kwargs: ({**params, "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_order_stock_scope_policy": "saved"}, "", [])), \
          patch("app.ui.chat_middleware.push_sims_result_to_chat", side_effect=lambda p, a: captured.append((p, a)) or p.get("meta", {})):
         handled = _try_handle_io_nlq("발주 계산", room={}, session_state={},
             make_ts=lambda: "fixture", next_seq=lambda: 1, logger=logging.getLogger("fixture"))
@@ -673,6 +678,7 @@ def test_production_nlq_dispatch():
     captured.clear()
     with patch("app.services.order_calculation_service.get_order_calculation_result",
                side_effect=internal_failure) as service, \
+         patch("app.services.order_stock_location_scope.prepare_order_stock_scope", side_effect=lambda params, **kwargs: ({**params, "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_order_stock_scope_policy": "saved"}, "", [])), \
          patch("app.ui.chat_middleware.push_sims_result_to_chat",
                side_effect=lambda p, a: captured.append((p, a)) or p.get("meta", {})):
         handled = _try_handle_io_nlq("발주 계산", room={}, session_state={},

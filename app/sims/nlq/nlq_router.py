@@ -5742,6 +5742,12 @@ def _build_dashboard_nlq_params(
     params["stock_cd_list"] = _profile_tcodes(params.get("stock_cd_list"))
     params["io_gu_list"] = _profile_tcodes(params.get("io_gu_list"))
     saved_stock_codes = list(params["stock_cd_list"])
+    params["_company_grade_scope_company_id"] = company_id
+    params["_company_grade_snapshot_scope"] = {
+        key: params.get(key) for key in (
+            "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "stock_mode",
+        )
+    }
 
     if _has_explicit_all_stock_locations(text):
         return {}, _dashboard_nlq_text_payload(
@@ -6588,6 +6594,34 @@ def _try_handle_io_nlq(
                 params["physic_nm"] = trailing_subject
             parsed["params"] = params
     registered_residual_entity = str(params.pop("_registered_unlabeled_entity", "") or "").strip()
+    if action in {"발주조회", "입고예정조회", "발주 계산"}:
+        from app.services.order_stock_location_scope import prepare_order_stock_scope
+
+        try:
+            params, stock_error, candidates = prepare_order_stock_scope(
+                params, saved_only=action == "발주 계산",
+            )
+        except Exception:
+            logger.exception("[nlq.router] order stock scope validation failed action=%r", action)
+            stock_error, candidates = "scope_unavailable", []
+        if stock_error:
+            message = "재고위치를 확인할 수 없습니다. 등록된 코드 또는 정확한 이름으로 다시 지정해 주세요."
+            if stock_error == "location_name_ambiguous":
+                message = "여러 재고위치가 일치합니다. 코드 또는 정확한 이름으로 다시 지정해 주세요."
+            elif stock_error in {"no_saved_locations", "profile_unavailable"}:
+                message = "회사 기본 재고위치가 설정되지 않았습니다. 저장 조건을 확인해 주세요."
+            payload = {
+                "final": True, "type": "text", "title": action, "action": action,
+                "params": params, "data": message, "message": message,
+                "meta": {"nlq": True, "nlq_query": txt, "result_status": "input_required",
+                         "service_call_skipped": True, "source_call_count": 0,
+                         "stock_scope_reason": stock_error, "row_count": 0,
+                         "row_count_total": 0, "_force_push": True,
+                         "_nlq_nonce": str(uuid.uuid4())},
+            }
+            push_sims_result_to_chat(payload, action)
+            return True
+        parsed["params"] = params
     if registered_residual_entity and action in {"최종 계약단가 조회", "계약단가 이력 조회"}:
         # R070's parser keeps the historical physic_nm projection for direct
         # parser callers.  In the production route it is only tentative until

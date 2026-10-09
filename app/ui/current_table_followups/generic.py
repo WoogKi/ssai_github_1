@@ -381,6 +381,11 @@ def _strip_common_filter_value(value: str, *, known_values: pd.Series | None = N
     command_removed = False
     while changed and v:
         changed = False
+        rank_suffix = re.search(r"(?:top|상위|하위)\d*$", v, flags=re.IGNORECASE)
+        if rank_suffix:
+            v = v[:rank_suffix.start()].strip()
+            changed = True
+            continue
         for suffix in sorted(_COMMON_FILTER_VALUE_SUFFIXES, key=len, reverse=True):
             sx = _norm_col_name(suffix)
             if sx and v.endswith(sx):
@@ -622,6 +627,8 @@ def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
 
     q_norm = _norm_col_name(query)
     if not q_norm:
+        return "", ""
+    if _find_common_top_numeric_column(df, query):
         return "", ""
     if "별" in q_norm and _find_common_group_column(df, query):
         # An explicit existing dimension owns the request. A shorter alias
@@ -920,6 +927,8 @@ def _find_common_top_numeric_column(df: pd.DataFrame, query: str) -> str:
     for col in [str(c) for c in df.columns]:
         if col in _COMMON_FILTER_SKIP_COLUMNS:
             continue
+        if re.search(r"(?:코드|명|이름|번호|아이디|id)$", _norm_col_name(col), flags=re.IGNORECASE):
+            continue
         series = _first_series_for_column(df, col)
         try:
             if pd.api.types.is_numeric_dtype(series):
@@ -933,9 +942,11 @@ def _find_common_top_numeric_column(df: pd.DataFrame, query: str) -> str:
                     .str.replace("▲", "-", regex=False)
                     .str.strip()
                     .str.replace(r"^\(([-+]?[0-9.]+)\)$", r"-\1", regex=True)
-                    .str.replace(r"[^0-9.\-+]", "", regex=True)
                 )
-                has_numeric_value = bool(pd.to_numeric(normalized, errors="coerce").notna().any())
+                nonempty = normalized.loc[normalized.ne("")]
+                has_numeric_value = bool(
+                    not nonempty.empty and pd.to_numeric(nonempty, errors="coerce").notna().all()
+                )
         except Exception:
             has_numeric_value = False
         if not has_numeric_value:

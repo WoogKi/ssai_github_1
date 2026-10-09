@@ -504,8 +504,7 @@ def build_demand_params(source_params: dict, scope) -> dict:
 
 
 def build_pending_params(source_params: dict) -> dict:
-    pending = {**source_params, "_today": source_params["policy_date"],
-               "include_blank_stock_cd": True}
+    pending = {**source_params, "_today": source_params["policy_date"]}
     pending.pop("date_to", None)
     pending.pop("date_from", None)
     # Order-vendor filters belong to the selected representative supplier, not
@@ -753,15 +752,30 @@ def load_sources(params: dict) -> dict:
             if code:
                 params[field + "_nm"] = names[code]
     scope = resolve_dashboard_profile_stock_scope(company_id=params["company_id"])
-    if params.get("stock_cd") and params["stock_cd"] not in scope.stock_codes:
-        raise ValueError("저장된 재고범위 밖의 재고위치는 계산할 수 없습니다.")
+    from app.services.order_stock_location_scope import prepare_order_stock_scope
+
+    if (params.get("_order_stock_scope_resolved")
+            and params.get("_order_stock_scope_policy") == "saved"):
+        stock_codes = list(params.get("stock_cd_list") or [])
+    else:
+        scoped, stock_error, _ = prepare_order_stock_scope(
+            params, default_codes=list(scope.stock_codes), saved_only=True,
+        )
+        if stock_error:
+            raise ValueError(f"발주 계산 재고위치를 확인할 수 없습니다: {stock_error}")
+        stock_codes = list(scoped["stock_cd_list"])
+    if not stock_codes:
+        raise ValueError("발주 계산 재고위치가 비어 있습니다.")
     source_params = {**source_request, "evaluation_month": reference.strftime("%Y%m"),
                      "policy_date": reference.strftime("%Y%m%d"), "today": reference.strftime("%Y%m%d"),
-                     "date_to": reference.strftime("%Y%m%d"), "stock_cd_list": list(scope.stock_codes),
+                     "date_to": reference.strftime("%Y%m%d"), "stock_cd_list": stock_codes,
                      "product_group_list": list(scope.product_group_codes),
                      "product_di_list": list(scope.product_di_codes),
                      "product_class_list": list(scope.product_class_codes), "stock_mode": scope.stock_mode}
     source_params["io_gu_list"] = list(scope.io_gu_codes)
+    source_params["stock_cd"] = stock_codes[0] if len(stock_codes) == 1 else ""
+    source_params["stock_cds"] = list(stock_codes)
+    source_params.pop("stock_nm", None)
     source_params["_require_company_io"] = True
     for field in ("cost_apply", "stock_apply"):
         if source_params.get(field + "_cd"):
@@ -1568,6 +1582,23 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
     if current is None or (q.get("company_id") is not None and int(q["company_id"]) != int(current)):
         raise ValueError("현재 회사와 발주계산 회사가 일치하지 않습니다.")
     q["company_id"] = int(current)
+    if source_loader is load_sources and not (
+        q.get("_order_stock_scope_resolved")
+        and q.get("_order_stock_scope_policy") == "saved"
+    ):
+        from app.services.order_stock_location_scope import prepare_order_stock_scope
+
+        q, stock_error, _ = prepare_order_stock_scope(q, saved_only=True)
+        if stock_error:
+            message = "재고위치를 확인할 수 없습니다. 등록된 코드 또는 정확한 이름으로 다시 지정해 주세요."
+            return {
+                "table": TABLE, "action": ACTION, "title": ACTION, "params": q,
+                "data": message, "message": message, "records": [], "columns": [], "final": True,
+                "meta": {"result_status": "input_required", "input_required": True,
+                         "stock_scope_reason": stock_error, "service_call_skipped": True,
+                         "source_call_count": 0, "row_count": 0, "row_count_total": 0,
+                         "tableless_result": True},
+            }
     OrderConditions(date.fromisoformat(q["order_date"]), int(q["safety_days"]), int(q["target_days"]), int(q["closing_day"]))
     with read_only_request(timeout_seconds=120) as measurement:
         token = _source_measurement.set(measurement)

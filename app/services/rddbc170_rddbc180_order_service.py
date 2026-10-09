@@ -58,7 +58,9 @@ def _feature_spec():
     return _ORDER_SPEC
 
 
-_SELECT_COLUMNS = """
+_ORDER_STOCK_CD_SQL = "COALESCE(NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), ''), '00001')"
+
+_SELECT_COLUMNS = f"""
     RTRIM(H.Rd17_Or_YyMmDd) AS [발주일자],
     RTRIM(D.Rd18_OrVen_Cd) AS [발주거래처코드],
     ISNULL(OV.Rd03_Ven_Nm, '') AS [발주거래처명],
@@ -71,7 +73,7 @@ _SELECT_COLUMNS = """
     ISNULL(CV.Rd03_Ven_Nm, '') AS [단가적용처명],
     RTRIM(D.Rd18_Stock_Apply_Cd) AS [재고적용처코드],
     ISNULL(SV.Rd03_Ven_Nm, '') AS [재고적용처명],
-    RTRIM(D.Rd18_Stock_Cd) AS [재고위치코드],
+    {_ORDER_STOCK_CD_SQL} AS [재고위치코드],
     ISNULL(ST.Rd01_Hnm, '') AS [재고위치명],
     D.Rd18_Unit_Cost AS [단가],
     D.Rd18_Quantity AS [발주수량],
@@ -106,8 +108,8 @@ LEFT JOIN dbo.Rddbc030 AS SV ON D.Rd18_Stock_Apply_Cd = SV.Rd03_Ven_Cd
 LEFT JOIN dbo.Rddbc030 AS PV ON D.Rd18_Pro_Ven_Cd = PV.Rd03_Ven_Cd
 LEFT JOIN dbo.Rddbc030 AS RV ON D.Rd18_Real_Ven_Cd = RV.Rd03_Ven_Cd
 LEFT JOIN dbo.Rddbc010 AS ST
-    ON D.Rd18_Stock_Cd_Gcode = ST.Rd01_Gcode
-   AND D.Rd18_Stock_Cd = ST.Rd01_Tcode
+    ON ST.Rd01_Gcode = '0018'
+   AND {_ORDER_STOCK_CD_SQL} = ST.Rd01_Tcode
 LEFT JOIN dbo.Rddbc010 AS OS
     ON D.Rd18_Or_Di_Gcode = OS.Rd01_Gcode
    AND D.Rd18_Or_Di = OS.Rd01_Tcode
@@ -226,7 +228,8 @@ def _expected_inbound_query_summary(params: dict[str, Any]) -> str:
     _append_query_condition(parts, "발주처", params.get("order_vendor_cd"), params.get("order_vendor_nm"))
     _append_query_condition(parts, "단가적용처", params.get("cost_apply_cd"), params.get("cost_apply_nm"))
     _append_query_condition(parts, "재고적용처", params.get("stock_apply_cd"), params.get("stock_apply_nm"))
-    _append_query_condition(parts, "재고위치", params.get("stock_cd"), params.get("stock_nm"))
+    stock_codes = _clean_codes(params.get("stock_cd_list"))
+    _append_query_condition(parts, "재고위치", ",".join(stock_codes) or params.get("stock_cd"), params.get("stock_nm"))
     status_codes = _order_status_codes(params.get("status_codes"), fallback=params.get("status_code"))
     if status_codes:
         parts.append("발주상태 " + ",".join(status_codes))
@@ -257,7 +260,8 @@ def normalize_order_params(params: Optional[dict[str, Any]] = None, *, mode: str
     out["pending_product_code_list"] = _clean_codes(source.get("pending_product_code_list"))
     out["_order_price_history_minimal"] = bool(source.get("_order_price_history_minimal", False))
     out["_order_unit_history_minimal"] = bool(source.get("_order_unit_history_minimal", False))
-    out["include_blank_stock_cd"] = bool(source.get("include_blank_stock_cd", False))
+    # Blank R180 order locations belong to 00001, never to an independent scope.
+    out["include_blank_stock_cd"] = "00001" in out["stock_cd_list"] or out["stock_cd"] == "00001"
     if mode == "order":
         out["date_from"] = _date_value(source.get("date_from"), default=(today - timedelta(days=30)).strftime("%Y%m%d"))
         out["date_to"] = _date_value(source.get("date_to"), default=today.strftime("%Y%m%d"))
@@ -284,6 +288,20 @@ def normalize_order_params(params: Optional[dict[str, Any]] = None, *, mode: str
     limits = registered_query_limits(out, source_limit_env=_feature_spec().source_limit_env)
     out.update({"mode": mode, "display_top": limits.display_top, "source_top": limits.source_top, "top": limits.source_top, "_limit_contract": limits})
     return out
+
+
+def _append_order_stock_filter(
+    clauses: list[str], values: list[Any], params: dict[str, Any],
+) -> None:
+    codes = _clean_codes(params.get("stock_cd_list")) or _clean_codes(params.get("stock_cd"))
+    if not codes:
+        return
+    # Keep the indexed code predicate; only 00001 also owns blank R180 rows.
+    clause = f"D.Rd18_Stock_Cd IN ({','.join('?' for _ in codes)})"
+    if "00001" in codes:
+        clause = f"({clause} OR NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL)"
+    clauses.append(clause)
+    values.extend(codes)
 
 
 def _filters(params: dict[str, Any], *, mode: str) -> tuple[list[str], list[Any]]:
@@ -339,16 +357,7 @@ def _filters(params: dict[str, Any], *, mode: str) -> tuple[list[str], list[Any]
         if params.get(key):
             clauses.append(f"{expression} = ?")
             values.append(params[key])
-    stock_codes = _clean_codes(params.get("stock_cd_list"))
-    if stock_codes:
-        stock_clause = f"D.Rd18_Stock_Cd IN ({','.join('?' for _ in stock_codes)})"
-        if params.get("include_blank_stock_cd"):
-            stock_clause = f"({stock_clause} OR NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL)"
-        clauses.append(stock_clause)
-        values.extend(stock_codes)
-    elif params.get("stock_cd"):
-        clauses.append("D.Rd18_Stock_Cd = ?")
-        values.append(params["stock_cd"])
+    _append_order_stock_filter(clauses, values, params)
     for key, expression in likes:
         if params.get(key):
             clauses.append(f"{expression} LIKE ?")
@@ -465,16 +474,7 @@ def _order_unit_history_minimal_filters(params: dict[str, Any]) -> tuple[list[st
         if params.get(key):
             clauses.append(f"{expression} = ?")
             values.append(params[key])
-    stock_codes = _clean_codes(params.get("stock_cd_list"))
-    if stock_codes:
-        stock_clause = f"D.Rd18_Stock_Cd IN ({','.join('?' for _ in stock_codes)})"
-        if params.get("include_blank_stock_cd"):
-            stock_clause = f"({stock_clause} OR NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL)"
-        clauses.append(stock_clause)
-        values.extend(stock_codes)
-    elif params.get("stock_cd"):
-        clauses.append("D.Rd18_Stock_Cd = ?")
-        values.append(params["stock_cd"])
+    _append_order_stock_filter(clauses, values, params)
     return clauses, values
 
 
@@ -578,7 +578,7 @@ def get_expected_inbound_product_totals(
         WHEN '2' THEN D.Rd18_Quantity + D.Rd18_Oquantity - D.Rd18_In_Quantity
         ELSE 0
     END) AS [입고예정수량],
-    SUM(CASE WHEN NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL THEN 1 ELSE 0 END)
+    SUM(CASE WHEN NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL THEN 1 ELSE 0 END)
         AS [_공백재고위치행수]
 {_JOINS}
 WHERE {' AND '.join(clauses)}
@@ -627,6 +627,23 @@ def _date_to_obj(value: Any) -> date | None:
 
 
 def _result(params: Optional[dict[str, Any]], *, mode: str, title: str) -> dict[str, Any]:
+    if not (params or {}).get("_order_stock_scope_resolved"):
+        from app.services.order_stock_location_scope import prepare_order_stock_scope
+
+        scoped, error, _ = prepare_order_stock_scope(params or {})
+        if error:
+            message = "재고위치를 확인할 수 없습니다. 등록된 위치를 다시 지정해 주세요."
+            if error in {"no_saved_locations", "profile_unavailable"}:
+                message = "회사 기본 재고위치가 설정되지 않았습니다. 저장 조건을 확인해 주세요."
+            return {
+                "final": True, "type": "text", "title": title, "action": title,
+                "params": dict(params or {}), "data": message, "message": message,
+                "meta": {"result_status": "input_required", "input_required": True,
+                         "stock_scope_reason": error, "service_call_skipped": True,
+                         "source_call_count": 0, "row_count": 0, "row_count_total": 0,
+                         "tableless_result": True},
+            }
+        params = scoped
     qparams = normalize_order_params(params, mode=mode)
     limits = qparams.pop("_limit_contract")
     df = get_order_df(qparams, mode=mode)
@@ -636,6 +653,8 @@ def _result(params: Optional[dict[str, Any]], *, mode: str, title: str) -> dict[
         if mode == "expected"
         else qparams["date_from"] + "~" + qparams["date_to"]
     )
+    if mode == "order" and qparams.get("stock_cd_list"):
+        query_summary += " / 재고위치 " + ",".join(qparams["stock_cd_list"])
     summary = f"조회조건: {query_summary}\n\n결과: {len(df):,}건"
     payload = build_feature_result(table=TABLE, title=title, params=qparams, df=df, summary_md=summary)
     payload.update({"df": df, "df_display": display, "records": display.to_dict(orient="records"), "columns": list(display.columns)})
@@ -669,8 +688,18 @@ def get_expected_inbound_result(params: Optional[dict[str, Any]] = None) -> dict
 
 
 def get_order_export_df(params: Optional[dict[str, Any]] = None) -> pd.DataFrame:
-    return get_order_df(params, mode="order")
+    from app.services.order_stock_location_scope import prepare_order_stock_scope
+
+    scoped, error, _ = prepare_order_stock_scope(params or {})
+    if error:
+        raise ValueError("재고위치를 확인할 수 없습니다.")
+    return get_order_df(scoped, mode="order")
 
 
 def get_expected_inbound_export_df(params: Optional[dict[str, Any]] = None) -> pd.DataFrame:
-    return get_order_df(params, mode="expected")
+    from app.services.order_stock_location_scope import prepare_order_stock_scope
+
+    scoped, error, _ = prepare_order_stock_scope(params or {})
+    if error:
+        raise ValueError("재고위치를 확인할 수 없습니다.")
+    return get_order_df(scoped, mode="expected")

@@ -563,6 +563,61 @@ def _clean_list_param(values: Any) -> list[str]:
     return out
 
 
+_COMPANY_GRADE_SNAPSHOT_KEYS = (
+    "stock_cd_list", "product_group_list", "product_di_list", "product_class_list", "stock_mode",
+)
+
+
+def _company_grade_snapshot_scope(
+    params: Mapping[str, Any], *, profile_loader: Callable[..., Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Use the saved company basis for approved grade Snapshot reads."""
+    company_id = str(params.get("company_id") or "").strip()
+    if not company_id.isdigit():
+        return {}, "company_unavailable"
+    if str(params.get("_company_grade_scope_company_id") or "") == company_id:
+        saved = params.get("_company_grade_snapshot_scope")
+        if isinstance(saved, Mapping):
+            defaults = dict(saved)
+        else:
+            defaults = {}
+        if defaults:
+            codes = sorted({
+                str(value).rsplit(":", 1)[-1].strip()
+                for value in _clean_list_param(defaults.get("stock_cd_list"))
+                if str(value).rsplit(":", 1)[-1].strip()
+            })
+            scope = {
+                "stock_cd_list": codes,
+                "product_group_list": _clean_sorted(defaults.get("product_group_list")),
+                "product_di_list": _clean_sorted(defaults.get("product_di_list")),
+                "product_class_list": _clean_sorted(defaults.get("product_class_list")),
+                "stock_mode": str(defaults.get("stock_mode") or "real"),
+            }
+            return scope, "company_saved" if codes else "company_scope_empty"
+
+    from app.services.ssai_analysis_profile_service import (
+        load_dashboard_profile_checked, normalize_company_default_conditions,
+    )
+
+    profile = (profile_loader or load_dashboard_profile_checked)(company_id=int(company_id))
+    if profile.status != "ready":
+        return {}, "profile_unavailable"
+    defaults = normalize_company_default_conditions(profile.profile)
+    return _company_grade_snapshot_scope({
+        "company_id": company_id,
+        "_company_grade_scope_company_id": company_id,
+        "_company_grade_snapshot_scope": defaults,
+    })
+
+
+def _company_grade_stock_scope(
+    params: Mapping[str, Any], *, profile_loader: Callable[..., Any] | None = None,
+) -> tuple[list[str], str]:
+    scope, status = _company_grade_snapshot_scope(params, profile_loader=profile_loader)
+    return list(scope.get("stock_cd_list") or []), status
+
+
 def _clean_sorted(values: Any) -> list[str]:
     return sorted(_clean_list_param(values))
 
@@ -4214,7 +4269,8 @@ def build_dashboard_lite_facts(
         elapsed_ms=int((time.perf_counter() - t_sales) * 1000),
     )
     t_stock = time.perf_counter()
-    stock_codes = list(service_params.get("stock_cd_list") or [])
+    grade_scope, grade_scope_status = _company_grade_snapshot_scope(service_params)
+    grade_stock_codes = grade_scope.get("stock_cd_list") or []
     _checkpoint("after_stock")
     stock_frequency_source = _payload_df(stock_shortage_payload)
     projection_product_codes = (
@@ -4233,16 +4289,19 @@ def build_dashboard_lite_facts(
         active_projection_reader(
             company_id=service_params.get("company_id"),
             evaluation_month=service_params.get("evaluation_month"),
-            stock_codes=stock_codes,
-            product_group_codes=service_params.get("product_group_list"),
-            product_di_codes=service_params.get("product_di_list"),
-            product_class_codes=service_params.get("product_class_list"),
-            stock_mode=service_params.get("stock_mode"),
+            stock_codes=grade_stock_codes,
+            product_group_codes=grade_scope.get("product_group_list"),
+            product_di_codes=grade_scope.get("product_di_list"),
+            product_class_codes=grade_scope.get("product_class_list"),
+            stock_mode=grade_scope.get("stock_mode"),
             product_codes=projection_product_codes,
             as_of_date=service_params.get("policy_date"),
         )
-        if active_projection_reader is not None
-        else FrequencyProjectionReadResult(status="legacy", reason="projection reader not injected")
+        if active_projection_reader is not None and grade_stock_codes
+        else FrequencyProjectionReadResult(
+            status="missing" if not grade_stock_codes else "legacy",
+            reason=grade_scope_status if not grade_stock_codes else "projection reader not injected",
+        )
     )
     previous_frequency_evaluation_month = _add_months(str(service_params.get("evaluation_month") or ""), -1)
     previous_projection = FrequencyProjectionReadResult(
@@ -4265,18 +4324,18 @@ def build_dashboard_lite_facts(
         frequency_snapshot = read_approved_frequency_snapshot(
             company_id=service_params.get("company_id"),
             evaluation_month=service_params.get("evaluation_month"),
-            stock_codes=stock_codes,
-            product_group_codes=service_params.get("product_group_list"),
-            product_di_codes=service_params.get("product_di_list"),
-            product_class_codes=service_params.get("product_class_list"),
-            stock_mode=service_params.get("stock_mode"),
+            stock_codes=grade_stock_codes,
+            product_group_codes=grade_scope.get("product_group_list"),
+            product_di_codes=grade_scope.get("product_di_list"),
+            product_class_codes=grade_scope.get("product_class_list"),
+            stock_mode=grade_scope.get("stock_mode"),
             as_of_date=service_params.get("policy_date"),
         )
     elif projection.status == "legacy":
         frequency_snapshot = frequency_snapshot_reader(
             service_params.get("company_id"),
             service_params.get("evaluation_month"),
-            stock_codes,
+            grade_stock_codes,
         )
     else:
         frequency_snapshot = SnapshotReadResult(

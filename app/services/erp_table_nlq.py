@@ -331,6 +331,7 @@ def _has_explicit_order_residual_owner(params: Mapping[str, Any]) -> bool:
             "order_vendor_cd", "cost_apply_cd", "cost_apply_nm",
             "order_staff_nm", "pharma_staff_nm", "_ambiguous_staff_role",
             "stock_apply_cd", "stock_apply_nm", "stock_cd", "stock_nm",
+            "stock_cd_list", "stock_nm_list",
             "expected_vendor_cd", "expected_vendor_nm", "real_vendor_cd", "real_vendor_nm",
         )
     )
@@ -369,6 +370,16 @@ def _resolve_order_nlq(
         ("expected_vendor_cd", "expected_vendor_nm"),
         ("real_vendor_cd", "real_vendor_nm"),
     )))
+    from app.services.order_stock_location_scope import extract_order_stock_terms
+
+    stock_terms = extract_order_stock_terms(raw)
+    if stock_terms is not None:
+        codes, names = stock_terms
+        params.pop("stock_cd", None)
+        params.pop("stock_nm", None)
+        params["stock_cd_list"] = codes
+        params["stock_nm_list"] = names
+        params["_order_stock_terms_invalid"] = not bool(codes or names)
 
     for key in ("physic_cd", "insu_cd", "barcode"):
         value = _extract_code(raw, filter_labels(feature, key))
