@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -9551,12 +9552,12 @@ def run_basic_checks() -> list[CheckResult]:
                     or nlq_explicit.get("dashboard_product_group_list")
                 ):
                     raise AssertionError(f"nlq_explicit_override={nlq_explicit!r}")
-                nlq_clear = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                nlq_no_clear = nlq_router_mod._apply_company_default_to_analytics_nlq(
                     {}, text="전체 창고 품목별 재고부족현황", action="품목별 재고부족현황",
                     session_state={}, logger=logging.getLogger("ssai.regression"),
                 )
-                if nlq_clear.get("stock_cds") != []:
-                    raise AssertionError(f"nlq_explicit_clear={nlq_clear!r}")
+                if nlq_no_clear.get("stock_cds") != ["00001", "00247"]:
+                    raise AssertionError(f"nlq_stock_default_preserved={nlq_no_clear!r}")
 
                 full_profile = dict(profile_by_company["41"])
                 full_profile["product_class_list"] = ["0031:01", "0031:02", "0031:03", "0031:08"]
@@ -9973,15 +9974,12 @@ def run_basic_checks() -> list[CheckResult]:
                         "stock_cds": ["00247"], "stock_nm": "창고", "product_di_nm": "일반",
                     },
                 )
-                clear_summary = str((clear_payload.get("meta") or {}).get("query_summary") or "")
                 if (
-                    any(clear_params.get(key) not in ([], "") for key in ("stock_cd_list", "stock_cds", "stock_cd", "stock_nm", "stock_nm_list"))
-                    or any(clear_params.get(key) not in ([], "") for key in ("product_di_list", "dashboard_product_di_list", "product_di", "product_di_nm", "product_di_nm_list"))
-                    or clear_params.get("dashboard_product_class_list") != ["0031:01"]
-                    or "재고위치: 전체 (전체 조건)" not in clear_summary
-                    or "제품구분: 전체 (전체 조건)" not in clear_summary
+                    clear_params
+                    or (clear_payload.get("meta") or {}).get("result_status") != "input_required"
+                    or (clear_payload.get("meta") or {}).get("stock_scope_reason") != "all_stock_unsupported"
                 ):
-                    raise AssertionError(f"nlq_explicit_clear_aliases={clear_params!r}/{clear_summary!r}")
+                    raise AssertionError(f"nlq_all_stock_block={clear_params!r}/{clear_payload!r}")
 
                 summary_clear_params, _summary_clear_payload = _run_nlq_case(
                     "전체 제품분류 품목별 매출 추세 요약표", "품목별 매출 추세 요약표", {"product_class_nm": "기존"},
@@ -9993,17 +9991,21 @@ def run_basic_checks() -> list[CheckResult]:
                 ):
                     raise AssertionError(f"nlq_summary_product_class_clear={summary_clear_params!r}")
 
-                name_only = nlq_router_mod._apply_company_default_to_analytics_nlq(
-                    {"stock_nm": "본사"}, text="본사 창고 품목별 재고부족현황", action="품목별 재고부족현황",
-                    session_state={}, logger=logging.getLogger("ssai.regression"),
-                )
+                with patch("app.services.io_nlq.get_current_stock_location_name_map", return_value={
+                    "00001": "본사 창고", "00247": "전주 창고",
+                }):
+                    name_only = nlq_router_mod._apply_company_default_to_analytics_nlq(
+                        {"stock_nm": "본사창고"}, text="재고위치 본사창고 품목별 재고부족현황", action="품목별 재고부족현황",
+                        session_state={}, logger=logging.getLogger("ssai.regression"),
+                    )
                 if (
-                    name_only.get("stock_nm") != "본사"
-                    or name_only.get("stock_cd_list") not in (None, [])
-                    or name_only.get("stock_cds") not in (None, [])
-                    or name_only.get("stock_cd") not in (None, "")
+                    name_only.get("stock_nm") != ""
+                    or name_only.get("stock_cd_list") != ["00001"]
+                    or name_only.get("stock_cds") != ["00001"]
+                    or name_only.get("stock_cd") != "00001"
+                    or name_only.get("__analytics_stock_scope_error")
                 ):
-                    raise AssertionError(f"nlq_name_to_code_leak={name_only!r}")
+                    raise AssertionError(f"nlq_saved_stock_name_scope={name_only!r}")
 
                 actual_parser_results: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
                 old_resolver = nlq_router_mod._resolve_analytics_action
@@ -10049,7 +10051,12 @@ def run_basic_checks() -> list[CheckResult]:
                     actual_parser_results["code"] = _run_actual_parser_case("장부재고 00247 창고 품목별 재고부족현황", "품목별 재고부족현황")
                     actual_parser_results["clear"] = _run_actual_parser_case("전체 창고 전체 제품구분 품목별 재고부족현황", "품목별 재고부족현황")
                     actual_parser_results["class_clear"] = _run_actual_parser_case("전체 제품분류 품목별 매출 추세 요약표", "품목별 매출 추세 요약표")
-                    actual_parser_results["stock_name"] = _run_actual_parser_case("본사 창고 품목별 재고부족현황", "품목별 재고부족현황")
+                    with patch("app.services.io_nlq.get_current_stock_location_name_map", return_value={
+                        "00001": "본사 창고", "00247": "전주 창고",
+                    }):
+                        actual_parser_results["stock_name"] = _run_actual_parser_case(
+                            "품목별 재고부족현황 재고위치 본사창고", "품목별 재고부족현황",
+                        )
                     actual_parser_results["di_name"] = _run_actual_parser_case("일반의약품 제품구분 품목별 매출 추세 요약표", "품목별 매출 추세 요약표")
                     for action in (
                         "품목별 재고부족현황",
@@ -10117,7 +10124,7 @@ def run_basic_checks() -> list[CheckResult]:
                     supplier_scope_mod.resolve_supplier_vendor_codes = old_supplier_resolver
 
                 actual_code_params, actual_code_payload = actual_parser_results["code"]
-                actual_clear_params, _actual_clear_payload = actual_parser_results["clear"]
+                actual_clear_params, actual_clear_payload = actual_parser_results["clear"]
                 actual_class_params, _actual_class_payload = actual_parser_results["class_clear"]
                 actual_stock_name_params, actual_stock_name_payload = actual_parser_results["stock_name"]
                 actual_di_name_params, _actual_di_name_payload = actual_parser_results["di_name"]
@@ -10131,16 +10138,16 @@ def run_basic_checks() -> list[CheckResult]:
                 ):
                     raise AssertionError(f"actual_parser_code_path={actual_code_params!r}/{actual_code_summary!r}")
                 if (
-                    any(actual_clear_params.get(key) not in ([], "") for key in ("stock_cd_list", "stock_cds", "stock_cd", "stock_nm", "stock_nm_list"))
-                    or any(actual_clear_params.get(key) not in ([], "") for key in ("product_di_list", "dashboard_product_di_list", "product_di", "product_di_nm", "product_di_nm_list"))
+                    actual_clear_params
+                    or (actual_clear_payload.get("meta") or {}).get("stock_scope_reason") != "all_stock_unsupported"
                     or any(actual_class_params.get(key) not in ([], "") for key in ("product_class_list", "dashboard_product_class_list", "product_class", "product_class_nm", "product_class_nm_list"))
                 ):
-                    raise AssertionError(f"actual_parser_explicit_clear={actual_clear_params!r}/{actual_class_params!r}")
+                    raise AssertionError(f"actual_parser_stock_block={actual_clear_params!r}/{actual_clear_payload!r}/{actual_class_params!r}")
                 if (
-                    actual_stock_name_params.get("stock_nm") != "본사"
-                    or actual_stock_name_params.get("stock_cd_list") not in (None, [])
-                    or actual_stock_name_params.get("stock_cds") not in (None, [])
-                    or "본사" not in str((actual_stock_name_payload.get("meta") or {}).get("query_summary") or "")
+                    actual_stock_name_params.get("stock_nm") not in (None, "")
+                    or actual_stock_name_params.get("stock_cd_list") != ["00001"]
+                    or actual_stock_name_params.get("stock_cds") != ["00001"]
+                    or "00001" not in str((actual_stock_name_payload.get("meta") or {}).get("query_summary") or "")
                     or actual_di_name_params.get("product_di_nm") != "일반의약품"
                     or actual_di_name_params.get("product_di_list") not in (None, [])
                     or actual_di_name_params.get("dashboard_product_di_list") not in (None, [])
@@ -17007,14 +17014,14 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
             )
 
         scope_params, scope_notice = router._build_dashboard_nlq_params(
-            "SIMS 일일점검 장부재고 재고위치 00002 제품그룹 0013:G2 제품구분 0004:D2 "
+            "SIMS 일일점검 장부재고 재고위치 00001 제품그룹 0013:G2 제품구분 0004:D2 "
             "제품분류 0031:C2 거래처그룹 0019:V2 거래처종류 0009:K2 입출고구분 0012:590",
             session_state={}, logger=log,
         )
         scope_ok = (
             scope_notice is None
             and scope_params.get("stock_mode") == "book"
-            and scope_params.get("stock_cd_list") == ["00002"]
+            and scope_params.get("stock_cd_list") == ["00001"]
             and scope_params.get("product_group_list") == ["0013:G2"]
             and scope_params.get("product_di_list") == ["0004:D2"]
             and scope_params.get("product_class_list") == ["0031:C2"]
@@ -17026,6 +17033,20 @@ def run_dashboard_nlq_contract_checks() -> list[CheckResult]:
         results.append(
             _ok("dashboard NLQ code-safe explicit scope priority", repr(scope_params))
             if scope_ok else _fail("dashboard NLQ code-safe explicit scope priority", f"notice={scope_notice!r}, params={scope_params!r}")
+        )
+
+        blocked_scope, blocked_notice = router._build_dashboard_nlq_params(
+            "SIMS 일일점검 재고위치 00002", session_state={}, logger=log,
+        )
+        blocked_ok = (
+            not blocked_scope
+            and isinstance(blocked_notice, dict)
+            and blocked_notice.get("meta", {}).get("result_status") == "input_required"
+            and blocked_notice.get("meta", {}).get("source_call_count") == 0
+        )
+        results.append(
+            _ok("dashboard NLQ outside saved stock location blocked", "source_call_count=0")
+            if blocked_ok else _fail("dashboard NLQ outside saved stock location blocked", repr(blocked_notice))
         )
 
         shorthand_scope_cases = (

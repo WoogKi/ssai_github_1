@@ -1944,6 +1944,18 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     if semantic_conflict:
         params["_product_prescription_semantic_conflict"] = True
     params = _apply_analytics_condition_aliases(params, txt)
+    stock_terms = _extract_analytics_stock_location_terms(txt)
+    if stock_terms is not None:
+        codes, names = stock_terms
+        if not codes and not names:
+            params["__analytics_stock_scope_error"] = {
+                "reason": "location_unresolved", "allowed_codes": [],
+            }
+        params["stock_cd_list"] = codes
+        params["stock_cds"] = codes
+        params["stock_cd"] = codes[0] if len(codes) == 1 else ""
+        params["stock_nm"] = ""
+        params["stock_nm_list"] = names
     params = _clear_analytics_grouping_artifacts(params, txt)
     params = _apply_analytics_period_defaults(params, txt)
 
@@ -1961,6 +1973,30 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     params["top"] = _extract_analytics_top(txt)
 
     return params
+
+
+def _extract_analytics_stock_location_terms(text: str) -> tuple[list[str], list[str]] | None:
+    """Read an explicit KPI location list without changing general IO parsing."""
+    match = re.search(r"재고위치(?:코드|명)?(?!별)\s*[:=]?\s*(.*)", str(text or ""))
+    if not match:
+        return None
+    from app.services.io_nlq import _trim_io_named_value_at_next_label, _trim_named_value
+
+    raw = _trim_io_named_value_at_next_label(match.group(1))
+    parts = re.split(r"\s*[,+/]\s*|(?<=\S)[와과]\s+|\s+[와과]\s*", raw)
+    if any(not part.strip() for part in parts):
+        return [], []
+    codes: list[str] = []
+    names: list[str] = []
+    for part in parts:
+        value = _trim_named_value(part)
+        if not value:
+            return [], []
+        if re.fullmatch(r"\d{1,6}", value):
+            codes.append(value)
+        else:
+            names.append(value)
+    return list(dict.fromkeys(codes)), list(dict.fromkeys(names))
 
 
 def _apply_analytics_condition_aliases(params: Dict[str, Any], txt: str) -> Dict[str, Any]:
@@ -2245,6 +2281,56 @@ def _analytics_nlq_param_log_summary(params: Dict[str, Any], sources: Dict[str, 
     }
 
 
+def _resolve_analytics_stock_location_scope(
+    params: Dict[str, Any],
+    *,
+    saved_codes: list[str],
+    location_names: Dict[str, str],
+) -> tuple[Dict[str, Any], str]:
+    """Bind an explicit KPI location to exactly one or more saved company codes."""
+    out = dict(params)
+    requested_codes = _analytics_nlq_code_values(out, "stock_cd_list")
+    requested_names = _analytics_nlq_name_values(out, "stock_cd_list")
+    saved = set(saved_codes)
+    if not saved:
+        return out, "no_saved_locations"
+    if any(code not in saved for code in requested_codes):
+        return out, "outside_saved_locations"
+
+    names = [name for name in requested_names if name not in requested_codes]
+    if names:
+        def normalized(value: str) -> str:
+            without_prefix = re.sub(r"^[^\w]+", "", str(value or "").strip())
+            return re.sub(r"\s+", "", without_prefix).casefold()
+
+        for name in names:
+            requested_name = normalized(name)
+            exact = [
+                code for code in saved_codes
+                if requested_name and normalized(location_names.get(code, "")) == requested_name
+            ]
+            matching = exact or [
+                code for code in saved_codes
+                if requested_name and requested_name in normalized(location_names.get(code, ""))
+            ]
+            if len(matching) != 1:
+                if matching:
+                    out["__analytics_stock_candidates"] = matching
+                    return out, "location_name_ambiguous"
+                return out, "location_name_unresolved"
+            if matching[0] not in requested_codes:
+                requested_codes.append(matching[0])
+
+    if not requested_codes:
+        return out, "location_unresolved"
+    out["stock_cd_list"] = list(dict.fromkeys(requested_codes))
+    out["stock_cds"] = list(out["stock_cd_list"])
+    out["stock_cd"] = out["stock_cd_list"][0] if len(out["stock_cd_list"]) == 1 else ""
+    out["stock_nm"] = ""
+    out["stock_nm_list"] = []
+    return out, ""
+
+
 def _apply_company_default_to_analytics_nlq(
     params: Dict[str, Any],
     *,
@@ -2254,6 +2340,8 @@ def _apply_company_default_to_analytics_nlq(
     logger,
 ) -> Dict[str, Any]:
     """Apply only code-safe company Defaults to an analytics NLQ request."""
+    if params.get("__analytics_stock_scope_error"):
+        return params
     supported = set(_ANALYTICS_NLQ_DEFAULT_KEYS.get(action, set()))
     if not supported:
         return params
@@ -2270,6 +2358,11 @@ def _apply_company_default_to_analytics_nlq(
     except Exception:
         company_id = ""
     if not company_id:
+        if (_analytics_nlq_code_values(params, "stock_cd_list")
+                or _analytics_nlq_name_values(params, "stock_cd_list")):
+            return {**params, "__analytics_stock_scope_error": {
+                "reason": "company_unavailable", "allowed_codes": [],
+            }}
         return params
 
     out = dict(params or {})
@@ -2287,8 +2380,6 @@ def _apply_company_default_to_analytics_nlq(
         out["stock_cd_list"] = list(stock_code_values)
         out["stock_cds"] = list(stock_code_values)
         out["stock_cd"] = stock_code_values[0] if len(stock_code_values) == 1 else ""
-    if any(token in text_compact for token in ("전체창고", "전창고", "모든창고", "창고전체")):
-        clear_keys.add("stock_cd_list")
     if any(token in text_compact for token in ("전체제품구분", "전제품구분", "모든제품구분")):
         clear_keys.add("product_di_list")
     if any(token in text_compact for token in ("전체제품분류", "전제품분류", "모든제품분류")):
@@ -2461,16 +2552,29 @@ def _apply_company_default_to_analytics_nlq(
 
     # Clear every legacy alias too.  Some services still inspect the older
     # name/code fields, so clearing only the adapter key is not sufficient.
-    if "stock_cd_list" in clear_keys:
-        for key in ("stock_cd_list", "stock_cds", "stock_cd", "stock_nm", "stock_nm_list"):
-            out[key] = [] if key in {"stock_cd_list", "stock_cds", "stock_nm_list"} else ""
-        out["_stock_scope_is_full_selection"] = True
     if "product_di_list" in clear_keys:
         for key in ("product_di_list", "dashboard_product_di_list", "product_di", "product_di_nm", "product_di_nm_list"):
             out[key] = [] if key.endswith("_list") else ""
     if "product_class_list" in clear_keys:
         for key in ("product_class_list", "dashboard_product_class_list", "product_class", "product_class_nm", "product_class_nm_list"):
             out[key] = [] if key.endswith("_list") else ""
+
+    if "stock_cd_list" in explicit_keys and "stock_cd_list" not in clear_keys:
+        saved_codes = _profile_tcodes((profile or {}).get("stock_cd_list"))
+        location_names: Dict[str, str] = {}
+        if stock_name_values and any(name not in stock_code_values for name in stock_name_values):
+            from app.services.io_nlq import get_current_stock_location_name_map
+
+            location_names = get_current_stock_location_name_map()
+        out, stock_error = _resolve_analytics_stock_location_scope(
+            out, saved_codes=saved_codes, location_names=location_names,
+        )
+        if stock_error:
+            candidate_codes = out.pop("__analytics_stock_candidates", None) or saved_codes
+            out["__analytics_stock_scope_error"] = {
+                "reason": stock_error, "allowed_codes": candidate_codes,
+                "allowed_names": [location_names.get(code, "") for code in candidate_codes],
+            }
 
     out["__analysis_default_sources"] = dict(adapter.get("sources") or {})
     io_source = str((out["__analysis_default_sources"] or {}).get("io_gu_list") or "")
@@ -2859,6 +2963,19 @@ def _try_handle_analytics_nlq(
         logger.exception("[nlq.router] failed to import chat_middleware")
         return False
 
+    from app.services.io_nlq import _has_explicit_all_stock_locations
+    if _has_explicit_all_stock_locations(t):
+        message = "분석/KPI에서는 전체창고 명령을 사용하지 않습니다. 재고위치를 지정하지 않으면 저장된 기본 위치로 조회됩니다."
+        push_sims_result_to_chat({
+            "final": True, "type": "text", "title": action, "action": action,
+            "data": message, "message": message,
+            "meta": {"nlq": True, "analysis_nlq": True, "result_status": "input_required",
+                     "input_required": True, "service_call_skipped": True,
+                     "row_count": 0, "row_count_total": 0,
+                     "stock_scope_reason": "all_stock_unsupported"},
+        }, action)
+        return True
+
     grouping_guard = _analytics_grouping_guard(t, action)
     if grouping_guard:
         payload = _analytics_grouping_guard_payload(text=t, guard=grouping_guard)
@@ -2888,6 +3005,14 @@ def _try_handle_analytics_nlq(
         return False
 
     params = _build_analytics_params(t, action)
+    if (
+        (_analytics_nlq_code_values(params, "stock_cd_list")
+         or _analytics_nlq_name_values(params, "stock_cd_list"))
+        and "stock_cd_list" not in _ANALYTICS_NLQ_DEFAULT_KEYS.get(action, set())
+    ):
+        params["__analytics_stock_scope_error"] = {
+            "reason": "unsupported_action", "allowed_codes": [],
+        }
     if params.pop("_product_prescription_semantic_conflict", False):
         message = "전문약과 일반약 제품구분이 함께 지정되었습니다. 한 가지 제품구분만 지정해 다시 조회해 주세요."
         payload = {
@@ -2953,6 +3078,37 @@ def _try_handle_analytics_nlq(
     adapter_sources = dict(params.pop("__analysis_default_sources", {}) or {})
     service_params = dict(params)
     log_summary = _analytics_nlq_param_log_summary(service_params, adapter_sources)
+
+    stock_scope_error = service_params.pop("__analytics_stock_scope_error", None)
+    if stock_scope_error:
+        choices = ", ".join(
+            f"{code} ({name})" if name else code
+            for code, name in zip(
+                stock_scope_error.get("allowed_codes") or [],
+                stock_scope_error.get("allowed_names") or [""] * len(stock_scope_error.get("allowed_codes") or []),
+            )
+        )
+        reason = stock_scope_error.get("reason")
+        if reason == "unsupported_action":
+            message = "이 분석은 재고위치 조건을 지원하지 않습니다. 재고위치별 조회는 품목별 매출 추세 분석을 사용해 주세요."
+        elif reason == "location_name_ambiguous":
+            message = "여러 저장된 재고위치가 일치합니다. 코드 또는 정확한 이름으로 다시 지정해 주세요."
+        else:
+            message = "재고위치를 확인할 수 없습니다. 이 KPI에 저장된 재고위치로 다시 지정해 주세요."
+        if choices:
+            message += f" 선택 가능한 위치: {choices}"
+        payload = {
+            "final": True, "type": "text", "title": action, "action": action,
+            "params": service_params, "data": message, "message": message,
+            "meta": {
+                "nlq": True, "analysis_nlq": True, "analytics": True,
+                "result_status": "input_required", "input_required": True,
+                "service_call_skipped": True, "row_count": 0, "row_count_total": 0,
+                "stock_scope_reason": stock_scope_error.get("reason"),
+            },
+        }
+        push_sims_result_to_chat(payload, action)
+        return True
 
     if service_params.pop("__company_io_missing", False):
         payload = {
@@ -5523,7 +5679,10 @@ def _build_dashboard_nlq_params(
 ) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
     """Merge explicit Dashboard NLQ conditions over one company Default."""
     from app.services.dashboard_lite_facts import default_dashboard_lite_scope, normalize_dashboard_lite_params
-    from app.services.io_nlq import extract_params
+    from app.services.io_nlq import (
+        _has_explicit_all_stock_locations, extract_params,
+        get_current_stock_location_name_map,
+    )
     from app.services.product_supplier_scope_service import (
         SCOPE_ALL, SCOPE_MANUFACTURER, SCOPE_ORDER_VENDOR,
         load_supplier_manager_options, resolve_supplier_vendor_codes,
@@ -5549,6 +5708,14 @@ def _build_dashboard_nlq_params(
     }
     params["stock_cd_list"] = _profile_tcodes(params.get("stock_cd_list"))
     params["io_gu_list"] = _profile_tcodes(params.get("io_gu_list"))
+    saved_stock_codes = list(params["stock_cd_list"])
+
+    if _has_explicit_all_stock_locations(text):
+        return {}, _dashboard_nlq_text_payload(
+            "일일점검에서는 전체창고 명령을 사용하지 않습니다. 재고위치를 지정하지 않으면 저장된 기본 위치로 조회됩니다.",
+            status="input_required", params=params, question=text,
+            reason_code="all_stock_unsupported",
+        )
 
     parsed_conditions = extract_params(text)
     parsed_period = _apply_analytics_period_defaults(parsed_conditions, text)
@@ -5575,11 +5742,34 @@ def _build_dashboard_nlq_params(
     stock_basis = _resolve_analytics_stock_basis(text)
     if stock_basis.get("explicit"):
         params["stock_mode"] = stock_basis["stock_mode"]
-    stock_codes = _analytics_nlq_code_values(parsed_conditions, "stock_cd_list")
-    if stock_codes:
-        params["stock_cd_list"] = list(stock_codes)
-    if any(token in re.sub(r"\s+", "", text) for token in ("전체재고위치", "전체창고", "전창고", "모든창고", "창고전체")):
-        params["stock_cd_list"] = []
+    stock_terms = _extract_analytics_stock_location_terms(text)
+    if stock_terms is not None:
+        stock_codes, stock_names = stock_terms
+        requested = {
+            "stock_cd_list": stock_codes, "stock_nm_list": stock_names,
+        }
+        location_names = get_current_stock_location_name_map() if stock_names else {}
+        resolved, stock_error = _resolve_analytics_stock_location_scope(
+            requested, saved_codes=saved_stock_codes, location_names=location_names,
+        )
+        if stock_error:
+            candidate_codes = resolved.get("__analytics_stock_candidates") or saved_stock_codes
+            choices = ", ".join(
+                f"{code} ({location_names[code]})" if location_names.get(code) else code
+                for code in candidate_codes
+            )
+            message = (
+                "여러 저장된 재고위치가 일치합니다. 코드 또는 정확한 이름으로 다시 지정해 주세요."
+                if stock_error == "location_name_ambiguous"
+                else "재고위치를 확인할 수 없습니다. 이 일일점검에 저장된 재고위치로 다시 지정해 주세요."
+            )
+            if choices:
+                message += f" 선택 가능한 위치: {choices}"
+            return {}, _dashboard_nlq_text_payload(
+                message, status="input_required", params=params, question=text,
+                reason_code=stock_error,
+            )
+        params["stock_cd_list"] = resolved["stock_cd_list"]
 
     for target_key, labels, expected_gcode in (
         ("product_group_list", ("제품그룹",), "0013"),
