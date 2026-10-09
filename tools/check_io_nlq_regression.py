@@ -6945,6 +6945,7 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
         chat_middleware = importlib.import_module("app.ui.chat_middleware")
         original_inventory_result = inventory_service.get_product_inventory_result
         original_push = chat_middleware.push_sims_result_to_chat
+        original_stock_name_map = io_nlq.get_current_stock_location_name_map
         service_calls: list[dict[str, Any]] = []
         pushed_payloads: list[dict[str, Any]] = []
         try:
@@ -6969,6 +6970,10 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
 
             inventory_service.get_product_inventory_result = _capture_inventory_params
             chat_middleware.push_sims_result_to_chat = lambda payload, *_args, **_kwargs: pushed_payloads.append(payload)
+            io_nlq.get_current_stock_location_name_map = lambda: {
+                "00001": "본사 창고", "00247": "전주 창고", "00901": "오토스토어 창고",
+                "00555": "별도 창고",
+            }
             company["id"] = 4
             public_results = []
             for query in (
@@ -6996,6 +7001,7 @@ def run_product_inventory_default_scope_checks() -> list[CheckResult]:
         finally:
             inventory_service.get_product_inventory_result = original_inventory_result
             chat_middleware.push_sims_result_to_chat = original_push
+            io_nlq.get_current_stock_location_name_map = original_stock_name_map
 
         public_params = service_calls[0] if len(service_calls) >= 1 else {}
         results.append(

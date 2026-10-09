@@ -2235,11 +2235,17 @@ def _extract_unlabeled_entity_phrase(text: str, action: str) -> str:
             candidate = re.sub(pattern, " ", candidate)
 
     candidate = _ALL_STOCK_LOCATIONS_RE.sub(" ", candidate)
+    # The location label can precede an all-warehouses token. Consume both
+    # together so a dangling "창고" cannot become an ERP entity search.
+    if _has_explicit_all_stock_locations(text):
+        candidate = re.sub(r"(?<!\S)재고위치(?:명|코드)?\s*(?=\s|$)", " ", candidate)
     if action in {"제품재고현황 조회", "현재고 조회"}:
         # A separately parsed stock-location condition does not consume a
         # preceding unlabeled product/manufacturer search phrase.
         candidate = re.sub(
-            r"(?<!\S)재고위치(?:명|코드)?\s*[:=]?\s*[^\s,]+(?:\s*[,/]\s*[^\s,]+)*",
+            r"(?<!\S)재고위치(?:명|코드)?\s*[:=]?\s*.*?"
+            r"(?=\s+(?:제품명|제품코드|제품|제조사명|제조사|제약사명|제약사|"
+            r"발주처명|발주처|매입처명|매입처|출고빈도등급|출고빈도구분|출고빈도)\s*(?:[:=]|\s)|$)",
             " ", candidate,
         )
 
@@ -2804,6 +2810,37 @@ def get_current_stock_location_name_map() -> dict[str, str]:
     return stock_location_name_map
 
 
+def resolve_stock_location_codes(
+    codes: list[str], names: list[str], *,
+    allowed_codes: list[str], location_names: Mapping[str, str],
+) -> tuple[list[str], str, list[str]]:
+    """Resolve every requested location against one company's permitted codes."""
+    allowed = list(dict.fromkeys(clean_text(code) for code in allowed_codes if clean_text(code)))
+    selected = list(dict.fromkeys(clean_text(code) for code in codes if clean_text(code)))
+    if not allowed:
+        return [], "no_registered_locations", []
+    if any(code not in allowed for code in selected):
+        return [], "outside_registered_locations", allowed
+
+    def normalize(value: str) -> str:
+        return re.sub(r"\s+", "", re.sub(r"^[^\w]+", "", clean_text(value))).casefold()
+
+    for name in names:
+        requested = normalize(name)
+        exact = [code for code in allowed if requested and normalize(location_names.get(code, "")) == requested]
+        matches = exact or [
+            code for code in allowed
+            if requested and requested in normalize(location_names.get(code, ""))
+        ]
+        if len(matches) != 1:
+            return [], "location_name_ambiguous" if matches else "location_name_unresolved", matches or allowed
+        if matches[0] not in selected:
+            selected.append(matches[0])
+    if not selected:
+        return [], "location_unresolved", allowed
+    return selected, "", []
+
+
 def has_current_stock_executable_structured_filter(params: Optional[Mapping[str, Any]]) -> bool:
     """Return whether current stock can run without an entity-name lookup."""
     values = dict(params or {})
@@ -2868,22 +2905,19 @@ def resolve_current_stock_entity_condition(
     if stock_location_name_map:
         out["stock_location_name_map"] = stock_location_name_map
     if "재고위치" in lookup_text and not (out.get("stock_cds") or out.get("stock_cd_list")):
-        # ERP 표시명은 선행 기호를 포함할 수 있지만, 사용자가 입력한 이름과
-        # 비교할 때만 그 기호를 무시한다. 결과 표의 원래 표시명은 바꾸지 않는다.
-        normalized_lookup_text = re.sub(r"\s+", " ", lookup_text.replace(".", " ")).strip()
-        stock_matches = [
-            (code, name)
-            for code, name in stock_location_name_map.items()
-            if re.sub(r"\s+", " ", name.lstrip(".").strip()) in normalized_lookup_text
-        ]
-        if stock_matches:
-            longest = max(len(name) for _, name in stock_matches)
-            selected_stocks = [(code, name) for code, name in stock_matches if len(name) == longest]
-            out["stock_cds"] = list(dict.fromkeys(code for code, _ in selected_stocks))
-            out["stock_cd_list"] = list(out["stock_cds"])
-            for _, name in selected_stocks:
-                lookup_text = lookup_text.replace(name, " ")
-            lookup_text = re.sub(r"재고위치(?:명|코드)?", " ", lookup_text)
+        requested_name = clean_text(out.get("stock_nm"))
+        if requested_name:
+            selected, stock_error, _ = resolve_stock_location_codes(
+                [], [requested_name], allowed_codes=list(stock_location_name_map),
+                location_names=stock_location_name_map,
+            )
+            if stock_error:
+                return {
+                    "status": "input_required", "params": out,
+                    "resolved_kind": "stock_location_unresolved", "candidates": [],
+                }
+            out["stock_cds"] = selected
+            out["stock_cd_list"] = list(selected)
             out.pop("stock_nm", None)
     explicit_maker = clean_text(out.get("maker_nm") or out.get("maker_cd"))
     explicit_product = clean_text(out.get("physic_nm") or out.get("physic_cd"))

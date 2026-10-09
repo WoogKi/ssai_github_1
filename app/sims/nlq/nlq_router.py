@@ -1999,6 +1999,59 @@ def _extract_analytics_stock_location_terms(text: str) -> tuple[list[str], list[
     return list(dict.fromkeys(codes)), list(dict.fromkeys(names))
 
 
+def _split_general_stock_location_subject(
+    text: str, location_names: Dict[str, str],
+) -> tuple[tuple[list[str], list[str]] | None, str, str]:
+    """Separate a verified location prefix from a trailing unlabeled subject."""
+    from app.services.io_nlq import (
+        _has_explicit_all_stock_locations, _trim_io_named_value_at_next_label, _trim_named_value,
+        resolve_stock_location_codes,
+    )
+
+    match = re.search(r"재고위치(?:코드|명)?(?!별)\s*[:=]?\s*(.*)", text)
+    if not match:
+        return None, text, ""
+    if _has_explicit_all_stock_locations(text):
+        entity_text = re.sub(
+            r"재고위치(?:코드|명)?\s*(?:(?:전체|모든|전)\s*창고|(?:전체|모든|전)\s*재고위치)",
+            " ", text,
+        )
+        return None, entity_text, ""
+
+    terms = _extract_analytics_stock_location_terms(text)
+    if terms is None:
+        return None, text, ""
+    codes, names = terms
+    if codes or len(names) != 1:
+        return terms, text, ""
+    selected, error, _ = resolve_stock_location_codes(
+        [], names, allowed_codes=list(location_names), location_names=location_names,
+    )
+    if selected and not error:
+        return terms, text, ""
+
+    raw = _trim_io_named_value_at_next_label(match.group(1))
+    raw_match = re.match(r"\s*" + re.escape(raw), match.group(1)) if raw else None
+    if raw_match is None:
+        return terms, text, ""
+    labelled_tail = match.group(1)[raw_match.end():]
+    words = raw.split()
+    for split_at in range(len(words) - 1, 0, -1):
+        prefix = " ".join(words[:split_at])
+        prefix_is_code = bool(re.fullmatch(r"\d{1,6}", prefix))
+        selected, error, _ = resolve_stock_location_codes(
+            [prefix] if prefix_is_code else [], [] if prefix_is_code else [prefix],
+            allowed_codes=list(location_names), location_names=location_names,
+        )
+        if selected and not error:
+            suffix = _trim_named_value(" ".join(words[split_at:]))
+            if not suffix:
+                break
+            entity_text = text[:match.start()] + " " + suffix + labelled_tail + text[match.end():]
+            return ([prefix], []) if prefix_is_code else ([], [prefix]), entity_text, suffix
+    return terms, text, ""
+
+
 def _apply_analytics_condition_aliases(params: Dict[str, Any], txt: str) -> Dict[str, Any]:
     """Fill analytics-only name/code aliases without coercing names to codes."""
     out = dict(params or {})
@@ -2288,42 +2341,22 @@ def _resolve_analytics_stock_location_scope(
     location_names: Dict[str, str],
 ) -> tuple[Dict[str, Any], str]:
     """Bind an explicit KPI location to exactly one or more saved company codes."""
+    from app.services.io_nlq import resolve_stock_location_codes
+
     out = dict(params)
     requested_codes = _analytics_nlq_code_values(out, "stock_cd_list")
     requested_names = _analytics_nlq_name_values(out, "stock_cd_list")
-    saved = set(saved_codes)
-    if not saved:
-        return out, "no_saved_locations"
-    if any(code not in saved for code in requested_codes):
-        return out, "outside_saved_locations"
-
-    names = [name for name in requested_names if name not in requested_codes]
-    if names:
-        def normalized(value: str) -> str:
-            without_prefix = re.sub(r"^[^\w]+", "", str(value or "").strip())
-            return re.sub(r"\s+", "", without_prefix).casefold()
-
-        for name in names:
-            requested_name = normalized(name)
-            exact = [
-                code for code in saved_codes
-                if requested_name and normalized(location_names.get(code, "")) == requested_name
-            ]
-            matching = exact or [
-                code for code in saved_codes
-                if requested_name and requested_name in normalized(location_names.get(code, ""))
-            ]
-            if len(matching) != 1:
-                if matching:
-                    out["__analytics_stock_candidates"] = matching
-                    return out, "location_name_ambiguous"
-                return out, "location_name_unresolved"
-            if matching[0] not in requested_codes:
-                requested_codes.append(matching[0])
-
-    if not requested_codes:
-        return out, "location_unresolved"
-    out["stock_cd_list"] = list(dict.fromkeys(requested_codes))
+    selected, error, candidates = resolve_stock_location_codes(
+        requested_codes, requested_names, allowed_codes=saved_codes, location_names=location_names,
+    )
+    if error:
+        if candidates and error == "location_name_ambiguous":
+            out["__analytics_stock_candidates"] = candidates
+        return out, {
+            "no_registered_locations": "no_saved_locations",
+            "outside_registered_locations": "outside_saved_locations",
+        }.get(error, error)
+    out["stock_cd_list"] = selected
     out["stock_cds"] = list(out["stock_cd_list"])
     out["stock_cd"] = out["stock_cd_list"][0] if len(out["stock_cd_list"]) == 1 else ""
     out["stock_nm"] = ""
@@ -6490,6 +6523,70 @@ def _try_handle_io_nlq(
     params = dict(parsed.get("params") or {})
     if not action:
         return False
+    entity_txt_for_io = txt_for_io
+    trailing_subject = ""
+    if action in {"현재고 조회", "제품재고현황 조회"}:
+        from app.services.io_nlq import (
+            _has_explicit_all_stock_locations, get_current_stock_location_name_map,
+            resolve_stock_location_codes,
+        )
+
+        all_stock = _has_explicit_all_stock_locations(txt_for_io)
+        location_names = get_current_stock_location_name_map() if not all_stock and "재고위치" in txt_for_io else {}
+        stock_terms, entity_txt_for_io, trailing_subject = _split_general_stock_location_subject(
+            txt_for_io, location_names,
+        )
+        if all_stock:
+            for key in ("stock_nm", "nlq_unlabeled_name"):
+                params.pop(key, None)
+        if stock_terms is not None and not _has_explicit_all_stock_locations(txt_for_io):
+            codes, names = stock_terms
+            selected, stock_error, candidates = resolve_stock_location_codes(
+                codes, names, allowed_codes=list(location_names), location_names=location_names,
+            )
+            if stock_error:
+                choices = ", ".join(
+                    f"{code} ({location_names[code]})" for code in candidates[:5]
+                    if stock_error == "location_name_ambiguous" and code in location_names
+                )
+                message = "재고위치를 확인할 수 없습니다. 등록된 코드 또는 정확한 이름으로 다시 지정해 주세요."
+                if stock_error == "location_name_ambiguous":
+                    message = "여러 재고위치가 일치합니다. 코드 또는 정확한 이름으로 다시 지정해 주세요."
+                if choices:
+                    message += f" 선택 가능한 위치: {choices}"
+                push_sims_result_to_chat({
+                    "final": True, "type": "text", "title": action, "action": action,
+                    "params": params, "data": message, "message": message,
+                    "meta": {"nlq": True, "nlq_query": txt, "result_status": "input_required",
+                             "service_call_skipped": True, "source_call_count": 0,
+                             "stock_scope_reason": stock_error, "row_count": 0,
+                             "row_count_total": 0, "_force_push": True,
+                             "_nlq_nonce": str(uuid.uuid4())},
+                }, action)
+                return True
+            params["stock_cds"] = selected
+            params["stock_cd_list"] = list(selected)
+            params["stock_cd"] = selected[0] if len(selected) == 1 else ""
+            params["stock_location_name_map"] = location_names
+            for key in ("stock_nm", "stock_nm_list", "stock_names"):
+                params.pop(key, None)
+            explicit_product = str(params.get("physic_nm") or "").strip()
+            if trailing_subject and explicit_product and explicit_product != trailing_subject:
+                message = "제품 검색어가 둘 이상입니다. 제품명을 하나로 지정해 다시 조회해 주세요."
+                push_sims_result_to_chat({
+                    "final": True, "type": "text", "title": action, "action": action,
+                    "params": params, "data": message, "message": message,
+                    "meta": {"nlq": True, "nlq_query": txt, "result_status": "input_required",
+                             "service_call_skipped": True, "source_call_count": 0,
+                             "row_count": 0, "row_count_total": 0, "_force_push": True,
+                             "_nlq_nonce": str(uuid.uuid4())},
+                }, action)
+                return True
+            if trailing_subject and (
+                action == "제품재고현황 조회" or params.get("maker_nm") or params.get("maker_cd")
+            ):
+                params["physic_nm"] = trailing_subject
+            parsed["params"] = params
     registered_residual_entity = str(params.pop("_registered_unlabeled_entity", "") or "").strip()
     if registered_residual_entity and action in {"최종 계약단가 조회", "계약단가 이력 조회"}:
         # R070's parser keeps the historical physic_nm projection for direct
@@ -6532,7 +6629,7 @@ def _try_handle_io_nlq(
     # Label-free proper nouns are never assigned to a condition by wording
     # alone.  The IO master relationships must identify exactly one semantic
     # target; otherwise retain the existing candidate-table result contract.
-    inventory_entity_text = remove_product_inventory_grade_phrases(txt_for_io)
+    inventory_entity_text = remove_product_inventory_grade_phrases(entity_txt_for_io)
     if action == "현재고 조회" and params.get("frequency_grade"):
         inventory_entity_text = remove_outbound_frequency_phrase(inventory_entity_text)
     inventory_entity_phrase = _extract_unlabeled_entity_phrase(inventory_entity_text, action)
@@ -6637,6 +6734,12 @@ def _try_handle_io_nlq(
         # unlabeled entity remains.  Keep that action-consumed cleanup before
         # evaluating its status; otherwise raw action text re-enters params.
         params = dict(resolved_params)
+        parsed["params"] = params
+    if trailing_subject and action == "제품재고현황 조회":
+        # A subject trailing a verified location is a product search, not
+        # the broad vendor/product/manufacturer OR lookup for a bare name.
+        params.pop("nlq_unlabeled_name", None)
+        params["physic_nm"] = trailing_subject
         parsed["params"] = params
 
     entity_status = str(entity_resolution.get("status") or "")

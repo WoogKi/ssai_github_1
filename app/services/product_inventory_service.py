@@ -1297,6 +1297,8 @@ def _resolve_stock_codes(params: Dict[str, Any]) -> list[str]:
     if not stock_nm:
         return []
 
+    from app.services.io_nlq import resolve_stock_location_codes
+
     # User input may omit the ERP display-name prefix or spaces.  Normalize
     # only for matching; the displayed stock-location name remains unchanged.
     normalized_stock_nm = re.sub(r"[.\s]+", "", stock_nm)
@@ -1305,7 +1307,8 @@ def _resolve_stock_codes(params: Dict[str, Any]) -> list[str]:
 
     sql = """
 SELECT
-    LTRIM(RTRIM(Rd01_Tcode)) AS stock_cd
+    LTRIM(RTRIM(Rd01_Tcode)) AS stock_cd,
+    LTRIM(RTRIM(ISNULL(Rd01_Hnm, ''))) AS stock_nm
 FROM dbo.Rddbc010
 WHERE Rd01_Gcode = '0018'
   AND ISNULL(Rd01_Del_Flag, '') <> 'E'
@@ -1330,14 +1333,16 @@ ORDER BY Rd01_Tcode
     if not isinstance(df, pd.DataFrame) or df.empty or "stock_cd" not in df.columns:
         return []
 
-    out: list[str] = []
-    seen = set()
-    for v in df["stock_cd"].fillna("").astype(str).str.strip().tolist():
-        if v and v not in seen:
-            out.append(v)
-            seen.add(v)
-
-    return out
+    if "stock_nm" not in df.columns:
+        return []
+    location_names = dict(zip(
+        df["stock_cd"].fillna("").astype(str).str.strip(),
+        df["stock_nm"].fillna("").astype(str).str.strip(),
+    ))
+    selected, error, _ = resolve_stock_location_codes(
+        [], [stock_nm], allowed_codes=list(location_names), location_names=location_names,
+    )
+    return [] if error else selected
 
 
 def resolve_inventory_stock_codes(params: Dict[str, Any]) -> list[str]:
@@ -1356,10 +1361,7 @@ def _stock_not_found_message(*, stock_name: str = "", stock_codes: list[str] | N
 
     return (
         f"{target}에 해당하는 등록 코드를 찾지 못했습니다.\n\n"
-        "재고위치명과 재고위치코드는 코드마스터 Rddbc010의 그룹코드 0018 기준으로 조회합니다.\n"
-        "코드마스터에 등록된 명칭/코드와 입력값이 다르면 조회되지 않습니다.\n"
-        "예: '본사창고'가 아니라 '본사 창고'처럼 공백이 포함되어 등록되어 있을 수 있습니다.\n"
-        "재고위치명을 확인하거나 등록된 재고위치코드로 다시 조회해 주세요."
+        "입력한 위치를 모두 확인할 수 없습니다. 등록된 재고위치명이나 코드로 다시 조회해 주세요."
     )
 
 
@@ -3961,7 +3963,7 @@ def get_product_inventory_df(params: Optional[Dict[str, Any]] = None) -> pd.Data
 
     if stock_codes_before:
         registered_codes = _registered_stock_codes(stock_codes_before)
-        if not registered_codes:
+        if len(registered_codes) != len(stock_codes_before):
             return pd.DataFrame()
 
         work_params["stock_cds"] = registered_codes
@@ -4014,7 +4016,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
         if stock_codes_before:
             registered_codes = _registered_stock_codes(stock_codes_before)
 
-            if not registered_codes:
+            if len(registered_codes) != len(stock_codes_before):
                 return _inventory_text_payload(
                     message=_stock_not_found_message(stock_codes=stock_codes_before),
                     params=params,
@@ -4023,7 +4025,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                     date_to=date_to,
                     work_params=work_params,
                     meta={
-                        "result_status": "no_data",
+                        "result_status": "input_required",
                         "row_count": 0,
                         "row_count_total": 0,
                     },
@@ -4051,7 +4053,7 @@ def get_product_inventory_result(params: Optional[Dict[str, Any]] = None) -> Dic
                     date_to=date_to,
                     work_params=work_params,
                     meta={
-                        "result_status": "no_data",
+                        "result_status": "input_required",
                         "row_count": 0,
                         "row_count_total": 0,
                     },

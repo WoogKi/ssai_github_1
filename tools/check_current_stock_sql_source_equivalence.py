@@ -47,11 +47,13 @@ def _assert_sql_shape() -> None:
 
     prescription = dict(params, product_prescription_semantic="prescription")
     prescription_sql, prescription_binds = inventory._build_month_carry_sql(prescription, cfg)
-    code_binds = sorted(
-        value for key, value in prescription_binds.items()
-        if key.startswith("carry_product_prescription_")
-    )
-    if "WITH CurrentStockMonthAgg AS" not in prescription_sql or code_binds != ["0", "2", "3", "6", "7"]:
+    preaggregate = prescription_sql.split("WITH CurrentStockMonthAgg AS", 1)[-1].split("GROUP BY", 1)[0]
+    if (
+        "WITH CurrentStockMonthAgg AS" not in prescription_sql
+        or "EXISTS (SELECT 1 FROM dbo.Rddbc010 AS CompanyProductDi" not in preaggregate
+        or "CompanyProductDi.Rd01_Tcode = PFilter.Rd04_Physic_Di" not in preaggregate
+        or any(key.startswith("carry_product_prescription_") for key in prescription_binds)
+    ):
         raise AssertionError("prescription current-stock predicate is not pushed into the preaggregate")
     for key in PRODUCT_FILTER_KEYS:
         value = True if key == "product_only_use" else "fixture"
