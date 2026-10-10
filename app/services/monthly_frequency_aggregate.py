@@ -789,6 +789,7 @@ def product_lifecycle_sql(
     if exclude_management_only:
         add_named_management_only_exclusion(
             product_filters, product_code_expression="P.Rd04_Physic_Cd",
+            product_di_code_expression="P.Rd04_Physic_Di",
         )
     product_filter_sql = "\n      AND " + "\n      AND ".join(product_filters) if product_filters else ""
     monthly_prefix = "Rd21" if mode == "real" else "Rd22"

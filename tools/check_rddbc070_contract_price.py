@@ -326,17 +326,17 @@ def main() -> int:
         ("전문약 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
         ("전문제품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
         ("보험약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
-        ("보험제품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance"}),
+        ("보험제품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance_product"}),
         ("전문의약품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
         ("ETC 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "prescription"}),
         ("일반약 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
         ("일반제품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
-        ("비보험약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
+        ("비보험약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance_drug"}),
         ("비보험제품 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance"}),
         ("일반의약품 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
         ("OTC 계약단가 조회", "최종 계약단가 조회", {"product_prescription_semantic": "otc"}),
         ("보험약 전문약 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "insurance", "product_prescription_semantic": "prescription"}),
-        ("비보험약 OTC 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance", "product_prescription_semantic": "otc"}),
+        ("비보험약 OTC 계약단가 조회", "최종 계약단가 조회", {"product_di_semantic_group": "non_insurance_drug", "product_prescription_semantic": "otc"}),
         (
             "일반약 제약사 삼진 계약단가 조회",
             "최종 계약단가 조회",
@@ -832,7 +832,9 @@ def main() -> int:
             failures.append(f"order contract-price semantic projection changed: {exc}")
 
     semantic_cases = {
-        "insurance": "N'%|보험|%'",
+        "insurance": "IN (N'1', N'2', N'3')",
+        "insurance_product": "N'%|보험|%'",
+        "non_insurance_drug": "IN (N'5', N'6', N'7')",
         "non_insurance": "N'%|비보험|%'",
     }
     for semantic_group, expected_sql_token in semantic_cases.items():
@@ -854,8 +856,8 @@ def main() -> int:
             )
 
     for prescription_semantic, expected_sql_token in {
-        "prescription": "PrescriptionStd.Rd046_Physic_Cd",
-        "otc": "CompanyProductDi.Rd01_Hnm",
+        "prescription": "IN (N'2', N'3', N'6', N'7')",
+        "otc": "IN (N'1', N'5')",
     }.items():
         captured.clear()
         with patch.object(service, "execute_bound_select", side_effect=_capture):
@@ -878,7 +880,10 @@ def main() -> int:
             }
         )
     combined_sql, _combined_values = captured[0]
-    if "N'%|보험|%'" not in combined_sql or "PrescriptionStd.Rd046_Physic_Cd" not in combined_sql:
+    if (
+        "IN (N'1', N'2', N'3')" not in combined_sql
+        or "IN (N'2', N'3', N'6', N'7')" not in combined_sql
+    ):
         failures.append("independent insurance and prescription SQL predicates do not combine with AND")
 
     captured.clear()

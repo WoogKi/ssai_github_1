@@ -475,6 +475,7 @@ def _master(params):
     add_named_management_only_exclusion(
         clauses,
         product_code_expression="P.Rd04_Physic_Cd",
+        product_di_code_expression="P.Rd04_Physic_Di",
     )
     if params.get("physic_nm"):
         clauses.append("P.Rd04_Physic_Nm LIKE ?")

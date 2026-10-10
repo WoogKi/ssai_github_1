@@ -9,6 +9,7 @@ import streamlit as st
 
 from app.services.rddbc040_service import search_goods_full
 from app.services.utils import apply_labels
+from app.sims.goods_display import build_goods_display_df, order_goods_full_columns
 from app.sims.views.rddbc_io_shared import (
     _top_value,
     _trigger_panel_run,
@@ -141,38 +142,8 @@ def view_rddbc040(params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 "message": "해당 조회조건의 자료가 없습니다.",
             }
         else:
-            prefer = [
-                c
-                for c in [
-                    "제품코드",
-                    "보험코드",
-                    "제품명",
-                    "제약사명",
-                    "제품그룹명",
-                    "구분명",
-                    "제품플래그명",
-                    "함량명",
-                    "제품분류명",
-                    "규격",
-                    "단위",
-                    "보험적용일",
-                    "보험약가",
-                    "바코드1",
-                    "바코드2",
-                    "바코드3",
-                    "바코드4",
-                    "바코드5",
-                    "사용구분",
-                    "삭제/사용여부",
-                    "등록자명",
-                    "등록일자",
-                    "수정자명",
-                    "수정일자",
-                ]
-                if c in df.columns
-            ]
-
-            df_display = df[prefer].copy() if prefer else df.copy()
+            df_display = build_goods_display_df(df, detail=False)
+            df = order_goods_full_columns(df, df_display)
 
             payload = {
                 "final": True,

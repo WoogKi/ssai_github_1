@@ -22,6 +22,7 @@ from app.services.datetime_tool import operating_now
 from app.sims.nlq import nlq_goods
 from app.sims.nlq import nlq_router
 from app.services.snapshot_product_information_service import normalize_product_information_params
+from app.services.ssai_analysis_profile_service import DashboardProfileLoadResult
 from app.ui.knowledge_chat_adapter import (
     parse_incomplete_sims_help_request,
     parse_sims_query_examples_request,
@@ -59,19 +60,19 @@ def run() -> list[dict[str, str]]:
     parse("제품재고장 재고위치 00001 2026 조회", "제품재고현황 조회", {"stock_cd": "00001"}, ("physic_cd",))
     parse("제품재고현황 재고위치 00001 2026 조회", "제품재고현황 조회", {"stock_cd": "00001"}, ("physic_cd",))
     parse("보험약 제품정보 조회", "제품정보 조회", {"product_di_semantic_group": "insurance"}, ("_product_information_unlabeled_name",))
-    parse("비보험약 제품정보 조회", "제품정보 조회", {"product_di_semantic_group": "non_insurance"}, ("_product_information_unlabeled_name",))
+    parse("비보험약 제품정보 조회", "제품정보 조회", {"product_di_semantic_group": "non_insurance_drug"}, ("_product_information_unlabeled_name",))
     parse("보험약 제품정보조회", "제품정보 조회", {"product_di_semantic_group": "insurance"}, ("_product_information_unlabeled_name",))
-    parse("비보험약 제품정보조회", "제품정보 조회", {"product_di_semantic_group": "non_insurance"}, ("_product_information_unlabeled_name",))
-    parse("전문약 비보험약 제품정보 조회", "제품정보 조회", {"product_prescription_semantic": "prescription", "product_di_semantic_group": "non_insurance"})
+    parse("비보험약 제품정보조회", "제품정보 조회", {"product_di_semantic_group": "non_insurance_drug"}, ("_product_information_unlabeled_name",))
+    parse("전문약 비보험약 제품정보 조회", "제품정보 조회", {"product_prescription_semantic": "prescription", "product_di_semantic_group": "non_insurance_drug"})
     parse("제품정보 빈도구분 A", "제품정보 조회", {"frequency_grade": "A"}, ("_product_information_unlabeled_name",))
     parse("제품정보 빈도구분 a", "제품정보 조회", {"frequency_grade": "A"}, ("_product_information_unlabeled_name",))
-    for query, expected in (("보험약 제품정보 조회", "insurance"), ("비보험약 제품정보 조회", "non_insurance")):
+    for query, expected in (("보험약 제품정보 조회", "insurance"), ("비보험약 제품정보 조회", "non_insurance_drug")):
         parsed = resolve_io_nlq(query) or {}
         normalized = normalize_product_information_params(parsed.get("params"))
         record(query + " service", "제품정보 조회", expected,
                str(normalized.get("product_di_semantic_group")),
                normalized.get("product_di_semantic_group") == expected,
-               "existing product-master filter contract retains insurance axis")
+               "approved drug-only insurance axis reaches the product-master filter")
     normalized_frequency = normalize_product_information_params(
         (resolve_io_nlq("제품정보 빈도구분 a") or {}).get("params")
     )
@@ -206,6 +207,30 @@ def run() -> list[dict[str, str]]:
         ("오늘입고현황", "입고명세 조회", "app.services.rddbc110_service.get_rddbc110_result"),
         ("입고거래명세서 2026 조회", "거래명세서 공통 조회", "app.services.rddbc130_service.get_rddbc130_result"),
     )
+    blocked_delivery: list[dict[str, object]] = []
+    with (
+        patch("app.db.mssql_client.get_current_company_id", return_value=None),
+        patch("app.services.ssai_analysis_profile_service.load_dashboard_profile_checked",
+              side_effect=AssertionError("profile read without company")) as profile_read,
+        patch("app.services.order_calculation_service.get_order_calculation_result",
+              side_effect=AssertionError("order service called without company")) as order_service,
+        patch("app.db.mssql_client.get_conn", side_effect=AssertionError("DB connection attempted")) as db_connect,
+        patch("app.ui.chat_middleware.push_sims_result_to_chat",
+              side_effect=lambda payload, action: blocked_delivery.append(payload)),
+    ):
+        blocked_handled = nlq_router.try_handle_nlq(
+            "발주 계산해줘", room={"messages": []}, session_state={},
+            make_ts=lambda: "fixture", next_seq=lambda: 1, logger=logging.getLogger(__name__),
+        )
+    blocked_meta = (blocked_delivery[-1].get("meta") or {}) if blocked_delivery else {}
+    record("발주 계산해줘 without company", "발주 계산", "input_required; source calls 0",
+           repr({"status": blocked_meta.get("result_status"),
+                 "reason": blocked_meta.get("stock_scope_reason")}),
+           blocked_handled and blocked_meta.get("result_status") == "input_required"
+           and blocked_meta.get("stock_scope_reason") == "company_mismatch"
+           and blocked_meta.get("source_call_count") == 0 and order_service.call_count == 0
+           and profile_read.call_count == 0 and db_connect.call_count == 0,
+           "company authority fails closed before profile, ERP, and order service")
     for query, expected_action, service_target in service_targets:
         called: list[dict[str, object]] = []
         delivered: list[dict[str, object]] = []
@@ -222,6 +247,11 @@ def run() -> list[dict[str, str]]:
 
         with (
             patch(service_target, side_effect=service_stub),
+            patch("app.db.mssql_client.get_current_company_id", return_value=4),
+            patch("app.services.ssai_analysis_profile_service.load_dashboard_profile_checked",
+                  return_value=DashboardProfileLoadResult(
+                      status="ready", profile={"stock_cd_list": ["00001"]}, company_id=4,
+                  )) as profile_read,
             patch.object(nlq_router, "_get_trans_doc_full_summary", return_value={"row_count_total": 0}),
             patch("app.ui.chat_middleware.push_sims_result_to_chat", side_effect=lambda payload, action: delivered.append(payload)),
             patch("app.db.mssql_client.get_conn", side_effect=block_db) as db_connect,
@@ -239,7 +269,12 @@ def run() -> list[dict[str, str]]:
         delivered_ok = bool(delivered) and delivered[-1].get("action") == expected_action and str(
             (delivered[-1].get("meta") or {}).get("result_status")
         ) == "success"
-        success = handled and len(called) == 1 and delivered_ok and db_connect.call_count == 0 and date_ok and entity_ok and sequence_ok
+        order_scope_ok = (
+            params.get("stock_cd_list") == ["00001"]
+            and params.get("_order_stock_scope_policy") == "saved"
+            and profile_read.call_count == 1
+        ) if query == "발주 계산해줘" else True
+        success = handled and len(called) == 1 and delivered_ok and db_connect.call_count == 0 and date_ok and entity_ok and sequence_ok and order_scope_ok
         record(query + " production route", expected_action, "one service call; no command/date entity",
                repr({"calls": len(called), "date_from": params.get("date_from"), "date_to": params.get("date_to"),
                      "entity": {key: params.get(key) for key in ("nlq_unlabeled_name", "physic_nm", "ven_nm")},

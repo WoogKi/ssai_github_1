@@ -62,8 +62,8 @@ def assert_sql_contract() -> None:
     for builder, prefix in ((inbound_filters, "in_"), (outbound_filters, "out_")):
         params = {"product_prescription_semantic": "prescription"}
         sql = builder(params)
-        if "Rddbc046 AS PrescriptionStd" not in sql or "Rd046_Main_Standard_Cd" not in sql:
-            fail(f"R046 authority missing: {prefix}: {sql}")
+        if "Rddbc046 AS PrescriptionStd" in sql or "Rd046_Main_Standard_Cd" in sql:
+            fail(f"prescription filter retained R046 validity gate: {prefix}: {sql}")
         if "CompanyProductDi.Rd01_Hnm" not in sql or "N'보험(전문)'" not in sql:
             fail(f"company-specific prescription predicate missing: {prefix}: {sql}")
 
@@ -77,8 +77,8 @@ def assert_sql_contract() -> None:
         product_di_gcode_expression="P.Rd04_Physic_Di_Gcode",
         bind_prefix="focused",
     )
-    if not clauses or "Rddbc046" not in clauses[0] or "880%" not in clauses[0]:
-        fail(f"shared R046 predicate missing: {clauses!r}")
+    if not clauses or "Rddbc046" in clauses[0] or "IN (N'1', N'5')" not in clauses[0]:
+        fail(f"shared product-division predicate missing: {clauses!r}")
     if "CompanyProductDi.Rd01_Hnm" not in clauses[0] or "N'보험(일반)'" not in clauses[0]:
         fail(f"OTC company-name predicate missing: {clauses!r}")
 
@@ -328,10 +328,10 @@ def main() -> None:
         fail("professional product classification mismatch")
     if classify_product_prescription_semantic("1", valid, valid, "보험(일반)") != "otc":
         fail("OTC product classification mismatch")
-    if classify_product_prescription_semantic("3", invalid, valid, "보험(전문)"):
-        fail("invalid standard code was classified")
-    if classify_product_prescription_semantic("3", valid, invalid, "보험(전문)"):
-        fail("invalid main standard code was classified")
+    if classify_product_prescription_semantic("3", invalid, valid, "보험(전문)") != "prescription":
+        fail("invalid standard code excluded an in-scope drug")
+    if classify_product_prescription_semantic("3", valid, invalid, "보험(전문)") != "prescription":
+        fail("invalid representative code excluded an in-scope drug")
     if not is_management_only_standard_code(valid, valid):
         fail("management-only standard code was not detected")
 

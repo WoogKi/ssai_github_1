@@ -11,6 +11,7 @@ import streamlit as st
 
 from app.services.rddbc040_service import search_goods_full, get_goods_detail_full
 from app.services.utils import apply_labels
+from app.sims.goods_display import build_goods_display_df, order_goods_full_columns
 from app.sims.views.rddbc_io_shared import _trigger_panel_run
 
 from app.sims.views.master_advanced_filters import (
@@ -36,33 +37,6 @@ def _panel_display_max_rows(default: int = 1000) -> int:
     return v
 
 
-_GOODS_LIST_PREFER_COLS = [
-    "제품코드", "보험코드", "제품명", "제약사명",
-    "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-    "규격", "단위",
-    "계산단위",
-    "보험수가변경일자", "보험가격", "보험단가",
-    "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-    "최종단가변경일자", "단가",
-    "특수관리제품코드", "특수관리제품",
-    "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-    "사용구분", "삭제/사용여부",
-    "등록자명", "등록일자", "수정자명", "수정일자",
-]
-
-_GOODS_DETAIL_PREFER_COLS = [
-    "제품코드", "보험코드", "제품명", "출력명", "약어명", "제약사명",
-    "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-    "규격", "단위",
-    "계산단위",
-    "보험수가변경일자", "보험가격", "보험단가",
-    "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-    "최종단가변경일자", "단가",
-    "특수관리제품코드", "특수관리제품",
-    "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-    "사용구분", "삭제/사용여부",
-    "등록자명", "등록일자", "수정자명", "수정일자",
-]
 
 def _ensure_df(obj: Any) -> pd.DataFrame:
     if obj is None:
@@ -75,151 +49,7 @@ def _ensure_df(obj: Any) -> pd.DataFrame:
         return pd.DataFrame()
 
 def _build_goods_display_df(df: pd.DataFrame, *, detail: bool = False) -> pd.DataFrame:
-    work = _ensure_df(df)
-    if work.empty:
-        return work
-
-    def _pick_col(df_src: pd.DataFrame, candidates: list[str]) -> str:
-        for c in candidates:
-            if c in df_src.columns:
-                return c
-        return ""
-
-    def _norm_series(sr: pd.Series) -> pd.Series:
-        return (
-            sr.fillna("")
-            .astype(str)
-            .replace({"None": "", "nan": "", "<NA>": ""})
-            .str.strip()
-        )
-
-    def _fmt_char8_date(sr: pd.Series) -> pd.Series:
-        s = (
-            sr.fillna("")
-            .astype(str)
-            .str.strip()
-            .str.replace(r"\.0$", "", regex=True)
-            .replace({
-                "": None,
-                "0": None,
-                "00000000": None,
-                "19000101": None,
-                "20010101": None,
-                "99999999": None,
-                "None": None,
-                "nan": None,
-                "<NA>": None,
-            })
-        )
-        dt = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
-        return dt.dt.strftime("%Y-%m-%d").fillna("")
-
-    def _fmt_datetime(sr: pd.Series) -> pd.Series:
-        s = (
-            sr.fillna("")
-            .astype(str)
-            .str.strip()
-            .replace({
-                "": None,
-                "None": None,
-                "nan": None,
-                "<NA>": None,
-            })
-        )
-        dt = pd.to_datetime(s, errors="coerce")
-        return dt.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
-
-    out = work.copy()
-
-    # 이름 컬럼을 코드 컬럼보다 먼저 우선 사용
-    add_name_col = _pick_col(out, ["__raw_add_user_nm", "add_user_nm", "등록자명", "등록자"])
-    add_code_col = _pick_col(out, ["등록자코드", "Rd04_Add_Cd"])
-    mod_name_col = _pick_col(out, ["__raw_mod_user_nm", "mod_user_nm", "수정자명", "수정자"])
-    mod_code_col = _pick_col(out, ["수정자코드", "Rd04_Mod_Cd"])
-
-    if add_name_col:
-        out["등록자"] = _norm_series(out[add_name_col])
-    elif add_code_col:
-        out["등록자"] = _norm_series(out[add_code_col])
-    else:
-        out["등록자"] = ""
-
-    if mod_name_col:
-        out["수정자"] = _norm_series(out[mod_name_col])
-    elif mod_code_col:
-        out["수정자"] = _norm_series(out[mod_code_col])
-    else:
-        out["수정자"] = ""
-
-    if "등록일자" not in out.columns and "Rd04_Add_Date" in out.columns:
-        out["등록일자"] = out["Rd04_Add_Date"]
-    if "수정일자" not in out.columns and "Rd04_Mod_Date" in out.columns:
-        out["수정일자"] = out["Rd04_Mod_Date"]
-    for col in ["보험수가변경일자", "이전보험수가변경일자", "최종단가변경일자", "등록일자", "수정일자"]:
-        if col in out.columns:
-            out[col] = _fmt_char8_date(out[col])
-    for col in [
-        "표준코드수정일시", "대표코드수정일시", "보험코드수정일시",
-        "Rddbc046 등록일자", "Rddbc046 수정일자",
-    ]:
-        if col in out.columns:
-            out[col] = _fmt_datetime(out[col])
-
-
-    if "계산단위" in out.columns:
-        num = pd.to_numeric(out["계산단위"], errors="coerce")
-        non_na = num.dropna()
-        if not non_na.empty and ((non_na % 1) == 0).all():
-            out["계산단위"] = num.round(0).astype("Int64")
-        else:
-            out["계산단위"] = num.round(3)
-
-    for col in ["보험가격", "보험단가", "이전보험가격", "이전보험단가", "단가"]:
-        if col in out.columns:
-            num = pd.to_numeric(out[col], errors="coerce").round(0)
-            out[col] = num.astype("Int64")
-
-    if detail:
-        preferred = [
-            "제품코드", "보험코드", "제품명", "출력명", "약어명", "제약사명",
-            "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-            "규격", "단위",
-            "계산단위",
-            "보험수가변경일자", "보험가격", "보험단가",
-            "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-            "최종단가변경일자", "단가",
-            "표준코드제품명", "표준코드", "표준코드수정일시",
-            "대표코드", "대표코드수정일시", "Rddbc046 보험코드", "보험코드수정일시",
-            "WEB 재고사용여부", "보험수가변경사유", "보험코드변경사유",
-            "Rddbc046 등록자코드", "Rddbc046 등록일자", "Rddbc046 수정자코드", "Rddbc046 수정일자",
-            "표준코드정리사용여부", "신고계산단위", "신고환산단위", "신고환산단위사용구분",
-            "특수관리제품코드", "특수관리제품",
-            "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-            "사용구분", "삭제/사용여부",
-            "등록자", "등록일자", "수정자", "수정일자",
-                ]
-    else:
-        preferred = [
-            "제품코드", "보험코드", "제품명", "제약사명",
-            "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-            "규격", "단위",
-            "계산단위",
-            "보험수가변경일자", "보험가격", "보험단가",
-            "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-            "최종단가변경일자", "단가",
-            "표준코드제품명", "표준코드", "표준코드수정일시",
-            "대표코드", "대표코드수정일시", "Rddbc046 보험코드", "보험코드수정일시",
-            "WEB 재고사용여부", "보험수가변경사유", "보험코드변경사유",
-            "Rddbc046 등록자코드", "Rddbc046 등록일자", "Rddbc046 수정자코드", "Rddbc046 수정일자",
-            "표준코드정리사용여부", "신고계산단위", "신고환산단위", "신고환산단위사용구분",
-            "특수관리제품코드", "특수관리제품",
-            "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-            "사용구분", "삭제/사용여부",
-            "등록자", "등록일자", "수정자", "수정일자",
-        ]
-
-    preferred = [c for c in preferred if c in out.columns]
-    return out[preferred].copy() if preferred else out.copy()
+    return build_goods_display_df(df, detail=detail)
 
 def _format_goods_full_df(df: pd.DataFrame) -> pd.DataFrame:
     out = _ensure_df(df)
@@ -640,6 +470,7 @@ def view_goods_list(widget_ns: str = "0") -> Dict[str, Any]:
 
     total = loaded_total
     df_display_all = _build_goods_display_df(df, detail=False)
+    df = order_goods_full_columns(df, df_display_all)
     df_display = df_display_all.head(display_top).copy()
     display_count = int(len(df_display))
 
@@ -752,14 +583,13 @@ def view_goods_detail(widget_ns: str = "0") -> Dict[str, Any]:
         st.warning("해당 제품코드의 상세가 없습니다.")
         return {
             "final": True,
-            "type": "table",
+            "type": "text",
             "title": f"제품코드 상세 ({physic_cd}) (0건)",
             "action": f"제품코드 상세 ({physic_cd})",
             "params": params_out,
-            "df": pd.DataFrame(),
-            "df_display": pd.DataFrame(),
             "meta": {
                 "제품코드": physic_cd,
+                "result_status": "no_data",
                 "row_count": 0,
                 "row_count_total": 0,
                 "source": "제품코드마스터(Rddbc040)",
@@ -770,6 +600,7 @@ def view_goods_detail(widget_ns: str = "0") -> Dict[str, Any]:
 
     df = apply_labels(df, "rddbc040")
     df_display = _build_goods_display_df(df, detail=True)
+    df = order_goods_full_columns(df, df_display)
 
     if "보험적용일" in df_display.columns:
         log.info("[view.goods.detail] formatted 보험적용일 sample=%s", df_display["보험적용일"].head(5).tolist())

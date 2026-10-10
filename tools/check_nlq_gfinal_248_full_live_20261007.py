@@ -1,4 +1,4 @@
-"""One-pass, company-3-only GFINAL-248 production-faithful live runner.
+"""One-pass, explicit-company GFINAL-248 production-faithful live runner.
 
 The preflight mode makes no ERP call.  Live mode is explicit and has no retry
 path: each Golden case is persisted before and after its one invocation.
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import copy
+import csv
 from datetime import datetime
 import hashlib
 import json
@@ -58,20 +59,20 @@ def _casebook_checksum(cases: list[dict[str, Any]]) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _new_state(case_id: str) -> dict[str, Any]:
+def _new_state(case_id: str, company_id: int) -> dict[str, Any]:
     return {
-        "current_room": {"id": f"gfinal-full-{case_id}", "company": "3", "messages": []},
+        "current_room": {"id": f"gfinal-full-{company_id}-{case_id}", "company": str(company_id), "messages": []},
         "chat_rooms": [], "sims_tables": {}, "sims_export_tables": {},
         "__sims_export_tables_by_key": {}, "__io_pending_product_pick": {},
     }
 
 
-def _assert_sibling_restore_contract() -> None:
+def _assert_sibling_restore_contract(company_id: int) -> None:
     """Prove the cache used by ``run`` cannot feed sibling output onward."""
     parent_calls = 0
     original = {"stash": {"source": "parent", "rows": [1, 2, 3]}}
     cache: dict[tuple[int, str], dict[str, Any]] = {}
-    key = (3, SHORTAGE_PARENT)
+    key = (company_id, SHORTAGE_PARENT)
     for question in sorted(SHORTAGE_QUESTIONS):
         cached = cache.get(key)
         if cached is None:
@@ -86,7 +87,19 @@ def _assert_sibling_restore_contract() -> None:
     assert parent_calls == 1
 
 
-def preflight(casebook: Path, *, expected_checksum: str = EXPECTED_CASEBOOK_CHECKSUM) -> dict[str, Any]:
+def _assert_parent_cache_contract(cases: list[dict[str, Any]]) -> None:
+    """Validate every Current Table sibling has a stable non-empty parent key."""
+    for case in cases:
+        parent = str(case.get("parent_question_raw") or "")
+        if parent and not parent.strip():
+            raise AssertionError("Current Table parent key is whitespace only")
+
+
+def preflight(
+    casebook: Path, *, expected_checksum: str = EXPECTED_CASEBOOK_CHECKSUM, company_id: int = 3,
+) -> dict[str, Any]:
+    if company_id not in {3, 4}:
+        raise AssertionError(f"unsupported live company: {company_id}")
     cases = _load(casebook)
     if len(cases) != 248:
         raise AssertionError(f"expected 248 cases, got {len(cases)}")
@@ -103,7 +116,11 @@ def preflight(casebook: Path, *, expected_checksum: str = EXPECTED_CASEBOOK_CHEC
     shortage = [case for case in cases if str(case.get("parent_question_raw") or "") == SHORTAGE_PARENT]
     if len(shortage) != 5 or {str(case["question_raw"]) for case in shortage} != SHORTAGE_QUESTIONS:
         raise AssertionError("shortage sibling population changed")
-    _assert_sibling_restore_contract()
+    _assert_parent_cache_contract(cases)
+    _assert_sibling_restore_contract(company_id)
+    state = _new_state("GFINAL-0001", company_id)
+    if state["current_room"].get("company") != str(company_id):
+        raise AssertionError("runner room company context drift")
     if not _action_name_matches("계약단가 조회", "최종 계약단가 조회"):
         raise AssertionError("R070 screen/runtime compatibility missing")
     return {"cases": len(cases), "checksum": checksum, "shortage_siblings": len(shortage)}
@@ -126,10 +143,21 @@ def _direct_classification(case: dict[str, Any], payload: dict[str, Any] | None,
 
 
 def _current_table_classification(detail: dict[str, Any]) -> str:
-    if detail.get("verdict") == "PASS":
-        return "PASS"
     status = str(detail.get("followup_status") or "")
     extra_calls = detail.get("current_table_extra_erp_source_call")
+    if detail.get("parent_status") == "no_data" and not detail.get("source_table_key") and extra_calls == 0:
+        return "DATA_NO_RESULT_ALLOWED"
+    # Parent action and follow-up action are intentionally different labels.
+    # Use the production result contract instead of a focused-harness route hint.
+    if (
+        detail.get("parent_status") == "success"
+        and detail.get("followup_handled")
+        and status == "success"
+        and detail.get("source_binding_pass")
+        and extra_calls == 0
+        and detail.get("schema_pass")
+    ):
+        return "PASS"
     if status == "no_data" and extra_calls == 0:
         return "DATA_NO_RESULT_ALLOWED"
     if status == "column_unavailable":
@@ -154,16 +182,43 @@ def _performance_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
-def run(casebook: Path, output: Path, progress: Path, performance: Path) -> list[dict[str, Any]]:
+def _load_existing_rows(output: Path, *, start_source_seq: int) -> list[dict[str, Any]]:
+    if start_source_seq <= 1 or not output.exists():
+        return []
+    with output.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    existing = {str(row.get("golden_case_id") or "") for row in rows}
+    if len(existing) != len(rows):
+        raise AssertionError("resume output contains duplicate Golden case IDs")
+    if any(int(row.get("source_seq") or 0) >= start_source_seq for row in rows):
+        raise AssertionError("resume output overlaps the requested continuation range")
+    return rows
+
+
+def run(
+    casebook: Path, output: Path, progress: Path, performance: Path, *, company_id: int,
+    start_source_seq: int = 1, end_source_seq: int = 248,
+) -> list[dict[str, Any]]:
     from app.sims.nlq import nlq_codes, nlq_goods, nlq_router, nlq_vendors
     from app.ui import chat_middleware, ssai_login
 
-    cases = _load(casebook)
+    all_cases = _load(casebook)
+    _assert_parent_cache_contract(all_cases)
+    cases = [
+        case for case in all_cases
+        if start_source_seq <= int(case["source_seq"]) <= end_source_seq
+    ]
+    if not cases:
+        raise AssertionError("requested live continuation range has no Golden cases")
     original_company = get_current_company_id()
     original_st = chat_middleware.st
     original_push = chat_middleware.push_sims_result_to_chat
-    rows: list[dict[str, Any]] = []
+    rows = _load_existing_rows(output, start_source_seq=start_source_seq)
     parent_cache: dict[tuple[int, str], dict[str, Any]] = {}
+    remaining_parent_cases = Counter(
+        str(case.get("parent_question_raw") or "")
+        for case in cases if str(case.get("parent_question_raw") or "")
+    )
     persistence = _RunPersistence(output, progress, rows)
     sequence = 0
 
@@ -172,16 +227,16 @@ def run(casebook: Path, output: Path, progress: Path, performance: Path) -> list
         sequence += 1
         return sequence
 
-    set_current_company_id(3)
+    set_current_company_id(company_id)
     try:
-        with patch.object(ssai_login, "get_selected_company", return_value={"company_id": 3}):
+        with patch.object(ssai_login, "get_selected_company", return_value={"company_id": company_id}):
             for case in cases:
                 persistence.start(case)
                 started = time.perf_counter()
                 parent_query = str(case.get("parent_question_raw") or "")
-                parent_key = (3, parent_query)
+                parent_key = (company_id, parent_query)
                 cached_parent = parent_cache.get(parent_key) if parent_query else None
-                state = copy.deepcopy(cached_parent["state"]) if cached_parent else _new_state(str(case["golden_case_id"]))
+                state = copy.deepcopy(cached_parent["state"]) if cached_parent else _new_state(str(case["golden_case_id"]), company_id)
                 room = state["current_room"]
                 chat_middleware.st = SimpleNamespace(session_state=state)
                 capture = DeliveryCapture(original_push)
@@ -214,8 +269,9 @@ def run(casebook: Path, output: Path, progress: Path, performance: Path) -> list
                                 "golden_case_id": case["golden_case_id"], "source_seq": case["source_seq"],
                                 "question_raw": case["question_raw"], "parent_question_raw": parent_query,
                                 "expected_action_raw": case["expected_action_raw"], "execution_mode": case["execution_mode"],
-                                "company_id": 3, "actual_action_raw": detail.get("followup_action", ""),
-                                "parent_action_raw": detail.get("parent_action", ""), "source_action": detail.get("source_action", ""),
+                                "company_id": company_id, "actual_action_raw": detail.get("followup_action", ""),
+                                "parent_action_raw": detail.get("parent_action", ""), "parent_result_status": detail.get("parent_status", ""),
+                                "source_action": detail.get("source_action", ""),
                                 "result_status": detail.get("followup_status", ""), "row_count": detail.get("followup_rows", ""),
                                 "source_table_key": detail.get("source_table_key", ""), "source_call_count": detail.get("parent_source_call_count", ""),
                                 "parent_execution_count": 0 if cached_parent else 1, "parent_reused": bool(cached_parent),
@@ -235,7 +291,7 @@ def run(casebook: Path, output: Path, progress: Path, performance: Path) -> list
                                 "golden_case_id": case["golden_case_id"], "source_seq": case["source_seq"],
                                 "question_raw": case["question_raw"], "parent_question_raw": "",
                                 "expected_action_raw": case["expected_action_raw"], "execution_mode": case["execution_mode"],
-                                "company_id": 3, "actual_action_raw": _payload_action(payload), "parent_action_raw": "", "source_action": "",
+                                "company_id": company_id, "actual_action_raw": _payload_action(payload), "parent_action_raw": "", "source_action": "",
                                 "result_status": _payload_meta(payload).get("result_status", ""), "row_count": _payload_rows(payload),
                                 "source_table_key": "", "source_call_count": _payload_meta(payload).get("source_call_count", ""),
                                 "parent_execution_count": 0, "parent_reused": False, "followup_extra_erp_calls": 0,
@@ -247,7 +303,7 @@ def run(casebook: Path, output: Path, progress: Path, performance: Path) -> list
                     rows.append({
                         "golden_case_id": case["golden_case_id"], "source_seq": case["source_seq"],
                         "question_raw": case["question_raw"], "parent_question_raw": parent_query,
-                        "expected_action_raw": case["expected_action_raw"], "execution_mode": case["execution_mode"], "company_id": 3,
+                        "expected_action_raw": case["expected_action_raw"], "execution_mode": case["execution_mode"], "company_id": company_id,
                         "actual_action_raw": "", "parent_action_raw": "", "source_action": "", "result_status": "", "row_count": "",
                         "source_table_key": "", "source_call_count": "", "parent_execution_count": 0 if cached_parent else int(bool(parent_query)),
                         "parent_reused": bool(cached_parent), "followup_extra_erp_calls": "", "date_columns": "", "valid_date_rows": "",
@@ -256,6 +312,10 @@ def run(casebook: Path, output: Path, progress: Path, performance: Path) -> list
                         "error": f"{type(exc).__name__}: {exc}"[:300],
                     })
                 persistence.done(case)
+                if parent_query:
+                    remaining_parent_cases[parent_query] -= 1
+                    if remaining_parent_cases[parent_query] == 0:
+                        parent_cache.pop(parent_key, None)
     finally:
         chat_middleware.st = original_st
         chat_middleware.push_sims_result_to_chat = original_push
@@ -279,17 +339,26 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--progress", type=Path)
     parser.add_argument("--performance", type=Path)
+    parser.add_argument("--start-source-seq", type=int, default=1)
+    parser.add_argument("--end-source-seq", type=int, default=248)
     args = parser.parse_args()
     report = preflight(
         args.casebook.resolve(),
         expected_checksum=str(args.expected_casebook_checksum),
+        company_id=int(args.company_id or 3),
     )
     print(json.dumps({"preflight": "PASS", **report}, ensure_ascii=False))
     if args.preflight and not args.execute_live:
         return 0
-    if not args.execute_live or args.company_id != 3 or not all((args.output, args.progress, args.performance)):
-        raise SystemExit("live mode requires --execute-live --company-id 3 --output --progress --performance")
-    rows = run(args.casebook.resolve(), args.output.resolve(), args.progress.resolve(), args.performance.resolve())
+    if not args.execute_live or args.company_id not in {3, 4} or not all((args.output, args.progress, args.performance)):
+        raise SystemExit("live mode requires --execute-live --company-id 3 or 4 --output --progress --performance")
+    if not 1 <= args.start_source_seq <= args.end_source_seq <= 248:
+        raise SystemExit("source-seq range must be within 1..248")
+    rows = run(
+        args.casebook.resolve(), args.output.resolve(), args.progress.resolve(), args.performance.resolve(),
+        company_id=int(args.company_id), start_source_seq=args.start_source_seq,
+        end_source_seq=args.end_source_seq,
+    )
     print(json.dumps({"executed": len(rows), **dict(Counter(row["classification"] for row in rows))}, ensure_ascii=False))
     return 0
 

@@ -333,10 +333,16 @@ def _run_current_table(case: FocusedCase, router, state: dict[str, Any], room: d
         from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
         valid_date_rows = int(derive_current_table_time_grouping(source_frame[date_columns[0]], "day").ne("").sum())
     namespace = _main_namespace(state, capture.push)
+    runtime_followup = case.runtime_followup
+    if (
+        source_action in namespace["_ANALYTICS_KPI_SOURCE_ACTIONS"]
+        and not any(token in runtime_followup.replace(" ", "") for token in ("현재표", "현재조회결과", "현재결과"))
+    ):
+        runtime_followup = namespace["_normalize_implicit_analytics_current_followup"](runtime_followup)
     followup_before = len(capture.items)
     try:
         followup_handled = bool(namespace["_try_handle_current_table_dataframe_followup"](
-            case.runtime_followup, room=room,
+            runtime_followup, room=room,
             make_ts=lambda: datetime.now().isoformat(timespec="seconds"), next_seq=next_seq,
         ))
     except BaseException as exc:
@@ -352,7 +358,7 @@ def _run_current_table(case: FocusedCase, router, state: dict[str, Any], room: d
         and source_action == parent_action
         and (not case.parent_action or _action_name_matches(case.parent_action, parent_action))
     )
-    result_contract = _followup_result_contract(case.runtime_followup, followup, source_action)
+    result_contract = _followup_result_contract(runtime_followup, followup, source_action)
     source_binding_pass = bool(
         followup_meta.get("source_table_key") == source_key
         and followup_meta.get("source_action") == source_action
@@ -362,7 +368,7 @@ def _run_current_table(case: FocusedCase, router, state: dict[str, Any], room: d
         and source_binding_pass and _source_call_count(followup) == 0
         and result_contract["rank_contract_pass"]
     )
-    expected_current_action = "현재표 추세판정별 집계" if "추세판정" in case.runtime_followup else ""
+    expected_current_action = "현재표 추세판정별 집계" if "추세판정" in runtime_followup else ""
     route_pass = bool(success and (not expected_current_action or followup_action == expected_current_action))
     return {
         "case_id": case.case_id, "question": case.question, "company_id": 3,
@@ -375,7 +381,7 @@ def _run_current_table(case: FocusedCase, router, state: dict[str, Any], room: d
         "parent_source_call_count": 0 if cached_parent is not None else _source_call_count(parent),
         "parent_reused": cached_parent is not None,
         "source_table_key": "present" if source_key else "", "source_action": source_action,
-        "runtime_followup": case.runtime_followup, "followup_action": followup_action,
+        "runtime_followup": runtime_followup, "followup_action": followup_action,
         "followup_status": followup_status,
         "followup_rows": followup_meta.get("row_count_total", followup_meta.get("row_count", "")),
         "route_pass": route_pass, "schema_pass": bool(parent_ok and followup is not None and result_contract["rank_contract_pass"]),

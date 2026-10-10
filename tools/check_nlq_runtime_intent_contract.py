@@ -151,6 +151,14 @@ def _resolver_notice_case(name: str, question: str, status: str) -> bool:
 
 def main() -> int:
     checks: list[bool] = []
+    for question in ("IMS 일일점검", "IMS 일일점검 재고위치 00001", "SIMS 일일점검 재고위치 00001"):
+        action = nlq_router._resolve_dashboard_nlq_action(question)
+        candidate = nlq_router.resolve_new_sims_nlq_candidate(question)
+        checks.append(_assert(
+            f"dashboard invocation {question}",
+            action == "SIMS 일일점검" and (candidate or {}).get("action") == "SIMS 일일점검",
+            {"action": action, "candidate": candidate},
+        ))
     checks.append(_handler_case("이가탄 재고", "이가탄 재고", "현재고 조회", {"physic_nm": "이가탄", "physic_cd": "00301"}))
     checks.append(_handler_case("이가탄 재고현황", "이가탄 재고현황", "현재고 조회", {"physic_nm": "이가탄", "physic_cd": "00301"}))
     checks.append(_handler_case("이가탄 재고수량", "이가탄 재고수량", "현재고 조회", {"physic_nm": "이가탄", "physic_cd": "00301"}))

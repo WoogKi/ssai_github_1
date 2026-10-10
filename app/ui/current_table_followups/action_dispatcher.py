@@ -61,6 +61,7 @@ from app.ui.current_table_followups.generic import (
     handle_generic_followup,
     handle_common_column_filter_followup,
     handle_common_column_group_followup,
+    _find_common_group_column,
     _find_common_top_numeric_column,
     parse_current_table_rank_request,
 )
@@ -428,6 +429,8 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
     ("purchase_vendor", "매입처", ("매입처별", "매입처명별"), ("매입처명", "매입처", "매입처코드")),
     ("order_vendor", "발주처", ("발주처별", "발주처명별"), ("발주처명", "발주처", "발주처코드")),
+    ("order_vendor_staff", "발주처 담당자", ("발주처담당자별", "발주처담당자"), ("발주처 담당자",)),
+    ("manufacturer_staff", "제약사 담당자", ("제약사담당자별", "제약사담당자"), ("제약사 담당자",)),
     ("stock_apply", "재고적용처", ("재고적용처별", "재고적용처명별"), ("재고적용처명", "재고적용처", "재고적용처코드")),
     ("stock_location", "재고위치", ("재고위치별", "재고위치명별"), ("재고위치명", "재고위치", "재고위치코드")),
     ("product_group", "제품그룹", ("제품그룹별",), ("제품그룹명", "제품그룹")),
@@ -988,6 +991,7 @@ def _current_table_unresolved_request_labels(
     metrics: list[str],
     groupings: list[str],
     kind: str = "",
+    source_dimension_aliases: tuple[str, ...] = (),
 ) -> tuple[str, str]:
     """Return explicit unknown metric/dimension labels without inventing a substitute column."""
     compact = re.sub(r"\s+", "", str(query or ""))
@@ -1011,7 +1015,7 @@ def _current_table_unresolved_request_labels(
     )
     source_date_terms = _current_table_source_date_terms(kind)
     known_dimension_terms = sorted(
-        {*dimension_terms, *source_date_terms},
+        {*dimension_terms, *source_date_terms, *source_dimension_aliases},
         key=len,
         reverse=True,
     )
@@ -1204,6 +1208,22 @@ def _current_table_followup_intent(
     requested_dimensions = _requested_current_table_dimensions(query)
     metrics = _current_table_requested_metrics(query)
     kind = detect_current_table_kind(source_action)
+    source_dimension_aliases: tuple[str, ...] = ()
+    if (
+        kind == "generic"
+        and isinstance(df, pd.DataFrame)
+        and {"제품코드", "구분명"}.issubset(df.columns)
+        and any(token in re.sub(r"\s+", "", str(source_action or ""))
+                for token in ("제품정보", "제품코드", "제품조회", "제품마스터", "품목조회"))
+        and _find_common_group_column(df, query, source_action) == "구분명"
+    ):
+        source_dimension_aliases = ("구분명", "구분")
+        if not requested_dimensions:
+            requested_dimensions = [next(
+                (key, label, aliases)
+                for key, label, _phrases, aliases in _CURRENT_TABLE_DIMENSION_SPECS
+                if key == "product_category"
+            )]
     source_is_trans_doc = "거래명세서" in re.sub(r"\s+", "", str(source_action or ""))
     # 거래명세서 공통은 매입/매출 별도의 금액 컬럼을 만들지 않는다. 시간 단위
     # 집계에서 명시한 매입/매출 방향은 header의 공식 합계금액을 구분으로 좁힌다.
@@ -1233,6 +1253,13 @@ def _current_table_followup_intent(
         # 공식 지표를 확정할 때만 이를 재사용한다.
         metrics.append(source_metric)
     groupings = [key for key, _label, _aliases in requested_dimensions]
+    ambiguous_staff = (
+        classify_current_table_followup_intent(query) == "llm_analysis"
+        and "담당자" in compact_query
+        and not any(key in {"order_vendor_staff", "manufacturer_staff"} for key in groupings)
+        and isinstance(df, pd.DataFrame)
+        and sum(str(column).endswith("담당자") for column in df.columns) > 1
+    )
     if not groupings and (not exact_rank_column or semantic_rank_target) and len(metrics) == 1:
         inferred_grouping = _current_table_requested_grouping(query, metrics[0], source_action)
         if inferred_grouping:
@@ -1245,6 +1272,7 @@ def _current_table_followup_intent(
             metrics=metrics,
             groupings=groupings,
             kind=kind,
+            source_dimension_aliases=source_dimension_aliases,
         )
         # The source name can precede a real time dimension in an interpretive
         # request ("현재표 거래명세서 일자별 분석"). It is not an unknown
@@ -1260,6 +1288,7 @@ def _current_table_followup_intent(
         "requested_dimensions": requested_dimensions,
         "unresolved_dimension_label": unresolved_dimension,
         "unresolved_metric_label": unresolved_metric,
+        "ambiguous_staff_dimension": ambiguous_staff,
     }
 
 
@@ -1369,6 +1398,15 @@ def _current_table_followup_capability(
     requested = intent["requested_dimensions"]
     unresolved_dimension = str(intent.get("unresolved_dimension_label") or "")
     unresolved_metric = str(intent.get("unresolved_metric_label") or "")
+    if intent.get("ambiguous_staff_dimension"):
+        return {
+            "status": "input_required",
+            "issue_codes": ["ambiguous_staff_dimension"],
+            "available_columns": [str(column) for column in df.columns if str(column).endswith("담당자")],
+            "missing_columns": [],
+            "requested_metric": "",
+            "requested_grouping": "",
+        }
     missing_columns: list[str] = []
     available_columns: list[str] = []
     requested_date_label = _requested_current_table_date_label(query)
@@ -1623,6 +1661,13 @@ def build_current_table_interpretive_facts(
                 detail_mask &= ~df[location_column].astype("string").eq("제품 합계").fillna(False)
         elif kind == "trans_doc":
             detail_mask, _ = _current_table_trans_doc_direction_mask(df, query)
+        if grouping == "frequency_grade":
+            grade_column = _resolve_current_table_dimension_column(
+                df, grouping=grouping, kind=kind, query=query,
+            )
+            detail_mask &= df[grade_column].fillna("").astype(str).str.strip().isin(
+                EXTENDED_FREQUENCY_PROJECTION_GRADES
+            )
         detail = df.loc[detail_mask].reset_index(drop=True)
         if detail.empty:
             return {"status": "no_data", "capability": capability, "facts": []}
@@ -1638,6 +1683,13 @@ def build_current_table_interpretive_facts(
             query=query,
             group_column=group_column or "",
         )
+        if grouping and group_column and not whole.get("group_column"):
+            return {
+                "status": "column_unavailable",
+                "capability": {**capability, "missing_columns": [group_column]},
+                "facts": [],
+                "available_columns": [str(column) for column in df.columns],
+            }
         return {"status": "success", "capability": capability,
                 "whole_table_facts": whole, "input_row_count": len(df),
                 "source_row_count": len(detail), "excluded_summary_row_count": int((~detail_mask).sum()),
@@ -1683,6 +1735,13 @@ def build_current_table_interpretive_facts(
         detail_mask = inventory_detail_row_mask(df, product_column=product_column)
     elif kind == "trans_doc":
         detail_mask, _type_column = _current_table_trans_doc_direction_mask(df, query)
+    if grouping == "frequency_grade":
+        grade_column = _resolve_current_table_dimension_column(
+            df, grouping=grouping, kind=kind, query=query,
+        )
+        detail_mask &= df[grade_column].fillna("").astype(str).str.strip().isin(
+            EXTENDED_FREQUENCY_PROJECTION_GRADES
+        )
 
     detail_df = facts_source_df.loc[detail_mask]
     work = pd.DataFrame(

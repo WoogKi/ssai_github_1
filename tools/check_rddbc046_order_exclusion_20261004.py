@@ -27,14 +27,16 @@ VALID = "8801234567890"
 
 def test_policy_boundary() -> None:
     def excluded(di: str, standard: str, representative: str) -> bool:
-        return is_management_only_standard_code(standard, representative)
+        return di in {"1", "2", "3", "5", "6", "7"} and is_management_only_standard_code(standard, representative)
 
-    for di in ("", "0", "1", "3", "4", "D", "B"):
+    for di in ("1", "2", "3", "5", "6", "7"):
         assert excluded(di, VALID, VALID)
         assert not excluded(di, VALID, "8801234567891")
         assert not excluded(di, "", "")
         assert not excluded(di, "880BAD", "880BAD")
         assert not excluded(di, "9901234567890", "9901234567890")
+    for di in ("", "0", "4", "D", "B"):
+        assert not excluded(di, VALID, VALID)
 
 
 def test_order_master_sql() -> None:
@@ -55,16 +57,17 @@ def test_order_master_sql() -> None:
         assert "ManagementStd.Rd046_Main_Standard_Cd" in sql
         assert "LIKE '880%'" in sql and "NOT LIKE '%[^0-9]%'" in sql
         management = sql.split("NOT EXISTS (SELECT 1 FROM dbo.Rddbc046 AS ManagementStd", 1)[1]
-        assert "P.Rd04_Physic_Di" not in management
+        assert "P.Rd04_Physic_Di" in management
     assert "P.Rd04_Physic_Cd = ?" not in captured[0][0]
     assert "P.Rd04_Physic_Cd = ?" in captured[1][0]
     assert "63431" not in captured[1][0] and "63431" in captured[1][1]
     existing_consumer: list[str] = []
     add_named_management_only_exclusion(
         existing_consumer, product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+        product_di_code_expression="Physic_Cd.Rd04_Physic_Di",
     )
     assert len(existing_consumer) == 1
-    assert "Physic_Di" not in existing_consumer[0]
+    assert "Physic_Di" in existing_consumer[0]
 
 
 def test_full_single_nlq_snapshot_bridge() -> None:

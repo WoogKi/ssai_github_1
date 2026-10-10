@@ -4458,10 +4458,13 @@ def _current_table_get_latest_df() -> tuple[pd.DataFrame | None, str]:
 
             return None
 
-        preferred_keys: list[str] = []
-        for key in (source_table_key, last_table_key):
-            if key and key not in preferred_keys:
-                preferred_keys.append(key)
+        # A bound source key is authoritative. If its frame was pruned, a
+        # derived last table must not silently become the new original.
+        preferred_keys = (
+            [source_table_key]
+            if source_table_key
+            else ([last_table_key] if last_table_key else [])
+        )
 
         for key in preferred_keys:
             df = _best_df_for_key(key)
@@ -4579,6 +4582,18 @@ def _prepare_current_table_analysis_override(source_query: str) -> bool:
             facts.get("source_row_count"),
             facts.get("fact_row_count"),
         )
+        if facts_status == "input_required" and "ambiguous_staff_dimension" in (facts.get("capability") or {}).get("issue_codes", []):
+            _current_table_push_notice(
+                title="현재표 분석 조건 확인",
+                action="현재표 분석 조건 확인",
+                message="분석할 담당자를 지정해 주세요: `현재표 제약사 담당자별 분석` 또는 `현재표 발주처 담당자별 분석`.",
+                query_summary="현재표 / 담당자 차원 선택 필요",
+                source_query=source_query,
+            )
+            ss.pop("__current_table_analysis_ctx_override", None)
+            ss.pop("__current_table_analysis_query", None)
+            return False
+
         if facts_status == "column_unavailable":
             missing = list((facts.get("capability") or {}).get("missing_columns") or [])
             available = list(facts.get("available_columns") or [])

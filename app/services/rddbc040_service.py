@@ -63,6 +63,7 @@ def _get_table_and_cols() -> Tuple[str, Dict[str, str]]:
             "insu_cd": "Rd04_Insu_Cd",
             "physic_nm": "Rd04_Physic_Nm",
             "ven_cd": "Rd04_Ven_Cd",
+            "orven_cd": "Rd04_Orven_Cd",
             "bar1": "Rd04_Bar_Code1",
             "bar2": "Rd04_Bar_Code2",
             "bar3": "Rd04_Bar_Code3",
@@ -95,7 +96,7 @@ def _get_table_and_cols_030() -> Tuple[str, Dict[str, str]]:
     try:
         return S["tables"]["rddbc030"], S["cols"]["rddbc030"]
     except Exception:
-        return "dbo.Rddbc030", {"ven_cd": "Rd03_Ven_Cd", "ven_nm": "Rd03_Ven_Nm"}
+        return "dbo.Rddbc030", {"ven_cd": "Rd03_Ven_Cd", "ven_nm": "Rd03_Ven_Nm", "sales_man_cd": "Rd03_Sales_Man"}
 
 
 def _get_table_and_cols_060() -> Tuple[str, Dict[str, str]]:
@@ -137,6 +138,7 @@ def _build_from_join() -> Tuple[str, Dict[str, str]]:
 
     physic_cd = _al(C040, "physic_cd", "Rd04_Physic_Cd")
     ven_cd = _al(C040, "ven_cd", "Rd04_Ven_Cd")
+    orven_cd = _al(C040, "orven_cd", "Rd04_Orven_Cd")
     add_cd = _al(C040, "add_cd", "Rd04_Add_Cd")
     mod_cd = _al(C040, "mod_cd", "Rd04_Mod_Cd")
 
@@ -153,6 +155,7 @@ def _build_from_join() -> Tuple[str, Dict[str, str]]:
 
     ven_cd_030 = _al(C030, "ven_cd", "Rd03_Ven_Cd")
     ven_nm_030 = _al(C030, "ven_nm", "Rd03_Ven_Nm")
+    sales_man_cd_030 = _al(C030, "sales_man_cd", "Rd03_Sales_Man")
 
     user_cd = _al(C060, "user_cd", "Rd06_User_Cd")
     user_nm = _al(C060, "user_nm", "Rd06_User_Nm")
@@ -164,6 +167,9 @@ def _build_from_join() -> Tuple[str, Dict[str, str]]:
     from_join = f"""
 FROM {T040} a
 LEFT JOIN {T030} v   ON a.{ven_cd} = v.{ven_cd_030}
+LEFT JOIN {T030} ov  ON a.{orven_cd} = ov.{ven_cd_030}
+LEFT JOIN {T060} ms  ON v.{sales_man_cd_030} = ms.{user_cd}
+LEFT JOIN {T060} os  ON ov.{sales_man_cd_030} = os.{user_cd}
 LEFT JOIN {T060} au  ON a.{add_cd} = au.{user_cd}
 LEFT JOIN {T060} mu  ON a.{mod_cd} = mu.{user_cd}
 
@@ -177,6 +183,9 @@ LEFT JOIN dbo.Rddbc046 std ON a.{physic_cd} = std.Rd046_Physic_Cd
 
     extra = {
         "ven_nm": f"v.{ven_nm_030}",
+        "maker_manager_nm": f"ms.{user_nm}",
+        "order_vendor_nm": f"ov.{ven_nm_030}",
+        "order_vendor_manager_nm": f"os.{user_nm}",
         "group_name": f"g.{hnm}",
         "di_name": f"d.{hnm}",
         "flag_name": f"f.{hnm}",
@@ -200,8 +209,11 @@ def search_goods_full(
     insu_cd: str = "",
     barcode: str = "",
     ven_nm_kw: str = "",
+    maker_manager_nm_kw: str = "",
+    order_vendor_manager_nm_kw: str = "",
     group_name_kw: str = "",
     di_name_kw: str = "",
+    product_di_semantic_group: str = "",
     product_prescription_semantic: str = "",
 
     physic_gu_name_kw: str = "",
@@ -239,8 +251,11 @@ def search_goods_full(
     insu_cd = (insu_cd or "").strip()
     barcode = (barcode or "").strip()
     ven_nm_kw = (ven_nm_kw or "").strip()
+    maker_manager_nm_kw = (maker_manager_nm_kw or "").strip()
+    order_vendor_manager_nm_kw = (order_vendor_manager_nm_kw or "").strip()
     group_name_kw = (group_name_kw or "").strip()
     di_name_kw = (di_name_kw or "").strip()
+    product_di_semantic_group = (product_di_semantic_group or "").strip()
     product_prescription_semantic = (product_prescription_semantic or "").strip()
 
     physic_gu_name_kw = (physic_gu_name_kw or "").strip()
@@ -315,8 +330,11 @@ CROSS APPLY (
             "insu_cd": insu_cd,
             "barcode": barcode,
             "maker_nm": ven_nm_kw,
+            "maker_manager_nm": maker_manager_nm_kw,
+            "order_vendor_manager_nm": order_vendor_manager_nm_kw,
             "product_group_nm": group_name_kw,
             "product_di_nm": di_name_kw,
+            "product_di_semantic_group": product_di_semantic_group,
             "product_prescription_semantic": product_prescription_semantic,
             "product_class_nm": physic_gu_name_kw,
             "product_add_user_nm": add_user_nm_kw,
@@ -337,6 +355,8 @@ CROSS APPLY (
                 f"a.{column}" for column in (col_bar1, col_bar2, col_bar3, col_bar4, col_bar5)
             ),
             "maker_nm": extra["ven_nm"],
+            "maker_manager_nm": extra["maker_manager_nm"],
+            "order_vendor_manager_nm": extra["order_vendor_manager_nm"],
             "product_group_nm": extra["group_name"],
             "product_di_nm": extra["di_name"],
             "product_di_cd": f"a.{col_product_di}",
@@ -360,6 +380,9 @@ CROSS APPLY (
 SELECT {top_clause}
     a.*,
     {extra['ven_nm']} AS ven_nm,
+    LTRIM(RTRIM(ISNULL({extra['maker_manager_nm']}, ''))) AS maker_manager_nm,
+    ISNULL({extra['order_vendor_nm']}, '') AS order_vendor_nm,
+    LTRIM(RTRIM(ISNULL({extra['order_vendor_manager_nm']}, ''))) AS order_vendor_manager_nm,
     {extra['group_name']} AS group_name,
     {extra['di_name']} AS di_name,
     {extra['flag_name']} AS flag_name,
@@ -480,6 +503,9 @@ END
 SELECT TOP 1
     a.*,
     {extra['ven_nm']} AS ven_nm,
+    LTRIM(RTRIM(ISNULL({extra['maker_manager_nm']}, ''))) AS maker_manager_nm,
+    ISNULL({extra['order_vendor_nm']}, '') AS order_vendor_nm,
+    LTRIM(RTRIM(ISNULL({extra['order_vendor_manager_nm']}, ''))) AS order_vendor_manager_nm,
     {extra['group_name']} AS group_name,
     {extra['di_name']} AS di_name,
     {extra['flag_name']} AS flag_name,

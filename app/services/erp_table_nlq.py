@@ -17,6 +17,7 @@ from app.services.product_master_filter_contract import (
     extract_product_di_semantic_group,
     extract_product_prescription_semantic,
     has_product_prescription_semantic_conflict,
+    strip_product_di_semantic_terms,
     strip_product_prescription_semantic_terms,
 )
 
@@ -197,7 +198,7 @@ def _resolve_rddbc230_nlq(
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
     labels = lambda key: filter_labels(feature, key)
 
-    entity_raw = strip_product_prescription_semantic_terms(raw)
+    entity_raw = strip_product_di_semantic_terms(strip_product_prescription_semantic_terms(raw))
     params.update(_extract_registered_roles(entity_raw, feature, (
         ("buy_cd", "buy_nm"),
         ("stock_cd", "stock_nm"),
@@ -545,7 +546,7 @@ def resolve_registered_erp_table_nlq(
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
 
     labels = lambda key: filter_labels(feature, key)
-    entity_raw = strip_product_prescription_semantic_terms(raw)
+    entity_raw = strip_product_di_semantic_terms(strip_product_prescription_semantic_terms(raw))
     params.update(_extract_registered_roles(entity_raw, feature, (("ven_cd", "ven_nm"),)))
     physic_cd = _extract_code(raw, labels("physic_cd"))
     physic_nm = _extract_name(entity_raw, labels("physic_nm"))

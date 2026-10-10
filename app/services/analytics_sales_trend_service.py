@@ -834,6 +834,7 @@ def _build_filters(params: Dict[str, Any]) -> str:
     add_named_management_only_exclusion(
         clauses,
         product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+        product_di_code_expression="Physic_Cd.Rd04_Physic_Di",
     )
 
     if _add_in_filter(
@@ -1127,6 +1128,7 @@ def _build_monthly_filters(params: Dict[str, Any], spec: Dict[str, str]) -> str:
     add_named_management_only_exclusion(
         clauses,
         product_code_expression="Physic_Cd.Rd04_Physic_Cd",
+        product_di_code_expression="Physic_Cd.Rd04_Physic_Di",
     )
 
     if _add_in_filter(

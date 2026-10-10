@@ -1047,7 +1047,7 @@ def _strip_group_words(value: str) -> str:
     return out
 
 
-def _find_common_group_column(df: pd.DataFrame, query: str) -> str:
+def _find_common_group_column(df: pd.DataFrame, query: str, source_action: str = "") -> str:
     if not isinstance(df, pd.DataFrame) or df.empty or not _has_common_group_intent(query):
         return ""
 
@@ -1055,6 +1055,25 @@ def _find_common_group_column(df: pd.DataFrame, query: str) -> str:
     body = _common_filter_body(query)
     body_norm = _norm_col_name(body)
     body_stripped = _strip_group_words(body)
+    explicit_product_dimension = re.search(
+        r"(제품구분명|제품구분|제품분류명|제품분류|제품그룹명|제품그룹|제품명|품목명|상품명|제품|품목|상품)(?=별|기준|집계|분석|요약|$)",
+        body_norm,
+    )
+    if explicit_product_dimension:
+        dimension = explicit_product_dimension.group(1)
+        product_source = any(
+            token in re.sub(r"\s+", "", str(source_action or ""))
+            for token in ("제품정보", "제품코드", "제품조회", "제품마스터", "품목조회")
+        )
+        if dimension.startswith("제품구분"):
+            columns = ("제품구분명", "제품구분", "구분명") if product_source else ("제품구분명", "제품구분")
+        elif dimension.startswith("제품분류"):
+            columns = ("제품분류명", "제품분류")
+        elif dimension.startswith("제품그룹"):
+            columns = ("제품그룹명", "제품그룹")
+        else:
+            columns = ("제품명", "품목명", "상품명")
+        return next((column for column in columns if column in df.columns), "")
     candidates: list[tuple[int, int, int, str]] = []
 
     for col in [str(c) for c in df.columns]:
@@ -1403,7 +1422,7 @@ def handle_common_column_group_followup(
         return False
 
     t = str(query or "").strip()
-    group_col = _find_common_group_column(df, t)
+    group_col = _find_common_group_column(df, t, source_action)
     if not group_col:
         return False
 

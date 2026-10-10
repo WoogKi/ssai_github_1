@@ -17,6 +17,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     FREQUENCY_INSUFFICIENT_GRADE,
 )
 from app.services.product_master_filter_contract import (
+    extract_product_manager_filters,
     extract_product_di_semantic_group,
     extract_product_prescription_semantic,
     has_product_prescription_semantic_conflict,
@@ -3526,7 +3527,8 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
 
     if _has_any(raw, _PRODUCT_INFORMATION_WORDS):
         # Consume the registered action aliases before the common entity extractor.
-        entity_text = raw
+        manager_filters, manager_residual = extract_product_manager_filters(raw)
+        entity_text = manager_residual
         for alias in sorted(_PRODUCT_INFORMATION_WORDS, key=len, reverse=True):
             entity_text = entity_text.replace(alias, " ")
         info_frequency = re.search(r"(?:출고)?빈도(?:등급|구분)?\s*[:=]?\s*([A-FX])(?:\s*등급)?", raw, re.IGNORECASE)
@@ -3537,6 +3539,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
         if di_semantic:
             entity_text = strip_product_di_semantic_terms(entity_text)
         params = extract_params(entity_text, today=today)
+        params.update(manager_filters)
         from app.services.erp_table_nlq import _extract_name, _extract_code
         from app.sims.meta.erp_table_feature_registry import RDDBC230, filter_labels
         for key in ("product_keyword", "maker_nm", "product_group_nm", "product_di_nm", "product_class_nm"):
@@ -3554,7 +3557,7 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             params["product_di_semantic_group"] = di_semantic
         if semantic_conflict:
             params["_product_prescription_semantic_conflict"] = True
-        unlabeled_source = strip_product_prescription_semantic_terms(raw) if semantic_group else raw
+        unlabeled_source = strip_product_prescription_semantic_terms(manager_residual) if semantic_group else manager_residual
         if di_semantic:
             unlabeled_source = strip_product_di_semantic_terms(unlabeled_source)
         if info_frequency:

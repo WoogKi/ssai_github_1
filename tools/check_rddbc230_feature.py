@@ -201,7 +201,7 @@ def main() -> int:
         ("일반약 최종 매입단가 조회", {"product_prescription_semantic": "otc"}),
         ("OTC 최종 매입단가 조회", {"product_prescription_semantic": "otc"}),
         ("보험약 전문약 최종 매입단가 조회", {"product_di_semantic_group": "insurance", "product_prescription_semantic": "prescription"}),
-        ("비보험약 OTC 최종 매입단가 조회", {"product_di_semantic_group": "non_insurance", "product_prescription_semantic": "otc"}),
+        ("비보험약 OTC 최종 매입단가 조회", {"product_di_semantic_group": "non_insurance_drug", "product_prescription_semantic": "otc"}),
         ("제품구분 전문 최종 매입단가 조회", {"product_di_nm": "전문"}),
         ("최종 매입단가 조회 TOP 20", {"display_top": 20}),
     )
@@ -257,7 +257,10 @@ def main() -> int:
         )
         if any(join not in normalized_sql for join in required_joins):
             failures.append("native raw-equality JOIN contract missing")
-        if "N'%|보험|%'" not in sql or "PrescriptionStd.Rd046_Physic_Cd" not in sql:
+        if (
+            "IN (N'1', N'2', N'3')" not in sql
+            or "IN (N'2', N'3', N'6', N'7')" not in sql
+        ):
             failures.append("independent insurance and prescription predicates were not applied together")
         required_calculations = (
             "(S.Rd23_In_Quantity - S.Rd23_Out_Quantity) AS [재고수량]",

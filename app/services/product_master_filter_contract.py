@@ -8,7 +8,8 @@ from typing import Any, Mapping, MutableSequence
 
 
 PRODUCT_FILTER_KEYS = (
-    "physic_cd", "product_keyword", "insu_cd", "barcode", "maker_nm",
+    "physic_cd", "product_keyword", "insu_cd", "barcode", "maker_nm", "order_nm",
+    "maker_manager_nm", "order_vendor_manager_nm",
     "product_group_nm", "product_di_nm", "product_di_semantic_group",
     "product_prescription_semantic", "product_class_nm",
     "product_unit_price", "product_final_price_date", "product_only_use",
@@ -16,11 +17,34 @@ PRODUCT_FILTER_KEYS = (
     "product_mod_user_nm", "product_mod_date_from", "product_mod_date_to",
 )
 
+_PRODUCT_MANAGER_LABEL = re.compile(
+    r"(?<![0-9A-Za-z가-힣])(?P<label>제약사?\s*담당자|발주처?\s*담당자)"
+    r"\s*[:=]?\s*(?P<value>(?!(?:조회|검색|보여줘|알려줘|해줘)(?:\s|$))[^\s,?.!]+)"
+)
+_PRODUCT_MANAGER_ROLE = re.compile(
+    r"(?<![0-9A-Za-z가-힣])(?:제약사?\s*담당자|발주처?\s*담당자)"
+)
+
+
+def extract_product_manager_filters(text: Any) -> tuple[dict[str, str], str]:
+    """Consume explicit product-master staff conditions before vendor-name parsing."""
+    source = _text(text)
+    filters: dict[str, str] = {}
+    for match in reversed(list(_PRODUCT_MANAGER_LABEL.finditer(source))):
+        key = "maker_manager_nm" if match.group("label").startswith("제약") else "order_vendor_manager_nm"
+        filters[key] = match.group("value")
+        source = source[:match.start()] + " " + source[match.end():]
+    if _PRODUCT_MANAGER_ROLE.search(source):
+        filters["_product_manager_condition_invalid"] = "1"
+    return filters, re.sub(r"\s+", " ", source).strip()
+
 PRODUCT_DI_SEMANTIC_GROUP_TERMS: dict[str, str] = {
     "보험약": "insurance",
-    "보험제품": "insurance",
-    "비보험약": "non_insurance",
+    "보험제품": "insurance_product",
+    "비보험약": "non_insurance_drug",
     "비보험제품": "non_insurance",
+    "보험": "insurance_product",
+    "비보험": "non_insurance",
 }
 
 PRODUCT_PRESCRIPTION_SEMANTIC_TERMS: dict[str, str] = {
@@ -37,7 +61,13 @@ PRODUCT_PRESCRIPTION_SEMANTIC_TERMS: dict[str, str] = {
 }
 
 PRODUCT_PRESCRIPTION_SEMANTICS = frozenset(("prescription", "otc"))
-PRODUCT_DI_SEMANTICS = frozenset(("insurance", "non_insurance"))
+PRODUCT_DI_SEMANTICS = frozenset(("insurance", "insurance_product", "non_insurance", "non_insurance_drug"))
+DRUG_PRODUCT_DI_CODES = frozenset(("1", "2", "3", "5", "6", "7"))
+PRESCRIPTION_PRODUCT_DI_CODES = frozenset(("2", "3", "6", "7"))
+OTC_PRODUCT_DI_CODES = frozenset(("1", "5"))
+INSURANCE_PRODUCT_DI_CODES = frozenset(("1", "2", "3"))
+INSURANCE_PRODUCT_SCOPE_DI_CODES = frozenset(("0", "1", "2", "3", "4"))
+NON_INSURANCE_PRODUCT_DI_CODES = frozenset(("5", "6", "7"))
 
 _PRODUCT_DI_SEMANTIC_OWNER_LABELS = (
     "제품명", "품목명", "상품명", "제품그룹명", "제품그룹", "제품분류명", "제품분류",
@@ -152,10 +182,14 @@ def classify_product_prescription_semantic(
     main_standard_cd: Any,
     product_di_nm: Any = "",
 ) -> str:
-    if not (
-        is_valid_drug_standard_code(standard_cd)
-        and is_valid_drug_standard_code(main_standard_cd)
-    ) or not _text(product_di_cd):
+    code = _text(product_di_cd)
+    if code in PRESCRIPTION_PRODUCT_DI_CODES:
+        return "prescription"
+    if code in OTC_PRODUCT_DI_CODES:
+        return "otc"
+    # Numeric non-drug divisions are authoritative. Character divisions keep
+    # their company code-master name meaning and must not be numerically cast.
+    if not code or code.isdecimal():
         return ""
     name = _text(product_di_nm).replace(" ", "")
     if name in {"전문", "전문의약품", "수입", "약가유연제"} or re.fullmatch(
@@ -174,10 +208,10 @@ def _product_di_name_predicate(name_expression: str, semantic: str) -> str:
                   "보험(약가유연제)", "비보험(전문)", "비보험(수입)", "비보험(약가유연제)")
     elif semantic == "otc":
         labels = ("일반", "일반의약품", "보험(일반)", "비보험(일반)")
-    elif semantic == "insurance":
+    elif semantic in {"insurance", "insurance_product"}:
         tokens = _product_di_semantic_tokens_sql(name_expression)
         return f"({tokens} LIKE N'%|보험|%' AND {tokens} NOT LIKE N'%|비보험|%')"
-    elif semantic == "non_insurance":
+    elif semantic in {"non_insurance", "non_insurance_drug"}:
         tokens = _product_di_semantic_tokens_sql(name_expression)
         return f"({tokens} LIKE N'%|비보험|%' AND {tokens} NOT LIKE N'%|보험|%')"
     else:
@@ -200,6 +234,31 @@ def _company_product_di_exists_sql(product_di_code_expression: str,
         f"AND CompanyProductDi.Rd01_Tcode = {product_di_code_expression} "
         f"AND {_product_di_name_predicate('CompanyProductDi.Rd01_Hnm', semantic)})"
     )
+
+
+def _product_prescription_code_predicate(product_di_code_expression: str, semantic: str) -> str:
+    codes = PRESCRIPTION_PRODUCT_DI_CODES if semantic == "prescription" else OTC_PRODUCT_DI_CODES
+    expression = f"LTRIM(RTRIM(ISNULL({product_di_code_expression}, N'')))"
+    values = ", ".join(f"N'{code}'" for code in sorted(codes))
+    return f"{expression} IN ({values})"
+
+
+def _product_di_semantic_code_predicate(product_di_code_expression: str, semantic: str) -> str:
+    if semantic == "insurance":
+        codes = INSURANCE_PRODUCT_DI_CODES
+    elif semantic == "insurance_product":
+        codes = INSURANCE_PRODUCT_SCOPE_DI_CODES
+    else:
+        codes = NON_INSURANCE_PRODUCT_DI_CODES
+    expression = f"LTRIM(RTRIM(ISNULL({product_di_code_expression}, N'')))"
+    values = ", ".join(f"N'{code}'" for code in sorted(codes))
+    return f"{expression} IN ({values})"
+
+
+def _non_numeric_product_di_predicate(product_di_code_expression: str) -> str:
+    """Allow name semantics only for non-numeric company product-division codes."""
+    expression = f"LTRIM(RTRIM(ISNULL({product_di_code_expression}, N'')))"
+    return f"({expression} <> N'' AND {expression} LIKE N'%[^0-9]%')"
 
 
 def is_management_only_standard_code(standard_cd: Any, main_standard_cd: Any) -> bool:
@@ -230,19 +289,12 @@ def add_named_product_prescription_filter(
     product_di_gcode_expression: str,
     bind_prefix: str = "product_prescription",
 ) -> None:
-    code_clauses: list[str] = []
     add_named_product_prescription_code_filter(
-        code_clauses,
+        clauses,
         params,
         product_di_code_expression=product_di_code_expression,
         product_di_gcode_expression=product_di_gcode_expression,
         bind_prefix=bind_prefix,
-    )
-    if not code_clauses:
-        return
-    clauses.append(
-        "(" + _prescription_exists_sql(product_code_expression)
-        + f" AND {code_clauses[0]})"
     )
 
 
@@ -260,26 +312,34 @@ def add_named_product_prescription_code_filter(
         return
     if semantic not in PRODUCT_PRESCRIPTION_SEMANTICS:
         raise ValueError("지원하지 않는 전문/일반 제품 의미입니다.")
-    clauses.append(_company_product_di_exists_sql(
+    numeric = _product_prescription_code_predicate(product_di_code_expression, semantic)
+    code_master = _company_product_di_exists_sql(
         product_di_code_expression, product_di_gcode_expression, semantic,
-    ))
+    )
+    clauses.append(
+        f"({numeric} OR ({_non_numeric_product_di_predicate(product_di_code_expression)} "
+        f"AND {code_master}))"
+    )
 
 
 def add_named_management_only_exclusion(
     clauses: MutableSequence[str],
     *,
     product_code_expression: str,
+    product_di_code_expression: str,
 ) -> None:
     """Exclude only valid matching standard/representative drug codes."""
     valid = valid_drug_standard_code_sql(
         "ManagementStd.Rd046_Standard_Cd",
         "ManagementStd.Rd046_Main_Standard_Cd",
     )
+    drug_codes = ", ".join(f"N'{code}'" for code in sorted(DRUG_PRODUCT_DI_CODES))
+    product_di = f"LTRIM(RTRIM(ISNULL({product_di_code_expression}, N'')))"
     clauses.append(
         "NOT EXISTS (SELECT 1 FROM dbo.Rddbc046 AS ManagementStd WITH (NOLOCK) "
         f"WHERE ManagementStd.Rd046_Physic_Cd = {product_code_expression} AND {valid} "
         "AND LTRIM(RTRIM(ManagementStd.Rd046_Standard_Cd)) = "
-        "LTRIM(RTRIM(ManagementStd.Rd046_Main_Standard_Cd)))"
+        f"LTRIM(RTRIM(ManagementStd.Rd046_Main_Standard_Cd)) AND {product_di} IN ({drug_codes}))"
     )
 
 
@@ -335,11 +395,13 @@ def build_product_master_enrichment_sql(
     product_alias: str,
     aliases: Mapping[str, str] | None = None,
     include_audit_price: bool = True,
+    include_vendor_managers: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Build the canonical R040 name/audit/price joins for another table query."""
     names = {
         "maker": "PV", "group": "PG", "di": "PD", "class": "PC",
         "add_user": "PAU", "mod_user": "PMU", "price": "PMCALC", "standard": "PSTD",
+        "order_vendor": "POV", "maker_manager": "PMS", "order_vendor_manager": "POS",
     }
     names.update(dict(aliases or {}))
     p = product_alias
@@ -357,6 +419,16 @@ LEFT JOIN dbo.Rddbc010 AS {names['class']} WITH (NOLOCK)
    AND {p}.Rd04_Physic_Gu = {names['class']}.Rd01_Tcode
 LEFT JOIN dbo.Rddbc046 AS {names['standard']} WITH (NOLOCK)
     ON {p}.Rd04_Physic_Cd = {names['standard']}.Rd046_Physic_Cd
+""".strip()
+    if include_vendor_managers:
+        joins = f"""
+{joins}
+LEFT JOIN dbo.Rddbc030 AS {names['order_vendor']} WITH (NOLOCK)
+    ON {p}.Rd04_Orven_Cd = {names['order_vendor']}.Rd03_Ven_Cd
+LEFT JOIN dbo.Rddbc060 AS {names['maker_manager']} WITH (NOLOCK)
+    ON {names['maker']}.Rd03_Sales_Man = {names['maker_manager']}.Rd06_User_Cd
+LEFT JOIN dbo.Rddbc060 AS {names['order_vendor_manager']} WITH (NOLOCK)
+    ON {names['order_vendor']}.Rd03_Sales_Man = {names['order_vendor_manager']}.Rd06_User_Cd
 """.strip()
     if include_audit_price:
         joins = f"""
@@ -387,6 +459,9 @@ CROSS APPLY (
         "insu_cd": f"{p}.Rd04_Insu_Cd",
         "barcodes": tuple(f"{p}.Rd04_Bar_Code{index}" for index in range(1, 6)),
         "maker_nm": f"{names['maker']}.Rd03_Ven_Nm",
+        "order_vendor_nm": f"{names['order_vendor']}.Rd03_Ven_Nm",
+        "maker_manager_nm": f"{names['maker_manager']}.Rd06_User_Nm" if include_vendor_managers else "",
+        "order_vendor_manager_nm": f"{names['order_vendor_manager']}.Rd06_User_Nm" if include_vendor_managers else "",
         "product_group_nm": f"{names['group']}.Rd01_Hnm",
         "product_di_nm": f"{names['di']}.Rd01_Hnm",
         "product_di_cd": f"{p}.Rd04_Physic_Di",
@@ -414,7 +489,7 @@ def normalize_product_master_filters(values: Mapping[str, Any] | None) -> dict[s
     out = {key: _text(source.get(key)) for key in PRODUCT_FILTER_KEYS if key != "product_only_use"}
     out["product_only_use"] = bool(source.get("product_only_use", False))
     semantic_group = out.get("product_di_semantic_group", "")
-    if semantic_group and semantic_group not in {"insurance", "non_insurance"}:
+    if semantic_group and semantic_group not in PRODUCT_DI_SEMANTICS:
         raise ValueError("지원하지 않는 상위 제품구분입니다.")
     prescription_semantic = out.get("product_prescription_semantic", "")
     if prescription_semantic and prescription_semantic not in PRODUCT_PRESCRIPTION_SEMANTICS:
@@ -486,26 +561,45 @@ def append_product_master_filter_clauses(
             bind_values.extend([values["barcode"]] * len(barcode_expressions))
 
     add_like("maker_nm", "maker_nm")
+    if values["order_nm"] and not _text(expressions.get("order_vendor_nm")):
+        raise ValueError("발주처 조건을 적용할 수 없습니다.")
+    add_like("order_nm", "order_vendor_nm")
+    for key in ("maker_manager_nm", "order_vendor_manager_nm"):
+        if values[key] and not _text(expressions.get(key)):
+            raise ValueError("담당자 조건을 적용할 수 없습니다.")
+        add_like(key, key)
     add_like("product_group_nm", "product_group_nm")
     add_like("product_di_nm", "product_di_nm")
-    semantic_group = values["product_di_semantic_group"]
+    product_code = _text(expressions.get("physic_cd"))
+    product_di_code = _text(expressions.get("product_di_cd"))
+    product_di_gcode = _text(expressions.get("product_di_gcode"))
+    semantic_group = values["product_di_semantic_group"] if not values["product_di_nm"] else ""
     product_di_name = _text(expressions.get("product_di_nm"))
     if semantic_group and not product_di_name:
         raise ValueError("제품구분 이름 조건을 적용할 수 없습니다.")
     if semantic_group:
-        clauses.append(_product_di_name_predicate(product_di_name, semantic_group))
-    prescription_semantic = values["product_prescription_semantic"]
-    product_code = _text(expressions.get("physic_cd"))
-    product_di_code = _text(expressions.get("product_di_cd"))
-    product_di_gcode = _text(expressions.get("product_di_gcode"))
-    if prescription_semantic and not (product_code and product_di_code and product_di_gcode):
+        if not product_di_code:
+            raise ValueError("제품구분 코드 조건을 적용할 수 없습니다.")
+        numeric = _product_di_semantic_code_predicate(product_di_code, semantic_group)
+        # Numeric product-division codes are authoritative.  Letter codes retain
+        # their company-owned display-name semantics without numeric coercion.
+        if semantic_group in {"insurance", "non_insurance_drug"}:
+            clauses.append(numeric)
+        else:
+            clauses.append(
+                "(" + numeric + " OR (" + _non_numeric_product_di_predicate(product_di_code)
+                + " AND " + _product_di_name_predicate(product_di_name, semantic_group) + "))"
+            )
+    prescription_semantic = values["product_prescription_semantic"] if not values["product_di_nm"] else ""
+    if prescription_semantic and not (product_di_code and product_di_gcode):
         raise ValueError("전문/일반 제품 조건을 적용할 수 없습니다.")
     if prescription_semantic:
         clauses.append(
-            "(" + _prescription_exists_sql(product_code)
+            "(" + _product_prescription_code_predicate(product_di_code, prescription_semantic)
+            + " OR (" + _non_numeric_product_di_predicate(product_di_code)
             + " AND " + _company_product_di_exists_sql(
                 product_di_code, product_di_gcode, prescription_semantic,
-            ) + ")"
+            ) + "))"
         )
     add_like("product_class_nm", "product_class_nm")
     add_like("product_add_user_nm", "product_add_user_nm")

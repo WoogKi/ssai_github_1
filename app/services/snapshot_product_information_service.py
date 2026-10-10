@@ -43,7 +43,7 @@ def load_product_information_master(params: Mapping[str, Any]) -> pd.DataFrame:
     from app.db.mssql_client import get_conn
 
     joins, expressions = build_product_master_enrichment_sql(
-        product_alias="P", include_audit_price=False,
+        product_alias="P", include_audit_price=False, include_vendor_managers=True,
     )
     clauses: list[str] = []
     values: list[Any] = []
@@ -61,6 +61,8 @@ def load_product_information_master(params: Mapping[str, Any]) -> pd.DataFrame:
     sql = f"""
 SELECT LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS [제품코드],
        P.Rd04_Physic_Nm AS [제품명], PV.Rd03_Ven_Nm AS [제약사],
+       LTRIM(RTRIM(ISNULL({expressions['maker_manager_nm']}, ''))) AS [제약사 담당자],
+       LTRIM(RTRIM(ISNULL({expressions['order_vendor_manager_nm']}, ''))) AS [발주처 담당자],
        P.Rd04_Standard AS [규격], P.Rd04_Insu_Cd AS [보험코드],
        PSTD.Rd046_Standard_Cd AS [표준코드],
        PSTD.Rd046_Main_Standard_Cd AS [대표코드],
@@ -326,6 +328,14 @@ def _get_snapshot_product_information_result(
             message="회사 범위를 확인할 수 없어 제품정보를 조회하지 않았습니다.",
             snapshot_read_call_count=0,
         )
+    if qparams.get("_product_manager_condition_invalid"):
+        return _empty_or_error_payload(
+            params=qparams,
+            status="input_required",
+            reason="product_manager_name_missing",
+            message="담당자 이름을 입력해 주세요.",
+            snapshot_read_call_count=0,
+        )
     evaluation_month = _evaluation_month(qparams)
     snapshot_started = time.perf_counter()
     try:
@@ -415,6 +425,14 @@ def _get_snapshot_product_information_result(
         leading = [key for key in ("제품코드", "제품명", "제약사", "규격") if key in frame]
         basic = [key for key in master.columns if key not in leading]
         frame = frame.loc[:, leading + [key for key in frame if key not in leading + basic] + basic]
+        managers = ["제약사 담당자", "발주처 담당자"]
+        if "품목기여등급" in frame:
+            for key in managers:
+                if key not in frame:
+                    frame[key] = ""
+            columns = [key for key in frame if key not in managers]
+            position = columns.index("품목기여등급")
+            frame = frame.loc[:, columns[:position + 1] + managers + columns[position + 1:]]
         for column in ("제품수명주기", "출고자료상태", "매입단가상태", "매출단가상태", "수익성상태",
                        "출고빈도등급", "품목손익등급", "품목기여등급"):
             if column in frame:
@@ -429,7 +447,9 @@ def _get_snapshot_product_information_result(
     for key, label in (
         ("physic_cd", "제품코드"),
         ("physic_nm", "제품명"), ("product_keyword", "키워드"),
-        ("insu_cd", "보험코드"), ("maker_nm", "제약사"), ("barcode", "바코드"),
+        ("insu_cd", "보험코드"), ("maker_nm", "제약사"), ("order_nm", "발주처"), ("barcode", "바코드"),
+        ("maker_manager_nm", "제약사 담당자"),
+        ("order_vendor_manager_nm", "발주처 담당자"),
         ("product_group_nm", "제품그룹"), ("product_di_nm", "구분"),
         ("product_class_nm", "제품분류"),
         ("frequency_grade", "출고빈도"),
@@ -542,7 +562,8 @@ def get_snapshot_product_information_result(
     meta["performance_ms"] = performance_ms
     query = payload.get("params") or {}
     filters = {key: str(query[key])[:120] for key in (
-        "physic_cd", "physic_nm", "product_keyword", "insu_cd", "barcode", "maker_nm", "frequency_grade", "profit_grade",
+        "physic_cd", "physic_nm", "product_keyword", "insu_cd", "barcode", "maker_nm", "order_nm",
+        "maker_manager_nm", "order_vendor_manager_nm", "frequency_grade", "profit_grade",
         "contribution_grade", "lifecycle_status", "product_group_nm", "product_di_nm", "product_class_nm",
     ) if query.get(key)}
     log.info(

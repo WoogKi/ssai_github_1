@@ -397,7 +397,10 @@ def test_snapshot_management_only_universe_contract() -> None:
     legacy_sql, legacy_binds = product_lifecycle_sql(**options)
     snapshot_sql, snapshot_binds = product_lifecycle_sql(**options, exclude_management_only=True)
     clauses: list[str] = []
-    add_named_management_only_exclusion(clauses, product_code_expression="P.Rd04_Physic_Cd")
+    add_named_management_only_exclusion(
+        clauses, product_code_expression="P.Rd04_Physic_Cd",
+        product_di_code_expression="P.Rd04_Physic_Di",
+    )
     universe_sql = snapshot_sql.split("WITH ProductUniverse AS (", 1)[1].split("), FirstInbound AS (", 1)[0]
     _assert(len(clauses) == 1 and clauses[0] in universe_sql, "snapshot did not use the shared R046 predicate")
     _assert("ManagementStd" not in legacy_sql, "non-snapshot lifecycle query changed")

@@ -53,7 +53,7 @@ def main() -> int:
     valid = "8801234567890"
     for code, name, insurance, prescription in (
         ("0", "수거품목", "", ""),
-        ("0", "보험(약가유연제)", "insurance", "prescription"),
+        ("0", "보험(약가유연제)", "insurance", ""),
         ("D", "소모품1", "", ""),
         ("D", "약가유연제", "", "prescription"),
         ("A", "건강기능식품", "", ""),
@@ -70,7 +70,9 @@ def main() -> int:
             failures.append(f"company prescription axis mismatch: {code}/{name}")
 
     for group, expected_sql in {
-        "insurance": "LIKE N'%|보험|%'",
+        "insurance": "IN (N'1', N'2', N'3')",
+        "insurance_product": "LIKE N'%|보험|%'",
+        "non_insurance_drug": "IN (N'5', N'6', N'7')",
         "non_insurance": "LIKE N'%|비보험|%'",
     }.items():
         clauses: list[str] = []
@@ -82,8 +84,9 @@ def main() -> int:
             expressions=expressions,
         )
         sql = " ".join(clauses)
-        if ("PD.Rd01_Hnm" not in sql or expected_sql not in sql
-                or "NOT LIKE" not in sql or values):
+        name_expected = group in {"insurance_product", "non_insurance"}
+        if (expected_sql not in sql or bool("PD.Rd01_Hnm" in sql) != name_expected
+                or (name_expected and "NOT LIKE" not in sql) or values):
             failures.append(f"code-master semantic SQL mismatch: {group}: {sql}/{values}")
         if any(token in sql.upper() for token in ("CAST(", "TRY_CONVERT", "ISNUMERIC", " < ", " >= ")):
             failures.append(f"numeric semantic leaked: {group}: {sql}")
@@ -117,7 +120,7 @@ def main() -> int:
         return 1
     print("PRODUCT BUSINESS CODE SEMANTIC CONTRACT PASS")
     print("- raw string code/code-name equality and leading-zero preservation PASS")
-    print("- insurance/non-insurance code-master-name semantics PASS")
+    print("- drug codes and general product code-master-name semantics PASS")
     print("- character code B/medical-device preserved as a valid other group PASS")
     print("- R070/R230/R170-R180 common authority PASS")
     return 0

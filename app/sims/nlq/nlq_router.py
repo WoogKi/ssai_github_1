@@ -27,7 +27,13 @@ _DASHBOARD_NLQ_ACTION = "SIMS 일일점검"
 
 
 def _normalize_sims_invocation(text: str) -> str:
-    return re.sub(r"(?<![가-힣A-Za-z0-9])심스(?=\s|$)", "SIMS", str(text or ""))
+    normalized = re.sub(r"(?<![가-힣A-Za-z0-9])심스(?=\s|$)", "SIMS", str(text or ""))
+    # The dashboard invocation is commonly mistyped as IMS.  Correct only
+    # this complete action prefix; arbitrary IMS product/user terms remain
+    # untouched and cannot fall into the user-master handler.
+    return re.sub(
+        r"(?i)^\s*ims(?=\s*(?:일일점검|운영점검)\b)", "SIMS", normalized,
+    )
 
 
 _DASHBOARD_NLQ_PHRASES = (

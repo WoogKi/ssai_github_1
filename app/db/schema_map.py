@@ -86,6 +86,7 @@ SCHEMA = {
             # 기본키/식별
             'ven_cd':         'Rd03_Ven_Cd',
             'ven_nm':         'Rd03_Ven_Nm',
+            'sales_man_cd':   'Rd03_Sales_Man',
             'owner_nm':       'Rd03_Owner_Nm',
             'biz_no':         'Rd03_Ven_Num',
             'corp_reg_num':   'Rd03_CorpReg_Num',
@@ -134,6 +135,7 @@ SCHEMA = {
             'physic_prt': 'Rd04_Physic_PRT',
             'physic_sm': 'Rd04_Physic_Sm',
             'ven_cd': 'Rd04_Ven_Cd',
+            'orven_cd': 'Rd04_Orven_Cd',
 
             # 코드(대분류/상세)
             'group_g': 'Rd04_Physic_Group_Gcode',

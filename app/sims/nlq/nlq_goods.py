@@ -7,11 +7,15 @@ import re
 import uuid
 
 import pandas as pd
+from app.sims.goods_display import build_goods_display_df, order_goods_full_columns
 
 from app.services.rddbc040_service import search_goods_full, get_goods_detail_full
 from app.services.product_master_filter_contract import (
+    extract_product_manager_filters,
+    extract_product_di_semantic_group,
     extract_product_prescription_semantic,
     has_product_prescription_semantic_conflict,
+    strip_product_di_semantic_terms,
     strip_product_prescription_semantic_terms,
 )
 from app.sims.nlq.master_source_limit import resolve_chat_source_limit
@@ -54,34 +58,6 @@ _GOODS_STOP = {
     "수정자", "수정자명", "수정일자",
     "단가", "최종단가변경일자",
 }
-
-_GOODS_LIST_PREFER_COLS = [
-    "제품코드", "보험코드", "제품명", "제약사명",
-    "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-    "규격", "단위",
-    "계산단위",
-    "보험수가변경일자", "보험가격", "보험단가",
-    "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-    "최종단가변경일자", "단가",
-    "특수관리제품코드", "특수관리제품",
-    "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-    "사용구분", "삭제/사용여부",
-    "등록자", "등록일자", "수정자", "수정일자",
-]
-
-_GOODS_DETAIL_PREFER_COLS = [
-    "제품코드", "보험코드", "제품명", "출력명", "약어명", "제약사명",
-    "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-    "규격", "단위",
-    "계산단위",
-    "보험수가변경일자", "보험가격", "보험단가",
-    "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-    "최종단가변경일자", "단가",
-    "특수관리제품코드", "특수관리제품",
-    "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-    "사용구분", "삭제/사용여부",
-    "등록자", "등록일자", "수정자", "수정일자",
-]
 
 def _ensure_df(obj: Any) -> pd.DataFrame:
     if obj is None:
@@ -487,151 +463,7 @@ def _extract_name_keyword(txt: str) -> str:
 
 
 def _build_goods_display_df(df: pd.DataFrame, *, detail: bool = False) -> pd.DataFrame:
-    work = _ensure_df(df)
-    if work.empty:
-        return work
-
-    def _pick_col(df_src: pd.DataFrame, candidates: list[str]) -> str:
-        for c in candidates:
-            if c in df_src.columns:
-                return c
-        return ""
-
-    def _norm_series(sr: pd.Series) -> pd.Series:
-        return (
-            sr.fillna("")
-            .astype(str)
-            .replace({"None": "", "nan": "", "<NA>": ""})
-            .str.strip()
-        )
-
-    def _fmt_char8_date(sr: pd.Series) -> pd.Series:
-        s = (
-            sr.fillna("")
-            .astype(str)
-            .str.strip()
-            .str.replace(r"\.0$", "", regex=True)
-            .replace({
-                "": None,
-                "0": None,
-                "00000000": None,
-                "19000101": None,
-                "20010101": None,
-                "99999999": None,
-                "None": None,
-                "nan": None,
-                "<NA>": None,
-            })
-        )
-        dtv = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
-        return dtv.dt.strftime("%Y-%m-%d").fillna("")
-
-    def _fmt_datetime(sr: pd.Series) -> pd.Series:
-        s = (
-            sr.fillna("")
-            .astype(str)
-            .str.strip()
-            .replace({
-                "": None,
-                "None": None,
-                "nan": None,
-                "<NA>": None,
-            })
-        )
-        dtv = pd.to_datetime(s, errors="coerce")
-        return dtv.dt.strftime("%Y-%m-%d %H:%M:%S").fillna("")
-
-    out = work.copy()
-
-    # 이름 컬럼 우선, 코드 컬럼은 fallback
-    add_name_col = _pick_col(out, ["__raw_add_user_nm", "add_user_nm", "등록자명", "등록자"])
-    add_code_col = _pick_col(out, ["등록자코드", "Rd04_Add_Cd"])
-    mod_name_col = _pick_col(out, ["__raw_mod_user_nm", "mod_user_nm", "수정자명", "수정자"])
-    mod_code_col = _pick_col(out, ["수정자코드", "Rd04_Mod_Cd"])
-
-    if add_name_col:
-        out["등록자"] = _norm_series(out[add_name_col])
-    elif add_code_col:
-        out["등록자"] = _norm_series(out[add_code_col])
-    else:
-        out["등록자"] = ""
-
-    if mod_name_col:
-        out["수정자"] = _norm_series(out[mod_name_col])
-    elif mod_code_col:
-        out["수정자"] = _norm_series(out[mod_code_col])
-    else:
-        out["수정자"] = ""
-
-    if "등록일자" not in out.columns and "Rd04_Add_Date" in out.columns:
-        out["등록일자"] = out["Rd04_Add_Date"]
-    if "수정일자" not in out.columns and "Rd04_Mod_Date" in out.columns:
-        out["수정일자"] = out["Rd04_Mod_Date"]
-    for col in ["보험수가변경일자", "이전보험수가변경일자", "최종단가변경일자", "등록일자", "수정일자"]:
-        if col in out.columns:
-            out[col] = _fmt_char8_date(out[col])
-    for col in [
-        "표준코드수정일시", "대표코드수정일시", "보험코드수정일시",
-        "Rddbc046 등록일자", "Rddbc046 수정일자",
-    ]:
-        if col in out.columns:
-            out[col] = _fmt_datetime(out[col])
-
-
-    if "계산단위" in out.columns:
-        num = pd.to_numeric(out["계산단위"], errors="coerce")
-        non_na = num.dropna()
-        if not non_na.empty and ((non_na % 1) == 0).all():
-            out["계산단위"] = num.round(0).astype("Int64")
-        else:
-            out["계산단위"] = num.round(3)
-
-    for col in ["보험가격", "보험단가", "이전보험가격", "이전보험단가", "단가"]:
-        if col in out.columns:
-            num = pd.to_numeric(out[col], errors="coerce").round(0)
-            out[col] = num.astype("Int64")
-
-    if detail:
-        preferred = [
-            "제품코드", "보험코드", "제품명", "출력명", "약어명", "제약사명",
-            "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-            "규격", "단위",
-            "계산단위",
-            "보험수가변경일자", "보험가격", "보험단가",
-            "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-            "최종단가변경일자", "단가",
-            "표준코드제품명", "표준코드", "표준코드수정일시",
-            "대표코드", "대표코드수정일시", "Rddbc046 보험코드", "보험코드수정일시",
-            "WEB 재고사용여부", "보험수가변경사유", "보험코드변경사유",
-            "Rddbc046 등록자코드", "Rddbc046 등록일자", "Rddbc046 수정자코드", "Rddbc046 수정일자",
-            "표준코드정리사용여부", "신고계산단위", "신고환산단위", "신고환산단위사용구분",
-            "특수관리제품코드", "특수관리제품",
-            "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-            "사용구분", "삭제/사용여부",
-            "등록자", "등록일자", "수정자", "수정일자",
-                ]
-    else:
-        preferred = [
-            "제품코드", "보험코드", "제품명", "제약사명",
-            "제품그룹명", "구분명", "제품플래그명", "함량명", "제품분류명",
-            "규격", "단위",
-            "계산단위",
-            "보험수가변경일자", "보험가격", "보험단가",
-            "이전보험수가변경일자", "이전보험가격", "이전보험단가",
-            "최종단가변경일자", "단가",
-            "표준코드제품명", "표준코드", "표준코드수정일시",
-            "대표코드", "대표코드수정일시", "Rddbc046 보험코드", "보험코드수정일시",
-            "WEB 재고사용여부", "보험수가변경사유", "보험코드변경사유",
-            "Rddbc046 등록자코드", "Rddbc046 등록일자", "Rddbc046 수정자코드", "Rddbc046 수정일자",
-            "표준코드정리사용여부", "신고계산단위", "신고환산단위", "신고환산단위사용구분",
-            "특수관리제품코드", "특수관리제품",
-            "바코드1", "바코드2", "바코드3", "바코드4", "바코드5",
-            "사용구분", "삭제/사용여부",
-            "등록자", "등록일자", "수정자", "수정일자",
-        ]
-
-    preferred = [c for c in preferred if c in out.columns]
-    return out[preferred].copy() if preferred else out.copy()
+    return build_goods_display_df(df, detail=detail)
 
 def _build_goods_params(
     *,
@@ -640,8 +472,11 @@ def _build_goods_params(
     insu_cd: str = "",
     barcode: str = "",
     ven_nm_kw: str = "",
+    maker_manager_nm_kw: str = "",
+    order_vendor_manager_nm_kw: str = "",
     group_name_kw: str = "",
     di_name_kw: str = "",
+    product_di_semantic_group: str = "",
     product_prescription_semantic: str = "",
     physic_gu_name_kw: str = "",
     add_user_nm_kw: str = "",
@@ -661,8 +496,11 @@ def _build_goods_params(
         "보험코드": insu_cd,
         "바코드": barcode,
         "제약사명": ven_nm_kw,
+        "제약사 담당자": maker_manager_nm_kw,
+        "발주처 담당자": order_vendor_manager_nm_kw,
         "제품그룹명": group_name_kw,
         "구분명": di_name_kw,
+        "product_di_semantic_group": product_di_semantic_group,
         "product_prescription_semantic": product_prescription_semantic,
         "제품분류명": physic_gu_name_kw,
         "등록자": add_user_nm_kw,
@@ -694,8 +532,11 @@ def _build_goods_query_summary(
     insu_cd: str = "",
     barcode: str = "",
     ven_nm_kw: str = "",
+    maker_manager_nm_kw: str = "",
+    order_vendor_manager_nm_kw: str = "",
     group_name_kw: str = "",
     di_name_kw: str = "",
+    product_di_semantic_group: str = "",
     product_prescription_semantic: str = "",
     physic_gu_name_kw: str = "",
     add_user_nm_kw: str = "",
@@ -719,10 +560,16 @@ def _build_goods_query_summary(
         parts.append(f"바코드 {barcode}")
     if ven_nm_kw:
         parts.append(f"제약사명 {ven_nm_kw}")
+    if maker_manager_nm_kw:
+        parts.append(f"제약사 담당자 {maker_manager_nm_kw}")
+    if order_vendor_manager_nm_kw:
+        parts.append(f"발주처 담당자 {order_vendor_manager_nm_kw}")
     if group_name_kw:
         parts.append(f"제품그룹명 {group_name_kw}")
     if di_name_kw:
         parts.append(f"구분명 {di_name_kw}")
+    if product_di_semantic_group:
+        parts.append({"insurance": "보험약", "insurance_product": "보험", "non_insurance": "비보험", "non_insurance_drug": "비보험약"}[product_di_semantic_group])
     if product_prescription_semantic:
         parts.append("전문약" if product_prescription_semantic == "prescription" else "일반약")
     if physic_gu_name_kw:
@@ -860,6 +707,7 @@ def _push_goods_result(
 ) -> bool:
     df_full = _ensure_df(df)
     df_display_all = _ensure_df(df_display)
+    df_full = order_goods_full_columns(df_full, df_display_all)
 
     total = int(len(df_full))
     try:
@@ -1132,6 +980,19 @@ def try_handle_goods_nlq(
     ):
         return False
 
+    manager_filters, manager_residual = extract_product_manager_filters(t)
+    if manager_filters.get("_product_manager_condition_invalid"):
+        return _push_goods_text(
+            txt=txt,
+            title="담당자 조건 확인",
+            action="제품코드 목록",
+            params_out=_build_goods_params(),
+            query_summary="담당자 이름 확인 필요",
+            source="제품코드마스터(Rddbc040)",
+            message="담당자 이름을 입력해 주세요.",
+        )
+    maker_manager_nm_kw = manager_filters.get("maker_manager_nm", "")
+    order_vendor_manager_nm_kw = manager_filters.get("order_vendor_manager_nm", "")
     physic_cd = ""
     insu_cd = ""
     barcode = ""
@@ -1142,7 +1003,8 @@ def try_handle_goods_nlq(
     di_name_kw = ""
     physic_gu_name_kw = ""
     product_prescription_semantic = extract_product_prescription_semantic(t)
-    semantic_text = strip_product_prescription_semantic_terms(t)
+    product_di_semantic_group = extract_product_di_semantic_group(t)
+    semantic_text = strip_product_di_semantic_terms(strip_product_prescription_semantic_terms(manager_residual))
 
     if has_product_prescription_semantic_conflict(t):
         return _push_goods_text(
@@ -1178,10 +1040,13 @@ def try_handle_goods_nlq(
     if m:
         barcode = _clean_goods_token(m.group(1) or "")
 
-    ven_nm_kw = _extract_vendor_keyword(t)
+    ven_nm_kw = _extract_vendor_keyword(manager_residual)
 
     group_name_kw = _extract_labeled_keyword(t, _GROUP_LABEL_PATTERNS)
     di_name_kw = _extract_labeled_keyword(t, _DI_LABEL_PATTERNS)
+    if di_name_kw:
+        product_prescription_semantic = ""
+        product_di_semantic_group = ""
     physic_gu_name_kw = _extract_labeled_keyword(t, _CLASS_LABEL_PATTERNS)
 
     add_user_nm_kw = _extract_add_user_name(t)
@@ -1195,9 +1060,9 @@ def try_handle_goods_nlq(
 
     if (
         physic_cd or insu_cd or barcode
-        or ven_nm_kw
+        or ven_nm_kw or maker_manager_nm_kw or order_vendor_manager_nm_kw
         or group_name_kw or di_name_kw or physic_gu_name_kw
-        or product_prescription_semantic
+        or product_prescription_semantic or product_di_semantic_group
         or add_user_nm_kw or add_date_from or add_date_to
         or mod_user_nm_kw or mod_date_from or mod_date_to
         or unit_price_kw or final_price_date_kw
@@ -1210,12 +1075,12 @@ def try_handle_goods_nlq(
 
 
     if not any([
-        physic_cd, insu_cd, barcode, ven_nm_kw, keyword,
+        physic_cd, insu_cd, barcode, ven_nm_kw, maker_manager_nm_kw, order_vendor_manager_nm_kw, keyword,
         group_name_kw, di_name_kw, physic_gu_name_kw,
         add_user_nm_kw, add_date_from, add_date_to,
         mod_user_nm_kw, mod_date_from, mod_date_to,
         unit_price_kw, final_price_date_kw,
-        product_prescription_semantic,
+        product_prescription_semantic, product_di_semantic_group,
     ]):
         residual = re.sub(
             r"(알려줘|조회|검색|찾아줘|찾아봐줘|찾아봐|찾아|보여줘|어떤|있어|있는지|목록|"
@@ -1241,7 +1106,7 @@ def try_handle_goods_nlq(
         # 등록자/등록일자는 서비스 SQL 조건으로 전달한다.
         top = 2000
 
-    elif group_name_kw or di_name_kw or physic_gu_name_kw or product_prescription_semantic:
+    elif group_name_kw or di_name_kw or physic_gu_name_kw or product_prescription_semantic or product_di_semantic_group:
         # 제품그룹/구분/분류 wide filter의 기존 성능 보호 상한.
         top = 1000
         action_cap = 1000
@@ -1261,8 +1126,11 @@ def try_handle_goods_nlq(
         insu_cd=insu_cd,
         barcode=barcode,
         ven_nm_kw=ven_nm_kw,
+        maker_manager_nm_kw=maker_manager_nm_kw,
+        order_vendor_manager_nm_kw=order_vendor_manager_nm_kw,
         group_name_kw=group_name_kw,
         di_name_kw=di_name_kw,
+        product_di_semantic_group=product_di_semantic_group,
         product_prescription_semantic=product_prescription_semantic,
         physic_gu_name_kw=physic_gu_name_kw,
         add_user_nm_kw=add_user_nm_kw,
@@ -1282,8 +1150,11 @@ def try_handle_goods_nlq(
         insu_cd=insu_cd,
         barcode=barcode,
         ven_nm_kw=ven_nm_kw,
+        maker_manager_nm_kw=maker_manager_nm_kw,
+        order_vendor_manager_nm_kw=order_vendor_manager_nm_kw,
         group_name_kw=group_name_kw,
         di_name_kw=di_name_kw,
+        product_di_semantic_group=product_di_semantic_group,
         product_prescription_semantic=product_prescription_semantic,
         physic_gu_name_kw=physic_gu_name_kw,
         add_user_nm_kw=add_user_nm_kw,
@@ -1295,7 +1166,7 @@ def try_handle_goods_nlq(
         unit_price_kw=unit_price_kw,
         final_price_date_kw=final_price_date_kw,
     )
-    if physic_cd and len(physic_cd) <= 6:
+    if physic_cd and len(physic_cd) <= 6 and not (maker_manager_nm_kw or order_vendor_manager_nm_kw):
         df = get_goods_detail_full(physic_cd=physic_cd)
         if df is None:
             df = pd.DataFrame()
@@ -1338,8 +1209,11 @@ def try_handle_goods_nlq(
         insu_cd=insu_cd,
         barcode=barcode,
         ven_nm_kw=ven_nm_kw,
+        maker_manager_nm_kw=maker_manager_nm_kw,
+        order_vendor_manager_nm_kw=order_vendor_manager_nm_kw,
         group_name_kw=group_name_kw,
         di_name_kw=di_name_kw,
+        product_di_semantic_group=product_di_semantic_group,
         product_prescription_semantic=product_prescription_semantic,
         physic_gu_name_kw=physic_gu_name_kw,
         add_user_nm_kw=add_user_nm_kw,

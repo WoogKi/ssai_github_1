@@ -150,10 +150,11 @@ def build_whole_table_facts(df: pd.DataFrame, *, action: str, query: str,
     if groups is not None:
         counts = groups.value_counts(dropna=False)
         result["group_count"] = len(counts)
+        result["group_rows_total"] = int(counts.sum())
         result["group_distribution"] = [
             {"group": text(k, group_column), "rows": int(v), "row_share_pct": float(v / len(safe) * 100)}
-            for k, v in counts.head(12).items()]
-        result["group_distribution_omitted_count"] = max(0, len(counts) - 12)
+            for k, v in counts.head(20).items()]
+        result["group_distribution_omitted_count"] = max(0, len(counts) - 20)
     example_indices = []
     for c in selected:
         values = pd.to_numeric(safe[c].astype("string").str.replace(",", "", regex=False), errors="coerce")
@@ -172,6 +173,14 @@ def build_whole_table_facts(df: pd.DataFrame, *, action: str, query: str,
             aggregated = work.groupby("group", dropna=False)["value"].agg(
                 rows="size", valid_count="count", sum=lambda s: s.sum(min_count=1), mean="mean",
                 negative_count=lambda s: int(s.lt(0).sum()), zero_count=lambda s: int(s.eq(0).sum()))
+            if additive:
+                stats["group_sum_total"] = number(aggregated["sum"].sum(min_count=1))
+                stats["group_sum_matches_total"] = (
+                    stats["sum"] is None and stats["group_sum_total"] is None
+                ) or (
+                    stats["sum"] is not None and stats["group_sum_total"] is not None
+                    and math.isclose(stats["sum"], stats["group_sum_total"], rel_tol=1e-9, abs_tol=1e-6)
+                )
             rank_col = "sum" if additive else "mean"
             ordered = aggregated.dropna(subset=[rank_col]).sort_values(rank_col, ascending=False, kind="stable")
             def group_records(frame):
