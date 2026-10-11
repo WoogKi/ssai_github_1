@@ -1989,6 +1989,9 @@ _INVENTORY_STATUS_COLORS = {
     "적정 재고": ("#16a34a", "#ffffff"),
     "과다 재고": ("#7c3aed", "#ffffff"),
 }
+_DISPLAY_INVENTORY_STATUS_ORDER = tuple(
+    label for label in INVENTORY_STATUS_ORDER if label != "예상수요 없음"
+)
 
 _MONTHLY_DEPLETION_STATUS_ORDER = (
     "월예상 초과 달성", "월예상 달성", "예상외 출고", "재고로 월말 충족 가능",
@@ -2071,8 +2074,10 @@ def _monthly_depletion_cross_table(facts: Mapping[str, Any]) -> pd.DataFrame:
     cross = frame.pivot_table(
         index="재고상태", columns="월간 소진상태", values="품목수", aggfunc="sum", fill_value=0,
     )
-    cross = cross.reindex(index=[label for label in INVENTORY_STATUS_ORDER if label in cross.index])
+    cross = cross.reindex(index=[label for label in _DISPLAY_INVENTORY_STATUS_ORDER if label in cross.index])
     cross = cross.reindex(columns=[label for label in _MONTHLY_DEPLETION_STATUS_ORDER if label in cross.columns])
+    if cross.empty:
+        return cross
     cross = cross.astype(int)
     cross["합계"] = cross.sum(axis=1)
     cross.loc["합계"] = cross.sum(axis=0)
@@ -2083,6 +2088,8 @@ def _render_monthly_depletion_cross_distribution(facts: Mapping[str, Any]) -> No
     cross = _monthly_depletion_cross_table(facts)
     if cross.empty:
         return
+    total = int(_inventory_status_summary(facts).get("total_product_count") or 0)
+    visible = int(cross.loc["합계", "합계"])
     def cell_styles(frame: pd.DataFrame) -> pd.DataFrame:
         styles = pd.DataFrame("background-color:#ffffff;color:#334155", index=frame.index, columns=frame.columns)
         styles = styles.where(frame.eq(0), "background-color:#f0f5fa;color:#24364a")
@@ -2091,6 +2098,8 @@ def _render_monthly_depletion_cross_distribution(facts: Mapping[str, Any]) -> No
         styles.loc["합계", "합계"] = "background-color:#c8d9e9;color:#17324a;font-weight:700"
         return styles
     st.markdown("#### 재고상태 × 월간 소진상태")
+    if total != visible:
+        st.caption(f"표시 대상 {visible:,}개 / 전체 관리 품목 {total:,}개")
     st.dataframe(cross.style.apply(cell_styles, axis=None).format("{:,.0f}"), width="stretch")
 
 
@@ -2185,6 +2194,8 @@ def _inventory_status_minor_html(facts: Mapping[str, Any]) -> str | None:
     else:
         minor_rows = zip(current[:4], pending[:4])
     for left, right in minor_rows:
+        if left["label"] == "예상수요 없음":
+            continue
         parts.append(
             '<div class="dashboard-lite-status-minor-item">'
             f'<div class="dashboard-lite-status-minor-name">{html.escape(str(left["label"]))}</div>'
@@ -2764,7 +2775,7 @@ def _filter_integrated_inventory_detail_rows(
     contribution_grade: str = "전체",
     monthly_depletion_status: str = "전체",
 ) -> pd.DataFrame:
-    filtered = frame.copy()
+    filtered = frame.loc[frame["재고상태"].ne("예상수요 없음")].copy()
     if inventory_status != "전체":
         filtered = filtered.loc[filtered["재고상태"].eq(inventory_status)]
     if frequency_grade != "전체":
@@ -2835,7 +2846,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     namespace = _dashboard_render_namespace(dict(cache), render_mode="inventory-status-detail")
     risk_rows = [dict(row) for row in (inventory.get("risk_detail_rows") or []) if isinstance(row, Mapping)]
     vendor_options, vendor_labels = _risk_detail_vendor_options(risk_rows)
-    status_options = ["전체", *INVENTORY_STATUS_ORDER]
+    status_options = ["전체", *_DISPLAY_INVENTORY_STATUS_ORDER]
     depletion_options = ["전체", *[row["label"] for row in _monthly_depletion_rows(facts)]]
     frequency_options = ["전체", "F", "A", "B", "C", "D", "E", "X", "빈도자료 부족"]
     grade_options = ["전체", "A", "B", "C", "D", "E", "X", "등급자료 부족"]
@@ -2906,7 +2917,7 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
     applied_search = str(applied.get("search_text") or "")
     display_limit = min(300, len(filtered))
     st.caption(
-        f"관리 품목 {int(summary.get('total_product_count') or 0):,}개 / "
+        f"관리 품목 {int(summary.get('total_product_count') or 0):,}개 / 표시 대상 {len(frame.loc[frame['재고상태'].ne('예상수요 없음')]):,}개 / "
         f"예상수요 품목 {int(summary.get('expected_demand_product_count') or 0):,}개 / "
         f"위험 품목 {len(risk_rows):,}개 / 필터 결과 {len(filtered):,}개"
     )

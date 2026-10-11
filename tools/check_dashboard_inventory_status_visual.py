@@ -63,7 +63,8 @@ def main() -> None:
     assert legend.count('class="dashboard-lite-status-legend-item"') == 5
     assert [legend.index(label) for label in INVENTORY_STATUS_ORDER[4:]] == sorted(legend.index(label) for label in INVENTORY_STATUS_ORDER[4:])
     minor = _inventory_status_minor_html(facts)
-    assert minor is not None and minor.count('class="dashboard-lite-status-minor-item"') == 4
+    assert minor is not None and minor.count('class="dashboard-lite-status-minor-item"') == 3
+    assert "예상수요 없음" not in minor
     assert "현재 1개 → 예정 1개" in minor
 
     changes = _inventory_status_change_html(facts)
@@ -96,7 +97,7 @@ def main() -> None:
         "pending_status_counts": dict(dominant_counts),
     })
     assert _inventory_status_core_donut(facts) is not None
-    assert _inventory_status_minor_html(facts).count('class="dashboard-lite-status-minor-item"') == 3
+    assert _inventory_status_minor_html(facts).count('class="dashboard-lite-status-minor-item"') == 2
     assert "자료 부족 0건" in _inventory_status_minor_html(facts)
 
     # Counts from the supplied company-7 screen, not a fresh ERP query.
