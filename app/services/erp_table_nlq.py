@@ -396,7 +396,13 @@ def _resolve_order_nlq(
         staff_labels.append(labels)
         staff_name = _extract_name(raw, labels, preserve_period_tokens=True, stop_at_action=True) if labels else ""
         if staff_name:
-            params[key] = staff_name
+            if action_spec.mode == "calculation":
+                name_parts = staff_name.split(maxsplit=1)
+                params[key] = name_parts[0]
+                if len(name_parts) > 1:
+                    params["_unconsumed_order_condition"] = name_parts[1]
+            else:
+                params[key] = staff_name
     if re.search(r"(?<!발주)(?<!제약)(?<!영업)담당자(?:명)?\s*[:=]?\s*\S+", raw):
         params["_ambiguous_staff_role"] = True
     if not params.get("physic_nm"):
@@ -460,7 +466,7 @@ def _resolve_order_nlq(
 
 
 _ORDER_CALCULATION_INTENT = re.compile(
-    r"발주\s*(?:수량\s*계산|계산|추천|예상\s*품목)|"
+    r"발주\s*(?:수량\s*계산(?!식)|계산(?!식)|추천|예상\s*품목)|"
     r"(?:권장|추천)\s*발주(?:량|수량)?|"
     r"발주할\s*(?:수량|것만\s*계산)|"
     r"발주\s*수량(?:\s*(?:조회\s*조건|전체|발주\s*해당\s*자료(?:만)?|확인\s*필요))*\s*(?:뽑아|산출|알려)\s*줘"
@@ -479,6 +485,28 @@ _ORDER_CALCULATION_QUERY_MODE = re.compile(
 def is_order_calculation_request(text: str) -> bool:
     """Explicit calculation intent must never execute the existing order inquiry."""
     return bool(_ORDER_CALCULATION_INTENT.search(_clean(text)))
+
+
+def _unconsumed_calculation_action_tail(text: str) -> str:
+    """Fail closed when a free condition follows the calculation action."""
+    from app.sims.meta.erp_table_feature_registry import ORDER_CALCULATION
+
+    match = _ORDER_CALCULATION_INTENT.search(text)
+    if not match:
+        return ""
+    tail = text[match.end():].strip(" ,:/-~")
+    tail = re.sub(r"^(?:해\s*줘(?:요)?|해\s*주세요|조회|검색)(?:\s|$)", "", tail).strip()
+    if not tail:
+        return ""
+    labels = sorted(
+        {label for spec in ORDER_CALCULATION.filters for label in (spec.label, *spec.aliases)},
+        key=len, reverse=True,
+    )
+    if any(tail.startswith(label) for label in labels):
+        return ""
+    if re.match(r"^(?:안전\s*재고|적정\s*재고|결제\s*일|마감\s*일|조회\s*(?:구분|조건))", tail):
+        return ""
+    return tail
 
 
 def resolve_registered_erp_table_nlq(
@@ -525,6 +553,9 @@ def resolve_registered_erp_table_nlq(
         )
         resolved = _resolve_order_nlq(condition_text, ORDER_CALCULATION, action_spec, today=today or kst_today())
         params = resolved["params"]
+        unconsumed_tail = _unconsumed_calculation_action_tail(_clean(text))
+        if unconsumed_tail:
+            params["_unconsumed_order_condition"] = unconsumed_tail
         params["order_date"] = (today or kst_today()).isoformat()
         params.update(calculation_params)
         params.update(query_mode=mode, only_needed=mode == "발주해당자료만")

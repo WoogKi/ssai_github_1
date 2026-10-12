@@ -99,6 +99,10 @@ def main() -> None:
                                       next_seq=lambda: 1, logger=logging.getLogger(__name__))
         source.assert_not_called()
     with (patch("app.ui.chat_middleware.push_sims_result_to_chat"),
+          patch("app.services.order_stock_location_scope.prepare_order_stock_scope",
+                side_effect=lambda params, **_kwargs: ({**params, "stock_cd": "00001", "stock_cd_list": ["00001"],
+                                                       "_order_stock_scope_resolved": True,
+                                                       "_order_stock_scope_policy": "saved"}, "", [])),
           patch("app.services.order_calculation_service.get_order_calculation_result",
                 return_value={"final": True, "type": "text", "data": "offline", "message": "offline",
                               "meta": {"result_status": "no_data", "source_call_count": 0}}) as order_source):

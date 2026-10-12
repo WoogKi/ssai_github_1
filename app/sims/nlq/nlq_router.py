@@ -1222,6 +1222,7 @@ def _is_general_explanation_request(txt: str) -> bool:
         "구조",
         "계산방식",
         "계산방법",
+        "계산식",
         "산정방식",
         "산정방법",
         "원리",
@@ -1357,6 +1358,11 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     # intentionally a route hint, not a completed-action audit record.
     if _is_explicit_codes_master_intent(normalized):
         return {"route": "master", "action": "업무코드 조회"}
+
+    # A fresh user-list request owns its table even when it contains a stock
+    # location filter and a previous SIMS table is available.
+    if re.search(r"사용자\s*(?:목록|조회|검색)", normalized):
+        return {"route": "users", "action": "사용자목록 + 부서명"}
 
     dashboard_action = _resolve_dashboard_nlq_action(normalized)
     if dashboard_action:
@@ -7764,6 +7770,13 @@ def try_handle_nlq(
     if raw != original:
         logger.info("[nlq.router] invocation_prefix_removed original_chars=%s", len(original))
     if not raw:
+        return False
+    from app.ui.knowledge_chat_adapter import parse_incomplete_sims_help_request
+    help_intent = parse_incomplete_sims_help_request(raw)
+    if help_intent and help_intent.reason in {
+        "action_confirmation", "condition_confirmation", "single_action_required",
+    }:
+        logger.info("[nlq.router] condition or action confirmation required; erp_call_count=0")
         return False
     from app.services.erp_table_nlq import is_order_calculation_request
     if is_order_calculation_request(raw):

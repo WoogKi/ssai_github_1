@@ -33,7 +33,6 @@ _USER_MASTER_ATTR_WORDS = (
     "부서",
     "직책",
     "영업지역",
-    "재고위치",
     "수정자",
     "수정자명",
     "수정일자"
@@ -1109,6 +1108,12 @@ def try_handle_users_nlq(
     )
 
     if not user_anchor:
+        return False
+
+    from app.sims.nlq.nlq_router import resolve_new_sims_nlq_candidate
+
+    candidate = resolve_new_sims_nlq_candidate(t)
+    if candidate and candidate.get("route") != "users":
         return False
 
     user_cd = _extract_user_cd(t) or ""

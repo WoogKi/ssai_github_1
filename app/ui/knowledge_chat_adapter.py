@@ -57,6 +57,7 @@ _BUSINESS_HELP_CUES = (
 )
 _BUSINESS_HELP_TOPIC_OPTIONAL_CUES = (
     "질문예시",
+    "발주계산식",
 )
 
 
@@ -169,6 +170,26 @@ def parse_incomplete_sims_help_request(value: object, *, today: date | None = No
         return None
     query = re.sub(r"\s+", " ", value.strip())
     compact = re.sub(r"\s+", "", query).casefold()
+    # These shapes otherwise lose an explicit condition or execute a different
+    # registered action. Resolve them before current-table and ERP routing.
+    if re.search(r"(?i)^(?:sims\s+)?일일점(?!검)[^\s]*", query):
+        return SimsHelpIntent("action_confirmation", query)
+    if "현재고금액" in compact and "매출금액" in compact:
+        return SimsHelpIntent("single_action_required", query)
+    if re.search(r"영업사원\s*별\s*매출\s*현황", query):
+        return SimsHelpIntent("action_confirmation", query)
+    if "발주처기준" in compact and "현재고금액" in compact:
+        return SimsHelpIntent("condition_confirmation", query)
+    if (re.search(r"발주\s*조회", query)
+            and re.search(r"\b(?:\d{1,2}/\d{1,2}|\d{1,2}월\s*\d{1,2}일)\b", query)
+            and re.search(r"발주\s*조회\s+[가-힣]{2,}(?:\s|$)", query)):
+        return SimsHelpIntent("condition_confirmation", query)
+    from app.services.erp_table_nlq import is_order_calculation_request, resolve_registered_erp_table_nlq
+
+    if is_order_calculation_request(query):
+        parsed = resolve_registered_erp_table_nlq(query, today=today)
+        if (parsed or {}).get("params", {}).get("_unconsumed_order_condition"):
+            return SimsHelpIntent("condition_confirmation", query)
     from app.services.io_nlq import extract_nlq_natural_period, strip_nlq_period_tokens_for_entity_residual
 
     period_params = extract_nlq_natural_period(query, today=today)
@@ -248,6 +269,8 @@ def verified_sims_help_examples(
         candidates.append(("입고명세 조회", f"{role}명 {value} 입고명세 조회", "ven_nm", value))
     elif intent.reason == "stock_action_required":
         candidates.append(("실재고월집계 조회", "실재고월집계 조회" if period else "실재고월집계 조회 이달", "month_from", ""))
+    elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required"}:
+        return ()
     else:
         raise ValueError("Unknown SIMS help intent")
 
@@ -289,6 +312,9 @@ def verified_sims_help_text(
         "detail_role_required": "상세 조회 대상이 거래처인지 입고명세인지 확인해 주세요.",
         "stock_action_required": "월집계와 제품별 재고현황 중 필요한 조회를 선택해 주세요.",
         "grouping_scope_required": "집계 기준과 조회 대상 중 어떤 조건인지 구분해 주세요.",
+        "action_confirmation": "지원되는 업무명을 확인해 주세요. 다른 업무로 조회하지 않았습니다.",
+        "condition_confirmation": "조회조건의 의미를 확인해 주세요. 조건을 생략한 전체 조회는 실행하지 않았습니다.",
+        "single_action_required": "한 번에 한 업무를 질문해 주세요. 두 업무를 하나로 조회하지 않았습니다.",
     }
     if intent.reason not in titles:
         raise ValueError("Unknown SIMS help intent")
@@ -316,6 +342,8 @@ def verified_sims_help_text(
         answer += f"\n\n{label}: " + " / ".join(example for _, example in examples)
     if allow_knowledge_help:
         answer += "\n\n추가 설명은 'SIMS 질문 예시 알려줘'로 요청할 수 있습니다."
+    elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required"}:
+        answer += "\n\n지원되는 질문은 'SIMS 질문 예시 알려줘'에서 확인할 수 있습니다."
     return answer + "\n\n조회는 조건을 선택해 다시 입력한 뒤 기존 권한 검사를 거쳐 실행됩니다."
 
 
