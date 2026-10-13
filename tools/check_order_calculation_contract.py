@@ -831,6 +831,18 @@ render_actual_quantity_editor({'meta': {'table_key': 'widget'}}, {'table_key': '
     at.session_state['sims_export_tables'] = {'widget': updated}
     at.run()
     assert not at.exception and at.dataframe[0].proto.id == first_id
+    from app.services.order_calculation_service import get_order_calculation_result
+    with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+        display_columns = list(get_order_calculation_result(
+            fixture()[0], source_loader=lambda _params: fixture()[1])['df_display'].columns)
+    assert len(display_columns) == 33
+    exact = pd.concat([updated] * 284, ignore_index=True)
+    exact['제품코드'] = [f'{i:05d}' for i in range(284)]
+    at.session_state['sims_export_tables'] = {'widget': exact}
+    at.session_state['sims_tables'] = {'widget': exact[display_columns]}
+    at.run()
+    assert not at.exception and at.dataframe[0].value.shape == (284, 33)
+    assert not at.selectbox
     many = pd.concat([updated] * 301, ignore_index=True)
     many['제품코드'] = [f'{i:05d}' for i in range(301)]
     at.session_state['sims_export_tables'] = {'widget': many}
@@ -1073,13 +1085,14 @@ if __name__ == "__main__":
         with patch.object(ui, 'st', fake), patch('app.db.mssql_client.get_current_company_id', return_value=7), \
              patch('app.ui.chat_middleware._build_sims_context_from_result') as context, \
              patch('app.services.order_calculation_service.get_order_calculation_result') as source_query:
-            for count in (15, 290, 300):
+            for count in (15, 284, 290, 300):
                 state['sims_export_tables']['order'] = full.head(count).copy()
                 state['sims_tables']['order'] = full.head(count)[display_columns].copy()
                 state['__sims_table_render_path'] = 'live'
                 assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
-                assert len(edits) == (15, 290, 300).index(count) + 1 and not views
+                assert len(edits) == (15, 284, 290, 300).index(count) + 1 and not views
                 assert len(edits[-1][0]) == count and list(edits[-1][0]) == display_columns
+                assert len(edits[-1][0].columns) == 33
                 assert edits[-1][1]['column_config']['출고빈도등급']['label'] == '등급'
                 assert edits[-1][1]['column_config']['추천 발주수량']['width'] == 86
                 assert all(edits[-1][1]['column_config'][c]['pinned'] for c in ('제품코드', '제품명', '규격'))
