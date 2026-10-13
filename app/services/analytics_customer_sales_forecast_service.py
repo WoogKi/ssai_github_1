@@ -30,6 +30,13 @@ from app.services.analytics_sales_trend_service import (
 
 log = logging.getLogger("ssai.sims.analytics_customer_sales_forecast")
 
+# Filters actually applied by the R030 customer-master predicate for all three
+# customer-grain forecast views. Keep the NLQ execution guard on this contract.
+CUSTOMER_SALES_FORECAST_FILTER_KEYS = frozenset({
+    "ven_cd", "ven_nm", "sales_man_nm", "sales_man_cd",
+    "sido_nm", "gugun_nm", "road_nm",
+})
+
 SOURCE_LABEL = "출고 거래명세서 원장매출(Rddbc130)"
 
 CUSTOMER_FORECAST_COLUMNS = [
@@ -427,7 +434,7 @@ WHERE {where_sql}
 def _has_master_filter(params: Dict[str, Any]) -> bool:
     return any(
         _clean_text(params.get(k))
-        for k in ("ven_cd", "ven_nm", "sales_man_nm", "sido_nm", "gugun_nm", "road_nm")
+        for k in CUSTOMER_SALES_FORECAST_FILTER_KEYS
     )
 
 

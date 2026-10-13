@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date
 import json
 import re
+from typing import Mapping
 
 from app.services.knowledge_document_service import ContextPacket
 
@@ -176,20 +177,69 @@ def parse_incomplete_sims_help_request(value: object, *, today: date | None = No
         return SimsHelpIntent("action_confirmation", query)
     if "현재고금액" in compact and "매출금액" in compact:
         return SimsHelpIntent("single_action_required", query)
-    if re.search(r"영업사원\s*별\s*매출\s*현황", query):
-        return SimsHelpIntent("action_confirmation", query)
+    from app.sims.nlq.nlq_router import _unregistered_grouped_sales_status
+
+    grouped_status = _unregistered_grouped_sales_status(query)
+    if grouped_status:
+        return SimsHelpIntent("unregistered_grouped_sales_status", query, grouped_status[1])
+    # A requested but unrecognized table/document is not a reference to the
+    # previous result. Keep its wording; do not infer a business from history.
+    if (re.search(r"(?:^|\s)[가-힣A-Za-z0-9]+표(?:[은는을를도가만]|\s|$)", query)
+            and re.search(r"조회|검색|찾아|보여|알려", query)
+            and not re.search(r"현재\s*표|이\s*표|위\s*표|방금\s*표|조회\s*결과", query)):
+        from app.sims.nlq.nlq_router import (
+            _resolve_analytics_registered_phrase_action,
+            resolve_new_sims_nlq_candidate,
+        )
+
+        candidate = resolve_new_sims_nlq_candidate(query)
+        candidate_action = str((candidate or {}).get("action") or "")
+        action_label = re.sub(r"(?:조회|분석)$", "", candidate_action)
+        label_matches = bool(action_label and re.sub(r"\s+", "", action_label) in compact)
+        registered_alias = bool(
+            (candidate or {}).get("route") == "analytics"
+            and _resolve_analytics_registered_phrase_action(query) == candidate_action
+        )
+        if not label_matches and not registered_alias:
+            return SimsHelpIntent("document_type_confirmation", query)
     if "발주처기준" in compact and "현재고금액" in compact:
         return SimsHelpIntent("condition_confirmation", query)
     if (re.search(r"발주\s*조회", query)
             and re.search(r"\b(?:\d{1,2}/\d{1,2}|\d{1,2}월\s*\d{1,2}일)\b", query)
             and re.search(r"발주\s*조회\s+[가-힣]{2,}(?:\s|$)", query)):
         return SimsHelpIntent("condition_confirmation", query)
+    from app.sims.nlq.nlq_router import (
+        _dashboard_unrecognized_staff_label, _extract_dashboard_nlq_conditions,
+        _resolve_dashboard_nlq_action,
+    )
+
+    incomplete_staff = _dashboard_unrecognized_staff_label(query)
+    if incomplete_staff:
+        return SimsHelpIntent("dashboard_condition_confirmation", query, incomplete_staff[1], incomplete_staff[0])
+
+    reversed_dashboard = re.fullmatch(r"(?i)(?:sims\s+)?(.+?)\s+일일\s*점검", query)
+    if reversed_dashboard and not _resolve_dashboard_nlq_action(query):
+        conditions, residual = _extract_dashboard_nlq_conditions(reversed_dashboard.group(1))
+        if not residual and len(conditions) == 1:
+            role, name = next(iter(conditions.items()))
+            if role in {"발주담당자", "제약담당자"} and name:
+                return SimsHelpIntent("dashboard_action_order", query, role, name)
     from app.services.erp_table_nlq import is_order_calculation_request, resolve_registered_erp_table_nlq
 
     if is_order_calculation_request(query):
         parsed = resolve_registered_erp_table_nlq(query, today=today)
-        if (parsed or {}).get("params", {}).get("_unconsumed_order_condition"):
-            return SimsHelpIntent("condition_confirmation", query)
+        unconsumed = (parsed or {}).get("params", {}).get("_unconsumed_order_condition")
+        if unconsumed:
+            from app.services.order_stock_location_scope import extract_order_stock_terms
+
+            stock_terms = extract_order_stock_terms(f"재고위치 {unconsumed}")
+            stock_like = bool(stock_terms and (stock_terms[0] or stock_terms[1]) and (
+                re.search(r"창고|스토어|재고위치", unconsumed) or stock_terms[0]
+            ))
+            return SimsHelpIntent(
+                "condition_confirmation", query,
+                "재고위치" if stock_like else "", str(unconsumed) if stock_like else "",
+            )
     from app.services.io_nlq import extract_nlq_natural_period, strip_nlq_period_tokens_for_entity_residual
 
     period_params = extract_nlq_natural_period(query, today=today)
@@ -226,8 +276,25 @@ def parse_incomplete_sims_help_request(value: object, *, today: date | None = No
     return None
 
 
+def cached_company_stock_location_names(session_state: Mapping[str, object], company_id: object) -> dict[str, str]:
+    """Use only already-loaded choices for this company; help must not query ERP."""
+    from app.sims.views.dashboard_lite import DASHBOARD_LITE_OPTION_CACHE_KEY, DASHBOARD_LITE_OPTION_CACHE_VERSION
+
+    company = str(company_id or "").strip()
+    if not company or str(session_state.get("__dashboard_lite_profile_loaded_for") or "") != company:
+        return {}
+    options = session_state.get(DASHBOARD_LITE_OPTION_CACHE_KEY)
+    if not isinstance(options, dict) or options.get("cache_version") != DASHBOARD_LITE_OPTION_CACHE_VERSION:
+        return {}
+    return {
+        str(code): str(name) for code, name in dict(options.get("stock_code_to_name") or {}).items()
+        if str(code).strip() and str(name).strip()
+    }
+
+
 def verified_sims_help_examples(
     intent: SimsHelpIntent, *, allowed_actions: set[str], today: date | None = None,
+    stock_location_names: Mapping[str, str] | None = None,
 ) -> tuple[tuple[str, str], ...]:
     """Build examples from the user's role, then verify action and condition parsing."""
     from app.services.io_nlq import resolve_io_nlq
@@ -269,7 +336,96 @@ def verified_sims_help_examples(
         candidates.append(("입고명세 조회", f"{role}명 {value} 입고명세 조회", "ven_nm", value))
     elif intent.reason == "stock_action_required":
         candidates.append(("실재고월집계 조회", "실재고월집계 조회" if period else "실재고월집계 조회 이달", "month_from", ""))
-    elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required"}:
+    elif intent.reason == "dashboard_condition_confirmation":
+        from app.sims.nlq.nlq_router import _extract_dashboard_nlq_conditions, resolve_new_sims_nlq_candidate
+
+        action = "SIMS 일일점검"
+        if action not in supported or action not in allowed_actions:
+            return ()
+        short_label, role = value, intent.subject_label
+        pattern = rf"(?<![가-힣A-Za-z0-9]){re.escape(short_label)}(?!자)(?=\s+\S)"
+        example = re.sub(pattern, role, intent.query, count=1)
+        if example == intent.query:
+            return ()
+        candidate = resolve_new_sims_nlq_candidate(example)
+        original_conditions, _ = _extract_dashboard_nlq_conditions(intent.query)
+        conditions, residual = _extract_dashboard_nlq_conditions(example)
+        if (candidate or {}).get("action") != action or residual or not conditions.get(role):
+            return ()
+        if any(conditions.get(label) != condition for label, condition in original_conditions.items() if label != role):
+            return ()
+        return ((action, example),)
+    elif intent.reason == "dashboard_action_order":
+        from app.sims.nlq.nlq_router import _extract_dashboard_nlq_conditions, resolve_new_sims_nlq_candidate
+
+        action = "SIMS 일일점검"
+        example = f"SIMS 일일점검 {role} {value}"
+        if action not in supported or action not in allowed_actions:
+            return ()
+        candidate = resolve_new_sims_nlq_candidate(example)
+        conditions, residual = _extract_dashboard_nlq_conditions(example)
+        return ((action, example),) if (
+            candidate and candidate.get("action") == action and conditions.get(role) == value and not residual
+        ) else ()
+    elif intent.reason == "unregistered_grouped_sales_status":
+        from app.sims.nlq.action_inventory import ANALYTICS_INTENT_ACTIONS
+        from app.sims.nlq.nlq_router import _resolve_analytics_action, resolve_new_sims_nlq_candidate
+
+        label = intent.subject_label
+        grouping = next(
+            (axis for (metric, axis), action in ANALYTICS_INTENT_ACTIONS.items()
+             if metric == "sales_forecast" and action.startswith(f"{label}별")),
+            "",
+        )
+        action = ANALYTICS_INTENT_ACTIONS.get(("sales_forecast", grouping))
+        original = re.sub(r"\s+", "", intent.query)
+        if not action or action not in supported or action not in allowed_actions:
+            return ()
+        if original not in {f"{label}별매출현황", f"{label}별매출현황조회"}:
+            return ()
+        example = action
+        candidate = resolve_new_sims_nlq_candidate(example)
+        if _resolve_analytics_action(example) != action or (candidate or {}).get("action") != action:
+            return ()
+        return ((action, example),)
+    elif intent.reason == "condition_confirmation" and role == "재고위치":
+        from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
+        from app.services.order_stock_location_scope import extract_order_stock_terms
+        from app.services.io_nlq import resolve_stock_location_codes
+
+        action = "발주 계산"
+        names_by_code = dict(stock_location_names or {})
+        if action not in supported or action not in allowed_actions:
+            return ()
+        terms = extract_order_stock_terms(f"재고위치 {value}")
+        if not terms or not (terms[0] or terms[1]):
+            return ()
+        if names_by_code:
+            selected, error, _ = resolve_stock_location_codes(
+                *terms, allowed_codes=list(names_by_code), location_names=names_by_code,
+            )
+            if error or not selected:
+                return ()
+        offset = intent.query.rfind(value)
+        if offset < 0:
+            return ()
+        example = intent.query[:offset] + "재고위치 " + intent.query[offset:]
+        original = resolve_registered_erp_table_nlq(intent.query, today=today)
+        reparsed = resolve_registered_erp_table_nlq(example, today=today)
+        if (original or {}).get("action") != action or (reparsed or {}).get("action") != action:
+            return ()
+        original_params = dict(original.get("params") or {})
+        reparsed_params = dict(reparsed.get("params") or {})
+        if reparsed_params.get("_unconsumed_order_condition"):
+            return ()
+        if reparsed_params.get("stock_cd_list") != terms[0] or reparsed_params.get("stock_nm_list") != terms[1]:
+            return ()
+        excluded = {"stock_cd_list", "stock_nm_list", "stock_cds", "stock_cd", "stock_nm", "stock_names"}
+        def retained(params: dict) -> dict:
+            return {key: item for key, item in params.items() if key not in excluded and not key.startswith("_")}
+        return ((action, example),) if retained(original_params) == retained(reparsed_params) else ()
+    elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required",
+                           "document_type_confirmation"}:
         return ()
     else:
         raise ValueError("Unknown SIMS help intent")
@@ -303,27 +459,43 @@ def verified_sims_help_examples(
 def verified_sims_help_text(
     intent: SimsHelpIntent, *, allowed_actions: set[str], allow_knowledge_help: bool = False,
     selected_action: str = "", today: date | None = None,
+    stock_location_names: Mapping[str, str] | None = None,
 ) -> str:
     """Only advertise actions present in the current executable inventory."""
-    examples = verified_sims_help_examples(intent, allowed_actions=allowed_actions, today=today)
+    examples = verified_sims_help_examples(
+        intent, allowed_actions=allowed_actions, today=today,
+        stock_location_names=stock_location_names,
+    )
     titles = {
         "code_role_required": "코드가 가리키는 종류를 지정해 주세요.",
         "action_required": "조회할 업무 동작을 지정해 주세요.",
         "detail_role_required": "상세 조회 대상이 거래처인지 입고명세인지 확인해 주세요.",
         "stock_action_required": "월집계와 제품별 재고현황 중 필요한 조회를 선택해 주세요.",
         "grouping_scope_required": "집계 기준과 조회 대상 중 어떤 조건인지 구분해 주세요.",
+        "dashboard_action_order": "일일점검 업무명과 담당자 조건을 구분해 주세요. 아직 조회하지 않았습니다.",
+        "dashboard_condition_confirmation": "담당자 조건의 정식 이름을 확인해 주세요. 이번 일일점검은 실행하지 않았습니다.",
         "action_confirmation": "지원되는 업무명을 확인해 주세요. 다른 업무로 조회하지 않았습니다.",
+        "document_type_confirmation": "어떤 업무 또는 전표 종류를 뜻하는지 확인해 주세요. 이전 조회 결과를 적용하거나 새로 조회하지 않았습니다.",
+        "unregistered_grouped_sales_status": "현재 질문에 해당하는 조회 업무를 확정하지 못했습니다. 이번 조회는 실행하지 않았습니다.",
         "condition_confirmation": "조회조건의 의미를 확인해 주세요. 조건을 생략한 전체 조회는 실행하지 않았습니다.",
         "single_action_required": "한 번에 한 업무를 질문해 주세요. 두 업무를 하나로 조회하지 않았습니다.",
     }
     if intent.reason not in titles:
         raise ValueError("Unknown SIMS help intent")
     answer = titles[intent.reason]
+    if intent.reason == "unregistered_grouped_sales_status":
+        answer += "\n\n매출현황과 매출 예상은 서로 다른 개념입니다."
+    if intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
+        answer = "발주계산에서 재고위치를 지정하려는 것으로 이해했습니다. 이번 발주계산은 실행하지 않았습니다."
     if intent.query:
         answer += f"\n\n입력한 요청: {intent.query}"
     if intent.subject_label and intent.subject_value:
         if intent.reason == "grouping_scope_required":
             answer += f"\n입력한 검색어: {intent.subject_value}"
+        elif intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
+            answer += f"\n\n확인하지 못한 조건: {intent.subject_value}"
+        elif intent.reason == "dashboard_condition_confirmation":
+            answer += f"\n확인하지 못한 조건: {intent.subject_value}"
         else:
             answer += f"\n확인한 대상: {intent.subject_label} {intent.subject_value}"
     elif intent.subject_value and intent.reason == "stock_action_required":
@@ -339,10 +511,22 @@ def verified_sims_help_text(
     if examples:
         label = "일반 사용법 예시" if (intent.reason in {"code_role_required", "stock_action_required"}
                                   or intent.period and any(not example.endswith(intent.period) for _, example in examples)) else "현재 질문을 보완한 예시"
-        answer += f"\n\n{label}: " + " / ".join(example for _, example in examples)
+        if intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
+            answer += "\n\n다음과 같이 질문해 주세요."
+            answer += "\n\n" + " / ".join(example for _, example in examples)
+            if not stock_location_names:
+                answer += "\n\n현재 재고위치 등록 여부는 확인하지 않았습니다."
+        elif intent.reason == "unregistered_grouped_sales_status":
+            answer += "\n\nSIMS AI에서 지원하는 관련 업무: " + ", ".join(action for action, _ in examples)
+            answer += "\n매출 예측을 원하시면 다음처럼 질문해 주세요: " + " / ".join(example for _, example in examples)
+        else:
+            answer += f"\n\n{label}: " + " / ".join(example for _, example in examples)
+    elif intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
+        answer += "\n\n재고위치를 뜻하셨다면 등록된 재고위치를 확인해 '재고위치' 조건을 명시해 주세요."
     if allow_knowledge_help:
         answer += "\n\n추가 설명은 'SIMS 질문 예시 알려줘'로 요청할 수 있습니다."
-    elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required"}:
+    elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required",
+                           "document_type_confirmation"}:
         answer += "\n\n지원되는 질문은 'SIMS 질문 예시 알려줘'에서 확인할 수 있습니다."
     return answer + "\n\n조회는 조건을 선택해 다시 입력한 뒤 기존 권한 검사를 거쳐 실행됩니다."
 

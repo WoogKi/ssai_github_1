@@ -60,6 +60,20 @@ _DASHBOARD_NLQ_CONDITION_LABELS = (
 )
 
 
+def _dashboard_unrecognized_staff_label(text: str) -> tuple[str, str] | None:
+    """Find an incomplete staff label without making it executable syntax."""
+    source = _normalize_sims_invocation(text)
+    if not _resolve_dashboard_nlq_action(source):
+        return None
+    for label in _DASHBOARD_NLQ_CONDITION_LABELS:
+        if label == "담당자" or not label.endswith("담당자"):
+            continue
+        shortened = label[:-1]
+        if re.search(rf"(?<![가-힣A-Za-z0-9]){re.escape(shortened)}(?!자)(?=\s+\S)", source):
+            return shortened, label
+    return None
+
+
 def _resolve_dashboard_nlq_action(text: str) -> str:
     return (
         _DASHBOARD_NLQ_ACTION
@@ -988,6 +1002,19 @@ _ANALYTICS_METRIC_LABELS = {
 }
 
 
+def _unregistered_grouped_sales_status(txt: str) -> tuple[str, str] | None:
+    """Identify a grouped sales-status request without claiming a registered action."""
+    compact = re.sub(r"\s+", "", str(txt or ""))
+    if "매출현황" not in compact:
+        return None
+    for grouping, label, phrase in _ANALYTICS_GROUPING_TERMS:
+        if not phrase.endswith("별") or f"{phrase}매출현황" not in compact:
+            continue
+        if ("sales_status", grouping) not in ANALYTICS_INTENT_ACTIONS:
+            return grouping, label
+    return None
+
+
 def _classify_analytics_metric_grouping(txt: str) -> Dict[str, str] | None:
     """Extract explicit Analytics metric and grouping without treating filters as groups."""
     compact = re.sub(r"\s+", "", str(txt or "").strip())
@@ -1246,6 +1273,18 @@ def _is_general_explanation_request(txt: str) -> bool:
     return not any(marker in compact.lower() for marker in lookup_markers)
 
 
+def _resolve_analytics_registered_phrase_action(txt: str) -> str | None:
+    """Match only phrases explicitly registered for an Analytics action."""
+    text = str(txt or "").strip()
+    compact = re.sub(r"\s+", "", text)
+    for spec in _ANALYTICS_ACTION_SPECS:
+        for phrase in spec["phrases"]:
+            phrase = str(phrase or "").strip()
+            if phrase and (phrase in text or re.sub(r"\s+", "", phrase) in compact):
+                return str(spec["action"])
+    return None
+
+
 def _resolve_analytics_action(txt: str) -> str | None:
     """
     분석/KPI 문장에서 실행할 action을 결정한다.
@@ -1295,21 +1334,7 @@ def _resolve_analytics_action(txt: str) -> str | None:
         if supported_action:
             return supported_action
 
-    for spec in _ANALYTICS_ACTION_SPECS:
-        for phrase in spec["phrases"]:
-            p = str(phrase or "").strip()
-            if not p:
-                continue
-
-            compact_p = re.sub(r"\s+", "", p)
-
-            if p in t:
-                return str(spec["action"])
-
-            if compact_p and compact_p in compact_t:
-                return str(spec["action"])
-
-    return None
+    return _resolve_analytics_registered_phrase_action(t)
 
 def _looks_like_analytics_nlq(txt: str) -> bool:
     """
@@ -1342,6 +1367,8 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     """
     normalized = keyboard_fix(str(txt or "").strip())
     if not normalized:
+        return None
+    if _unregistered_grouped_sales_status(normalized):
         return None
     from app.services.erp_table_nlq import is_order_calculation_request
     if is_order_calculation_request(normalized):
@@ -1531,23 +1558,25 @@ def _analytics_nlq_max_rows(default: int = 30000) -> int:
         v = int(default)
     return v
 
-def _extract_analytics_top(txt: str, default: int = 0) -> int:
+def _match_analytics_top(txt: str) -> re.Match[str] | None:
     t = str(txt or "")
-    env_max = _analytics_nlq_max_rows()
-    if not default or default < 1:
-        default = env_max
-
-    patterns = [
+    for pat in (
         r"(?:top|TOP)\s*[:=]?\s*(\d{1,5})",
         r"상위\s*(\d{1,5})",
         r"(\d{1,5})\s*건",
-    ]
+    ):
+        match = re.search(pat, t)
+        if match:
+            return match
+    return None
 
-    for pat in patterns:
-        m = re.search(pat, t)
-        if not m:
-            continue
 
+def _extract_analytics_top(txt: str, default: int = 0) -> int:
+    env_max = _analytics_nlq_max_rows()
+    if not default or default < 1:
+        default = env_max
+    m = _match_analytics_top(txt)
+    if m:
         try:
             v = int(m.group(1))
             return max(1, min(v, env_max))
@@ -1672,6 +1701,38 @@ _ANALYTICS_GROUP_ACTIONS = {
     "매출처별 매출 예상",
     "영업사원별 매출 예상",
     "지역별 매출 예상",
+}
+
+_CUSTOMER_FORECAST_ACTIONS = frozenset({
+    "매출처별 매출 예상", "영업사원별 매출 예상", "지역별 매출 예상",
+})
+
+_CUSTOMER_FORECAST_FILTER_LABELS = {
+    "maker_cd": "제약사", "maker_nm": "제약사",
+    "product_ven_cd": "제약사", "product_ven_nm": "제약사",
+    "manufacturer_cd": "제약사", "manufacturer_nm": "제약사",
+    "physic_cd": "제품", "physic_nm": "제품",
+    "product_group": "제품그룹", "product_group_nm": "제품그룹",
+    "product_group_list": "제품그룹",
+    "product_di": "제품구분", "product_di_nm": "제품구분",
+    "product_di_list": "제품구분",
+    "product_class": "제품분류", "product_class_nm": "제품분류",
+    "product_class_list": "제품분류",
+    "product_prescription_semantic": "제품구분",
+    "order_cd": "발주처", "order_nm": "발주처",
+    "buy_cd": "매입처", "buy_nm": "매입처",
+    "real_ven_cd": "실납처", "real_ven_nm": "실납처",
+    "ven_group_nm": "거래처그룹", "ven_kind_nm": "거래처종류",
+    "stock_apply_cd": "재고적용처", "stock_apply_nm": "재고적용처",
+    "stock_cd": "재고위치", "stock_nm": "재고위치",
+    "stock_cd_list": "재고위치", "stock_nm_list": "재고위치",
+    "stock_cds": "재고위치",
+    "sales_man": "영업사원",
+    "sale_cd": "매출처", "sale_nm": "매출처",
+    "in_seq": "입고순번", "out_seq": "출고순번",
+    "trans_di": "거래명세서구분", "trans_seq": "거래명세서순번",
+    "tax_di": "세금계산서구분", "tax_seq": "세금계산서순번",
+    "add_nm": "등록자", "mod_nm": "수정자",
 }
 
 
@@ -1951,6 +2012,19 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
         params = {}
 
     params = _cleanup_analytics_named_params(params, text=txt, action=action)
+    if action in _CUSTOMER_FORECAST_ACTIONS:
+        # IO uses sales_man for the code; this forecast service binds sales_man_cd.
+        if params.get("sales_man") and not params.get("sales_man_cd"):
+            params["sales_man_cd"] = params.pop("sales_man")
+        residual = _strip_analytics_action_phrases(txt, action)
+        for key, label in (
+            ("sido_nm", r"(?:시도명|시도)(?!별)"),
+            ("gugun_nm", r"(?:시구군명|시군구명|시구군|시군구)(?!별)"),
+            ("road_nm", r"도로명(?!주소)"),
+        ):
+            value = _extract_road_label_token(residual, label)
+            if value:
+                params[key] = value
     if semantic_group:
         params["product_prescription_semantic"] = semantic_group
     if semantic_conflict:
@@ -1985,6 +2059,65 @@ def _build_analytics_params(txt: str, action: str) -> Dict[str, Any]:
     params["top"] = _extract_analytics_top(txt)
 
     return params
+
+
+def _unsupported_customer_forecast_filters(action: str, params: Dict[str, Any], text: str = "") -> list[str]:
+    if action not in _CUSTOMER_FORECAST_ACTIONS:
+        return []
+    from app.services.analytics_customer_sales_forecast_service import CUSTOMER_SALES_FORECAST_FILTER_KEYS
+
+    unsupported = []
+    residual = _strip_analytics_action_phrases(text, action)
+    region_pair = re.search(
+        r"(?:시도명|시도|시구군명|시군구명|시구군|시군구|도로명)\s*"
+        r"[가-힣A-Za-z0-9_-]+\s*(?:[+,/]|및|와|과)\s*[가-힣A-Za-z0-9_-]+",
+        residual,
+    )
+    if region_pair:
+        unsupported.append(region_pair.group(0).strip())
+    top_match = _match_analytics_top(residual)
+    if top_match:
+        unsupported.append(top_match.group(0).strip())
+    for key, label in _CUSTOMER_FORECAST_FILTER_LABELS.items():
+        value = params.get(key)
+        if key in CUSTOMER_SALES_FORECAST_FILTER_KEYS or not value:
+            continue
+        values = value if isinstance(value, (list, tuple)) else [value]
+        for item in values:
+            condition = f"{label} {str(item).strip()}"
+            if str(item).strip() and condition not in unsupported:
+                unsupported.append(condition)
+    return unsupported
+
+
+def _customer_forecast_filter_guard_payload(
+    text: str, action: str, params: Dict[str, Any], conditions: list[str],
+) -> Dict[str, Any]:
+    message = (
+        f"{action}은 현재 다음 조건을 지원하지 않습니다.\n\n"
+        f"입력한 조건: {', '.join(conditions)}\n\n"
+        "해당 조건을 제외한 전체 조회는 실행하지 않았습니다."
+    )
+    from app.sims.nlq.action_inventory import implemented_actions
+    from app.services.ssai_permission_policy import get_required_permission
+    from app.ui.ssai_login import has_permission
+
+    spec = next((item for item in implemented_actions() if item.canonical_action == action), None)
+    permission = get_required_permission(category=spec.panel_category, action=action) if spec else None
+    if permission and has_permission(permission) and _resolve_analytics_action(action) == action:
+        unfiltered = _build_analytics_params(action, action)
+        if not _unsupported_customer_forecast_filters(action, unfiltered):
+            message += f"\n\n조건 없이 조회하려면 '{action}'으로 질문해 주세요."
+    return {
+        "final": True, "type": "text", "title": action, "action": action,
+        "params": params, "data": message, "message": message,
+        "meta": {
+            "nlq": True, "analysis_nlq": True, "analytics": True,
+            "result_status": "input_required", "execution_status": "input_required",
+            "service_call_skipped": True, "source_call_count": 0,
+            "unsupported_conditions": conditions, "row_count": 0, "row_count_total": 0,
+        },
+    }
 
 
 def _extract_analytics_stock_location_terms(text: str) -> tuple[list[str], list[str]] | None:
@@ -3050,6 +3183,12 @@ def _try_handle_analytics_nlq(
         return False
 
     params = _build_analytics_params(t, action)
+    unsupported_filters = _unsupported_customer_forecast_filters(action, params, t)
+    if unsupported_filters:
+        payload = _customer_forecast_filter_guard_payload(t, action, params, unsupported_filters)
+        push_sims_result_to_chat(payload, action)
+        logger.info("[nlq.router] analytics explicit filters blocked action=%s filter_count=%s erp_call_count=0", action, len(unsupported_filters))
+        return True
     if (
         (_analytics_nlq_code_values(params, "stock_cd_list")
          or _analytics_nlq_name_values(params, "stock_cd_list"))
@@ -5723,6 +5862,13 @@ def _build_dashboard_nlq_params(
     text: str, *, session_state: Dict[str, Any], logger
 ) -> tuple[Dict[str, Any], Dict[str, Any] | None]:
     """Merge explicit Dashboard NLQ conditions over one company Default."""
+    incomplete_staff = _dashboard_unrecognized_staff_label(text)
+    if incomplete_staff:
+        return {}, _dashboard_nlq_text_payload(
+            f"'{incomplete_staff[0]}' 조건은 확인하지 못했습니다. '{incomplete_staff[1]}' 조건으로 다시 질문해 주세요. 이번 일일점검은 실행하지 않았습니다.",
+            status="input_required", params={}, question=text,
+            reason_code="unrecognized_staff_condition",
+        )
     from app.services.dashboard_lite_facts import default_dashboard_lite_scope, normalize_dashboard_lite_params
     from app.services.io_nlq import (
         _has_explicit_all_stock_locations, extract_params,
@@ -7772,9 +7918,15 @@ def try_handle_nlq(
     if not raw:
         return False
     from app.ui.knowledge_chat_adapter import parse_incomplete_sims_help_request
-    help_intent = parse_incomplete_sims_help_request(raw)
+    help_intent = parse_incomplete_sims_help_request(
+        original if _resolve_dashboard_nlq_action(original) else raw
+    )
     if help_intent and help_intent.reason in {
         "action_confirmation", "condition_confirmation", "single_action_required",
+        "document_type_confirmation",
+        "dashboard_action_order",
+        "dashboard_condition_confirmation",
+        "unregistered_grouped_sales_status",
     }:
         logger.info("[nlq.router] condition or action confirmation required; erp_call_count=0")
         return False

@@ -397,6 +397,12 @@ def _push_table_result(
 ) -> bool:
     df_full = _ensure_df(df)
     df_display_all = _ensure_df(df_display)
+    if action == "사용자목록 + 부서명":
+        if len(df_full) != len(df_display_all) or not df_display_all.columns.is_unique:
+            raise ValueError("User export projection does not match the filtered source")
+        # The approved user view owns chat, current-table, and download columns.
+        # Keep all filtered rows; only df_show below is capped for the screen.
+        df_full = df_display_all.copy()
 
     total = int(len(df_full)) if not df_full.empty else int(len(df_display_all))
     show_n = min(total, 500)

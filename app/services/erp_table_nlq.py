@@ -481,6 +481,12 @@ _ORDER_CALCULATION_QUERY_MODE = re.compile(
     r"(?![가-힣A-Za-z0-9])"
 )
 
+_ORDER_CALCULATION_DAY_FILTERS = (
+    ("safety_days", r"안전\s*재고(?:일수)?"),
+    ("target_days", r"적정\s*재고(?:일수)?"),
+    ("closing_day", r"(?:결제|마감)\s*일(?:자)?"),
+)
+
 
 def is_order_calculation_request(text: str) -> bool:
     """Explicit calculation intent must never execute the existing order inquiry."""
@@ -495,7 +501,21 @@ def _unconsumed_calculation_action_tail(text: str) -> str:
     if not match:
         return ""
     tail = text[match.end():].strip(" ,:/-~")
-    tail = re.sub(r"^(?:해\s*줘(?:요)?|해\s*주세요|조회|검색)(?:\s|$)", "", tail).strip()
+    while tail:
+        command = re.match(r"^(?:로\s*)?(?:해\s*줘(?:요)?|해\s*주세요|조회|검색)(?:\s|$)", tail)
+        if command:
+            tail = tail[command.end():].strip(" ,:/-~")
+            continue
+        mode = _ORDER_CALCULATION_QUERY_MODE.match(tail)
+        if mode:
+            tail = tail[mode.end():].strip(" ,:/-~")
+            continue
+        day = next((match for _, label in _ORDER_CALCULATION_DAY_FILTERS
+                    if (match := re.match(rf"^(?:{label})\s*[:=]?\s*\d+\s*(?:영업일|일)?", tail))), None)
+        if day:
+            tail = tail[day.end():].strip(" ,:/-~")
+            continue
+        break
     if not tail:
         return ""
     labels = sorted(
@@ -529,9 +549,7 @@ def resolve_registered_erp_table_nlq(
         action_spec = ORDER_CALCULATION.actions[0]
         condition_text = _clean(text)
         calculation_params = {"safety_days": 3, "target_days": 15, "closing_day": 25}
-        for key, labels in (("safety_days", r"안전\s*재고(?:일수)?"),
-                            ("target_days", r"적정\s*재고(?:일수)?"),
-                            ("closing_day", r"(?:결제|마감)\s*일(?:자)?")):
+        for key, labels in _ORDER_CALCULATION_DAY_FILTERS:
             pattern = re.compile(labels + r"\s*[:=]?\s*(\d+)\s*(?:영업일|일)?")
             matches = list(pattern.finditer(condition_text))
             if matches:

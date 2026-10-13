@@ -585,6 +585,99 @@ def run_parser_checks() -> list[CheckResult]:
     return [_evaluate_parser_case(case) for case in _parser_cases()]
 
 
+def run_sales_condition_semantics_checks() -> list[CheckResult]:
+    """Keep labelled sales filters and compact day/action text on the IO route."""
+    from app.services.io_nlq import (
+        has_unconsumed_detail_condition,
+        resolve_io_nlq,
+        resolve_unlabeled_io_entity_condition,
+    )
+
+    today = date(2026, 10, 13)
+    cases = (
+        ("영업사원 김 오늘 매출현황", "sales_man_nm", "김"),
+        ("영업사원김 오늘 매출현황", "sales_man_nm", "김"),
+        ("영업담당자 김 오늘 매출현황", "sales_man_nm", "김"),
+        ("영업사원코드 00001 오늘 매출현황", "sales_man", "00001"),
+        ("거래처 샘플약국 오늘 매출현황", "ven_nm", "샘플약국"),
+        ("오늘매출현황 거래처 샘플약국", "ven_nm", "샘플약국"),
+        ("거래처 샘플도매 오늘매출", "ven_nm", "샘플도매"),
+    )
+    results = []
+    for query, key, value in cases:
+        parsed = resolve_io_nlq(query, today=today) or {}
+        action = parsed.get("action")
+        params = parsed.get("params") or {}
+        resolved = resolve_unlabeled_io_entity_condition(query, action=action or "", params=params)
+        final = resolved.get("params") or {}
+        ok = (
+            action == "출고명세 조회"
+            and params.get(key) == value
+            and params.get("date_from") == today.strftime("%Y%m%d")
+            and params.get("date_to") == today.strftime("%Y%m%d")
+            and not has_unconsumed_detail_condition(query, action, params)
+            and not final.get("nlq_unlabeled_name")
+            and (key != "sales_man" or not final.get("sales_man_nm"))
+            and final.get(key) == value
+        )
+        results.append(CheckResult(f"sales condition semantics: {query}", ok, f"params={params!r}, final={final!r}"))
+    ambiguous = "영업사원 김 오늘 매출현황 미확인조건"
+    parsed = resolve_io_nlq(ambiguous, today=today) or {}
+    results.append(CheckResult(
+        "unconsumed sales condition still blocks ERP",
+        has_unconsumed_detail_condition(ambiguous, parsed.get("action", ""), parsed.get("params") or {}),
+        f"parsed={parsed!r}",
+    ))
+
+    from app.services import rddbc120_service
+    from app.sims.nlq import nlq_router
+    from app.ui import chat_middleware
+
+    calls: list[dict[str, Any]] = []
+    deliveries: list[dict[str, Any]] = []
+
+    def _fake_service(params: dict[str, Any]) -> dict[str, Any]:
+        calls.append(dict(params))
+        return {
+            "type": "text", "action": "출고명세 조회", "data": "fixture",
+            "meta": {"result_status": "no_data", "source_call_count": 1,
+                     "row_count": 0, "row_count_total": 0},
+        }
+
+    with (
+        patch.object(rddbc120_service, "get_rddbc120_result", side_effect=_fake_service),
+        patch.object(chat_middleware, "push_sims_result_to_chat", side_effect=lambda payload, _action: deliveries.append(payload) or dict(payload.get("meta") or {})),
+    ):
+        for query, key, value in cases:
+            before = len(calls)
+            handled = nlq_router._try_handle_io_nlq(
+                query, room={}, session_state={}, make_ts=lambda: "fixture",
+                next_seq=lambda: 1, logger=logging.getLogger("nlq_regression"),
+            )
+            actual = calls[-1] if len(calls) > before else {}
+            results.append(CheckResult(
+                f"IO handler receives only the requested filter: {query}",
+                handled and len(calls) == before + 1 and actual.get(key) == value
+                and not actual.get("nlq_unlabeled_name")
+                and (key != "sales_man" or not actual.get("sales_man_nm"))
+                and actual.get("date_from") == actual.get("date_to")
+                and (deliveries[-1].get("meta") or {}).get("source_call_count") == 1,
+                f"service_calls={len(calls) - before}, params={actual!r}",
+            ))
+        before = len(calls)
+        blocked = nlq_router._try_handle_io_nlq(
+            ambiguous, room={}, session_state={}, make_ts=lambda: "fixture",
+            next_seq=lambda: 1, logger=logging.getLogger("nlq_regression"),
+        )
+        results.append(CheckResult(
+            "unknown sales residual is blocked before service",
+            blocked and len(calls) == before
+            and (deliveries[-1].get("meta") or {}).get("source_call_count") == 0,
+            f"service_calls={len(calls) - before}",
+        ))
+    return results
+
+
 def run_vendor_master_business_intent_priority_checks() -> list[CheckResult]:
     """Ensure transaction queries cannot be intercepted by the vendor master route."""
     from unittest.mock import MagicMock, patch
@@ -597,6 +690,7 @@ def run_vendor_master_business_intent_priority_checks() -> list[CheckResult]:
         "매입현황 거래처 온라인팜",
         "매출현황 거래처 소망약국",
         "오늘 매출 현황 거래처 약국 조회",
+        "거래처 샘플도매 오늘매출",
     )
     other_business_entity_queries = (
         "매출현황 제품 타이레놀",
@@ -8015,6 +8109,9 @@ def main() -> int:
 
     parser_results = run_parser_checks()
     failed += _print_results("IO NLQ PARSER CHECKS", parser_results)
+
+    sales_semantics_results = run_sales_condition_semantics_checks()
+    failed += _print_results("SALES CONDITION SEMANTICS CHECKS", sales_semantics_results)
 
     vendor_priority_results = run_vendor_master_business_intent_priority_checks()
     failed += _print_results(

@@ -352,6 +352,7 @@ from app.ui.knowledge_chat_adapter import (
     build_knowledge_followup_queue_request,
     build_knowledge_prompt,
     build_sims_help_choice_prompt,
+    cached_company_stock_location_names,
     parse_business_help_knowledge_request,
     parse_incomplete_sims_help_request,
     parse_knowledge_followup_queue_request,
@@ -3635,6 +3636,11 @@ def is_sims_result_followup_question(text: str) -> bool:
     if not t:
         return False
 
+    if "표" in t and not is_explicit_current_table_followup_reference(t):
+        help_intent = parse_incomplete_sims_help_request(t)
+        if help_intent and help_intent.reason == "document_type_confirmation":
+            return False
+
     # 명시적인 NLQ 조회 명령은 후속 질문으로 보지 않는다.
     # 예: "품목별 매출 추세 요약표 2025년 조회"
     if _looks_like_explicit_sims_nlq_command(t):
@@ -3761,9 +3767,6 @@ def is_sims_result_followup_question(text: str) -> bool:
         "다음조회",
         "다음 조회",
         "제안",
-        "표",
-        "표로",
-
     )
 
     request_words = (
@@ -12928,8 +12931,15 @@ if user_input and user_input.strip():
             )
             if permission and require_permission(permission, show_error=False):
                 allowed_help_actions.add(action_spec.canonical_action)
+        stock_location_names = {}
+        if (incomplete_sims_help.reason == "condition_confirmation"
+                and incomplete_sims_help.subject_label == "재고위치"):
+            stock_location_names = cached_company_stock_location_names(
+                st.session_state, _selected_chat_company_id(),
+            )
         help_examples = verified_sims_help_examples(
             incomplete_sims_help, allowed_actions=allowed_help_actions,
+            stock_location_names=stock_location_names,
         )
         knowledge_allowed = require_permission("RAG_USE", show_error=False)
         selected_help_action, help_llm_calls = (
@@ -12942,6 +12952,7 @@ if user_input and user_input.strip():
                 incomplete_sims_help, allowed_actions=allowed_help_actions,
                 allow_knowledge_help=knowledge_allowed,
                 selected_action=selected_help_action,
+                stock_location_names=stock_location_names,
             ),
             "time": make_ts(), "seq": _next_seq(),
             **_message_meta("sims_help"),

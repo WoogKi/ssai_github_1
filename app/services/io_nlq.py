@@ -127,7 +127,18 @@ _SALES_SIDE_VENDOR_WORDS = (
 def has_transaction_query_signal(text: str) -> bool:
     """Return whether text requests transactional/business data, not a master lookup."""
     t = _norm(text)
-    return any(w in t for w in _TRANSACTION_SIGNAL_WORDS)
+    return any(w in t for w in _TRANSACTION_SIGNAL_WORDS) or bool(
+        re.search(r"(?:^|\s)(?:오늘|어제|그저께|당일)\s*(?:매입|매출)(?:조회)?(?=\s|$)", t)
+    )
+
+
+def _split_compact_relative_day_action(text: str) -> str:
+    """Separate a relative day from an existing IO action in the same token."""
+    return re.sub(
+        r"(?<![가-힣A-Za-z0-9])(오늘|어제|그저께|당일)((?:입고|출고|매입|매출)(?:현황|조회)?)(?=\s|$)",
+        r"\1 \2",
+        text,
+    )
 
 
 def _has_transaction_signal(text: str) -> bool:
@@ -412,7 +423,7 @@ def extract_nlq_natural_period(
 
     Policy source: docs/02_design/SIMS_AI_NLQ_기간정책_공식기준.md
     """
-    raw = _norm(text)
+    raw = _split_compact_relative_day_action(_norm(text))
     if not raw:
         return {}
     if today is None:
@@ -617,6 +628,7 @@ def strip_nlq_period_tokens_for_entity_residual(text: str) -> str:
     embedded-name token before applying the common parser to the full phrase.
     This preserves multi-token natural periods such as ``최근 한달``.
     """
+    text = _split_compact_relative_day_action(str(text or ""))
     text = re.sub(
         r"^(오늘|어제|그저께|당일)(?=(?:거래명세서|입고현황|출고현황|입고명세|출고명세|세금계산서))",
         r"\1 ",
@@ -1732,6 +1744,8 @@ def _extract_io_compound_named_values(text: str) -> dict[str, str]:
     def label_pattern(label: str) -> str:
         if label == "제품":
             return r"제품(?!그룹명|그룹|구분명|구분|분류명|분류|코드|명)"
+        if label in {"영업사원", "영업담당자"}:
+            return rf"{re.escape(label)}(?!코드)"
         return _named_filter_label_pattern(label)
 
     all_labels = tuple(label for _, labels in label_specs for label in labels) + (
@@ -2274,7 +2288,7 @@ def has_unconsumed_detail_condition(text: str, action: str, params: Dict[str, An
         "ven_cd", "ven_nm", "physic_cd", "physic_nm", "maker_cd", "maker_nm",
         "product_ven_cd", "product_ven_nm", "order_cd", "order_nm",
         "buy_cd", "buy_nm", "nlq_unlabeled_name",
-        "stock_cd", "stock_cds", "stock_nm",
+        "stock_cd", "stock_cds", "stock_nm", "sales_man", "sales_man_nm",
     ))
     if not has_bound_name and _extract_unlabeled_entity_phrase(text, action):
         return False
@@ -2304,6 +2318,18 @@ def has_unconsumed_detail_condition(text: str, action: str, params: Dict[str, An
         if stock_name and not stock_codes:
             residual = re.sub(
                 rf"(?<![가-힣A-Za-z0-9])(?:재고위치명|재고위치|재고명)\s*[:=]?\s*{re.escape(stock_name)}(?![가-힣A-Za-z0-9])",
+                " ", residual,
+            )
+        sales_name = clean_text(params.get("sales_man_nm"))
+        if sales_name:
+            residual = re.sub(
+                rf"(?<![가-힣A-Za-z0-9])(?:영업담당자명|영업담당자|영업사원명|영업사원)\s*[:=]?\s*{re.escape(sales_name)}(?![가-힣A-Za-z0-9])",
+                " ", residual,
+            )
+        sales_code = clean_text(params.get("sales_man"))
+        if sales_code:
+            residual = re.sub(
+                rf"(?<![가-힣A-Za-z0-9])(?:영업담당자코드|영업사원코드|영업담당자|영업사원)\s*[:=]?\s*{re.escape(sales_code)}(?![가-힣A-Za-z0-9])",
                 " ", residual,
             )
         for key in (
@@ -2517,6 +2543,7 @@ def resolve_unlabeled_io_entity_condition(
         action in {"입고명세 조회", "출고명세 조회", "제품재고현황 조회"}
         and not _has_explicit_name_label(text)
         and not clean_text(out.get("physic_cd"))
+        and not any(clean_text(out.get(key)) for key in ("sales_man", "sales_man_nm"))
     ):
         # Generic parsing may tentatively put raw residual text in physic_nm
         # before the action is known.  It is authoritative only after the
@@ -3460,7 +3487,7 @@ def _apply_transaction_document_validation_intent(
 # 입출고/재고 관련 신호가 있는지 보고, 관련 신호가 있으면 extract_params()로 파싱한 뒤
 # 입출고/재고 NLQ 의도를 판정한다.
 def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str, Any]]:
-    raw = _norm(text)
+    raw = _split_compact_relative_day_action(_norm(text))
     if not raw:
         return None
 
