@@ -45,7 +45,7 @@ _VALUE_BOUNDARY = (
     r"매입처(?:코드|명)?|재고위치(?:코드|명)?|재고적용처(?:코드|명)?|재고적용코드|"
     r"단가적용거래처(?:코드|명)?|단가적용처(?:코드|명)?|단가적용코드|거래처(?:코드|명)?|"
     r"제품(?:코드|명|키워드|그룹명?|구분명?|분류명?|단가|등록자|수정자)?|"
-    r"품목(?:코드|명|키워드)?|보험코드|바코드|제약사명?|제조사|키워드|발주담당자|제약담당자|담당자|"
+    r"품목(?:코드|명|키워드)?|보험코드|바코드|제약사명?|제조사|키워드|발주담당자|발주담당|제약담당자|제약담당|담당자|"
     r"실입고단가|장부입고단가|입고수량|출고수량|최종단가변경일자|"
     r"제품등록일|제품수정일|계약시작일(?:자)?|기준일|조회(?:구분|조건)|조회건수|TOP)\b|$)"
 )
@@ -403,6 +403,11 @@ def _resolve_order_nlq(
                     params["_unconsumed_order_condition"] = name_parts[1]
             else:
                 params[key] = staff_name
+        elif action_spec.mode == "calculation" and any(
+            re.search(rf"(?<![0-9A-Za-z가-힣]){re.escape(label)}(?=\s|[:=]|$)", raw)
+            for label in labels
+        ):
+            params.setdefault("_unconsumed_order_condition", labels[0])
     if re.search(r"(?<!발주)(?<!제약)(?<!영업)담당자(?:명)?\s*[:=]?\s*\S+", raw):
         params["_ambiguous_staff_role"] = True
     if not params.get("physic_nm"):

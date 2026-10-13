@@ -241,8 +241,8 @@ RDDBC170_RDDBC180 = ErpTableFeatureSpec(
         ErpFilterSpec("expected_vendor_nm", "예상매출처명", "Rd03_Ven_Nm", "text", ("예상매출처",)),
         ErpFilterSpec("real_vendor_cd", "실납처코드", "Rd18_Real_Ven_Cd", "code"),
         ErpFilterSpec("real_vendor_nm", "실납처명", "Rd03_Ven_Nm", "text", ("실납처",)),
-        ErpFilterSpec("order_staff_nm", "발주담당자", "발주조회: Rddbc170.Rd17_DamDang -> Rddbc060.Rd06_User_Nm; 발주 계산: 최종 발주처 영업사원", "text"),
-        ErpFilterSpec("pharma_staff_nm", "제약담당자", "Rddbc040.Rd04_Ven_Cd -> Rddbc030.Rd03_Sales_Man -> Rddbc060.Rd06_User_Nm", "text"),
+        ErpFilterSpec("order_staff_nm", "발주담당자", "발주조회: Rddbc170.Rd17_DamDang -> Rddbc060.Rd06_User_Nm; 발주 계산: 최종 발주처 영업사원", "text", ("발주담당",)),
+        ErpFilterSpec("pharma_staff_nm", "제약담당자", "Rddbc040.Rd04_Ven_Cd -> Rddbc030.Rd03_Sales_Man -> Rddbc060.Rd06_User_Nm", "text", ("제약담당",)),
         ErpFilterSpec("has_outstanding", "미입고 존재", "calculated outstanding quantity", "bool", ("미입고",)),
     ),
     actions=(

@@ -230,6 +230,8 @@ def parse_incomplete_sims_help_request(value: object, *, today: date | None = No
         parsed = resolve_registered_erp_table_nlq(query, today=today)
         unconsumed = (parsed or {}).get("params", {}).get("_unconsumed_order_condition")
         if unconsumed:
+            if unconsumed in {"발주담당자", "제약담당자"}:
+                return SimsHelpIntent("condition_confirmation", query, unconsumed, "")
             from app.services.order_stock_location_scope import extract_order_stock_terms
 
             stock_terms = extract_order_stock_terms(f"재고위치 {unconsumed}")
@@ -487,6 +489,8 @@ def verified_sims_help_text(
         answer += "\n\n매출현황과 매출 예상은 서로 다른 개념입니다."
     if intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
         answer = "발주계산에서 재고위치를 지정하려는 것으로 이해했습니다. 이번 발주계산은 실행하지 않았습니다."
+    elif intent.reason == "condition_confirmation" and intent.subject_label in {"발주담당자", "제약담당자"}:
+        answer = f"{intent.subject_label} 이름을 지정해 주세요. 조건 없이 전체 발주계산을 실행하지 않았습니다."
     if intent.query:
         answer += f"\n\n입력한 요청: {intent.query}"
     if intent.subject_label and intent.subject_value:
@@ -523,6 +527,8 @@ def verified_sims_help_text(
             answer += f"\n\n{label}: " + " / ".join(example for _, example in examples)
     elif intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
         answer += "\n\n재고위치를 뜻하셨다면 등록된 재고위치를 확인해 '재고위치' 조건을 명시해 주세요."
+    elif intent.reason == "condition_confirmation" and intent.subject_label in {"발주담당자", "제약담당자"}:
+        answer += f"\n\n질문 형식: {intent.subject_label} [이름] 발주계산"
     if allow_knowledge_help:
         answer += "\n\n추가 설명은 'SIMS 질문 예시 알려줘'로 요청할 수 있습니다."
     elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required",

@@ -83,31 +83,40 @@ def _check_dashboard_help() -> None:
 
 def _check_dashboard_staff_condition() -> None:
     logger = logging.getLogger(__name__)
+    blocked = []
+    with (patch("app.ui.ssai_login.get_selected_company", side_effect=AssertionError("company lookup")),
+          patch("app.services.ssai_analysis_profile_service.load_dashboard_profile", side_effect=AssertionError("profile DB")),
+          patch("app.services.product_supplier_scope_service.resolve_supplier_vendor_codes", side_effect=AssertionError("supplier")),
+          patch("app.sims.views.dashboard_lite.build_dashboard_lite_result_payload", side_effect=AssertionError("ERP")),
+          patch("app.ui.chat_middleware.push_sims_result_to_chat", side_effect=lambda payload, action: blocked.append((payload, action)))):
+        for short, full in (("발주담당", "발주담당자"), ("제약담당", "제약담당자")):
+            for label in (short, full):
+                question = f"SIMS 일일점검 {label}"
+                assert parse_incomplete_sims_help_request(question) is None
+                assert nlq_router._extract_dashboard_nlq_conditions(question) == ({full: ""}, "")
+                params, notice = nlq_router._build_dashboard_nlq_params(
+                    question, session_state={}, logger=logger,
+                )
+                assert params == {} and notice["meta"]["result_status"] == "input_required"
+                assert notice["meta"]["reason_code"] == "missing_staff_name"
+                assert notice["meta"]["source_call_count"] == 0 and full in notice["message"]
+                assert nlq_router.try_handle_nlq(
+                    question, room={"messages": []}, session_state={},
+                    make_ts=lambda: "now", next_seq=lambda: 1, logger=logger,
+                )
+    assert len(blocked) == 4
+    assert all(action == "SIMS 일일점검" and payload["meta"]["result_status"] == "input_required"
+               and payload["meta"]["source_call_count"] == 0 for payload, action in blocked)
     for short, full in (("발주담당", "발주담당자"), ("제약담당", "제약담당자")):
-        question = f"SIMS 일일점검 {short} 가상민우"
-        intent = parse_incomplete_sims_help_request(question)
-        assert intent and intent.reason == "dashboard_condition_confirmation"
-        example = f"SIMS 일일점검 {full} 가상민우"
-        assert verified_sims_help_examples(intent, allowed_actions={"SIMS 일일점검"}) == (("SIMS 일일점검", example),)
-        assert verified_sims_help_examples(intent, allowed_actions=set()) == ()
-        assert example in verified_sims_help_text(intent, allowed_actions={"SIMS 일일점검"})
-        assert nlq_router._extract_dashboard_nlq_conditions(example) == ({full: "가상민우"}, "")
-        with (patch("app.services.ssai_analysis_profile_service.load_dashboard_profile", side_effect=AssertionError("DB")),
-              patch("app.services.product_supplier_scope_service.resolve_supplier_vendor_codes", side_effect=AssertionError("supplier")),
-              patch.object(nlq_router, "_try_handle_dashboard_nlq", side_effect=AssertionError("ERP route"))):
-            params, notice = nlq_router._build_dashboard_nlq_params(question, session_state={}, logger=logger)
-            assert not params and notice["meta"]["result_status"] == "input_required"
-            assert notice["meta"]["source_call_count"] == 0
-            assert not nlq_router.try_handle_nlq(
-                question, room={"messages": []}, session_state={}, make_ts=lambda: "now",
-                next_seq=lambda: 1, logger=logger,
-            )
+        for question in (f"SIMS 일일점검 {short} 가상민우", f"{short} 가상민우 SIMS 일일점검"):
+            assert parse_incomplete_sims_help_request(question) is None
+            assert nlq_router._dashboard_unrecognized_staff_label(question) is None
+            assert nlq_router._extract_dashboard_nlq_conditions(question) == ({full: "가상민우"}, "")
+            assert nlq_router.resolve_new_sims_nlq_candidate(question)["action"] == "SIMS 일일점검"
 
     mixed = "SIMS 일일점검 발주담당 가상민우 제약사 삼진"
-    mixed_intent = parse_incomplete_sims_help_request(mixed)
-    assert mixed_intent and mixed_intent.reason == "dashboard_condition_confirmation"
-    mixed_example = verified_sims_help_examples(mixed_intent, allowed_actions={"SIMS 일일점검"})[0][1]
-    assert nlq_router._extract_dashboard_nlq_conditions(mixed_example) == (
+    assert parse_incomplete_sims_help_request(mixed) is None
+    assert nlq_router._extract_dashboard_nlq_conditions(mixed) == (
         {"발주담당자": "가상민우", "제약사": "삼진"}, "",
     )
     assert nlq_router._dashboard_unrecognized_staff_label("SIMS 일일점검 담당 가상민우") is None
@@ -119,7 +128,10 @@ def _check_dashboard_staff_condition() -> None:
 
     cases = (
         ("SIMS 일일점검 발주담당자 가상민우", "dashboard_order_staff_nm", "가상민우", []),
+        ("SIMS 일일점검 발주담당 가상민우", "dashboard_order_staff_nm", "가상민우", []),
+        ("발주담당 가상민우 SIMS 일일점검", "dashboard_order_staff_nm", "가상민우", []),
         ("SIMS 일일점검 제약담당자 가상민우", "dashboard_pharma_staff_nm", "가상민우", []),
+        ("SIMS 일일점검 제약담당 가상민우", "dashboard_pharma_staff_nm", "가상민우", []),
         ("SIMS 일일점검 제약사 삼진", "manufacturer_test_query", "삼진", [("삼진", "manufacturer")]),
         ("SIMS 일일점검 삼진", "manufacturer_test_query", "삼진", [("삼진", "manufacturer")]),
         ("SIMS 일일점검 발주처 삼진", "order_vendor_codes", ["V1"], [("삼진", "order_vendor")]),
@@ -134,8 +146,35 @@ def _check_dashboard_staff_condition() -> None:
                 question, session_state={"__analysis_profile_company_cache": {"4": {}}}, logger=logger,
             )
             assert notice is None and params[key] == expected, (question, params, notice)
+            if key in {"dashboard_order_staff_nm", "dashboard_pharma_staff_nm"}:
+                label = "order_staff_label" if key == "dashboard_order_staff_nm" else "pharma_staff_label"
+                assert params[label] == expected and not params.get("manufacturer_test_query"), question
             assert calls == supplier_calls, (question, calls)
             assert nlq_router.resolve_new_sims_nlq_candidate(question)["action"] == "SIMS 일일점검"
+
+    sent, executed = [], []
+    def dashboard_result(params, **kwargs):
+        executed.append(dict(params))
+        return (
+            {"meta": {"result_status": "success", "source_call_count": 3}},
+            {"params": dict(params), "facts": {"source_call_count": 3, "inventory": {"readiness_rows": [{}]}}},
+        )
+    with (patch("app.ui.ssai_login.get_selected_company", return_value={"company_id": 4}),
+          patch("app.services.ssai_analysis_profile_service.load_dashboard_profile", side_effect=AssertionError("DB")),
+          patch("app.services.product_supplier_scope_service.resolve_supplier_vendor_codes", side_effect=AssertionError("supplier")),
+          patch("app.sims.views.dashboard_lite.build_dashboard_lite_result_payload", side_effect=dashboard_result),
+          patch("app.sims.views.dashboard_lite.dashboard_request_publish_allowed", return_value=True),
+          patch("app.ui.chat_middleware.get_current_chat_room_id", return_value="fixture-room"),
+          patch("app.ui.chat_middleware.push_sims_result_to_chat", side_effect=lambda payload, action: sent.append((payload, action)))):
+        for question in ("발주담당 신 SIMS 일일점검", "SIMS 일일점검 발주담당자 신"):
+            assert nlq_router._try_handle_dashboard_nlq(
+                question, room={"id": "fixture-room"},
+                session_state={"__analysis_profile_company_cache": {"4": {}}}, logger=logger,
+            )
+    assert len(executed) == len(sent) == 2
+    assert all(params["dashboard_order_staff_nm"] == params["order_staff_label"] == "신" for params in executed)
+    assert all(action == "SIMS 일일점검" and payload["meta"]["result_status"] == "success"
+               and payload["meta"]["source_call_count"] == 3 for payload, action in sent)
 
 
 def _check_ambiguous_document_help() -> None:

@@ -18,6 +18,7 @@ from app.services.ssai_analysis_profile_service import (
     normalize_business_code_pair,
 )
 from app.sims.nlq.action_inventory import ANALYTICS_INTENT_ACTIONS
+from app.sims.meta.erp_table_feature_registry import ORDER_CALCULATION, filter_labels
 
 
 _log = logging.getLogger("ssai.sims.nlq_router")
@@ -53,8 +54,13 @@ _DASHBOARD_NLQ_PHRASE_PATTERNS = tuple(
     _dashboard_nlq_phrase_pattern(phrase)
     for phrase in _DASHBOARD_NLQ_PHRASES
 )
+_DASHBOARD_STAFF_LABELS = {
+    label: filter_labels(ORDER_CALCULATION, key)[0]
+    for key in ("order_staff_nm", "pharma_staff_nm")
+    for label in filter_labels(ORDER_CALCULATION, key)
+}
 _DASHBOARD_NLQ_CONDITION_LABELS = (
-    "발주담당자", "제약담당자", "제약사", "제조사", "발주처", "담당자",
+    *_DASHBOARD_STAFF_LABELS, "제약사", "제조사", "발주처", "담당자",
     "재고기준", "재고위치", "제품그룹", "제품구분", "제품분류",
     "거래처그룹", "거래처종류", "입출고구분",
 )
@@ -69,6 +75,8 @@ def _dashboard_unrecognized_staff_label(text: str) -> tuple[str, str] | None:
         if label == "담당자" or not label.endswith("담당자"):
             continue
         shortened = label[:-1]
+        if shortened in _DASHBOARD_STAFF_LABELS:
+            continue
         if re.search(rf"(?<![가-힣A-Za-z0-9]){re.escape(shortened)}(?!자)(?=\s+\S)", source):
             return shortened, label
     return None
@@ -5797,6 +5805,7 @@ def _extract_dashboard_nlq_conditions(text: str) -> tuple[dict[str, str], str]:
     for match in pattern.finditer(source):
         residual_parts.append(source[cursor:match.start()])
         label = str(match.group("label") or "").strip()
+        label = _DASHBOARD_STAFF_LABELS.get(label, label)
         value = _dashboard_nlq_residual(str(match.group("value") or ""))
         # A bare supplier label (for example, "발주처 담당자 김") still
         # explicitly selects the Dashboard supplier mode.  Keep it even when
@@ -5869,6 +5878,14 @@ def _build_dashboard_nlq_params(
             status="input_required", params={}, question=text,
             reason_code="unrecognized_staff_condition",
         )
+    explicit_conditions, _ = _extract_dashboard_nlq_conditions(text)
+    for label in ("발주담당자", "제약담당자"):
+        if label in explicit_conditions and not explicit_conditions[label]:
+            return {}, _dashboard_nlq_text_payload(
+                f"{label} 이름을 지정해 주세요. 담당자 조건을 제외한 일일점검은 실행하지 않았습니다.",
+                status="input_required", params={}, question=text,
+                reason_code="missing_staff_name",
+            )
     from app.services.dashboard_lite_facts import default_dashboard_lite_scope, normalize_dashboard_lite_params
     from app.services.io_nlq import (
         _has_explicit_all_stock_locations, extract_params,

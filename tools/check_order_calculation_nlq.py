@@ -11,6 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.services.erp_table_nlq import resolve_registered_erp_table_nlq, is_order_calculation_request
 from app.services.io_nlq import resolve_io_nlq
 from app.sims.nlq.nlq_router import _try_handle_io_nlq, resolve_new_sims_nlq_candidate
+from app.sims.nlq import nlq_router
+from app.ui.knowledge_chat_adapter import parse_incomplete_sims_help_request, verified_sims_help_text
 from app.services.order_calculation_service import (
     build_manual_validation_evidence,
     filter_base_by_order_scope,
@@ -345,6 +347,7 @@ def run():
         assert sent[0]['meta']['source_call_count'] == 0
 
     staff_cases = {
+        '발주담당 신 조회구분 전체 발주계산': ['신민우'],
         '발주담당자 신민우 조회구분 전체 발주계산': ['신민우'],
         '발주담당자 신 조회구분 전체 발주계산': ['신민우'],
         '발주담당자 윤 조회구분 전체 발주계산': ['윤정아'],
@@ -366,10 +369,49 @@ def run():
         assert requests[0]['order_staff_nm'] in text
         assert requests[0]["_original_question"] == text
         if expected_names:
+            assert 'df' in sent[0], (text, sent[0].get('meta'))
             assert sorted(sent[0]['df']['발주담당자'].drop_duplicates().tolist()) == expected_names
         else:
             assert sent[0].get('records') == [] and sent[0]['meta']['row_count_total'] == 0
         assert sent[0]['meta']['source_call_count'] == 0
+
+    for text in ('발주담당 신 발주계산', '발주담당자 신 발주계산',
+                 '발주계산 발주담당 신', '발주계산 발주담당자 신'):
+        assert resolve_io_nlq(text)['params']['order_staff_nm'] == '신', text
+        sent, requests = [], []
+        def capture_service(params=None):
+            requests.append(params)
+            return {'records': [], 'meta': {'row_count_total': 0, 'source_call_count': 0}}
+        with patch('app.services.order_calculation_service.get_order_calculation_result', side_effect=capture_service), \
+             patch('app.ui.chat_middleware.push_sims_result_to_chat', side_effect=lambda p, a: sent.append(p) or p['meta']):
+            assert _try_handle_io_nlq(text, room={}, session_state={}, make_ts=lambda: 'fixture',
+                next_seq=lambda: 1, logger=logging.getLogger('fixture'))
+        assert len(requests) == len(sent) == 1 and requests[0]['order_staff_nm'] == '신'
+    assert resolve_io_nlq('발주담당자 신민우 발주계산')['params']['order_staff_nm'] == '신민우'
+    both = resolve_io_nlq('제약담당자 김 발주담당 신 조회구분 전체 발주계산')['params']
+    assert both['order_staff_nm'] == '신' and both['pharma_staff_nm'] == '김'
+    assert both['query_mode'] == '전체'
+    assert not resolve_io_nlq('발주계산')['params'].get('order_staff_nm')
+    inquiry = resolve_io_nlq('발주담당 신 발주조회')
+    assert inquiry['action'] == '발주조회' and inquiry['params']['order_staff_nm'] == '신'
+    for text in ('발주담당 신 SIMS 일일점검', 'SIMS 일일점검 발주담당자 신'):
+        assert parse_incomplete_sims_help_request(text) is None
+        assert nlq_router._extract_dashboard_nlq_conditions(text) == ({'발주담당자': '신'}, '')
+    assert resolve_io_nlq('제약담당 김 발주계산')['params']['pharma_staff_nm'] == '김'
+
+    for text in ('발주담당 발주계산', '발주담당자 발주계산', '발주계산 발주담당'):
+        parsed = resolve_io_nlq(text)
+        assert parsed['params'].get('_unconsumed_order_condition') == '발주담당자', text
+        help_intent = parse_incomplete_sims_help_request(text)
+        assert help_intent and help_intent.subject_label == '발주담당자', text
+        help_text = verified_sims_help_text(help_intent, allowed_actions={'발주 계산'})
+        assert '발주담당자 [이름] 발주계산' in help_text, text
+        with patch.object(nlq_router, '_try_handle_io_nlq', side_effect=AssertionError('ERP route')):
+            assert not nlq_router.try_handle_nlq(
+                text, room={'messages': []}, session_state={}, make_ts=lambda: 'fixture',
+                next_seq=lambda: 1, logger=logging.getLogger('fixture'),
+            ), text
+    print('PASS order-staff alias, role isolation, incomplete-condition ERP guard')
 
     pharma_cases = {
         '제약담당자 이 조회구분 전체 발주계산': ['이기재', '이정민'],
