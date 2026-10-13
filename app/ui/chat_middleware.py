@@ -6,6 +6,7 @@
 #VERSION = "vendors/2026-05-03-002"
 from __future__ import annotations
 from typing import Any, Dict, Optional, Iterable, Tuple, List
+from decimal import Decimal, InvalidOperation
 import os
 import io, json, hashlib, logging
 import math
@@ -2951,6 +2952,15 @@ def _sims_business_terms(action_name: str, columns: Any = ()) -> dict:
     """
     action = str(action_name or "")
 
+    if action == "발주 계산":
+        return {
+            "flow_label": "발주 계산", "amount_label": "발주금액(부가세포함)",
+            "vendor_label": "발주처", "qty_label": "실제 발주수량",
+            "amount_priority": ("발주금액(부가세포함)",),
+            "avoid_words": ["반품공급가액", "확정 발주금액"],
+            "preferred_words": ["추천 발주수량", "실제 발주수량", "단가 미확정", "금액 부분합"],
+        }
+
     if action == "제품정보 조회":
         try:
             labels = {str(column) for column in columns}
@@ -3573,6 +3583,39 @@ def _build_sims_doc_division_profile(df: pd.DataFrame, action_name: str = "") ->
         "division_summary": _sims_ctx_to_records(grouped, 20),
     }
 
+def _build_order_calculation_analysis_profile(df: pd.DataFrame) -> dict[str, Any]:
+    """Summarize only order measures; unknown prices never become zero amounts."""
+    def numbers(column: str) -> pd.Series:
+        return pd.to_numeric(df.get(column, pd.Series(index=df.index, dtype="float64")), errors="coerce")
+
+    recommended = numbers("추천 발주수량")
+    actual = numbers("실제 발주수량")
+    amount = numbers("발주금액(부가세포함)")
+    decision = df.get("단가판정", pd.Series("", index=df.index)).fillna("").astype(str).str.strip()
+    price_missing = decision.eq("REVIEW")
+    confirmed_amount = amount.where(~price_missing)
+    exact_amount = Decimal(0)
+    for value in df.get("발주금액(부가세포함)", pd.Series(index=df.index, dtype="object"))[~price_missing]:
+        if pd.isna(value):
+            continue
+        try:
+            exact_amount += Decimal(str(value))
+        except InvalidOperation:
+            continue
+    changed = numbers("추천대비수정수량").fillna(0).ne(0)
+    return {
+        "amount_col": "발주금액(부가세포함)",
+        "amount_confirmed_partial_sum": str(exact_amount) if confirmed_amount.notna().any() else None,
+        "amount_confirmed_rows": int(confirmed_amount.notna().sum()),
+        "amount_unconfirmed_rows": int((price_missing | (actual.gt(0) & amount.isna())).sum()),
+        "price_unconfirmed_rows": int(price_missing.sum()),
+        "price_unconfirmed_positive_recommended_rows": int((price_missing & recommended.gt(0)).sum()),
+        "recommended_quantity_sum": float(recommended.sum()) if recommended.notna().any() else None,
+        "actual_quantity_sum": float(actual.sum()) if actual.notna().any() else None,
+        "user_edited_rows": int(changed.sum()),
+    }
+
+
 def _build_sims_analysis_context_from_df(
     base_df: pd.DataFrame,
     *,
@@ -3594,6 +3637,12 @@ def _build_sims_analysis_context_from_df(
         columns=list(base_df.columns),
     )
     safe_sample_df = sanitize_sims_llm_dataframe(base_df, profile)
+    if action == "발주 계산":
+        order_sample_columns = (
+            "제품코드", "제품명", "발주처", "추천 발주수량", "실제 발주수량",
+            "발주단가", "단가판정", "발주금액(부가세포함)", "추천대비수정수량",
+        )
+        safe_sample_df = safe_sample_df.loc[:, [col for col in order_sample_columns if col in safe_sample_df.columns]]
     safe_params = sanitize_llm_mapping(params, profile=profile)
     safe_meta = sanitize_llm_mapping(meta, profile=profile)
     query_scope_summary = build_query_scope_summary(
@@ -3664,14 +3713,20 @@ def _build_sims_analysis_context_from_df(
     except Exception:
         pass
 
-    sales_time_profile = _build_sims_sales_time_profile(base_df, business_terms)
-    sales_group_profile = _build_sims_sales_group_profile(base_df, business_terms)
+    order_calculation_profile = _build_order_calculation_analysis_profile(base_df) if action == "발주 계산" else {}
+    if order_calculation_profile:
+        business_terms = _sims_business_terms(action, base_df.columns)
+        sales_time_profile, sales_group_profile = {}, {}
+    else:
+        sales_time_profile = _build_sims_sales_time_profile(base_df, business_terms)
+        sales_group_profile = _build_sims_sales_group_profile(base_df, business_terms)
 
-    sales_time_profile, sales_group_profile = _apply_business_terms_to_sales_profiles(
-        sales_time_profile,
-        sales_group_profile,
-        business_terms,
-    )
+    if not order_calculation_profile:
+        sales_time_profile, sales_group_profile = _apply_business_terms_to_sales_profiles(
+            sales_time_profile,
+            sales_group_profile,
+            business_terms,
+        )
 
     from app.ui.sims_analysis_profiles import snapshot_grade_analysis_contract
     grade_contract = snapshot_grade_analysis_contract(action, base_df.columns)
@@ -3843,6 +3898,12 @@ def _build_sims_analysis_context_from_df(
 
 
     analysis_text += grade_contract
+    if order_calculation_profile:
+        analysis_text += (
+            "- 발주금액은 확정 단가가 있는 행의 부분합만 제시합니다. "
+            "단가 미확정 행의 금액을 0원이나 전체 확정액으로 해석하지 마세요.\n"
+            f"- 발주계산 수량/금액 요약: {order_calculation_profile}\n"
+        )
     if llm_summary_md:
         analysis_text += "\n[LLM 요약/전체 집계]\n" + llm_summary_md + "\n"
 
@@ -3872,6 +3933,7 @@ def _build_sims_analysis_context_from_df(
         "llm_summary_md": llm_summary_md,
         
         "business_terms": business_terms,
+        "order_calculation_profile": order_calculation_profile,
         "doc_division_profile": doc_division_profile,
         "doc_time_profile": doc_time_profile,
         "doc_counterparty_profile": doc_counterparty_profile,

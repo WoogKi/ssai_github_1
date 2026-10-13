@@ -864,7 +864,14 @@ def _prepare_display_df(
 
     fallback_product_cd = clean_text(params.get("physic_cd"))
     fallback_product_nm = clean_text(params.get("physic_nm"))
-    fallback_stock_nm = ", ".join([str(x).strip() for x in stock_names if str(x).strip()])
+    stock_codes = _normalize_stock_codes(params)
+    if not stock_codes:
+        carry_stock_label = "전체 위치 합계"
+    elif len(stock_codes) > 1:
+        carry_stock_label = "선택 위치 합계"
+    else:
+        names = [str(x).strip() for x in stock_names if str(x).strip()]
+        carry_stock_label = names[0] if len(names) == 1 else stock_codes[0]
 
     raw_master_info = params.get("__product_info__")
     master_info = raw_master_info if isinstance(raw_master_info, dict) else {}
@@ -916,12 +923,11 @@ def _prepare_display_df(
             "특수관리제품명": _pick_text("특수관리제품명"),
         }
 
-    def _make_carry_row(source_row: Dict[str, Any] | None = None) -> Dict[str, Any]:
-        src = source_row or {}
+    def _make_carry_row() -> Dict[str, Any]:
         row = _blank_row()
         row["입출고일자"] = "이월재고"
         row["재고수량"] = carry_qty
-        row["재고위치"] = str(src.get("재고위치", "")).strip() or fallback_stock_nm
+        row["재고위치"] = carry_stock_label
         return row
 
     if df is None or df.empty:
@@ -978,7 +984,7 @@ def _prepare_display_df(
         first_src = {}
 
     product_info = _build_product_info(first_src)
-    carry_row = _make_carry_row(first_src)
+    carry_row = _make_carry_row()
 
     out = _concat_product_flow_frames(
         [
