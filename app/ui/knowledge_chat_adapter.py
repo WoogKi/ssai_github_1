@@ -171,6 +171,11 @@ def parse_incomplete_sims_help_request(value: object, *, today: date | None = No
         return None
     query = re.sub(r"\s+", " ", value.strip())
     compact = re.sub(r"\s+", "", query).casefold()
+    from app.services.io_nlq import unregistered_io_status_phrase
+
+    unregistered_status = unregistered_io_status_phrase(query)
+    if unregistered_status:
+        return SimsHelpIntent("unregistered_io_status", query, subject_value=unregistered_status)
     # These shapes otherwise lose an explicit condition or execute a different
     # registered action. Resolve them before current-table and ERP routing.
     if re.search(r"(?i)^(?:sims\s+)?일일점(?!검)[^\s]*", query):
@@ -396,6 +401,8 @@ def verified_sims_help_examples(
         if _resolve_analytics_action(example) != action or (candidate or {}).get("action") != action:
             return ()
         return ((action, example),)
+    elif intent.reason == "unregistered_io_status":
+        return ()
     elif intent.reason == "condition_confirmation" and role == "재고위치":
         from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
         from app.services.order_stock_location_scope import extract_order_stock_terms
@@ -486,6 +493,7 @@ def verified_sims_help_text(
         "document_type_confirmation": "어떤 업무 또는 전표 종류를 뜻하는지 확인해 주세요. 이전 조회 결과를 적용하거나 새로 조회하지 않았습니다.",
         "unregistered_grouped_sales_status": "현재 질문에 해당하는 조회 업무를 확정하지 못했습니다. 이번 조회는 실행하지 않았습니다.",
         "unregistered_grouped_sales_budget": "매출예산은 매출 예상과 다른 업무입니다. 예산 조회는 실행하지 않았습니다.",
+        "unregistered_io_status": "요청하신 입출고 상태 조회는 현재 SIMS AI에서 지원하지 않습니다. 수주 연계 및 해당 현황 조회 기능이 구현되지 않았습니다. 이번 조회는 실행하지 않았습니다.",
         "condition_confirmation": "조회조건의 의미를 확인해 주세요. 조건을 생략한 전체 조회는 실행하지 않았습니다.",
         "single_action_required": "한 번에 한 업무를 질문해 주세요. 두 업무를 하나로 조회하지 않았습니다.",
     }
@@ -494,6 +502,8 @@ def verified_sims_help_text(
     answer = titles[intent.reason]
     if intent.reason == "unregistered_grouped_sales_status":
         answer += "\n\n매출현황과 매출 예상은 서로 다른 개념입니다."
+    if intent.reason == "unregistered_io_status":
+        answer = f"{intent.subject_value}은 현재 SIMS AI에서 지원하지 않습니다. 수주 연계 및 {intent.subject_value} 조회 기능이 구현되지 않았습니다. 이번 조회는 실행하지 않았습니다."
     if intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
         answer = "발주계산에서 재고위치를 지정하려는 것으로 이해했습니다. 이번 발주계산은 실행하지 않았습니다."
     elif intent.reason == "condition_confirmation" and intent.subject_label in {"발주담당자", "제약담당자"}:
@@ -542,8 +552,11 @@ def verified_sims_help_text(
     if allow_knowledge_help:
         answer += "\n\n추가 설명은 'SIMS 질문 예시 알려줘'로 요청할 수 있습니다."
     elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required",
-                           "document_type_confirmation", "unregistered_grouped_sales_budget"}:
+                           "document_type_confirmation", "unregistered_grouped_sales_budget",
+                           "unregistered_io_status"}:
         answer += "\n\n지원되는 질문은 'SIMS 질문 예시 알려줘'에서 확인할 수 있습니다."
+    if intent.reason == "unregistered_io_status":
+        return answer
     return answer + "\n\n조회는 조건을 선택해 다시 입력한 뒤 기존 권한 검사를 거쳐 실행됩니다."
 
 

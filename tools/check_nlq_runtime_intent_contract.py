@@ -25,6 +25,7 @@ from app.services.io_nlq import (
     resolve_unlabeled_io_entity_condition as production_unlabeled_io_entity_condition,
 )
 from app.sims.nlq import nlq_router
+from app.ui.knowledge_chat_adapter import parse_incomplete_sims_help_request, verified_sims_help_text
 
 
 FIXED_NOW = datetime(2026, 9, 27, 12, 0, 0)
@@ -151,6 +152,45 @@ def _resolver_notice_case(name: str, question: str, status: str) -> bool:
 
 def main() -> int:
     checks: list[bool] = []
+    for question in (
+        "미출고현황", "현재 미출고현황", "제품별 미출고현황", "미출고 현황 제품별",
+        "제품별 미출고 현황", "미출고현황조회", "미출고현황을 보여줘",
+        "미출고현황이 궁금해요", "현재미출고현황",
+    ):
+        intent = parse_incomplete_sims_help_request(question)
+        handled, calls, sent = _run_router(question)
+        help_text = verified_sims_help_text(
+            intent, allowed_actions={"출고명세 조회"},
+        ) if intent else ""
+        checks.append(_assert(
+            f"unregistered IO status {question}",
+            bool(intent and intent.reason == "unregistered_io_status"
+                 and resolve_io_nlq(question) is None
+                 and nlq_router.resolve_new_sims_nlq_candidate(question) is None
+                 and not handled and not calls and not sent
+                 and "미출고현황" in help_text and "이번 조회는 실행하지 않았습니다" in help_text
+                 and "출고명세 조회" not in help_text
+                 and "조건을 선택해 다시 입력" not in help_text),
+            {"intent": intent, "calls": len(calls), "candidate": nlq_router.resolve_new_sims_nlq_candidate(question)},
+        ))
+    for question in ("출고명세", "출고명세 조회", "출고명세 제조사 동제"):
+        parsed = resolve_io_nlq(question) or {}
+        params = parsed.get("params") or {}
+        checks.append(_assert(
+            f"registered outbound detail {question}",
+            parsed.get("action") == "출고명세 조회"
+            and (question != "출고명세 제조사 동제" or params.get("maker_nm") == "동제"),
+            parsed,
+        ))
+    for question in ("미결출고", "미결출고 조회", "미결출고 현황"):
+        parsed = resolve_io_nlq(question) or {}
+        checks.append(_assert(
+            f"existing pending outbound {question}",
+            parse_incomplete_sims_help_request(question) is None
+            and parsed.get("action") == "출고명세 조회"
+            and (parsed.get("params") or {}).get("io_gu_prefix") == "8",
+            parsed,
+        ))
     for question in ("IMS 일일점검", "IMS 일일점검 재고위치 00001", "SIMS 일일점검 재고위치 00001"):
         action = nlq_router._resolve_dashboard_nlq_action(question)
         candidate = nlq_router.resolve_new_sims_nlq_candidate(question)

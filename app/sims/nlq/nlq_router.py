@@ -7963,6 +7963,7 @@ def try_handle_nlq(
         "dashboard_condition_confirmation",
         "unregistered_grouped_sales_status",
         "unregistered_grouped_sales_budget",
+        "unregistered_io_status",
     }:
         logger.info("[nlq.router] condition or action confirmation required; erp_call_count=0")
         return False

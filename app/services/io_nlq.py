@@ -172,6 +172,26 @@ def _norm(text: str) -> str:
     return normalized.replace("메입", "매입")
 
 
+def unregistered_io_status_phrase(text: str) -> str:
+    """Keep an unregistered negative status distinct from an IO detail action."""
+    match = re.search(
+        r"(?<![가-힣A-Za-z0-9])(?:현재\s*)?미\s*(출고)\s*현황"
+        r"(?=$|[^가-힣A-Za-z0-9]|조회|[이가은는을를])",
+        _norm(text),
+    )
+    if not match:
+        return ""
+    phrase = f"미{match.group(1)}현황"
+    from app.sims.nlq.action_inventory import implemented_actions
+
+    registered = {
+        re.sub(r"\s+", "", label)
+        for action in implemented_actions()
+        for label in (action.canonical_action, *action.label_aliases, *action.nlq_aliases)
+    }
+    return "" if phrase in registered or f"{phrase}조회" in registered else phrase
+
+
 def _has_any(text: str, words: tuple[str, ...]) -> bool:
     return any(w in text for w in words)
 
@@ -3489,6 +3509,9 @@ def _apply_transaction_document_validation_intent(
 def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str, Any]]:
     raw = _split_compact_relative_day_action(_norm(text))
     if not raw:
+        return None
+
+    if unregistered_io_status_phrase(raw):
         return None
 
     from app.services.erp_table_nlq import is_order_calculation_request, resolve_registered_erp_table_nlq
