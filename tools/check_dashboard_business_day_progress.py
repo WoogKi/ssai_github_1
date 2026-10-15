@@ -26,7 +26,7 @@ from app.services.dashboard_lite_facts import (
     build_dashboard_lite_facts,
 )
 from app.services.ssai_business_calendar_repository import CalendarAuthorityRead
-from app.sims.views.dashboard_lite import _build_sales_bar_chart
+from app.sims.views.dashboard_lite import _build_sales_bar_chart, _build_sales_gauge_markup, _sales_gauge_state
 
 
 def _ready_context() -> BusinessDayMonthContext:
@@ -106,6 +106,51 @@ def main() -> int:
     assert abs(float(visualization["expected_to_date_sales"]) - 45.0) < 1e-12
     assert abs(float(visualization["time_adjusted_achievement_pct"]) - (50 / 45 * 100)) < 1e-12
     assert float(visualization["forecast_sales"]) == 100.0
+    assert sales["metrics"]["current_month_sales"]["value"] == 50.0
+    assert sales["metrics"]["current_month_forecast_sales"]["value"] == 100.0
+    assert sales["metrics"]["current_month_progress_pct"]["value"] == 50.0
+    assert abs(float(visualization["sales_progress_pct"]) - 50.0) < 1e-12
+    sales_rows = {row["kind"]: row["value"] for row in sales["chart_rows"] if row["period_sort"] == "202609"}
+    assert sales_rows["당월 현재(부분월)"] == visualization["current_sales"]
+    assert sales_rows["당월 예상"] == visualization["forecast_sales"]
+    gauge = _sales_gauge_state({"period": {"judgement_date": "20260911"}, "sales": sales})
+    assert gauge["needle_pct"] == 50.0
+    assert gauge["today_marker_pct"] == 45.0
+    markup = _build_sales_gauge_markup({"period": {"judgement_date": "20260911"}, "sales": sales})
+    assert "월말 예상 대비 누적 진척률" in markup
+    assert "주황선 45.0%: 11일 기준 예상 진척률" in markup
+    assert "11일 기준 예상 대비 달성률 111.1%" in markup
+    chart_spec = _build_sales_bar_chart({"period": {"judgement_date": "20260911"}, "sales": sales}).to_dict()
+    chart_rows = [row for rows in chart_spec.get("datasets", {}).values() for row in rows if isinstance(row, dict)]
+    assert any(row.get("series") == "실제매출" and row.get("value") == 50.0 for row in chart_rows)
+    assert any(row.get("series") == "월말 예상매출" and row.get("value") == 100.0 for row in chart_rows)
+    assert any(row.get("series") == "11일 기준 누적 예상매출" and row.get("value") == 45.0 for row in chart_rows)
+
+    october_context = BusinessDayMonthContext(
+        evaluation_date="20261015", evaluation_month="202610",
+        calendar_days_total=31, elapsed_calendar_days=15,
+        calendar_progress_ratio=15 / 31,
+        business_days_total=20, elapsed_business_days=9,
+        business_day_progress_ratio=9 / 20, authority_status="ready",
+    )
+    october_sales = _build_sales_facts(
+        {"df": pd.DataFrame([{
+            "제약사명": "fixture", "완료월총매출": 0.0, "완료월수": 0,
+            "당월 현재매출": 63_339_100_000.0,
+            "당월 예상매출": 133_133_700_000.0,
+        }]), "meta": {"evaluation_month": "202610"}},
+        evaluation_month="202610", policy_date="20261015",
+        today=date(2026, 10, 15), business_day_context=october_context,
+    )
+    october_visual = october_sales["visualization"]
+    assert round(float(october_visual["sales_progress_pct"]), 1) == 47.6
+    assert abs(float(october_visual["expected_to_date_sales"]) / 1_000_000 - 59_910.1) < 0.1
+    assert round(float(october_visual["time_adjusted_achievement_pct"]), 1) == 105.7
+    october_gauge = _sales_gauge_state({"period": {"judgement_date": "20261015"}, "sales": october_sales})
+    assert round(float(october_gauge["today_marker_pct"]), 1) == 45.0
+    october_rows = {row["kind"]: row["value"] for row in october_sales["chart_rows"] if row["period_sort"] == "202610"}
+    assert october_rows["당월 현재(부분월)"] == october_visual["current_sales"]
+    assert october_rows["당월 예상"] == october_visual["forecast_sales"]
     product_forecast = pd.DataFrame([{
         "제품코드": "fixture-1",
         **{f"2026-{month:02d} 매출": float(month * 10) for month in range(3, 9)},

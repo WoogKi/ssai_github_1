@@ -39,6 +39,13 @@ CUSTOMER_SALES_FORECAST_FILTER_KEYS = frozenset({
 
 SOURCE_LABEL = "출고 거래명세서 원장매출(Rddbc130)"
 
+
+def _source_label(source_stats: Dict[str, Any]) -> str:
+    if source_stats.get("source_table") == "Rddbc120":
+        return "출고상세 매출(Rddbc120, 선택 입출고구분)"
+    return SOURCE_LABEL
+
+
 CUSTOMER_FORECAST_COLUMNS = [
     "순번",
     "매출처코드",
@@ -621,10 +628,10 @@ def get_customer_sales_forecast_df(params: Optional[Dict[str, Any]] = None) -> p
     params = _apply_period_source_policy_params(_apply_month_or_date_params(coalesce_params(params)))
     policy = _resolve_period_source_policy(params)
     months = _month_range(params, policy)
-    source_label = SOURCE_LABEL
     source_t0 = time.perf_counter()
     monthly = _combine_sources(params, policy)
     source_stats = dict(getattr(monthly, "attrs", {}) or {})
+    source_label = _source_label(source_stats)
     source_elapsed = time.perf_counter() - source_t0
     master_t0 = time.perf_counter()
     master = _load_customer_master(params)
@@ -907,6 +914,7 @@ def get_group_sales_forecast_df(params: Optional[Dict[str, Any]] = None, *, grou
     monthly, source_stats, source_elapsed, master_elapsed = _prepare_customer_monthly_with_master(params, policy)
     if monthly.empty:
         return pd.DataFrame()
+    source_label = _source_label(source_stats)
 
     if group_type == "salesperson":
         monthly["영업사원코드"] = monthly["영업사원코드"].replace("", "빈값")
@@ -951,7 +959,7 @@ def get_group_sales_forecast_df(params: Optional[Dict[str, Any]] = None, *, grou
     group_monthly = grid.merge(group_monthly, on=[group_id_col, "기준월"], how="left")
     for c in ["매출공급가액", "매출세액", "매출합계", "집계건수", "매출처수", "영업사원수"]:
         group_monthly[c] = pd.to_numeric(group_monthly[c], errors="coerce").fillna(0) if c in group_monthly.columns else 0
-    group_monthly["분석자료원"] = SOURCE_LABEL
+    group_monthly["분석자료원"] = source_label
     group_monthly["기간구분"] = _display_period_label(policy)
     wf = _build_group_workforward(group_monthly, group_id_col, params)
     evaluation_month = str(policy.get("evaluation_month") or (months[-1] if months else ""))
@@ -1082,7 +1090,7 @@ def get_group_sales_forecast_df(params: Optional[Dict[str, Any]] = None, *, grou
             "months": months,
             "evaluation_mode": policy.get("evaluation_mode"),
             "evaluation_month": policy.get("evaluation_month"),
-            "source_label": SOURCE_LABEL,
+            "source_label": source_label,
             "display_period_label": _display_period_label(policy),
             "pre_filter_trend_judge_counts": pre_trend_counts,
             "post_filter_trend_judge_counts": post_trend_counts,

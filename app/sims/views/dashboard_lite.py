@@ -1326,7 +1326,7 @@ def _build_sales_gauge_markup(facts: dict[str, Any], *, render_namespace: str = 
         )
     else:
         main_text = f"{_fmt_number(progress, 1)}%"
-        gauge_label = "월말 예상 대비 실제 진행률"
+        gauge_label = "월말 예상 대비 실제 진행률" if state["is_completed_month"] else "월말 예상 대비 누적 진척률"
         if state["is_completed_month"]:
             amount_unit = _facts_amount_display_unit(facts)
             difference = state.get("completed_forecast_difference")
@@ -1339,7 +1339,13 @@ def _build_sales_gauge_markup(facts: dict[str, Any], *, render_namespace: str = 
             else:
                 gauge_sub = "예상과 동일"
         else:
-            gauge_sub = f"{state['judgement_basis']} 예상 대비 달성률 {today_achievement}"
+            marker_pct = state.get("today_marker_pct")
+            gauge_sub = (
+                f"주황선 {_fmt_number(marker_pct, 1)}%: {state['judgement_basis']} 예상 진척률 · "
+                f"{state['judgement_basis']} 예상 대비 달성률 {today_achievement}"
+                if marker_pct is not None
+                else f"{state['judgement_basis']} 예상 대비 달성률 {today_achievement}"
+            )
     return "".join([
         '<div class="dashboard-lite-sales-gauge">',
         f'<div class="dashboard-lite-sales-gauge-title">{html.escape(state["evaluation_label"])} 매출 진행</div>',
@@ -1623,7 +1629,7 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
     return_df["month_status"] = "반품"
     visualization = (facts.get("sales") or {}).get("visualization") or {}
     state = _sales_presentation_state(facts)
-    current_day_series = f"{state['judgement_basis']} 예상매출"
+    current_day_series = f"{state['judgement_basis']} 누적 예상매출"
     has_sales_returns = bool(return_df["return_magnitude"].gt(0).any())
     display_frames = [actual_df, forecast_df]
     if state["expected_to_date_chart_visible"]:
@@ -1641,6 +1647,8 @@ def _build_sales_bar_chart(facts: dict[str, Any]) -> alt.Chart | alt.LayerChart 
             "amount_display_unit": unit_label,
             "month_status": "평가월",
             "time_progress_pct": visualization.get("time_progress_pct"),
+            "forecast_basis": "월말 예상매출 × 기준일 시간 진척률",
+            "forecast_status": "기준일 누적 예상",
         }]))
     display_df = pd.concat(display_frames, ignore_index=True, sort=False)
     cluster_order = ["실제매출", "월말 예상매출", current_day_series]
@@ -1880,7 +1888,7 @@ def _render_sales_chart(facts: dict[str, Any]) -> None:
     if chart is None:
         st.info("매출 그래프를 표시할 완료월/당월 facts가 없습니다.")
         return
-    judgement_label = f"{state['judgement_basis']} 예상매출"
+    judgement_label = f"{state['judgement_basis']} 누적 예상매출"
     judgement_legend = (
         f'<span class="dashboard-lite-sales-chart-legend-item"><span class="dashboard-lite-sales-chart-legend-swatch dashboard-lite-sales-chart-legend-judgement"></span>{html.escape(judgement_label)}</span>'
         if state["expected_to_date_chart_visible"] else ""

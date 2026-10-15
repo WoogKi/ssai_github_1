@@ -11309,9 +11309,9 @@ def run_basic_checks() -> list[CheckResult]:
             expected_to_date = 90 * 10 / 23
             if active_marks != ["bar", "bar", "bar", "text"]:
                 chart_errors.append(f"active_grouped_bar_layers={active_marks!r}")
-            if not all(active_rows.get(series) for series in ("실제매출", "월말 예상매출", "14일 기준 예상매출")):
+            if not all(active_rows.get(series) for series in ("실제매출", "월말 예상매출", "14일 기준 누적 예상매출")):
                 chart_errors.append(f"active_marker_series={sorted(active_rows)!r}")
-            judgement_rows = active_rows.get("14일 기준 예상매출") or []
+            judgement_rows = active_rows.get("14일 기준 누적 예상매출") or []
             if (
                 len(judgement_rows) != 1
                 or judgement_rows[0].get("month_status") != "평가월"
@@ -11353,7 +11353,7 @@ def run_basic_checks() -> list[CheckResult]:
                 progress = float((boundary_facts.get("visualization") or {}).get("time_progress_pct") or 0)
                 if progress != expected_progress:
                     chart_errors.append(f"{label}_progress={progress!r}")
-                if any("기준 예상매출" in series for series in boundary_rows) or boundary_marks != ["bar", "bar"]:
+                if any("기준 누적 예상매출" in series for series in boundary_rows) or boundary_marks != ["bar", "bar"]:
                     chart_errors.append(f"{label}_marker_eligibility={boundary_marks!r}/{sorted(boundary_rows)!r}")
                 if not boundary_rows.get("월말 예상매출"):
                     chart_errors.append(f"{label}_month_end_marker_missing")
@@ -11638,8 +11638,8 @@ def run_basic_checks() -> list[CheckResult]:
             month_scale = (bar_encoding.get("x") or {}).get("scale") or {}
             offset_encoding = bar_encoding.get("xOffset") or {}
             offset_scale = offset_encoding.get("scale") or {}
-            expected_cluster_order = ["실제매출", "월말 예상매출", "14일 기준 예상매출"]
-            expected_legend_order = ["실제매출", "월말 예상매출", "14일 기준 예상매출"]
+            expected_cluster_order = ["실제매출", "월말 예상매출", "14일 기준 누적 예상매출"]
+            expected_legend_order = ["실제매출", "월말 예상매출", "14일 기준 누적 예상매출"]
             if (
                 month_scale.get("paddingInner") != 0.42
                 or month_scale.get("paddingOuter") != 0.10
@@ -11691,7 +11691,7 @@ def run_basic_checks() -> list[CheckResult]:
                 for series, rows in grouped_rows.items()
                 if any(row.get("display_period") == "6월" for row in rows)
             }
-            if july_series != {"실제매출", "14일 기준 예상매출", "월말 예상매출"}:
+            if july_series != {"실제매출", "14일 기준 누적 예상매출", "월말 예상매출"}:
                 preforecast_errors.append(f"evaluation_month_grouped_series={sorted(july_series)!r}")
             if june_series != {"실제매출", "월말 예상매출"}:
                 preforecast_errors.append(f"completed_month_grouped_series={sorted(june_series)!r}")
@@ -15990,6 +15990,7 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
     )
 
     old_130 = getattr(customer_mod, "_load_rddbc130_monthly", None)
+    old_120 = getattr(customer_mod, "_load_rddbc120_monthly_for_exact_io", None)
     old_master = getattr(customer_mod, "_load_customer_master", None)
 
     def fake_130(params, policy):
@@ -16373,6 +16374,36 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
         if set(filtered["매출처코드"].astype(str).tolist()) != {"50001"}:
             mismatches.append(f"master address filter failed codes={filtered['매출처코드'].astype(str).tolist()}")
 
+        selected_calls = {"r120": 0}
+
+        def fake_120(_params, _policy):
+            selected_calls["r120"] += 1
+            selected = monthly_rows.copy()
+            selected.attrs.update({"source_table": "Rddbc120", "source_mode": "detail_exact_io"})
+            return selected
+
+        setattr(customer_mod, "_load_rddbc120_monthly_for_exact_io", fake_120)
+        prior_r130_calls = calls["r130"]
+        selected_params = {**params_current, "io_gu_list": ["598"]}
+        selected_df = customer_mod.get_salesperson_sales_forecast_df(selected_params)
+        selected_result = customer_mod.get_salesperson_sales_forecast_result(selected_params)
+        selected_customer = customer_mod.get_customer_sales_forecast_result(selected_params)
+        selected_region = customer_mod.get_region_sales_forecast_result(selected_params)
+        selected_meta = selected_result.get("meta") or {}
+        if selected_calls["r120"] != 4 or calls["r130"] != prior_r130_calls:
+            mismatches.append("selected IO must use only the Rddbc120 loader")
+        if not selected_df["분석자료원"].astype(str).str.contains("Rddbc120", regex=False).all():
+            mismatches.append("selected IO table label does not match Rddbc120")
+        for action_result in (selected_result, selected_customer, selected_region):
+            result_meta = action_result.get("meta") or {}
+            for field in ("source_label", "query_summary", "summary_md"):
+                if "Rddbc120" not in str(result_meta.get(field) or "") or "Rddbc130" in str(result_meta.get(field) or ""):
+                    mismatches.append(f"selected IO {field} does not match Rddbc120")
+        if selected_meta.get("source_table") != "Rddbc120":
+            mismatches.append("selected IO source_table meta does not match Rddbc120")
+        if "Rddbc130" not in str(meta.get("source_label") or ""):
+            mismatches.append("legacy Rddbc130 label changed unexpectedly")
+
         if mismatches:
             results.append(_fail("customer sales forecast", "; ".join(mismatches)))
         else:
@@ -16382,6 +16413,8 @@ def _run_customer_sales_forecast_basic_checks() -> list[CheckResult]:
     finally:
         if old_130 is not None:
             setattr(customer_mod, "_load_rddbc130_monthly", old_130)
+        if old_120 is not None:
+            setattr(customer_mod, "_load_rddbc120_monthly_for_exact_io", old_120)
         if old_master is not None:
             setattr(customer_mod, "_load_customer_master", old_master)
 
