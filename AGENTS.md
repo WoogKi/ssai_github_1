@@ -79,6 +79,7 @@ Company isolation is mandatory:
 
 ## Development rules
 
+- For NLQ changes, follow [SIMS NLQ development policy](docs/02_design/SIMS_NLQ_DEVELOPMENT_POLICY.md).
 - Prefer small, reviewable patches.
 - Avoid broad common-module changes unless impact is clear.
 - For stable screens, patch narrow service/view layer first.
