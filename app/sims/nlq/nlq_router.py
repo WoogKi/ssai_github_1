@@ -823,6 +823,7 @@ _ANALYTICS_ACTION_SPECS = (
         "phrases": (
             "영업사원별 매출 예상",
             "영업사원별 매출예상",
+            "영업사원별 매출예측",
             "담당자별 매출 예상",
             "담당자별 매출예상",
             "사원별 다음달 매출 예상",
@@ -1023,6 +1024,16 @@ def _unregistered_grouped_sales_status(txt: str) -> tuple[str, str] | None:
     return None
 
 
+def _unregistered_grouped_sales_budget(txt: str) -> tuple[str, str] | None:
+    """Keep an unregistered sales budget distinct from a sales forecast."""
+    compact = re.sub(r"\s+", "", str(txt or ""))
+    for grouping, label, phrase in _ANALYTICS_GROUPING_TERMS:
+        if phrase.endswith("별") and f"{phrase}매출예산" in compact:
+            if ("sales_budget", grouping) not in ANALYTICS_INTENT_ACTIONS:
+                return grouping, label
+    return None
+
+
 def _classify_analytics_metric_grouping(txt: str) -> Dict[str, str] | None:
     """Extract explicit Analytics metric and grouping without treating filters as groups."""
     compact = re.sub(r"\s+", "", str(txt or "").strip())
@@ -1057,7 +1068,10 @@ def _classify_analytics_metric_grouping(txt: str) -> Dict[str, str] | None:
         and grouping in {"product", "manufacturer"}
         and not any(domain in compact for domain in ("입고", "출고", "재고", "발주"))
     )
-    if "매출예상" in compact or "예상매출" in compact:
+    if (
+        "매출예상" in compact or "예상매출" in compact
+        or (grouping == "salesperson" and "매출예측" in compact)
+    ):
         metric = "sales_forecast"
     elif "매출추세" in compact or grouped_trend_shorthand:
         metric = "sales_trend_summary" if "요약" in compact else "sales_trend"
@@ -1376,7 +1390,7 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
     normalized = keyboard_fix(str(txt or "").strip())
     if not normalized:
         return None
-    if _unregistered_grouped_sales_status(normalized):
+    if _unregistered_grouped_sales_status(normalized) or _unregistered_grouped_sales_budget(normalized):
         return None
     from app.services.erp_table_nlq import is_order_calculation_request
     if is_order_calculation_request(normalized):
@@ -5956,7 +5970,11 @@ def _build_dashboard_nlq_params(
     stock_basis = _resolve_analytics_stock_basis(text)
     if stock_basis.get("explicit"):
         params["stock_mode"] = stock_basis["stock_mode"]
-    stock_terms = _extract_analytics_stock_location_terms(text)
+    stock_text = (
+        f"재고위치 {explicit_conditions['재고위치']}"
+        if "재고위치" in explicit_conditions else text
+    )
+    stock_terms = _extract_analytics_stock_location_terms(stock_text)
     if stock_terms is not None:
         stock_codes, stock_names = stock_terms
         requested = {
@@ -7944,6 +7962,7 @@ def try_handle_nlq(
         "dashboard_action_order",
         "dashboard_condition_confirmation",
         "unregistered_grouped_sales_status",
+        "unregistered_grouped_sales_budget",
     }:
         logger.info("[nlq.router] condition or action confirmation required; erp_call_count=0")
         return False

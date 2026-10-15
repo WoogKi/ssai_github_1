@@ -177,8 +177,13 @@ def parse_incomplete_sims_help_request(value: object, *, today: date | None = No
         return SimsHelpIntent("action_confirmation", query)
     if "현재고금액" in compact and "매출금액" in compact:
         return SimsHelpIntent("single_action_required", query)
-    from app.sims.nlq.nlq_router import _unregistered_grouped_sales_status
+    from app.sims.nlq.nlq_router import (
+        _unregistered_grouped_sales_budget, _unregistered_grouped_sales_status,
+    )
 
+    grouped_budget = _unregistered_grouped_sales_budget(query)
+    if grouped_budget:
+        return SimsHelpIntent("unregistered_grouped_sales_budget", query, grouped_budget[1])
     grouped_status = _unregistered_grouped_sales_status(query)
     if grouped_status:
         return SimsHelpIntent("unregistered_grouped_sales_status", query, grouped_status[1])
@@ -369,7 +374,7 @@ def verified_sims_help_examples(
         return ((action, example),) if (
             candidate and candidate.get("action") == action and conditions.get(role) == value and not residual
         ) else ()
-    elif intent.reason == "unregistered_grouped_sales_status":
+    elif intent.reason in {"unregistered_grouped_sales_status", "unregistered_grouped_sales_budget"}:
         from app.sims.nlq.action_inventory import ANALYTICS_INTENT_ACTIONS
         from app.sims.nlq.nlq_router import _resolve_analytics_action, resolve_new_sims_nlq_candidate
 
@@ -383,7 +388,8 @@ def verified_sims_help_examples(
         original = re.sub(r"\s+", "", intent.query)
         if not action or action not in supported or action not in allowed_actions:
             return ()
-        if original not in {f"{label}별매출현황", f"{label}별매출현황조회"}:
+        requested_term = "매출예산" if intent.reason == "unregistered_grouped_sales_budget" else "매출현황"
+        if original not in {f"{label}별{requested_term}", f"{label}별{requested_term}조회"}:
             return ()
         example = action
         candidate = resolve_new_sims_nlq_candidate(example)
@@ -479,6 +485,7 @@ def verified_sims_help_text(
         "action_confirmation": "지원되는 업무명을 확인해 주세요. 다른 업무로 조회하지 않았습니다.",
         "document_type_confirmation": "어떤 업무 또는 전표 종류를 뜻하는지 확인해 주세요. 이전 조회 결과를 적용하거나 새로 조회하지 않았습니다.",
         "unregistered_grouped_sales_status": "현재 질문에 해당하는 조회 업무를 확정하지 못했습니다. 이번 조회는 실행하지 않았습니다.",
+        "unregistered_grouped_sales_budget": "매출예산은 매출 예상과 다른 업무입니다. 예산 조회는 실행하지 않았습니다.",
         "condition_confirmation": "조회조건의 의미를 확인해 주세요. 조건을 생략한 전체 조회는 실행하지 않았습니다.",
         "single_action_required": "한 번에 한 업무를 질문해 주세요. 두 업무를 하나로 조회하지 않았습니다.",
     }
@@ -523,6 +530,9 @@ def verified_sims_help_text(
         elif intent.reason == "unregistered_grouped_sales_status":
             answer += "\n\nSIMS AI에서 지원하는 관련 업무: " + ", ".join(action for action, _ in examples)
             answer += "\n매출 예측을 원하시면 다음처럼 질문해 주세요: " + " / ".join(example for _, example in examples)
+        elif intent.reason == "unregistered_grouped_sales_budget":
+            answer += "\n\n별도로 지원되는 관련 업무: " + ", ".join(action for action, _ in examples)
+            answer += "\n매출 예측을 원하시는 경우에만 다음처럼 질문해 주세요: " + " / ".join(example for _, example in examples)
         else:
             answer += f"\n\n{label}: " + " / ".join(example for _, example in examples)
     elif intent.reason == "condition_confirmation" and intent.subject_label == "재고위치":
@@ -532,7 +542,7 @@ def verified_sims_help_text(
     if allow_knowledge_help:
         answer += "\n\n추가 설명은 'SIMS 질문 예시 알려줘'로 요청할 수 있습니다."
     elif intent.reason in {"action_confirmation", "condition_confirmation", "single_action_required",
-                           "document_type_confirmation"}:
+                           "document_type_confirmation", "unregistered_grouped_sales_budget"}:
         answer += "\n\n지원되는 질문은 'SIMS 질문 예시 알려줘'에서 확인할 수 있습니다."
     return answer + "\n\n조회는 조건을 선택해 다시 입력한 뒤 기존 권한 검사를 거쳐 실행됩니다."
 
