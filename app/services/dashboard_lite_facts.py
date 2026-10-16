@@ -30,6 +30,7 @@ from app.services.product_supplier_scope_service import apply_product_supplier_s
 from app.services.dashboard_inventory_frequency_snapshot import FrequencyProjectionReadResult
 from app.services.business_calendar_service import BusinessDayMonthContext, business_day_month_context, kst_today
 from app.services.ssai_snapshot_repository import SnapshotReadResult
+from app.services.saved_io_scope import resolve_saved_io_scope
 
 
 FACTS_KIND = "SIMS_DASHBOARD_FACTS_V01"
@@ -3985,6 +3986,10 @@ def build_dashboard_lite_facts(
     if needs_inbound_source:
         from app.services.dashboard_inbound_facts_service import get_dashboard_inbound_facts
 
+        saved_inbound_scope = (
+            resolve_saved_io_scope(service_params["io_gu_list"], confirmed_trade_roles=True)
+            if service_params.get("io_gu_list") else None
+        )
         inbound_started = time.perf_counter()
         with dashboard_query_measurement(
             physical_measurement,
@@ -3997,6 +4002,7 @@ def build_dashboard_lite_facts(
                 data_cutoff_date=inbound_cutoff_date,
                 cycle_lookback_days=365,
                 vendor_lookback_days=int(service_params["major_purchase_vendor_days"]),
+                io_scope=saved_inbound_scope,
             )
         inbound_source_elapsed_ms = int((time.perf_counter() - inbound_started) * 1000)
         inbound_source_rows = int(getattr(inbound_facts_df, "attrs", {}).get("inbound_source_rows") or 0)

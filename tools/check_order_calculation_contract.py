@@ -346,6 +346,29 @@ def test_full_scope_compact_representative_vendor_equality():
     pd.testing.assert_frame_equal(detailed, compact)
 
 
+def test_representative_vendor_changes_order_unit_without_changing_price_scope():
+    params, sources = fixture()
+    sources["demand"]["당월 예상출고수량"] = D(53)
+    sources["contract_purchase_prices"] = {("00001", "00007"): D(100)}
+    sources["order_history_unit"] = pd.DataFrame([
+        {"제품코드": "00001", "발주거래처코드": vendor, "발주일자": day, "발주수량": D(unit)}
+        for vendor, unit in (("00100", 10), ("00200", 20))
+        for day in ("20260901", "20260910", "20260920")
+    ])
+    sources["order_history_unit_period"] = ["20260624", "20260924"]
+    sources["order_history_unit_recent_period"] = ["20260824", "20260924"]
+    sources["order_history_recent_complete"] = True
+    former = assemble_result(params, sources).iloc[0]
+    changed_sources = {**sources, "suppliers": sources["suppliers"].copy()}
+    changed_sources["suppliers"]["recent_inbound_vendor_code"] = "00200"
+    changed = assemble_result(params, changed_sources).iloc[0]
+    assert (former["발주단위"], changed["발주단위"]) == (D(10), D(20))
+    assert former["추천 발주수량"] != changed["추천 발주수량"]
+    assert former["발주단가"] == changed["발주단가"] == D(100)
+    assert former["단가출처"] == changed["단가출처"] == "계약단가"
+    assert former["발주금액(부가세포함)"] != changed["발주금액(부가세포함)"]
+
+
 def test_trend_applies_before_stock_pending_and_unit():
     params, sources = fixture()
     params.update(order_date="2026-09-01", safety_days=15, target_days=15)
@@ -910,7 +933,7 @@ def test_code_lookup_company_cache():
 
 
 if __name__ == "__main__":
-    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_closing_boundary_business_day_policy, test_full_scope_compact_representative_vendor_equality, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_panel_nlq_order_staff_parity, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_failed_source_count_survives, test_editor_callback_ownership_and_cache)
+    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_closing_boundary_business_day_policy, test_full_scope_compact_representative_vendor_equality, test_representative_vendor_changes_order_unit_without_changing_price_scope, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_panel_nlq_order_staff_parity, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_failed_source_count_survives, test_editor_callback_ownership_and_cache)
     tests += (test_empty_parameter_bridge_and_check_mode, test_snapshot_scope_to_demand_scope)
     tests += (test_code_lookup_company_cache,)
     tests += (test_excel_numeric_round_trip, test_production_editor_render_boundary)

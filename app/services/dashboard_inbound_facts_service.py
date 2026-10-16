@@ -17,6 +17,7 @@ import pandas as pd
 from app.db.mssql_client import dashboard_measurement_phase, dashboard_query_measurement, get_active_dashboard_query_measurement
 from app.services.rddbc_io_common import query_to_df
 from app.services.product_supplier_scope_service import build_product_supplier_scope_sql
+from app.services.saved_io_scope import SavedIoScope, bind_io_codes
 
 
 log = logging.getLogger("ssai.sims.dashboard_inbound")
@@ -119,7 +120,9 @@ def summarize_transaction_cycle_dates(
     }
 
 
-def _sql(params: Mapping[str, Any], *, start_date: str, cutoff_date: str) -> tuple[str, dict[str, Any]]:
+def _sql(
+    params: Mapping[str, Any], *, start_date: str, cutoff_date: str, io_scope: SavedIoScope | None = None
+) -> tuple[str, dict[str, Any]]:
     binds: dict[str, Any] = {"inbound_start": str(start_date), "inbound_cutoff": str(cutoff_date)}
     product_filters: list[str] = []
     supplier_scope_sql = build_product_supplier_scope_sql(
@@ -134,11 +137,17 @@ def _sql(params: Mapping[str, Any], *, start_date: str, cutoff_date: str) -> tup
     if 0 < len(scope_codes) <= MAX_PRODUCT_SCOPE_BINDS:
         _add_in(product_filters, binds, "P.Rd04_Physic_Cd", "inbound_product_code", scope_codes)
 
+    inbound_codes_clause = (
+        bind_io_codes(
+            "I.Rd11_Io_Gu", (*io_scope.normal_inbound_codes, *io_scope.inbound_return_codes),
+            binds, prefix="inbound_io", style="pyformat",
+        ) if io_scope is not None else "I.Rd11_Io_Gu IN ('001', '002', '101', '102', '193')"
+    )
     transaction_filters = [
         "I.Rd11_Io_Gu_Gcode = '0012'",
         "I.Rd11_In_YyMmDd >= %(inbound_start)s",
         "I.Rd11_In_YyMmDd <= %(inbound_cutoff)s",
-        "I.Rd11_Io_Gu IN ('001', '002', '101', '102', '193')",
+        inbound_codes_clause,
     ]
     stock_codes = _codes(params.get("stock_cd_list"))
     if stock_codes:
@@ -218,6 +227,7 @@ def _scope_authority_sql(
     *,
     cutoff_date: str,
     vendor_lookback_days: int,
+    io_scope: SavedIoScope | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Return the representative-vendor authority at product grain.
 
@@ -245,11 +255,15 @@ def _scope_authority_sql(
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Di_Gcode", tcode_column="P.Rd04_Physic_Di", bind_key="scope_product_di", values=params.get("dashboard_product_di_list") or params.get("product_di_list"), expected_gcode="0004")
     _add_pair_filter(product_filters, binds, gcode_column="P.Rd04_Physic_Tax_Gcode", tcode_column="P.Rd04_Physic_Tax", bind_key="scope_product_class", values=params.get("dashboard_product_class_list") or params.get("product_class_list"), expected_gcode="0031")
 
+    normal_inbound_clause = (
+        bind_io_codes("I.Rd11_Io_Gu", io_scope.normal_inbound_codes, binds, prefix="scope_inbound_io", style="pyformat")
+        if io_scope is not None else "I.Rd11_Io_Gu IN ('001', '002')"
+    )
     transaction_filters = [
         "I.Rd11_Io_Gu_Gcode = '0012'",
         "I.Rd11_In_YyMmDd >= %(aggregate_start)s",
         "I.Rd11_In_YyMmDd <= %(inbound_cutoff)s",
-        "I.Rd11_Io_Gu IN ('001', '002')",
+        normal_inbound_clause,
         "COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0",
         "LTRIM(RTRIM(I.Rd11_Ven_Cd)) <> ''",
     ]
@@ -360,11 +374,13 @@ def get_dashboard_inbound_scope_authority(
     *,
     data_cutoff_date: str,
     vendor_lookback_days: int = 90,
+    io_scope: SavedIoScope | None = None,
 ) -> pd.DataFrame:
     """Resolve order staff/vendor scope without loading detailed R110 facts."""
     started = time.perf_counter()
     sql, binds = _scope_authority_sql(
-        params or {}, cutoff_date=data_cutoff_date, vendor_lookback_days=vendor_lookback_days
+        params or {}, cutoff_date=data_cutoff_date, vendor_lookback_days=vendor_lookback_days,
+        io_scope=io_scope,
     )
     query_started = time.perf_counter()
     authority = query_to_df(sql, binds)
@@ -398,6 +414,7 @@ def build_dashboard_inbound_facts_frame(
     data_cutoff_date: str,
     cycle_lookback_days: int = 365,
     vendor_lookback_days: int = 90,
+    io_scope: SavedIoScope | None = None,
 ) -> pd.DataFrame:
     """Reduce the one-query row source to one vectorized inbound facts row per product."""
     started = time.perf_counter()
@@ -451,8 +468,10 @@ def build_dashboard_inbound_facts_frame(
     raw["within_purchase_vendor_count_90"] = raw["inbound_date_value"].between(
         purchase_vendor_count_start_ts, cutoff_ts, inclusive="both"
     )
-    raw["is_normal"] = raw["within_cycle"] & raw["io_tcode"].isin(NORMAL_INBOUND_TCODES)
-    raw["is_return"] = raw["within_cycle"] & raw["io_tcode"].isin(INBOUND_RETURN_TCODES)
+    normal_codes = io_scope.normal_inbound_codes if io_scope is not None else NORMAL_INBOUND_TCODES
+    return_codes = io_scope.inbound_return_codes if io_scope is not None else INBOUND_RETURN_TCODES
+    raw["is_normal"] = raw["within_cycle"] & raw["io_tcode"].isin(normal_codes)
+    raw["is_return"] = raw["within_cycle"] & raw["io_tcode"].isin(return_codes)
     raw["is_positive_normal"] = raw["is_normal"] & raw["event_qty"].gt(0)
     normalize_ms = int((time.perf_counter() - normalize_started) * 1000)
 
@@ -600,6 +619,7 @@ def get_dashboard_inbound_facts(
     data_cutoff_date: str,
     cycle_lookback_days: int = 365,
     vendor_lookback_days: int = 90,
+    io_scope: SavedIoScope | None = None,
 ) -> pd.DataFrame:
     """Execute exactly one read-only Rddbc110 query and return product facts."""
     started = time.perf_counter()
@@ -607,7 +627,7 @@ def get_dashboard_inbound_facts(
     cycle_days = max(1, int(cycle_lookback_days))
     vendor_days = max(1, int(vendor_lookback_days))
     start_date = (cutoff - timedelta(days=cycle_days - 1)).strftime("%Y%m%d")
-    sql, binds = _sql(params or {}, start_date=start_date, cutoff_date=cutoff.strftime("%Y%m%d"))
+    sql, binds = _sql(params or {}, start_date=start_date, cutoff_date=cutoff.strftime("%Y%m%d"), io_scope=io_scope)
     query_started = time.perf_counter()
     measurement = get_active_dashboard_query_measurement()
     phase_context = (
@@ -645,6 +665,7 @@ def get_dashboard_inbound_facts(
             data_cutoff_date=cutoff.strftime("%Y%m%d"),
             cycle_lookback_days=cycle_days,
             vendor_lookback_days=vendor_days,
+            io_scope=io_scope,
         )
         if isinstance(phase_state, dict):
             phase_state["result_rows"] = len(facts)

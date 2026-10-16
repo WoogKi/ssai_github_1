@@ -68,9 +68,14 @@ def main() -> int:
         )},
     }}}
     cross = view._monthly_depletion_cross_table(cross_facts)
-    assert cross.loc["합계", "합계"] == 10085
-    assert cross.loc["합계"].drop("합계").tolist() == column_totals
-    assert cross["합계"].drop("합계").tolist() == row_totals
+    hidden_index = view.INVENTORY_STATUS_ORDER[1:].index("예상수요 없음")
+    visible_matrix = [row for i, row in enumerate(matrix) if i != hidden_index]
+    visible_column_totals = [sum(row[j] for row in visible_matrix) for j in range(len(column_totals))]
+    assert cross.loc["합계", "합계"] == 10085 - row_totals[hidden_index]
+    assert cross.loc["합계"].drop("합계").tolist() == visible_column_totals
+    assert cross["합계"].drop("합계").tolist() == [
+        total for i, total in enumerate(row_totals) if i != hidden_index
+    ]
     assert sum(row["count"] for row in view._monthly_depletion_rows(cross_facts)) == 10085
     rendered: list[str] = []
     captured_tables: list[pd.io.formats.style.Styler] = []
@@ -158,7 +163,7 @@ def main() -> int:
     completed_frame = sales_frame.assign(**{"평가월 예상매출": [100, 100]})
     completed = sales(completed_frame, month="202609")
     assert completed["metrics"]["current_month_remaining_forecast_sales"]["value"] == 0
-    print("PASS dashboard final semantic UI: cross=10085 grades=9104 missing=981 risk=50/100 remaining=30")
+    print("PASS dashboard final semantic UI: source=10085 visible_cross=10066 grades=9104 missing=981 risk=50/100 remaining=30")
     return 0
 
 

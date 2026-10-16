@@ -23,6 +23,7 @@ from app.services.dashboard_inbound_facts_service import (
 )
 from app.services.dashboard_lite_facts import _attach_dashboard_inbound_facts, _attach_major_purchase_vendors
 from app.services.order_calculation_service import filter_base_by_order_scope, order_scope_row_matches, _index
+from app.services.saved_io_scope import resolve_saved_io_scope
 
 
 CUTOFF = "20260825"
@@ -96,6 +97,34 @@ def _legacy_order_scope(base: pd.DataFrame, suppliers: pd.DataFrame, params: dic
 
 
 def main() -> int:
+    saved_scope = resolve_saved_io_scope(("001", "052", "090", "101", "580"), confirmed_trade_roles=True)
+    detail_sql, detail_binds = _sql(
+        {"stock_cd_list": ["00001"]}, start_date="20250826", cutoff_date=CUTOFF,
+        io_scope=saved_scope,
+    )
+    authority_sql, authority_binds = _scope_authority_sql(
+        {"stock_cd_list": ["00001"]}, cutoff_date=CUTOFF, vendor_lookback_days=90,
+        io_scope=saved_scope,
+    )
+    assert {value for key, value in detail_binds.items() if key.startswith("inbound_io_")} == {"001", "052", "090", "101"}
+    assert {value for key, value in authority_binds.items() if key.startswith("scope_inbound_io_")} == {"001", "052", "090"}
+    assert "Rd11_Stock_Cd" in detail_sql and "Rd11_Stock_Cd" in authority_sql
+    assert "COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0" in authority_sql
+    saved_events = pd.DataFrame([
+        ("SAVED", "MASTER", "마스터", "U1", "담당", "M1", "제약", "P1", "제약담당", "20260820", "090", "V1", "정상V1", "U2", "매입담당", 10, 0, 100),
+        ("SAVED", "MASTER", "마스터", "U1", "담당", "M1", "제약", "P1", "제약담당", "20260821", "052", "V2", "조정V2", "U3", "조정담당", -20, 0, -200),
+        ("SAVED", "MASTER", "마스터", "U1", "담당", "M1", "제약", "P1", "제약담당", "20260822", "101", "V2", "반품V2", "U3", "반품담당", -3, 0, -30),
+        ("SAVED", "MASTER", "마스터", "U1", "담당", "M1", "제약", "P1", "제약담당", "20260823", "099", "V3", "미저장V3", "U4", "미저장담당", 100, 0, 1000),
+    ], columns=INBOUND_COLUMNS)
+    scoped_events = saved_events.loc[saved_events["io_tcode"].isin(saved_scope.normal_inbound_codes + saved_scope.inbound_return_codes)]
+    saved_facts = build_dashboard_inbound_facts_frame(
+        scoped_events, data_cutoff_date=CUTOFF, io_scope=saved_scope,
+    ).set_index("product_code")
+    assert saved_facts.loc["SAVED", "recent_inbound_vendor_code"] == "V1"
+    assert saved_facts.loc["SAVED", "normal_inbound_raw_qty_365"] == -10
+    assert saved_facts.loc["SAVED", "normal_inbound_positive_qty_365"] == 10
+    assert saved_facts.loc["SAVED", "inbound_return_raw_qty_365"] == -3
+
     facts = build_dashboard_inbound_facts_frame(
         _source_fixture(), data_cutoff_date=CUTOFF, cycle_lookback_days=365, vendor_lookback_days=90
     ).set_index("product_code")

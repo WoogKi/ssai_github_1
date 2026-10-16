@@ -23,6 +23,7 @@ from app.services.order_calculation_contract import (
     OrderConditions, amounts, calculate_quantities, closing_day_relation, demand_for_dates, demand_trend_adjustment,
     horizon_dates, infer_order_unit,
 )
+from app.services.saved_io_scope import resolve_saved_io_scope
 
 ACTION = "발주 계산"
 TABLE = "order_calculation"
@@ -778,6 +779,7 @@ def load_sources(params: dict) -> dict:
     source_params["stock_cds"] = list(stock_codes)
     source_params.pop("stock_nm", None)
     source_params["_require_company_io"] = True
+    inbound_io_scope = resolve_saved_io_scope(scope.io_gu_codes, confirmed_trade_roles=True)
     for field in ("cost_apply", "stock_apply"):
         if source_params.get(field + "_cd"):
             source_params.pop(field + "_nm", None)
@@ -805,7 +807,8 @@ def load_sources(params: dict) -> dict:
         scope_authority = call(
             'representative_vendor_scope_authority', get_dashboard_inbound_scope_authority,
             source_params, data_cutoff_date=reference.strftime("%Y%m%d"),
-            vendor_lookback_days=vendor_lookback_days, input_rows=len(candidate_codes),
+            vendor_lookback_days=vendor_lookback_days, io_scope=inbound_io_scope,
+            input_rows=len(candidate_codes),
         )
         frame = filter_base_by_order_scope(frame, scope_authority, params)
     selected_codes = _normalized_product_codes(frame)
@@ -862,7 +865,8 @@ def load_sources(params: dict) -> dict:
     else:
         suppliers = call('representative_vendor', get_dashboard_inbound_scope_authority, inbound_params,
             data_cutoff_date=reference.strftime("%Y%m%d"),
-            vendor_lookback_days=vendor_lookback_days, input_rows=len(selected_codes))
+            vendor_lookback_days=vendor_lookback_days, io_scope=inbound_io_scope,
+            input_rows=len(selected_codes))
     if isinstance(suppliers, pd.DataFrame):
         stage_evidence['representative_vendor'].update({
             "configured_days": vendor_lookback_days,

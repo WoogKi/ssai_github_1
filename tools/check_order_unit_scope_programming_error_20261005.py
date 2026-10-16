@@ -32,7 +32,7 @@ def _params(codes):
         "order_unit_product_code_list": codes,
         "product_prescription_semantic": "prescription",
         "order_vendor_cd": "V", "cost_apply_cd": "50002",
-        "stock_apply_cd": "50001", "stock_cd_list": ["S1", "S2"],
+        "stock_apply_cd": "50001", "stock_cd_list": ["00001", "S2"],
         "include_blank_stock_cd": True,
     }
 
@@ -50,7 +50,7 @@ def check_single_source_modes() -> None:
         assert "CAST(? AS xml)" in sql and "Rd18_Or_Di IN (?,?,?)" in sql
         assert "Rd18_OrVen_Cd = ?" in sql and "Rd18_Cost_Apply_Cd = ?" in sql
         assert "Rd18_Stock_Apply_Cd = ?" in sql and "Rd18_Stock_Cd IN (?,?)" in sql
-        assert "NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL" in sql
+        assert "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql
         xml = next(value for value in values if isinstance(value, str) and value.startswith("<codes>"))
         assert [node.text for node in ElementTree.fromstring(xml)] == ["A&B"]
         return pd.DataFrame([row("A&B", 1)], columns=COLS)
@@ -63,6 +63,16 @@ def check_single_source_modes() -> None:
     assert small.attrs["order_history_query_mode"] == "unit_inference_r170_r180_scoped_sql"
     assert small.attrs["order_unit_history_complete_scope"] is True
     assert small.attrs["order_unit_scope_product_count"] == 1
+
+    without_headquarters = _params(["A&B"])
+    without_headquarters["stock_cd_list"] = ["S1", "S2"]
+    with patch("sqlalchemy.engine.Engine.connect", side_effect=AssertionError("DB forbidden")), \
+         patch("pyodbc.connect", side_effect=AssertionError("DB forbidden")), \
+         patch.object(orders, "execute_bound_select", return_value=pd.DataFrame(columns=COLS)) as query:
+        orders.get_order_df(without_headquarters, mode="order")
+        assert query.call_count == 1
+        assert "Rd18_Stock_Cd IN (?,?)" in query.call_args.args[0]
+        assert "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" not in query.call_args.args[0]
 
     for count in (10, 100, 1000):
         with patch("sqlalchemy.engine.Engine.connect", side_effect=AssertionError("DB forbidden")), \
@@ -79,7 +89,7 @@ def check_single_source_modes() -> None:
         assert "Rd18_Or_Di IN (?,?,?)" in sql
         assert "Rd18_OrVen_Cd = ?" in sql and "Rd18_Cost_Apply_Cd = ?" in sql
         assert "Rd18_Stock_Apply_Cd = ?" in sql and "Rd18_Stock_Cd IN (?,?)" in sql
-        assert "NULLIF(RTRIM(D.Rd18_Stock_Cd), '') IS NULL" in sql
+        assert "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql
         assert not any(str(value).startswith("<codes>") for value in values)
         return pd.DataFrame([row("OUTSIDE", 1), row("A&B", 2), row("00001", 3)], columns=COLS)
 
