@@ -3204,9 +3204,20 @@ def _build_inventory_facts(
             evaluation_expected = _num(row.get("당월 예상출고수량"))
             source_shortage_qty = _num(row.get("부족예상수량"), max(remaining - stock, 0))
             source_shortage_amt = _num(row.get("부족예상금액"))
-            unit_price = _safe_div(source_shortage_amt, source_shortage_qty, 0.0) if source_shortage_qty > 0 else 0.0
-            if not unit_price:
-                unit_price = _num(row.get("재고평가단가")) or _num(row.get("평가단가")) or _num(row.get("장부재고평가단가"))
+            source_unit_price = next(
+                (
+                    _num(row.get(column))
+                    for column in ("재고평가단가", "평가단가", "장부재고평가단가")
+                    if column in row and row.get(column) is not None
+                    and pd.notna(row.get(column)) and str(row.get(column)).strip() != ""
+                ),
+                None,
+            )
+            unit_price = (
+                source_unit_price
+                if source_unit_price is not None
+                else _safe_div(source_shortage_amt, source_shortage_qty, 0.0)
+            )
             required_values = [
                 row.get("현재재고수량"),
                 row.get("당월 잔여예상출고수량"),
@@ -3235,6 +3246,7 @@ def _build_inventory_facts(
                     "3개월필요수량": _num(row.get("3개월필요수량")),
                     "_source_shortage_qty": source_shortage_qty,
                     "_source_shortage_amt": source_shortage_amt,
+                    "_source_unit_price": source_unit_price,
                     "_unit_price": unit_price,
                     "_stock_cover_stock_present": row.get("현재재고수량") is not None and pd.notna(row.get("현재재고수량")) and str(row.get("현재재고수량")).strip() != "",
                     "_stock_cover_demand_present": row.get("당월 잔여예상출고수량") is not None and pd.notna(row.get("당월 잔여예상출고수량")) and str(row.get("당월 잔여예상출고수량")).strip() != "",
@@ -3278,6 +3290,7 @@ def _build_inventory_facts(
                     "3개월필요수량": 0.0,
                     "_source_shortage_qty": 0.0,
                     "_source_shortage_amt": 0.0,
+                    "_source_unit_price_values": [],
                     "_unit_price_values": [],
                     "_stock_cover_stock_present": True,
                     "_stock_cover_demand_present": True,
@@ -3303,6 +3316,8 @@ def _build_inventory_facts(
             acc["3개월필요수량"] += float(item.get("3개월필요수량") or 0)
             acc["_source_shortage_qty"] += float(item.get("_source_shortage_qty") or 0)
             acc["_source_shortage_amt"] += float(item.get("_source_shortage_amt") or 0)
+            if item.get("_source_unit_price") is not None:
+                acc["_source_unit_price_values"].append(float(item["_source_unit_price"]))
             if float(item.get("_unit_price") or 0) > 0:
                 acc["_unit_price_values"].append(float(item.get("_unit_price") or 0))
             acc["_stock_risk_required_values_present"] = bool(acc["_stock_risk_required_values_present"]) and bool(item.get("_stock_risk_required_values_present"))
@@ -3326,7 +3341,9 @@ def _build_inventory_facts(
                 float(row.get("_source_shortage_qty") or 0),
                 0.0,
             )
-            if not unit_price and row.get("_unit_price_values"):
+            if row.get("_source_unit_price_values"):
+                unit_price = max(float(row["_source_unit_price_values"][0]), 0.0)
+            elif row.get("_unit_price_values"):
                 unit_price = float(row["_unit_price_values"][0])
             shortage_amt = shortage_qty * unit_price
             if remaining <= 0:
