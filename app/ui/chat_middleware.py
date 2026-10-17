@@ -9612,6 +9612,11 @@ def _build_sims_result_header_view(
             "",
             "안내 | 수량은 추천이며 ERP에 등록되지 않습니다.",
         ]
+        spike_count = int((safe_meta.get("order_filter_diagnostics") or {}).get("non_order_spike_confirmation_rows") or 0)
+        if mode == "발주해당자료만" and spike_count:
+            compact_lines.append(
+                f"발주대상 외 당월 출고 급증 확인 {spike_count:,}건은 제외됐습니다. 조회구분 '확인 필요'에서 확인하세요."
+            )
 
     result_time_text = _sims_result_datetime_text(item, safe_meta)
     nlq_query = str(

@@ -11,7 +11,9 @@ from app.services.order_calculation_contract import (
     OrderConditions, closing_day_relation, horizon_dates, demand_for_dates, demand_trend_adjustment,
     calculate_quantities, recommend_quantity, amounts,
 )
-from app.services.order_calculation_service import assemble_result, get_order_calculation_result
+from app.services.order_calculation_service import (
+    _infer_unit_from_windows, assemble_result, get_order_calculation_result,
+)
 from app.services.business_calendar_service import next_business_day_on_or_after
 from app.services.ssai_business_calendar_repository import CalendarAuthorityRead
 from app.ui.order_calculation_editor import apply_actual_edits
@@ -367,6 +369,137 @@ def test_representative_vendor_changes_order_unit_without_changing_price_scope()
     assert former["발주단가"] == changed["발주단가"] == D(100)
     assert former["단가출처"] == changed["단가출처"] == "계약단가"
     assert former["발주금액(부가세포함)"] != changed["발주금액(부가세포함)"]
+
+
+def test_unconfirmed_unit_evidence_and_pending_quantity():
+    period = ["20260716", "20261016"]
+    history = [
+        {"발주일자": f"202610{day:02d}", "발주수량": D(qty)}
+        for day, qty in enumerate((10, 20, 30, 20, 30, 40, 20, 30, 40), 1)
+    ]
+    unit, reason, count = _infer_unit_from_windows(
+        history, recent_start="20261001", period=period,
+    )
+    assert unit is None and count == 9
+    assert "추정 후보, 확정 발주단위 아님" in reason
+    irregular = [
+        {"발주일자": f"202610{day:02d}", "발주수량": D(qty)}
+        for day, qty in enumerate((10, 10, 25), 1)
+    ]
+    unit, reason, _ = _infer_unit_from_windows(
+        irregular, recent_start="20261001", period=period,
+    )
+    assert unit is None and "불규칙" in reason and "추정 후보" not in reason
+    unit, reason, _ = _infer_unit_from_windows(
+        [], recent_start="20261001", period=period,
+    )
+    assert unit is None and "발주이력 없음" in reason
+
+    params, sources = fixture()
+    sources["pending"] = pd.DataFrame({"제품코드": ["00001"], "입고예정수량": [D(220)]})
+    row = assemble_result(params, sources).iloc[0]
+    assert row["발주단위"] is None and row["입고예정수량"] == D(220)
+    assert "입고예정 잔량은 발주단위 근거 아님" in row["조달주의"]
+    assert row["수량조정정책"] != "확정 이력단위"
+
+
+def current_month_spike_fixture():
+    params, sources = fixture()
+    params.update(order_date="2026-10-16", closing_day=25, target_days=10)
+    sources["business_dates"] = [
+        date(2026, 10, day) for day in range(1, 32)
+        if date(2026, 10, day).weekday() < 5
+    ]
+    sources["base"]["출고빈도등급"] = "E"
+    sources["demand"]["현재재고수량"] = D(18)
+    sources["demand"]["예상기준월수량"] = D(6)
+    sources["demand"]["당월 예상출고수량"] = D("7.8")
+    sources["demand"]["최근3개월평균수요수량"] = D(6)
+    sources["demand"]["직전3개월평균수요수량"] = D("0.3333333333333333")
+    sources["demand"]["완료월수"] = 6
+    sources["demand"]["당월 현재출고수량"] = D(122)
+    sources["elapsed_days"] = 10
+    sources["normal_outbound_verified"] = True
+    sources["contract_purchase_prices"] = {("00001", "00007"): D("61749.6")}
+    return params, sources
+
+
+def test_current_month_spike_warns_without_auto_order():
+    params, sources = current_month_spike_fixture()
+    row = assemble_result(params, sources).iloc[0]
+    assert row["adjusted_demand_qty"] == D("7.8")
+    assert row["계산 발주수량"] < 0 and row["추천 발주수량"] == 0
+    assert row["발주금액(부가세포함)"] == 0
+    assert "당월 출고 급증 사용자확인" in row["조달주의"]
+    assert "추천수량 자동 변경 없음" in row["발주사유/계산근거"]
+
+    ordinary = {**sources, "demand": sources["demand"].copy()}
+    ordinary["demand"]["당월 현재출고수량"] = D(12)
+    ordinary_row = assemble_result(params, ordinary).iloc[0]
+    assert "당월 출고 급증" not in ordinary_row["조달주의"]
+    assert ordinary_row["추천 발주수량"] == row["추천 발주수량"]
+
+
+def test_current_month_spike_query_visibility():
+    from app.ui import chat_middleware as chat
+
+    params, sources = current_month_spike_fixture()
+    with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+        full = get_order_calculation_result({**params, 'query_mode': '전체'}, source_loader=lambda q: sources)
+        confirm = get_order_calculation_result({**params, 'query_mode': '확인 필요'}, source_loader=lambda q: sources)
+        needed = get_order_calculation_result({**params, 'query_mode': '발주해당자료만'}, source_loader=lambda q: sources)
+    assert (len(full['df']), len(confirm['df']), len(needed['df'])) == (1, 1, 0)
+    for item in (full, confirm):
+        row = item['df'].iloc[0]
+        assert row['계산상태'] == '발주 필요 없음'
+        assert row['추천 발주수량'] == row['발주금액(부가세포함)'] == 0
+        assert '당월 출고 급증 사용자확인' in row['조달주의']
+    assert needed['meta']['order_filter_diagnostics']['non_order_spike_confirmation_rows'] == 1
+    assert '발주대상 외 당월 출고 급증 확인 1건' in needed['meta']['summary_md']
+    header = chat._build_sims_result_header_view(needed, needed['meta'], needed['df_display'])
+    assert header['order_cards'][0][:2] == ('발주대상', 0)
+    assert any("조회구분 '확인 필요'" in line and '1건' in line for line in header['compact_lines'])
+
+    ordinary = {**sources, 'demand': sources['demand'].copy()}
+    ordinary['demand']['당월 현재출고수량'] = D(12)
+    with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+        ordinary_confirm = get_order_calculation_result(
+            {**params, 'query_mode': '확인 필요'}, source_loader=lambda q: ordinary,
+        )
+        ordinary_needed = get_order_calculation_result(
+            {**params, 'query_mode': '발주해당자료만'}, source_loader=lambda q: ordinary,
+        )
+    assert ordinary_confirm['df'].empty and ordinary_needed['df'].empty
+    assert ordinary_needed['meta']['order_filter_diagnostics']['non_order_spike_confirmation_rows'] == 0
+
+    order_params, order_sources = fixture()
+    assert assemble_result(order_params, order_sources).iloc[0]['계산상태'] == '발주해당'
+    with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+        order_needed = get_order_calculation_result(
+            {**order_params, 'query_mode': '발주해당자료만'}, source_loader=lambda q: order_sources,
+        )
+    assert len(order_needed['df']) == 1
+    assert order_needed['meta']['order_filter_diagnostics']['non_order_spike_confirmation_rows'] == 0
+
+    mixed = {**sources}
+    for key, code_column in (('base', '제품코드'), ('demand', '제품코드'), ('suppliers', 'product_code')):
+        other = order_sources[key].copy()
+        other[code_column] = '00002'
+        mixed[key] = pd.concat([sources[key], other], ignore_index=True)
+    other_price = order_sources['prices']['df'].copy()
+    other_price['제품코드'] = '00002'
+    mixed['prices'] = {'df': pd.concat([sources['prices']['df'], other_price], ignore_index=True)}
+    other_history = order_sources['order_history'].copy()
+    other_history['제품코드'] = '00002'
+    mixed['order_history'] = pd.concat([sources['order_history'], other_history], ignore_index=True)
+    with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+        mixed_needed = get_order_calculation_result(
+            {**params, 'query_mode': '발주해당자료만'}, source_loader=lambda q: mixed,
+        )
+    assert len(mixed_needed['df']) == 1
+    assert mixed_needed['df'].iloc[0]['제품코드'] == '00002'
+    assert mixed_needed['meta']['order_filter_diagnostics']['non_order_spike_confirmation_rows'] == 1
+    assert '발주대상 외 당월 출고 급증 확인 1건' in mixed_needed['meta']['summary_md']
 
 
 def test_trend_applies_before_stock_pending_and_unit():
@@ -933,7 +1066,7 @@ def test_code_lookup_company_cache():
 
 
 if __name__ == "__main__":
-    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_closing_boundary_business_day_policy, test_full_scope_compact_representative_vendor_equality, test_representative_vendor_changes_order_unit_without_changing_price_scope, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_panel_nlq_order_staff_parity, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_failed_source_count_survives, test_editor_callback_ownership_and_cache)
+    tests = (test_horizon, test_monthly_allocation, test_quantities, test_demand_trend_adjustment, test_closing_boundary_business_day_policy, test_full_scope_compact_representative_vendor_equality, test_representative_vendor_changes_order_unit_without_changing_price_scope, test_unconfirmed_unit_evidence_and_pending_quantity, test_current_month_spike_warns_without_auto_order, test_current_month_spike_query_visibility, test_trend_applies_before_stock_pending_and_unit, test_assembly_edit_export, test_company_isolation, test_purchase_vendor_count_staff_and_sensitive_projection, test_routes_menu, test_panel_submission, test_panel_nlq_order_staff_parity, test_price_conflict_and_field_status, test_scoped_timeout_and_no_retry, test_production_nlq_dispatch, test_failed_source_count_survives, test_editor_callback_ownership_and_cache)
     tests += (test_empty_parameter_bridge_and_check_mode, test_snapshot_scope_to_demand_scope)
     tests += (test_code_lookup_company_cache,)
     tests += (test_excel_numeric_round_trip, test_production_editor_render_boundary)

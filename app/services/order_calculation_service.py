@@ -586,6 +586,11 @@ def _infer_unit_from_windows(history: list[dict], *, recent_start: str, period: 
     evidence = f"기간 {adopted[0]}~{adopted[1]} / 발주일 {order_days}일"
     if unit is not None:
         evidence += f" / 관측최소 {unit} ({repeat_days}일 반복)"
+    elif reason == '최소 발주수량 반복 부족' and considered:
+        observed = [Decimal(str(row['발주수량'])) for row in considered]
+        candidate = min(observed)
+        if all(quantity % candidate == 0 for quantity in observed):
+            evidence += f" / 관측최소 {candidate} (추정 후보, 확정 발주단위 아님)"
     return unit, f"{reason} / {evidence}", len(recent)
 
 
@@ -1448,6 +1453,16 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
                                        pending=pending_qty, safety_demand=sd if stock is not None else None,
                                        horizon_demand=hd, unit=unit, increasing=increasing,
                                        default_unit_allowed=default_unit_allowed, price=price)
+        current_month_spike = bool(
+            not closing_cycle_next_month_policy and forecast_ready
+            and sources.get("normal_outbound_verified")
+            and current_actual is not None and adjusted_plan is not None
+            and stock is not None and pending_qty is not None
+            and current_actual >= adjusted_plan * Decimal(3)
+            and current_actual - adjusted_plan >= Decimal(10)
+            and current_actual > stock + pending_qty
+            and quantity["추천 발주수량"] == 0
+        )
         quantity_ms += (time.perf_counter() - quantity_started) * 1000
         row = {**basic, **quantity, "회사": params["company_id"], "발주일자": effective_order_date,
                "입력 발주일자": input_order_date,
@@ -1504,6 +1519,15 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         row["발주사유/계산근거"] = _order_reason(row, len(horizon))
         if quantity['수량조정정책'] == '확정 이력단위' and quantity['최소수량 적용']:
             row['조달주의'] = '최소 발주단위 1회분 적용/원 필요수량보다 큰 추천수량 확인'
+        if pending_qty is not None and pending_qty > 0 and unit is None:
+            row["조달주의"] += " / 입고예정 잔량은 발주단위 근거 아님"
+        if current_month_spike:
+            warning = (
+                f"당월 출고 급증 사용자확인 (정상출고 {current_actual}, 월 예상 {adjusted_plan}); "
+                "추천수량 자동 변경 없음"
+            )
+            row["조달주의"] += f" / {warning}" if row["조달주의"] else warning
+            row["발주사유/계산근거"] += f" / {warning}"
         if not vendor_code:
             row["조달주의"] += " / 대표매입처 사용자확인"
         if params.get("stock_apply_nm") and not params.get("stock_apply_cd"):
@@ -1519,6 +1543,9 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         {str(key): int(value) for key, value in result["계산상태"].value_counts(dropna=False).items()}
         if not result.empty and "계산상태" in result else {}
     )
+    spike_warning = result["조달주의"].fillna("").astype(str).str.contains(
+        "당월 출고 급증 사용자확인", regex=False,
+    ) if "조달주의" in result else pd.Series(False, index=result.index)
     before_rows = len(result)
     filter_diagnostics = {
         "total_product_rows": before_rows,
@@ -1536,11 +1563,14 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         "expected_inbound_positive_rows": int((pd.to_numeric(result["입고예정수량"], errors="coerce") > 0).sum()) if "입고예정수량" in result else 0,
         "calculation_status_counts": status_counts,
         "only_needed_before_rows": before_rows,
+        "non_order_spike_confirmation_rows": int((
+            result["계산상태"].ne("발주해당") & spike_warning
+        ).sum()) if "계산상태" in result else 0,
     }
     if params.get("only_needed") and not result.empty:
         result = result.loc[result["계산상태"].eq("발주해당")].copy()
     if params.get("query_mode") == "확인 필요" and not result.empty:
-        result = result.loc[result["계산상태"].str.contains("확인") | result["발주단가"].isna() | result["발주처코드"].eq("")].copy()
+        result = result.loc[result["계산상태"].str.contains("확인") | result["발주단가"].isna() | result["발주처코드"].eq("") | spike_warning].copy()
     timings['only_needed_filter'] = (time.perf_counter() - filter_started) * 1000
     filter_diagnostics["only_needed_after_rows"] = len(result)
     filter_diagnostics["excluded_by_only_needed_rows"] = before_rows - len(result) if params.get("only_needed") else 0
@@ -1698,6 +1728,12 @@ def get_order_calculation_result(params=None, *, source_loader: Callable = load_
             f"확인 필요 {int(exclusion.get('needs_confirmation') or 0):,}건, "
             f"발주 필요 없음 {int(exclusion.get('no_order_required') or 0):,}건. "
             "'확인 필요' 조회로 자료 부족 품목을 확인하세요."
+        )
+    spike_count = int(order_filter_diagnostics.get("non_order_spike_confirmation_rows") or 0)
+    if q.get("only_needed") and spike_count:
+        summary += (
+            f"\n발주대상 외 당월 출고 급증 확인 {spike_count:,}건은 이 조회에서 제외됐습니다. "
+            "조회구분 '확인 필요'에서 확인하세요."
         )
     input_order_date = q["order_date"]
     effective_order_date = str(sources.get("effective_business_date") or input_order_date)
