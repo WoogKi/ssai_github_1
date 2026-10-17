@@ -1233,17 +1233,28 @@ def _is_product_code_token(value: Any, *, explicit: bool = False) -> bool:
     )
 
 
-def _extract_product_code_for_io(text: str) -> Optional[str]:
-    """IO 문장의 명시·단독 제품코드를 문자열 그대로 추출한다."""
+def extract_labeled_product_code(text: str, *, generic_only: bool = False) -> Optional[str]:
+    """명시적인 제품코드/제품 5자리 조건을 문자열 그대로 추출한다."""
     t = _norm(text)
     for match in re.finditer(
         r"(?P<label>제품코드|제품)\s*[:=]?\s*(?P<code>[A-Za-z0-9]{5})(?![A-Za-z0-9])",
         t,
     ):
         label = match.group("label")
+        if generic_only and label != "제품":
+            continue
         code = match.group("code")
         if _is_product_code_token(code, explicit=(label == "제품코드")):
             return code
+    return None
+
+
+def _extract_product_code_for_io(text: str) -> Optional[str]:
+    """IO 문장의 명시·단독 제품코드를 문자열 그대로 추출한다."""
+    t = _norm(text)
+    labeled_code = extract_labeled_product_code(t)
+    if labeled_code:
+        return labeled_code
 
     if _has_any(t, _PRODUCT_IO_WORDS):
         # An unlabeled five-digit product code cannot be the value of a

@@ -9,6 +9,7 @@ from typing import Any, Mapping, Optional
 from app.sims.meta.erp_table_feature_registry import filter_labels, match_action_in_text
 from app.services.business_calendar_service import kst_today
 from app.services.io_nlq import (
+    extract_labeled_product_code,
     extract_nlq_natural_period,
     nlq_period_to_date_range,
     strip_nlq_period_tokens_for_entity_residual,
@@ -390,6 +391,12 @@ def _resolve_order_nlq(
         value = _extract_name(raw, filter_labels(feature, key))
         if value:
             params[key] = value
+    labeled_code = extract_labeled_product_code(raw)
+    if labeled_code:
+        params.setdefault("physic_cd", labeled_code)
+        generic_code = extract_labeled_product_code(raw, generic_only=True)
+        if generic_code and params.get("physic_nm") == generic_code:
+            params.pop("physic_nm")
     staff_labels: list[tuple[str, ...]] = []
     for key in ("order_staff_nm", "pharma_staff_nm"):
         labels = filter_labels(feature, key)
@@ -410,7 +417,7 @@ def _resolve_order_nlq(
             params.setdefault("_unconsumed_order_condition", labels[0])
     if re.search(r"(?<!발주)(?<!제약)(?<!영업)담당자(?:명)?\s*[:=]?\s*\S+", raw):
         params["_ambiguous_staff_role"] = True
-    if not params.get("physic_nm"):
+    if not params.get("physic_cd") and not params.get("physic_nm"):
         physic_nm = _extract_name_before_label(raw, filter_labels(feature, "physic_nm"))
         if physic_nm:
             params["physic_nm"] = physic_nm

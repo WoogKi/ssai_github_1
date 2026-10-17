@@ -195,6 +195,45 @@ def run():
     _assert_snapshot_error_precedes_early_scope()
     _assert_manual_validation_evidence()
     _assert_r230_scoped_source_call_contract()
+    product_cases = (
+        ('제품 31278 발주계산 조회조건 전체', 'physic_cd', '31278', '전체'),
+        ('발주계산 제품코드 31278 조회구분 전체', 'physic_cd', '31278', '전체'),
+        ('제품코드 31278 발주계산 조회구분 확인', 'physic_cd', '31278', '확인 필요'),
+        ('발주계산 제품코드 00846', 'physic_cd', '00846', '발주해당자료만'),
+        ('발주계산 제품명 조플루자정', 'physic_nm', '조플루자정', '발주해당자료만'),
+        ('발주계산 제품명 31278', 'physic_nm', '31278', '발주해당자료만'),
+        ('발주계산 제품 조플루자정', 'physic_nm', '조플루자정', '발주해당자료만'),
+        ('발주계산 제품 00846', 'physic_cd', '00846', '발주해당자료만'),
+        ('발주계산 제품 1234', 'physic_nm', '1234', '발주해당자료만'),
+    )
+    for question, key, value, mode in product_cases:
+        for resolver in (resolve_registered_erp_table_nlq, resolve_io_nlq):
+            parsed = resolver(question, today=date(2026, 10, 17))
+            params = parsed['params']
+            assert parsed['action'] == '발주 계산' and params[key] == value, (question, parsed)
+            assert params['query_mode'] == mode, (question, parsed)
+            assert not params.get('physic_nm' if key == 'physic_cd' else 'physic_cd'), (question, parsed)
+    assert resolve_io_nlq('입고명세 제품 00029 조회')['params']['physic_cd'] == '00029'
+    assert resolve_registered_erp_table_nlq('발주조회 제품명 31278')['params']['physic_nm'] == '31278'
+    for question in ('발주계산 제품 31278 제품코드 00846', '발주계산 제품코드 00846 제품 31278'):
+        params = resolve_registered_erp_table_nlq(question)['params']
+        assert params['physic_cd'] == '00846' and not params.get('physic_nm'), (question, params)
+    explicit_name = resolve_registered_erp_table_nlq('발주계산 제품명 31278 제품코드 00846')['params']
+    assert explicit_name['physic_cd'] == '00846' and explicit_name['physic_nm'] == '31278'
+    sent, requests = [], []
+    def capture_product_service(params=None):
+        requests.append(dict(params or {}))
+        return {'records': [], 'meta': {'row_count_total': 0, 'source_call_count': 0}}
+    with patch('app.services.order_calculation_service.get_order_calculation_result', side_effect=capture_product_service), \
+         patch('app.ui.chat_middleware.push_sims_result_to_chat', side_effect=lambda p, a: sent.append(p) or p['meta']):
+        assert _try_handle_io_nlq(
+            product_cases[0][0], room={}, session_state={}, make_ts=lambda: 'fixture',
+            next_seq=lambda: 1, logger=logging.getLogger('fixture'),
+        )
+    assert len(requests) == len(sent) == 1
+    assert requests[0]['physic_cd'] == '31278' and not requests[0].get('physic_nm')
+    assert requests[0]['query_mode'] == '전체' and sent[0]['meta']['source_call_count'] == 0
+    print('PASS order product code/name parser and mocked service boundary 9/9; ERP calls 0')
     mode_cases = [
         ('한림 안전재고 5일 적정재고 20일 마감일자 25일 조회구분 해당 발주 계산', '한림', True),
         ('환인 조회구분 발주해당자료만 발주 계산', '환인', True),
