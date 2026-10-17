@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+from decimal import Decimal
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,22 +17,31 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (  # noq
     build_frequency_snapshot_plan,
     generate_frequency_snapshot_draft,
     resolve_dashboard_profile_stock_scope,
+    selected_io_snapshot_key,
 )
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     SnapshotContractError,
 )
+from app.services.saved_io_scope import resolve_saved_io_scope  # noqa: E402
 
 
-def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, scope_source: str) -> dict[str, Any]:
+def _json_decimal(value: Any) -> str:
+    if isinstance(value, Decimal):
+        return str(value)
+    raise TypeError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, scope_source: str, saved_io_full: bool = False) -> dict[str, Any]:
     return {
         "mode": "apply" if apply else "dry-run",
         "company_id": plan.company_id,
         "evaluation_month": plan.evaluation_month,
         "schema_version": PRODUCT_STATISTICS_SCHEMA_VERSION,
-        "algorithm_version": PRODUCT_STATISTICS_ALGORITHM_VERSION,
+        "algorithm_version": SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION if saved_io_full else PRODUCT_STATISTICS_ALGORITHM_VERSION,
         "basis_months": list(plan.basis_months),
         "basis_from": plan.basis_from,
         "basis_to": plan.basis_to,
@@ -79,7 +89,11 @@ def main() -> int:
     parser.add_argument("--created-by", default="")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--saved-io-full", action="store_true", help="company-profile saved-I/O contract")
     args = parser.parse_args()
+
+    if args.saved_io_full and (args.force or not args.dashboard_profile):
+        parser.error("--saved-io-full requires --dashboard-profile and no --force")
 
     manual_scope = None if args.dashboard_profile else ([] if args.all_stock_locations else args.stock_code)
     try:
@@ -117,7 +131,16 @@ def main() -> int:
         timeout_seconds=max(1, int(args.timeout_seconds)),
         force=bool(args.force),
         scope_source=resolved_scope.scope_source,
+        saved_io_full=bool(args.saved_io_full),
     )
+    if args.saved_io_full:
+        io_scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True)
+        output["saved_io_roles"] = io_scope.snapshot_role_report()
+        if io_scope.unclassified_codes:
+            output.update({"ok": False, "error_code": "saved_io_roles_unconfirmed"})
+            print(json.dumps(output, ensure_ascii=False, indent=2))
+            return 1
+        output["product_scope"]["profile_fingerprint"] = selected_io_snapshot_key(plan, io_scope).profile_fingerprint
     if not args.apply:
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
@@ -130,6 +153,7 @@ def main() -> int:
             timeout_seconds=max(1, int(args.timeout_seconds)),
             force=bool(args.force),
             progress_reporter=lambda message: print(f"[진행] {message}"),
+            saved_io_full=bool(args.saved_io_full),
         )
         relational_snapshot = result["relational_snapshot"]
         draft = result["draft"]
@@ -160,9 +184,9 @@ def main() -> int:
         )
     except Exception as exc:
         output.update({"ok": False, "error_type": type(exc).__name__, "error": str(exc)})
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        print(json.dumps(output, ensure_ascii=False, indent=2, default=_json_decimal))
         return 1
-    print(json.dumps(output, ensure_ascii=False, indent=2))
+    print(json.dumps(output, ensure_ascii=False, indent=2, default=_json_decimal))
     return 0
 
 

@@ -51,6 +51,19 @@ class SavedIoScope:
         encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
+    def snapshot_role_report(self) -> dict[str, tuple[str, ...]]:
+        """Account for every saved code without treating other roles as grade events."""
+        if self.policy_version != FULL_POLICY_VERSION:
+            raise ValueError("snapshot role report requires the full saved I/O policy")
+        return {
+            "normal_inbound_and_price": self.normal_inbound_codes,
+            "inbound_return_not_price": self.inbound_return_codes,
+            "normal_outbound": self.outbound_codes,
+            "outbound_return_not_frequency": self.outbound_return_codes,
+            "other_r110_role_unconfirmed": tuple(code for code in self.unclassified_codes if code[0] in "234"),
+            "other_r120_role_unconfirmed": tuple(code for code in self.unclassified_codes if code[0] in "789"),
+        }
+
 
 def resolve_saved_io_scope(
     io_gu_list: Iterable[Any], *, include_pda_candidate: bool = False,

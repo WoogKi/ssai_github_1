@@ -72,10 +72,9 @@ def test_profile_contract_reaches_snapshot_plan() -> None:
     _assert(plan.product_di_codes == ("0004:01",), "product type scope missing")
     _assert(plan.product_class_codes == ("0031:02",), "product class scope missing")
     _assert(plan.io_gu_codes == ("001", "501") and plan.stock_mode == "book", "profile metadata missing")
-    _assert(
-        frequency_snapshot_read_keys(plan)[0].profile_fingerprint == plan.profile_fingerprint,
-        "v2 repository key lost the saved-profile identity",
-    )
+    keys = frequency_snapshot_read_keys(plan)
+    _assert(keys[0].profile_fingerprint != plan.profile_fingerprint, "saved I/O key lost its separate identity")
+    _assert(keys[1].profile_fingerprint == plan.profile_fingerprint, "v2 fallback lost the saved-profile identity")
 
 
 def test_profile_fingerprint_is_canonical_and_sensitive() -> None:

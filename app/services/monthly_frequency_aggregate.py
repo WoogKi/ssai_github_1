@@ -18,6 +18,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     validate_relational_frequency_snapshot,
 )
 from app.services.product_master_filter_contract import add_named_management_only_exclusion
+from app.services.saved_io_scope import FULL_POLICY_VERSION, SavedIoScope, bind_io_codes
 
 
 MONTHLY_FREQUENCY_SCHEMA_VERSION = "1.0"
@@ -665,6 +666,7 @@ def first_normal_inbound_month_sql(
     *,
     stock_codes: Iterable[Any],
     cutoff_date: Any,
+    io_scope: SavedIoScope | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Return the canonical scope-bound first normal inbound month query."""
     cutoff = str(cutoff_date or "").strip()
@@ -683,12 +685,16 @@ def first_normal_inbound_month_sql(
             "AND I.Rd11_Stock_Cd_Gcode = '0018'\n"
             "  AND I.Rd11_Stock_Cd IN (" + ", ".join(names) + ")"
         )
+    normal_inbound_clause = (
+        bind_io_codes("I.Rd11_Io_Gu", io_scope.normal_inbound_codes, binds, prefix="first_inbound_io")
+        if io_scope is not None else "I.Rd11_Io_Gu IN ('001', '002')"
+    )
     sql = f"""
 SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
        LEFT(MIN(LTRIM(RTRIM(I.Rd11_In_YyMmDd))), 6) AS first_normal_inbound_month
 FROM dbo.Rddbc110 AS I
 WHERE I.Rd11_Io_Gu_Gcode = '0012'
-  AND I.Rd11_Io_Gu IN ('001', '002')
+  AND {normal_inbound_clause}
   AND COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0
   AND NULLIF(LTRIM(RTRIM(I.Rd11_Physic_Cd)), '') IS NOT NULL
   AND LEN(LTRIM(RTRIM(I.Rd11_In_YyMmDd))) = 8
@@ -718,6 +724,7 @@ def product_lifecycle_sql(
     snapshot_projection_only: bool = False,
     seek_char5_monthly_stock: bool = False,
     exclude_management_only: bool = False,
+    io_scope: SavedIoScope | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Read profile-scoped lifecycle and product-universe evidence once."""
     cutoff = str(cutoff_date or "").strip()
@@ -766,6 +773,61 @@ def product_lifecycle_sql(
         inbound_stock = "AND I.Rd11_Stock_Cd_Gcode = '0018' AND I.Rd11_Stock_Cd IN (" + values + ")"
         outbound_stock = "AND O.Rd12_Stock_Cd_Gcode = '0018' AND O.Rd12_Stock_Cd IN (" + values + ")"
         monthly_stock = "AND M.{prefix}_Stock_Cd IN (" + values + ")"
+    normal_inbound_clause = (
+        bind_io_codes("I.Rd11_Io_Gu", io_scope.normal_inbound_codes, binds, prefix="lifecycle_inbound_io")
+        if io_scope is not None else "I.Rd11_Io_Gu IN ('001', '002')"
+    )
+    price_clause = (
+        bind_io_codes("I.Rd11_Io_Gu", io_scope.price_codes, binds, prefix="lifecycle_price_io")
+        if io_scope is not None else "I.Rd11_Io_Gu IN ('001', '002')"
+    )
+    shadow_price = io_scope is not None and io_scope.policy_version == FULL_POLICY_VERSION
+    if shadow_price:
+        price_ctes = f"""PurchasePriceMonthly AS (
+    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
+           LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6) AS basis_month,
+           CAST(I.Rd11_Quantity AS decimal(38, 6)) AS paid_quantity,
+           CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price) AS decimal(38, 6)) AS supply_amount,
+           ROW_NUMBER() OVER (
+               PARTITION BY LTRIM(RTRIM(I.Rd11_Physic_Cd))
+               ORDER BY I.Rd11_In_YyMmDd DESC,
+                        I.Rd11_In_Seq DESC, I.Rd11_Ven_Cd DESC,
+                        I.Rd11_Cost_Apply_Cd DESC, I.Rd11_Io_Gu DESC
+           ) AS price_rank
+    FROM dbo.Rddbc110 AS I
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {price_clause}
+      AND COALESCE(I.Rd11_Quantity, 0) > 0
+      AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
+      AND NULLIF(LTRIM(RTRIM(I.Rd11_Cost_Apply_Cd)), '') IS NOT NULL
+      AND I.Rd11_In_YyMmDd >= :price_lookback_from AND I.Rd11_In_YyMmDd <= :basis_to
+      {inbound_stock}
+), LatestPurchasePrice AS (
+    SELECT product_code, basis_month, paid_quantity, supply_amount, price_rank
+    FROM PurchasePriceMonthly
+)"""
+    else:
+        price_ctes = f"""PurchasePriceMonthly AS (
+    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
+           LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6) AS basis_month,
+           SUM(CAST(I.Rd11_Quantity AS decimal(38, 6))) AS paid_quantity,
+           SUM(CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) AS decimal(38, 6))) AS supply_amount
+    FROM dbo.Rddbc110 AS I
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {price_clause}
+      AND COALESCE(I.Rd11_Quantity, 0) > 0
+      AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
+      AND I.Rd11_In_YyMmDd >= :price_lookback_from AND I.Rd11_In_YyMmDd <= :basis_to
+      {inbound_stock}
+    GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd)), LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6)
+), LatestPurchasePrice AS (
+    SELECT product_code, basis_month, paid_quantity, supply_amount,
+           ROW_NUMBER() OVER (PARTITION BY product_code ORDER BY basis_month DESC) AS price_rank
+    FROM PurchasePriceMonthly
+    WHERE paid_quantity > 0
+)"""
+    outbound_clause = (
+        bind_io_codes("O.Rd12_Io_Gu", io_scope.outbound_codes, binds, prefix="lifecycle_outbound_io")
+        if io_scope is not None else None
+    )
 
     def _dimension_clause(values: Iterable[Any], *, expected_gcode: str, gcode_column: str, tcode_column: str, prefix: str) -> str:
         checks: list[str] = []
@@ -853,6 +915,7 @@ def product_lifecycle_sql(
             WHEN LEN(LTRIM(RTRIM(O.Rd12_Io_Gu))) = 3
              AND LTRIM(RTRIM(O.Rd12_Io_Gu)) NOT LIKE '%[^0-9]%'
             THEN LTRIM(RTRIM(O.Rd12_Io_Gu)) ELSE NULL END) BETWEEN 500 AND 599
+      {f'AND {outbound_clause}' if outbound_clause is not None else ''}
       AND COALESCE(O.Rd12_Quantity, 0) + COALESCE(O.Rd12_Oquantity, 0) > 0
       AND NULLIF(LTRIM(RTRIM(O.Rd12_Physic_Cd)), '') IS NOT NULL
       AND LEN(LTRIM(RTRIM(O.Rd12_Out_YyMmDd))) = 8
@@ -887,7 +950,7 @@ WITH ProductUniverse AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
            MIN(LTRIM(RTRIM(I.Rd11_In_YyMmDd))) AS first_normal_inbound_date
     FROM dbo.Rddbc110 AS I
-    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND I.Rd11_Io_Gu IN ('001', '002')
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {normal_inbound_clause}
       AND COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0
       AND NULLIF(LTRIM(RTRIM(I.Rd11_Physic_Cd)), '') IS NOT NULL
       AND LEN(LTRIM(RTRIM(I.Rd11_In_YyMmDd))) = 8
@@ -899,28 +962,11 @@ WITH ProductUniverse AS (
 ), BasisInbound AS (
     SELECT DISTINCT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code
     FROM dbo.Rddbc110 AS I
-    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND I.Rd11_Io_Gu IN ('001', '002')
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {normal_inbound_clause}
       AND COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0
       AND I.Rd11_In_YyMmDd >= :basis_from AND I.Rd11_In_YyMmDd <= :basis_to
       {inbound_stock}
-), PurchasePriceMonthly AS (
-    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
-           LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6) AS basis_month,
-           SUM(CAST(I.Rd11_Quantity AS decimal(38, 6))) AS paid_quantity,
-           SUM(CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) AS decimal(38, 6))) AS supply_amount
-    FROM dbo.Rddbc110 AS I
-    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND I.Rd11_Io_Gu IN ('001', '002')
-      AND COALESCE(I.Rd11_Quantity, 0) > 0
-      AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
-      AND I.Rd11_In_YyMmDd >= :price_lookback_from AND I.Rd11_In_YyMmDd <= :basis_to
-      {inbound_stock}
-    GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd)), LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6)
-), LatestPurchasePrice AS (
-    SELECT product_code, basis_month, paid_quantity, supply_amount,
-           ROW_NUMBER() OVER (PARTITION BY product_code ORDER BY basis_month DESC) AS price_rank
-    FROM PurchasePriceMonthly
-    WHERE paid_quantity > 0
-){first_outbound_cte}{monthly_stock_cte}, CurrentInbound AS (
+), {price_ctes}{first_outbound_cte}{monthly_stock_cte}, CurrentInbound AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code, SUM({detail_in_qty}) AS quantity
     FROM dbo.Rddbc110 AS I
     WHERE :use_current_detail = 1 AND I.Rd11_Io_Gu_Gcode = '0012'

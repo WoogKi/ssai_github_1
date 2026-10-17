@@ -14,6 +14,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     FrequencyProjectionReadResult,
     RELATIONAL_FREQUENCY_REPRESENTATION,
     RelationalFrequencySnapshot,
+    SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
     SnapshotContractError,
     build_frequency_projection,
     build_relational_frequency_projection,
@@ -367,8 +368,20 @@ class SqlServerSnapshotRepository:
         *,
         created_by: str,
         force: bool = False,
+        saved_io_verified: bool = False,
     ) -> SnapshotPublishResult:
         """Store one complete payload-less relational authority set as a draft."""
+        if snapshot.key.algorithm_version == SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION and not saved_io_verified:
+            raise SnapshotContractError("candidate Saved I/O prices cannot be persisted as an approved Snapshot contract")
+        if saved_io_verified and (
+            force or snapshot.key.algorithm_version != SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION
+            or not snapshot.key.profile_fingerprint
+        ):
+            raise SnapshotContractError("verified Saved I/O draft requires its exact versioned profile key")
+        if saved_io_verified:
+            from app.services.dashboard_inventory_frequency_snapshot_service import validate_saved_io_snapshot_profile_key
+
+            validate_saved_io_snapshot_profile_key(snapshot.key)
         actor = _validate_actor(created_by, field="created_by")
         validate_relational_frequency_snapshot(snapshot)
         projection_rows, projection_headers = build_relational_frequency_projection(snapshot)
@@ -503,6 +516,7 @@ class SqlServerSnapshotRepository:
         expected_checksum: str,
         approved_by: str,
         approval_reason: str,
+        saved_io_verified: bool = False,
     ) -> SnapshotPublishResult:
         checksum = str(expected_checksum or "").strip().lower()
         if len(checksum) != 64 or any(ch not in "0123456789abcdef" for ch in checksum):
@@ -513,6 +527,7 @@ class SqlServerSnapshotRepository:
             approved_by=approved_by,
             approval_reason=approval_reason,
             expected_checksum=checksum,
+            saved_io_verified=saved_io_verified,
         )
 
     def _approve(
@@ -523,7 +538,18 @@ class SqlServerSnapshotRepository:
         approved_by: str,
         approval_reason: str,
         expected_checksum: str,
+        saved_io_verified: bool = False,
     ) -> SnapshotPublishResult:
+        if key.algorithm_version == SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION and not saved_io_verified:
+            raise SnapshotContractError("candidate Saved I/O prices cannot be approved")
+        if saved_io_verified and (
+            key.algorithm_version != SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION or not key.profile_fingerprint
+        ):
+            raise SnapshotContractError("verified Saved I/O approval requires its exact versioned profile key")
+        if saved_io_verified:
+            from app.services.dashboard_inventory_frequency_snapshot_service import validate_saved_io_snapshot_profile_key
+
+            validate_saved_io_snapshot_profile_key(key)
         actor = _validate_actor(approved_by, field="approved_by")
         reason = _validate_actor(approval_reason, field="approval_reason")
         conn = self._writer_connection_factory()

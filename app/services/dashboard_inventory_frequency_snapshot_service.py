@@ -29,6 +29,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     EXTENDED_SCHEMA_VERSION,
     LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     FrequencyProjectionReadResult,
     RelationalFrequencySnapshot,
@@ -43,6 +44,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     scope_fingerprint,
 )
 from app.services.monthly_frequency_aggregate import product_lifecycle_sql
+from app.services.saved_io_scope import FULL_POLICY_VERSION, SavedIoScope, bind_io_codes, resolve_saved_io_scope
 from app.services.product_classification_contract import ClassificationStatus
 from app.services.ssai_product_classification_repository import (
     ProductClassificationTargets,
@@ -306,13 +308,65 @@ def frequency_snapshot_key(
     )
 
 
-def frequency_snapshot_read_keys(plan: FrequencySnapshotPlan) -> tuple[SnapshotKey, SnapshotKey, SnapshotKey]:
-    """Prefer product statistics, then lifecycle v2, without invalidating v1."""
-    return (
+def frequency_snapshot_read_keys(plan: FrequencySnapshotPlan) -> tuple[SnapshotKey, ...]:
+    """Prefer an approved saved-I/O generation, retaining legacy fallbacks."""
+    legacy = (
         frequency_snapshot_key(plan, product_statistics=True),
         frequency_snapshot_key(plan, extended=True),
         frequency_snapshot_key(plan),
     )
+    if plan.io_gu_codes:
+        scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True)
+        if not scope.unclassified_codes:
+            return (selected_io_snapshot_key(plan, scope), *legacy)
+    return legacy
+
+
+def selected_io_snapshot_key(plan: FrequencySnapshotPlan, io_scope: SavedIoScope) -> SnapshotKey:
+    """Identify the saved-I/O calculation separately from approved v2.1 keys."""
+    _require_plan_io_scope(plan, io_scope)
+    legacy = frequency_snapshot_key(plan, product_statistics=True)
+    return replace(
+        legacy,
+        algorithm_version=f"{legacy.algorithm_version}+{io_scope.policy_version}",
+        profile_fingerprint=io_scope.fingerprint(plan.profile_fingerprint),
+    )
+
+
+def validate_saved_io_snapshot_profile_key(key: SnapshotKey) -> None:
+    """Reject direct Repository writes using a key outside the current company profile."""
+    stored = resolve_dashboard_profile_stock_scope(company_id=key.company_id)
+    plan = build_frequency_snapshot_plan(
+        company_id=stored.company_id, evaluation_month=key.evaluation_month,
+        stock_codes=stored.stock_codes, product_group_codes=stored.product_group_codes,
+        product_di_codes=stored.product_di_codes, product_class_codes=stored.product_class_codes,
+        io_gu_codes=stored.io_gu_codes, stock_mode=stored.stock_mode,
+    )
+    io_scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True)
+    if io_scope.unclassified_codes or key != selected_io_snapshot_key(plan, io_scope):
+        raise SnapshotContractError("Saved I/O key differs from the current company profile")
+
+
+def _plan_with_current_saved_io(plan: FrequencySnapshotPlan) -> FrequencySnapshotPlan:
+    """Use each company's saved I/O only when the remaining profile scope matches."""
+    try:
+        stored = resolve_dashboard_profile_stock_scope(company_id=plan.company_id)
+    except Exception:
+        return plan
+    if (
+        stored.stock_codes != plan.stock_codes
+        or tuple(sorted(stored.product_group_codes)) != plan.product_group_codes
+        or tuple(sorted(stored.product_di_codes)) != plan.product_di_codes
+        or tuple(sorted(stored.product_class_codes)) != plan.product_class_codes
+        or stored.stock_mode != plan.stock_mode
+    ):
+        return plan
+    return replace(plan, io_gu_codes=stored.io_gu_codes)
+
+
+def _require_plan_io_scope(plan: FrequencySnapshotPlan, io_scope: SavedIoScope) -> None:
+    if io_scope.all_codes != resolve_saved_io_scope(plan.io_gu_codes).all_codes:
+        raise SnapshotContractError("selected I/O scope differs from the saved plan")
 
 
 @contextmanager
@@ -320,13 +374,14 @@ def frequency_snapshot_generation_guard(
     plan: FrequencySnapshotPlan,
     *,
     lock_root: Path | None = None,
+    key: SnapshotKey | None = None,
 ) -> Iterable[SnapshotKey]:
     """Serialize one company/month/scope generation across local CLI processes.
 
     A stale lock intentionally remains fail-closed for an operator to inspect;
     this prevents a crashed run from silently overlapping a later retry.
     """
-    key = frequency_snapshot_key(plan, product_statistics=True)
+    key = key or frequency_snapshot_key(plan, product_statistics=True)
     digest_input = "|".join(
         (
             key.company_id,
@@ -453,6 +508,8 @@ def read_approved_frequency_snapshot(
         )
     except SnapshotContractError as exc:
         return SnapshotReadResult(status=SNAPSHOT_STATUS_MISSING, reason=str(exc))
+    if repository is None:
+        plan = _plan_with_current_saved_io(plan)
     keys = frequency_snapshot_read_keys(plan)
     try:
         as_of = _operating_as_of_date(as_of_date)
@@ -554,6 +611,8 @@ def read_approved_frequency_projection(
             product_class_codes=product_class_codes,
             stock_mode=stock_mode,
         )
+        if repository is None:
+            plan = _plan_with_current_saved_io(plan)
         keys = frequency_snapshot_read_keys(plan)
         as_of = _operating_as_of_date(as_of_date)
     except SnapshotContractError as exc:
@@ -1039,8 +1098,12 @@ _PRODUCT_STATISTICS_STREAM_COLUMNS = (
 
 def product_statistics_raw_event_stream_sql(
     plan: FrequencySnapshotPlan,
+    *,
+    io_scope: SavedIoScope | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Return one ordered, profile-scoped R120 stream for Python aggregation."""
+    if io_scope is not None:
+        _require_plan_io_scope(plan, io_scope)
     binds: dict[str, Any] = {
         "basis_from": plan.basis_from,
         "basis_to": plan.basis_to,
@@ -1054,6 +1117,13 @@ def product_statistics_raw_event_stream_sql(
             binds[key] = code
             names.append(f":{key}")
         stock_clause = "AND O.Rd12_Stock_Cd_Gcode='0018' AND O.Rd12_Stock_Cd IN (" + ", ".join(names) + ")"
+    selected_io_clause = (
+        "AND O.Rd12_Io_Gu_Gcode='0012' AND "
+        + bind_io_codes(
+            "O.Rd12_Io_Gu", (*io_scope.outbound_codes, *io_scope.outbound_return_codes),
+            binds, prefix="statistics_io",
+        ) if io_scope is not None else ""
+    )
     product_join, product_clause = _product_dimension_scope_sql(plan, binds, product_alias="P")
     return f"""
 SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
@@ -1070,8 +1140,9 @@ FROM dbo.Rddbc120 AS O
 {product_join}
 WHERE O.Rd12_Out_YyMmDd >= :price_lookback_from AND O.Rd12_Out_YyMmDd <= :basis_to
   {stock_clause}
+  {selected_io_clause}
   {product_clause}
-ORDER BY O.Rd12_Out_YyMmDd, O.Rd12_Ven_Cd, O.Rd12_Out_Seq
+ORDER BY O.Rd12_Out_YyMmDd, O.Rd12_Ven_Cd, O.Rd12_Out_Seq{', O.Rd12_Io_Gu' if io_scope is not None and io_scope.policy_version == FULL_POLICY_VERSION else ''}
 """.strip(), binds
 
 def _fixture_decimal(value: Any, *, field: str) -> Decimal:
@@ -1238,6 +1309,7 @@ def _python_product_statistics_projection_chunks(
     basis_from: str,
     output_chunk_rows: int = 50000,
     metrics: dict[str, Any] | None = None,
+    io_scope: SavedIoScope | None = None,
 ) -> Iterable[pd.DataFrame]:
     """Convert one ordered raw R120 stream to the legacy 22-column projection."""
     required = {
@@ -1258,7 +1330,8 @@ def _python_product_statistics_projection_chunks(
         "return_nonpositive_row_count": 0,
         "other_tcode_row_count": 0,
     }
-    current_slip: tuple[str, str, str] | None = None
+    preserve_io_role = io_scope is not None and io_scope.policy_version == FULL_POLICY_VERSION
+    current_slip: tuple[str, ...] | None = None
     normal_exact: dict[tuple[str, str, Decimal], list[Any]] = {}
     return_exact: dict[tuple[str, str, Decimal, Decimal], int] = {}
 
@@ -1269,7 +1342,7 @@ def _python_product_statistics_projection_chunks(
         nonlocal normal_exact, return_exact
         if current_slip is None:
             return
-        outbound_date, vendor_code, _outbound_seq = current_slip
+        outbound_date, vendor_code, _outbound_seq = current_slip[:3]
         if normal_exact:
             mapping_count = len(normal_exact)
             product_code = max(key[0] for key in normal_exact)
@@ -1284,6 +1357,14 @@ def _python_product_statistics_projection_chunks(
                 price[0] += paid_quantity
                 price[1] += supply_amount
             if outbound_date >= basis_from:
+                if preserve_io_role and metrics is not None and mapping_count == 1:
+                    io_tcode = current_slip[3]
+                    events = metrics.setdefault("normal_event_count_by_io", {})
+                    quantities = metrics.setdefault("normal_outbound_quantity_by_io", {})
+                    amounts = metrics.setdefault("normal_supply_amount_by_io", {})
+                    events[io_tcode] = int(events.get(io_tcode, 0)) + 1
+                    quantities[io_tcode] = int(quantities.get(io_tcode, 0)) + int(outbound_quantity)
+                    amounts[io_tcode] = amounts.get(io_tcode, Decimal(0)) + supply_amount
                 output_rows.append(projection(
                     row_kind="event", outbound_date=outbound_date, vendor_code=vendor_code,
                     product_code=product_code, stock_code=stock_code,
@@ -1299,6 +1380,14 @@ def _python_product_statistics_projection_chunks(
                 current[0] += 1
                 current[1] += -outbound_quantity
                 current[2] += -supply_amount
+                if preserve_io_role and metrics is not None:
+                    io_tcode = current_slip[3]
+                    returns = metrics.setdefault("return_event_count_by_io", {})
+                    quantities = metrics.setdefault("return_source_quantity_by_io", {})
+                    amounts = metrics.setdefault("return_source_amount_by_io", {})
+                    returns[io_tcode] = int(returns.get(io_tcode, 0)) + 1
+                    quantities[io_tcode] = quantities.get(io_tcode, Decimal(0)) + outbound_quantity
+                    amounts[io_tcode] = amounts.get(io_tcode, Decimal(0)) + supply_amount
         normal_exact = {}
         return_exact = {}
 
@@ -1316,7 +1405,9 @@ def _python_product_statistics_projection_chunks(
             outbound_quantity = _stream_decimal(record.get("outbound_quantity"), field="outbound_quantity")
             paid_quantity = _stream_decimal(record.get("paid_quantity"), field="paid_quantity")
             supply_amount = _stream_decimal(record.get("supply_amount"), field="supply_amount")
-            slip = (outbound_date, vendor_code, outbound_seq)
+            slip = (outbound_date, vendor_code, outbound_seq, io_tcode) if preserve_io_role else (
+                outbound_date, vendor_code, outbound_seq,
+            )
             if current_slip is None:
                 current_slip = slip
             elif slip != current_slip:
@@ -1327,8 +1418,12 @@ def _python_product_statistics_projection_chunks(
                     output_rows = []
 
             ascii_digits = len(io_tcode) == 3 and io_tcode.isascii() and io_tcode.isdigit()
-            is_normal = io_gcode == "0012" and ascii_digits and io_tcode[0] == "5"
-            is_return = io_gcode == "0012" and ascii_digits and io_tcode[0] == "6"
+            is_normal = io_gcode == "0012" and ascii_digits and (
+                io_tcode in io_scope.outbound_codes if preserve_io_role else io_tcode[0] == "5"
+            )
+            is_return = io_gcode == "0012" and ascii_digits and (
+                io_tcode in io_scope.outbound_return_codes if preserve_io_role else io_tcode[0] == "6"
+            )
             if outbound_date >= basis_from:
                 diagnostics["source_row_count"] += 1
                 if is_normal and outbound_quantity > 0:
@@ -1668,10 +1763,30 @@ def _aggregate_result(frame: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
     return rows, diagnostics
 
 
-def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None, classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority) -> dict[str, Any]:
+def _generate_frequency_snapshot_draft_locked(
+    *, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120,
+    query_executor: QueryExecutor | None = None, repository: Any | None = None,
+    force: bool = False, progress_reporter: ProgressReporter | None = None,
+    classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority,
+    io_scope: SavedIoScope | None = None, shadow_only: bool = False,
+    saved_io_full: bool = False,
+) -> dict[str, Any]:
     actor = str(created_by or "").strip()
     if not actor:
         raise SnapshotContractError("created_by is required")
+    use_saved_io = shadow_only or saved_io_full
+    if use_saved_io:
+        if io_scope is None or io_scope.policy_version != FULL_POLICY_VERSION:
+            raise SnapshotContractError("saved I/O calculation requires the full saved I/O policy")
+        _require_plan_io_scope(plan, io_scope)
+        if io_scope.unclassified_codes:
+            raise SnapshotContractError(
+                "saved I/O roles are unconfirmed: " + ", ".join(io_scope.unclassified_codes)
+            )
+        if force:
+            raise SnapshotContractError("saved I/O generation cannot be forced")
+    elif io_scope is not None:
+        raise SnapshotContractError("saved I/O candidates cannot be written as a Snapshot draft")
     query = query_executor or _query_company_df
     report = progress_reporter or (lambda _message: None)
     evaluation_last_day = date(
@@ -1695,6 +1810,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
         snapshot_projection_only=True,
         exclude_management_only=True,
         seek_char5_monthly_stock=plan.company_id in (12, 13) and plan.stock_mode == "real",
+        io_scope=io_scope,
     )
     report("제품 및 최초 정상 입고 조회 중")
     source1_started = time.perf_counter()
@@ -1702,11 +1818,13 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
     source_metrics: dict[str, Any] = {
         "source1_ms": round((time.perf_counter() - source1_started) * 1000, 3),
     }
+    if io_scope is not None:
+        source_metrics["saved_io_roles"] = io_scope.snapshot_role_report()
     if not isinstance(lifecycle_df, pd.DataFrame) or "product_code" not in lifecycle_df.columns:
         raise SnapshotContractError("product lifecycle query returned an invalid shape")
     report("출고 집계 중")
     if query_executor is None:
-        aggregate_sql, aggregate_binds = product_statistics_raw_event_stream_sql(plan)
+        aggregate_sql, aggregate_binds = product_statistics_raw_event_stream_sql(plan, io_scope=io_scope)
         source2_metrics: dict[str, Any] = {}
         source2_started = time.perf_counter()
         monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
@@ -1716,6 +1834,7 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
                 ),
                 basis_from=plan.basis_from,
                 metrics=source2_metrics,
+                io_scope=io_scope,
             )
         )
         source2_metrics["total_ms"] = round((time.perf_counter() - source2_started) * 1000, 3)
@@ -1732,12 +1851,26 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
             timeout_seconds,
         )
     else:
-        aggregate_sql, aggregate_binds = product_statistics_event_stream_sql(plan)
-        source2_started = time.perf_counter()
-        monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
-            (query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds),)
+        aggregate_sql, aggregate_binds = (
+            product_statistics_raw_event_stream_sql(plan, io_scope=io_scope)
+            if use_saved_io else product_statistics_event_stream_sql(plan)
         )
-        source_metrics["source2"] = {"total_ms": round((time.perf_counter() - source2_started) * 1000, 3)}
+        source2_started = time.perf_counter()
+        source2_frame = query(plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds)
+        source2_metrics = {} if use_saved_io else None
+        source2_chunks = (
+            _python_product_statistics_projection_chunks(
+                (source2_frame,), basis_from=plan.basis_from, io_scope=io_scope,
+                metrics=source2_metrics,
+            ) if use_saved_io else (source2_frame,)
+        )
+        monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
+            source2_chunks
+        )
+        source_metrics["source2"] = {
+            **(source2_metrics or {}),
+            "total_ms": round((time.perf_counter() - source2_started) * 1000, 3),
+        }
     product_codes, universe_diagnostics = _select_snapshot_product_universe(lifecycle_df, monthly_rows)
     if not product_codes:
         raise SnapshotContractError("dashboard profile product universe is empty")
@@ -1816,15 +1949,31 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
         profitability_unavailable_products=profitability_unavailable_products,
         stock_codes=plan.stock_codes, source_watermark=None,
         source_watermark_status="unverified", source_diagnostics=diagnostics,
-        profile_fingerprint=plan.profile_fingerprint,
+        profile_fingerprint=(selected_io_snapshot_key(plan, io_scope).profile_fingerprint
+                             if use_saved_io else plan.profile_fingerprint),
+        algorithm_version=(SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION if use_saved_io
+                           else PRODUCT_STATISTICS_ALGORITHM_VERSION),
     )
     key = relational_snapshot.key
+    if use_saved_io and key != selected_io_snapshot_key(plan, io_scope):
+        raise SnapshotContractError("saved I/O key does not match the stored profile")
+    if shadow_only:
+        return {
+            "plan": plan,
+            "relational_snapshot": relational_snapshot,
+            "source_metrics": source_metrics,
+            "operating_eligible": False,
+            "price_authority": "shadow_candidate_only",
+        }
     repo = repository or _company_snapshot_repository(int(plan.company_id))
     report("draft 저장 중")
     publish_relational = getattr(repo, "publish_relational", None)
     if not callable(publish_relational):
         raise SnapshotContractError("repository does not support relational frequency snapshots")
-    draft = publish_relational(relational_snapshot, created_by=actor, force=bool(force))
+    if saved_io_full:
+        draft = publish_relational(relational_snapshot, created_by=actor, force=False, saved_io_verified=True)
+    else:
+        draft = publish_relational(relational_snapshot, created_by=actor, force=bool(force))
     draft_generation_no = int(draft.generation_no or 0)
     draft_inspection = repo.inspect_generation(key, draft_generation_no)
     operating_read = repo.read(key)
@@ -1875,9 +2024,11 @@ def _generate_frequency_snapshot_draft_locked(*, plan: FrequencySnapshotPlan, cr
     }
 
 
-def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None, classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority) -> dict[str, Any]:
+def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None, classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority, saved_io_full: bool = False) -> dict[str, Any]:
     """Generate one exact snapshot draft while preventing an overlapping run."""
-    with frequency_snapshot_generation_guard(plan):
+    io_scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True) if saved_io_full else None
+    key = selected_io_snapshot_key(plan, io_scope) if io_scope is not None else None
+    with frequency_snapshot_generation_guard(plan, key=key):
         return _generate_frequency_snapshot_draft_locked(
             plan=plan,
             created_by=created_by,
@@ -1887,4 +2038,25 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
             force=force,
             progress_reporter=progress_reporter,
             classification_authority_loader=classification_authority_loader,
+            io_scope=io_scope, saved_io_full=saved_io_full,
+        )
+
+
+def calculate_saved_io_three_grades_shadow(
+    *, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120,
+    query_executor: QueryExecutor | None = None, progress_reporter: ProgressReporter | None = None,
+    classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Reuse the two-source grade calculation without creating or publishing a Snapshot."""
+    if query_executor is None and not execute:
+        raise SnapshotContractError("live Saved I/O Shadow requires explicit execution approval")
+    io_scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True)
+    key = selected_io_snapshot_key(plan, io_scope)
+    with frequency_snapshot_generation_guard(plan, key=key):
+        return _generate_frequency_snapshot_draft_locked(
+            plan=plan, created_by=created_by, timeout_seconds=timeout_seconds,
+            query_executor=query_executor, progress_reporter=progress_reporter,
+            classification_authority_loader=classification_authority_loader,
+            io_scope=io_scope, shadow_only=True,
         )

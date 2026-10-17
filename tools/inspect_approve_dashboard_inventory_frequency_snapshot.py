@@ -17,6 +17,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     EXTENDED_ALGORITHM_VERSION,
     EXTENDED_SCHEMA_VERSION,
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
+    SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SNAPSHOT_TYPE,
@@ -25,6 +26,10 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
 from app.services.sql_server_snapshot_repository import SqlServerSnapshotRepository  # noqa: E402
 from app.services.ssai_analytics_target_resolver import connect_company_analytics_db  # noqa: E402
 from app.services.ssai_snapshot_repository import SnapshotKey  # noqa: E402
+from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
+    build_frequency_snapshot_plan, resolve_dashboard_profile_stock_scope, selected_io_snapshot_key,
+)
+from app.services.saved_io_scope import resolve_saved_io_scope  # noqa: E402
 
 
 _GRADE_KEYS = ("A", "B", "C", "D", "E", "X")
@@ -69,7 +74,7 @@ def _key(args: argparse.Namespace) -> SnapshotKey:
         evaluation_month=str(args.evaluation_month),
         scope_fingerprint=scope_fingerprint(scope_codes),
         schema_version=(PRODUCT_STATISTICS_SCHEMA_VERSION if contract_version == "2.1" else EXTENDED_SCHEMA_VERSION if contract_version == "2" else SCHEMA_VERSION),
-        algorithm_version=(PRODUCT_STATISTICS_ALGORITHM_VERSION if contract_version == "2.1" else EXTENDED_ALGORITHM_VERSION if contract_version == "2" else ALGORITHM_VERSION),
+        algorithm_version=(SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION if getattr(args, "saved_io_full", False) else PRODUCT_STATISTICS_ALGORITHM_VERSION if contract_version == "2.1" else EXTENDED_ALGORITHM_VERSION if contract_version == "2" else ALGORITHM_VERSION),
         profile_fingerprint=profile_fingerprint,
     )
 
@@ -184,6 +189,21 @@ def _stage(
 def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str, Any]:
     """Run the inspect/approve contract once; every external stage is timed and has no retry."""
     key = _key(args)
+    if getattr(args, "saved_io_full", False):
+        if args.contract_version != "2.1":
+            raise ValueError("verified Saved I/O approval requires contract 2.1")
+        stored = resolve_dashboard_profile_stock_scope(company_id=args.company_id, manual_stock_codes=args.stock_code)
+        plan = build_frequency_snapshot_plan(
+            company_id=args.company_id, evaluation_month=args.evaluation_month,
+            stock_codes=stored.stock_codes, product_group_codes=stored.product_group_codes,
+            product_di_codes=stored.product_di_codes, product_class_codes=stored.product_class_codes,
+            io_gu_codes=stored.io_gu_codes, stock_mode=stored.stock_mode,
+        )
+        io_scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True)
+        if io_scope.unclassified_codes:
+            raise ValueError("saved I/O roles are unconfirmed: " + ", ".join(io_scope.unclassified_codes))
+        if key != selected_io_snapshot_key(plan, io_scope):
+            raise ValueError("Saved I/O approval key differs from the current company profile")
     expected_checksum = str(args.expected_checksum).strip().lower()
     timings: dict[str, int] = {}
     inspection = _stage(
@@ -244,6 +264,7 @@ def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str
             expected_checksum=args.expected_checksum,
             approved_by=args.approved_by,
             approval_reason=args.approval_reason,
+            **({"saved_io_verified": True} if getattr(args, "saved_io_full", False) else {}),
         ),
     )
     post = _stage(
@@ -318,6 +339,7 @@ def main() -> int:
     parser.add_argument("--expected-grade-counts", required=True)
     parser.add_argument("--contract-version", choices=("1", "2", "2.1"), required=True)
     parser.add_argument("--expected-profile-fingerprint", default="")
+    parser.add_argument("--saved-io-full", action="store_true")
     parser.add_argument("--approve", action="store_true")
     parser.add_argument("--approved-by", default="")
     parser.add_argument("--approval-reason", default="")

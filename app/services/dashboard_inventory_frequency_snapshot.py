@@ -30,6 +30,7 @@ PRODUCT_STATISTICS_SCHEMA_VERSION = "2.1"
 LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v1"
 CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v2"
 PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v3"
+SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION = f"{PRODUCT_STATISTICS_ALGORITHM_VERSION}+saved_io_full_v1"
 PRODUCT_STATISTICS_DECIMAL_STORAGE = {
     "return_supply_amount_3m": (38, 6),
     "avg_purchase_unit_cost": (38, 10),
@@ -413,6 +414,7 @@ def _is_product_statistics_key(key: SnapshotKey) -> bool:
             LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION,
             CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION,
             PRODUCT_STATISTICS_ALGORITHM_VERSION,
+            SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
         }
     )
 
@@ -785,8 +787,13 @@ def build_product_statistics_relational_snapshot_from_aggregates(
     source_watermark_status: str = "unverified",
     source_diagnostics: Mapping[str, Any] | None = None,
     profile_fingerprint: str = "",
+    algorithm_version: str = PRODUCT_STATISTICS_ALGORITHM_VERSION,
 ) -> RelationalFrequencySnapshot:
     """Build the versioned v2 product-statistics authority without changing frequency grades."""
+    if algorithm_version not in {PRODUCT_STATISTICS_ALGORITHM_VERSION, SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION}:
+        raise SnapshotContractError("product statistics algorithm version is unsupported")
+    if algorithm_version == SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION and not profile_fingerprint:
+        raise SnapshotContractError("saved I/O shadow requires a profile fingerprint")
     lifecycle = build_extended_relational_frequency_snapshot_from_aggregates(
         company_id=company_id,
         evaluation_month=evaluation_month,
@@ -878,7 +885,7 @@ def build_product_statistics_relational_snapshot_from_aggregates(
         lifecycle.key.evaluation_month,
         lifecycle.key.scope_fingerprint,
         PRODUCT_STATISTICS_SCHEMA_VERSION,
-        PRODUCT_STATISTICS_ALGORITHM_VERSION,
+        algorithm_version,
         lifecycle.key.profile_fingerprint,
     )
     rows = [canonicalize_frequency_product_storage_row(key, row) for row in rows]
@@ -1076,7 +1083,9 @@ def validate_relational_frequency_snapshot(snapshot: RelationalFrequencySnapshot
                 if profitability_status == "ready":
                     allowed_grades = (
                         {*FREQUENCY_GRADES, "X"}
-                        if snapshot.key.algorithm_version == PRODUCT_STATISTICS_ALGORITHM_VERSION
+                        if snapshot.key.algorithm_version in {
+                            PRODUCT_STATISTICS_ALGORITHM_VERSION, SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION
+                        }
                         else set(FREQUENCY_GRADES)
                     )
                     if profit_grade not in allowed_grades or contribution_grade not in allowed_grades:
