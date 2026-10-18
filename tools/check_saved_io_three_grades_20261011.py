@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
     SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+    SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION,
+    SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
     SnapshotContractError,
     validate_relational_frequency_snapshot,
 )
@@ -46,14 +48,17 @@ def test_three_grades_without_repository_access() -> None:
     lifecycle = pd.DataFrame([
         {"product_code": "P1", "first_normal_inbound_month": "202608",
          "current_stock_present": 1, "basis_inbound_present": 1,
-         "avg_purchase_unit_cost": 40, "purchase_price_basis_month": "202609"},
+         "avg_purchase_unit_cost": 40, "purchase_price_basis_month": "202609",
+         "representative_vendor_code": "BUY1", "purchase_cost_apply_code": "PC1"},
         {"product_code": "P2", "first_normal_inbound_month": None,
          "current_stock_present": 1, "basis_inbound_present": 0,
-         "avg_purchase_unit_cost": None, "purchase_price_basis_month": None},
+         "avg_purchase_unit_cost": None, "purchase_price_basis_month": None,
+         "representative_vendor_code": "", "purchase_cost_apply_code": ""},
     ])
     raw = pd.DataFrame([
         {"outbound_date": "20260901", "vendor_code": "V1", "outbound_seq": "1",
          "product_code": "P1", "stock_code": "00001", "io_gcode": "0012", "io_tcode": code,
+         "cost_apply_code": "C1",
          "outbound_quantity": quantity, "paid_quantity": quantity,
          "supply_amount": amount}
         for code, quantity, amount in (("580", 2, 200), ("590", 3, 300), ("690", -1, -30))
@@ -75,13 +80,15 @@ def test_three_grades_without_repository_access() -> None:
         )
     snapshot = result["relational_snapshot"]
     validate_relational_frequency_snapshot(snapshot)
-    assert len(calls) == 2 and "PurchasePriceMonthly" in calls[0][0]
+    assert len(calls) == 2 and "PurchaseCandidates" in calls[0][0]
     assert all("TRY_CONVERT" not in sql.upper() for sql, _ in calls)
-    assert "ORDER BY I.Rd11_In_YyMmDd DESC,\n                        I.Rd11_In_Seq DESC" in calls[0][0]
-    assert calls[0][0].count("I.Rd11_In_Seq DESC") == 1
-    assert "I.Rd11_Cost_Apply_Cd" in calls[0][0]
+    assert "ORDER BY I.Rd11_In_YyMmDd DESC, I.Rd11_In_Seq DESC" in calls[0][0]
+    assert calls[0][0].count("I.Rd11_In_Seq DESC") == 2
+    assert "L0.purchase_date IS NULL AND LEN(P.product_code) < 5" in calls[0][0]
+    assert "I.Rd11_Cost_Apply_Cd" not in calls[0][0]
     assert "ROW_NUMBER() OVER (" in calls[0][0]
-    assert "NULLIF(LTRIM(RTRIM(I.Rd11_Cost_Apply_Cd)), '') IS NOT NULL" in calls[0][0]
+    assert "RC.cost_apply_code = LTRIM(RTRIM(I.Rd11_Cost_Apply_Cd))" not in calls[0][0]
+    assert "V.Rd03_Cost_Apply_Cd" not in calls[0][0]
     assert "GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd)), LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6)" not in calls[0][0]
     legacy_sql, _ = product_lifecycle_sql(stock_codes=plan.stock_codes, cutoff_date="20261010")
     assert "Rd11_Cost_Apply_Cd" not in legacy_sql
@@ -92,10 +99,11 @@ def test_three_grades_without_repository_access() -> None:
         "580", "590", "690"
     }
     assert result["operating_eligible"] is False and result["price_authority"] == "shadow_candidate_only"
-    assert "draft" not in result and snapshot.key.algorithm_version == SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION
+    assert "draft" not in result and snapshot.key.algorithm_version == SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION
     assert snapshot.key == selected_io_snapshot_key(plan, resolve_saved_io_scope(codes, confirmed_trade_roles=True))
     assert frequency_snapshot_read_keys(plan)[0] == snapshot.key
-    assert frequency_snapshot_read_keys(plan)[1].algorithm_version == PRODUCT_STATISTICS_ALGORITHM_VERSION
+    assert frequency_snapshot_read_keys(plan)[1].algorithm_version == SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION
+    assert frequency_snapshot_read_keys(plan)[3].algorithm_version == PRODUCT_STATISTICS_ALGORITHM_VERSION
     rows = {row["product_code"]: row for row in snapshot.frequency_products}
     assert len(rows) == 2 and rows["P1"]["frequency_grade"] == "F"
     assert rows["P1"]["occurrence_count_3m"] == 2

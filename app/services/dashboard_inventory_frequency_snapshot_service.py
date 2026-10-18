@@ -30,6 +30,8 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
     SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+    SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION,
+    SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     FrequencyProjectionReadResult,
     RelationalFrequencySnapshot,
@@ -318,7 +320,15 @@ def frequency_snapshot_read_keys(plan: FrequencySnapshotPlan) -> tuple[SnapshotK
     if plan.io_gu_codes:
         scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True)
         if not scope.unclassified_codes:
-            return (selected_io_snapshot_key(plan, scope), *legacy)
+            old_saved_io_key = replace(
+                selected_io_snapshot_key(plan, scope),
+                algorithm_version=SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+            )
+            future_profit_key = replace(
+                selected_io_snapshot_key(plan, scope),
+                algorithm_version=SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION,
+            )
+            return (selected_io_snapshot_key(plan, scope), future_profit_key, old_saved_io_key, *legacy)
     return legacy
 
 
@@ -328,7 +338,7 @@ def selected_io_snapshot_key(plan: FrequencySnapshotPlan, io_scope: SavedIoScope
     legacy = frequency_snapshot_key(plan, product_statistics=True)
     return replace(
         legacy,
-        algorithm_version=f"{legacy.algorithm_version}+{io_scope.policy_version}",
+        algorithm_version=SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
         profile_fingerprint=io_scope.fingerprint(plan.profile_fingerprint),
     )
 
@@ -1089,6 +1099,7 @@ ORDER BY row_kind,product_code,outbound_date
 _PRODUCT_STATISTICS_STREAM_COLUMNS = (
     "row_kind", "outbound_date", "vendor_code", "product_code", "stock_code",
     "outbound_quantity", "paid_quantity", "mapping_count", "exact_duplicate_row_count",
+    "cost_apply_code", "contract_supply_amount",
     "basis_month", "unit_price", "return_event_count", "return_quantity", "return_supply_amount",
     "source_row_count", "normal_positive_row_count", "normal_nonpositive_row_count",
     "return_positive_row_count", "return_nonpositive_row_count", "other_tcode_row_count",
@@ -1133,6 +1144,7 @@ SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
        LTRIM(RTRIM(O.Rd12_Stock_Cd)) AS stock_code,
        LTRIM(RTRIM(O.Rd12_Io_Gu_Gcode)) AS io_gcode,
        LTRIM(RTRIM(O.Rd12_Io_Gu)) AS io_tcode,
+       LTRIM(RTRIM(O.Rd12_Cost_Apply_Cd)) AS cost_apply_code,
        CAST(COALESCE(O.Rd12_Quantity,0)+COALESCE(O.Rd12_Oquantity,0) AS decimal(38,6)) AS outbound_quantity,
        CAST(COALESCE(O.Rd12_Quantity,0) AS decimal(38,6)) AS paid_quantity,
        CAST(COALESCE(O.Rd12_Fin_Supply_Price,O.Rd12_Supply_Price,0) AS decimal(38,6)) AS supply_amount
@@ -1405,6 +1417,7 @@ def _python_product_statistics_projection_chunks(
             outbound_quantity = _stream_decimal(record.get("outbound_quantity"), field="outbound_quantity")
             paid_quantity = _stream_decimal(record.get("paid_quantity"), field="paid_quantity")
             supply_amount = _stream_decimal(record.get("supply_amount"), field="supply_amount")
+            cost_apply_code = _stream_text(record.get("cost_apply_code"))
             slip = (outbound_date, vendor_code, outbound_seq, io_tcode) if preserve_io_role else (
                 outbound_date, vendor_code, outbound_seq,
             )
@@ -1448,11 +1461,13 @@ def _python_product_statistics_projection_chunks(
                 exact_key = (product_code, stock_code, outbound_quantity)
                 exact = normal_exact.get(exact_key)
                 if exact is None:
-                    normal_exact[exact_key] = [paid_quantity, supply_amount, 1]
+                    normal_exact[exact_key] = [paid_quantity, supply_amount, 1, cost_apply_code]
                 else:
                     exact[0] = max(exact[0], paid_quantity)
                     exact[1] = max(exact[1], supply_amount)
                     exact[2] += 1
+                    if exact[3] != cost_apply_code:
+                        exact[3] = ""
             if (
                 is_return and outbound_date >= basis_from and outbound_quantity < 0 and supply_amount < 0
                 and complete_key and integral_quantity
@@ -1811,6 +1826,7 @@ def _generate_frequency_snapshot_draft_locked(
         exclude_management_only=True,
         seek_char5_monthly_stock=plan.company_id in (12, 13) and plan.stock_mode == "real",
         io_scope=io_scope,
+        average_purchase_price=use_saved_io,
     )
     report("제품 및 최초 정상 입고 조회 중")
     source1_started = time.perf_counter()
@@ -1822,6 +1838,8 @@ def _generate_frequency_snapshot_draft_locked(
         source_metrics["saved_io_roles"] = io_scope.snapshot_role_report()
     if not isinstance(lifecycle_df, pd.DataFrame) or "product_code" not in lifecycle_df.columns:
         raise SnapshotContractError("product lifecycle query returned an invalid shape")
+    if use_saved_io and not {"representative_vendor_code", "purchase_cost_apply_code"}.issubset(lifecycle_df.columns):
+        raise SnapshotContractError("representative purchase vendor evidence is missing")
     report("출고 집계 중")
     if query_executor is None:
         aggregate_sql, aggregate_binds = product_statistics_raw_event_stream_sql(plan, io_scope=io_scope)
@@ -1835,7 +1853,7 @@ def _generate_frequency_snapshot_draft_locked(
                 basis_from=plan.basis_from,
                 metrics=source2_metrics,
                 io_scope=io_scope,
-            )
+            ),
         )
         source2_metrics["total_ms"] = round((time.perf_counter() - source2_started) * 1000, 3)
         source_metrics["source2"] = dict(source2_metrics)
@@ -1865,7 +1883,7 @@ def _generate_frequency_snapshot_draft_locked(
             ) if use_saved_io else (source2_frame,)
         )
         monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
-            source2_chunks
+            source2_chunks,
         )
         source_metrics["source2"] = {
             **(source2_metrics or {}),
@@ -1887,6 +1905,8 @@ def _generate_frequency_snapshot_draft_locked(
         price["status"] = _price_status(plan.evaluation_month, price.get("basis_month"))
     first_inbound_months: dict[str, Any] = {}
     purchase_prices: dict[str, dict[str, Any]] = {}
+    excluded_purchase_products: dict[str, dict[str, Any]] = {}
+    purchase_basis_counts = {"three_month": 0, "six_month": 0, "historical": 0, "unavailable": 0}
     classification_authority = classification_authority_loader(
         company_id=plan.company_id,
         as_of=date(int(lifecycle_cutoff[:4]), int(lifecycle_cutoff[4:6]), int(lifecycle_cutoff[6:])),
@@ -1902,8 +1922,30 @@ def _generate_frequency_snapshot_draft_locked(
         purchase_prices[code] = {
             "unit_price": getattr(row, "avg_purchase_unit_cost", None),
             "basis_month": purchase_price_basis_month,
-            "status": _price_status(plan.evaluation_month, purchase_price_basis_month),
+            "status": (
+                "ready" if purchase_price_basis_month and getattr(row, "avg_purchase_unit_cost", None) is not None
+                else "unavailable"
+            ) if use_saved_io else _price_status(plan.evaluation_month, purchase_price_basis_month),
         }
+        if use_saved_io:
+            excluded = int(getattr(row, "excluded_purchase_trade_count", 0) or 0)
+            if excluded:
+                excluded_purchase_products[code] = {
+                    "trade_count": excluded,
+                    "quantity": str(getattr(row, "excluded_purchase_quantity", 0) or 0),
+                    "amount": str(getattr(row, "excluded_purchase_amount", 0) or 0),
+                    "center_price": str(getattr(row, "purchase_center_price", 0) or 0),
+                    "before": str(
+                        (Decimal(str(getattr(row, "original_purchase_amount"))) /
+                         Decimal(str(getattr(row, "original_purchase_quantity"))))
+                        if getattr(row, "original_purchase_quantity", None) else 0
+                    ),
+                    "after": str(getattr(row, "avg_purchase_unit_cost", 0) or 0),
+                }
+            basis_kind = str(getattr(row, "purchase_price_basis_kind", "") or "")
+            if basis_kind not in purchase_basis_counts:
+                basis_kind = "unavailable"
+            purchase_basis_counts[basis_kind] += 1
         targets = ProductClassificationTargets(
             product_group_keys=tuple(value for value in (str(getattr(row, "product_group_key", "") or "").strip(),) if value and not value.endswith(":")),
             product_di_keys=tuple(value for value in (str(getattr(row, "product_di_key", "") or "").strip(),) if value and not value.endswith(":")),
@@ -1921,6 +1963,13 @@ def _generate_frequency_snapshot_draft_locked(
             ClassificationStatus.UNAVAILABLE, ClassificationStatus.CONFLICT, ClassificationStatus.CORRUPT
         }:
             profitability_unavailable_products.add(code)
+    if use_saved_io:
+        source_metrics["average_purchase_price_coverage"] = purchase_basis_counts
+        source_metrics["excluded_purchase_trades"] = {
+            "product_count": len(excluded_purchase_products),
+            "trade_count": sum(value["trade_count"] for value in excluded_purchase_products.values()),
+            "by_product": excluded_purchase_products,
+        }
     log.info(
         "[dashboard.snapshot.product_universe] company_id=%s evaluation_month=%s profile_products=%s current_stock_products=%s basis_inbound_products=%s basis_outbound_products=%s eligible_products=%s product_group_filters=%s product_di_filters=%s product_class_filters=%s stock_mode=%s",
         plan.company_id,
@@ -1951,7 +2000,7 @@ def _generate_frequency_snapshot_draft_locked(
         source_watermark_status="unverified", source_diagnostics=diagnostics,
         profile_fingerprint=(selected_io_snapshot_key(plan, io_scope).profile_fingerprint
                              if use_saved_io else plan.profile_fingerprint),
-        algorithm_version=(SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION if use_saved_io
+        algorithm_version=(SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION if use_saved_io
                            else PRODUCT_STATISTICS_ALGORITHM_VERSION),
     )
     key = relational_snapshot.key

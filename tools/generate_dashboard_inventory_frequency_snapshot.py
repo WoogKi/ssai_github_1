@@ -22,7 +22,7 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (  # noq
 from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     EXTENDED_RELATIONAL_FREQUENCY_REPRESENTATION,
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
-    SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+    SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     SnapshotContractError,
 )
@@ -41,7 +41,7 @@ def _plan_json(plan: Any, *, apply: bool, timeout_seconds: int, force: bool, sco
         "company_id": plan.company_id,
         "evaluation_month": plan.evaluation_month,
         "schema_version": PRODUCT_STATISTICS_SCHEMA_VERSION,
-        "algorithm_version": SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION if saved_io_full else PRODUCT_STATISTICS_ALGORITHM_VERSION,
+        "algorithm_version": SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION if saved_io_full else PRODUCT_STATISTICS_ALGORITHM_VERSION,
         "basis_months": list(plan.basis_months),
         "basis_from": plan.basis_from,
         "basis_to": plan.basis_to,

@@ -17,7 +17,7 @@ from app.services.dashboard_inventory_frequency_snapshot import (  # noqa: E402
     EXTENDED_ALGORITHM_VERSION,
     EXTENDED_SCHEMA_VERSION,
     PRODUCT_STATISTICS_ALGORITHM_VERSION,
-    SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+    SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
     PRODUCT_STATISTICS_SCHEMA_VERSION,
     SCHEMA_VERSION,
     SNAPSHOT_TYPE,
@@ -74,7 +74,7 @@ def _key(args: argparse.Namespace) -> SnapshotKey:
         evaluation_month=str(args.evaluation_month),
         scope_fingerprint=scope_fingerprint(scope_codes),
         schema_version=(PRODUCT_STATISTICS_SCHEMA_VERSION if contract_version == "2.1" else EXTENDED_SCHEMA_VERSION if contract_version == "2" else SCHEMA_VERSION),
-        algorithm_version=(SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION if getattr(args, "saved_io_full", False) else PRODUCT_STATISTICS_ALGORITHM_VERSION if contract_version == "2.1" else EXTENDED_ALGORITHM_VERSION if contract_version == "2" else ALGORITHM_VERSION),
+        algorithm_version=(SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION if getattr(args, "saved_io_full", False) else PRODUCT_STATISTICS_ALGORITHM_VERSION if contract_version == "2.1" else EXTENDED_ALGORITHM_VERSION if contract_version == "2" else ALGORITHM_VERSION),
         profile_fingerprint=profile_fingerprint,
     )
 

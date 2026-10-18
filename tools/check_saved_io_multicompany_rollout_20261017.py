@@ -45,7 +45,7 @@ def test_company_keys_and_profile_isolation() -> None:
             io_gu_codes=codes,
         )
         assert frequency_snapshot_read_keys(plan)[0] == selected_io_snapshot_key(plan, scope)
-        assert frequency_snapshot_read_keys(plan)[1] == frequency_snapshot_key(plan, product_statistics=True)
+        assert frequency_snapshot_read_keys(plan)[3] == frequency_snapshot_key(plan, product_statistics=True)
     other_scope = resolve_saved_io_scope(("001", "501", "601"), confirmed_trade_roles=True)
     plan3 = build_frequency_snapshot_plan(company_id=3, evaluation_month="202610", stock_codes=("00001",), io_gu_codes=codes)
     plan4 = build_frequency_snapshot_plan(company_id=4, evaluation_month="202610", stock_codes=("00001",), io_gu_codes=other_scope.all_codes)
@@ -98,7 +98,7 @@ def test_approved_reader_priority_and_legacy_fallback() -> None:
         company_id=4, evaluation_month="202610", stock_codes=("00001",),
         io_gu_codes=stored.io_gu_codes,
     )
-    saved, legacy = frequency_snapshot_read_keys(expected)[:2]
+    saved, future_profit, old_saved_io, legacy = frequency_snapshot_read_keys(expected)[:4]
 
     class Repository:
         def __init__(self, available: object) -> None:
@@ -114,7 +114,11 @@ def test_approved_reader_priority_and_legacy_fallback() -> None:
             assert key == self.available
             return SnapshotReadResult(status="ready", generation_no=1)
 
-    for available, expected_attempts in ((saved, [saved]), (legacy, [saved, legacy])):
+    for available, expected_attempts in (
+        (saved, [saved]), (future_profit, [saved, future_profit]),
+        (old_saved_io, [saved, future_profit, old_saved_io]),
+        (legacy, [saved, future_profit, old_saved_io, legacy]),
+    ):
         repo = Repository(available)
         with patch("app.services.dashboard_inventory_frequency_snapshot_service.resolve_dashboard_profile_stock_scope", return_value=stored), patch(
             "app.services.dashboard_inventory_frequency_snapshot_service._company_snapshot_repository", return_value=repo

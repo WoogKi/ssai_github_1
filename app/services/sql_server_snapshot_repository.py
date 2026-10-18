@@ -15,6 +15,9 @@ from app.services.dashboard_inventory_frequency_snapshot import (
     RELATIONAL_FREQUENCY_REPRESENTATION,
     RelationalFrequencySnapshot,
     SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+    SAVED_IO_CONTRACT_ALGORITHM_VERSION,
+    SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION,
+    SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
     SnapshotContractError,
     build_frequency_projection,
     build_relational_frequency_projection,
@@ -371,10 +374,10 @@ class SqlServerSnapshotRepository:
         saved_io_verified: bool = False,
     ) -> SnapshotPublishResult:
         """Store one complete payload-less relational authority set as a draft."""
-        if snapshot.key.algorithm_version == SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION and not saved_io_verified:
+        if snapshot.key.algorithm_version in {SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION, SAVED_IO_CONTRACT_ALGORITHM_VERSION, SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION, SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION} and not saved_io_verified:
             raise SnapshotContractError("candidate Saved I/O prices cannot be persisted as an approved Snapshot contract")
         if saved_io_verified and (
-            force or snapshot.key.algorithm_version != SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION
+            force or snapshot.key.algorithm_version not in {SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION, SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION}
             or not snapshot.key.profile_fingerprint
         ):
             raise SnapshotContractError("verified Saved I/O draft requires its exact versioned profile key")
@@ -540,10 +543,10 @@ class SqlServerSnapshotRepository:
         expected_checksum: str,
         saved_io_verified: bool = False,
     ) -> SnapshotPublishResult:
-        if key.algorithm_version == SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION and not saved_io_verified:
+        if key.algorithm_version in {SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION, SAVED_IO_CONTRACT_ALGORITHM_VERSION, SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION, SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION} and not saved_io_verified:
             raise SnapshotContractError("candidate Saved I/O prices cannot be approved")
         if saved_io_verified and (
-            key.algorithm_version != SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION or not key.profile_fingerprint
+            key.algorithm_version not in {SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION, SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION} or not key.profile_fingerprint
         ):
             raise SnapshotContractError("verified Saved I/O approval requires its exact versioned profile key")
         if saved_io_verified:

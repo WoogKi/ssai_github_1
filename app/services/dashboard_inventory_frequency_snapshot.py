@@ -31,6 +31,12 @@ LEGACY_PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statis
 CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v2"
 PRODUCT_STATISTICS_ALGORITHM_VERSION = "outbound_frequency_product_statistics_v3"
 SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION = f"{PRODUCT_STATISTICS_ALGORITHM_VERSION}+saved_io_full_v1"
+SAVED_IO_CONTRACT_ALGORITHM_VERSION = f"{PRODUCT_STATISTICS_ALGORITHM_VERSION}+saved_io_contract_v1"
+SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION = "outbound_frequency_product_v3+saved_io_future_profit_v1"
+SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION = "outbound_frequency_product_v3+saved_io_avg_purchase_v1"
+SAVED_IO_PROFIT_ALGORITHMS = frozenset({
+    SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION, SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
+})
 PRODUCT_STATISTICS_DECIMAL_STORAGE = {
     "return_supply_amount_3m": (38, 6),
     "avg_purchase_unit_cost": (38, 10),
@@ -415,6 +421,9 @@ def _is_product_statistics_key(key: SnapshotKey) -> bool:
             CUMULATIVE_PRODUCT_STATISTICS_ALGORITHM_VERSION,
             PRODUCT_STATISTICS_ALGORITHM_VERSION,
             SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+            SAVED_IO_CONTRACT_ALGORITHM_VERSION,
+            SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION,
+            SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
         }
     )
 
@@ -790,9 +799,14 @@ def build_product_statistics_relational_snapshot_from_aggregates(
     algorithm_version: str = PRODUCT_STATISTICS_ALGORITHM_VERSION,
 ) -> RelationalFrequencySnapshot:
     """Build the versioned v2 product-statistics authority without changing frequency grades."""
-    if algorithm_version not in {PRODUCT_STATISTICS_ALGORITHM_VERSION, SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION}:
+    if algorithm_version not in {
+        PRODUCT_STATISTICS_ALGORITHM_VERSION, SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+        SAVED_IO_CONTRACT_ALGORITHM_VERSION,
+        SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION,
+        SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
+    }:
         raise SnapshotContractError("product statistics algorithm version is unsupported")
-    if algorithm_version == SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION and not profile_fingerprint:
+    if algorithm_version in {SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION, SAVED_IO_CONTRACT_ALGORITHM_VERSION, *SAVED_IO_PROFIT_ALGORITHMS} and not profile_fingerprint:
         raise SnapshotContractError("saved I/O shadow requires a profile fingerprint")
     lifecycle = build_extended_relational_frequency_snapshot_from_aggregates(
         company_id=company_id,
@@ -836,7 +850,14 @@ def build_product_statistics_relational_snapshot_from_aggregates(
             if unit_profit is not None and sales_price is not None and sales_price != 0
             else None
         )
-        contribution = unit_profit * outbound_quantities.get(code, 0) if unit_profit is not None else None
+        expected_quantity = paid_quantity if algorithm_version in SAVED_IO_PROFIT_ALGORITHMS else outbound_quantities.get(code, 0)
+        contribution = unit_profit * expected_quantity if unit_profit is not None else None
+        purchase_basis_month = purchase.get("basis_month") or None
+        sales_basis_month = sales.get("basis_month") or None
+        if algorithm_version in SAVED_IO_PROFIT_ALGORITHMS and (
+            purchase_status != "ready" or sales_status != "ready"
+        ):
+            unit_profit = profit_rate = contribution = None
         if code in adjustment_codes:
             profitability_status = "excluded_adjustment_only"
         elif code in unavailable_codes:
@@ -856,10 +877,10 @@ def build_product_statistics_relational_snapshot_from_aggregates(
             "return_qty_3m": _required_nonnegative_int(returns.get("quantity", 0), field="return_qty_3m"),
             "return_supply_amount_3m": _optional_decimal(returns.get("supply_amount", 0), field="return_supply_amount_3m") or Decimal(0),
             "avg_purchase_unit_cost": purchase_cost,
-            "purchase_price_basis_month": purchase.get("basis_month") or None,
+            "purchase_price_basis_month": purchase_basis_month,
             "purchase_price_status": purchase_status,
             "avg_sales_unit_price": sales_price,
-            "sales_price_basis_month": sales.get("basis_month") or None,
+            "sales_price_basis_month": sales_basis_month,
             "sales_price_status": sales_status,
             "estimated_unit_profit": unit_profit,
             "estimated_profit_rate": profit_rate,
@@ -892,7 +913,13 @@ def build_product_statistics_relational_snapshot_from_aggregates(
     source_contract = dict(lifecycle.source_contract)
     source_contract.update({
         "fingerprint_contract_version": 5,
-        "fingerprint_mode": "event_product_statistics_v1",
+        "fingerprint_mode": (
+            "average_purchase_statistics_v1"
+            if algorithm_version == SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION else
+            "future_profit_statistics_v1"
+            if algorithm_version == SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION
+            else "event_product_statistics_v1"
+        ),
     })
     product_columns = _frequency_product_columns(key)
     source_fingerprint = hashlib.sha256(
@@ -1013,6 +1040,12 @@ def validate_relational_frequency_snapshot(snapshot: RelationalFrequencySnapshot
     diagnostics = snapshot.source_diagnostics
     if int(diagnostics.get("diagnostic_contract_version") or 0) >= 2:
         expected_mode = (
+            "average_purchase_statistics_v1"
+            if snapshot.key.algorithm_version == SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION else
+            "future_profit_statistics_v1"
+            if snapshot.key.algorithm_version == SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION else
+            "contract_matched_product_statistics_v1"
+            if snapshot.key.algorithm_version == SAVED_IO_CONTRACT_ALGORITHM_VERSION else
             "event_product_statistics_v1"
             if _is_product_statistics_key(snapshot.key)
             else "event_product_projection_v2"
@@ -1084,7 +1117,10 @@ def validate_relational_frequency_snapshot(snapshot: RelationalFrequencySnapshot
                     allowed_grades = (
                         {*FREQUENCY_GRADES, "X"}
                         if snapshot.key.algorithm_version in {
-                            PRODUCT_STATISTICS_ALGORITHM_VERSION, SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION
+                            PRODUCT_STATISTICS_ALGORITHM_VERSION, SAVED_IO_FULL_SHADOW_ALGORITHM_VERSION,
+                            SAVED_IO_CONTRACT_ALGORITHM_VERSION,
+                            SAVED_IO_FUTURE_PROFIT_ALGORITHM_VERSION,
+                            SAVED_IO_AVG_PURCHASE_ALGORITHM_VERSION,
                         }
                         else set(FREQUENCY_GRADES)
                     )

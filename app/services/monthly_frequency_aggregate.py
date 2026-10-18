@@ -725,6 +725,7 @@ def product_lifecycle_sql(
     seek_char5_monthly_stock: bool = False,
     exclude_management_only: bool = False,
     io_scope: SavedIoScope | None = None,
+    average_purchase_price: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Read profile-scoped lifecycle and product-universe evidence once."""
     cutoff = str(cutoff_date or "").strip()
@@ -782,8 +783,136 @@ def product_lifecycle_sql(
         if io_scope is not None else "I.Rd11_Io_Gu IN ('001', '002')"
     )
     shadow_price = io_scope is not None and io_scope.policy_version == FULL_POLICY_VERSION
-    if shadow_price:
-        price_ctes = f"""PurchasePriceMonthly AS (
+    if average_purchase_price and not shadow_price:
+        raise SnapshotContractError("average purchase price requires the verified saved I/O scope")
+    if average_purchase_price:
+        three_month_start = datetime.strptime(basis_start, "%Y%m%d").replace(day=1)
+        six_month_start = (three_month_start.year * 12 + three_month_start.month - 1) - 3
+        binds["purchase_three_month_from"] = basis_start
+        binds["purchase_six_month_from"] = f"{six_month_start // 12:04d}{six_month_start % 12 + 1:02d}01"
+        binds["representative_vendor_from"] = basis_start
+        price_ctes = f"""VendorAggregate AS (
+    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
+           LTRIM(RTRIM(I.Rd11_Ven_Cd)) AS vendor_code,
+           SUM(CAST(I.Rd11_Quantity AS decimal(38, 6))) AS vendor_quantity,
+           SUM(CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price) AS decimal(38, 6))) AS vendor_supply_price,
+           MAX(I.Rd11_In_YyMmDd) AS vendor_last_date
+    FROM dbo.Rddbc110 AS I
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {price_clause}
+      AND I.Rd11_Quantity > 0 AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
+      AND NULLIF(LTRIM(RTRIM(I.Rd11_Ven_Cd)), '') IS NOT NULL
+      AND I.Rd11_In_YyMmDd BETWEEN :representative_vendor_from AND :basis_to
+      {inbound_stock}
+    GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd)), LTRIM(RTRIM(I.Rd11_Ven_Cd))
+), RankedVendor AS (
+    SELECT product_code, vendor_code,
+           ROW_NUMBER() OVER (PARTITION BY product_code ORDER BY vendor_quantity DESC,
+               vendor_supply_price DESC, vendor_last_date DESC, vendor_code ASC) AS vendor_rank
+    FROM VendorAggregate
+), RepresentativeContract AS (
+    SELECT P.product_code, COALESCE(RV.vendor_code, P.master_order_vendor_code) AS vendor_code,
+           CAST(NULL AS varchar(20)) AS cost_apply_code
+    FROM ProductUniverse AS P
+    LEFT JOIN RankedVendor AS RV ON RV.product_code = P.product_code AND RV.vendor_rank = 1
+), PurchaseCandidates AS (
+    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
+           I.Rd11_In_YyMmDd AS purchase_date,
+           CAST(I.Rd11_Quantity AS decimal(28, 6)) AS paid_quantity,
+           CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price) AS decimal(28, 6)) AS supply_amount,
+           CAST(CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price) AS decimal(28, 6)) /
+                NULLIF(CAST(I.Rd11_Quantity AS decimal(28, 6)), 0) AS decimal(28, 6)) AS unit_price
+    FROM dbo.Rddbc110 AS I
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {price_clause}
+      AND I.Rd11_Quantity > 0 AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
+      AND I.Rd11_In_YyMmDd BETWEEN :purchase_six_month_from AND :basis_to
+      {inbound_stock}
+), PurchaseWindow AS (
+    SELECT C.*, SUM(CASE WHEN purchase_date >= :purchase_three_month_from THEN 1 ELSE 0 END)
+                  OVER (PARTITION BY product_code) AS recent_trade_count
+    FROM PurchaseCandidates AS C
+), SelectedPurchase AS (
+    SELECT product_code, purchase_date, paid_quantity, supply_amount, unit_price
+    FROM PurchaseWindow
+    WHERE recent_trade_count = 0 OR purchase_date >= :purchase_three_month_from
+), RankedPurchase AS (
+    SELECT S.*, ROW_NUMBER() OVER (PARTITION BY product_code ORDER BY unit_price, purchase_date) AS price_rank,
+           COUNT_BIG(*) OVER (PARTITION BY product_code) AS trade_count
+    FROM SelectedPurchase AS S
+), MedianPurchase AS (
+    SELECT product_code, AVG(CASE WHEN price_rank IN ((trade_count + 1) / 2, (trade_count + 2) / 2)
+                      THEN unit_price END) AS center_price
+    FROM RankedPurchase GROUP BY product_code
+), ScoredPurchase AS (
+    SELECT R.*, M.center_price,
+           CASE WHEN R.unit_price BETWEEN M.center_price * 0.8 AND M.center_price * 1.2 THEN 1 ELSE 0 END AS in_center,
+           CASE WHEN R.unit_price > 2 AND
+                     (R.unit_price >= M.center_price * 5 OR R.unit_price <= M.center_price / 5)
+                THEN 1 ELSE 0 END AS is_extreme
+    FROM RankedPurchase AS R INNER JOIN MedianPurchase AS M ON M.product_code = R.product_code
+), PurchaseDistribution AS (
+    SELECT product_code, COUNT_BIG(*) AS trade_count, SUM(paid_quantity) AS total_quantity,
+           SUM(CASE WHEN in_center = 1 THEN 1 ELSE 0 END) AS center_count,
+           SUM(CASE WHEN in_center = 1 THEN paid_quantity ELSE 0 END) AS center_quantity,
+           SUM(CASE WHEN is_extreme = 1 THEN 1 ELSE 0 END) AS extreme_count,
+           SUM(CASE WHEN is_extreme = 1 THEN paid_quantity ELSE 0 END) AS extreme_quantity,
+           MAX(center_price) AS center_price
+    FROM ScoredPurchase GROUP BY product_code
+), AcceptedPurchase AS (
+    SELECT S.*, CASE WHEN D.trade_count >= 4 AND D.center_count >= 3
+                AND D.center_count * 4 >= D.trade_count * 3
+                AND D.center_quantity * 5 >= D.total_quantity * 4
+                AND D.center_price > 2 AND D.extreme_count * 4 <= D.trade_count
+                AND D.extreme_quantity * 5 <= D.total_quantity
+                AND S.is_extreme = 1 THEN 1 ELSE 0 END AS excluded
+    FROM ScoredPurchase AS S INNER JOIN PurchaseDistribution AS D ON D.product_code = S.product_code
+), PurchaseAverage AS (
+    SELECT product_code,
+           SUM(CASE WHEN excluded = 0 THEN paid_quantity ELSE 0 END) AS paid_quantity,
+           SUM(CASE WHEN excluded = 0 THEN supply_amount ELSE 0 END) AS supply_amount,
+           MAX(CASE WHEN excluded = 0 THEN LEFT(purchase_date, 6) END) AS basis_month,
+           MAX(CASE WHEN purchase_date >= :purchase_three_month_from THEN 1 ELSE 0 END) AS in_three_month_window,
+           SUM(excluded) AS excluded_trade_count,
+           SUM(CASE WHEN excluded = 1 THEN paid_quantity ELSE 0 END) AS excluded_quantity,
+           SUM(CASE WHEN excluded = 1 THEN supply_amount ELSE 0 END) AS excluded_amount,
+           SUM(paid_quantity) AS original_quantity,
+           SUM(supply_amount) AS original_amount,
+           MAX(center_price) AS center_price
+    FROM AcceptedPurchase GROUP BY product_code
+)"""
+    elif shadow_price:
+        # Keep the Dashboard representative-vendor window anchored to the completed basis month.
+        binds["representative_vendor_from"] = (datetime.strptime(basis_end, "%Y%m%d") - timedelta(days=91)).strftime("%Y%m%d")
+        price_ctes = f"""VendorAggregate AS (
+    SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
+           LTRIM(RTRIM(I.Rd11_Ven_Cd)) AS vendor_code,
+           SUM(COALESCE(I.Rd11_Quantity, 0)) AS vendor_quantity,
+           SUM(COALESCE(I.Rd11_Supply_Price, 0)) AS vendor_supply_price,
+           MAX(I.Rd11_In_YyMmDd) AS vendor_last_date
+    FROM dbo.Rddbc110 AS I
+    INNER JOIN ProductUniverse AS P ON P.product_code = LTRIM(RTRIM(I.Rd11_Physic_Cd))
+    WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {normal_inbound_clause}
+      AND COALESCE(I.Rd11_Quantity, 0) + COALESCE(I.Rd11_Oquantity, 0) > 0
+      AND NULLIF(LTRIM(RTRIM(I.Rd11_Ven_Cd)), '') IS NOT NULL
+      AND I.Rd11_In_YyMmDd >= :representative_vendor_from AND I.Rd11_In_YyMmDd <= :basis_to
+      {inbound_stock}
+    GROUP BY LTRIM(RTRIM(I.Rd11_Physic_Cd)), LTRIM(RTRIM(I.Rd11_Ven_Cd))
+), RankedVendor AS (
+    SELECT product_code, vendor_code,
+           ROW_NUMBER() OVER (
+               PARTITION BY product_code
+               ORDER BY vendor_quantity DESC, vendor_supply_price DESC,
+                        vendor_last_date DESC, vendor_code ASC
+           ) AS vendor_rank
+    FROM VendorAggregate
+), RepresentativeContract AS (
+    SELECT P.product_code,
+           COALESCE(RV.vendor_code, P.master_order_vendor_code) AS vendor_code,
+           LTRIM(RTRIM(V.Rd03_Cost_Apply_Cd)) AS cost_apply_code
+    FROM ProductUniverse AS P
+    LEFT JOIN RankedVendor AS RV ON RV.product_code = P.product_code AND RV.vendor_rank = 1
+    LEFT JOIN dbo.Rddbc030 AS V
+      ON V.Rd03_Ven_Cd = COALESCE(RV.vendor_code, P.master_order_vendor_code)
+), PurchasePriceMonthly AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
            LEFT(LTRIM(RTRIM(I.Rd11_In_YyMmDd)), 6) AS basis_month,
            CAST(I.Rd11_Quantity AS decimal(38, 6)) AS paid_quantity,
@@ -792,13 +921,17 @@ def product_lifecycle_sql(
                PARTITION BY LTRIM(RTRIM(I.Rd11_Physic_Cd))
                ORDER BY I.Rd11_In_YyMmDd DESC,
                         I.Rd11_In_Seq DESC, I.Rd11_Ven_Cd DESC,
-                        I.Rd11_Cost_Apply_Cd DESC, I.Rd11_Io_Gu DESC
+                        I.Rd11_Io_Gu DESC
            ) AS price_rank
     FROM dbo.Rddbc110 AS I
+    INNER JOIN RepresentativeContract AS RC
+      ON RC.product_code = LTRIM(RTRIM(I.Rd11_Physic_Cd))
+     AND RC.vendor_code = LTRIM(RTRIM(I.Rd11_Ven_Cd))
+     AND RC.cost_apply_code = LTRIM(RTRIM(I.Rd11_Cost_Apply_Cd))
     WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {price_clause}
       AND COALESCE(I.Rd11_Quantity, 0) > 0
       AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
-      AND NULLIF(LTRIM(RTRIM(I.Rd11_Cost_Apply_Cd)), '') IS NOT NULL
+      AND NULLIF(RC.cost_apply_code, '') IS NOT NULL
       AND I.Rd11_In_YyMmDd >= :price_lookback_from AND I.Rd11_In_YyMmDd <= :basis_to
       {inbound_stock}
 ), LatestPurchasePrice AS (
@@ -927,7 +1060,7 @@ def product_lifecycle_sql(
 )""" if include_first_outbound else ""
     first_outbound_select = "       O.first_outbound_date,\n" if include_first_outbound else ""
     first_outbound_join = "LEFT JOIN FirstOutbound AS O ON O.product_code=P.product_code" if include_first_outbound else ""
-    hash_join_hint = "\nOPTION (HASH JOIN)" if force_hash_join else ""
+    hash_join_hint = "\nOPTION (HASH JOIN)" if force_hash_join and not average_purchase_price else ""
     registered_date_select = "" if snapshot_projection_only else """,
            CASE WHEN LEN(LTRIM(RTRIM(P.Rd04_Add_Date))) = 8
                      AND LTRIM(RTRIM(P.Rd04_Add_Date)) NOT LIKE '%[^0-9]%'
@@ -937,12 +1070,69 @@ def product_lifecycle_sql(
        I.first_normal_inbound_date,
 """
     profile_count_select = "" if snapshot_projection_only else "       COUNT_BIG(*) OVER () AS profile_product_count,\n"
+    representative_select = (
+        "       RC.vendor_code AS representative_vendor_code, RC.cost_apply_code AS purchase_cost_apply_code,\n"
+        if shadow_price and snapshot_projection_only else ""
+    )
+    representative_join = (
+        "LEFT JOIN RepresentativeContract AS RC ON RC.product_code=P.product_code"
+        if shadow_price and snapshot_projection_only else ""
+    )
+    if average_purchase_price:
+        excluded_trade_select = (
+            "       COALESCE(PA.excluded_trade_count, 0) AS excluded_purchase_trade_count,\n"
+            "       PA.excluded_quantity AS excluded_purchase_quantity, PA.excluded_amount AS excluded_purchase_amount,\n"
+            "       PA.original_quantity AS original_purchase_quantity, PA.original_amount AS original_purchase_amount,\n"
+            "       PA.center_price AS purchase_center_price,\n"
+            "       CASE WHEN PA.product_code IS NULL AND COALESCE(L0.purchase_date, L1.purchase_date) IS NOT NULL THEN 'historical'\n"
+            "            WHEN PA.in_three_month_window = 1 THEN 'three_month'\n"
+            "            WHEN PA.product_code IS NOT NULL THEN 'six_month' END AS purchase_price_basis_kind,\n"
+        )
+        price_projection = (
+            "CAST(CASE WHEN COALESCE(PA.paid_quantity, L0.paid_quantity, L1.paid_quantity) > 0\n"
+            "            THEN COALESCE(PA.supply_amount, L0.supply_amount, L1.supply_amount) /\n"
+            "                 COALESCE(PA.paid_quantity, L0.paid_quantity, L1.paid_quantity) END AS decimal(38, 10)) AS avg_purchase_unit_cost,\n"
+            "       COALESCE(PA.basis_month, LEFT(L0.purchase_date, 6), LEFT(L1.purchase_date, 6)) AS purchase_price_basis_month"
+        )
+        price_join = f"""LEFT JOIN PurchaseAverage AS PA ON PA.product_code=P.product_code
+OUTER APPLY (
+    SELECT TOP 1 I.Rd11_In_YyMmDd AS purchase_date,
+           CAST(I.Rd11_Quantity AS decimal(28, 6)) AS paid_quantity,
+           CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price) AS decimal(28, 6)) AS supply_amount
+    FROM dbo.Rddbc110 AS I
+    WHERE PA.product_code IS NULL AND I.Rd11_Physic_Cd = P.product_code
+      AND I.Rd11_Io_Gu_Gcode = '0012' AND {price_clause}
+      AND I.Rd11_Quantity > 0 AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
+      AND I.Rd11_In_YyMmDd < :purchase_six_month_from
+      {inbound_stock}
+    ORDER BY I.Rd11_In_YyMmDd DESC, I.Rd11_In_Seq DESC, I.Rd11_Ven_Cd DESC
+) AS L0
+OUTER APPLY (
+    SELECT TOP 1 I.Rd11_In_YyMmDd AS purchase_date,
+           CAST(I.Rd11_Quantity AS decimal(28, 6)) AS paid_quantity,
+           CAST(COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price) AS decimal(28, 6)) AS supply_amount
+    FROM dbo.Rddbc110 AS I
+    WHERE PA.product_code IS NULL AND L0.purchase_date IS NULL AND LEN(P.product_code) < 5
+      AND I.Rd11_Physic_Cd = RIGHT('    ' + P.product_code, 5)
+      AND I.Rd11_Io_Gu_Gcode = '0012' AND {price_clause}
+      AND I.Rd11_Quantity > 0 AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
+      AND I.Rd11_In_YyMmDd < :purchase_six_month_from
+      {inbound_stock}
+    ORDER BY I.Rd11_In_YyMmDd DESC, I.Rd11_In_Seq DESC, I.Rd11_Ven_Cd DESC
+) AS L1"""
+    else:
+        excluded_trade_select = ""
+        price_projection = (
+            "CAST(CASE WHEN PP.paid_quantity > 0 THEN PP.supply_amount / PP.paid_quantity END AS decimal(38, 10)) AS avg_purchase_unit_cost,\n"
+            "       PP.basis_month AS purchase_price_basis_month"
+        )
+        price_join = "LEFT JOIN LatestPurchasePrice AS PP ON PP.product_code=P.product_code AND PP.price_rank=1"
     sql = f"""
 WITH ProductUniverse AS (
     SELECT LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code,
            CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Group_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Group))) AS product_group_key,
            CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Di_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Di))) AS product_di_key,
-           CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Tax_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Tax))) AS product_class_key{registered_date_select}
+           CONCAT(LTRIM(RTRIM(P.Rd04_Physic_Tax_Gcode)), ':', LTRIM(RTRIM(P.Rd04_Physic_Tax))) AS product_class_key{', LTRIM(RTRIM(P.Rd04_Orven_Cd)) AS master_order_vendor_code' if shadow_price else ''}{registered_date_select}
     FROM dbo.Rddbc040 AS P
     WHERE P.Rd04_Physic_Cd <> ''
       {product_filter_sql}
@@ -987,8 +1177,7 @@ SELECT P.product_code, P.product_group_key, P.product_di_key, P.product_class_ke
 {first_outbound_select}
        CASE WHEN COALESCE(S.stock_quantity, 0) + COALESCE(CI.quantity, 0) - COALESCE(CO.quantity, 0) <> 0 THEN 1 ELSE 0 END AS current_stock_present,
        CASE WHEN BI.product_code IS NULL THEN 0 ELSE 1 END AS basis_inbound_present,
-{profile_count_select}       CAST(CASE WHEN PP.paid_quantity > 0 THEN PP.supply_amount / PP.paid_quantity END AS decimal(38, 10)) AS avg_purchase_unit_cost,
-       PP.basis_month AS purchase_price_basis_month
+{profile_count_select}{representative_select}{excluded_trade_select}       {price_projection}
 FROM ProductUniverse AS P
 LEFT JOIN FirstInbound AS I ON I.product_code=P.product_code
 {first_outbound_join}
@@ -996,7 +1185,8 @@ LEFT JOIN BasisInbound AS BI ON BI.product_code=P.product_code
 {monthly_stock_join}
 LEFT JOIN CurrentInbound AS CI ON CI.product_code=P.product_code
 LEFT JOIN CurrentOutbound AS CO ON CO.product_code=P.product_code
-LEFT JOIN LatestPurchasePrice AS PP ON PP.product_code=P.product_code AND PP.price_rank=1
+{representative_join}
+{price_join}
 ORDER BY P.product_code{hash_join_hint}
 """.strip()
     return sql, binds
