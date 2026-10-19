@@ -1195,7 +1195,7 @@ def render_code_master_search() -> Dict[str, Any]:
             "title": "업무코드 마스터 조회",
             "action": "업무코드 마스터 조회",
             "params": params,
-            "df": df,
+            "df": view_df_all,
             "df_display": view_df,
             "meta": meta,
         }

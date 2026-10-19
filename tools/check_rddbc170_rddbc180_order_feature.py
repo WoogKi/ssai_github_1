@@ -195,14 +195,16 @@ def main() -> int:
         "AS [발주순번]", "AS [상세순번]",
     )
     if (
-        any(token in unit_sql for token in forbidden_joins)
+        any(token in unit_sql for token in ("Rddbc040", "Rddbc030", "Rddbc060"))
+        or "Rddbc010" not in unit_sql
         or not all(token in unit_sql for token in unit_required_columns)
         or "D.Rd18_Cost_Apply_Cd = ?" not in unit_sql
         or "D.Rd18_Stock_Apply_Cd = ?" not in unit_sql
         or "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" not in unit_sql
-        or unit_values[:2] != ["20260825", "20260925"]
-        or unit_values[2:5] != ["1", "2", "3"]
-        or unit_values[5:7] != ["50002", "50001"]
+        or unit_values[:3] != ["00001", "00008", "00013"]
+        or unit_values[3:5] != ["20260825", "20260925"]
+        or unit_values[5:8] != ["1", "2", "3"]
+        or unit_values[8:10] != ["50002", "50001"]
     ):
         failures.append("order-unit minimal R170/R180 projection/filter contract changed")
 
@@ -513,8 +515,8 @@ def main() -> int:
 
     ready_calendar = RecentBusinessDaysResult(status="ready", dates=business_dates)
     with patch.dict("os.environ", {"SIMS_CHAT_DISPLAY_MAX_ROWS": "300", "SIMS_IO_QUERY_MAX_ROWS": "100000"}), patch.object(service, "recent_business_days", return_value=ready_calendar), patch.object(service, "execute_bound_select", side_effect=fake_select):
-        order = service.get_order_result({"date_from": "20260901", "date_to": "20260907", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_display_context": "chat"})
-        expected = service.get_expected_inbound_result({"_today": "20260907", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_display_context": "chat"})
+        order = service.get_order_result({"date_from": "20260901", "date_to": "20260907", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_order_stock_scope_policy": "saved", "_order_saved_stock_cd_list": ["00001"], "_display_context": "chat"})
+        expected = service.get_expected_inbound_result({"_today": "20260907", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_order_stock_scope_policy": "saved", "_order_saved_stock_cd_list": ["00001"], "_display_context": "chat"})
     if len(captured) != 2:
         failures.append(f"one source call per request failed: {len(captured)}")
     for payload in (order, expected):
@@ -557,6 +559,7 @@ def main() -> int:
                 "order_vendor_nm": "삼진",
                 "physic_nm": "테스트",
                 "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True,
+                "_order_stock_scope_policy": "saved", "_order_saved_stock_cd_list": ["00001"],
             },
             mode="expected",
             title="입고예정조회",
@@ -582,7 +585,7 @@ def main() -> int:
 
     with patch.object(service, "recent_business_days", return_value=ready_calendar), patch.object(service, "execute_bound_select", return_value=pd.DataFrame()):
         expected_empty = service.get_expected_inbound_result(
-            {"_today": "20260907", "order_vendor_nm": "삼진", "physic_nm": "테스트", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True}
+            {"_today": "20260907", "order_vendor_nm": "삼진", "physic_nm": "테스트", "stock_cd_list": ["00001"], "_order_stock_scope_resolved": True, "_order_stock_scope_policy": "saved", "_order_saved_stock_cd_list": ["00001"]}
         )
     empty_summary = str(expected_empty.get("meta", {}).get("query_summary") or "")
     if (
@@ -754,7 +757,7 @@ def main() -> int:
         failures.append("grain/filter/clamp contract violated")
     if "D.Rd18_Or_Di IN ('1', '2')" not in expected_sql or "H.Rd17_Or_YyMmDd IN (?,?,?,?)" not in expected_sql:
         failures.append("expected-inbound status/business-day filter missing")
-    if captured and list(captured[1][1][:4]) != list(business_dates):
+    if captured and list(captured[1][1][1:5]) != list(business_dates):
         failures.append("expected-inbound SQL did not bind the SSAI Calendar date set")
     expected_where = expected_sql.rsplit("WHERE", 1)[-1]
     if "Rd17_Put_YyMmDd" in expected_where:
@@ -778,7 +781,7 @@ def main() -> int:
         or "H.Rd17_Or_YyMmDd >= ?" not in explicit_sql
         or "H.Rd17_Or_YyMmDd <= ?" not in explicit_sql
         or "H.Rd17_Or_YyMmDd IN (?,?,?,?)" in explicit_sql
-        or explicit_params[:4] != ["1", "2", "20260101", "20260909"]
+        or explicit_params[1:5] != ["1", "2", "20260101", "20260909"]
     ):
         failures.append(f"explicit expected-inbound period/status SQL contract failed: {explicit_meta}/{explicit_sql}/{explicit_params}")
 

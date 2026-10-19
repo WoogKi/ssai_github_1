@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+import logging
 from typing import Any, Optional
 from xml.etree import ElementTree
 
@@ -18,6 +19,7 @@ from app.services.product_master_filter_contract import (
 
 
 TABLE = "rddbc170_rddbc180"
+_LOG = logging.getLogger(__name__)
 ORDER_ACTION = "발주조회"
 EXPECTED_ACTION = "입고예정조회"
 
@@ -58,7 +60,46 @@ def _feature_spec():
     return _ORDER_SPEC
 
 
-_ORDER_STOCK_CD_SQL = "COALESCE(NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), ''), '00001')"
+_ORDER_STOCK_CD_SQL = (
+    "COALESCE(NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), ''), "
+    "CASE WHEN OrderLocation.match_count = 1 THEN OrderLocation.stock_code "
+    "ELSE HeadOffice.stock_code END)"
+)
+
+_ORDER_STOCK_APPLIES = """
+OUTER APPLY (
+    SELECT CASE WHEN COUNT(*) = 1 THEN MIN(RTRIM(S.Rd01_Tcode)) END AS stock_code
+    FROM dbo.Rddbc010 AS S
+    WHERE S.Rd01_Gcode = '0018'
+      AND REPLACE(REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(S.Rd01_Hnm)), '.', ''), ' ', ''), '(', ''), ')', '') = N'본사창고'
+) AS HeadOffice
+OUTER APPLY (
+    SELECT COUNT(*) AS match_count, MIN(RTRIM(S.Rd01_Tcode)) AS stock_code
+    FROM dbo.Rddbc010 AS S
+    CROSS APPLY (
+        SELECT REPLACE(REPLACE(REPLACE(LTRIM(RTRIM(S.Rd01_Hnm)), '.', ''), '(', ''), ')', '') AS location_name
+    ) AS NameText
+    CROSS APPLY (
+        SELECT LEFT(NameText.location_name,
+            CASE WHEN PATINDEX('%[ _]%', NameText.location_name) > 0
+                 THEN PATINDEX('%[ _]%', NameText.location_name) - 1
+                 ELSE LEN(NameText.location_name) END) AS first_word
+    ) AS NamePart
+    CROSS APPLY (
+        SELECT CASE WHEN RIGHT(NamePart.first_word, 2) IN (N'창고', N'지점')
+                    THEN LEFT(NamePart.first_word, LEN(NamePart.first_word) - 2)
+                    ELSE NamePart.first_word END AS keyword
+    ) AS LocationKey
+    WHERE S.Rd01_Gcode = '0018'
+      AND S.Rd01_Tcode IN (__SAVED_STOCK_CODES__)
+      AND (RTRIM(S.Rd01_Hnm) LIKE N'%창고' OR RTRIM(S.Rd01_Hnm) LIKE N'%지점')
+      AND S.Rd01_Tcode <> HeadOffice.stock_code
+      AND LEN(LocationKey.keyword) >= 2
+      AND CHARINDEX(LocationKey.keyword,
+            REPLACE(COALESCE(H.Rd17_Other1, ''), ' ', '')) > 0
+      AND NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL
+) AS OrderLocation
+""".strip()
 
 _SELECT_COLUMNS = f"""
     RTRIM(H.Rd17_Or_YyMmDd) AS [발주일자],
@@ -74,6 +115,7 @@ _SELECT_COLUMNS = f"""
     RTRIM(D.Rd18_Stock_Apply_Cd) AS [재고적용처코드],
     ISNULL(SV.Rd03_Ven_Nm, '') AS [재고적용처명],
     {_ORDER_STOCK_CD_SQL} AS [재고위치코드],
+    OrderLocation.match_count AS [__stock_location_match_count],
     ISNULL(ST.Rd01_Hnm, '') AS [재고위치명],
     D.Rd18_Unit_Cost AS [단가],
     D.Rd18_Quantity AS [발주수량],
@@ -107,6 +149,7 @@ LEFT JOIN dbo.Rddbc030 AS CV ON D.Rd18_Cost_Apply_Cd = CV.Rd03_Ven_Cd
 LEFT JOIN dbo.Rddbc030 AS SV ON D.Rd18_Stock_Apply_Cd = SV.Rd03_Ven_Cd
 LEFT JOIN dbo.Rddbc030 AS PV ON D.Rd18_Pro_Ven_Cd = PV.Rd03_Ven_Cd
 LEFT JOIN dbo.Rddbc030 AS RV ON D.Rd18_Real_Ven_Cd = RV.Rd03_Ven_Cd
+{_ORDER_STOCK_APPLIES}
 LEFT JOIN dbo.Rddbc010 AS ST
     ON ST.Rd01_Gcode = '0018'
    AND {_ORDER_STOCK_CD_SQL} = ST.Rd01_Tcode
@@ -144,6 +187,8 @@ INNER JOIN dbo.Rddbc170 AS H
    AND H.Rd17_Or_Seq = D.Rd18_Or_Seq
 """.strip()
 
+_ORDER_UNIT_HISTORY_MINIMAL_JOINS = _ORDER_PRICE_HISTORY_MINIMAL_JOINS + "\n" + _ORDER_STOCK_APPLIES
+
 _ORDER_UNIT_HISTORY_MINIMAL_COLUMNS = """
     RTRIM(H.Rd17_Or_YyMmDd) AS [발주일자],
     RTRIM(D.Rd18_OrVen_Cd) AS [발주거래처코드],
@@ -167,6 +212,22 @@ def _clean_codes(value: Any) -> tuple[str, ...]:
         return ()
     values = value if isinstance(value, (list, tuple, set)) else (value,)
     return tuple(dict.fromkeys(code for code in (_clean(item) for item in values) if code))
+
+
+def _bind_saved_order_locations(
+    sql: str, values: list[Any], params: dict[str, Any],
+) -> tuple[str, list[Any]]:
+    marker = "__SAVED_STOCK_CODES__"
+    if marker not in sql:
+        return sql, values
+    codes = (
+        _clean_codes(params.get("_order_saved_stock_cd_list"))
+        if "_order_saved_stock_cd_list" in params
+        else _clean_codes(params.get("stock_cd_list"))
+    )
+    if not codes:
+        return sql.replace(marker, "NULL"), values
+    return sql.replace(marker, ",".join("?" for _ in codes)), [*codes, *values]
 
 
 def _order_status_codes(value: Any, *, fallback: Any = "") -> tuple[str, ...]:
@@ -260,8 +321,7 @@ def normalize_order_params(params: Optional[dict[str, Any]] = None, *, mode: str
     out["pending_product_code_list"] = _clean_codes(source.get("pending_product_code_list"))
     out["_order_price_history_minimal"] = bool(source.get("_order_price_history_minimal", False))
     out["_order_unit_history_minimal"] = bool(source.get("_order_unit_history_minimal", False))
-    # Blank R180 order locations belong to 00001, never to an independent scope.
-    out["include_blank_stock_cd"] = "00001" in out["stock_cd_list"] or out["stock_cd"] == "00001"
+    out["include_blank_stock_cd"] = bool(out["stock_cd_list"] or out["stock_cd"])
     if mode == "order":
         out["date_from"] = _date_value(source.get("date_from"), default=(today - timedelta(days=30)).strftime("%Y%m%d"))
         out["date_to"] = _date_value(source.get("date_to"), default=today.strftime("%Y%m%d"))
@@ -296,11 +356,16 @@ def _append_order_stock_filter(
     codes = _clean_codes(params.get("stock_cd_list")) or _clean_codes(params.get("stock_cd"))
     if not codes:
         return
-    # Keep the indexed code predicate; only 00001 also owns blank R180 rows.
-    clause = f"D.Rd18_Stock_Cd IN ({','.join('?' for _ in codes)})"
-    if "00001" in codes:
-        clause = f"({clause} OR NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL)"
+    # Explicit R180 locations stay indexable; blank rows use the same resolved
+    # location as the projection and expected-inbound aggregation.
+    placeholders = ','.join('?' for _ in codes)
+    clause = (
+        f"(D.Rd18_Stock_Cd IN ({placeholders}) OR "
+        f"(NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL "
+        f"AND {_ORDER_STOCK_CD_SQL} IN ({placeholders})))"
+    )
     clauses.append(clause)
+    values.extend(codes)
     values.extend(codes)
 
 
@@ -522,12 +587,16 @@ ORDER BY [발주일자] DESC, [발주거래처코드], [발주순번], [상세�
         order_by = "" if large_unit_scope else "ORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"
         sql = f"""SELECT {top}
 {_ORDER_UNIT_HISTORY_MINIMAL_COLUMNS}
-{_ORDER_PRICE_HISTORY_MINIMAL_JOINS}
+{_ORDER_UNIT_HISTORY_MINIMAL_JOINS}
 WHERE {' AND '.join(clauses)}
 {order_by}"""
     else:
         sql = f"""SELECT TOP {int(qparams['top'])}\n{_SELECT_COLUMNS}\n{_JOINS}\nWHERE {' AND '.join(clauses)}\nORDER BY H.Rd17_Or_YyMmDd DESC,D.Rd18_OrVen_Cd,D.Rd18_Or_Seq,D.Rd18_Orsub_Seq"""
+    sql, values = _bind_saved_order_locations(sql, values, qparams)
     source = execute_bound_select(sql, values)
+    ambiguous_rows = 0
+    if "__stock_location_match_count" in source.columns:
+        ambiguous_rows = int((pd.to_numeric(source.pop("__stock_location_match_count"), errors="coerce") > 1).sum())
     raw_source_rows = len(source)
     if large_unit_scope:
         selected = set(unit_codes)
@@ -562,6 +631,9 @@ WHERE {' AND '.join(clauses)}
             out.attrs["order_unit_history_complete_scope"] = False
         out.attrs["order_unit_scope_product_count"] = len(unit_codes)
         out.attrs["order_unit_scope_chunk_count"] = 0
+        out.attrs["order_location_ambiguous_rows"] = ambiguous_rows
+    if ambiguous_rows:
+        _LOG.warning("[order.stock_location] ambiguous_saved_remark_rows=%s", ambiguous_rows)
     return out
 
 
@@ -579,11 +651,14 @@ def get_expected_inbound_product_totals(
         ELSE 0
     END) AS [입고예정수량],
     SUM(CASE WHEN NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL THEN 1 ELSE 0 END)
-        AS [_공백재고위치행수]
+        AS [_공백재고위치행수],
+    SUM(CASE WHEN OrderLocation.match_count > 1 THEN 1 ELSE 0 END)
+        AS [_중복재고위치행수]
 {_JOINS}
 WHERE {' AND '.join(clauses)}
 GROUP BY D.Rd18_Physic_Cd
 ORDER BY D.Rd18_Physic_Cd"""
+    sql, values = _bind_saved_order_locations(sql, values, qparams)
     out = execute_bound_select(sql, values)
     include_blank = bool(qparams.get("include_blank_stock_cd"))
     stock_scope = list(_clean_codes(qparams.get("stock_cd_list")) or _clean_codes(qparams.get("stock_cd")))
@@ -597,6 +672,7 @@ ORDER BY D.Rd18_Physic_Cd"""
         "include_blank_stock_cd": include_blank,
         "blank_stock_location_included_rows": 0,
         "blank_stock_location_excluded_rows": None if not include_blank else 0,
+        "ambiguous_saved_remark_rows": 0,
         "preserved_detail_dimensions": ["단가적용처코드", "재고적용처코드", "재고위치코드"],
     }
     if out is None or not isinstance(out, pd.DataFrame) or out.empty:
@@ -609,6 +685,7 @@ ORDER BY D.Rd18_Physic_Cd"""
         else pd.Series(0, index=out.index)
     )
     blank_rows = int(pd.to_numeric(blank_series, errors="coerce").fillna(0).sum())
+    ambiguous_rows = int(pd.to_numeric(out.get("_중복재고위치행수", 0), errors="coerce").fillna(0).sum()) if "_중복재고위치행수" in out.columns else 0
     out = out[["제품코드", "입고예정수량"]].copy()
     out["제품코드"] = out["제품코드"].fillna("").astype(str).str.strip()
     out["입고예정수량"] = pd.to_numeric(out["입고예정수량"], errors="coerce").fillna(0)
@@ -617,6 +694,9 @@ ORDER BY D.Rd18_Physic_Cd"""
         raise ValueError("expected inbound product projection must be one row per product")
     attrs["blank_stock_location_included_rows"] = blank_rows if include_blank else 0
     attrs["blank_stock_location_excluded_rows"] = 0 if include_blank else None
+    attrs["ambiguous_saved_remark_rows"] = ambiguous_rows
+    if ambiguous_rows:
+        _LOG.warning("[order.stock_location] ambiguous_saved_remark_rows=%s mode=expected", ambiguous_rows)
     out.attrs.update(attrs)
     return out
 
@@ -627,10 +707,10 @@ def _date_to_obj(value: Any) -> date | None:
 
 
 def _result(params: Optional[dict[str, Any]], *, mode: str, title: str) -> dict[str, Any]:
-    if not (params or {}).get("_order_stock_scope_resolved"):
+    if not (params or {}).get("_order_stock_scope_resolved") or (params or {}).get("_order_stock_scope_policy") == "registered":
         from app.services.order_stock_location_scope import prepare_order_stock_scope
 
-        scoped, error, _ = prepare_order_stock_scope(params or {})
+        scoped, error, _ = prepare_order_stock_scope(params or {}, saved_only=True)
         if error:
             message = "재고위치를 확인할 수 없습니다. 등록된 위치를 다시 지정해 주세요."
             if error in {"no_saved_locations", "profile_unavailable"}:
@@ -674,6 +754,7 @@ def _result(params: Optional[dict[str, Any]], *, mode: str, title: str) -> dict[
         "expected_inbound_period_kind": "explicit_order_period" if qparams.get("_expected_inbound_explicit_period") else "recent_business_days",
         "query_summary": query_summary,
         "condition": query_summary,
+        "ambiguous_saved_remark_rows": int(df.attrs.get("order_location_ambiguous_rows") or 0),
     })
     payload["meta"] = meta
     return payload
@@ -690,7 +771,7 @@ def get_expected_inbound_result(params: Optional[dict[str, Any]] = None) -> dict
 def get_order_export_df(params: Optional[dict[str, Any]] = None) -> pd.DataFrame:
     from app.services.order_stock_location_scope import prepare_order_stock_scope
 
-    scoped, error, _ = prepare_order_stock_scope(params or {})
+    scoped, error, _ = prepare_order_stock_scope(params or {}, saved_only=True)
     if error:
         raise ValueError("재고위치를 확인할 수 없습니다.")
     return get_order_df(scoped, mode="order")
@@ -699,7 +780,7 @@ def get_order_export_df(params: Optional[dict[str, Any]] = None) -> pd.DataFrame
 def get_expected_inbound_export_df(params: Optional[dict[str, Any]] = None) -> pd.DataFrame:
     from app.services.order_stock_location_scope import prepare_order_stock_scope
 
-    scoped, error, _ = prepare_order_stock_scope(params or {})
+    scoped, error, _ = prepare_order_stock_scope(params or {}, saved_only=True)
     if error:
         raise ValueError("재고위치를 확인할 수 없습니다.")
     return get_order_df(scoped, mode="expected")

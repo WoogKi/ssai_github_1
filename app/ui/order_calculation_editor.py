@@ -10,27 +10,28 @@ from app.services.order_calculation_contract import amounts
 from app.services.order_calculation_service import ROW_KEY, _order_reason, decimal_or_none
 from app.ui.sims_table_display import (
     _format_numeric_null_columns_for_display,
+    _format_numeric_display_value,
     _infer_width_px,
     _make_column_config,
+    is_sims_numeric_display_col,
     prepare_sims_table_display_df,
 )
 
 
 _ORDER_VIEW_LABELS = {
-    "출고빈도등급": "등급", "추세판정": "추세", "계산 발주수량": "계산수량",
+    "출고빈도등급": "출고빈도등급", "추세판정": "추세", "계산 발주수량": "계산수량",
     "추천 발주수량": "추천수량", "실제 발주수량": "발주수량", "입고예정수량": "입고예정",
     "재고수량": "현재재고", "당월 정상출고수량": "당월출고",
     "최근3개월평균": "최근3개월", "이전3개월평균": "이전3개월",
 }
 _ORDER_VIEW_WIDTHS = {
-    "제품코드": 82, "제품명": 230, "규격": 80, "발주처": 155,
-    "출고빈도등급": 62, "추세판정": 92, "발주단위": 74,
-    "계산 발주수량": 86, "추천 발주수량": 86, "실제 발주수량": 86,
-    "입고예정수량": 84, "재고수량": 84, "당월 정상출고수량": 86,
+    "제품코드": 82, "제품명": 230, "규격": 100, "발주처": 155,
+    "출고빈도등급": 112, "추세판정": 105, "발주단위": 88,
+    "계산 발주수량": 100, "추천 발주수량": 100, "실제 발주수량": 104,
+    "입고예정수량": 92, "재고수량": 92, "당월 정상출고수량": 92,
 }
-
-
 _PAGE_SIZE = 300
+_ORDER_AFTER_OUTBOUND = ("발주단가", "발주금액(부가세포함)", "계산상태")
 _ORDER_QUANTITY_COLORS = {
     "계산 발주수량": "#edf3fb",
     "추천 발주수량": "#e8f4ee",
@@ -42,33 +43,77 @@ _ORDER_STOCK_COLUMNS = ("입고예정수량", "재고수량", "당월 정상출�
 
 def _order_table_display_config(source: pd.DataFrame, *, editing: bool) -> tuple[pd.DataFrame, dict, int]:
     view = prepare_sims_table_display_df(source, action_name="발주 계산")
+    forecast_column = "월 기준 예상수량"
+    if forecast_column in view:
+        numeric = pd.to_numeric(view[forecast_column], errors="coerce")
+        if numeric.notna().sum() == view[forecast_column].notna().sum():
+            view[forecast_column] = numeric.round(2)
     formatted = set()
     if not editing:
         view, formatted = _format_numeric_null_columns_for_display(view)
+    if forecast_column in view and view[forecast_column].isna().any():
+        view[forecast_column] = view[forecast_column].map(
+            lambda value: _format_numeric_display_value(value, "decimal2")
+        ).astype("string")
+        formatted.add(forecast_column)
     config = {}
     for column in view.columns:
         width = _ORDER_VIEW_WIDTHS.get(column, _infer_width_px(view, column))
         cell = _make_column_config(
             view, column, width=width, pinned=column in {"제품코드", "제품명", "규격"},
-            force_text=column in formatted, align_numbers=editing,
+            force_text=column in formatted, align_numbers=True,
         )
         cell["label"] = _ORDER_VIEW_LABELS.get(column, column)
         if editing and column == "계산 발주수량" and cell.get("type_config", {}).get("type") == "number":
-            cell["type_config"]["format"] = "%.2f"
+            cell["type_config"]["format"] = "%,.2f"
+        if column == "월 기준 예상수량":
+            if cell.get("type_config", {}).get("type") == "number":
+                cell["type_config"]["format"] = "%,.2f"
+            cell["alignment"] = "right"
+        if column == "발주단위":
+            cell["alignment"] = "right"
         config[column] = cell
     height = min(520, max(170, 32 * (len(view) + 1) + 42))
     return view, config, height
 
 
-def _style_order_table(view: pd.DataFrame, *, editing: bool) -> Styler:
-    styled = view.style
+def _order_display_columns(columns: list[str]) -> list[str]:
+    if "당월 정상출고수량" not in columns:
+        return columns
+    remaining = [column for column in columns if column not in _ORDER_AFTER_OUTBOUND]
+    position = remaining.index("당월 정상출고수량") + 1
+    return remaining[:position] + [column for column in _ORDER_AFTER_OUTBOUND if column in columns] + remaining[position:]
+
+
+def _order_readonly_styles(view: pd.DataFrame, *, editing: bool) -> pd.DataFrame:
+    styles = pd.DataFrame("", index=view.index, columns=view.columns)
+    readonly = [column for column in view if not (editing and column == "실제 발주수량")]
+    for column in ("제품코드", "제품명", "규격"):
+        if column in view:
+            styles[column] += "color:#1f2937;"
+    band_columns = [column for column in readonly if column not in _ORDER_QUANTITY_COLORS and column not in _ORDER_STOCK_COLUMNS]
+    positions = [view.columns.get_loc(column) for column in band_columns]
+    for start in range(5, len(view), 10):
+        styles.iloc[start:start + 5, positions] += "background-color:#F0F2F5;"
     for column, color in _ORDER_QUANTITY_COLORS.items():
         if column in view and (not editing or column != "실제 발주수량"):
-            styled = styled.set_properties(subset=[column], **{"background-color": color})
-    stock_columns = [column for column in _ORDER_STOCK_COLUMNS if column in view]
-    if stock_columns:
-        styled = styled.set_properties(subset=stock_columns, **{"background-color": _ORDER_STOCK_COLOR})
-    return styled
+            styles[column] += f"background-color:{color};"
+    for column in _ORDER_STOCK_COLUMNS:
+        if column in view:
+            styles[column] += f"background-color:{_ORDER_STOCK_COLOR};"
+    for column in readonly:
+        if is_sims_numeric_display_col(view, column):
+            negative = pd.to_numeric(view[column], errors="coerce").lt(0).fillna(False)
+            styles.loc[negative, column] += "color:#dc2626;"
+    if "추세판정" in view:
+        trend = view["추세판정"].astype("string").str.strip()
+        styles.loc[trend.eq("증가").fillna(False), "추세판정"] += "color:#2563eb;"
+        styles.loc[trend.isin(("유지", "감소")), "추세판정"] += "color:#dc2626;"
+    return styles
+
+
+def _style_order_table(view: pd.DataFrame, *, editing: bool) -> Styler:
+    return view.style.apply(_order_readonly_styles, axis=None, editing=editing)
 
 
 def _log_order_table_render(*, path: str, mode: str, renderer: str, page: int, page_count: int,
@@ -146,7 +191,7 @@ def render_actual_quantity_editor(item: dict, meta: dict, *, download_uid: str):
     existing_display = ss.get("sims_tables", {}).get(key)
     display_columns = list(existing_display.columns) if isinstance(existing_display, pd.DataFrame) else list(full.columns)
     widget_key = f"order_actual::{key}::{page}"
-    columns = [c for c in display_columns if c in visible]
+    columns = _order_display_columns([c for c in display_columns if c in visible])
     display_source = visible[columns].copy()
     raw = pd.to_numeric(display_source['계산 발주수량'], errors='coerce')
     display_source.loc[raw.le(0), '계산 발주수량'] = None
@@ -164,7 +209,7 @@ def render_actual_quantity_editor(item: dict, meta: dict, *, download_uid: str):
         None if v is None or pd.isna(v) else int(v) for v in visible["실제 발주수량"]], dtype="Int64")
     actual_config = column_config.get("실제 발주수량") or {}
     column_config["실제 발주수량"] = st.column_config.NumberColumn(
-        "🟩 발주수량", min_value=0, step=1, format="%d",
+        "🟩 발주수량", min_value=0, step=1, format="%,.0f",
         width=actual_config.get("width"), pinned=actual_config.get("pinned"), alignment="right",
         help="정수를 입력하고 Enter 또는 다른 셀로 이동하면 수량과 금액이 반영됩니다.")
 

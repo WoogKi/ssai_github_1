@@ -81,6 +81,8 @@ def resolve_order_stock_scope(
     out.pop("stock_names", None)
     out["_order_stock_scope_source"] = source
     out["_order_stock_scope_policy"] = "saved" if saved_only else "registered"
+    if saved_only:
+        out["_order_saved_stock_cd_list"] = list(dict.fromkeys(_values(default_codes)))
     out["_order_stock_scope_resolved"] = True
     return out, "", []
 

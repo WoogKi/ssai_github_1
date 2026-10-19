@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -72,7 +73,7 @@ def check_single_source_modes() -> None:
         orders.get_order_df(without_headquarters, mode="order")
         assert query.call_count == 1
         assert "Rd18_Stock_Cd IN (?,?)" in query.call_args.args[0]
-        assert "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" not in query.call_args.args[0]
+        assert orders._ORDER_STOCK_CD_SQL in query.call_args.args[0]
 
     for count in (10, 100, 1000):
         with patch("sqlalchemy.engine.Engine.connect", side_effect=AssertionError("DB forbidden")), \
@@ -159,6 +160,45 @@ def check_failure_and_duplicate() -> None:
                               default_unit_allowed=True, price=Decimal(1000000)) == 1
 
 
+def check_cross_location_unit_history() -> None:
+    source = {"policy_date": "20261019", "cost_apply_cd": "50002", "stock_apply_cd": "50001",
+              "stock_cd_list": ["00001"], "_order_saved_stock_cd_list": ["00001", "00247"]}
+    headquarters = calculation.build_order_unit_history_params(source, reference=date(2026, 10, 19))
+    jeonju = calculation.build_order_unit_history_params(
+        {**source, "stock_cd_list": ["00247"]}, reference=date(2026, 10, 19),
+    )
+    for params in (headquarters, jeonju):
+        assert all(key not in params for key in ("stock_cd", "stock_nm", "stock_cd_list", "stock_cds"))
+        assert params["cost_apply_cd"] == "50002" and params["stock_apply_cd"] == "50001"
+        params["_order_unit_selected_scope"] = True
+        params["order_unit_product_code_list"] = ["00001"]
+    rows = pd.DataFrame([
+        {"제품코드": "00001", "발주일자": day, "발주거래처코드": "V", "발주순번": index,
+         "상세순번": 1, "발주수량": Decimal(qty)}
+        for index, (day, qty) in enumerate((("20261001", 6), ("20261008", 12), ("20261015", 6)), 1)
+    ], columns=COLS)
+    with patch("sqlalchemy.engine.Engine.connect", side_effect=AssertionError("DB forbidden")), \
+         patch("pyodbc.connect", side_effect=AssertionError("DB forbidden")), \
+         patch.object(orders, "execute_bound_select", return_value=rows) as query:
+        for params in (headquarters, jeonju):
+            history = orders.get_order_df(params, mode="order")
+            sql, values = query.call_args.args
+            assert "Rd18_Stock_Cd IN" not in sql
+            assert "Rd18_OrVen_Cd" in sql
+            assert "Rd18_Cost_Apply_Cd = ?" in sql
+            assert "Rd18_Stock_Apply_Cd = ?" in sql
+            assert "V" not in values
+            grouped = calculation._history_index(history)
+            unit, reason, count = calculation._infer_unit_from_windows(
+                grouped[("00001", "V")], recent_start="20260919",
+                period=["20260719", "20261019"],
+            )
+            assert unit == 6 and count == 3 and "반복" in reason
+        assert query.call_count == 2
+    assert recommend_quantity(Decimal(23), None, increasing=True) == 30
+    assert recommend_quantity(Decimal(23), Decimal(6), increasing=True) == 24
+
+
 def check_original_error_preserved() -> None:
     class Driver:
         def __init__(self):
@@ -199,6 +239,7 @@ def check_original_error_preserved() -> None:
 if __name__ == "__main__":
     check_single_source_modes()
     check_failure_and_duplicate()
+    check_cross_location_unit_history()
     check_original_error_preserved()
     check_editor_revision()
     print("PASS single unit scope, completeness, timeout error and editor regression; DB attempts=0")

@@ -6792,7 +6792,7 @@ def _try_handle_io_nlq(
 
         try:
             params, stock_error, candidates = prepare_order_stock_scope(
-                params, saved_only=action == "발주 계산",
+                params, saved_only=True,
             )
         except Exception:
             logger.exception("[nlq.router] order stock scope validation failed action=%r", action)

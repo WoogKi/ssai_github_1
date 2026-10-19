@@ -4,13 +4,21 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services.dashboard_lite_facts import INVENTORY_STATUS_ORDER
 from app.sims.views.dashboard_lite import (
+    _INVENTORY_DETAIL_COLUMNS,
     _INVENTORY_STATUS_COLORS,
+    _integrated_inventory_detail_display_frame,
+    _inventory_detail_numeric_styles,
+    _inventory_detail_column_config,
+    _inventory_detail_status_cell_style,
+    _style_inventory_detail,
     _dashboard_inline_icon,
     _build_dashboard_grade_distribution_chart,
     _dashboard_grade_distribution_rows,
@@ -150,6 +158,48 @@ def main() -> None:
     assert _dashboard_grade_distribution_rows(legacy, "profit_grade_counts") == []
     assert _dashboard_grade_distribution_rows(legacy, "contribution_grade_counts") == []
     assert _build_dashboard_grade_distribution_chart(legacy, "profit_grade_counts") is None
+    detail = pd.DataFrame({
+        "재고상태": ["긴급 부족", "적정 재고"],
+        "제품코드": ["00001", "00002"],
+        "제품명": ["제품 A", "제품 B"],
+        "규격": ["1T", "2T"],
+        "입고예정 포함 재고상태": ["재고 부족", "적정 재고"],
+        "현재재고수량": [-1, 20],
+        "입고예정수량": [2, 0],
+        "입고예정 반영 가용재고": [3, 20],
+        "월잔여예상수요": [10, 5],
+        "출고빈도등급": ["A", "B"],
+        "품목손익등급": ["C", "D"],
+        "품목기여등급": ["E", "A"],
+        "월간 소진상태": ["월말 부족 예상", "재고로 월말 충족 가능"],
+        "위험사유": ["확인 필요", ""],
+    })
+    original = detail.copy(deep=True)
+    shown = _integrated_inventory_detail_display_frame(detail, 1)
+    assert list(shown.columns) == [column for column in _INVENTORY_DETAIL_COLUMNS if column in detail]
+    product_index = list(shown.columns).index("제품코드")
+    assert list(shown.columns)[product_index:product_index + 3] == ["제품코드", "제품명", "규격"]
+    assert len(shown) == 1 and set(shown.columns) == set(detail.columns)
+    pd.testing.assert_frame_equal(detail, original)
+    styled = _style_inventory_detail(shown)._compute()
+    assert (0, 0) in styled.ctx
+    assert (0, list(shown.columns).index("현재재고수량")) in styled.ctx
+    assert _inventory_detail_numeric_styles(shown).loc[0, "현재재고수량"] == "color:#dc2626;"
+    assert _inventory_detail_numeric_styles(shown).loc[0, "제품코드"] == "color:#1f2937;"
+    band = _inventory_detail_numeric_styles(pd.concat([shown] * 12, ignore_index=True))
+    assert band.loc[5, "현재재고수량"] == "background-color:#F0F2F5;color:#dc2626;"
+    assert band.loc[5, "제품코드"] == "background-color:#F0F2F5;color:#1f2937;"
+    assert band.loc[10, "제품코드"] == "color:#1f2937;"
+    config = _inventory_detail_column_config(shown, {})
+    assert config["제품명"]["width"] == 230 and config["제품명"]["pinned"] is True
+    assert config["규격"]["width"] == 100 and config["규격"]["pinned"] is True
+    assert pd.api.types.is_numeric_dtype(shown["현재재고수량"])
+    assert _INVENTORY_STATUS_COLORS["긴급 부족"][0] in _inventory_detail_status_cell_style("긴급 부족")
+    assert "background-color" not in _inventory_detail_status_cell_style("긴급 부족")
+    assert _inventory_detail_status_cell_style("안전재고 확보") == "color:#854d0e"
+    assert len(_integrated_inventory_detail_display_frame(pd.concat([detail] * 151, ignore_index=True), 300)) == 300
+    complete = pd.DataFrame({column: [""] for column in _INVENTORY_DETAIL_COLUMNS})
+    assert list(_integrated_inventory_detail_display_frame(complete, 1).columns) == list(_INVENTORY_DETAIL_COLUMNS)
     print("dashboard inventory visual: PASS")
 
 

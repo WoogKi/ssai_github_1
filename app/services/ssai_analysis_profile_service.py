@@ -164,6 +164,7 @@ def resolve_company_default_stock_scope(
             "scope_source": "explicit_full",
             "selected_count": len(selected),
             "default_count": 0,
+            "default_codes": list(selected),
         }
 
     loader = profile_loader or load_dashboard_profile_checked
@@ -175,6 +176,7 @@ def resolve_company_default_stock_scope(
             "scope_source": "fail_closed",
             "selected_count": len(selected),
             "default_count": 0,
+            "default_codes": [],
             "reason_code": result.reason_code,
         }
     defaults = normalize_company_default_conditions(result.profile)
@@ -191,6 +193,7 @@ def resolve_company_default_stock_scope(
         "scope_source": "company_default" if is_match else "custom_subset",
         "selected_count": len(selected),
         "default_count": len(default_codes),
+        "default_codes": list(default_codes),
     }
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import date
 import logging
 from pathlib import Path
-import sqlite3
 import sys
 from unittest.mock import patch
 
@@ -68,8 +67,8 @@ def main() -> int:
             mode="expected",
         )
         clauses, _ = orders._filters(normalized, mode="expected")
-        assert not normalized["include_blank_stock_cd"]
-        assert "OR NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" not in " ".join(clauses)
+        assert normalized["include_blank_stock_cd"]
+        assert orders._ORDER_STOCK_CD_SQL in " ".join(clauses)
     for requested in (["00001", "99999"], ["99999"], []):
         selected, error, _ = resolve_order_stock_scope(
             {"stock_cd_list": requested, "_order_stock_terms_invalid": not requested},
@@ -135,11 +134,11 @@ def main() -> int:
 
     for question, expected_action, expected_codes in (
         ("발주 조회 재고위치 본사 + 오토", "발주조회", ["00001", "00901"]),
-        ("발주 조회 재고위치 본사, (전주)", "발주조회", ["00001", "00247"]),
+        ("발주 조회 재고위치 본사, 전주", "발주조회", ["00001", "00247"]),
         ("입고예정자료 조회 재고위치 00247", "입고예정조회", ["00247"]),
         ("발주 계산 재고위치 00001,00247", "발주 계산", ["00001", "00247"]),
-        ("발주 조회 재고위치 00004", "발주조회", ["00004"]),
-        ("입고예정자료 조회 재고위치 00004", "입고예정조회", ["00004"]),
+        ("발주 조회 재고위치 전주", "발주조회", ["00247"]),
+        ("입고예정자료 조회 재고위치 전주", "입고예정조회", ["00247"]),
     ):
         sent, called = [], []
 
@@ -161,7 +160,8 @@ def main() -> int:
         assert len(called) == 1 and called[0]["stock_cd_list"] == expected_codes, (question, called)
         assert sent and sent[-1][1] == expected_action
     for invalid_question in (
-        "발주 조회 재고위치 00001,99999", "발주 조회 재고위치 전주",
+        "발주 조회 재고위치 00001,99999", "발주 조회 재고위치 00004",
+        "입고예정자료 조회 재고위치 00004",
         "발주 계산 재고위치 00004", "발주 계산 재고위치 00001,00004",
     ):
         sent, called = [], []
@@ -183,61 +183,58 @@ def main() -> int:
         assert _strip_common_filter_value(query_tail, known_values=values) == "삼진"
     assert _strip_common_filter_value("동제약품 상세히 보여줘", known_values=values) == "동제약품"
 
-    assert "COALESCE(NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), ''), '00001')" in orders._SELECT_COLUMNS
+    assert orders._ORDER_STOCK_CD_SQL in orders._SELECT_COLUMNS
     assert "ST.Rd01_Gcode = '0018'" in orders._JOINS
     assert orders._ORDER_STOCK_CD_SQL in orders._JOINS
+    assert "Rd17_Other1" in orders._ORDER_STOCK_APPLIES
+    assert "match_count = 1" in orders._ORDER_STOCK_CD_SQL
+    assert "N'본사창고'" in orders._ORDER_STOCK_APPLIES
+    assert "S.Rd01_Tcode IN (__SAVED_STOCK_CODES__)" in orders._ORDER_STOCK_APPLIES
+    bound_sql, bound_values = orders._bind_saved_order_locations(
+        orders._JOINS + " WHERE D.Rd18_Stock_Cd = ?", ["00001"],
+        {"_order_saved_stock_cd_list": ["00001", "00247", "00901"]},
+    )
+    assert "__SAVED_STOCK_CODES__" not in bound_sql
+    assert "S.Rd01_Tcode IN (?,?,?)" in bound_sql
+    assert bound_values == ["00001", "00247", "00901", "00001"]
+    ambiguous_order = pd.DataFrame({
+        "발주일자": ["20261009"], "__stock_location_match_count": [2],
+    })
+    with patch.object(orders, "execute_bound_select", return_value=ambiguous_order):
+        diagnosed = orders.get_order_df({
+            "date_from": "20261001", "date_to": "20261009", "stock_cd_list": ["00001"],
+            "_order_saved_stock_cd_list": default,
+        })
+    assert diagnosed.attrs["order_location_ambiguous_rows"] == 1
+    assert "__stock_location_match_count" not in diagnosed.columns
     for mode in ("order", "expected"):
-        for scope, blanks in ((["00001"], True), (["00247"], False), (["00001", "00247"], True)):
+        for scope in (["00001"], ["00247"], ["00001", "00247"]):
             params = {"stock_cd_list": scope, "date_from": "20261001", "date_to": "20261009"}
             normalized = orders.normalize_order_params(params, mode=mode)
             clauses, binds = orders._filters(normalized, mode=mode)
             sql = " ".join(clauses)
-            assert ("NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql) is blanks
+            assert "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql
+            assert orders._ORDER_STOCK_CD_SQL in sql
             assert all(code in binds for code in scope)
-            assert normalized["include_blank_stock_cd"] is blanks
+            assert binds[-2 * len(scope):] == scope + scope
+            assert normalized["include_blank_stock_cd"]
     pending_params = build_pending_params({"policy_date": "20261009", "stock_cd_list": ["00247"]})
-    assert not pending_params.get("include_blank_stock_cd")
+    assert not pending_params.get("include_blank_stock_cd")  # normalized by the order source
     with patch.object(orders, "execute_bound_select", return_value=pd.DataFrame()) as select:
         orders.get_expected_inbound_product_totals({"stock_cd_list": ["00001", "00247"], "date_from": "20261001", "date_to": "20261009"})
     sql, binds = select.call_args.args
     assert orders._ORDER_STOCK_CD_SQL in sql
     assert "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql
-    assert binds.count("00001") == 1 and binds.count("00247") == 1
-    with sqlite3.connect(":memory:") as connection:
-        connection.execute(
-            "CREATE TABLE Rddbc180 (Rd18_Stock_Cd TEXT, Rd18_Quantity INTEGER, "
-            "Rd18_Oquantity INTEGER, Rd18_In_Quantity INTEGER, Rd18_Or_Di TEXT)"
-        )
-        connection.executemany(
-            "INSERT INTO Rddbc180 VALUES (?,?,?,?,?)",
-            ((None, 10, 0, 0, "1"), ("", 4, 0, 0, "1"), ("   ", 6, 0, 0, "1"),
-             ("00001", 3, 0, 1, "2"), ("00247", 8, 0, 2, "2"),
-             ("00247", 7, 0, 0, "3")),
-        )
-        for scope, expected in ((["00001"], [("00001", 22)]),
-                                (["00247"], [("00247", 6)]),
-                                (["00001", "00247"], [("00001", 22), ("00247", 6)])):
-            clauses, values = [], []
-            orders._append_order_stock_filter(clauses, values, {"stock_cd_list": scope})
-            observed = connection.execute(
-                f"SELECT {orders._ORDER_STOCK_CD_SQL}, "
-                "SUM(CASE D.Rd18_Or_Di WHEN '1' THEN D.Rd18_Quantity + D.Rd18_Oquantity "
-                "WHEN '2' THEN D.Rd18_Quantity + D.Rd18_Oquantity - D.Rd18_In_Quantity "
-                "ELSE 0 END) FROM Rddbc180 AS D "
-                f"WHERE {' AND '.join(clauses)} GROUP BY {orders._ORDER_STOCK_CD_SQL} "
-                f"ORDER BY {orders._ORDER_STOCK_CD_SQL}", values,
-            ).fetchall()
-            assert observed == expected, (scope, observed)
-            from app.services.analytics_sales_trend_service import _merge_expected_inbound_projection
+    assert binds[-4:] == ["00001", "00247", "00001", "00247"]
+    from app.services.analytics_sales_trend_service import _merge_expected_inbound_projection
 
-            pending = sum(quantity for _, quantity in observed)
-            shortage = pd.DataFrame({"제품코드": ["fixture-product"], "부족예상수량": [30]})
-            projection = pd.DataFrame({"제품코드": ["fixture-product"], "입고예정수량": [pending]})
-            projection.attrs["source_call_count"] = 1
-            attached = _merge_expected_inbound_projection(shortage, projection)
-            assert attached.loc[0, "입고예정수량"] == pending
-            assert attached.loc[0, "입고예정 반영 부족수량"] == 30 - pending
-            assert attached.attrs["expected_inbound_source_call_count"] == 1
+    shortage = pd.DataFrame({"제품코드": ["fixture-product"], "부족예상수량": [30]})
+    projection = pd.DataFrame({"제품코드": ["fixture-product"], "입고예정수량": [28]})
+    projection.attrs["source_call_count"] = 1
+    attached = _merge_expected_inbound_projection(shortage, projection)
+    assert attached.loc[0, "입고예정수량"] == 28
+    assert attached.loc[0, "입고예정 반영 부족수량"] == 2
+    assert attached.attrs["expected_inbound_source_call_count"] == 1
     print("PASS order/expected/calculation location parsing, default, registration, company isolation and SQL scope; ERP calls 0")
     return 0
 

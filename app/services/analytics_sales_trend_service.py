@@ -1502,51 +1502,15 @@ SELECT
     M.{p}_Ven_Cd AS [매입처코드],
     M.{p}_Stock_Apply_Cd AS [재고적용처코드],
 
-    SUM(
-        CASE
-            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(M.{p}_Out_Quantity, 0)
-            ELSE COALESCE(M.{p}_Out_Quantity, 0)
-        END
-    ) AS [출고수량],
+    SUM(COALESCE(M.{p}_Out_Quantity, 0)) AS [출고수량],
 
-    SUM(
-        CASE
-            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(M.{p}_Out_Oquantity, 0)
-            ELSE COALESCE(M.{p}_Out_Oquantity, 0)
-        END
-    ) AS [출고할증수량],
+    SUM(COALESCE(M.{p}_Out_Oquantity, 0)) AS [출고할증수량],
 
-    SUM(
-        CASE
-            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(M.{p}_Out_Supply_Price, 0)
-            ELSE COALESCE(M.{p}_Out_Supply_Price, 0)
-        END
-    ) AS [매출공급가액],
+    SUM(COALESCE(M.{p}_Out_Supply_Price, 0)) AS [매출공급가액],
 
-    SUM(
-        CASE
-            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(M.{p}_Out_Tax_Price, 0)
-            ELSE COALESCE(M.{p}_Out_Tax_Price, 0)
-        END
-    ) AS [매출세액],
+    SUM(COALESCE(M.{p}_Out_Tax_Price, 0)) AS [매출세액],
 
-    SUM(
-        CASE
-            WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
-            THEN -1 * (
-                COALESCE(M.{p}_Out_Supply_Price, 0)
-                + COALESCE(M.{p}_Out_Tax_Price, 0)
-            )
-            ELSE (
-                COALESCE(M.{p}_Out_Supply_Price, 0)
-                + COALESCE(M.{p}_Out_Tax_Price, 0)
-            )
-        END
-    ) AS [매출합계],
+    SUM(COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) AS [매출합계],
 
     SUM(
         CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6'
@@ -2243,11 +2207,11 @@ SELECT
     M.{p}_Physic_Cd AS [제품코드],
     M.{p}_Ven_Cd AS [매입처코드],
     M.{p}_Stock_Apply_Cd AS [재고적용처코드],
-    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Quantity, 0) ELSE COALESCE(M.{p}_Out_Quantity, 0) END) AS [출고수량],
-    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Oquantity, 0) ELSE COALESCE(M.{p}_Out_Oquantity, 0) END) AS [출고할증수량],
-    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Supply_Price, 0) ELSE COALESCE(M.{p}_Out_Supply_Price, 0) END) AS [매출공급가액],
-    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * COALESCE(M.{p}_Out_Tax_Price, 0) ELSE COALESCE(M.{p}_Out_Tax_Price, 0) END) AS [매출세액],
-    SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN -1 * (COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) ELSE (COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) END) AS [매출합계],
+    SUM(COALESCE(M.{p}_Out_Quantity, 0)) AS [출고수량],
+    SUM(COALESCE(M.{p}_Out_Oquantity, 0)) AS [출고할증수량],
+    SUM(COALESCE(M.{p}_Out_Supply_Price, 0)) AS [매출공급가액],
+    SUM(COALESCE(M.{p}_Out_Tax_Price, 0)) AS [매출세액],
+    SUM(COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) AS [매출합계],
     SUM(CASE WHEN LEFT(M.{p}_Io_Gu, 1) = '6' THEN ABS(COALESCE(M.{p}_Out_Supply_Price, 0) + COALESCE(M.{p}_Out_Tax_Price, 0)) ELSE 0 END) AS [매출반품금액],
     COUNT(*) AS [집계건수],
     COUNT(DISTINCT M.{p}_Ven_Cd) AS [매입처수],
@@ -2558,51 +2522,15 @@ SELECT
     {a}.{p}_Stock_Apply_Cd AS 재고적용처코드,
     Stock_Apply.Rd03_Ven_Nm AS 재고적용처명,
 
-    SUM(
-        CASE
-            WHEN LEFT({a}.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE({a}.{p}_Out_Quantity, 0)
-            ELSE COALESCE({a}.{p}_Out_Quantity, 0)
-        END
-    ) AS 출고수량,
+    SUM(COALESCE({a}.{p}_Out_Quantity, 0)) AS 출고수량,
 
-    SUM(
-        CASE
-            WHEN LEFT({a}.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE({a}.{p}_Out_Oquantity, 0)
-            ELSE COALESCE({a}.{p}_Out_Oquantity, 0)
-        END
-    ) AS 출고할증수량,
+    SUM(COALESCE({a}.{p}_Out_Oquantity, 0)) AS 출고할증수량,
 
-    SUM(
-        CASE
-            WHEN LEFT({a}.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE({a}.{p}_Out_Supply_Price, 0)
-            ELSE COALESCE({a}.{p}_Out_Supply_Price, 0)
-        END
-    ) AS 매출공급가액,
+    SUM(COALESCE({a}.{p}_Out_Supply_Price, 0)) AS 매출공급가액,
 
-    SUM(
-        CASE
-            WHEN LEFT({a}.{p}_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE({a}.{p}_Out_Tax_Price, 0)
-            ELSE COALESCE({a}.{p}_Out_Tax_Price, 0)
-        END
-    ) AS 매출세액,
+    SUM(COALESCE({a}.{p}_Out_Tax_Price, 0)) AS 매출세액,
 
-    SUM(
-        CASE
-            WHEN LEFT({a}.{p}_Io_Gu, 1) = '6'
-            THEN -1 * (
-                COALESCE({a}.{p}_Out_Supply_Price, 0)
-                + COALESCE({a}.{p}_Out_Tax_Price, 0)
-            )
-            ELSE (
-                COALESCE({a}.{p}_Out_Supply_Price, 0)
-                + COALESCE({a}.{p}_Out_Tax_Price, 0)
-            )
-        END
-    ) AS 매출합계,
+    SUM(COALESCE({a}.{p}_Out_Supply_Price, 0) + COALESCE({a}.{p}_Out_Tax_Price, 0)) AS 매출합계,
 
     SUM(
         CASE WHEN LEFT({a}.{p}_Io_Gu, 1) = '6'
@@ -3113,50 +3041,17 @@ SELECT
     Road1.Rd021_Gugun AS 시구군명,
     Road1.Rd021_DongNm AS 법정읍면동명,
 
-    SUM(
-        CASE
-            WHEN LEFT(Out_Put.Rd12_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(Out_Put.Rd12_Quantity, 0)
-            ELSE COALESCE(Out_Put.Rd12_Quantity, 0)
-        END
-    ) AS 출고수량,
+    SUM(COALESCE(Out_Put.Rd12_Quantity, 0)) AS 출고수량,
+
+    SUM(COALESCE(Out_Put.Rd12_Oquantity, 0)) AS 출고할증수량,
+
+    SUM(COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0)) AS 매출공급가액,
+
+    SUM(COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0)) AS 매출세액,
 
     SUM(
-        CASE
-            WHEN LEFT(Out_Put.Rd12_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(Out_Put.Rd12_Oquantity, 0)
-            ELSE COALESCE(Out_Put.Rd12_Oquantity, 0)
-        END
-    ) AS 출고할증수량,
-
-    SUM(
-        CASE
-            WHEN LEFT(Out_Put.Rd12_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0)
-            ELSE COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0)
-        END
-    ) AS 매출공급가액,
-
-    SUM(
-        CASE
-            WHEN LEFT(Out_Put.Rd12_Io_Gu, 1) = '6'
-            THEN -1 * COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0)
-            ELSE COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0)
-        END
-    ) AS 매출세액,
-
-    SUM(
-        CASE
-            WHEN LEFT(Out_Put.Rd12_Io_Gu, 1) = '6'
-            THEN -1 * (
-                COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0)
-                + COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0)
-            )
-            ELSE (
-                COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0)
-                + COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0)
-            )
-        END
+        COALESCE(Out_Put.Rd12_Fin_Supply_Price, Out_Put.Rd12_Supply_Price, 0)
+        + COALESCE(Out_Put.Rd12_Fin_Tax_Price, Out_Put.Rd12_Tax_Price, 0)
     ) AS 매출합계,
 
     SUM(
@@ -6350,6 +6245,7 @@ def get_stock_shortage_df(
                 selected_codes=stock_scope,
                 explicit_full=bool(params.get("_stock_scope_is_full_selection", False)),
             )
+            inbound_params["_order_saved_stock_cd_list"] = scope.get("default_codes") or []
             inbound_params["include_blank_stock_cd"] = "00001" in stock_scope
             inbound_params["_today"] = dict(params.get("_period_source_policy") or {}).get(
                 "effective_date_to"

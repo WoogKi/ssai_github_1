@@ -2663,7 +2663,6 @@ _INVENTORY_DETAIL_COLUMNS = (
     "입고 경과일", "정상 입고 거래일수", "평균 입고간격일", "입고 자료상태", "입고 지연후보",
     "최근입고 대표매입처코드", "최근입고 대표매입처명", "최근입고 대표매입처출처",
 )
-
 _INVENTORY_DETAIL_SURGE_COLUMNS = (
     "수요급증상위분류",
     "수요급증세부분류",
@@ -2726,6 +2725,60 @@ def _integrated_inventory_detail_display_frame(frame: pd.DataFrame, display_limi
 
     columns = [column for column in _INVENTORY_DETAIL_COLUMNS if column in display.columns]
     return display.loc[:, columns]
+
+
+def _inventory_detail_status_cell_style(value: Any) -> str:
+    colors = _INVENTORY_STATUS_COLORS.get(str(value).strip())
+    if not colors:
+        return ""
+    color = {
+        "#94a3b8": "#475569", "#f97316": "#c2410c",
+        "#f5b700": "#854d0e", "#16a34a": "#15803d",
+    }.get(colors[0], colors[0])
+    return f"color:{color}"
+
+
+def _inventory_detail_numeric_styles(view: pd.DataFrame) -> pd.DataFrame:
+    styles = pd.DataFrame("", index=view.index, columns=view.columns)
+    for start in range(5, len(view), 10):
+        styles.iloc[start:start + 5] = "background-color:#F0F2F5;"
+    for column in ("월간 소진상태", "위험 품목 여부", "위험 유형", "제품코드", "제품명", "규격", "위험사유"):
+        if column in view:
+            styles[column] += "color:#1f2937;"
+    for column in view:
+        if is_sims_numeric_display_col(view, column):
+            negative = pd.to_numeric(view[column], errors="coerce").lt(0).fillna(False)
+            styles.loc[negative, column] += "color:#dc2626;"
+    return styles
+
+
+def _style_inventory_detail(view: pd.DataFrame):
+    return view.style.apply(_inventory_detail_numeric_styles, axis=None).map(
+        _inventory_detail_status_cell_style, subset=["재고상태"]
+    )
+
+
+def _inventory_detail_column_config(display: pd.DataFrame, common_column_config: dict[str, Any]) -> dict[str, Any]:
+    risk_text_column_config = {
+        column: config
+        for column, config in _risk_detail_display_column_config().items()
+        if not is_sims_numeric_display_col(display, column)
+    }
+    config = {
+        **common_column_config,
+        **risk_text_column_config,
+        "재고상태": st.column_config.TextColumn("재고 상태", width=110, pinned=True, alignment="center"),
+        "월간 소진상태": st.column_config.TextColumn("월간 소진상태", width=150, pinned=True, alignment="center"),
+        "위험 품목 여부": st.column_config.TextColumn("위험 품목", width=100, pinned=True, alignment="center"),
+        "위험 유형": st.column_config.TextColumn("위험 유형", width=100, pinned=True, alignment="center"),
+        "출고빈도등급": st.column_config.TextColumn("출고빈도", width=90, alignment="center"),
+        "품목손익등급": st.column_config.TextColumn("손익등급", width=90, alignment="center"),
+        "품목기여등급": st.column_config.TextColumn("기여등급", width=90, alignment="center"),
+    }
+    for column, width in {"제품명": 230, "규격": 100}.items():
+        if column in config:
+            config[column]["width"] = width
+    return config
 
 
 def _build_integrated_inventory_detail_frame(inventory: Mapping[str, Any]) -> pd.DataFrame:
@@ -2942,27 +2995,12 @@ def _render_inventory_status_detail(facts: dict[str, Any], cache: Mapping[str, A
         min_height=170,
         max_height=520,
     )
-    risk_text_column_config = {
-        column: config
-        for column, config in _risk_detail_display_column_config().items()
-        if not is_sims_numeric_display_col(display, column)
-    }
     st.dataframe(
-        display,
+        _style_inventory_detail(display),
         width="stretch",
         height=_risk_detail_display_height(display_limit),
         hide_index=True,
-        column_config={
-            **common_column_config,
-            **risk_text_column_config,
-            "재고상태": st.column_config.TextColumn("재고 상태", width=110, pinned=True, alignment="center"),
-            "월간 소진상태": st.column_config.TextColumn("월간 소진상태", width=150, pinned=True, alignment="center"),
-            "위험 품목 여부": st.column_config.TextColumn("위험 품목", width=100, pinned=True, alignment="center"),
-            "위험 유형": st.column_config.TextColumn("위험 유형", width=100, pinned=True, alignment="center"),
-            "출고빈도등급": st.column_config.TextColumn("출고빈도", width=90, alignment="center"),
-            "품목손익등급": st.column_config.TextColumn("손익등급", width=90, alignment="center"),
-            "품목기여등급": st.column_config.TextColumn("기여등급", width=90, alignment="center"),
-        },
+        column_config=_inventory_detail_column_config(display, common_column_config),
     )
     if not bool(require_permission("EXPORT_EXCEL", show_error=False)):
         st.warning("다운로드 권한이 없습니다. 필요 권한: EXPORT_EXCEL (엑셀/CSV 다운로드)")

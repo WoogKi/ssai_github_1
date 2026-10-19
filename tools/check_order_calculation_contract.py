@@ -187,7 +187,7 @@ def test_full_month_forecast_and_blank_pending():
     from app.services.rddbc170_rddbc180_order_service import normalize_order_params
     calendar_fixture = {**q, "_business_dates": ("20260914", "20260911", "20260910", "20260909")}
     assert normalize_order_params(calendar_fixture, mode="expected")["include_blank_stock_cd"]
-    assert not normalize_order_params({**calendar_fixture, "stock_cd_list": ["00247"]}, mode="expected")["include_blank_stock_cd"]
+    assert normalize_order_params({**calendar_fixture, "stock_cd_list": ["00247"]}, mode="expected")["include_blank_stock_cd"]
     assert "date_to" not in q and "order_vendor_cd" not in q
     history_q = build_order_price_history_params(
         {
@@ -210,7 +210,8 @@ def test_full_month_forecast_and_blank_pending():
     with patch.object(pending, "execute_bound_select", return_value=pd.DataFrame()) as query:
         pending.get_expected_inbound_product_totals({**q, "_business_dates": ("20260914", "20260911", "20260910", "20260909")})
     sql = query.call_args.args[0]
-    assert "OR NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql
+    assert "NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in sql
+    assert pending._ORDER_STOCK_CD_SQL in sql
     assert " - D.Rd18_In_Quantity" in sql
     calendar = sources["business_dates"]
     for plan in (D(1), D(10), D(43)):
@@ -954,15 +955,17 @@ def test_streamlit_editor_widget():
     from streamlit.testing.v1 import AppTest
     script = '''
 import streamlit as st
-from tools.check_order_calculation_contract import fixture, assemble_result
+from tools.check_order_calculation_contract import fixture, get_order_calculation_result
+from unittest.mock import patch
 from app.db.mssql_client import set_current_company_id
 from app.ui.order_calculation_editor import render_actual_quantity_editor
 set_current_company_id(7)
 p, s = fixture()
-f = assemble_result(p, s)
-f['규격'] = ''
+with patch('app.services.order_calculation_service.get_current_company_id', return_value=7):
+    result = get_order_calculation_result(p, source_loader=lambda _params: s)
+f = result['df']
 st.session_state.setdefault('sims_export_tables', {'widget': f})
-st.session_state.setdefault('sims_tables', {'widget': f})
+st.session_state.setdefault('sims_tables', {'widget': result['df_display']})
 st.session_state['__sims_current_table_source_key'] = 'widget'
 render_actual_quantity_editor({'meta': {'table_key': 'widget'}}, {'table_key': 'widget'}, download_uid='widget')
 '''
@@ -979,6 +982,10 @@ render_actual_quantity_editor({'meta': {'table_key': 'widget'}}, {'table_key': '
     assert not config["실제 발주수량"].get("disabled", False)
     assert config["추천 발주수량"]["disabled"] and config["계산 발주수량"]["disabled"]
     assert all(config[col].get('pinned') for col in ('제품코드', '제품명', '규격'))
+    assert list(at.dataframe[0].value.columns[:3]) == ['제품코드', '제품명', '규격']
+    assert '수량조정단위' not in at.dataframe[0].value.columns
+    assert config['발주단위']['alignment'] == 'right'
+    assert config['출고빈도등급']['label'] == '출고빈도등급'
     assert config['실제 발주수량']['label'].endswith('발주수량')
     assert not at.selectbox
     first_id = proto.id
@@ -998,6 +1005,7 @@ render_actual_quantity_editor({'meta': {'table_key': 'widget'}}, {'table_key': '
     at.session_state['sims_tables'] = {'widget': exact[display_columns]}
     at.run()
     assert not at.exception and at.dataframe[0].value.shape == (284, 33)
+    assert len(at.session_state['sims_export_tables']['widget'].columns) == len(updated.columns)
     assert not at.selectbox
     many = pd.concat([updated] * 301, ignore_index=True)
     many['제품코드'] = [f'{i:05d}' for i in range(301)]
@@ -1195,9 +1203,12 @@ if __name__ == "__main__":
         shown = captured['df'].data
         for col in expected:
             if col != '실제 발주수량':
-                pd.testing.assert_series_equal(shown[col], expected[col])
+                if col == '월 기준 예상수량':
+                    assert shown[col].tolist() == [round(float(value), 2) for value in expected[col]]
+                else:
+                    pd.testing.assert_series_equal(shown[col], expected[col])
                 assert captured['column_config'][col]['label'] == ui._ORDER_VIEW_LABELS.get(col, col)
-        assert captured['column_config']['계산 발주수량']['type_config']['format'] == '%.2f'
+        assert captured['column_config']['계산 발주수량']['type_config']['format'] == '%,.2f'
         for col in ('발주단가', '발주금액(부가세포함)'):
             assert shown[col].isna().all()
             assert pd.api.types.is_numeric_dtype(shown[col])
@@ -1206,6 +1217,23 @@ if __name__ == "__main__":
         for col in ('월 기준 예상수량', '안전재고 기준수량'):
             assert pd.api.types.is_numeric_dtype(shown[col])
             assert captured['column_config'][col]['alignment'] == 'right'
+        assert captured['column_config']['월 기준 예상수량']['type_config']['format'] == '%,.2f'
+        forecast = pd.DataFrame({'월 기준 예상수량': [D('8.8742225'), D('54.4848484848')]})
+        for editing in (True, False):
+            forecast_view, forecast_config, _ = ui._order_table_display_config(forecast, editing=editing)
+            assert pd.api.types.is_numeric_dtype(forecast_view['월 기준 예상수량'])
+            assert forecast_view['월 기준 예상수량'].tolist() == [8.87, 54.48]
+            assert forecast_config['월 기준 예상수량']['type_config']['format'] == '%,.2f'
+            assert forecast_config['월 기준 예상수량']['alignment'] == 'right'
+        pd.testing.assert_frame_equal(forecast, pd.DataFrame({'월 기준 예상수량': [D('8.8742225'), D('54.4848484848')]}))
+        prior = display.copy()
+        prior.loc[prior.index[0], '월 기준 예상수량'] = None
+        prior_view, prior_config, _ = ui._order_table_display_config(prior, editing=False)
+        assert prior_config['월 기준 예상수량']['alignment'] == 'right'
+        assert prior_view['월 기준 예상수량'].iloc[0] == ''
+        null_editor, null_config, _ = ui._order_table_display_config(prior, editing=True)
+        assert null_editor['월 기준 예상수량'].iloc[0] == ''
+        assert null_config['월 기준 예상수량']['alignment'] == 'right'
         assert ui._ORDER_QUANTITY_COLORS['계산 발주수량'] in captured['df'].to_html()
         assert ui._ORDER_QUANTITY_COLORS['추천 발주수량'] in captured['df'].to_html()
         assert ui._ORDER_STOCK_COLOR in captured['df'].to_html()
@@ -1215,6 +1243,42 @@ if __name__ == "__main__":
         assert captured['height'] == height
         pd.testing.assert_frame_equal(full, saved)
     tests += (test_editor_shared_formatter,)
+    def test_order_display_only_styles():
+        from app.ui import order_calculation_editor as ui
+        columns = list(ui._ORDER_AFTER_OUTBOUND)
+        original = ['제품코드', '제품명', '규격', '계산 발주수량', '당월 정상출고수량',
+                    '최근3개월평균', *columns, '추천 발주수량', '실제 발주수량']
+        moved = ui._order_display_columns(original)
+        assert moved == ['제품코드', '제품명', '규격', '계산 발주수량', '당월 정상출고수량',
+                         *columns, '최근3개월평균', '추천 발주수량', '실제 발주수량']
+        assert original[5] == '최근3개월평균'
+        frame = pd.DataFrame({
+            '제품코드': [f'{i:05d}' for i in range(16)],
+            '추세판정': ['증가', '유지', '감소', '판정불가', '증가근거 부족'] + [''] * 11,
+            '계산 발주수량': [D('-1.5')] + [D('1')] * 15,
+            '추천 발주수량': [D('2')] * 16,
+            '실제 발주수량': [0] * 16,
+            '재고수량': [D('-2')] + [D('3')] * 15,
+            '발주단가': [D('-10')] + [D('10')] * 15,
+        })
+        original_frame = frame.copy(deep=True)
+        styles = ui._order_readonly_styles(frame, editing=True)
+        assert styles.loc[0, '계산 발주수량'] == 'background-color:#edf3fb;color:#dc2626;'
+        assert styles.loc[0, '재고수량'] == 'background-color:#f5f3e8;color:#dc2626;'
+        assert styles.loc[0, '발주단가'] == 'color:#dc2626;'
+        assert styles.loc[5, '제품코드'] == 'color:#1f2937;background-color:#F0F2F5;'
+        assert styles.loc[9, '제품코드'] == 'color:#1f2937;background-color:#F0F2F5;'
+        assert styles.loc[10, '제품코드'] == 'color:#1f2937;'
+        assert styles.loc[15, '제품코드'] == 'color:#1f2937;background-color:#F0F2F5;'
+        assert styles.loc[5, '계산 발주수량'] == 'background-color:#edf3fb;'
+        assert styles['실제 발주수량'].eq('').all()
+        assert styles['추세판정'].iloc[:5].tolist() == [
+            'color:#2563eb;', 'color:#dc2626;', 'color:#dc2626;', '', '',
+        ]
+        assert 'color: #dc2626' in ui._style_order_table(frame, editing=True).to_html()
+        assert ui._order_readonly_styles(frame, editing=False)['실제 발주수량'].iloc[5] == 'background-color:#d8f0e2;'
+        pd.testing.assert_frame_equal(frame, original_frame)
+    tests += (test_order_display_only_styles,)
     def test_order_dedicated_view_edit_history_and_full_source():
         from types import SimpleNamespace
         from app.ui import order_calculation_editor as ui
@@ -1225,6 +1289,7 @@ if __name__ == "__main__":
         full = pd.concat([result['df']] * 16267, ignore_index=True)
         full['제품코드'] = [f'{i:05d}' for i in range(16267)]
         display_columns = list(result['df_display'].columns)
+        editor_columns = ui._order_display_columns(display_columns)
         state = {'sims_export_tables': {'order': full}, 'sims_tables': {'order': full.head(300)[display_columns]},
                  '__sims_current_table_source_key': 'order'}
         views = []
@@ -1247,11 +1312,14 @@ if __name__ == "__main__":
                 state['__sims_table_render_path'] = 'live'
                 assert ui.render_actual_quantity_editor({}, {**result['meta'], 'table_key': 'order'}, download_uid='order')
                 assert len(edits) == (15, 284, 290, 300).index(count) + 1 and not views
-                assert len(edits[-1][0]) == count and list(edits[-1][0]) == display_columns
-                assert len(edits[-1][0].columns) == 33
-                assert edits[-1][1]['column_config']['출고빈도등급']['label'] == '등급'
-                assert edits[-1][1]['column_config']['추천 발주수량']['width'] == 86
+                assert len(edits[-1][0]) == count and list(edits[-1][0]) == editor_columns
+                assert len(edits[-1][0].columns) == len(display_columns) == 33
+                assert edits[-1][1]['column_config']['출고빈도등급']['label'] == '출고빈도등급'
+                assert edits[-1][1]['column_config']['추천 발주수량']['width'] == 100
                 assert all(edits[-1][1]['column_config'][c]['pinned'] for c in ('제품코드', '제품명', '규격'))
+                assert edits[-1][1]['column_config']['발주단위']['alignment'] == 'right'
+                assert '수량조정단위' not in edits[-1][0].columns
+                assert list(edits[-1][0].columns[:3]) == ['제품코드', '제품명', '규격']
             state['sims_export_tables']['order'] = full
             state['sims_tables']['order'] = full.head(300)[display_columns].copy()
             state['__sims_table_render_path'] = 'live'
@@ -1295,7 +1363,7 @@ if __name__ == "__main__":
             source_query.assert_not_called()
         assert len(state['sims_export_tables']['order']) == 16267
         assert list(state['sims_export_tables']['order'].columns) == list(full.columns)
-        assert list(edits[-1][0].columns) == display_columns and len(display_columns) == 33
+        assert list(edits[-1][0].columns) == editor_columns and len(display_columns) == 33
     tests += (test_order_dedicated_view_edit_history_and_full_source,)
     def test_compact_order_header_and_initial_values():
         from app.ui import chat_middleware as chat

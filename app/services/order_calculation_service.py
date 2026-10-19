@@ -498,7 +498,7 @@ def build_demand_params(source_params: dict, scope) -> dict:
         demand_params["dashboard_" + key + "_list"] = demand_params.pop(key + "_list", [])
     demand_params["product_ven_nm"] = source_params.get("maker_nm", "")
     demand_params["product_ven_cd"] = source_params.get("maker_cd", "")
-    demand_params["io_gu_list"] = [c for c in scope.io_gu_codes if len(str(c)) == 3 and "500" <= str(c) <= "599"]
+    demand_params["io_gu_list"] = list(resolve_saved_io_scope(scope.io_gu_codes).outbound_codes)
     if not demand_params["io_gu_list"]:
         raise ValueError("저장조건에 정상출고 수요 코드가 없습니다.")
     demand_params["_order_product_month_forecast"] = True
@@ -539,13 +539,15 @@ def build_order_price_history_params(source_params: dict, *, reference: date) ->
 
 
 def build_order_unit_history_params(source_params: dict, *, reference: date) -> dict:
-    """Read one three-calendar-month unit source; select recent evidence in Python."""
+    """Read company/product/vendor unit history across all stock locations."""
     history = build_pending_params(source_params)
     # Staff scope selects the products being calculated.  The historical
     # ordering unit remains valid regardless of which staff member entered an
     # earlier order, exactly like the price-history authority below.
     history.pop("order_staff_nm", None)
     history.pop("pharma_staff_nm", None)
+    for key in ("stock_cd", "stock_nm", "stock_cd_list", "stock_cds"):
+        history.pop(key, None)
     history.update({
         "date_from": (pd.Timestamp(reference) - pd.DateOffset(months=3)).strftime("%Y%m%d"),
         "date_to": reference.strftime("%Y%m%d"),

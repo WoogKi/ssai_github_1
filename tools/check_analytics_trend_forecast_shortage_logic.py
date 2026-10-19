@@ -503,12 +503,12 @@ def test_expected_inbound_sql_projection_contract() -> None:
 
     def fake_execute(sql: str, values: list[object]) -> pd.DataFrame:
         captured.append({"sql": sql, "values": values})
-        if values[-1:] == ["00009"] and len(values) == 5:
+        if values[-2:] == ["00009", "00009"] and len(values) == 7:
             return pd.DataFrame(columns=["제품코드", "입고예정수량", "_공백재고위치행수"])
         return pd.DataFrame({
             "제품코드": ["07886"],
             "입고예정수량": [5],
-            "_공백재고위치행수": [1 if "OR NULLIF" in sql else 0],
+            "_공백재고위치행수": [1 if "00001" in values else 0],
         })
 
     order_service.execute_bound_select = fake_execute
@@ -539,12 +539,13 @@ def test_expected_inbound_sql_projection_contract() -> None:
     full_values = list(captured[0]["values"])
     _assert("GROUP BY D.Rd18_Physic_Cd" in full_sql, "expected inbound must pre-aggregate by product")
     _assert("D.Rd18_Stock_Cd IN (?,?,?)" in full_sql, "stock scope must be pushed down")
-    _assert("OR NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" in full_sql, "00001 scope must include blank stock")
-    _assert("OR NULLIF(LTRIM(RTRIM(D.Rd18_Stock_Cd)), '') IS NULL" not in partial_sql, "scope without 00001 must exclude blank stock")
+    _assert(order_service._ORDER_STOCK_CD_SQL in full_sql, "full scope must resolve blank stock")
+    _assert(order_service._ORDER_STOCK_CD_SQL in partial_sql, "partial scope must resolve remark-directed blank stock")
     _assert(order_service._NORMAL_ORDER_PREDICATE in full_sql, "negative return exclusion changed")
     _assert("IN ('1', '2')" in full_sql, "expected inbound status scope changed")
     _assert("dbo.WB_Holiday" not in full_sql, "ERP holiday-table dependency returned")
-    _assert(full_values[:4] == ["20260908", "20260907", "20260904", "20260903"], "business-date binding changed")
+    _assert(full_values[:3] == ["00001", "00008", "00009"], "saved remark-location scope changed")
+    _assert(full_values[3:7] == ["20260908", "20260907", "20260904", "20260903"], "business-date binding changed")
     _assert("ABS(" not in full_sql.upper() and "CLIP" not in full_sql.upper(), "quantity clamp/absolute conversion added")
     _assert(full_values[-3:] == ["00001", "00008", "00009"], "leading-zero stock scope changed")
     _assert(full_result.loc[0, "제품코드"] == "07886", "blank-stock fixture product changed")
@@ -586,6 +587,7 @@ def test_company_default_stock_scope_authority() -> None:
     _assert(partial["is_full_default_scope"] is False, "partial scope was treated as full")
     _assert(explicit_full["is_full_default_scope"] is True, "explicit full selection was lost")
     _assert(full["selected_count"] == 3 and full["default_count"] == 3, "scope counts changed")
+    _assert(full["default_codes"] == ["00001", "00008", "00009"], "saved location codes were not retained for KPI matching")
 
 
 def test_order_large_product_scope_uses_full_authority_then_exact_filter() -> None:

@@ -5025,7 +5025,7 @@ def _render_partial_download_source_notice(
     if source_status != "display_only_partial":
         return False
     st.warning("전체 원본을 찾지 못했습니다.")
-    st.caption(f"CSV/EXCEL은 현재 화면 데이터 {download_rows:,}건만 포함합니다.")
+    st.caption("전체 원본을 확인할 때까지 CSV/EXCEL 다운로드를 제공하지 않습니다.")
     st.caption(f"전체 예상 결과는 {expected_rows:,}건입니다.")
     return True
 
@@ -5979,6 +5979,10 @@ def _get_sims_excel_eager_max_cells() -> int:
 # - 작은 표: 기존처럼 CSV/EXCEL/LLM 버튼 즉시 표시
 # - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
 # - [Excel 다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
+def _download_prompt_columns(download_df: Any, display_df: pd.DataFrame) -> pd.Index:
+    return download_df.columns if isinstance(download_df, pd.DataFrame) else display_df.columns
+
+
 def _render_sims_result_actions_lazy(
     *,
     key_suffix: str,
@@ -5993,6 +5997,7 @@ def _render_sims_result_actions_lazy(
     clicked_action: str = "",
     clicked_meta: Optional[Dict[str, Any]] = None,
     download_label_prefix: str = "",
+    source_status: str = "",
 ) -> None:    
 
     """
@@ -6018,7 +6023,11 @@ def _render_sims_result_actions_lazy(
     if not isinstance(download_df, pd.DataFrame) or download_df.empty:
         c1, c2, c3 = st.columns(3)
         with c1:
-            st.caption("다운로드할 표가 없습니다.")
+            st.caption(
+                "전체 다운로드 원본을 확인할 수 없습니다. 조회를 다시 실행해 주세요."
+                if source_status in {"partial_unverified", "display_only_partial", "column_projection_unavailable"}
+                else "다운로드할 표가 없습니다."
+            )
         with c3:
             run_llm = st.button(
                 "LLM 분석",
@@ -10313,10 +10322,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 elif expected_history_columns > len(data.columns):
                     raw_download_df = None
                     download_source_result["source_status"] = "column_projection_unavailable"
+                elif expected_rows_initial > display_rows_initial:
+                    raw_download_df = None
+                    download_source_result["source_status"] = "display_only_partial"
                 else:
                     raw_download_df = data
                     download_source_result["source_name"] = "history_display_only"
-                    download_source_result["source_status"] = "display_only_partial"
+                    download_source_result["source_status"] = "complete_display"
                 defer_full_export = True
                 file_generation_status = "deferred"
             else:
@@ -10980,7 +10992,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     display_rows=display_rows_for_download,
                     download_rows=download_rows,
                     expected_rows=expected_rows,
-                    columns=raw_download_df.columns,
+                    columns=_download_prompt_columns(raw_download_df, data),
                 )
 
                 _render_sims_result_actions_lazy(
@@ -11000,6 +11012,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                         if download_source_status == "display_only_partial"
                         else ""
                     ),
+                    source_status=download_source_status,
                 )
 
             except Exception:

@@ -684,8 +684,8 @@ def _push_codes_result(
     source: str,
     extra_meta: Dict[str, Any] | None = None,
 ) -> None:
-    df_full = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
     df_display_all = df_display.copy() if isinstance(df_display, pd.DataFrame) else pd.DataFrame()
+    df_full = df_display_all
 
     total = int(len(df_full)) if not df_full.empty else int(len(df_display_all))
     show_n = min(total, 500)
