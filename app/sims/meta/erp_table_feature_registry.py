@@ -241,14 +241,14 @@ RDDBC170_RDDBC180 = ErpTableFeatureSpec(
         ErpFilterSpec("expected_vendor_nm", "예상매출처명", "Rd03_Ven_Nm", "text", ("예상매출처",)),
         ErpFilterSpec("real_vendor_cd", "실납처코드", "Rd18_Real_Ven_Cd", "code"),
         ErpFilterSpec("real_vendor_nm", "실납처명", "Rd03_Ven_Nm", "text", ("실납처",)),
-        ErpFilterSpec("order_staff_nm", "발주담당자", "발주조회: Rddbc170.Rd17_DamDang -> Rddbc060.Rd06_User_Nm; 발주 계산: 최종 발주처 영업사원", "text", ("발주담당",)),
-        ErpFilterSpec("pharma_staff_nm", "제약담당자", "Rddbc040.Rd04_Ven_Cd -> Rddbc030.Rd03_Sales_Man -> Rddbc060.Rd06_User_Nm", "text", ("제약담당",)),
+        ErpFilterSpec("order_staff_nm", "발주담당자", "발주조회: Rddbc170.Rd17_DamDang -> Rddbc060.Rd06_User_Nm; 발주 계산: 최종 발주처 영업사원", "text", ("발주담당자명", "발주담당")),
+        ErpFilterSpec("pharma_staff_nm", "제약담당자", "Rddbc040.Rd04_Ven_Cd -> Rddbc030.Rd03_Sales_Man -> Rddbc060.Rd06_User_Nm", "text", ("제약담당자명", "제약담당")),
         ErpFilterSpec("has_outstanding", "미입고 존재", "calculated outstanding quantity", "bool", ("미입고",)),
     ),
     actions=(
         ErpTableActionSpec(
             action="발주조회",
-            aliases=("발주 조회", "발주 보여줘", "발주 내역 보여줘", "발주내역 조회", "발주 내역 조회", "최근 발주내역 조회", "최근 발주 조회", "오늘 발주 조회", "이번주 발주 조회", "입고중 발주 조회", "미입고 발주 조회", "발주상태", "발주내역", "발주 내역", "발주현황", "발주 현황"),
+            aliases=("발주 조회", "발주 보여줘", "발주 내역 보여줘", "발주내역 조회", "발주 내역 조회", "최근 발주내역 조회", "최근 발주 조회", "오늘 발주 조회", "이번주 발주 조회", "입고중 발주 조회", "미입고 발주 조회", "발주상태", "발주내역", "발주 내역", "발주현황", "발주 현황", "발주"),
             mode="order",
             service_function="app.services.rddbc170_rddbc180_order_service.get_order_result",
             export_function="app.services.rddbc170_rddbc180_order_service.get_order_export_df",
@@ -349,7 +349,11 @@ def match_action_in_text(text: Any) -> tuple[ErpTableFeatureSpec, ErpTableAction
     for feature, action_spec in iter_action_specs():
         for label in (action_spec.action, *action_spec.aliases):
             label_compact = re.sub(r"\s+", "", label)
-            if label_compact and label_compact in compact:
+            if label_compact == "발주":
+                matched = re.search(r"(?<![0-9A-Za-z가-힣])발주(?=$|\s|[?!.])", normalized)
+            else:
+                matched = label_compact and label_compact in compact
+            if matched:
                 candidates.append((len(label_compact), feature, action_spec))
     if not candidates:
         return None

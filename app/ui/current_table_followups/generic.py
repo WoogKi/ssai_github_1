@@ -617,6 +617,38 @@ def _reorder_numeric_filter_columns(out: pd.DataFrame, filter_col: str) -> pd.Da
     return out.loc[:, front + rest]
 
 
+def _explicit_common_filter_conditions(df: pd.DataFrame, query: str) -> list[str]:
+    """Identify separate labelled source columns before a single-column filter runs."""
+    aliases: dict[str, str] = {}
+    for col in [str(value) for value in df.columns]:
+        if col in _COMMON_FILTER_SKIP_COLUMNS:
+            continue
+        for alias in _column_filter_aliases(col):
+            aliases.setdefault(alias, col)
+    if not aliases:
+        return []
+
+    pattern = re.compile(
+        r"(?<![가-힣A-Za-z0-9_])(?:"
+        + "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+        + r")(?=\s|[:=]|$)"
+    )
+    matches = list(pattern.finditer(str(query or "")))
+    conditions: list[str] = []
+    seen_columns: set[str] = set()
+    for index, match in enumerate(matches):
+        col = aliases[match.group(0)]
+        if col in seen_columns:
+            continue
+        tail_end = matches[index + 1].start() if index + 1 < len(matches) else len(query)
+        value = _strip_common_filter_value(query[match.end():tail_end])
+        if not value or value in {"집계", "요약", "분석", "현황", "조회", "기준"}:
+            continue
+        conditions.append(f"{match.group(0)} {value}")
+        seen_columns.add(col)
+    return conditions
+
+
 def _find_common_column_filter(df: pd.DataFrame, query: str) -> tuple[str, str]:
     """
     '현재표 <컬럼명> <값> 상세히 보여줘' 형태를 찾아
@@ -1422,7 +1454,9 @@ def handle_common_column_group_followup(
         return False
 
     t = str(query or "").strip()
-    group_col = _find_common_group_column(df, t, source_action)
+    group_col = str(helpers.get("_requested_group_column") or "") or _find_common_group_column(df, t, source_action)
+    if group_col and group_col not in df.columns:
+        return False
     if not group_col:
         return False
 
@@ -1544,6 +1578,21 @@ def handle_common_column_filter_followup(
     push_notice = helpers.get("push_notice")
     if not callable(push_table):
         return False
+
+    conditions = _explicit_common_filter_conditions(df, t)
+    if len(conditions) > 1 and callable(push_notice):
+        return bool(push_notice(
+            title="현재표 조회조건 확인",
+            action="현재표 조회조건 확인",
+            message=(
+                f"현재표에서 {', '.join(conditions)} 조건을 함께 적용하는 조회는 지원하지 않습니다. "
+                "일부 조건만 적용한 조회는 실행하지 않았습니다. 조건을 하나씩 지정해 주세요."
+            ),
+            query_summary=f"현재표 / 복합 조건 미지원 / 원본 {len(df):,}건 유지",
+            source_query=t,
+            extra_meta={"result_status": "input_required", "execution_status": "input_required",
+                        "source_call_count": 0, "unsupported_conditions": conditions},
+        ))
 
     # 0) 조건 없는 숫자 순위: 현재표 배정부족예상금액 TOP 20 / low 10
     rank_direction, rank_limit = parse_current_table_rank_request(t, default_limit=top_n)

@@ -1744,6 +1744,20 @@ def _extract_named_text(text: str, labels: tuple[str, ...]) -> Optional[str]:
     return None
 
 
+def normalize_current_stock_location_label(text: str) -> str:
+    """Normalize a known stock-location label typo only in current-stock requests."""
+    if "현재고" not in text:
+        return text
+    def replace(match: re.Match[str]) -> str:
+        if re.search(r"(?:제품명|품목명|상품명)\s*[:：=]?\s*$", text[:match.start()]):
+            return match.group(0)
+        return "재고위치"
+    return re.sub(
+        r"(?<![0-9A-Za-z가-힣])제고위치(?=(?:코드|명)?(?:\s|[:：=]|$))",
+        replace, text,
+    )
+
+
 def _trim_io_named_value_at_next_label(value: Optional[str]) -> str:
     """Keep one labelled IO value from absorbing the next labelled condition."""
     raw = clean_text(value)
@@ -2882,12 +2896,21 @@ def resolve_stock_location_codes(
         return [], "outside_registered_locations", allowed
 
     def normalize(value: str) -> str:
-        return re.sub(r"\s+", "", re.sub(r"^[^\w]+", "", clean_text(value))).casefold()
+        cleaned = clean_text(value)
+        wrapped = re.fullmatch(r"\(([^()]*)\)", cleaned)
+        if wrapped:
+            cleaned = wrapped.group(1).strip()
+        return re.sub(r"\s+", "", re.sub(r"^[^\w]+", "", cleaned)).casefold()
 
     for name in names:
         requested = normalize(name)
         exact = [code for code in allowed if requested and normalize(location_names.get(code, "")) == requested]
-        matches = exact or [
+        raw_requested = re.sub(r"\s+", "", re.sub(r"^[^\w]+", "", clean_text(name))).casefold()
+        raw_matches = [
+            code for code in allowed
+            if raw_requested and raw_requested in normalize(location_names.get(code, ""))
+        ] if raw_requested != requested else []
+        matches = exact or raw_matches or [
             code for code in allowed
             if requested and requested in normalize(location_names.get(code, ""))
         ]
@@ -3518,7 +3541,7 @@ def _apply_transaction_document_validation_intent(
 # 입출고/재고 관련 신호가 있는지 보고, 관련 신호가 있으면 extract_params()로 파싱한 뒤
 # 입출고/재고 NLQ 의도를 판정한다.
 def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str, Any]]:
-    raw = _split_compact_relative_day_action(_norm(text))
+    raw = normalize_current_stock_location_label(_split_compact_relative_day_action(_norm(text)))
     if not raw:
         return None
 
@@ -3601,6 +3624,36 @@ def resolve_io_nlq(text: str, *, today: date | None = None) -> Optional[Dict[str
             entity_text = strip_product_di_semantic_terms(entity_text)
         params = extract_params(entity_text, today=today)
         params.update(manager_filters)
+        product_name = clean_text(params.get("physic_nm"))
+        next_condition = re.search(
+            r"\s+(?=(?:등록자명|등록자|수정자명|수정자)(?:\s|[:：=]))",
+            product_name,
+        )
+        if next_condition:
+            product_name = clean_text(product_name[:next_condition.start()])
+            params["physic_nm"] = product_name
+        for key, labels in (
+            ("add_nm", ("등록자명", "등록자")),
+            ("mod_nm", ("수정자명", "수정자")),
+        ):
+            value = clean_text(params.get(key))
+            if value and product_name and any(
+                re.match(rf"{label}\s+{re.escape(value)}(?:\s|$)", product_name)
+                for label in labels
+            ):
+                params.pop(key, None)
+        unsupported_dates = []
+        for label in ("등록일자", "등록일", "수정일자", "수정일"):
+            match = re.search(
+                rf"(?<![0-9A-Za-z가-힣]){label}\s*[:=]?\s*(\d{{4}}(?:[-./]?\d{{2}}){{0,2}})(?!\d)",
+                entity_text,
+            )
+            if match and not re.search(
+                rf"(?:제품명|품목명|상품명)\s*[:=]?\s*{label}(?:\s|$)", entity_text
+            ):
+                unsupported_dates.append(f"{label} {match.group(1)}")
+        if unsupported_dates:
+            params["_product_information_unsupported_conditions"] = unsupported_dates
         from app.services.erp_table_nlq import _extract_name, _extract_code
         from app.sims.meta.erp_table_feature_registry import RDDBC230, filter_labels
         for key in ("product_keyword", "maker_nm", "product_group_nm", "product_di_nm", "product_class_nm"):

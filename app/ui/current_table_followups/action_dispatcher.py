@@ -428,7 +428,7 @@ _CURRENT_TABLE_DIMENSION_SPECS: tuple[tuple[str, str, tuple[str, ...], tuple[str
     ("product", "제품", ("제품별", "품목별"), ("제품명", "품목명", "상품명", "제품코드", "품목코드", "상품코드")),
     ("manufacturer", "제조사", ("제조사별", "제약사별", "제조사명별", "제약사명별", "제조사분석"), ("제조사명", "제조사", "제약사명", "제약사")),
     ("purchase_vendor", "매입처", ("매입처별", "매입처명별"), ("매입처명", "매입처", "매입처코드")),
-    ("order_vendor", "발주처", ("발주처별", "발주처명별"), ("발주처명", "발주처", "발주처코드")),
+    ("order_vendor", "발주처", ("발주처별", "발주처명별", "발주거래처별", "발주거래처명별"), ("발주거래처명", "발주거래처", "발주처명", "발주처", "발주처코드")),
     ("order_vendor_staff", "발주처 담당자", ("발주처담당자별", "발주처담당자"), ("발주처 담당자",)),
     ("manufacturer_staff", "제약사 담당자", ("제약사담당자별", "제약사담당자"), ("제약사 담당자",)),
     ("stock_apply", "재고적용처", ("재고적용처별", "재고적용처명별"), ("재고적용처명", "재고적용처", "재고적용처코드")),
@@ -2276,6 +2276,10 @@ def handle_current_table_followup_by_action(
 
     dispatch_helpers = dict(helpers)
     dispatch_helpers["_requested_grouping"] = capability["requested_grouping"]
+    if kind == "order" and requested_grouping == "order_vendor" and capability["status"] == "success":
+        dispatch_helpers["_requested_group_column"] = _resolve_current_table_dimension_column(
+            dispatch_df, grouping="order_vendor", kind=kind, query=query,
+        )
     dispatch_helpers["_is_deterministic_request"] = (
         classify_current_table_followup_intent(query) == "dataframe_table"
     )

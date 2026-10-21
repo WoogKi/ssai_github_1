@@ -6600,6 +6600,7 @@ def _try_handle_io_nlq(
             _extract_unlabeled_entity_phrase,
             has_unconsumed_detail_condition,
             has_current_stock_executable_structured_filter,
+            normalize_current_stock_location_label,
             remove_outbound_frequency_phrase,
             remove_product_inventory_grade_phrases,
             resolve_io_nlq,
@@ -6687,7 +6688,9 @@ def _try_handle_io_nlq(
                 )
                 return True
 
-    txt_for_io = _append_lookup_verb_for_io(_normalize_io_action_spacing(txt))
+    txt_for_io = normalize_current_stock_location_label(
+        _append_lookup_verb_for_io(_normalize_io_action_spacing(txt))
+    )
     if not isinstance(parsed, dict):
 
         parsed = resolve_io_nlq(txt_for_io)
@@ -6722,6 +6725,26 @@ def _try_handle_io_nlq(
     params = dict(parsed.get("params") or {})
     if not action:
         return False
+    unsupported_order_conditions = params.pop("_unsupported_order_conditions", [])
+    if action == "발주조회" and unsupported_order_conditions:
+        message = (
+            f"발주조회는 다음 조건을 지원하지 않습니다: {', '.join(unsupported_order_conditions)}. "
+            "해당 조건을 제외한 전체 조회는 실행하지 않았습니다. "
+            "지원되는 조건으로 다시 질문해 주세요."
+        )
+        push_sims_result_to_chat({
+            "final": True, "type": "text", "title": "SIMS 조회조건 확인",
+            "action": action, "params": params, "data": message, "message": message,
+            "meta": {"nlq": True, "nlq_query": txt, "result_status": "input_required",
+                     "execution_status": "input_required", "unsupported_conditions": unsupported_order_conditions,
+                     "service_call_skipped": True, "source_call_count": 0,
+                     "row_count": 0, "row_count_total": 0, "_force_push": True,
+                     "_nlq_nonce": str(uuid.uuid4())},
+        }, action)
+        _trace("finish", trace_action=action, trace_params=params,
+               result_status="input_required", rows=0, source_stage="unsupported_condition",
+               source_call_count=0)
+        return True
     entity_txt_for_io = txt_for_io
     trailing_subject = ""
     if action in {"현재고 조회", "제품재고현황 조회"}:

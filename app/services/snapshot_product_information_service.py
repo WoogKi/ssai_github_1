@@ -328,6 +328,36 @@ def _get_snapshot_product_information_result(
             message="회사 범위를 확인할 수 없어 제품정보를 조회하지 않았습니다.",
             snapshot_read_call_count=0,
         )
+    unsupported = list(qparams.get("_product_information_unsupported_conditions") or ())
+    for key, label in (
+        ("add_nm", "등록자"), ("mod_nm", "수정자"),
+        ("product_add_user_nm", "등록자"), ("product_mod_user_nm", "수정자"),
+        ("product_add_date_from", "등록일"), ("product_add_date_to", "등록일"),
+        ("product_mod_date_from", "수정일"), ("product_mod_date_to", "수정일"),
+        ("product_unit_price", "제품단가"),
+        ("product_final_price_date", "최종약가일"),
+        ("date_from", "조회기간 시작"), ("date_to", "조회기간 종료"),
+        ("month_from", "조회기간 시작"), ("month_to", "조회기간 종료"),
+    ):
+        value = _clean(qparams.get(key))
+        if value:
+            condition = f"{label} {value}"
+            if condition not in unsupported:
+                unsupported.append(condition)
+    if unsupported:
+        payload = _empty_or_error_payload(
+            params=qparams,
+            status="input_required",
+            reason="unsupported_product_information_conditions",
+            message=(
+                f"제품정보 조회는 다음 조건을 지원하지 않습니다: {', '.join(unsupported)}. "
+                "해당 조건을 제외하고 다시 질문해 주세요."
+            ),
+            snapshot_read_call_count=0,
+            source_call_count=0,
+        )
+        payload["meta"]["unsupported_conditions"] = unsupported
+        return payload
     if qparams.get("_product_manager_condition_invalid"):
         return _empty_or_error_payload(
             params=qparams,

@@ -2886,6 +2886,8 @@ def _sims_ctx_find_col(
     exact: tuple[str, ...] = (),
     include_any: tuple[str, ...] = (),
     exclude_any: tuple[str, ...] = (),
+    numeric_only: bool = False,
+    exact_only: bool = False,
 ) -> str | None:
     if not isinstance(df, pd.DataFrame) or df.empty:
         return None
@@ -2894,8 +2896,11 @@ def _sims_ctx_find_col(
 
     for target in exact:
         for c in cols:
-            if c.strip() == target:
+            if c.strip() == target and (not numeric_only or _sims_ctx_has_numeric_value(df[c])):
                 return c
+
+    if exact_only:
+        return None
 
     for c in cols:
         s = c.strip()
@@ -2903,9 +2908,44 @@ def _sims_ctx_find_col(
             continue
         if exclude_any and any(w in s for w in exclude_any):
             continue
+        if numeric_only and not _sims_ctx_has_numeric_value(df[c]):
+            continue
         return c
 
     return None
+
+
+def _sims_ctx_has_numeric_value(values: pd.Series) -> bool:
+    if pd.api.types.is_numeric_dtype(values):
+        return bool(values.notna().any())
+    parsed = pd.to_numeric(
+        values.astype(str).str.replace(",", "", regex=False)
+        .str.replace("원", "", regex=False).str.replace("개", "", regex=False).str.strip(),
+        errors="coerce",
+    )
+    return bool(parsed.notna().any())
+
+
+def _sims_ctx_find_amount_col(df: pd.DataFrame, priority: tuple[str, ...] = ()) -> str | None:
+    non_amount_parts = (
+        "순번", "코드", "ID", "건수", "처수", "제품수", "품목수", "행수", "개수",
+        "월수", "수량", "단가", "비율", "증감률", "율", "세액", "처명", "구분", "상태",
+    )
+    eligible = [
+        col for col in df.columns
+        if not any(part in str(col).strip() for part in non_amount_parts)
+        and any(part in str(col).strip() for part in ("금액", "가액", "매출", "매입", "손익", "기여"))
+    ]
+    if not eligible:
+        return None
+    amounts = df.loc[:, eligible]
+    return _sims_ctx_find_col(
+        amounts,
+        exact=(*priority, "합계금액", "총매출액", "매출합계", "매출금액",
+               "출고금액", "입고금액", "공급가액", "입고공급가액", "출고공급가액"),
+        include_any=("금액", "가액", "매출", "매입", "손익", "기여"),
+        numeric_only=True,
+    )
 
 
 def _sims_ctx_num_series(df: pd.DataFrame, col: str | None) -> pd.Series:
@@ -3228,14 +3268,7 @@ def _build_sims_sales_time_profile(df: pd.DataFrame, terms: dict | None = None) 
         exclude_any=("등록", "수정", "보험", "유효", "마감"),
     )
 
-    amount_col = _sims_ctx_find_col(df, exact=amount_priority) if amount_priority else None
-    if not amount_col:
-        amount_col = _sims_ctx_find_col(
-            df,
-            exact=("합계금액", "매출금액", "출고금액", "입고금액", "공급가액", "입고공급가액", "출고공급가액"),
-            include_any=("합계금액", "매출", "출고금액", "입고금액", "공급가액"),
-            exclude_any=("순번", "코드", "ID", "건수", "월수", "단가", "율", "세액"),
-        )
+    amount_col = _sims_ctx_find_amount_col(df, amount_priority)
 
     qty_col = _sims_ctx_find_col(
         df,
@@ -3393,14 +3426,7 @@ def _build_sims_sales_group_profile(df: pd.DataFrame, terms: dict | None = None)
     vendor_label = str(terms.get("vendor_label") or "거래처")
     amount_priority = tuple(str(x) for x in (terms.get("amount_priority") or ()) if str(x or "").strip())
 
-    amount_col = _sims_ctx_find_col(df, exact=amount_priority) if amount_priority else None
-    if not amount_col:
-        amount_col = _sims_ctx_find_col(
-            df,
-            exact=("합계금액", "매출금액", "출고금액", "입고금액", "공급가액", "입고공급가액", "출고공급가액"),
-            include_any=("합계금액", "매출", "출고금액", "입고금액", "공급가액"),
-            exclude_any=("순번", "코드", "ID", "건수", "월수", "단가", "율", "세액"),
-        )
+    amount_col = _sims_ctx_find_amount_col(df, amount_priority)
     qty_col = _sims_ctx_find_col(
         df,
         exact=("수량", "출고수량", "입고수량", "매출수량"),
@@ -3437,7 +3463,7 @@ def _build_sims_sales_group_profile(df: pd.DataFrame, terms: dict | None = None)
     work["_qty"] = _sims_ctx_num_series(df, qty_col)
 
     def _group_top(group_col: str | None, label: str, sort_by: str) -> list[dict]:
-        if not group_col or group_col not in df.columns:
+        if not group_col or group_col not in df.columns or (sort_by == "amount" and not amount_col):
             return []
 
         tmp = work.copy()
@@ -3447,15 +3473,10 @@ def _build_sims_sales_group_profile(df: pd.DataFrame, terms: dict | None = None)
         if tmp.empty:
             return []
 
-        grouped = (
-            tmp.groupby(label, dropna=False)
-            .agg(
-                건수=("_amount", "size"),
-                **{qty_label: ("_qty", "sum")},
-                **{amount_label: ("_amount", "sum")},
-            )
-            .reset_index()
-        )
+        aggregations = {"건수": ("_qty", "size"), qty_label: ("_qty", "sum")}
+        if amount_col:
+            aggregations[amount_label] = ("_amount", "sum")
+        grouped = tmp.groupby(label, dropna=False).agg(**aggregations).reset_index()
 
         sort_col = qty_label if sort_by == "qty" else amount_label
         grouped = grouped.sort_values(sort_col, ascending=False)

@@ -27,7 +27,7 @@ _ACTION_WORDS = (
     "발주 내역 보여줘", "발주 보여줘", "발주내역", "발주 내역", "발주현황", "발주 현황",
     "최근 발주내역 조회", "최근 발주 조회", "발주내역 조회", "발주 내역 조회", "오늘 발주 조회", "이번주 발주 조회",
     "입고중 발주 조회", "미입고 발주 조회", "발주조회", "발주 조회",
-    "발주상태",
+    "발주상태", "발주",
     "입고예정 제품 조회", "오늘 입고예정 조회", "미입고 예정 조회", "입고중 제품 조회",
     "입고예정 자료 조회", "입고 예정 자료 조회", "입고예정 자료", "입고 예정 자료",
     "입고예정자료 조회", "입고예정자료조회",
@@ -85,7 +85,7 @@ def _extract_name(
     label_pattern = "|".join(
         rf"(?<![0-9A-Za-z가-힣]){re.escape(label)}(?!코드|명|키워드|그룹|구분|분류|단가|등록|수정|별)"
         if label in generic_labels else re.escape(label)
-        for label in labels
+        for label in sorted(set(labels), key=len, reverse=True)
     )
     match = re.search(rf"(?:{label_pattern})\s*[:=]?\s*(.+?){_VALUE_BOUNDARY}", text)
     if not match:
@@ -100,7 +100,10 @@ def _extract_name(
         )
         value = value[:min(action_starts, default=len(value))]
     for action_word in _ACTION_WORDS:
-        value = value.replace(action_word, " ")
+        if action_word == "발주":
+            value = re.sub(r"(?<![0-9A-Za-z가-힣])발주(?=\s|$)", " ", value)
+        else:
+            value = value.replace(action_word, " ")
     value = re.sub(r"\s+(?:조회|검색|확인|보여줘|알려줘)\s*$", "", value)
     # The shared period authority removes standalone dates while protecting
     # date-shaped substrings embedded in a registered business name.
@@ -314,7 +317,10 @@ def _extract_unlabeled_order_vendor(
     candidate = strip_nlq_period_tokens_for_entity_residual(raw)
     action_words = (*_ACTION_WORDS, action_spec.action, *action_spec.aliases)
     for word in sorted(dict.fromkeys(action_words), key=len, reverse=True):
-        candidate = candidate.replace(word, " ")
+        if word == "발주":
+            candidate = re.sub(r"(?<![0-9A-Za-z가-힣])발주(?=\s|$)", " ", candidate)
+        else:
+            candidate = candidate.replace(word, " ")
     for spec in feature.filters:
         for label in sorted((spec.label, *spec.aliases), key=len, reverse=True):
             candidate = candidate.replace(label, " ")
@@ -364,6 +370,17 @@ def _resolve_order_nlq(
     today: date,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"mode": action_spec.mode, "_display_context": "chat"}
+    if action_spec.mode == "order":
+        unsupported = []
+        for labels in (("등록자명", "등록자"), ("수정자명", "수정자")):
+            label = next((item for item in labels if re.search(
+                rf"(?<![0-9A-Za-z가-힣]){re.escape(item)}(?=\s|[:=]|$)", raw
+            )), "")
+            if label:
+                value = _extract_name(raw, labels, preserve_period_tokens=True, stop_at_action=True)
+                unsupported.append(f"{label} {value}".strip())
+        if unsupported:
+            params["_unsupported_order_conditions"] = unsupported
     params.update(_extract_registered_roles(raw, feature, (
         ("order_vendor_cd", "order_vendor_nm"),
         ("cost_apply_cd", "cost_apply_nm"),
