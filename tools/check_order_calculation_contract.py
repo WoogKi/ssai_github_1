@@ -1205,6 +1205,12 @@ if __name__ == "__main__":
             if col != '실제 발주수량':
                 if col == '월 기준 예상수량':
                     assert shown[col].tolist() == [round(float(value), 2) for value in expected[col]]
+                elif col == '발주단위':
+                    pd.testing.assert_series_equal(
+                        pd.to_numeric(shown[col].replace('', pd.NA), errors='coerce'),
+                        pd.to_numeric(expected[col].replace('', pd.NA), errors='coerce'),
+                        check_dtype=False,
+                    )
                 else:
                     pd.testing.assert_series_equal(shown[col], expected[col])
                 assert captured['column_config'][col]['label'] == ui._ORDER_VIEW_LABELS.get(col, col)

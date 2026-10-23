@@ -792,8 +792,11 @@ def load_sources(params: dict) -> dict:
             source_params.pop(field + "_nm", None)
     def master(query):
         return call('master', _master, query)
+    snapshot_request = {key: value for key, value in source_request.items()
+                        if key not in ('date_from', 'date_to', 'month_from', 'month_to')}
+    snapshot_request['evaluation_month'] = reference.strftime('%Y%m')
     snapshot = call('snapshot_master', get_snapshot_product_information_result,
-        {**source_request, "evaluation_month": reference.strftime("%Y%m")}, master_loader=master,
+        snapshot_request, master_loader=master,
         apply_viewer_projection=False, materialize_presentation=False, input_rows=0)
     if snapshot.get("meta", {}).get("snapshot_status") != "ready":
         return {"snapshot": snapshot}

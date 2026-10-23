@@ -43,6 +43,13 @@ _ORDER_STOCK_COLUMNS = ("입고예정수량", "재고수량", "당월 정상출�
 
 def _order_table_display_config(source: pd.DataFrame, *, editing: bool) -> tuple[pd.DataFrame, dict, int]:
     view = prepare_sims_table_display_df(source, action_name="발주 계산")
+    if "발주단위" in view:
+        units = view["발주단위"].replace("", pd.NA)
+        numeric_units = pd.to_numeric(units, errors="coerce")
+        view["발주단위"] = (
+            numeric_units if numeric_units.notna().sum() == units.notna().sum()
+            else units.astype("string").fillna("")
+        )
     forecast_column = "월 기준 예상수량"
     if forecast_column in view:
         numeric = pd.to_numeric(view[forecast_column], errors="coerce")
