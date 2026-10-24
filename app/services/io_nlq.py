@@ -196,6 +196,27 @@ def _has_any(text: str, words: tuple[str, ...]) -> bool:
     return any(w in text for w in words)
 
 
+_EXPLICIT_COMPACT_DATE_RANGE_RE = re.compile(
+    r"(?<![가-힣A-Za-z0-9])((?:19|20)\d{6})\s*[~-]\s*([1-9]\d{7})(?![가-힣A-Za-z0-9])"
+)
+
+
+def _date_from_yyyymmdd(value: str) -> date | None:
+    if not re.fullmatch(r"\d{8}", value):
+        return None
+    try:
+        return date(int(value[:4]), int(value[4:6]), int(value[6:8]))
+    except ValueError:
+        return None
+
+
+def _valid_compact_date_range(text: str) -> re.Match[str] | None:
+    for match in _EXPLICIT_COMPACT_DATE_RANGE_RE.finditer(text):
+        if all(_date_from_yyyymmdd(value) for value in match.groups()):
+            return match
+    return None
+
+
 def _extract_date_range(text: str) -> Dict[str, str]:
     """
     일자 조건 추출.
@@ -240,9 +261,9 @@ def _extract_date_range(text: str) -> Dict[str, str]:
         return out
 
     # YYYYMMDD ~ YYYYMMDD
-    pairs = re.findall(r"((?:19|20)\d{6})\s*[~\-]\s*((?:19|20)\d{6})", t)
-    if pairs:
-        out["date_from"], out["date_to"] = pairs[0]
+    compact_range = _valid_compact_date_range(t)
+    if compact_range:
+        out["date_from"], out["date_to"] = compact_range.groups()
         return out
 
     # 단일 formatted date 2개 이상
@@ -284,6 +305,12 @@ def _extract_date_range(text: str) -> Dict[str, str]:
         out["date_to"] = singles[0]
 
     return out
+
+
+_EXPLICIT_COMPACT_MONTH_RANGE_RE = re.compile(
+    r"(?<![가-힣A-Za-z0-9])((?:19|20)\d{2}(?:0[1-9]|1[0-2]))"
+    r"\s*[~-]\s*([1-9]\d{3}(?:0[1-9]|1[0-2]))(?![가-힣A-Za-z0-9])"
+)
 
 
 def _extract_month_range(text: str) -> Dict[str, str]:
@@ -350,9 +377,9 @@ def _extract_month_range(text: str) -> Dict[str, str]:
         return out
 
     # 기존 YYYYMM ~ YYYYMM
-    pairs = re.findall(r"((?:19|20)\d{4})\s*[~\-]\s*((?:19|20)\d{4})", t)
-    if pairs:
-        out["month_from"], out["month_to"] = pairs[0]
+    compact_range = _EXPLICIT_COMPACT_MONTH_RANGE_RE.search(t)
+    if compact_range:
+        out["month_from"], out["month_to"] = compact_range.groups()
         return out
 
     # 단일 YYYY-MM / YYYY.MM / YYYY/MM
@@ -423,6 +450,8 @@ def _last_day_from_yyyymm(yyyymm: str) -> str:
     if not (1 <= m <= 12):
         return ""
 
+    if y == 9999 and m == 12:
+        return "99991231"
     if m == 12:
         nxt = date(y + 1, 1, 1)
     else:
@@ -618,6 +647,10 @@ def _classify_parsed_period(params: Dict[str, Any]) -> str:
 def strip_nlq_period_expressions(text: str) -> str:
     """Remove period syntax before extracting an unlabeled business entity."""
     out = str(text or "")
+    compact_date = _valid_compact_date_range(out)
+    if compact_date:
+        out = out[:compact_date.start()] + " " + out[compact_date.end():]
+    out = _EXPLICIT_COMPACT_MONTH_RANGE_RE.sub(" ", out)
     patterns = (
         r"(?<![가-힣A-Za-z0-9])(?:19|20)\d{6}(?:\s*[~-]\s*(?:19|20)\d{6})?(?![가-힣A-Za-z0-9])",
         r"(?<![가-힣A-Za-z0-9])(?:19|20)\d{2}[-./]\d{1,2}[-./]\d{1,2}(?:\s*[~-]\s*(?:19|20)\d{2}[-./]\d{1,2}[-./]\d{1,2})?(?![가-힣A-Za-z0-9])",
@@ -654,6 +687,10 @@ def strip_nlq_period_tokens_for_entity_residual(text: str) -> str:
         r"\1 ",
         str(text or ""),
     )
+    compact_date = _valid_compact_date_range(text)
+    if compact_date:
+        text = text[:compact_date.start()] + " " + text[compact_date.end():]
+    text = _EXPLICIT_COMPACT_MONTH_RANGE_RE.sub(" ", text)
     protected: dict[str, str] = {}
     tokens: list[str] = []
     for index, token in enumerate(str(text or "").split()):
@@ -2326,6 +2363,12 @@ def has_unconsumed_detail_condition(text: str, action: str, params: Dict[str, An
     """Reject an unbound detail subject before an unfiltered source query."""
     if action not in {"입고명세 조회", "출고명세 조회"}:
         return False
+    start = clean_text(params.get("date_from"))
+    end = clean_text(params.get("date_to"))
+    start_day = _date_from_yyyymmdd(start) if start else None
+    end_day = _date_from_yyyymmdd(end) if end else None
+    if (start and not start_day) or (end and not end_day) or (start_day and end_day and start_day > end_day):
+        return True
     action_roots = ("입고", "매입") if action == "입고명세 조회" else ("출고", "매출")
     if not any(root in text for root in action_roots):
         return False

@@ -896,7 +896,9 @@ def load_sources(params: dict) -> dict:
     # No new forecast model; the existing service supplies stock and quantity forecast together.
     # Saved classification is R040 Tax scope, not the legacy Physic_Gu filter.
     demand_params = build_demand_params(source_params, scope)
-    demand = call('forecast_stock', get_stock_shortage_df, demand_params, product_universe_df=frame[["제품코드"]], input_rows=len(selected_codes))
+    demand = call('forecast_stock', get_stock_shortage_df, demand_params,
+                  product_universe_df=frame[["제품코드"]], order_real_stock_full_sum=True,
+                  input_rows=len(selected_codes))
     for key in (
         'stock_sql_ms', 'stock_aggregate_ms', 'stock_shortage_build_ms', 'stock_shortage_total_ms',
         'forecast_source_rows', 'forecast_source_sql_ms', 'forecast_source_query_count',

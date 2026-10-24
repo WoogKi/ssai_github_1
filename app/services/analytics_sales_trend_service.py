@@ -5364,6 +5364,7 @@ def _load_product_current_stock(
     stock_apply_cd: Any = None,
     ignored_io_gu_count: int = 0,
     product_scope_params: Optional[Mapping[str, Any]] = None,
+    order_real_stock_full_sum: bool = False,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황의 현재고를 월집계 누계로 가져온다.
@@ -5414,6 +5415,8 @@ def _load_product_current_stock(
             elapsed_ms=int((time.perf_counter() - batch_plan_started) * 1000),
         )
 
+    if order_real_stock_full_sum and stock_mode != "real":
+        raise ValueError("발주계산 전체기간 재고는 실재고만 사용할 수 있습니다.")
     spec = _stock_current_monthly_spec(stock_mode)
     table = spec["table"]
     pfx = spec["prefix"]
@@ -5425,7 +5428,7 @@ def _load_product_current_stock(
     source_policy = _resolve_period_source_policy({"date_to": date_to, "policy_date": policy_date})
     stock_month_to = _normalize_month(month_to) or source_policy["effective_month_to"]
     detail_date_to = str(source_policy.get("effective_date_to") or "")
-    use_mid_month_detail = bool(source_policy.get("use_hybrid"))
+    use_mid_month_detail = bool(source_policy.get("use_hybrid")) and not order_real_stock_full_sum
     monthly_stock_month_to = _prev_yyyymm(detail_date_to[:6]) if use_mid_month_detail else stock_month_to
     if not monthly_stock_month_to:
         monthly_stock_month_to = stock_month_to
@@ -5450,11 +5453,14 @@ def _load_product_current_stock(
     ) -> pd.DataFrame:
         df.attrs["stock_source_table"] = spec["source_table"]
         df.attrs["stock_source_label"] = (
-            f"전월말 {spec['source_label']} + 당월 입출고상세"
-            if use_mid_month_detail
-            else spec["source_label"]
+            "실재고월집계(Rddbc210) 전체기간 누계"
+            if order_real_stock_full_sum
+            else f"전월말 {spec['source_label']} + 당월 입출고상세"
+            if use_mid_month_detail else spec["source_label"]
         )
-        df.attrs["stock_cutoff_month"] = detail_date_to if use_mid_month_detail else stock_month_to
+        df.attrs["stock_cutoff_month"] = (
+            "" if order_real_stock_full_sum else detail_date_to if use_mid_month_detail else stock_month_to
+        )
         df.attrs["stock_query_codes"] = len(codes)
         df.attrs["stock_query_batches"] = batches
         df.attrs["stock_query_elapsed_sec"] = elapsed
@@ -5484,9 +5490,40 @@ def _load_product_current_stock(
         in_qty_expr = f"CAST(ISNULL(M.{pfx}_In_Quantity, 0) AS FLOAT)"
         out_qty_expr = f"CAST(ISNULL(M.{pfx}_Out_Quantity, 0) AS FLOAT)"
 
+    if order_real_stock_full_sum:
+        inbound_aggregate = f"SUM({in_qty_expr})"
+        outbound_aggregate = f"SUM({out_qty_expr})"
+        stock_aggregate = (
+            f"SUM(ISNULL(M.{pfx}_In_Quantity, 0) + ISNULL(M.{pfx}_In_Oquantity, 0) "
+            f"- ISNULL(M.{pfx}_Out_Quantity, 0) - ISNULL(M.{pfx}_Out_Oquantity, 0))"
+        )
+        stock_source_filter = ""
+    else:
+        inbound_aggregate = (
+            f"SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql}) "
+            f"THEN {in_qty_expr} ELSE 0 END)"
+        )
+        outbound_aggregate = (
+            f"SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql}) "
+            f"THEN {out_qty_expr} ELSE 0 END)"
+        )
+        stock_aggregate = (
+            f"SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql}) "
+            f"THEN {in_qty_expr} ELSE 0 END - "
+            f"CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql}) "
+            f"THEN {out_qty_expr} ELSE 0 END)"
+        )
+        stock_source_filter = (
+            f"AND M.{pfx}_Stock_YyMm <= %(stock_month_to)s\n"
+            f"      AND M.{pfx}_Io_Gu_Gcode = %(io_gu_gcode)s\n"
+            f"      AND LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN "
+            f"({inbound_prefix_sql}, {outbound_prefix_sql})"
+        )
+
     def _query_batch(batch_codes: list[str]) -> pd.DataFrame:
-        bind_params: Dict[str, Any] = {
+        bind_params: Dict[str, Any] = {} if order_real_stock_full_sum else {
             "stock_month_to": monthly_stock_month_to,
+            "io_gu_gcode": "0012",
         }
         placeholders: list[str] = []
 
@@ -5503,7 +5540,6 @@ def _load_product_current_stock(
                 bind_params[key] = cd
                 stock_names.append(f"%({key})s")
             stock_filter_sql = f"\n      AND M.{pfx}_Stock_Cd IN ({', '.join(stock_names)})"
-        bind_params["io_gu_gcode"] = "0012"
         if len(bind_params) >= SQL_SERVER_PARAMETER_LIMIT:
             raise ValueError("stock query parameter count reached the SQL Server limit")
 
@@ -5512,34 +5548,9 @@ WITH StockAgg AS (
     SELECT
         M.{pfx}_Physic_Cd AS [제품코드_RAW],
 
-        SUM(
-            CASE
-                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
-                    THEN {in_qty_expr}
-                ELSE 0
-            END
-        ) AS [입고총수량],
-
-        SUM(
-            CASE
-                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
-                    THEN {out_qty_expr}
-                ELSE 0
-            END
-        ) AS [출고총수량],
-
-        SUM(
-            CASE
-                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
-                    THEN {in_qty_expr}
-                ELSE 0
-            END
-          - CASE
-                WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
-                    THEN {out_qty_expr}
-                ELSE 0
-            END
-        ) AS [현재재고수량원본],
+        {inbound_aggregate} AS [입고총수량],
+        {outbound_aggregate} AS [출고총수량],
+        {stock_aggregate} AS [현재재고수량원본],
 
         SUM(
             CAST(ISNULL(M.{pfx}_In_Supply_Price, 0) AS FLOAT)
@@ -5548,11 +5559,7 @@ WITH StockAgg AS (
     FROM {table} AS M WITH (NOLOCK)
 
     WHERE M.{pfx}_Physic_Cd IN ({",".join(placeholders)})
-      AND M.{pfx}_Stock_YyMm <= %(stock_month_to)s
-      AND M.{pfx}_Io_Gu_Gcode = %(io_gu_gcode)s
-      AND LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN (
-          {inbound_prefix_sql}, {outbound_prefix_sql}
-      )
+      {stock_source_filter}
       {stock_filter_sql}
 
     GROUP BY
@@ -5597,10 +5604,11 @@ OPTION (RECOMPILE)
 
     def _query_profile_scope() -> pd.DataFrame:
         bind_params: Dict[str, Any] = dict(scope_bind_params)
-        bind_params.update({
-            "stock_month_to": monthly_stock_month_to,
-            "io_gu_gcode": "0012",
-        })
+        if not order_real_stock_full_sum:
+            bind_params.update({
+                "stock_month_to": monthly_stock_month_to,
+                "io_gu_gcode": "0012",
+            })
         stock_filter_sql = ""
         if stock_codes:
             stock_names: list[str] = []
@@ -5614,19 +5622,13 @@ OPTION (RECOMPILE)
 WITH StockAgg AS (
     SELECT
         M.{pfx}_Physic_Cd AS [제품코드_RAW],
-        SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
-                 THEN {in_qty_expr} ELSE 0 END) AS [입고총수량],
-        SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
-                 THEN {out_qty_expr} ELSE 0 END) AS [출고총수량],
-        SUM(CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql})
-                 THEN {in_qty_expr} ELSE 0 END
-          - CASE WHEN LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({outbound_prefix_sql})
-                 THEN {out_qty_expr} ELSE 0 END) AS [현재재고수량원본],
+        {inbound_aggregate} AS [입고총수량],
+        {outbound_aggregate} AS [출고총수량],
+        {stock_aggregate} AS [현재재고수량원본],
         SUM(CAST(ISNULL(M.{pfx}_In_Supply_Price, 0) AS FLOAT)) AS [입고공급가액합계]
     FROM {table} AS M WITH (NOLOCK)
-    WHERE M.{pfx}_Stock_YyMm <= %(stock_month_to)s
-      AND M.{pfx}_Io_Gu_Gcode = %(io_gu_gcode)s
-      AND LEFT(LTRIM(RTRIM(M.{pfx}_Io_Gu)), 1) IN ({inbound_prefix_sql}, {outbound_prefix_sql})
+    WHERE 1=1
+      {stock_source_filter}
       {stock_filter_sql}
       AND EXISTS (
           SELECT 1
@@ -5766,7 +5768,7 @@ OPTION (RECOMPILE)
         int(sql_elapsed * 1000),
         int(aggregate_elapsed * 1000),
         stock_mode,
-        detail_date_to if use_mid_month_detail else stock_month_to,
+        "all" if order_real_stock_full_sum else detail_date_to if use_mid_month_detail else stock_month_to,
         batch_plan["configured_batch_size"],
         batch_plan["effective_chunk_size"],
         batch_plan["fixed_parameter_count"],
@@ -5927,6 +5929,7 @@ def get_stock_shortage_df(
     expected_inbound_df: Optional[pd.DataFrame] = None,
     *,
     include_expected_inbound: bool = False,
+    order_real_stock_full_sum: bool = False,
 ) -> pd.DataFrame:
     """
     품목별 재고부족현황 1차.
@@ -5964,9 +5967,15 @@ def get_stock_shortage_df(
         )
 
     params_started = time.perf_counter()
-    stock_mode = str(params.get("stock_mode") or "real").strip()
+    stock_mode = "real" if order_real_stock_full_sum else str(params.get("stock_mode") or "real").strip()
     stock_label = _stock_mode_label(stock_mode)
     source_labels = _stock_shortage_source_labels(params, stock_mode=stock_mode)
+    if order_real_stock_full_sum:
+        source_labels.update({
+            "display_source": "발주계산 실재고(Rddbc210) 전체기간 누계",
+            "stock_source": "실재고월집계(Rddbc210) 전체기간 누계",
+            "use_hybrid_detail": False,
+        })
     _record_stock_phase("stock_params_prepare", params_started)
 
     universe_started = time.perf_counter()
@@ -6039,6 +6048,7 @@ def get_stock_shortage_df(
         stock_cd=current_stock_params.get("stock_cd"),
         ignored_io_gu_count=ignored_io_count,
         product_scope_params=current_stock_params,
+        order_real_stock_full_sum=order_real_stock_full_sum,
     )
     t_stock = time.perf_counter()
     log.info(
@@ -6441,7 +6451,7 @@ def get_stock_shortage_df(
     out.attrs["display_source_label"] = source_labels["display_source"]
     out.attrs["evaluation_mode"] = source_labels.get("evaluation_mode")
     out.attrs["use_hybrid_detail"] = bool(source_labels.get("use_hybrid_detail"))
-    out.attrs["stock_cutoff_month"] = stock_cutoff_month
+    out.attrs["stock_cutoff_month"] = "" if order_real_stock_full_sum else stock_cutoff_month
     out.attrs["stock_mode"] = stock_mode
     out.attrs["evaluation_date"] = clean_text(params.get("_shortage_evaluation_date"))
     out.attrs["demand_analysis_date_from"] = clean_text(params.get("_shortage_analysis_date_from"))
