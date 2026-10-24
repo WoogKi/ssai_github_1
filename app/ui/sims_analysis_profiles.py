@@ -446,19 +446,24 @@ def build_query_scope_summary(
     meta = dict(meta or {})
     profile_id = str((profile or {}).get("profile_id") or "")
 
+    summary = ""
     for key in ("query_summary", "source_query", "condition"):
         raw = _clean_text(meta.get(key))
         if raw and len(raw) <= 220:
             sanitized = sanitize_llm_text(raw, label=key)
             if sanitized:
-                return sanitized
+                summary = sanitized
+                break
 
-    pieces: list[str] = []
-    for start_key, end_key in (("start_date", "end_date"), ("from_date", "to_date"), ("시작일", "종료일")):
+    pieces: list[str] = [summary] if summary else []
+    for start_key, end_key in (("date_from", "date_to"), ("month_from", "month_to"),
+                               ("start_date", "end_date"), ("from_date", "to_date"),
+                               ("시작일", "종료일")):
         start = _clean_text(params.get(start_key) or meta.get(start_key))
         end = _clean_text(params.get(end_key) or meta.get(end_key))
         if start or end:
-            pieces.append(f"기간 {start or '?'} ~ {end or '?'}")
+            if not summary or start not in summary or end not in summary:
+                pieces.append(f"기간 {start or '?'} ~ {end or '?'}")
             break
 
     allowed_keys = (
@@ -490,6 +495,15 @@ def build_query_scope_summary(
             pieces.append(piece)
         if len(pieces) >= 5:
             break
+
+    for keys, label in ((("stock_cd_list", "stock_cds"), "재고위치"),
+                        (("product_group_list", "dashboard_product_group_list"), "제품그룹"),
+                        (("product_di_list", "dashboard_product_di_list"), "제품구분"),
+                        (("product_class_list", "dashboard_product_class_list"), "제품분류")):
+        values = next((params[key] for key in keys if isinstance(params.get(key), (list, tuple))
+                       and params[key]), None)
+        if isinstance(values, (list, tuple)) and values and label not in " / ".join(pieces):
+            pieces.append(f"{label} {len(values)}개 적용")
 
     if pieces:
         return " / ".join(pieces)
@@ -526,19 +540,14 @@ def build_response_format_instruction(user_text: str, *, default_include_opinion
             "원인 자료가 없으면 확인된 값과 그룹 차이만 설명하고 원인은 이 표로 판단할 수 없다고 명시하세요."
         )
     summary_only = wants_summary_only(user_text)
-    include_opinion = (not summary_only) and (default_include_opinion or wants_opinion(user_text))
     if summary_only:
-        sections = "조회 이해, 핵심 요약 두 부분만 사용하고 LLM 의견은 강제하지 마세요."
-    elif include_opinion:
-        sections = "조회 이해, 핵심 요약, 주요 특징·확인할 점, LLM 의견 네 부분으로 답하세요."
+        direction = "요약 요청에는 핵심 사실을 간결하게 답하고 불필요한 의견은 덧붙이지 마세요."
     else:
-        sections = "조회 이해, 핵심 요약, 주요 특징·확인할 점 중심으로 답하세요."
+        direction = "고정 목차나 문장 수를 강제하지 말고, 질문과 자료에서 중요한 특징을 골라 충분히 해석하세요."
 
     return (
-        f"{sections} 전체는 약 8~12줄로 짧게 유지하고, 중요한 수치 3~5개만 사용하세요. "
-        "이미 제공된 표·집계를 길게 반복하지 말고 핵심 차이만 설명하세요. "
-        "LLM 의견은 일반적으로 1~2문장으로 쓰되, 데이터와 확인 근거가 충분하고 주요 특징이 여러 개이면 2~3문장까지 허용하세요. "
-        "근거가 부족하면 길이를 늘리지 말고 추가 확인 필요라고 쓰세요. "
-        "화면 목적은 screen_purpose를, 조건 의미는 query_scope_summary를 근거로 쓰며 사용자의 숨은 목적이나 업무 원인을 추측하지 마세요. "
-        "sample_records는 예시 행일 뿐 전체로 일반화하지 말고, display_row_count와 row_count가 다르면 화면 일부와 전체 결과를 구분하세요."
+        f"{direction} 결과의 규모와 확인된 지표에 맞게 설명의 깊이를 조절하세요. "
+        "조회조건, 전체 집계, 실제 항목의 차이와 집중도를 근거로 필요한 확인·관리 제안을 하세요. "
+        "참고 행과 전체 집계를 혼동하거나 데이터에 없는 원인을 단정하지 마세요. "
+        "존재하지 않는 제품·금액·비율·원인을 만들어내지 마세요."
     )

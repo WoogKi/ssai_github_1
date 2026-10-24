@@ -243,7 +243,9 @@ def main():
           "final answer hides implementation keys with business labels")
     rule = build_response_format_instruction("현재표 자세히 분석해줘", current_table_analysis=True)
     check("8~12" not in rule and "3~5" not in rule and "고정 줄수" in rule, "adaptive current table response")
-    check("8~12" in build_response_format_instruction("분석해줘"), "other SIMS prompts unchanged")
+    general_rule = build_response_format_instruction("분석해줘")
+    check("8~12" not in general_rule and "결과의 규모" in general_rule
+          and "존재하지 않는 제품" in general_rule, "general SIMS analysis uses evidence-based depth")
     # Run actual source-selection/preparation functions without starting Streamlit or querying ERP.
     source = (Path(__file__).resolve().parents[1] / "app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8-sig")
     tree = ast.parse(source)
@@ -268,7 +270,8 @@ def main():
            "build_current_table_interpretive_facts": build_current_table_interpretive_facts,
            "_current_table_push_notice": lambda **kwargs: notices.append(kwargs) or True,
            "is_sims_related_question": lambda q: True, "is_general_writing_request": lambda q: False,
-           "BASE_SYSTEM_PROMPT": "분석 답변은 짧게 정리하라.", "GENERAL_SYSTEM_PROMPT": "일반 대화",
+           "BASE_SYSTEM_PROMPT": "분석 답변은 ①핵심 요약 ②주요 수치 ③주의/확인할 점 ④다음 조회 제안 순서로 짧게 정리하라.", "GENERAL_SYSTEM_PROMPT": "일반 대화",
+           "_SIMS_BRIEF_ANALYSIS_RULE": "분석 답변은 ①핵심 요약 ②주요 수치 ③주의/확인할 점 ④다음 조회 제안 순서로 짧게 정리하라.",
            "get_sims_context_data": lambda **kw: None, "get_sims_context_text": lambda **kw: None,
            "fit_analysis_context": fit_analysis_context,
            "_clip_for_model": lambda text, limit: text[:limit],
@@ -302,12 +305,54 @@ def main():
     system = messages[0]["content"]
     check("고정 줄수, 수치 개수" in system and "짧게 정리/고정 섹션 지침보다" in system,
           "runtime adaptive instructions override base prompt")
+    check(env["_SIMS_BRIEF_ANALYSIS_RULE"] not in system,
+          "analysis mode removes the generic brief-answer rule")
     check("[CURRENT_TABLE_ANALYSIS_OUTPUT]" in system
           and "어떤 key도 그대로 쓰지 말고" in system,
           "runtime prompt prohibits implementation keys")
     delivered = json.loads(system.split("[SIMS_JSON]\n", 1)[1].split("\n[/SIMS_JSON]", 1)[0])
     check(delivered["whole_table_facts"]["numeric_metrics"]["다음월예상매출"]["sum"] == 150000,
           "runtime final model messages include whole-table statistics")
+    stock = pd.DataFrame({"제품코드": [f"{i:05d}" for i in range(620)],
+                          "제품명": [f"제품{i}" for i in range(620)],
+                          "재고상태": ["정상"] * 500 + ["부족"] * 120,
+                          "현재재고수량": [2] * 500 + [-1] * 120,
+                          "재고금액": [100] * 620})
+    from app.ui.chat_middleware import _build_sims_analysis_context_from_df
+    stock_ctx = _build_sims_analysis_context_from_df(
+        stock, result={}, action_name="현재고 조회", params={},
+        meta={"display_row_count": 300, "analysis_row_count": 620})
+    state["__model_ctx_len"] = 8192
+    stock_messages = env["build_messages_with_system"](
+        [], user_text="현재고 조회 결과 분석", analysis_ctx_override=stock_ctx)
+    stock_json = stock_messages[0]["content"].split("[SIMS_JSON]\n", 1)[1].split("\n[/SIMS_JSON]", 1)[0]
+    stock_delivered = json.loads(stock_json)
+    check(len(stock_json) <= 9000 and stock_delivered["whole_table_facts"]["numeric_metrics"]["현재재고수량"]["sum"] == 880
+          and stock_delivered["row_count"] == 620 and stock_delivered["display_row_count"] == 300,
+          "generic SIMS evidence fits 9000 chars without truncating full-table totals")
+    from tools.check_llm_analysis_accuracy_20261022 import stock_fixture
+    grade_ctx = _build_sims_analysis_context_from_df(
+        stock_fixture(), result={}, action_name="현재고 조회", params={"stock_cd": "00901"},
+        meta={"display_row_count": 300, "analysis_row_count": 600})
+    grade_messages = env["build_messages_with_system"](
+        [], user_text="현재고 조회 결과 분석", analysis_ctx_override=grade_ctx)
+    grade_json = grade_messages[0]["content"].split("[SIMS_JSON]\n", 1)[1].split("\n[/SIMS_JSON]", 1)[0]
+    grade_delivered = json.loads(grade_json)
+    grade_facts = grade_delivered["whole_table_facts"]
+    grade_qty = grade_facts["numeric_metrics"]["재고수량"]
+    grade_amount = grade_facts["numeric_metrics"]["보험금액"]
+    check(len(grade_json) <= 9000 and grade_facts["group_consistency_pass"]
+          and grade_qty["group_values_complete"] and grade_amount["group_values_complete"]
+          and {row["group"] for row in grade_qty["group_values"]}
+          == {"A", "B", "C", "D", "E", "F", "X", "빈도자료 부족"}
+          and grade_qty["sum"] == 7348 and grade_amount["sum"] == 173927513,
+          "600-row grade totals survive minimum model budget without a synthetic other group")
+    bad_ctx = dict(grade_ctx)
+    bad_ctx["whole_table_facts"] = {**grade_ctx["whole_table_facts"], "group_consistency_pass": False}
+    bad_messages = env["build_messages_with_system"](
+        [], user_text="현재고 조회 결과 분석", analysis_ctx_override=bad_ctx)
+    check("[SIMS_JSON]" not in bad_messages[0]["content"],
+          "inconsistent group evidence is not delivered to the model")
     check(not env["_prepare_current_table_analysis_override"]("현재표 임의없는차원별 분석")
           and notices[-1]["action"] == "현재표 컬럼 부족", "runtime unknown dimension notice")
     check("__current_table_analysis_ctx_override" not in state, "runtime removes stale override on blocked analysis")

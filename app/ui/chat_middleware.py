@@ -2504,7 +2504,6 @@ def _build_stock_shortage_analysis_ctx(
         meta=safe_meta if isinstance(safe_meta, dict) else {},
         profile=profile,
     )
-
     product_cols = [
         "순번",
         "제품코드",
@@ -3019,6 +3018,27 @@ def _sims_business_terms(action_name: str, columns: Any = ()) -> dict:
             "preferred_words": ["출고빈도등급", "품목손익등급", "품목기여등급", *cost_metrics, "자료 부족"],
         }
 
+    if action == "현재고 조회":
+        labels = {str(column) for column in columns}
+        return {
+            "flow_label": "현재고", "amount_label": "보험금액" if "보험금액" in labels else "재고금액",
+            "vendor_label": "제조사", "qty_label": "재고수량",
+            "avoid_words": ["매출액", "매입원가"],
+            "preferred_words": ["재고수량", "출고빈도등급", "보험금액"],
+        }
+
+    if action == "입고예정조회":
+        return {
+            "flow_label": "입고예정", "amount_label": "금액",
+            "vendor_label": "발주거래처", "qty_label": "미입고수량",
+            "qty_source_column": "미입고수량",
+            "quantity_meanings": {
+                "발주수량": "원발주 수량", "입고수량": "이미 입고된 수량",
+                "미입고수량": "아직 입고되지 않은 발주 잔량",
+            },
+            "preferred_words": ["발주수량", "입고수량", "미입고수량"],
+        }
+
     if (
         "매입처별 재고부족 현황" in action
         or "매입처별 재고부족" in action
@@ -3270,7 +3290,8 @@ def _build_sims_sales_time_profile(df: pd.DataFrame, terms: dict | None = None) 
 
     amount_col = _sims_ctx_find_amount_col(df, amount_priority)
 
-    qty_col = _sims_ctx_find_col(
+    qty_col = (str(terms.get("qty_source_column"))
+               if terms.get("qty_source_column") in df.columns else None) or _sims_ctx_find_col(
         df,
         exact=("수량", "출고수량", "입고수량", "매출수량"),
         include_any=("수량",),
@@ -3427,7 +3448,8 @@ def _build_sims_sales_group_profile(df: pd.DataFrame, terms: dict | None = None)
     amount_priority = tuple(str(x) for x in (terms.get("amount_priority") or ()) if str(x or "").strip())
 
     amount_col = _sims_ctx_find_amount_col(df, amount_priority)
-    qty_col = _sims_ctx_find_col(
+    qty_col = (str(terms.get("qty_source_column"))
+               if terms.get("qty_source_column") in df.columns else None) or _sims_ctx_find_col(
         df,
         exact=("수량", "출고수량", "입고수량", "매출수량"),
         include_any=("수량",),
@@ -3464,6 +3486,8 @@ def _build_sims_sales_group_profile(df: pd.DataFrame, terms: dict | None = None)
 
     def _group_top(group_col: str | None, label: str, sort_by: str) -> list[dict]:
         if not group_col or group_col not in df.columns or (sort_by == "amount" and not amount_col):
+            return []
+        if sort_by == "qty" and (not qty_col or not work["_qty"].ne(0).any()):
             return []
 
         tmp = work.copy()
@@ -3666,11 +3690,31 @@ def _build_sims_analysis_context_from_df(
         safe_sample_df = safe_sample_df.loc[:, [col for col in order_sample_columns if col in safe_sample_df.columns]]
     safe_params = sanitize_llm_mapping(params, profile=profile)
     safe_meta = sanitize_llm_mapping(meta, profile=profile)
+    if isinstance(safe_params, dict):
+        location_names = safe_params.pop("stock_location_name_map", None)
+        location_names = location_names if isinstance(location_names, dict) else {}
+        selected = (safe_params.get("stock_cds") or safe_params.get("stock_cd_list")
+                    or safe_params.get("stock_cd") or [])
+        selected_codes = selected if isinstance(selected, (list, tuple)) else [selected]
+        if selected_codes:
+            safe_params.setdefault("재고위치", ", ".join(
+                f"{location_names.get(str(code), str(code))}({code})"
+                if str(code) in location_names else str(code)
+                for code in dict.fromkeys(selected_codes)
+            ))
     query_scope_summary = build_query_scope_summary(
         params=safe_params if isinstance(safe_params, dict) else {},
         meta=safe_meta if isinstance(safe_meta, dict) else {},
         profile=profile,
     )
+    io_detail = meta.get("in_detail_summary") or meta.get("out_detail_summary") or {}
+    analysis_scope = str(meta.get("analysis_scope") or "")
+    if (not analysis_scope and isinstance(io_detail, dict)
+            and io_detail.get("summary_basis") == "표시된 결과 기준"):
+        analysis_scope = "display_only"
+    if analysis_scope in {"display_only", "partial_source"}:
+        basis = "화면 표시" if analysis_scope == "display_only" else "확보된 원본"
+        query_scope_summary += f" / {basis} {len(base_df):,}건 기준 (전체 합계 미검증)"
 
     if action in {"품목별 재고부족현황", "매입처별 재고부족 현황"} or analysis_type in {"stock_shortage", "supplier_stock_shortage"}:
         return _build_stock_shortage_analysis_ctx(
@@ -3679,6 +3723,23 @@ def _build_sims_analysis_context_from_df(
             params=params,
             meta=meta,
         )
+
+    from app.ui.current_table_followups.analysis_facts import build_whole_table_facts
+
+    group_candidates = (
+        ("추세판정", "매출처명", "거래처명", "출고빈도등급")
+        if "매출" in action and "추세" in action
+        else ("출고빈도등급", "재고상태", "발주거래처명", "발주처명", "매출처명", "매입처명", "거래처명")
+    )
+    group_col = next((col for col in group_candidates if col in safe_sample_df.columns), "")
+    whole_facts = build_whole_table_facts(base_df, action=action, query=query_scope_summary,
+                                          group_column=group_col, complete_groups=True)
+    if analysis_scope in {"display_only", "partial_source"}:
+        whole_facts["analysis_scope"] = analysis_scope
+    for stats in whole_facts["numeric_metrics"].values():
+        if stats.get("group_values_complete"):
+            stats.pop("top_groups", None)
+            stats.pop("bottom_groups", None)
 
     fallback_cols = list(safe_sample_df.columns[:25])
 
@@ -3702,9 +3763,13 @@ def _build_sims_analysis_context_from_df(
     llm_summary_md = str(meta.get("llm_summary_md") or meta.get("summary_md") or "").strip()
     detail_summary = sanitize_llm_mapping(detail_summary, profile=profile)
     llm_summary_md = sanitize_llm_text(llm_summary_md, label="llm_summary_md")
+    if analysis_scope == "display_only":
+        detail_summary = {}
+        llm_summary_md = ""
 
     analysis_row_count = int(
-        detail_summary.get("row_count_total")
+        (len(base_df) if analysis_scope in {"full_source", "display_only", "partial_source"} else None)
+        or detail_summary.get("row_count_total")
         or detail_summary.get("row_count")
         or meta.get("analysis_row_count")
         or len(base_df)
@@ -3948,6 +4013,10 @@ def _build_sims_analysis_context_from_df(
             k: (safe_meta or {}).get(k)
             for k, v in meta.items()
             if k in keep_meta_keys
+            and (analysis_scope != "display_only" or k in {
+                "analysis_type", "query_summary", "condition", "display_row_count",
+                "business_terms", "amount_label", "flow", "stock_basis",
+            })
         },
 
         "detail_summary": detail_summary,
@@ -3960,6 +4029,7 @@ def _build_sims_analysis_context_from_df(
         "doc_counterparty_profile": doc_counterparty_profile,
         "sales_time_profile": sales_time_profile_out,
         "sales_group_profile": sales_group_profile_out,
+        "whole_table_facts": whole_facts,
         "sample_records": _llm_records_from_df(safe_sample_df, fallback_cols, limit=30),
 
         "llm_rules": [
@@ -3980,6 +4050,9 @@ def _build_sims_analysis_context_from_df(
             "세금계산서 공통 조회에서 표준 제품명/제품코드 컬럼이 없으면 제품별/품목별/판매량 분석을 제안하지 말고 거래처별, 세금계산서구분별, 일자별 계산서금액 분석을 제안한다.",
             "세금계산서 공통 조회에서는 수량 컬럼이 있어도 수량 합계가 0이면 수량 기반 분석을 하지 않는다.",
             "sample_records는 대표 목록일 수 있으므로 전체 건수/합계 판단에는 사용하지 않는다.",
+            "group_values_complete가 true이면 그 지표의 모든 그룹을 각각 설명하고 임의의 기타 그룹을 만들지 않는다.",
+            "zero_count는 실제 0 값 건수이며 missing_or_invalid_count와 다르다. 0원을 결측으로 단정하지 않는다.",
+            "보험금액은 보험약가 기준 재고 평가금액이지 매출액이나 매입원가가 아니다.",
             "화면표시건수와 row_count가 다르면, 화면에는 일부만 표시되고 분석은 전체 조회조건 기준이라고 설명한다.",
             "내부 key 이름은 답변에 노출하지 않는다.",
         ],
@@ -3987,6 +4060,42 @@ def _build_sims_analysis_context_from_df(
 
         "analysis_text": analysis_text,
     }
+
+
+def _build_full_source_analysis_ctx(
+    full_df: pd.DataFrame, *, action: str, params: Dict[str, Any],
+    meta: Dict[str, Any], display_rows: int,
+) -> Dict[str, Any]:
+    """Use an already fetched, complete export without reusing display-only summaries."""
+    if not isinstance(full_df, pd.DataFrame) or full_df.empty:
+        return {}
+    prepared = len(full_df)
+    expected = _expected_analysis_row_count(meta, display_rows)
+    limit = _safe_int_for_download(
+        meta.get("applied_download_limit_rows") or meta.get("download_limit_rows"), 0)
+    confirmed_total = _safe_int_for_download(
+        meta.get("row_count_total_for_analysis") or meta.get("expected_rows")
+        or meta.get("row_count_total"), 0)
+    incomplete = (expected > prepared or bool(meta.get("download_source_status"))
+                  or (limit > 0 and prepared >= limit and confirmed_total != prepared))
+    clean_meta = {
+        key: meta[key] for key in (
+            "analysis_type", "query_summary", "condition", "amount_label",
+            "amount_priority", "flow", "business_terms", "table_key",
+            "source_table_key", "current_table_followup",
+        ) if key in meta
+    }
+    clean_meta.update(
+        display_row_count=display_rows, analysis_row_count=prepared,
+        row_count_total=prepared,
+        analysis_scope="partial_source" if incomplete else "full_source",
+    )
+    ctx = _build_sims_analysis_context_from_df(
+        full_df, result={}, action_name=action, params=params, meta=clean_meta)
+    if ctx:
+        ctx["analysis_scope"] = clean_meta["analysis_scope"]
+        ctx["whole_table_facts"]["analysis_scope"] = clean_meta["analysis_scope"]
+    return ctx
 
 
 def _sims_analysis_ctx_cache() -> Dict[str, Dict[str, Any]]:
@@ -4096,13 +4205,16 @@ def _select_sims_analysis_ctx_for_table(
                 return cached_copy, "cache"
 
     if isinstance(download_df, pd.DataFrame) and not download_df.empty:
-        ctx = _build_sims_analysis_context_from_df(
-            download_df,
-            result={},
-            action_name=action or str(meta.get("action") or "").strip(),
-            params=meta.get("params") if isinstance(meta.get("params"), dict) else {},
-            meta=meta,
-        )
+        selected_action = action or str(meta.get("action") or "").strip()
+        selected_params = meta.get("params") if isinstance(meta.get("params"), dict) else {}
+        ctx = (_build_full_source_analysis_ctx(
+            download_df, action=selected_action, params=selected_params, meta=meta,
+            display_rows=_safe_int_for_download(meta.get("display_row_count"), len(download_df)),
+        ) if selected_action in {"입고명세 조회", "출고명세 조회"} else {})
+        if not ctx:
+            ctx = _build_sims_analysis_context_from_df(
+                download_df, result={}, action_name=selected_action,
+                params=selected_params, meta=meta)
         if isinstance(ctx, dict) and ctx.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1":
             ctx["table_key"] = table_key or str(meta.get("table_key") or "").strip()
             ctx["source_table_key"] = str(meta.get("source_table_key") or "").strip()
@@ -4169,6 +4281,15 @@ def _run_clicked_sims_llm_analysis(
 # - 위 _normalize_result_for_chat()로 표준 payload로 변환한 후, LLM이 소비하기 좋은 JSON 컨테이너 + 텍스트로 변환한다.
 # - 세션 상태에 '최신 1개 컨텍스트'를 저장한다.
 # - 반환값은 컨텍스트 패키지(dict)로, 내부에 원본 payload/result 뿐만 아니라 LLM용 JSON 컨테이너와 텍스트 설명이 포함된다.
+def _analysis_query_params_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    for candidate in (payload.get("params"), payload.get("args"),
+                      meta.get("params")):
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
 def _build_sims_context_from_result(
     result: Dict[str, Any],
     action_name: str,
@@ -5796,7 +5917,8 @@ def _build_sims_detail_analysis_prompt(
         )
         return (
             f"현재 클릭한 표 [{action_name}]를 분석해줘. 전체 기준 {expected_rows:,}건, 표시 {display_rows:,}건이다.\n"
-            "전체 문맥/llm_summary_md를 우선하고 일부 표를 전체로 일반화하지 마라. "
+            "whole_table_facts의 전체 지표·완전한 등급별 집계와 llm_summary_md를 확인하고, "
+            "등급별 건수와 합계가 전체와 맞는지 검산하라. 일부 표를 전체로 일반화하지 마라. "
             + cost_hint
             + grade_contract
         )
@@ -5950,14 +6072,14 @@ def _build_sims_detail_analysis_prompt(
 # - 화면 표시 건수는 일부일 수 있다.
     if action_name.startswith("현재표"):
         return f"""
-현재표 후속분석 결과 [{action_name}]를 간단히 분석해줘.
+현재표 후속분석 결과 [{action_name}]를 실제 집계 근거에 따라 분석해줘.
 
 중요 원칙:
 - 전체 기준은 현재표 후속분석 결과 전체 {download_rows:,}건이다.
 - 화면 표시 {display_rows:,}건은 일부일 수 있다.
-- 표 전체를 나열하지 말고 상위 5~10개와 특징만 요약해라.
+- 전체 집계에서 중요한 차이·분포·집중도·예외를 선별하고, 표 행을 나열하지 마라.
 - 내부 key 이름은 노출하지 마라.
-- 답변은 1,200자 이내로 끝내라.
+- 근거가 충분한 항목은 수치와 함께 설명하고, 부족하면 판단 불가를 명시해라.
 - 불필요하게 긴 다음 조회 제안은 하지 마라.
 
 분석 형식:
@@ -7536,8 +7658,9 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
             payload["df"] = df
             payload["df_display"] = df_display
 
-            # meta/params 우선순위: meta > params > args
-            params = payload.get("meta") or payload.get("params") or payload.get("args") or {}
+            # Query conditions and result metadata have different roles. Passing
+            # meta as params duplicates detail summaries in the model context.
+            params = _analysis_query_params_from_payload(payload)
 
             df_llm = _shrink_df_for_llm(df_display)
 
@@ -7792,6 +7915,28 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                             meta["download_row_count"] = int(len(full_df_for_followup))
                             meta["display_row_count"] = int(display_rows_for_followup)
                             meta["row_count_total_for_followup"] = int(len(full_df_for_followup))
+
+                            if action_for_export in {"입고명세 조회", "출고명세 조회"}:
+                                full_ctx = _build_full_source_analysis_ctx(
+                                    full_df_for_followup, action=action_for_export,
+                                    params=_analysis_query_params_from_payload(item_for_export),
+                                    meta=meta, display_rows=display_rows_for_followup,
+                                )
+                                if full_ctx:
+                                    full_ctx["table_key"] = str(table_key)
+                                    full_ctx["source_table_key"] = str(meta.get("source_table_key") or "")
+                                    full_ctx["current_table_followup"] = bool(meta.get("current_table_followup"))
+                                    _cache_sims_analysis_ctx_by_table_key(full_ctx)
+                                    ss["__sims_analysis_ctx"] = full_ctx
+                                    ss["__sims_latest_analysis_key"] = full_ctx.get("analysis_key")
+                                    if not full_ctx["current_table_followup"]:
+                                        ss["__sims_current_table_source_analysis_ctx"] = full_ctx
+                                    log.info(
+                                        "[sims.analysis.context] action=%s scope=%s "
+                                        "display_rows=%s source_rows=%s table_key=%s",
+                                        action_for_export, full_ctx["analysis_scope"], display_rows_for_followup,
+                                        len(full_df_for_followup), table_key,
+                                    )
 
                             # lazy full source 보정은 신규 조회에만 현재표를 교체한다.
                             # 후속 결과는 자체 export DF를 보존하되 원본 포인터는 유지한다.

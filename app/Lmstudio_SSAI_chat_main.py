@@ -276,8 +276,14 @@ from app.ui.current_table_followups.action_dispatcher import (
 )
 from app.ui.sims_analysis_profiles import build_response_format_instruction
 from app.ui.current_table_followups.analysis_facts import (
+    build_structured_analysis_options,
+    build_verified_group_table,
+    build_verified_whole_table,
+    compose_structured_analysis_output,
+    compose_verified_analysis_output,
     fit_analysis_context,
     sanitize_current_table_analysis_output,
+    structured_analysis_code_id,
 )
 
 from app.services.ssai_permission_policy import (
@@ -3346,6 +3352,7 @@ def summarize_text_long(
 # =========================
 # LLM 호출 헬퍼/가드
 # =========================
+_SIMS_BRIEF_ANALYSIS_RULE = "분석 답변은 ①핵심 요약 ②주요 수치 ③주의/확인할 점 ④다음 조회 제안 순서로 짧게 정리하라."
 BASE_SYSTEM_PROMPT = (
     "너는 유통 ERP인 SIMS의 문서를 안전하게 요약·분석하는 어시스턴트다. "
     "테이블의 관계에 충실하고, 숫자/단위/날짜를 보존하라. "
@@ -3364,8 +3371,8 @@ BASE_SYSTEM_PROMPT = (
     "사용자가 '이 결과 분석/요약/정리'처럼 최신 조회 결과에 대한 분석을 요청하면 "
     "meta.summary_md, meta.message, aggregations, *_counts, columns, records 순서로 근거를 사용하라. "
     "records는 샘플일 수 있으므로 전체 분포/전체 합계는 meta나 aggregations에 있을 때만 단정하라. "
-    "분석 답변은 ①핵심 요약 ②주요 수치 ③주의/확인할 점 ④다음 조회 제안 순서로 짧게 정리하라."
-    "SIMS_JSON.kind가 SIMS_ANALYSIS_CONTEXT_V1이면 이것은 샘플 표가 아니라 최신 SIMS 조회 결과 전체를 Python으로 집계한 분석 컨텍스트다. "
+    + _SIMS_BRIEF_ANALYSIS_RULE
+    + "SIMS_JSON.kind가 SIMS_ANALYSIS_CONTEXT_V1이면 이것은 샘플 표가 아니라 최신 SIMS 조회 결과 전체를 Python으로 집계한 분석 컨텍스트다. "
     "이 경우 summary, shortage_grade_counts, forecast_grade_counts, trend_judge_counts는 전체 결과 기준이므로 샘플 데이터라고 표현하지 마라. "
     "risk_products_top과 grade_samples는 품목 설명용 대표 목록이며, 전체 건수 판단은 summary와 *_counts를 우선 사용하라. "
     "SIMS/ERP 데이터의 건수/컬럼/샘플은 실제 컨텍스트(SIMS_JSON/SIMS CONTEXT)나 NLQ 조회 결과가 있을 때만 말하고, "
@@ -6549,11 +6556,16 @@ def build_messages_with_system(
         log.exception("[chat] source analysis ctx selection failed")
 
     if attach_sims and isinstance(analysis_ctx, dict) and analysis_ctx.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1":
+        st.session_state.pop("__sims_analysis_attach_error", None)
+        SIMS_JSON_CHAR_LIMIT = 0
+        fit_diagnostics = {}
         try:
             try:
-                _ctx_len = int(st.session_state.get("__model_ctx_len") or 16384)
+                configured_ctx_len = st.session_state.get("__model_ctx_len")
+                _ctx_len = int(configured_ctx_len or 16384)
             except Exception:
                 _ctx_len = 16384
+                configured_ctx_len = None
 
             if _ctx_len <= 12288:
                 SIMS_JSON_CHAR_LIMIT = 9000
@@ -6564,34 +6576,30 @@ def build_messages_with_system(
             else:
                 SIMS_JSON_CHAR_LIMIT = 24000
 
-            def _shrink_analysis_ctx_for_limit(ctx: dict, limit: int) -> dict:
-                """분석 컨텍스트는 JSON 유효성을 유지하면서 대표 목록만 단계적으로 축소한다."""
-                if ctx.get("analysis_target") == "current_table_whole_facts":
-                    return fit_analysis_context(ctx, limit)
-                base = dict(ctx)
+            if (analysis_ctx.get("whole_table_facts") or {}).get("group_consistency_pass") is False:
+                raise ValueError("group_totals_mismatch")
 
-                def _with_limits(risk_n: int, grade_n: int) -> dict:
-                    out = dict(base)
-                    if isinstance(out.get("risk_products_top"), list):
-                        out["risk_products_top"] = out["risk_products_top"][:risk_n]
-                    gs = out.get("grade_samples")
-                    if isinstance(gs, dict):
-                        out["grade_samples"] = {
-                            str(k): (v[:grade_n] if isinstance(v, list) else v)
-                            for k, v in gs.items()
-                        }
-                    return out
+            llm_sims_data = fit_analysis_context(
+                analysis_ctx, SIMS_JSON_CHAR_LIMIT, question=user_text or "",
+                diagnostics=fit_diagnostics)
+            sims_json = json.dumps(llm_sims_data, ensure_ascii=False, default=str, separators=(",", ":"))
+            if len(sims_json) > SIMS_JSON_CHAR_LIMIT:
+                raise ValueError("context_budget_exceeded")
+            ctx_txt = sims_json
 
-                for risk_n, grade_n in ((50, 8), (40, 6), (30, 5), (25, 4), (20, 3), (15, 2), (10, 1)):
-                    cand = _with_limits(risk_n, grade_n)
-                    raw = json.dumps(cand, ensure_ascii=False, default=str)
-                    if len(raw) <= limit:
-                        return cand
-                return _with_limits(8, 1)
-
-            llm_sims_data = _shrink_analysis_ctx_for_limit(analysis_ctx, SIMS_JSON_CHAR_LIMIT)
-            sims_json = json.dumps(llm_sims_data, ensure_ascii=False, default=str)
-            ctx_txt = _clip_for_model(sims_json, limit=SIMS_JSON_CHAR_LIMIT)
+            log.info(
+                "[chat.analysis_context] action=%s source_rows=%s source_chars=%s "
+                "delivered_chars=%s limit_chars=%s ctx_len=%s ctx_len_source=%s "
+                "stage=%s reductions=%s sections_before=%s sections_after=%s params_shape=%s",
+                str(llm_sims_data.get("action") or "")[:60],
+                int(llm_sims_data.get("row_count") or 0),
+                fit_diagnostics.get("original_chars"), len(sims_json), SIMS_JSON_CHAR_LIMIT,
+                _ctx_len, "session" if configured_ctx_len else "fallback",
+                fit_diagnostics.get("stage", "unreduced"), fit_diagnostics.get("reductions", []),
+                fit_diagnostics.get("section_chars_before", {}),
+                fit_diagnostics.get("section_chars_after", {}),
+                fit_diagnostics.get("params_shape", {}),
+            )
 
             log_cols = int(llm_sims_data.get("column_count") or len(llm_sims_data.get("columns") or []))
             log_rows = int(llm_sims_data.get("row_count") or 0)
@@ -6625,10 +6633,16 @@ def build_messages_with_system(
             else:
                 analysis_data_rule = (
                     "- 이 JSON은 최신 SIMS 조회 결과 전체를 Python으로 집계한 분석 컨텍스트입니다.\n"
-                    "- summary와 *_counts는 전체 결과 기준입니다. 절대 '샘플 데이터'라고 말하지 마세요.\n"
-                    "- 일자/날짜/요일/일별/월별 매출 질문은 sales_time_profile의 daily_sales_top, monthly_sales, weekday_sales를 우선 사용하세요.\n"
-                    "- 제품별/거래처별/영업사원별/수량 TOP 질문은 sales_group_profile을 우선 사용하세요.\n"
-                    "- risk_products_top과 grade_samples는 품목 설명용 대표 목록입니다.\n"
+                    "- whole_table_facts와 업무별 profile의 전체 집계를 근거로 삼고, 상세 참고 행을 전체로 일반화하지 마세요.\n"
+                    "- 완전한 그룹 집계를 임의로 합치지 말고, 실제 0 값과 결측을 구분하세요.\n"
+                    "- 발주수량·입고수량·미입고수량 및 공급가액·확정공급가액, 세액·확정세액은 각각 다른 원본 지표입니다. "
+                    "같은 의미로 합치거나 명칭을 바꾸지 마세요.\n"
+                    "- 검증된 집계표의 합계를 본문에서 반복 나열하지 말고 의미를 해석하세요. "
+                    "상세 일부를 전체 품목 특성으로 일반화하거나 음수의 원인을 단정하지 마세요.\n"
+                    "- operational_findings가 있으면 전체 원본 기준 상위 거래처·품목과 확인 우선순위를 해석하세요. "
+                    "거래명세서 금액 일치 표시와 원본·확정 공급가액 차이는 별개이며, "
+                    "세금계산서 비교값이 없으면 일치·불일치를 주장하지 마세요.\n"
+                    "- 보험금액은 매출액이나 매입원가가 아니며, delivery_scope에 생략 정보가 있으면 그 범위를 지키세요.\n"
                 )
 
             sims_block = (
@@ -6638,12 +6652,10 @@ def build_messages_with_system(
                 + "\n"
                 + analysis_data_rule
                 + "- 이전 표, 이전 조회 결과, 이전 답변은 분석 근거로 사용하지 마세요.\n"
-                + "- 사용자가 특정 항목/목록/값을 물으면 그 질문에만 직접 답하세요. 이때 핵심 요약, 주의/확인할 점, 다음 조회 제안은 생략하세요.\n"
-                + "- 사용자가 요약/분석을 요청한 경우에만 ①핵심 요약 ②주요 수치 ③주의/확인할 점 ④다음 조회 제안 순서로 짧게 정리하세요.\n"
+                + "- 질문과 자료에 맞춰 중요한 특징을 해석하고, 근거가 있는 관리 제안을 하세요.\n"
                 + "- 사용자가 '표로'라고 요청하면 주요 수치나 목록은 표로 답하세요.\n"
-                + "- 내부 key 이름(low_stock_records, zero_stock_records, sample_records, risk_products_top, grade_samples 등)은 답변에 노출하지 마세요.\n"
                 + "- stock_mode 또는 stock_label 값이 '실수불'이면 반드시 '실수불 기준'이라고 그대로 표현하고, '실재고 기준'으로 바꾸지 마세요.\n"
-                + "- 답변 본문에 '샘플', '샘플 데이터', 'sample_rows', '대표 목록'이라는 표현을 쓰지 말고, 필요한 경우 '전체 조회 결과 기준'이라고만 표현하세요.\n"
+                + "- 내부 key 이름은 사용자에게 노출하지 마세요.\n"
                 + f"[SIMS_JSON]\n{ctx_txt}\n[/SIMS_JSON]"
             )
 
@@ -6655,8 +6667,29 @@ def build_messages_with_system(
                 log_rows,
                 log_risk,
             )
-        except Exception:
-            log.exception("[chat] build_messages_with_system → analysis ctx attach failed")
+        except Exception as exc:
+            reason = str(exc) if str(exc) in {"group_totals_mismatch", "context_budget_exceeded"} else "unexpected_exception"
+            try:
+                context_chars = len(json.dumps(analysis_ctx, ensure_ascii=False, default=str))
+            except Exception:
+                context_chars = -1
+            st.session_state["__sims_analysis_attach_error"] = {
+                "reason": reason, "context_chars": context_chars,
+                "reduced_chars": fit_diagnostics.get("reduced_chars"),
+                "limit_chars": SIMS_JSON_CHAR_LIMIT,
+            }
+            log.error(
+                "[chat] analysis ctx attach failed reason=%s context_chars=%s "
+                "reduced_chars=%s limit_chars=%s path=%s stage=%s reductions=%s "
+                "sections_before=%s sections_after=%s params_shape=%s",
+                reason, context_chars, fit_diagnostics.get("reduced_chars"), SIMS_JSON_CHAR_LIMIT,
+                str(analysis_ctx.get("analysis_target") or "")[:60],
+                fit_diagnostics.get("stage", "not_started"), fit_diagnostics.get("reductions", []),
+                fit_diagnostics.get("section_chars_before", {}),
+                fit_diagnostics.get("section_chars_after", {}),
+                fit_diagnostics.get("params_shape", {}),
+                exc_info=True,
+            )
             sims_block = None
 
     elif attach_sims and isinstance(sims_data, dict) and sims_data:
@@ -7101,7 +7134,7 @@ def build_messages_with_system(
     if analysis_mode:
         current_question = (user_text or "").strip()
         if not current_question:
-            current_question = "현재 조회 결과를 핵심 요약, 주요 수치, 주의할 점, 다음 조회 제안 순서로 분석해줘"
+            current_question = "현재 조회 결과를 자료에 맞게 분석해줘"
         response_format_instruction = build_response_format_instruction(
             current_question,
             default_include_opinion=True,
@@ -7127,26 +7160,13 @@ def build_messages_with_system(
             "- 현재 SIMS_JSON은 SIMS_ANALYSIS_CONTEXT_V1이다.\n"
             + analysis_scope_rule
             + f"- {response_format_instruction}\n"
-            "- summary와 shortage_grade_counts, forecast_grade_counts, trend_judge_counts는 전체 결과 기준이다.\n"
-            "- 일자/날짜/요일/일별/월별 매출 질문은 sales_time_profile을 우선 근거로 답한다.\n"
-            "- 제품별/거래처별/영업사원별/수량 TOP 질문은 sales_group_profile을 우선 근거로 답한다.\n"
-            "- risk_products_top은 품목 설명용 대표 위험 목록이며, 전체 판단은 summary와 *_counts를 우선 사용한다.\n"
-            "- risk_products_top의 건수가 적어도 '샘플 데이터', '전체를 대표하지 않을 수 있음'이라고 말하지 마라.\n"
-            "- sample_rows=10, sample_rows=300 같은 표현을 답변에 쓰지 마라.\n"
-            "- stock_mode가 real 또는 실재고이면 Rddbc220이라고 말하지 마라.\n"
-            "- 이전 대화, 이전 표, 이전 답변은 분석 근거로 사용하지 마라.\n"
-            "- source_table 또는 source_table_label이 명시되어 있지 않으면 테이블명(Rddbc210/Rddbc220)을 추정해서 말하지 마라.\n"
-            "- risk_products_top이라는 내부 키 이름을 답변에 그대로 쓰지 마라.\n"
-            "- risk_products_top의 전달 건수가 8건/30건이어도, 전체 분석이 8건만 기준이라고 말하지 마라.\n"
-            "- 필요하면 '우선 확인 대상 품목' 또는 '위험 품목 상세 목록'이라고 표현하라.\n"
-            "- 재고 기준과 기준 테이블은 SIMS_JSON.summary.stock_basis_label, SIMS_JSON.summary.source_table_label 값만 사용하라.\n"
-            "- low_stock_records, sample_records, risk_products_top, grade_samples 같은 내부 key 이름을 답변에 노출하지 마세요.\n"
-            "- 답변 본문에 '샘플', '샘플 데이터', 'sample_rows', '대표 목록'이라는 표현을 쓰지 말고, 필요한 경우 '전체 조회 결과 기준' 또는 '참고 목록'이라고만 표현하세요.\n"
-            "- source_table_label이 없으면 Rddbc210/Rddbc220 같은 테이블명을 추정해서 말하지 말고, '실재고 기준' 또는 '장부재고 기준'까지만 말하라.\n"
-            "- stock_mode가 real 또는 실재고이면 Rddbc220이라고 말하지 마라.\n"
+            "- 전체 집계와 전달된 참고 행을 구분하고 delivery_scope의 생략 범위를 지켜라.\n"
+            "- 이전 표·답변을 근거로 사용하거나 내부 JSON key를 답변에 노출하지 마라.\n"
+            "- 재고 기준과 원천 테이블은 명시된 근거만 사용하고 추정하지 마라.\n"
         )
 
         system_text = msgs[0]["content"] if msgs and msgs[0].get("role") == "system" else ""
+        system_text = system_text.replace(_SIMS_BRIEF_ANALYSIS_RULE, "")
         if "[SIMS_ANALYSIS_RULE]" not in system_text:
             system_text = system_text.rstrip() + analysis_rule
 
@@ -11043,6 +11063,9 @@ def stream_and_append_assistant(
     max_retries: int = 2,   # 스트리밍 중 예외 시 '전체 재시도' 횟수
     backoff: float = 1.5,
     history_channel: str = "gen_messages",
+    verified_analysis_table: str = "",
+    verified_analysis_facts: Optional[dict] = None,
+    structured_analysis_options: Optional[list[dict]] = None,
 ) -> str:
     model_id = EXPECTED_LM_MODEL or st.session_state.get("selected_model") or ""
     collected: List[str] = []
@@ -11063,6 +11086,13 @@ def stream_and_append_assistant(
     )
 
     def _display_text(text: str) -> str:
+        if structured_analysis_options is not None:
+            return compose_structured_analysis_output(
+                verified_analysis_table, text, facts=verified_analysis_facts,
+                options=structured_analysis_options)
+        if verified_analysis_table or verified_analysis_facts is not None:
+            return compose_verified_analysis_output(
+                verified_analysis_table, text, facts=verified_analysis_facts)
         if not current_table_analysis:
             return text
         group_match = re.search(r'"group_column"\\s*:\\s*"([^"]+)"', current_table_context_text)
@@ -11075,7 +11105,7 @@ def stream_and_append_assistant(
 
     ready, ready_message = _llm_request_config_ready(model_id)
     if not ready:
-        final_text = ready_message or LLM_SAFE_MESSAGES["model_not_loaded"]
+        final_text = _display_text(ready_message or LLM_SAFE_MESSAGES["model_not_loaded"])
         assistant_time = make_ts()
         with st.chat_message("assistant"):
             st.markdown(final_text)
@@ -11108,6 +11138,11 @@ def stream_and_append_assistant(
         last_err = None
         wait_slot = st.empty()
         wait_slot.caption("다른 요청 처리 중에는 잠시 대기할 수 있습니다.")
+        verified_analysis = (verified_analysis_table or verified_analysis_facts is not None
+                             or structured_analysis_options is not None)
+        if verified_analysis:
+            container.markdown((verified_analysis_table + "\n\n" if verified_analysis_table else "")
+                               + "_해석 생성 중..._")
 
         def _clear_wait_notice() -> None:
             try:
@@ -11115,7 +11150,8 @@ def stream_and_append_assistant(
             except Exception:
                 pass
 
-        stream_retry_count = bounded_retry_count(max_retries)
+        stream_retry_count = (0 if structured_analysis_options is not None
+                              else bounded_retry_count(max_retries))
         total_stream_tries = stream_retry_count + 1
         for attempt in range(total_stream_tries):
             collected.clear()
@@ -11159,7 +11195,8 @@ def stream_and_append_assistant(
 
                     now_ts = _time.perf_counter()
                     if (now_ts - last_render) >= render_interval and collected:
-                        container.markdown(_display_text("".join(collected)) + "▌")
+                        if not verified_analysis:
+                            container.markdown(_display_text("".join(collected)) + "▌")
                         last_render = now_ts
 
                 final_text = "".join(collected).strip()
@@ -11170,7 +11207,17 @@ def stream_and_append_assistant(
                     final_text = LLM_SAFE_MESSAGES["reasoning_only"]
                 elif not final_text:
                     final_text = LLM_SAFE_MESSAGES["empty_response"]
+                raw_chars = len(final_text)
+                compose_started = _time.perf_counter()
                 final_text = _display_text(final_text)
+                if verified_analysis:
+                    log.info(
+                        "[llm.analysis.output] code_id=%s path=%s raw_chars=%s final_chars=%s table_chars=%s compose_ms=%s",
+                        structured_analysis_code_id() if structured_analysis_options is not None else "legacy",
+                        "structured_evidence" if structured_analysis_options is not None else "legacy_prose",
+                        raw_chars, len(final_text), len(verified_analysis_table),
+                        int((_time.perf_counter() - compose_started) * 1000),
+                    )
 
                 log.info(
                     "[llm.stream] done model=%s attempt=%s/%s first_content=%s ttft_ms=%s finish_reason=%s elapsed_ms=%s reasoning_seen=%s",
@@ -11206,6 +11253,13 @@ def stream_and_append_assistant(
                     err_info.get("status"),
                     err_info.get("exception_type"),
                 )
+                if structured_analysis_options is not None:
+                    final_text = _display_text("")
+                    assistant_time = make_ts()
+                    _clear_wait_notice()
+                    container.markdown(final_text)
+                    caption_slot.caption(assistant_time)
+                    break
                 if collected:
                     final_text = "".join(collected).strip()
                     final_text = _display_text(final_text) + "\n\n_※ 응답 생성 중 연결이 중단되었습니다. 이미 생성된 내용만 표시합니다._"
@@ -13815,7 +13869,7 @@ with chat_history_container:
         try:
             prompt = (prompt or "").strip()
             if not prompt:
-                prompt = "현재 조회 결과를 조회 이해, 핵심 요약, 주요 특징과 확인할 점, LLM 의견 순서로 짧게 분석해줘"
+                prompt = "현재 조회 결과의 주요 수치와 분포, 특징, 확인할 점을 실제 집계 근거로 분석해줘"
 
             selected_ctx_table_key = ""
             selected_ctx_action = ""
@@ -13873,23 +13927,72 @@ with chat_history_container:
             )
 
             try:
-                has_sims = any(
-                    (m.get("role") == "system") and ("SIMS_JSON" in str(m.get("content", "")))
-                    for m in msgs
+                system_content = str(msgs[0].get("content") or "")
+                payload = system_content.split("[SIMS_JSON]\n", 1)[1].split("\n[/SIMS_JSON]", 1)[0]
+                delivered_ctx = json.loads(payload)
+                if delivered_ctx.get("kind") != "SIMS_ANALYSIS_CONTEXT_V1":
+                    raise ValueError("Wrong analysis context kind")
+                verified_table = build_verified_group_table(
+                    delivered_ctx.get("whole_table_facts") or {},
+                    scope=str(delivered_ctx.get("query_scope_summary") or ""),
+                    display_rows=int(delivered_ctx.get("display_row_count") or 0),
                 )
-                log.debug(
-                    "[chat.fragment] build_messages_with_system OK → msgs=%d, has_sims=%s",
-                    len(msgs),
-                    has_sims,
+                if not verified_table and delivered_ctx.get("action") in {"입고명세 조회", "출고명세 조회"}:
+                    verified_table = build_verified_whole_table(
+                        delivered_ctx.get("whole_table_facts") or {},
+                        scope=str(delivered_ctx.get("query_scope_summary") or ""),
+                        display_rows=int(delivered_ctx.get("display_row_count") or 0),
+                    )
+            except (IndexError, ValueError, KeyError, TypeError):
+                attach_error = st.session_state.pop("__sims_analysis_attach_error", {})
+                reason = attach_error.get("reason") if isinstance(attach_error, dict) else ""
+                log.warning("[chat.fragment] LLM analysis blocked reason=%s", reason or "missing_or_invalid_context")
+                if reason == "context_budget_exceeded":
+                    st.warning("분석 근거가 모델 전달 한도를 초과하여 LLM 분석을 실행하지 않았습니다.")
+                elif reason == "group_totals_mismatch":
+                    st.warning("전체 집계와 그룹별 합계가 일치하지 않아 LLM 분석을 실행하지 않았습니다.")
+                else:
+                    st.warning("분석 근거를 안전하게 전달할 수 없어 LLM 분석을 실행하지 않았습니다.")
+                return
+
+            if verified_table:
+                msgs[0]["content"] += (
+                    "\n검증된 집계표는 Python이 별도로 출력합니다. "
+                    "집계표를 다시 만들지 말고 해석과 확인·관리 제안에 집중하세요. "
+                    "수치를 언급할 때는 그룹·지표를 명시하고 whole_table_facts의 해당 값과 비중만 사용하세요. "
+                    "그룹별 검증표가 없으면 그룹별 순위·집중도·Top 목록을 만들지 마세요. "
+                    "실제 지표별 집중도와 결측 근거가 없는 원인은 단정하지 마세요."
                 )
-            except Exception:
-                pass
+
+            verified_facts = dict(delivered_ctx.get("whole_table_facts") or {})
+            verified_facts["display_row_count"] = int(delivered_ctx.get("display_row_count") or 0)
+            verified_facts["query_scope_summary"] = str(delivered_ctx.get("query_scope_summary") or "")
+            structured_options = build_structured_analysis_options(verified_facts)
+            model_options = [
+                {"evidence_id": item["evidence_id"], "topic": item["topic"],
+                 "check_id": item["check_id"], "check": item["check"]}
+                for item in structured_options
+            ]
+            msgs[0]["content"] += (
+                "\n[VERIFIED_EVIDENCE_OPTIONS]\n"
+                + json.dumps(model_options, ensure_ascii=False, separators=(",", ":"))
+                + "\n[/VERIFIED_EVIDENCE_OPTIONS]\n"
+                "이번 분석의 출력은 JSON 객체 {\"items\":[{\"evidence_id\":\"...\","
+                "\"check_id\":\"...\"}]}만 허용합니다. 위 목록에서 중요한 항목을 선택해 순서를 정하세요. "
+                "새 수치·품목명·순위·결측·원인·자유 Markdown은 작성하지 마세요. "
+                "이 규칙은 앞선 일반 서술 형식 지시보다 우선합니다."
+            )
+            log.info("[llm.analysis.path] code_id=%s path=structured_evidence options=%s",
+                     structured_analysis_code_id(), len(structured_options))
 
             stream_and_append_assistant(
                 messages_for_ai=msgs,
                 room=current_room,
                 temperature=0.2,
                 history_channel="sims_messages",
+                verified_analysis_table=verified_table,
+                verified_analysis_facts=verified_facts,
+                structured_analysis_options=structured_options,
             )
 
             log.debug("[chat.fragment] stream_and_append_assistant finished")
