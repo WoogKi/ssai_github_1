@@ -51,6 +51,11 @@ downloads/
 reports/
 temp/
 tmp/
+/artifacts/
+/.codex_task_output/
+/.tmp_onepass/
+/.codex/
+/0
 backup/
 backups/
 _backup_stage_*/
