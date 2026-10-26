@@ -27,7 +27,8 @@ from app.services.sql_server_snapshot_repository import SqlServerSnapshotReposit
 from app.services.ssai_analytics_target_resolver import connect_company_analytics_db  # noqa: E402
 from app.services.ssai_snapshot_repository import SnapshotKey  # noqa: E402
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
-    build_frequency_snapshot_plan, resolve_dashboard_profile_stock_scope, selected_io_snapshot_key,
+    build_frequency_snapshot_plan, require_unified_snapshot_algorithm,
+    resolve_dashboard_profile_stock_scope, selected_io_snapshot_key,
 )
 from app.services.saved_io_scope import resolve_saved_io_scope  # noqa: E402
 
@@ -186,8 +187,11 @@ def _stage(
     return result
 
 
-def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str, Any]:
+def run_approval_workflow(args: argparse.Namespace, repository: Any,
+                          approval_committed: Any | None = None) -> dict[str, Any]:
     """Run the inspect/approve contract once; every external stage is timed and has no retry."""
+    if args.approve:
+        require_unified_snapshot_algorithm(args.evaluation_month, saved_io_full=bool(getattr(args, "saved_io_full", False)))
     key = _key(args)
     if getattr(args, "saved_io_full", False):
         if args.contract_version != "2.1":
@@ -267,6 +271,8 @@ def run_approval_workflow(args: argparse.Namespace, repository: Any) -> dict[str
             **({"saved_io_verified": True} if getattr(args, "saved_io_full", False) else {}),
         ),
     )
+    if approval_committed is not None:
+        approval_committed(inspection.manifest_id, inspection.checksum, dict(timings))
     post = _stage(
         timings,
         "post_approval_inspect_generation",
@@ -344,6 +350,23 @@ def main() -> int:
     parser.add_argument("--approved-by", default="")
     parser.add_argument("--approval-reason", default="")
     args = parser.parse_args()
+    from app.services.snapshot_operation_history import OperationEvent, record_event, utc_now
+    from uuid import uuid4
+
+    run_id = str(uuid4())
+    started_at = utc_now()
+    started = time.perf_counter()
+
+    def committed_event(manifest_id: int, checksum: str, timings: dict[str, int]) -> None:
+        record_event(OperationEvent(
+            args.company_id, "approve_publish", "approval_committed", "stage_complete",
+            run_id=run_id, started_at=started_at, finished_at=utc_now(),
+            evaluation_month=args.evaluation_month, manifest_id=manifest_id,
+            generation_no=args.generation, whole_checksum=checksum,
+            approved_by=str(args.approved_by).strip(), approval_status="approved",
+            details={"stage_timings_ms": timings},
+        ))
+
     try:
         if args.company_id <= 0 or args.generation <= 0 or args.preserve_generation < 0:
             raise ValueError("company_id/generation must be positive and preserve_generation cannot be negative")
@@ -358,10 +381,32 @@ def main() -> int:
                 reader_connection_factory=lambda: connect_company_analytics_db(args.company_id, "reader"),
                 writer_connection_factory=lambda: connect_company_analytics_db(args.company_id, "writer"),
             ),
+            approval_committed=committed_event if args.approve else None,
         )
+        if output.get("integrity_status") == "ready" or (
+                not args.approve and output.get("integrity_status") == "unapproved"):
+            record_event(OperationEvent(
+                args.company_id, "approve_publish" if args.approve else "inspect",
+                "post_publish_verified" if args.approve else "exact_inspected", "succeeded",
+                run_id=run_id, started_at=started_at, finished_at=utc_now(),
+                evaluation_month=args.evaluation_month,
+                manifest_id=output.get("manifest_id"), generation_no=args.generation,
+                whole_checksum=output.get("checksum"),
+                exact_status="pass", approval_status=output.get("approval_status"),
+                approved_by=str(args.approved_by).strip() or None if args.approve else None,
+                total_ms=round((time.perf_counter() - started) * 1000, 3),
+                details={"stage_timings_ms": output.get("stage_elapsed_ms", {})},
+            ))
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
+        record_event(OperationEvent(
+            args.company_id, "approve_publish" if args.approve else "inspect",
+            "workflow_failed", "failed", run_id=run_id, started_at=started_at,
+            finished_at=utc_now(), evaluation_month=args.evaluation_month,
+            generation_no=args.generation, error_code=type(exc).__name__,
+            total_ms=round((time.perf_counter() - started) * 1000, 3),
+        ))
         print(json.dumps({"ok": False, "error_type": type(exc).__name__, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 1
 

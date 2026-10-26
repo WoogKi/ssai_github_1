@@ -681,6 +681,8 @@ def test_migration_idempotency_and_rollback() -> None:
             "007_snapshot_profile_fingerprint",
             "008_frequency_product_statistics_extension",
             "009_frequency_product_x_grade",
+            "010_monthly_io_components",
+            "011_snapshot_operation_event",
         ],
         "001-005 authority must apply migrations 006 and 007 in order",
     )
@@ -701,6 +703,8 @@ def test_migration_idempotency_and_rollback() -> None:
             "007_snapshot_profile_fingerprint",
             "008_frequency_product_statistics_extension",
             "009_frequency_product_x_grade",
+            "010_monthly_io_components",
+            "011_snapshot_operation_event",
         ],
         "001-003 authority must apply 004 through 007 in order",
     )

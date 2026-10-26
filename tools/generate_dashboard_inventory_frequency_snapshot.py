@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import time
 from decimal import Decimal
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
 from app.services.dashboard_inventory_frequency_snapshot_service import (  # noqa: E402
     build_frequency_snapshot_plan,
     generate_frequency_snapshot_draft,
+    require_unified_snapshot_algorithm,
     resolve_dashboard_profile_stock_scope,
     selected_io_snapshot_key,
 )
@@ -90,11 +92,29 @@ def main() -> int:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--saved-io-full", action="store_true", help="company-profile saved-I/O contract")
+    parser.add_argument("--direct-price-baseline", action="store_true", help="Exact comparison only: bypass approved monthly price reuse")
     args = parser.parse_args()
+
+    if args.direct_price_baseline and not args.saved_io_full:
+        parser.error("--direct-price-baseline requires --saved-io-full")
 
     if args.saved_io_full and (args.force or not args.dashboard_profile):
         parser.error("--saved-io-full requires --dashboard-profile and no --force")
+    try:
+        require_unified_snapshot_algorithm(args.evaluation_month, saved_io_full=bool(args.saved_io_full))
+    except SnapshotContractError as exc:
+        parser.error(str(exc))
 
+    from app.services.snapshot_operation_history import OperationEvent, record_event, utc_now
+    from uuid import uuid4
+
+    run_id = str(uuid4())
+    started_at = utc_now()
+    started = time.perf_counter()
+    if args.apply:
+        record_event(OperationEvent(args.company_id, "snapshot_generate", "scope_start", "started",
+                                    run_id=run_id, started_at=started_at,
+                                    evaluation_month=args.evaluation_month))
     manual_scope = None if args.dashboard_profile else ([] if args.all_stock_locations else args.stock_code)
     try:
         resolved_scope = resolve_dashboard_profile_stock_scope(
@@ -112,6 +132,11 @@ def main() -> int:
             stock_mode=resolved_scope.stock_mode,
         )
     except SnapshotContractError as exc:
+        if args.apply:
+            record_event(OperationEvent(args.company_id, "snapshot_generate", "scope_failed", "failed",
+                                        run_id=run_id, started_at=started_at, finished_at=utc_now(),
+                                        evaluation_month=args.evaluation_month,
+                                        error_code=type(exc).__name__))
         print(json.dumps({
             "ok": False,
             "stage": "dashboard_profile_scope",
@@ -119,6 +144,11 @@ def main() -> int:
         }, ensure_ascii=False, indent=2))
         return 1
     except Exception as exc:
+        if args.apply:
+            record_event(OperationEvent(args.company_id, "snapshot_generate", "scope_failed", "failed",
+                                        run_id=run_id, started_at=started_at, finished_at=utc_now(),
+                                        evaluation_month=args.evaluation_month,
+                                        error_code=type(exc).__name__))
         print(json.dumps({
             "ok": False,
             "stage": "dashboard_profile_scope",
@@ -137,6 +167,11 @@ def main() -> int:
         io_scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True)
         output["saved_io_roles"] = io_scope.snapshot_role_report()
         if io_scope.unclassified_codes:
+            if args.apply:
+                record_event(OperationEvent(args.company_id, "snapshot_generate", "scope_failed", "failed",
+                                            run_id=run_id, started_at=started_at, finished_at=utc_now(),
+                                            evaluation_month=args.evaluation_month,
+                                            error_code="saved_io_roles_unconfirmed"))
             output.update({"ok": False, "error_code": "saved_io_roles_unconfirmed"})
             print(json.dumps(output, ensure_ascii=False, indent=2))
             return 1
@@ -146,14 +181,18 @@ def main() -> int:
         return 0
 
     actor = str(args.created_by or getpass.getuser() or "").strip()
+    record_event(OperationEvent(args.company_id, "snapshot_generate", "scope_resolved", "stage_complete",
+                                run_id=run_id, started_at=started_at,
+                                evaluation_month=args.evaluation_month))
     try:
         result = generate_frequency_snapshot_draft(
             plan=plan,
             created_by=actor,
             timeout_seconds=max(1, int(args.timeout_seconds)),
             force=bool(args.force),
-            progress_reporter=lambda message: print(f"[진행] {message}"),
+            progress_reporter=lambda message: print(f"[진행] {message}", flush=True),
             saved_io_full=bool(args.saved_io_full),
+            monthly_reuse=not bool(args.direct_price_baseline),
         )
         relational_snapshot = result["relational_snapshot"]
         draft = result["draft"]
@@ -180,10 +219,29 @@ def main() -> int:
                 "read_status": result["read_status"],
                 "no_op": draft.no_op,
                 "source_metrics": result.get("source_metrics", {}),
+                "generation_elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
             }
         )
+        record_event(OperationEvent(
+            args.company_id, "snapshot_generate", "draft_committed", "succeeded",
+            run_id=run_id, started_at=started_at, finished_at=utc_now(),
+            evaluation_month=args.evaluation_month, manifest_id=draft.manifest_id,
+            generation_no=draft.generation_no, product_count=relational_snapshot.item_count,
+            whole_checksum=relational_snapshot.checksum,
+            total_ms=output["generation_elapsed_ms"],
+            approval_status=draft.approval_status,
+            details={"no_op": bool(draft.no_op),
+                     "source_call_count": result.get("source_metrics", {}).get("source_call_count"),
+                     "grade_counts": grade_counts},
+        ))
     except Exception as exc:
-        output.update({"ok": False, "error_type": type(exc).__name__, "error": str(exc)})
+        record_event(OperationEvent(args.company_id, "snapshot_generate", "generation_failed", "failed",
+                                    run_id=run_id, started_at=started_at, finished_at=utc_now(),
+                                    evaluation_month=args.evaluation_month,
+                                    total_ms=round((time.perf_counter() - started) * 1000, 3),
+                                    error_code=type(exc).__name__))
+        output.update({"ok": False, "error_type": type(exc).__name__, "error": str(exc),
+                       "generation_elapsed_ms": round((time.perf_counter() - started) * 1000, 3)})
         print(json.dumps(output, ensure_ascii=False, indent=2, default=_json_decimal))
         return 1
     print(json.dumps(output, ensure_ascii=False, indent=2, default=_json_decimal))

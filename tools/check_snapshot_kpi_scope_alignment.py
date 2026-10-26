@@ -17,6 +17,7 @@ from app.services.dashboard_inventory_frequency_snapshot_service import (  # noq
     _filter_product_statistics_to_universe,
     _select_snapshot_product_universe,
     build_frequency_snapshot_plan,
+    frequency_snapshot_key,
     frequency_snapshot_read_keys,
     outbound_base_rows_sql,
     read_approved_frequency_projection,
@@ -74,7 +75,8 @@ def test_profile_contract_reaches_snapshot_plan() -> None:
     _assert(plan.io_gu_codes == ("001", "501") and plan.stock_mode == "book", "profile metadata missing")
     keys = frequency_snapshot_read_keys(plan)
     _assert(keys[0].profile_fingerprint != plan.profile_fingerprint, "saved I/O key lost its separate identity")
-    _assert(keys[1].profile_fingerprint == plan.profile_fingerprint, "v2 fallback lost the saved-profile identity")
+    _assert(frequency_snapshot_key(plan, product_statistics=True) in keys[1:],
+            "v2 fallback lost the saved-profile identity")
 
 
 def test_profile_fingerprint_is_canonical_and_sensitive() -> None:

@@ -634,6 +634,205 @@ ALTER TABLE snapshot.frequency_product WITH CHECK ADD CONSTRAINT CK_snapshot_fre
 """
 
 
+MIGRATION_010_SQL = """
+IF DB_NAME() <> N'SSAI_ANALYTICS'
+    THROW 51010, 'Monthly IO draft targets SSAI_ANALYTICS only', 1;
+IF OBJECT_ID(N'snapshot.frequency_month_manifest', N'U') IS NULL
+    THROW 51011, 'Migrations 001-009 and month manifest are required', 1;
+IF OBJECT_ID(N'snapshot.monthly_io_fact', N'U') IS NOT NULL
+    THROW 51012, 'Monthly IO fact already exists; inspect migration ledger', 1;
+IF COL_LENGTH(N'snapshot.frequency_month_manifest', N'profile_fingerprint') IS NOT NULL
+   OR COL_LENGTH(N'snapshot.frequency_month_manifest', N'operating_schema_version') IS NOT NULL
+   OR COL_LENGTH(N'snapshot.frequency_month_manifest', N'operating_algorithm_version') IS NOT NULL
+    THROW 51013, 'Monthly IO manifest columns already exist; inspect migration ledger', 1;
+
+ALTER TABLE snapshot.frequency_month_manifest ADD
+    profile_fingerprint CHAR(64) NULL,
+    operating_schema_version NVARCHAR(32) NULL,
+    operating_algorithm_version NVARCHAR(64) NULL,
+    source_verified_at DATETIME2(3) NULL;
+
+-- SQL Server compiles a batch against the pre-ALTER table shape. Compile the
+-- constraint that refers to additive columns in a new dynamic batch, as 006/007 do.
+EXEC(N'
+ALTER TABLE snapshot.frequency_month_manifest ADD
+    CONSTRAINT CK_snapshot_frequency_month_io_contract CHECK (
+        algorithm_version <> N''monthly_io_components_v2''
+        OR (
+            schema_version = N''1.2''
+            AND profile_fingerprint IS NOT NULL AND LEN(profile_fingerprint) = 64
+            AND operating_schema_version IS NOT NULL AND operating_schema_version = N''2.1''
+            AND operating_algorithm_version IS NOT NULL
+            AND operating_algorithm_version =
+                N''outbound_frequency_product_v3+saved_io_avg_purchase_v1''
+        )
+    );
+');
+
+-- Existing unique CURRENT index still permits one published profile per
+-- company/month/stock-scope/version; do not silently relax its approval rule.
+CREATE UNIQUE INDEX UX_snapshot_frequency_month_manifest_owner
+ON snapshot.frequency_month_manifest (manifest_id, company_id, basis_month);
+
+CREATE TABLE snapshot.monthly_io_fact (
+    manifest_id BIGINT NOT NULL,
+    company_id NVARCHAR(128) NOT NULL,
+    basis_month CHAR(6) NOT NULL,
+    source_kind CHAR(4) NOT NULL,
+    row_kind VARCHAR(16) NOT NULL,
+    product_code NVARCHAR(128) NOT NULL,
+    stock_code NVARCHAR(128) NOT NULL,
+    io_gcode CHAR(4) NOT NULL,
+    io_code CHAR(3) NOT NULL,
+    bucket_unit_price DECIMAL(28,6) NOT NULL,
+    raw_product_code NVARCHAR(128) NOT NULL,
+    source_row_count BIGINT NOT NULL,
+    normal_event_count BIGINT NOT NULL,
+    return_event_count BIGINT NOT NULL,
+    eligible_price_row_count BIGINT NOT NULL,
+    source_paid_quantity DECIMAL(38,6) NOT NULL,
+    source_bonus_quantity DECIMAL(38,6) NOT NULL,
+    source_original_supply_amount DECIMAL(38,6) NOT NULL,
+    source_final_supply_amount DECIMAL(38,6) NOT NULL,
+    normal_event_quantity DECIMAL(38,6) NOT NULL,
+    return_quantity DECIMAL(38,6) NOT NULL,
+    return_supply_amount DECIMAL(38,6) NOT NULL,
+    eligible_paid_quantity DECIMAL(38,6) NOT NULL,
+    eligible_supply_amount DECIMAL(38,6) NOT NULL,
+    first_qualifying_date CHAR(8) NULL,
+    last_qualifying_date CHAR(8) NULL,
+    last_purchase_date CHAR(8) NULL,
+    last_purchase_seq INT NULL,
+    last_vendor_code NVARCHAR(128) NULL,
+    last_tie_count BIGINT NULL,
+    last_tie_conflict BIT NOT NULL,
+    row_checksum CHAR(64) NOT NULL,
+    CONSTRAINT PK_snapshot_monthly_io_fact PRIMARY KEY (
+        manifest_id, source_kind, row_kind, product_code, stock_code,
+        io_gcode, io_code, bucket_unit_price, raw_product_code
+    ),
+    CONSTRAINT FK_snapshot_monthly_io_fact_owner FOREIGN KEY (
+        manifest_id, company_id, basis_month
+    ) REFERENCES snapshot.frequency_month_manifest (
+        manifest_id, company_id, basis_month
+    ),
+    CONSTRAINT CK_snapshot_monthly_io_fact_source CHECK (
+        source_kind IN ('R110','R120')
+        AND io_gcode = '0012'
+        AND io_code LIKE '[0-9][0-9][0-9]'
+    ),
+    CONSTRAINT CK_snapshot_monthly_io_fact_counts CHECK (
+        source_row_count >= 0
+        AND normal_event_count >= 0 AND return_event_count >= 0
+        AND eligible_price_row_count >= 0
+        AND (last_tie_count IS NULL OR last_tie_count >= 1)
+    ),
+    CONSTRAINT CK_snapshot_monthly_io_fact_eligible CHECK (
+        normal_event_quantity >= 0 AND return_quantity >= 0
+        AND return_supply_amount >= 0
+        AND eligible_paid_quantity >= 0 AND eligible_supply_amount >= 0
+    ),
+    CONSTRAINT CK_snapshot_monthly_io_fact_dates CHECK (
+        (first_qualifying_date IS NULL AND last_qualifying_date IS NULL)
+        OR (first_qualifying_date IS NOT NULL AND last_qualifying_date IS NOT NULL
+            AND first_qualifying_date <= last_qualifying_date)
+    ),
+    CONSTRAINT CK_snapshot_monthly_io_fact_kind CHECK (
+        (row_kind = 'BASE' AND source_row_count > 0
+         AND bucket_unit_price = -1 AND raw_product_code = N''
+         AND last_purchase_date IS NULL AND last_purchase_seq IS NULL
+         AND last_vendor_code IS NULL AND last_tie_count IS NULL
+         AND last_tie_conflict = 0)
+        OR
+        (row_kind = 'PRICE_BUCKET' AND source_kind = 'R110'
+         AND source_row_count = 0 AND eligible_price_row_count > 0
+         AND eligible_paid_quantity > 0 AND eligible_supply_amount > 0
+         AND bucket_unit_price >= 0 AND raw_product_code = N''
+         AND stock_code = N'' AND io_gcode = '0012' AND io_code = '000'
+         AND last_purchase_date IS NULL AND last_purchase_seq IS NULL
+         AND last_vendor_code IS NULL AND last_tie_count IS NULL
+         AND last_tie_conflict = 0)
+        OR
+        (row_kind = 'PRICE_TAIL' AND source_kind = 'R110'
+         AND source_row_count = 0 AND eligible_price_row_count > 0
+         AND bucket_unit_price = -1 AND raw_product_code <> N''
+         AND stock_code = N'' AND io_gcode = '0012' AND io_code = '000'
+         AND last_purchase_date IS NOT NULL
+         AND last_tie_count IS NOT NULL AND last_tie_count >= 1
+         AND ((last_tie_conflict = 0 AND eligible_paid_quantity > 0
+               AND eligible_supply_amount > 0)
+           OR (last_tie_conflict = 1 AND eligible_paid_quantity = 0
+               AND eligible_supply_amount = 0)))
+    )
+);
+
+GRANT SELECT ON OBJECT::snapshot.monthly_io_fact TO [ssai_snapshot_reader];
+GRANT SELECT, INSERT ON OBJECT::snapshot.monthly_io_fact TO [ssai_snapshot_writer];
+"""
+
+
+MIGRATION_011_SQL = """
+CREATE TABLE snapshot.operation_event (
+    event_id BIGINT IDENTITY(1,1) NOT NULL CONSTRAINT PK_snapshot_operation_event PRIMARY KEY,
+    event_key CHAR(64) NOT NULL,
+    company_id NVARCHAR(128) NOT NULL,
+    analytics_target_hash CHAR(64) NOT NULL,
+    run_id UNIQUEIDENTIFIER NOT NULL,
+    operation_kind VARCHAR(32) NOT NULL,
+    stage VARCHAR(48) NOT NULL,
+    result_status VARCHAR(20) NOT NULL,
+    origin VARCHAR(16) NOT NULL,
+    event_at DATETIME2(3) NOT NULL CONSTRAINT DF_snapshot_operation_event_at DEFAULT SYSUTCDATETIME(),
+    operation_date DATE NULL,
+    started_at DATETIME2(3) NULL,
+    finished_at DATETIME2(3) NULL,
+    evaluation_month CHAR(6) NULL,
+    basis_month CHAR(6) NULL,
+    manifest_id BIGINT NULL,
+    generation_no INT NULL,
+    profile_fingerprint CHAR(64) NULL,
+    product_count BIGINT NULL,
+    fact_count BIGINT NULL,
+    source_row_count BIGINT NULL,
+    exact_status VARCHAR(20) NULL,
+    whole_checksum CHAR(64) NULL,
+    source_ms DECIMAL(18,3) NULL,
+    calculation_ms DECIMAL(18,3) NULL,
+    storage_ms DECIMAL(18,3) NULL,
+    total_ms DECIMAL(18,3) NULL,
+    approved_by NVARCHAR(128) NULL,
+    approval_status VARCHAR(20) NULL,
+    deleted_manifest_ids NVARCHAR(400) NULL,
+    deleted_rows BIGINT NULL,
+    reserved_delta_kib BIGINT NULL,
+    error_code NVARCHAR(128) NULL,
+    source_report NVARCHAR(128) NULL,
+    details_json NVARCHAR(2000) NULL,
+    CONSTRAINT UQ_snapshot_operation_event_key UNIQUE (event_key),
+    CONSTRAINT CK_snapshot_operation_event_result CHECK (
+        result_status IN ('started','stage_complete','succeeded','failed','skipped')
+    ),
+    CONSTRAINT CK_snapshot_operation_event_origin CHECK (origin IN ('runtime','backfill')),
+    CONSTRAINT CK_snapshot_operation_event_counts CHECK (
+        (product_count IS NULL OR product_count >= 0)
+        AND (fact_count IS NULL OR fact_count >= 0)
+        AND (source_row_count IS NULL OR source_row_count >= 0)
+        AND (deleted_rows IS NULL OR deleted_rows >= 0)
+        AND (reserved_delta_kib IS NULL OR reserved_delta_kib >= 0)
+    )
+);
+
+CREATE INDEX IX_snapshot_operation_event_search
+ON snapshot.operation_event (company_id,event_at DESC,event_id DESC)
+INCLUDE (operation_kind,result_status,evaluation_month,manifest_id,generation_no,total_ms);
+CREATE INDEX IX_snapshot_operation_event_run
+ON snapshot.operation_event (run_id,event_id);
+
+GRANT SELECT ON OBJECT::snapshot.operation_event TO [ssai_snapshot_reader];
+GRANT SELECT, INSERT ON OBJECT::snapshot.operation_event TO [ssai_snapshot_writer];
+"""
+
+
 MIGRATIONS = (
     SnapshotMigration("001_snapshot_manifest_payload", MIGRATION_001_SQL),
     SnapshotMigration("002_snapshot_frequency_projection", MIGRATION_002_SQL),
@@ -644,6 +843,8 @@ MIGRATIONS = (
     SnapshotMigration("007_snapshot_profile_fingerprint", MIGRATION_007_SQL),
     SnapshotMigration("008_frequency_product_statistics_extension", MIGRATION_008_SQL),
     SnapshotMigration("009_frequency_product_x_grade", MIGRATION_009_SQL),
+    SnapshotMigration("010_monthly_io_components", MIGRATION_010_SQL),
+    SnapshotMigration("011_snapshot_operation_event", MIGRATION_011_SQL),
 )
 
 

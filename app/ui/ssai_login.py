@@ -197,6 +197,7 @@ def _clear_company_dependent_state() -> None:
         "__sims_force_open",
         "__sims_run_flag",
         "__sims_inner_submit",
+        "__snapshot_history_query_result",
     ]
 
     for key in keys_to_clear:

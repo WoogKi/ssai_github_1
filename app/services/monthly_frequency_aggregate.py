@@ -726,6 +726,9 @@ def product_lifecycle_sql(
     exclude_management_only: bool = False,
     io_scope: SavedIoScope | None = None,
     average_purchase_price: bool = False,
+    cached_purchase_manifest_ids: Iterable[int] = (),
+    cached_purchase_company_id: int | None = None,
+    precomputed_purchase_prices: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Read profile-scoped lifecycle and product-universe evidence once."""
     cutoff = str(cutoff_date or "").strip()
@@ -785,13 +788,38 @@ def product_lifecycle_sql(
     shadow_price = io_scope is not None and io_scope.policy_version == FULL_POLICY_VERSION
     if average_purchase_price and not shadow_price:
         raise SnapshotContractError("average purchase price requires the verified saved I/O scope")
+    cache_manifests = tuple(sorted(set(int(value) for value in cached_purchase_manifest_ids)))
+    if cache_manifests and (not average_purchase_price or not cached_purchase_company_id):
+        raise SnapshotContractError("monthly price cache requires the saved I/O average contract")
+    if precomputed_purchase_prices and (not average_purchase_price or cache_manifests):
+        raise SnapshotContractError("precomputed purchase prices require the saved I/O average contract")
+    cache_cte = ""
+    cache_filter_candidate = ""
+    cache_filter_apply = ""
+    if cache_manifests:
+        binds["cached_purchase_company_id"] = str(cached_purchase_company_id)
+        manifest_names = []
+        for index, manifest_id in enumerate(cache_manifests):
+            name = f"cached_purchase_manifest_{index}"
+            binds[name] = manifest_id
+            manifest_names.append(f":{name}")
+        cache_cte = f"""CachedPurchaseProduct AS (
+    SELECT F.product_code FROM SSAI_ANALYTICS.snapshot.monthly_io_fact AS F
+    WHERE F.company_id=:cached_purchase_company_id
+      AND F.manifest_id IN ({', '.join(manifest_names)})
+      AND F.source_kind='R110' AND F.row_kind IN ('PRICE_BUCKET','PRICE_TAIL')
+      AND F.last_tie_conflict=0
+    GROUP BY F.product_code
+),\n"""
+        cache_filter_candidate = "AND NOT EXISTS (SELECT 1 FROM CachedPurchaseProduct AS CP WHERE CP.product_code=LTRIM(RTRIM(I.Rd11_Physic_Cd)))"
+        cache_filter_apply = "AND NOT EXISTS (SELECT 1 FROM CachedPurchaseProduct AS CP WHERE CP.product_code=P.product_code)"
     if average_purchase_price:
         three_month_start = datetime.strptime(basis_start, "%Y%m%d").replace(day=1)
         six_month_start = (three_month_start.year * 12 + three_month_start.month - 1) - 3
         binds["purchase_three_month_from"] = basis_start
         binds["purchase_six_month_from"] = f"{six_month_start // 12:04d}{six_month_start % 12 + 1:02d}01"
         binds["representative_vendor_from"] = basis_start
-        price_ctes = f"""VendorAggregate AS (
+        price_ctes = f"""{cache_cte}VendorAggregate AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
            LTRIM(RTRIM(I.Rd11_Ven_Cd)) AS vendor_code,
            SUM(CAST(I.Rd11_Quantity AS decimal(38, 6))) AS vendor_quantity,
@@ -814,7 +842,9 @@ def product_lifecycle_sql(
            CAST(NULL AS varchar(20)) AS cost_apply_code
     FROM ProductUniverse AS P
     LEFT JOIN RankedVendor AS RV ON RV.product_code = P.product_code AND RV.vendor_rank = 1
-), PurchaseCandidates AS (
+)"""
+        if not precomputed_purchase_prices:
+            price_ctes += f""", PurchaseCandidates AS (
     SELECT LTRIM(RTRIM(I.Rd11_Physic_Cd)) AS product_code,
            I.Rd11_In_YyMmDd AS purchase_date,
            CAST(I.Rd11_Quantity AS decimal(28, 6)) AS paid_quantity,
@@ -826,6 +856,7 @@ def product_lifecycle_sql(
       AND I.Rd11_Quantity > 0 AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
       AND I.Rd11_In_YyMmDd BETWEEN :purchase_six_month_from AND :basis_to
       {inbound_stock}
+      {cache_filter_candidate}
 ), PurchaseWindow AS (
     SELECT C.*, SUM(CASE WHEN purchase_date >= :purchase_three_month_from THEN 1 ELSE 0 END)
                   OVER (PARTITION BY product_code) AS recent_trade_count
@@ -1078,7 +1109,22 @@ def product_lifecycle_sql(
         "LEFT JOIN RepresentativeContract AS RC ON RC.product_code=P.product_code"
         if shadow_price and snapshot_projection_only else ""
     )
-    if average_purchase_price:
+    if average_purchase_price and precomputed_purchase_prices:
+        excluded_trade_select = (
+            "       CAST(0 AS bigint) AS excluded_purchase_trade_count,\n"
+            "       CAST(NULL AS decimal(38,6)) AS excluded_purchase_quantity,"
+            " CAST(NULL AS decimal(38,6)) AS excluded_purchase_amount,\n"
+            "       CAST(NULL AS decimal(38,6)) AS original_purchase_quantity,"
+            " CAST(NULL AS decimal(38,6)) AS original_purchase_amount,\n"
+            "       CAST(NULL AS decimal(28,6)) AS purchase_center_price,\n"
+            "       CAST(NULL AS varchar(16)) AS purchase_price_basis_kind,\n"
+        )
+        price_projection = (
+            "CAST(NULL AS decimal(38,10)) AS avg_purchase_unit_cost,\n"
+            "       CAST(NULL AS char(6)) AS purchase_price_basis_month"
+        )
+        price_join = ""
+    elif average_purchase_price:
         excluded_trade_select = (
             "       COALESCE(PA.excluded_trade_count, 0) AS excluded_purchase_trade_count,\n"
             "       PA.excluded_quantity AS excluded_purchase_quantity, PA.excluded_amount AS excluded_purchase_amount,\n"
@@ -1105,6 +1151,7 @@ OUTER APPLY (
       AND I.Rd11_Quantity > 0 AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
       AND I.Rd11_In_YyMmDd < :purchase_six_month_from
       {inbound_stock}
+      {cache_filter_apply}
     ORDER BY I.Rd11_In_YyMmDd DESC, I.Rd11_In_Seq DESC, I.Rd11_Ven_Cd DESC
 ) AS L0
 OUTER APPLY (
@@ -1118,6 +1165,7 @@ OUTER APPLY (
       AND I.Rd11_Quantity > 0 AND COALESCE(I.Rd11_Fin_Supply_Price, I.Rd11_Supply_Price, 0) > 0
       AND I.Rd11_In_YyMmDd < :purchase_six_month_from
       {inbound_stock}
+      {cache_filter_apply}
     ORDER BY I.Rd11_In_YyMmDd DESC, I.Rd11_In_Seq DESC, I.Rd11_Ven_Cd DESC
 ) AS L1"""
     else:

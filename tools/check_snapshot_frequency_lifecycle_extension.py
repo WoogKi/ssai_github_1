@@ -168,7 +168,7 @@ def test_migration_006_sql_server_batch_boundary() -> None:
         "new-column constraints escaped the dynamic compile scope",
     )
     _assert(
-        [migration.migration_id for migration in MIGRATIONS][-5:-1]
+        [migration.migration_id for migration in MIGRATIONS][4:8]
         == [
             "005_frequency_lifecycle_authority",
             "006_frequency_product_lifecycle_extension",

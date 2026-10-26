@@ -55,7 +55,8 @@ def _safe_key(value: Any) -> str:
 
 def _can_use_admin_page() -> bool:
     return (
-        has_permission("USER_APPROVE")
+        _is_super_admin_user(get_current_user())
+        or has_permission("USER_APPROVE")
         or has_permission("USER_MANAGE_ALL")
         or has_permission("USER_MANAGE_COMPANY")
         or has_permission("COMPANY_MANAGE")
@@ -173,6 +174,11 @@ def render_ssai_admin_sidebar() -> None:
         if _can_view_audit_logs():
             if st.button("감사 로그 조회", width="stretch", key="__ssai_admin_audit_logs_btn"):
                 st.session_state[SESSION_ADMIN_PAGE] = "audit_logs"
+                st.rerun()
+
+        if _is_super_admin_user(get_current_user()):
+            if st.button("집계 작업 이력", width="stretch", key="__ssai_snapshot_history_btn"):
+                st.session_state[SESSION_ADMIN_PAGE] = "snapshot_operation_history"
                 st.rerun()
 
         if st.session_state.get(SESSION_ADMIN_PAGE):
@@ -1953,6 +1959,15 @@ def render_ssai_admin_page() -> bool:
 
     if not page:
         return False
+
+    if page == "snapshot_operation_history":
+        if not _is_super_admin_user(get_current_user()):
+            st.error("관리자 권한이 필요합니다.")
+            return True
+        from app.ui.snapshot_operation_history import render_snapshot_operation_history_page
+
+        render_snapshot_operation_history_page()
+        return True
 
     if page == "user_approval":
         render_user_approval_page()

@@ -691,7 +691,9 @@ def test_sql_and_migration_contract() -> None:
         "estimated_contribution_amount", "contribution_grade", "profitability_status",
     )
     _assert(all(column in MIGRATION_008_SQL for column in required), "migration columns")
-    _assert(MIGRATIONS[-1].migration_id == "009_frequency_product_x_grade", "migration order")
+    _assert(MIGRATIONS[8].migration_id == "009_frequency_product_x_grade"
+            and MIGRATIONS[9].migration_id == "010_monthly_io_components"
+            and MIGRATIONS[-1].migration_id == "011_snapshot_operation_event", "migration order")
     _assert("DROP CONSTRAINT CK_snapshot_frequency_product_profit_grade" in MIGRATION_009_SQL and "'X'" in MIGRATION_009_SQL, "versioned X grade migration")
 
 

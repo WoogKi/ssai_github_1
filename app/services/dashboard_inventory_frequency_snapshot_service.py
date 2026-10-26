@@ -8,6 +8,7 @@ import tempfile
 import time
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from dataclasses import dataclass, replace
@@ -690,6 +691,8 @@ def _product_dimension_scope_sql(
     binds: dict[str, Any],
     *,
     product_alias: str,
+    source_alias: str = "O",
+    source_product_column: str = "Rd12_Physic_Cd",
 ) -> tuple[str, str]:
     """Bind the stored Dashboard Gcode:Tcode product scope without coercion."""
     clauses: list[str] = []
@@ -714,7 +717,7 @@ def _product_dimension_scope_sql(
     if not clauses:
         return "", ""
     return (
-        f"INNER JOIN dbo.Rddbc040 AS {product_alias} ON {product_alias}.Rd04_Physic_Cd = O.Rd12_Physic_Cd",
+        f"INNER JOIN dbo.Rddbc040 AS {product_alias} ON {product_alias}.Rd04_Physic_Cd = {source_alias}.{source_product_column}",
         "AND " + "\n  AND ".join(clauses),
     )
 
@@ -1111,6 +1114,9 @@ def product_statistics_raw_event_stream_sql(
     plan: FrequencySnapshotPlan,
     *,
     io_scope: SavedIoScope | None = None,
+    include_original_supply: bool = False,
+    stream_from: str | None = None,
+    ordered: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Return one ordered, profile-scoped R120 stream for Python aggregation."""
     if io_scope is not None:
@@ -1118,7 +1124,7 @@ def product_statistics_raw_event_stream_sql(
     binds: dict[str, Any] = {
         "basis_from": plan.basis_from,
         "basis_to": plan.basis_to,
-        "price_lookback_from": _month_start_months_before(plan.basis_from, 9),
+        "price_lookback_from": stream_from or _month_start_months_before(plan.basis_from, 9),
     }
     stock_clause = ""
     if plan.stock_codes:
@@ -1148,14 +1154,66 @@ SELECT LTRIM(RTRIM(O.Rd12_Out_YyMmDd)) AS outbound_date,
        CAST(COALESCE(O.Rd12_Quantity,0)+COALESCE(O.Rd12_Oquantity,0) AS decimal(38,6)) AS outbound_quantity,
        CAST(COALESCE(O.Rd12_Quantity,0) AS decimal(38,6)) AS paid_quantity,
        CAST(COALESCE(O.Rd12_Fin_Supply_Price,O.Rd12_Supply_Price,0) AS decimal(38,6)) AS supply_amount
+       {', CAST(COALESCE(O.Rd12_Supply_Price,0) AS decimal(38,6)) AS original_supply_amount' if include_original_supply else ''}
 FROM dbo.Rddbc120 AS O
 {product_join}
 WHERE O.Rd12_Out_YyMmDd >= :price_lookback_from AND O.Rd12_Out_YyMmDd <= :basis_to
   {stock_clause}
   {selected_io_clause}
   {product_clause}
-ORDER BY O.Rd12_Out_YyMmDd, O.Rd12_Ven_Cd, O.Rd12_Out_Seq{', O.Rd12_Io_Gu' if io_scope is not None and io_scope.policy_version == FULL_POLICY_VERSION else ''}
+{"ORDER BY O.Rd12_Out_YyMmDd, O.Rd12_Ven_Cd, O.Rd12_Out_Seq" + (", O.Rd12_Io_Gu" if io_scope is not None and io_scope.policy_version == FULL_POLICY_VERSION else "") if ordered else ""}
 """.strip(), binds
+
+
+def product_statistics_compact_event_stream_sql(
+    plan: FrequencySnapshotPlan, *, io_scope: SavedIoScope,
+) -> tuple[str, dict[str, Any]]:
+    """Keep recent slip rows exact; send only deduplicated monthly price evidence for older rows."""
+    raw_sql, raw_binds = product_statistics_raw_event_stream_sql(plan, io_scope=io_scope, ordered=False)
+    binds = dict(raw_binds)
+    normal_clause = bind_io_codes("H.io_tcode", io_scope.outbound_codes, binds, prefix="historical_normal_io")
+    sql = f"""WITH Raw AS (
+{raw_sql}
+), HistoricalExact AS (
+    SELECT H.outbound_date,H.vendor_code,H.outbound_seq,H.io_tcode,
+           H.product_code,H.stock_code,H.outbound_quantity,
+           MAX(H.paid_quantity) AS paid_quantity,
+           MAX(H.supply_amount) AS supply_amount
+    FROM Raw AS H
+    WHERE H.outbound_date < :basis_from AND H.io_gcode='0012' AND {normal_clause}
+      AND H.outbound_quantity > 0 AND H.outbound_quantity=FLOOR(H.outbound_quantity)
+      AND H.outbound_date <> '' AND H.vendor_code <> '' AND H.outbound_seq <> ''
+      AND H.product_code <> '' AND H.stock_code <> ''
+    GROUP BY H.outbound_date,H.vendor_code,H.outbound_seq,H.io_tcode,
+             H.product_code,H.stock_code,H.outbound_quantity
+), HistoricalSlip AS (
+    SELECT outbound_date,vendor_code,outbound_seq,io_tcode,
+           COUNT_BIG(*) AS mapping_count,MAX(product_code) AS product_code,
+           MAX(paid_quantity) AS paid_quantity,MAX(supply_amount) AS supply_amount
+    FROM HistoricalExact
+    GROUP BY outbound_date,vendor_code,outbound_seq,io_tcode
+), HistoricalMonthly AS (
+    SELECT product_code,LEFT(outbound_date,6) AS basis_month,
+           SUM(paid_quantity) AS paid_quantity,SUM(supply_amount) AS supply_amount
+    FROM HistoricalSlip
+    WHERE mapping_count=1 AND paid_quantity > 0 AND supply_amount > 0
+    GROUP BY product_code,LEFT(outbound_date,6)
+)
+SELECT CONCAT(basis_month,'01') AS outbound_date,
+       CAST('' AS varchar(100)) AS vendor_code,CAST('' AS varchar(100)) AS outbound_seq,
+       product_code,CAST('' AS varchar(100)) AS stock_code,
+       CAST('0012' AS varchar(4)) AS io_gcode,CAST('000' AS varchar(3)) AS io_tcode,
+       CAST('' AS varchar(100)) AS cost_apply_code,
+       CAST(0 AS decimal(38,6)) AS outbound_quantity,
+       paid_quantity,supply_amount,CAST('historical_price' AS varchar(20)) AS stream_row_kind
+FROM HistoricalMonthly
+UNION ALL
+SELECT outbound_date,vendor_code,outbound_seq,product_code,stock_code,
+       io_gcode,io_tcode,cost_apply_code,outbound_quantity,paid_quantity,supply_amount,
+       CAST('raw' AS varchar(20)) AS stream_row_kind
+FROM Raw WHERE outbound_date >= :basis_from
+ORDER BY outbound_date,vendor_code,outbound_seq,io_tcode"""
+    return sql, binds
 
 def _fixture_decimal(value: Any, *, field: str) -> Decimal:
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -1227,6 +1285,7 @@ def _query_company_chunks(
     *,
     chunk_rows: int = 50000,
     metrics: dict[str, Any] | None = None,
+    use_driver_cursor: bool = False,
 ) -> Iterable[pd.DataFrame]:
     """Read one ERP statement incrementally without retaining its full event result."""
     previous_company_id = get_current_company_id()
@@ -1237,25 +1296,48 @@ def _query_company_chunks(
             if hasattr(raw, "timeout"):
                 raw.timeout = max(1, int(timeout_seconds))
             query_started = time.perf_counter()
-            chunks = pd.read_sql_query(
-                text(sql), conn, params=dict(params), chunksize=max(1, int(chunk_rows)), coerce_float=False
-            )
+            cursor = None
+            if use_driver_cursor:
+                compiled = text(sql).compile(dialect=conn.dialect)
+                names = compiled.positiontup
+                if not names or any(name not in params for name in names):
+                    raise SnapshotContractError("outbound stream bind compilation is incomplete")
+                cursor = raw.cursor()
+                cursor.arraysize = min(max(1, int(chunk_rows)), 10000)
+                cursor.execute(str(compiled), *(params[name] for name in names))
+                columns = [str(item[0]) for item in cursor.description]
+                chunks = None
+            else:
+                chunks = pd.read_sql_query(
+                    text(sql), conn, params=dict(params), chunksize=max(1, int(chunk_rows)), coerce_float=False
+                )
             query_finished = time.perf_counter()
             fetched_rows = 0
             fetch_ms = 0.0
-            iterator = iter(chunks)
-            while True:
-                fetch_started = time.perf_counter()
-                try:
-                    chunk = next(iterator)
-                except StopIteration:
+            try:
+                iterator = iter(chunks) if chunks is not None else None
+                while True:
+                    fetch_started = time.perf_counter()
+                    if cursor is not None:
+                        batch = cursor.fetchmany(max(1, int(chunk_rows)))
+                        if not batch:
+                            fetch_ms += (time.perf_counter() - fetch_started) * 1000
+                            break
+                        chunk = pd.DataFrame.from_records(batch, columns=columns, coerce_float=False)
+                    else:
+                        try:
+                            chunk = next(iterator)
+                        except StopIteration:
+                            fetch_ms += (time.perf_counter() - fetch_started) * 1000
+                            break
                     fetch_ms += (time.perf_counter() - fetch_started) * 1000
-                    break
-                fetch_ms += (time.perf_counter() - fetch_started) * 1000
-                if not isinstance(chunk, pd.DataFrame):
-                    raise SnapshotContractError("outbound event stream returned an invalid chunk")
-                fetched_rows += len(chunk)
-                yield chunk
+                    if not isinstance(chunk, pd.DataFrame):
+                        raise SnapshotContractError("outbound event stream returned an invalid chunk")
+                    fetched_rows += len(chunk)
+                    yield chunk
+            finally:
+                if cursor is not None:
+                    cursor.close()
             if metrics is not None:
                 metrics.update({
                     "db_query_ms": round((query_finished - query_started) * 1000, 3),
@@ -1322,6 +1404,8 @@ def _python_product_statistics_projection_chunks(
     output_chunk_rows: int = 50000,
     metrics: dict[str, Any] | None = None,
     io_scope: SavedIoScope | None = None,
+    raw_row_observer: Callable[[Mapping[str, Any]], None] | None = None,
+    accepted_event_observer: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> Iterable[pd.DataFrame]:
     """Convert one ordered raw R120 stream to the legacy 22-column projection."""
     required = {
@@ -1368,6 +1452,13 @@ def _python_product_statistics_projection_chunks(
                 price = sales_monthly.setdefault(price_key, [Decimal(0), Decimal(0)])
                 price[0] += paid_quantity
                 price[1] += supply_amount
+            if mapping_count == 1 and accepted_event_observer is not None and outbound_date >= basis_from:
+                accepted_event_observer({
+                    "kind": "normal", "month": outbound_date[:6], "product_code": product_code,
+                    "stock_code": stock_code, "io_code": current_slip[3] if preserve_io_role else "",
+                    "quantity": outbound_quantity, "paid_quantity": paid_quantity,
+                    "supply_amount": supply_amount,
+                })
             if outbound_date >= basis_from:
                 if preserve_io_role and metrics is not None and mapping_count == 1:
                     io_tcode = current_slip[3]
@@ -1392,6 +1483,13 @@ def _python_product_statistics_projection_chunks(
                 current[0] += 1
                 current[1] += -outbound_quantity
                 current[2] += -supply_amount
+                if accepted_event_observer is not None:
+                    accepted_event_observer({
+                        "kind": "return", "month": outbound_date[:6], "product_code": product_code,
+                        "stock_code": key[1], "io_code": current_slip[3] if preserve_io_role else "",
+                        "quantity": -outbound_quantity, "paid_quantity": Decimal(0),
+                        "supply_amount": -supply_amount,
+                    })
                 if preserve_io_role and metrics is not None:
                     io_tcode = current_slip[3]
                     returns = metrics.setdefault("return_event_count_by_io", {})
@@ -1407,6 +1505,16 @@ def _python_product_statistics_projection_chunks(
         if not isinstance(chunk, pd.DataFrame) or not required.issubset(chunk.columns):
             raise SnapshotContractError("raw outbound event stream columns are invalid")
         for record in chunk.to_dict("records"):
+            if record.get("stream_row_kind") == "historical_price":
+                key = (_stream_text(record.get("product_code")), _stream_text(record.get("outbound_date"))[:6])
+                current = sales_monthly.setdefault(key, [Decimal(0), Decimal(0)])
+                current[0] += _stream_decimal(record.get("paid_quantity"), field="paid_quantity")
+                current[1] += _stream_decimal(record.get("supply_amount"), field="supply_amount")
+                if metrics is not None:
+                    metrics["historical_price_group_count"] = int(metrics.get("historical_price_group_count", 0)) + 1
+                continue
+            if raw_row_observer is not None:
+                raw_row_observer(record)
             outbound_date = _stream_text(record.get("outbound_date"))
             vendor_code = _stream_text(record.get("vendor_code"))
             outbound_seq = _stream_text(record.get("outbound_seq"))
@@ -1778,6 +1886,109 @@ def _aggregate_result(frame: pd.DataFrame) -> tuple[list[dict[str, Any]], dict[s
     return rows, diagnostics
 
 
+def _load_approved_monthly_purchase_prices(
+    plan: FrequencySnapshotPlan, io_scope: SavedIoScope,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Use only approved, checksum-checked monthly evidence; do not requery ERP."""
+    from app.services.monthly_io_components import reconstruct_purchase_prices
+    from app.services.sql_server_monthly_io_repository import SqlServerMonthlyIoRepository
+
+    started = time.perf_counter()
+    scope_key = io_scope.fingerprint(plan.profile_fingerprint)
+    repository = SqlServerMonthlyIoRepository(
+        lambda: connect_company_analytics_db(plan.company_id, "reader"),
+        lambda: connect_company_analytics_db(plan.company_id, "writer"),
+    )
+    first_six = _month_start_months_before(plan.basis_from, 3)[:6]
+    first_index = int(first_six[:4]) * 12 + int(first_six[4:]) - 1
+    months = tuple(f"{index // 12:04d}{index % 12 + 1:02d}" for index in range(first_index, first_index + 6))
+    facts = []
+    provenance = []
+    fact_read_metrics: dict[str, Any] = {}
+    try:
+        historical_months = repository.list_approved_months_before(
+            company_id=plan.company_id, before_month=first_six,
+            profile_fingerprint=plan.profile_fingerprint, scope_fingerprint=scope_key,
+        )
+        if not historical_months:
+            raise LookupError("approved historical price seed is missing")
+        first_historical = int(historical_months[0][:4]) * 12 + int(historical_months[0][4:]) - 1
+        expected_historical = tuple(
+            f"{index // 12:04d}{index % 12 + 1:02d}"
+            for index in range(first_historical, first_index)
+        )
+        if historical_months != expected_historical:
+            raise LookupError("approved historical price months are incomplete")
+        stored_months = repository.read_price_period_for_scope(
+            company_id=plan.company_id, months=historical_months + months,
+            first_bucket_month=first_six,
+            profile_fingerprint=plan.profile_fingerprint, scope_fingerprint=scope_key,
+            stock_codes=plan.stock_codes, timings_ms=fact_read_metrics,
+        )
+        for stored in stored_months:
+            facts.extend(stored.facts)
+            provenance.append({"month": stored.basis_month, "manifest_id": stored.manifest_id,
+                               "source_verified_at": str(stored.source_verified_at)})
+    except Exception as exc:
+        detail = getattr(exc, "name", "") if isinstance(exc, NameError) else ""
+        log.warning("[dashboard.snapshot.monthly_price] status=direct_fallback reason=%s symbol=%s",
+                    type(exc).__name__, detail)
+        return {}, {"status": "direct_fallback", "reason": type(exc).__name__, "reused_months": []}
+    candidates = {fact.product_code for fact in facts
+                  if fact.source_kind == "R110" and fact.row_kind == "PRICE_BUCKET"}
+    candidates.update(fact.product_code for fact in facts
+                      if fact.source_kind == "R110" and fact.row_kind == "PRICE_TAIL")
+    try:
+        prices = reconstruct_purchase_prices(
+            facts, three_month_from=plan.basis_from[:6], six_month_from=first_six,
+            basis_month=plan.basis_to[:6], product_codes=candidates,
+        )
+    except Exception as exc:
+        log.warning("[dashboard.snapshot.monthly_price] status=direct_fallback reason=%s", type(exc).__name__)
+        return {}, {"status": "direct_fallback", "reason": type(exc).__name__, "reused_months": []}
+    sql_membership = {
+        fact.product_code for fact in facts
+        if fact.source_kind == "R110"
+        and fact.row_kind in {"PRICE_BUCKET", "PRICE_TAIL"}
+        and fact.last_tie_conflict == 0
+    }
+    if sql_membership != set(prices):
+        log.warning("[dashboard.snapshot.monthly_price] status=direct_fallback reason=membership_mismatch")
+        return {}, {"status": "direct_fallback", "reason": "membership_mismatch", "reused_months": []}
+    return prices, {"status": "approved_reused_without_source_revalidation",
+                    "reused_months": provenance, "cached_product_count": len(prices),
+                    "erp_source_calls_added": 0,
+                    "fact_read_metrics": fact_read_metrics,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 3)}
+
+
+def _overlay_monthly_purchase_prices(
+    lifecycle_df: pd.DataFrame, prices: Mapping[str, Mapping[str, Any]],
+) -> pd.DataFrame:
+    updated = lifecycle_df.copy()
+    values = {
+        "avg_purchase_unit_cost": "unit_price",
+        "purchase_price_basis_month": "basis_month",
+        "purchase_price_basis_kind": "basis_kind",
+        "excluded_purchase_trade_count": "excluded_trade_count",
+        "excluded_purchase_quantity": "excluded_quantity",
+        "excluded_purchase_amount": "excluded_amount",
+        "original_purchase_quantity": "original_quantity",
+        "original_purchase_amount": "original_amount",
+        "purchase_center_price": "center_price",
+    }
+    for index, product in updated["product_code"].items():
+        cached = prices.get(str(product).strip())
+        if cached is None:
+            continue
+        direct = updated.at[index, "avg_purchase_unit_cost"]
+        if direct is not None and not pd.isna(direct):
+            raise SnapshotContractError("monthly price cache did not bypass direct price computation")
+        for column, field in values.items():
+            updated.at[index, column] = cached[field]
+    return updated
+
+
 def _generate_frequency_snapshot_draft_locked(
     *, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120,
     query_executor: QueryExecutor | None = None, repository: Any | None = None,
@@ -1785,6 +1996,7 @@ def _generate_frequency_snapshot_draft_locked(
     classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority,
     io_scope: SavedIoScope | None = None, shadow_only: bool = False,
     saved_io_full: bool = False,
+    monthly_reuse: bool = True,
 ) -> dict[str, Any]:
     actor = str(created_by or "").strip()
     if not actor:
@@ -1810,6 +2022,40 @@ def _generate_frequency_snapshot_draft_locked(
         calendar.monthrange(int(plan.evaluation_month[:4]), int(plan.evaluation_month[4:]))[1],
     )
     lifecycle_cutoff = min(evaluation_last_day, kst_today()).strftime("%Y%m%d")
+    def load_source2() -> tuple[tuple[Any, ...], dict[str, Any]]:
+        aggregate_sql, aggregate_binds = (
+            product_statistics_compact_event_stream_sql(plan, io_scope=io_scope)
+            if saved_io_full else product_statistics_raw_event_stream_sql(plan, io_scope=io_scope)
+        )
+        metrics: dict[str, Any] = {}
+        started = time.perf_counter()
+        result = _aggregate_product_statistics_event_chunks(
+            _python_product_statistics_projection_chunks(
+                _query_company_chunks(
+                    plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds,
+                    metrics=metrics, use_driver_cursor=True,
+                ),
+                basis_from=plan.basis_from, metrics=metrics, io_scope=io_scope,
+            ),
+        )
+        metrics["total_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        return result, metrics
+
+    monthly_price_cache: dict[str, dict[str, Any]] = {}
+    monthly_cache_metrics: dict[str, Any] = {"status": "direct", "reused_months": []}
+    source2_executor: ThreadPoolExecutor | None = None
+    source2_future: Any | None = None
+    if saved_io_full and monthly_reuse and query_executor is None:
+        source2_executor = ThreadPoolExecutor(max_workers=1)
+        source2_future = source2_executor.submit(load_source2)
+        monthly_price_cache, monthly_cache_metrics = _load_approved_monthly_purchase_prices(plan, io_scope)
+        report(
+            "monthly_price_cache status=%s months=%s elapsed_ms=%s" % (
+                monthly_cache_metrics.get("status"),
+                len(monthly_cache_metrics.get("reused_months", ())),
+                monthly_cache_metrics.get("elapsed_ms"),
+            )
+        )
     lifecycle_sql, lifecycle_binds = product_lifecycle_sql(
         stock_codes=plan.stock_codes,
         cutoff_date=lifecycle_cutoff,
@@ -1827,35 +2073,42 @@ def _generate_frequency_snapshot_draft_locked(
         seek_char5_monthly_stock=plan.company_id in (12, 13) and plan.stock_mode == "real",
         io_scope=io_scope,
         average_purchase_price=use_saved_io,
+        precomputed_purchase_prices=bool(monthly_price_cache),
     )
     report("제품 및 최초 정상 입고 조회 중")
     source1_started = time.perf_counter()
-    lifecycle_df = query(plan.company_id, lifecycle_sql, lifecycle_binds, timeout_seconds)
+    try:
+        lifecycle_df = query(plan.company_id, lifecycle_sql, lifecycle_binds, timeout_seconds)
+        source1_elapsed_ms = round((time.perf_counter() - source1_started) * 1000, 3)
+    except BaseException:
+        if source2_executor is not None:
+            source2_executor.shutdown(wait=True)
+        raise
     source_metrics: dict[str, Any] = {
-        "source1_ms": round((time.perf_counter() - source1_started) * 1000, 3),
+        "source1_ms": source1_elapsed_ms,
     }
+    report("source1_complete elapsed_ms=%s" % source_metrics["source1_ms"])
+    if saved_io_full:
+        source_metrics["monthly_purchase_cache"] = monthly_cache_metrics
     if io_scope is not None:
         source_metrics["saved_io_roles"] = io_scope.snapshot_role_report()
     if not isinstance(lifecycle_df, pd.DataFrame) or "product_code" not in lifecycle_df.columns:
         raise SnapshotContractError("product lifecycle query returned an invalid shape")
     if use_saved_io and not {"representative_vendor_code", "purchase_cost_apply_code"}.issubset(lifecycle_df.columns):
         raise SnapshotContractError("representative purchase vendor evidence is missing")
-    report("출고 집계 중")
+    if monthly_price_cache:
+        lifecycle_df = _overlay_monthly_purchase_prices(lifecycle_df, monthly_price_cache)
+    if source2_future is None:
+        report("출고 집계 중")
     if query_executor is None:
-        aggregate_sql, aggregate_binds = product_statistics_raw_event_stream_sql(plan, io_scope=io_scope)
-        source2_metrics: dict[str, Any] = {}
-        source2_started = time.perf_counter()
-        monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = _aggregate_product_statistics_event_chunks(
-            _python_product_statistics_projection_chunks(
-                _query_company_chunks(
-                    plan.company_id, aggregate_sql, aggregate_binds, timeout_seconds, metrics=source2_metrics
-                ),
-                basis_from=plan.basis_from,
-                metrics=source2_metrics,
-                io_scope=io_scope,
-            ),
-        )
-        source2_metrics["total_ms"] = round((time.perf_counter() - source2_started) * 1000, 3)
+        try:
+            source2_result, source2_metrics = (
+                source2_future.result() if source2_future is not None else load_source2()
+            )
+        finally:
+            if source2_executor is not None:
+                source2_executor.shutdown(wait=True)
+        monthly_rows, diagnostics, product_day_counts, product_customer_counts, outbound_paid_quantities, return_statistics, sales_prices = source2_result
         source_metrics["source2"] = dict(source2_metrics)
         log.info(
             "[dashboard.snapshot.source2_python] company_id=%s evaluation_month=%s db_query_ms=%s fetch_rows=%s fetch_ms=%s python_aggregate_ms=%s total_ms=%s source_calls=1 retry=0 timeout_s=%s",
@@ -1867,6 +2120,13 @@ def _generate_frequency_snapshot_draft_locked(
             source2_metrics.get("python_aggregate_ms"),
             source2_metrics.get("total_ms"),
             timeout_seconds,
+        )
+        report(
+            "source2_complete db_query_ms=%s fetch_rows=%s fetch_ms=%s python_aggregate_ms=%s total_ms=%s" % (
+                source2_metrics.get("db_query_ms"), source2_metrics.get("fetch_rows"),
+                source2_metrics.get("fetch_ms"), source2_metrics.get("python_aggregate_ms"),
+                source2_metrics.get("total_ms"),
+            )
         )
     else:
         aggregate_sql, aggregate_binds = (
@@ -2015,6 +2275,7 @@ def _generate_frequency_snapshot_draft_locked(
             "price_authority": "shadow_candidate_only",
         }
     repo = repository or _company_snapshot_repository(int(plan.company_id))
+    report("snapshot_built products=%s checksum=%s" % (relational_snapshot.item_count, relational_snapshot.checksum))
     report("draft 저장 중")
     publish_relational = getattr(repo, "publish_relational", None)
     if not callable(publish_relational):
@@ -2073,8 +2334,9 @@ def _generate_frequency_snapshot_draft_locked(
     }
 
 
-def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None, classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority, saved_io_full: bool = False) -> dict[str, Any]:
+def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by: str, timeout_seconds: int = 120, query_executor: QueryExecutor | None = None, repository: Any | None = None, force: bool = False, progress_reporter: ProgressReporter | None = None, classification_authority_loader: Callable[..., Any] = load_effective_company_classification_authority, saved_io_full: bool = False, monthly_reuse: bool = True) -> dict[str, Any]:
     """Generate one exact snapshot draft while preventing an overlapping run."""
+    require_unified_snapshot_algorithm(plan.evaluation_month, saved_io_full=saved_io_full)
     io_scope = resolve_saved_io_scope(plan.io_gu_codes, confirmed_trade_roles=True) if saved_io_full else None
     key = selected_io_snapshot_key(plan, io_scope) if io_scope is not None else None
     with frequency_snapshot_generation_guard(plan, key=key):
@@ -2088,7 +2350,15 @@ def generate_frequency_snapshot_draft(*, plan: FrequencySnapshotPlan, created_by
             progress_reporter=progress_reporter,
             classification_authority_loader=classification_authority_loader,
             io_scope=io_scope, saved_io_full=saved_io_full,
+            monthly_reuse=monthly_reuse,
         )
+
+
+def require_unified_snapshot_algorithm(evaluation_month: Any, *, saved_io_full: bool) -> None:
+    """Keep new operating months on the approved average-purchase algorithm."""
+    month = str(evaluation_month or "").strip()
+    if len(month) == 6 and month.isdigit() and month >= "202611" and not saved_io_full:
+        raise SnapshotContractError("202611 onward Snapshot generation requires --dashboard-profile --saved-io-full")
 
 
 def calculate_saved_io_three_grades_shadow(
