@@ -2176,7 +2176,10 @@ def get_dashboard_sales_source_bundle(params: Optional[Dict[str, Any]] = None) -
         }
 
     if source_mode not in {"monthly_book", "monthly_real"}:
-        sales_df = get_sales_trend_df(params)
+        detail_params = dict(params)
+        detail_params["_dashboard_skip_detail_row_trend"] = True
+        detail_params["_dashboard_compact_detail"] = True
+        sales_df = get_sales_trend_df(detail_params)
         return {
             "sales_df": sales_df,
             "purchase_vendor_df": pd.DataFrame(columns=["기준월", "제품코드", "매입처코드", "매입처명", "입고수량", "매입금액", "매입발생건수"]),
@@ -3009,6 +3012,13 @@ def get_sales_trend_detail_df(params: Optional[Dict[str, Any]] = None) -> pd.Dat
     params = _apply_month_or_date_params(params)
 
     where_sql = _build_filters(params)
+    compact = bool(params.get("_dashboard_compact_detail"))
+    customer_select = "" if compact else "Out_Put.Rd12_Ven_Cd AS 거래처코드, Ven_Cd.Rd03_Ven_Nm AS 거래처명,"
+    region_select = "" if compact else "Road1.Rd021_Sido AS 시도명, Road1.Rd021_Gugun AS 시구군명, Road1.Rd021_DongNm AS 법정읍면동명,"
+    customer_group = "" if compact else "Out_Put.Rd12_Ven_Cd, Ven_Cd.Rd03_Ven_Nm,"
+    region_group = "" if compact else ", Road1.Rd021_Sido, Road1.Rd021_Gugun, Road1.Rd021_DongNm"
+    customer_count = "" if compact else ", COUNT(DISTINCT Out_Put.Rd12_Ven_Cd) AS 거래처수"
+    order_sql = "매입처코드" if compact else "거래처코드"
 
     sql = f"""
 SELECT
@@ -3031,15 +3041,12 @@ SELECT
     Physic_Cd.Rd04_Physic_Tax AS 제품분류코드,
     Physic_Tax_Nm.Rd01_Hnm AS 제품분류명,
 
-    Out_Put.Rd12_Ven_Cd AS 거래처코드,
-    Ven_Cd.Rd03_Ven_Nm AS 거래처명,
+    {customer_select}
 
     Out_Put.Rd12_In_Ven_Cd AS 매입처코드,
     In_Ven_Cd.Rd03_Ven_Nm AS 매입처명,
 
-    Road1.Rd021_Sido AS 시도명,
-    Road1.Rd021_Gugun AS 시구군명,
-    Road1.Rd021_DongNm AS 법정읍면동명,
+    {region_select}
 
     SUM(COALESCE(Out_Put.Rd12_Quantity, 0)) AS 출고수량,
 
@@ -3063,8 +3070,7 @@ SELECT
         ELSE 0 END
     ) AS 매출반품금액,
 
-    COUNT(*) AS 출고건수,
-    COUNT(DISTINCT Out_Put.Rd12_Ven_Cd) AS 거래처수
+    COUNT(*) AS 출고건수{customer_count}
 
 FROM dbo.Rddbc120 AS Out_Put WITH (NOLOCK)
 
@@ -3129,20 +3135,16 @@ GROUP BY
     Physic_Cd.Rd04_Physic_Tax,
     Physic_Tax_Nm.Rd01_Hnm,
 
-    Out_Put.Rd12_Ven_Cd,
-    Ven_Cd.Rd03_Ven_Nm,
+    {customer_group}
 
     Out_Put.Rd12_In_Ven_Cd,
-    In_Ven_Cd.Rd03_Ven_Nm,
-
-    Road1.Rd021_Sido,
-    Road1.Rd021_Gugun,
-    Road1.Rd021_DongNm
+    In_Ven_Cd.Rd03_Ven_Nm
+    {region_group}
 
 ORDER BY
     제품코드,
     기준월,
-    거래처코드
+    {order_sql}
 """
 
     df = query_to_df(sql, params)
@@ -3150,7 +3152,8 @@ ORDER BY
     if df is None:
         df = pd.DataFrame()
 
-    df = _add_trend_columns(df)
+    if not params.get("_dashboard_skip_detail_row_trend"):
+        df = _add_trend_columns(df)
     df = _normalize_analytics_numeric_columns(df)
     return df
 
@@ -3302,8 +3305,9 @@ def get_sales_trend_df(params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
         df = get_sales_trend_detail_df(params)
 
     log.info(
-        "[analytics.sales_trend.perf] source_mode=%s rows=%s elapsed=%.3fs",
+        "[analytics.sales_trend.perf] source_mode=%s dashboard_compact=%s rows=%s elapsed=%.3fs",
         source_mode,
+        bool(params.get("_dashboard_compact_detail")),
         0 if df is None else len(df),
         time.perf_counter() - t0,
     )

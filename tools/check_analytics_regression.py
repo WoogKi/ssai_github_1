@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from contextlib import ExitStack
 import io
 import importlib
 import json
@@ -8464,6 +8465,9 @@ def run_basic_checks() -> list[CheckResult]:
             stock_shortage_payload={"df": stock_df, "meta": {}},
             inbound_facts_df=pd.DataFrame(),
             sales_transaction_cycle_df=pd.DataFrame(columns=["trade_date", "io_code"]),
+            business_day_context_loader=lambda **kwargs: _business_context(
+                kwargs["evaluation_date"].strftime("%Y%m%d"), 14, 23
+            ),
         )
         fact_errors: list[str] = []
         required_fact_keys = {
@@ -19233,8 +19237,14 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
                 self.keys.append(key)
                 return approved
 
+        def read_fixture_snapshot(**kwargs: Any) -> Any:
+            # The repository is a fixture; resolving a saved company profile
+            # here would turn this offline check into a real management-DB read.
+            with patch.object(snapshot_service, "_plan_with_current_saved_io", side_effect=lambda plan: plan):
+                return snapshot_service.read_approved_frequency_snapshot(**kwargs)
+
         repository = _Repository()
-        read = snapshot_service.read_approved_frequency_snapshot(
+        read = read_fixture_snapshot(
             company_id=4,
             evaluation_month="202608",
             stock_codes=["00901", "00001", "00247"],
@@ -19267,12 +19277,12 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
         try:
             snapshot_service.clear_frequency_snapshot_read_cache()
             snapshot_service.SqlServerSnapshotRepository = lambda **_kwargs: ready_repository
-            snapshot_service.read_approved_frequency_snapshot(
+            read_fixture_snapshot(
                 company_id=4,
                 evaluation_month="202608",
                 stock_codes=["00001", "00247", "00901"],
             )
-            snapshot_service.read_approved_frequency_snapshot(
+            read_fixture_snapshot(
                 company_id=4,
                 evaluation_month="202608",
                 stock_codes=["00001", "00247", "00901"],
@@ -19285,12 +19295,12 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
             )
             snapshot_service.clear_frequency_snapshot_read_cache()
             snapshot_service.SqlServerSnapshotRepository = lambda **_kwargs: stale_repository
-            snapshot_service.read_approved_frequency_snapshot(
+            read_fixture_snapshot(
                 company_id=4,
                 evaluation_month="202608",
                 stock_codes=["00001", "00247", "00901"],
             )
-            snapshot_service.read_approved_frequency_snapshot(
+            read_fixture_snapshot(
                 company_id=4,
                 evaluation_month="202608",
                 stock_codes=["00001", "00247", "00901"],
@@ -19636,6 +19646,22 @@ def run_dashboard_inventory_status_contract_checks() -> list[CheckResult]:
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------
+class OfflineDatabaseAccess(BaseException):
+    """Fail immediately even inside checks that catch ordinary exceptions."""
+
+
+def _reject_offline_connection(*_args: Any, **_kwargs: Any) -> None:
+    frames = traceback.extract_stack(limit=24)
+    callers = [
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+        for frame in frames[:-1]
+        if str(frame.filename).startswith(str(PROJECT_ROOT)) and Path(frame.filename) != THIS_FILE
+    ]
+    raise OfflineDatabaseAccess(
+        "DB connection attempted by offline Analytics gate at " + " > ".join(callers[-8:])
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="SIMS analytics/KPI regression checker")
     parser.add_argument(
@@ -19653,29 +19679,37 @@ def main() -> int:
     print(f"Project root: {PROJECT_ROOT}")
 
     failed = 0
+    try:
+        with ExitStack() as guards:
+            if not args.live and not args.nlq:
+                guards.enter_context(patch("pyodbc.connect", side_effect=_reject_offline_connection))
+                guards.enter_context(patch("sqlalchemy.engine.base.Engine.connect", side_effect=_reject_offline_connection))
 
-    basic_results = run_basic_checks()
-    failed += _print_results("BASIC IMPORT / HELPER CHECKS", basic_results)
+            basic_results = run_basic_checks()
+            failed += _print_results("BASIC IMPORT / HELPER CHECKS", basic_results)
 
-    dashboard_nlq_results = run_dashboard_nlq_contract_checks()
-    failed += _print_results("DASHBOARD NLQ CONTRACT CHECKS", dashboard_nlq_results)
+            dashboard_nlq_results = run_dashboard_nlq_contract_checks()
+            failed += _print_results("DASHBOARD NLQ CONTRACT CHECKS", dashboard_nlq_results)
 
-    dashboard_inventory_results = run_dashboard_inventory_status_contract_checks()
-    failed += _print_results("DASHBOARD INVENTORY STATUS CONTRACT CHECKS", dashboard_inventory_results)
+            dashboard_inventory_results = run_dashboard_inventory_status_contract_checks()
+            failed += _print_results("DASHBOARD INVENTORY STATUS CONTRACT CHECKS", dashboard_inventory_results)
 
-    general_rule_results = run_general_current_table_rule_checks()
-    failed += _print_results("GENERAL CURRENT-TABLE RULE CHECKS", general_rule_results)
+            general_rule_results = run_general_current_table_rule_checks()
+            failed += _print_results("GENERAL CURRENT-TABLE RULE CHECKS", general_rule_results)
 
-    source_contract_results = run_current_table_source_contract_checks()
-    failed += _print_results("CURRENT-TABLE SOURCE CONTRACT CHECKS", source_contract_results)
+            source_contract_results = run_current_table_source_contract_checks()
+            failed += _print_results("CURRENT-TABLE SOURCE CONTRACT CHECKS", source_contract_results)
 
-    if args.live:
-        service_results = run_service_live_checks()
-        failed += _print_results("SERVICE LIVE CHECKS", service_results)
+            if args.live:
+                service_results = run_service_live_checks()
+                failed += _print_results("SERVICE LIVE CHECKS", service_results)
 
-    if args.nlq:
-        nlq_results = run_nlq_live_checks()
-        failed += _print_results("NLQ LIVE ROUTING CHECKS", nlq_results)
+            if args.nlq:
+                nlq_results = run_nlq_live_checks()
+                failed += _print_results("NLQ LIVE ROUTING CHECKS", nlq_results)
+    except OfflineDatabaseAccess as exc:
+        print(f"RESULT: FAIL ({exc})")
+        return 1
 
     print()
     if failed:

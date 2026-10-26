@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import json
 import sys
 import time
@@ -31,6 +32,34 @@ CHILDREN = {
     ),
 }
 PARENTS = {"snapshot": "manifest", "monthly": "frequency_month_manifest"}
+
+
+def _recent_closed_evaluation_month(evaluation_month: str, *, today: date | None = None) -> bool:
+    """Protect the latest approved snapshot for each of the last 12 closed months."""
+    current = today or date.today()
+    value = str(evaluation_month)
+    if len(value) != 6 or not value.isdecimal() or not 1 <= int(value[4:]) <= 12:
+        raise ValueError("invalid snapshot evaluation month")
+    current_serial = current.year * 12 + current.month - 1
+    candidate_serial = int(value[:4]) * 12 + int(value[4:]) - 1
+    return candidate_serial >= current_serial - 11
+
+
+def _protect_recent_approved_snapshot(cursor: object, *, company_id: int,
+                                      manifest_id: int, evaluation_month: str,
+                                      approval_status: str, apply: bool) -> None:
+    if approval_status != "approved" or not _recent_closed_evaluation_month(evaluation_month):
+        return
+    lock = "WITH (UPDLOCK,HOLDLOCK)" if apply else ""
+    latest = cursor.execute(
+        "SELECT TOP 1 manifest_id FROM snapshot.manifest " + lock +
+        " WHERE company_id=? AND evaluation_month=? AND approval_status='approved' "
+        "AND status IN ('published','superseded') "
+        "ORDER BY approved_at DESC, manifest_id DESC",
+        str(company_id), evaluation_month,
+    ).fetchone()
+    if latest is None or int(latest[0]) == manifest_id:
+        raise ValueError("last approved snapshot for a recent closed month cannot be deleted")
 
 
 def _published_snapshot_is_obsolete(cursor: object, company_id: int,
@@ -103,6 +132,11 @@ def cleanup_one(*, company_id: int, kind: str, manifest_id: int,
                 raise ValueError("operating or unverified published manifest cannot be deleted")
         elif str(row[1]) not in {"superseded", "invalidated", "failed", "draft"}:
             raise ValueError("manifest status is not eligible for cleanup")
+        if kind == "snapshot":
+            _protect_recent_approved_snapshot(
+                cursor, company_id=company_id, manifest_id=manifest_id,
+                evaluation_month=str(row[6]), approval_status=str(row[2]), apply=apply,
+            )
         counts = {child: int(cursor.execute(
             f"SELECT COUNT_BIG(*) FROM snapshot.{child} WHERE manifest_id=?", manifest_id,
         ).fetchval()) for child in CHILDREN[kind]}
