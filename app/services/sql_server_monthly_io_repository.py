@@ -594,16 +594,30 @@ class SqlServerMonthlyIoRepository:
 
     def approve_checked(self, reference: MonthlyIoMaterialization, generation_no: int, *,
                         expected_checksum: str, approved_by: str, approval_reason: str,
-                        exact_confirmed: bool) -> MonthlyIoStored:
+                        exact_confirmed: bool, approval_event: Any | None = None,
+                        target_hash: str | None = None) -> MonthlyIoStored:
         if not exact_confirmed or not approved_by.strip() or not approval_reason.strip():
             raise SnapshotContractError("monthly IO approval requires independent Exact evidence")
         stored = self.read_generation(reference, generation_no)
         if (stored.status != "draft" or stored.approval_status != "pending"
                 or stored.materialization.checksum != expected_checksum):
             raise SnapshotContractError("monthly IO pending draft checksum mismatch")
+        if approval_event is not None:
+            if (not target_hash or approval_event.company_id != reference.company_id
+                    or approval_event.basis_month != reference.basis_month
+                    or approval_event.manifest_id != stored.manifest_id
+                    or approval_event.generation_no != stored.generation_no
+                    or approval_event.profile_fingerprint != reference.profile_fingerprint
+                    or approval_event.whole_checksum != expected_checksum
+                    or approval_event.approved_by != approved_by
+                    or approval_event.exact_status != "passed"):
+                raise SnapshotContractError("monthly IO approval history identity mismatch")
         conn = self._write()
         try:
             cursor = conn.cursor()
+            if approval_event is not None:
+                if cursor.execute("SELECT OBJECT_ID(N'snapshot.operation_event',N'U')").fetchone()[0] is None:
+                    raise SnapshotContractError("monthly IO approval history migration is missing")
             cursor.execute(
                 """UPDATE snapshot.frequency_month_manifest SET status='superseded',
                       superseded_at=SYSUTCDATETIME()
@@ -616,11 +630,18 @@ class SqlServerMonthlyIoRepository:
                 """UPDATE snapshot.frequency_month_manifest SET status='published',
                       approval_status='approved',approved_at=SYSUTCDATETIME(),
                       approved_by=?,approval_reason=?,published_at=SYSUTCDATETIME()
-                   WHERE manifest_id=? AND status='draft' AND approval_status='pending' AND checksum=?""",
-                approved_by.strip(), approval_reason.strip(), stored.manifest_id, expected_checksum,
+                   WHERE company_id=? AND manifest_id=? AND status='draft'
+                     AND approval_status='pending' AND checksum=?""",
+                approved_by.strip(), approval_reason.strip(), str(reference.company_id),
+                stored.manifest_id, expected_checksum,
             )
             if cursor.rowcount != 1:
                 raise SnapshotContractError("monthly IO approval lost its pending draft")
+            if approval_event is not None:
+                from app.services.snapshot_operation_history import insert_event_on_cursor
+
+                if not insert_event_on_cursor(cursor, approval_event, target_hash=target_hash):
+                    raise SnapshotContractError("monthly IO approval history already exists")
             conn.commit()
         except Exception:
             conn.rollback()

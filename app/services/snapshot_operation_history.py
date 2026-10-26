@@ -24,7 +24,7 @@ _ORIGIN = {"runtime", "backfill"}
 _KINDS = {"snapshot_generate", "monthly_build", "inspect", "approve_publish", "cleanup"}
 _DETAIL_KEYS = {"stage_timings_ms", "source_call_count", "reused_months", "monthly_manifest_ids",
                 "deleted_snapshot_ids", "deleted_monthly_ids", "no_op", "source_verified",
-                "grade_counts"}
+                "grade_counts", "approval_reason"}
 _COLUMNS = (
     "event_key", "company_id", "analytics_target_hash", "run_id", "operation_kind",
     "stage", "result_status", "origin", "operation_date", "started_at", "finished_at",
@@ -108,6 +108,10 @@ def _validated_values(event: OperationEvent, target_hash: str) -> tuple[Any, ...
         raise ValueError("unsafe operation report reference")
     if set(event.details) - _DETAIL_KEYS:
         raise ValueError("unsupported operation detail key")
+    if "approval_reason" in event.details:
+        reason = event.details["approval_reason"]
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 500:
+            raise ValueError("invalid operation approval reason")
     if any(not isinstance(value, (str, int, float, bool, list, tuple, dict, type(None)))
            for value in event.details.values()):
         raise ValueError("unsupported operation detail value")

@@ -322,7 +322,8 @@ def run(company_id: int, evaluation_month: str, *, apply: bool, timeout: int,
 
 def run_incremental(company_id: int, evaluation_month: str, *, apply: bool, plan_only: bool,
                     timeout: int, created_by: str,
-                    event_callback: Callable[..., None] | None = None) -> dict[str, Any]:
+                    event_callback: Callable[..., None] | None = None,
+                    evidence_callback: Callable[[MonthlyIoMaterialization], None] | None = None) -> dict[str, Any]:
     from app.services.dashboard_inventory_frequency_snapshot_service import _month_start_months_before
 
     scope = resolve_dashboard_profile_stock_scope(company_id=company_id)
@@ -432,6 +433,8 @@ def run_incremental(company_id: int, evaluation_month: str, *, apply: bool, plan
             product_codes, plan.stock_codes, tuple(facts),
         )
         item.validate()
+        if evidence_callback is not None:
+            evidence_callback(item)
         result["new_months"][month] = {
             "status": "component_validated_draft_ready", "fact_count": len(facts), "checksum": item.checksum,
             "saved": False, "empty_source_month": not bool(facts),
