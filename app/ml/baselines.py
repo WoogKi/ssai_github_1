@@ -58,7 +58,7 @@ def forecast_from_example(example: Example30, *, method: str, alpha: Decimal = D
 
 def backtest(
     dataset: DailyDataset, *, company_id: int, product_codes: Iterable[str], as_of_dates: Iterable[date],
-    calendar: OfflineCalendar, timestamp_policy_confirmed: bool, method: str,
+    calendar: OfflineCalendar | None, timestamp_policy_confirmed: bool, method: str,
     alpha: Decimal = Decimal("0.2"),
 ) -> tuple[Forecast, ...]:
     return backtest_models(
@@ -70,7 +70,7 @@ def backtest(
 
 def backtest_models(
     dataset: DailyDataset, *, company_id: int, product_codes: Iterable[str], as_of_dates: Iterable[date],
-    calendar: OfflineCalendar, timestamp_policy_confirmed: bool, methods: tuple[str, ...],
+    calendar: OfflineCalendar | None, timestamp_policy_confirmed: bool, methods: tuple[str, ...],
     alpha: Decimal = Decimal("0.2"), on_complete: Callable[[int], None] | None = None,
 ) -> tuple[Forecast, ...]:
     results = []

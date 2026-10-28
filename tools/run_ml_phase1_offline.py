@@ -7,6 +7,7 @@ offline official-calendar snapshot. It never opens an ERP or Analytics DB.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from dataclasses import asdict
@@ -33,9 +34,18 @@ def run_fixture(source: Path, runs_root: Path, *, run_id: str, progress_every: i
                 cancel_check: Callable[[], bool] | None = None) -> dict[str, object]:
     if progress_every <= 0 or progress_interval_s <= 0:
         raise ValueError("invalid progress cadence")
-    payload = json.loads(source.read_text(encoding="utf-8"))
+    source_bytes = source.read_bytes()
+    payload = json.loads(source_bytes)
     if payload.get("schema_version") != "ml_phase1_fixture_v1":
         raise ValueError("unsupported fixture schema")
+    manifest_path = source.parent / "manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (manifest.get("sha256_by_file", {}).get(source.name) != hashlib.sha256(source_bytes).hexdigest()
+                or manifest.get("dataset_version") != payload.get("dataset_version")
+                or manifest.get("company_id") != payload.get("company_id")
+                or manifest.get("dataset_status") not in {"REVIEW_REQUIRED", "READY"}):
+            raise ValueError("dataset manifest or checksum mismatch")
     company_id = int(payload["company_id"])
     dataset_version = str(payload["dataset_version"])
     run = RunState(runs_root, run_id=run_id, dataset_version=dataset_version)
@@ -62,12 +72,12 @@ def run_fixture(source: Path, runs_root: Path, *, run_id: str, progress_every: i
             complete_dates=(_date(day) for day in payload["complete_dates"]),
         )
         run.update(stage=stage, event="DONE", done=prepared.source_row_count, total=prepared.source_row_count)
-        calendar_data = payload["calendar"]
-        calendar = OfflineCalendar(
+        calendar_data = payload.get("calendar")
+        calendar = (OfflineCalendar(
             _date(calendar_data["start_date"]), _date(calendar_data["end_date"]),
             frozenset(calendar_data["holiday_dates"]), _date(calendar_data["known_as_of"]),
             calendar_data["version"],
-        )
+        ) if calendar_data is not None else None)
         stage = "forecast"
         done_count = 0
         as_of_dates = [_date(day) for day in payload["as_of_dates"]]
