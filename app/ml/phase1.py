@@ -492,8 +492,8 @@ def _window_summary(
 
 
 @lru_cache(maxsize=128)
-def _calendar_context(calendar: OfflineCalendar, as_of: date) -> tuple[str, int | None, date | None]:
-    if calendar.known_as_of > as_of:
+def _calendar_context(calendar: OfflineCalendar, as_of: date, require_asof: bool = True) -> tuple[str, int | None, date | None]:
+    if require_asof and calendar.known_as_of > as_of:
         return "unavailable", None, None
     month_start = as_of.replace(day=1)
     end = as_of + timedelta(days=30)
@@ -518,7 +518,7 @@ def _calendar_context(calendar: OfflineCalendar, as_of: date) -> tuple[str, int 
 def build_example(
     dataset: DailyDataset, *, company_id: int, product_code: str, as_of: date,
     calendar: OfflineCalendar | None, timestamp_policy_confirmed: bool,
-    horizon_days: int = 30,
+    horizon_days: int = 30, calendar_asof_required: bool = True,
 ) -> Example30:
     if horizon_days != 30:
         raise ValueError("only the validated 30-day horizon is supported")
@@ -553,7 +553,7 @@ def build_example(
     if label_status == "complete" and label[1]:
         label_status = "negative_quantity_review"
     calendar_status, business_days, first_business = (
-        _calendar_context(calendar, as_of) if calendar is not None else ("unavailable", None, None)
+        _calendar_context(calendar, as_of, calendar_asof_required) if calendar is not None else ("unavailable", None, None)
     )
     if feature_status == "ready":
         qty_7d = windows[7][0]

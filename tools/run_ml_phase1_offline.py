@@ -44,8 +44,12 @@ def run_fixture(source: Path, runs_root: Path, *, run_id: str, progress_every: i
         if (manifest.get("sha256_by_file", {}).get(source.name) != hashlib.sha256(source_bytes).hexdigest()
                 or manifest.get("dataset_version") != payload.get("dataset_version")
                 or manifest.get("company_id") != payload.get("company_id")
-                or manifest.get("dataset_status") not in {"REVIEW_REQUIRED", "READY"}):
+                or manifest.get("dataset_status") not in {"REVIEW_REQUIRED", "READY", "RESEARCH_POSTHOC"}):
             raise ValueError("dataset manifest or checksum mismatch")
+    research_posthoc = payload.get("calendar_asof_required") is False
+    if research_posthoc and (not manifest_path.exists() or manifest.get("dataset_status") != "RESEARCH_POSTHOC"
+                             or manifest.get("evaluation_grade") != "research_posthoc"):
+        raise ValueError("posthoc Calendar use requires a research-only manifest")
     company_id = int(payload["company_id"])
     dataset_version = str(payload["dataset_version"])
     run = RunState(runs_root, run_id=run_id, dataset_version=dataset_version)
@@ -104,17 +108,20 @@ def run_fixture(source: Path, runs_root: Path, *, run_id: str, progress_every: i
             as_of_dates=as_of_dates,
             calendar=calendar, timestamp_policy_confirmed=payload.get("timestamp_policy_confirmed") is True,
             methods=methods, alpha=Decimal(str(payload.get("ewma_alpha", "0.2"))),
-            on_complete=report_progress,
+            on_complete=report_progress, calendar_asof_required=not research_posthoc,
         )
         run.update(stage=stage, event="DONE", done=len(forecasts), total=len(forecasts))
         (run.path / "predictions.json").write_text(
-            json.dumps([{key: value.isoformat() if isinstance(value, date) else str(value) if isinstance(value, Decimal) else value
-                         for key, value in asdict(row).items()} for row in forecasts], ensure_ascii=False, indent=2) + "\n",
+            json.dumps([{**{key: value.isoformat() if isinstance(value, date) else str(value) if isinstance(value, Decimal) else value
+                            for key, value in asdict(row).items()},
+                         "evaluation_grade": "research_posthoc" if research_posthoc else "strict_asof_candidate"}
+                        for row in forecasts], ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
         report = {
             "run_id": run_id, "dataset_version": dataset_version,
             "company_id": company_id, "metric_policy_version": daily.metric_policy_version,
+            "evaluation_grade": "research_posthoc" if research_posthoc else "strict_asof_candidate",
             "source_row_count": prepared.source_row_count,
             "source_quantity": str(prepared.source_quantity),
             "document_match_counts": prepared.document_match_counts,

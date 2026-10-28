@@ -47,7 +47,7 @@ ORDER BY COUNT_BIG(*) DESC, product_code
 """
 
 SAMPLE_R120 = """
-SELECT TOP (501) Rd12_Out_YyMmDd, Rd12_Ven_Cd, Rd12_Out_Seq, Rd12_Physic_Cd,
+SELECT TOP ({row_limit}) Rd12_Out_YyMmDd, Rd12_Ven_Cd, Rd12_Out_Seq, Rd12_Physic_Cd,
        Rd12_Io_Gu, Rd12_Quantity, Rd12_Oquantity, Rd12_Stock_Cd_Gcode,
        Rd12_Stock_Cd, Rd12_Stock_Apply_Cd, Rd12_Cost_Apply_Cd,
        Rd12_Trans_Di, Rd12_Trans_YyMmDd, Rd12_Trans_Seq,
@@ -60,7 +60,7 @@ ORDER BY Rd12_Out_YyMmDd, Rd12_Ven_Cd, Rd12_Out_Seq
 """
 
 SAMPLE_R130 = """
-SELECT TOP (501) H.Rd13_Trans_Di, H.Rd13_Trans_YyMmDd, H.Rd13_Ven_Cd,
+SELECT TOP ({row_limit}) H.Rd13_Trans_Di, H.Rd13_Trans_YyMmDd, H.Rd13_Ven_Cd,
        H.Rd13_Trans_Seq, MAX(H.Rd13_Supply_Price) AS Rd13_Supply_Price,
        MAX(H.Rd13_Tax_Price) AS Rd13_Tax_Price, COUNT_BIG(*) AS header_count
 FROM dbo.Rddbc130 AS H
@@ -111,10 +111,10 @@ def run_db3_probe(query: Query, *, company_id: int = 3, alias: str = "DB3") -> d
     if not products or len(set(products)) != len(products) or any(not item for item in products):
         raise ValueError("no bounded unique representative products")
     marks = ", ".join("?" for _ in products)
-    sample_r120 = limited(SAMPLE_R120.format(product_marks=marks), ("20260401", "20260831", *products), 501)
+    sample_r120 = limited(SAMPLE_R120.format(product_marks=marks, row_limit=501), ("20260401", "20260831", *products), 501)
     if not sample_r120 or len(sample_r120) > SAMPLE_MAX_ROWS:
         raise ValueError("R120 sample is empty or truncated")
-    headers = limited(SAMPLE_R130.format(product_marks=marks), ("20260401", "20260831", *products), 501)
+    headers = limited(SAMPLE_R130.format(product_marks=marks, row_limit=501), ("20260401", "20260831", *products), 501)
     if len(headers) > SAMPLE_MAX_ROWS:
         raise ValueError("R130 sample is truncated")
     duplicate_headers = sum(int(row["header_count"]) - 1 for row in headers)

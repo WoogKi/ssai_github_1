@@ -59,12 +59,12 @@ def forecast_from_example(example: Example30, *, method: str, alpha: Decimal = D
 def backtest(
     dataset: DailyDataset, *, company_id: int, product_codes: Iterable[str], as_of_dates: Iterable[date],
     calendar: OfflineCalendar | None, timestamp_policy_confirmed: bool, method: str,
-    alpha: Decimal = Decimal("0.2"),
+    alpha: Decimal = Decimal("0.2"), calendar_asof_required: bool = True,
 ) -> tuple[Forecast, ...]:
     return backtest_models(
         dataset, company_id=company_id, product_codes=product_codes, as_of_dates=as_of_dates,
         calendar=calendar, timestamp_policy_confirmed=timestamp_policy_confirmed,
-        methods=(method,), alpha=alpha,
+        methods=(method,), alpha=alpha, calendar_asof_required=calendar_asof_required,
     )
 
 
@@ -72,6 +72,7 @@ def backtest_models(
     dataset: DailyDataset, *, company_id: int, product_codes: Iterable[str], as_of_dates: Iterable[date],
     calendar: OfflineCalendar | None, timestamp_policy_confirmed: bool, methods: tuple[str, ...],
     alpha: Decimal = Decimal("0.2"), on_complete: Callable[[int], None] | None = None,
+    calendar_asof_required: bool = True,
 ) -> tuple[Forecast, ...]:
     results = []
     products = sorted(set(product_codes))
@@ -80,6 +81,7 @@ def backtest_models(
             example = build_example(
                 dataset, company_id=company_id, product_code=product_code, as_of=as_of,
                 calendar=calendar, timestamp_policy_confirmed=timestamp_policy_confirmed,
+                calendar_asof_required=calendar_asof_required,
             )
             for method in methods:
                 results.append(forecast_from_example(example, method=method, alpha=alpha, dataset=dataset))
