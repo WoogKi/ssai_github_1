@@ -1,0 +1,2 @@
+# Optional CPU-only ML worker dependency; install into its own existing venv.
+scikit-learn==1.9.1
