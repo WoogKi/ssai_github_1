@@ -77,6 +77,24 @@ def _load_master(rows: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...
     return tuple(products[code] for code in sorted(products))
 
 
+def load_frozen_active_master(target: Path) -> tuple[dict[str, Any], ...]:
+    """Read the immutable initial R040 cohort for a resumed active-only run."""
+    plan = json.loads((target / "plan.json").read_text(encoding="utf-8"))
+    if (plan.get("product_selection") != "r040_use_gu_0"
+            or not plan.get("source_identity_sha256") or not plan.get("product_master_sha256")):
+        raise ValueError("resume requires an active-only plan with source identity")
+    master_file = target / "products.jsonl"
+    if (target.is_symlink() or (target / "plan.json").is_symlink()
+            or master_file.is_symlink() or (target / "products.sha256").is_symlink()
+            or _sha(master_file) != (target / "products.sha256").read_text(encoding="ascii").strip()
+            or _sha(master_file) != plan["product_master_sha256"]):
+        raise ValueError("frozen product master checksum mismatch")
+    masters = _load_master(_read_rows(master_file))
+    if any(str(row.get("Rd04_Use_Gu") or "").strip() != "0" for row in masters):
+        raise ValueError("frozen active product master contains an inactive product")
+    return masters
+
+
 def _write_rows(path: Path, rows: Iterable[Mapping[str, Any]], *, company_id: int,
                 row_cap: int = MAX_BATCH_ROWS,
                 row_progress: Callable[[int], None] | None = None) -> tuple[int, Decimal, Decimal]:
@@ -133,20 +151,26 @@ def _whole_digest(root: Path, batches: Iterable[Batch]) -> str:
 
 def _role_totals(rows: Iterable[Mapping[str, Any]], codes: Iterable[str]) -> dict[str, Any]:
     scope = resolve_saved_io_scope(codes, confirmed_trade_roles=True)
-    source_rows = list(rows)
-    result: dict[str, Any] = {}
-    for name, role_codes in (("normal", scope.outbound_codes), ("return", scope.outbound_return_codes),
-                             ("other", tuple(code for code in {str(row["Rd12_Io_Gu"]).strip() for row in source_rows}
-                                             if code not in (*scope.outbound_codes, *scope.outbound_return_codes)))):
-        selected = [row for row in source_rows if str(row["Rd12_Io_Gu"]).strip() in role_codes]
-        result[name + "_rows"] = len(selected)
-        result[name + "_quantity"] = str(sum((Decimal(str(row["Rd12_Quantity"])) for row in selected), Decimal(0)))
-        if name == "normal":
-            result["negative_normal_rows"] = sum(Decimal(str(row["Rd12_Quantity"])) < 0 for row in selected)
-    return result
+    normal = set(scope.outbound_codes)
+    returns = set(scope.outbound_return_codes)
+    counts = {name: 0 for name in ("normal", "return", "other")}
+    quantities = {name: Decimal(0) for name in counts}
+    negative_normal = 0
+    for row in rows:
+        code = str(row["Rd12_Io_Gu"]).strip()
+        name = "normal" if code in normal else "return" if code in returns else "other"
+        quantity = Decimal(str(row["Rd12_Quantity"]))
+        counts[name] += 1
+        quantities[name] += quantity
+        if name == "normal" and quantity < 0:
+            negative_normal += 1
+    return {**{name + "_rows": counts[name] for name in counts},
+            **{name + "_quantity": str(quantities[name]) for name in counts},
+            "negative_normal_rows": negative_normal}
 
 
-def verify_batch(root: Path, batch: Batch) -> dict[str, Any]:
+def verify_batch(root: Path, batch: Batch,
+                 saved_io_codes: Iterable[str] | None = None) -> dict[str, Any]:
     folder = _batch_dir(root, batch)
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
     if (manifest.get("batch_id") != batch.batch_id or manifest.get("status") != "VERIFIED"
@@ -160,12 +184,13 @@ def verify_batch(root: Path, batch: Batch) -> dict[str, Any]:
     count = 0
     qty = bonus = Decimal(0)
     source_keys = set()
+    batch_codes = set(batch.product_codes)
     outbound = _read_rows(folder / "r120.jsonl")
     for row in outbound:
         code = row["Rd12_Physic_Cd"]
         day = row["Rd12_Out_YyMmDd"]
         if (int(row["company_id"]) != 3 or not isinstance(code, str)
-                or code.strip() not in batch.product_codes or not batch.date_from <= day < batch.date_to_exclusive):
+                or code.strip() not in batch_codes or not batch.date_from <= day < batch.date_to_exclusive):
             raise ValueError("R120 batch scope mismatch")
         key = (day, row["Rd12_Ven_Cd"], row["Rd12_Out_Seq"])
         if key in source_keys:
@@ -188,8 +213,10 @@ def verify_batch(root: Path, batch: Batch) -> dict[str, Any]:
             or str(bonus) != manifest["r120_bonus"] or len(headers) != manifest["r130_headers"]):
         raise ValueError("batch count or quantity mismatch")
     if "role_totals" in manifest:
-        plan = json.loads((root / "plan.json").read_text(encoding="utf-8"))
-        if manifest["role_totals"] != _role_totals(outbound, plan["saved_io_codes"]):
+        codes = saved_io_codes
+        if codes is None:
+            codes = json.loads((root / "plan.json").read_text(encoding="utf-8"))["saved_io_codes"]
+        if manifest["role_totals"] != _role_totals(outbound, codes):
             raise ValueError("batch saved I/O role totals differ")
     return manifest
 
@@ -208,20 +235,22 @@ def _save_batch(
     try:
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         expected = source.totals(batch)
-        if int(expected["row_count"]) > MAX_BATCH_ROWS:
+        expected_rows = int(expected["row_count"])
+        if expected_rows < 0 or expected_rows > MAX_BATCH_ROWS:
             raise ValueError("R120 batch exceeds row cap; use a smaller group")
+        empty = expected_rows == 0
         stage = "r120_fetch"
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         count, qty, bonus = _write_rows(
-            folder / "r120.jsonl", source.outbound_rows(batch), company_id=3,
+            folder / "r120.jsonl", () if empty else source.outbound_rows(batch), company_id=3,
             row_progress=(lambda count: _emit(progress, "rows", count=count)) if progress else None,
         )
         stage = "r130_fetch"
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
-        headers, _, _ = _write_rows(folder / "r130.jsonl", source.document_rows(batch), company_id=3)
+        headers, _, _ = _write_rows(folder / "r130.jsonl", () if empty else source.document_rows(batch), company_id=3)
         stage = "independent_exact"
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
-        if (count != int(expected["row_count"]) or qty != Decimal(str(expected["quantity"]))
+        if (count != expected_rows or qty != Decimal(str(expected["quantity"]))
                 or bonus != Decimal(str(expected["bonus_quantity"]))):
             raise ValueError("R120 batch differs from independent SQL totals")
         outbound = _read_rows(folder / "r120.jsonl")
@@ -242,7 +271,8 @@ def _save_batch(
             "r120_quantity": str(qty), "r120_bonus": str(bonus), "r130_headers": headers,
             "role_totals": _role_totals(outbound, saved_io_codes),
             "document_match_counts": dict(prepared.document_match_counts),
-            "source_query_count": 3, "row_cap": MAX_BATCH_ROWS, "file_cap_bytes": MAX_BATCH_BYTES,
+            "source_query_count": 1 if empty else 3,
+            "row_cap": MAX_BATCH_ROWS, "file_cap_bytes": MAX_BATCH_BYTES,
             "verified_at_kst": datetime.now(KST).isoformat(),
             "elapsed_ms": int((perf_counter() - started) * 1000),
             "sha256_by_file": {name: _sha(folder / name) for name in ("r120.jsonl", "r130.jsonl")},
@@ -250,7 +280,7 @@ def _save_batch(
         (folder / "manifest.json").write_text(_json(manifest), encoding="utf-8")
         stage = "readback"
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
-        verify_batch(root, batch)
+        verify_batch(root, batch, saved_io_codes)
         return manifest
     except Exception as exc:
         (folder / "error.json").write_text(_json({
@@ -266,6 +296,9 @@ def build_bulk_dataset(
     saved_io_codes: Iterable[str], profile_fingerprint: str, calendar_version: str,
     date_from: date = FIRST_DAY, date_to: date = LAST_DAY, group_size: int = 100,
     resume: bool = False, max_batches: int | None = None,
+    active_only: bool = False,
+    source_identity_sha256: str | None = None,
+    stop_requested: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not dataset_version.startswith("db3-bulk-") or not dataset_version.replace("-", "").isalnum():
@@ -274,6 +307,8 @@ def build_bulk_dataset(
         raise ValueError("missing DB3 profile/Calendar or invalid batch limit")
     scope = resolve_saved_io_scope(saved_io_codes, confirmed_trade_roles=True)
     masters = _load_master(master_rows)
+    if active_only and any(str(row.get("Rd04_Use_Gu") or "").strip() != "0" for row in masters):
+        raise ValueError("active-only dataset contains a stopped or unknown-use product")
     codes = tuple(row["Rd04_Physic_Cd"].strip() for row in masters)
     batches = _month_batches(codes, date_from, date_to, group_size)
     target = root / "datasets" / dataset_version
@@ -285,12 +320,23 @@ def build_bulk_dataset(
         "calendar_version": calendar_version, "dataset_status": "BUILDING",
         "evaluation_grade": "research_posthoc", "last_complete_date": None,
     }
+    if active_only:
+        if (not isinstance(source_identity_sha256, str) or len(source_identity_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in source_identity_sha256)):
+            raise ValueError("active-only extraction requires verified source identity SHA256")
+        specification["product_selection"] = "r040_use_gu_0"
+        specification["source_identity_sha256"] = source_identity_sha256
+        master_digest = hashlib.sha256()
+        for row in masters:
+            master_digest.update(_json(row).encode("utf-8"))
+        specification["product_master_sha256"] = master_digest.hexdigest()
     if resume:
         old = json.loads((target / "plan.json").read_text(encoding="utf-8"))
         if old != specification:
             raise ValueError("resume plan differs from original scope")
         master_file = target / "products.jsonl"
-        if _sha(master_file) != (target / "products.sha256").read_text(encoding="ascii").strip():
+        master_sha = _sha(master_file)
+        if master_sha != (target / "products.sha256").read_text(encoding="ascii").strip():
             raise ValueError("product master checksum mismatch")
         if tuple(_read_rows(master_file)) != masters:
             raise ValueError("product master changed since extraction plan")
@@ -299,15 +345,18 @@ def build_bulk_dataset(
         target.mkdir(parents=True, exist_ok=False)
         (target / "plan.json").write_text(_json(specification), encoding="utf-8")
         _write_rows(target / "products.jsonl", masters, company_id=3, row_cap=100000)
-        (target / "products.sha256").write_text(_sha(target / "products.jsonl") + "\n", encoding="ascii")
+        master_sha = _sha(target / "products.jsonl")
+        (target / "products.sha256").write_text(master_sha + "\n", encoding="ascii")
     existing_candidates = sum(
         (_batch_dir(target, batch) / "manifest.json").is_file() for batch in batches
     ) if resume else 0
-    _emit(progress, "plan", planned_batches=len(batches), existing_candidates=existing_candidates)
+    _emit(progress, "plan", planned_batches=len(batches), existing_candidates=existing_candidates,
+          product_master_sha256=master_sha)
     master_index = {row["Rd04_Physic_Cd"].strip(): row for row in masters}
     complete = skipped = 0
     for batch in batches:
-        if max_batches is not None and complete >= max_batches:
+        if (max_batches is not None and complete >= max_batches) or (
+                stop_requested is not None and stop_requested()):
             break
         folder = _batch_dir(target, batch)
         if folder.exists():
@@ -322,7 +371,7 @@ def build_bulk_dataset(
                 folder.rename(failed)
                 folder = _batch_dir(target, batch)
             else:
-                verified = verify_batch(target, batch)
+                verified = verify_batch(target, batch, scope.all_codes)
                 skipped += 1
                 _emit(progress, "batch_reused", batch_id=batch.batch_id, rows=verified["r120_rows"])
                 continue
@@ -349,7 +398,8 @@ def build_bulk_dataset(
         if not manifest_path.exists():
             manifest_path.write_text(_json(manifest), encoding="utf-8")
     summary = {**result, "new_batches": complete, "reused_batches": skipped,
-               "planned_batches": len(batches), "dataset_status": "RESEARCH_POSTHOC" if finished else "BUILDING"}
+               "planned_batches": len(batches), "product_master_sha256": master_sha,
+               "dataset_status": "RESEARCH_POSTHOC" if finished else "BUILDING"}
     _emit(progress, "complete", verified_batches=result["verified_batches"],
           verified_rows=result["source_rows"], dataset_status=summary["dataset_status"])
     return summary
@@ -362,7 +412,10 @@ def verify_bulk_dataset(target: Path, *, require_complete: bool = True) -> dict[
     master = target / "products.jsonl"
     if _sha(master) != (target / "products.sha256").read_text(encoding="ascii").strip():
         raise ValueError("product master checksum mismatch")
-    products = tuple(row["Rd04_Physic_Cd"].strip() for row in _read_rows(master))
+    if plan.get("product_selection") == "r040_use_gu_0" and _sha(master) != plan.get("product_master_sha256"):
+        raise ValueError("product master differs from frozen extraction plan")
+    master_rows = _read_rows(master)
+    products = tuple(row["Rd04_Physic_Cd"].strip() for row in master_rows)
     batches = _month_batches(products, date.fromisoformat(plan["date_from"]),
                              date.fromisoformat(plan["date_to"]), int(plan["group_size"]))
     actual = {path.name for path in (target / "batches").iterdir() if path.is_dir()} if (target / "batches").exists() else set()
@@ -374,7 +427,7 @@ def verify_bulk_dataset(target: Path, *, require_complete: bool = True) -> dict[
     for batch in batches:
         folder = _batch_dir(target, batch)
         if folder.exists():
-            meta = verify_batch(target, batch)
+            meta = verify_batch(target, batch, plan["saved_io_codes"])
             rows += meta["r120_rows"]
             qty += Decimal(meta["r120_quantity"])
             bonus += Decimal(meta["r120_bonus"])
@@ -387,7 +440,8 @@ def verify_bulk_dataset(target: Path, *, require_complete: bool = True) -> dict[
                 or manifest.get("master_sha256") != _sha(master)):
             raise ValueError("bulk dataset is incomplete or totals differ")
         for field in ("dataset_version", "company_id", "source_db_alias", "date_from", "date_to",
-                      "group_size", "profile_fingerprint", "saved_io_codes", "calendar_version"):
+                      "group_size", "profile_fingerprint", "saved_io_codes", "calendar_version",
+                      "product_selection", "source_identity_sha256", "product_master_sha256"):
             if manifest.get(field) != plan.get(field):
                 raise ValueError("bulk dataset contract differs from extraction plan")
         if "whole_sha256" in manifest and manifest["whole_sha256"] != _whole_digest(target, batches):
@@ -395,7 +449,7 @@ def verify_bulk_dataset(target: Path, *, require_complete: bool = True) -> dict[
     return {"verified_batches": verified, "planned_batches": len(batches),
             "source_rows": rows, "source_quantity": str(qty), "source_bonus": str(bonus),
             "master_products": len(products),
-            "active_products": sum(str(row.get("Rd04_Use_Gu") or "").strip() == "0" for row in _read_rows(master))}
+            "active_products": sum(str(row.get("Rd04_Use_Gu") or "").strip() == "0" for row in master_rows)}
 
 
 def materialize_research_cohort(

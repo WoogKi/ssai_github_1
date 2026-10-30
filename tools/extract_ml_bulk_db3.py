@@ -5,17 +5,18 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import signal
 import sys
 from contextlib import ExitStack
 from datetime import date, datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import perf_counter, process_time
-from typing import Any, Iterator, TextIO
+from typing import Any, Callable, Iterator, TextIO
 
 import pyodbc
 
-from app.ml.bulk_dataset import Batch, ProgressCallback, build_bulk_dataset
+from app.ml.bulk_dataset import Batch, ProgressCallback, build_bulk_dataset, load_frozen_active_master
 from app.ml.integration import ml_storage_root
 from app.ml.db3_probe import SAMPLE_R120, SAMPLE_R130
 from app.services.ssai_analysis_profile_service import load_dashboard_profile_checked
@@ -24,13 +25,16 @@ from app.services.sql_server_workload_monitor import SqlServerWorkloadMonitor, w
 
 
 class ProgressReporter:
-    def __init__(self, *, interval: float = 10.0, stream: TextIO | None = None) -> None:
+    def __init__(self, *, interval: float = 10.0, stream: TextIO | None = None,
+                 concise: bool = False) -> None:
         self.interval = interval
+        self.concise = concise
         self.stream = stream if stream is not None else sys.stderr
         self.started = perf_counter()
         self.started_cpu = process_time()
         self.lock = Lock()
         self.stop = Event()
+        self.halt = Event()
         self.thread = Thread(target=self._heartbeat, daemon=True)
         self.stage = "setup"
         self.batch = "-"
@@ -47,6 +51,7 @@ class ProgressReporter:
         self.monitor_select_setup_count = 0
         self.monitor_summary: dict[str, Any] | None = None
         self.final_state: str | None = None
+        self.first_new_batch_started: float | None = None
 
     def __enter__(self) -> ProgressReporter:
         with self.lock:
@@ -75,6 +80,8 @@ class ProgressReporter:
                     "source_cursor_execute_fetch_ms": self.source_client_sql_ms,
                     "fetched_rows": self.fetched, "verified_rows": self.verified,
                     "new_batches": self.completed,
+                    "reused_batches": self.reused,
+                    "planned_batches": self.planned,
                     "new_batch_avg_ms": round(self.batch_elapsed_total_ms / self.completed) if self.completed else None,
                     "new_batch_max_ms": self.batch_elapsed_max_ms if self.completed else None,
                     "elapsed_ms": round((perf_counter() - self.started) * 1000),
@@ -103,8 +110,15 @@ class ProgressReporter:
     def _heartbeat(self) -> None:
         while not self.stop.wait(self.interval):
             with self.lock:
-                print(f"[DB3] HEARTBEAT RUNNING elapsed_s={perf_counter() - self.started:.1f} "
-                      f"last_confirmed_rows={self.fetched}", file=self.stream, flush=True)
+                if self.concise:
+                    remaining = max(0, self.planned - self.existing_candidates - self.completed) if self.planned is not None else None
+                    eta = (round((perf_counter() - self.first_new_batch_started) * remaining / self.completed)
+                           if self.first_new_batch_started is not None and self.completed and remaining is not None
+                           else "unknown")
+                    self._emit("PROGRESS_10M", eta_s=eta)
+                else:
+                    print(f"[DB3] HEARTBEAT RUNNING elapsed_s={perf_counter() - self.started:.1f} "
+                          f"last_confirmed_rows={self.fetched}", file=self.stream, flush=True)
 
     def update(self, event: str, details: dict[str, Any]) -> None:
         with self.lock:
@@ -115,22 +129,26 @@ class ProgressReporter:
             elif event == "plan":
                 self.planned = int(details["planned_batches"])
                 self.existing_candidates = int(details["existing_candidates"])
-                self._emit("PLAN")
+                self._emit("PLAN", product_master_sha256=details["product_master_sha256"])
             elif event == "batch_start":
                 self.batch = str(details["batch_id"])
                 self.stage = "source_totals"
-                self._emit("BATCH_START")
+                if self.first_new_batch_started is None:
+                    self.first_new_batch_started = perf_counter()
+                if not self.concise:
+                    self._emit("BATCH_START")
             elif event == "rows":
                 previous = self.fetched
                 self.fetched += int(details["count"])
-                for boundary in range(previous // 10000 + 1, self.fetched // 10000 + 1):
-                    self._emit("FETCH_10000", boundary_rows=boundary * 10000)
+                if not self.concise:
+                    for boundary in range(previous // 10000 + 1, self.fetched // 10000 + 1):
+                        self._emit("FETCH_10000", boundary_rows=boundary * 10000)
             elif event == "batch_reused":
                 self.batch = str(details["batch_id"])
                 self.stage = "reused_verify"
                 self.reused += 1
                 self.verified += int(details["rows"])
-                if self.reused % 10 == 0 or self.reused == self.existing_candidates:
+                if not self.concise and (self.reused % 10 == 0 or self.reused == self.existing_candidates):
                     self._emit("REUSED")
             elif event == "batch_complete":
                 self.completed += 1
@@ -138,7 +156,10 @@ class ProgressReporter:
                 elapsed = int(details.get("elapsed_ms", 0))
                 self.batch_elapsed_total_ms += elapsed
                 self.batch_elapsed_max_ms = max(self.batch_elapsed_max_ms, elapsed)
-                self._emit("BATCH_DONE", batch_rows=details["rows"])
+                if not self.concise:
+                    self._emit("BATCH_DONE", batch_rows=details["rows"])
+            elif event == "product_drift":
+                self._emit("PRODUCT_DRIFT", **details)
             elif event == "source_select":
                 self.source_select_count += 1
             elif event == "source_sql_elapsed":
@@ -305,14 +326,61 @@ def _select_fixed_products(all_products: list[dict[str, Any]], codes: tuple[str,
     return [by_code[code] for code in codes]
 
 
+def _source_identity_sha256(source: Db3Source, cfg: Any) -> str:
+    rows = list(source.rows(
+        "SELECT DB_NAME() AS database_name, @@SERVERNAME AS server_name, "
+        "CONVERT(varchar(36), database_guid) AS database_guid, "
+        "CONVERT(varchar(36), recovery_fork_guid) AS recovery_fork_guid "
+        "FROM sys.database_recovery_status WHERE database_id = DB_ID()", (),
+    ))
+    if len(rows) != 1 or not all(rows[0].get(name) for name in (
+            "database_name", "server_name", "database_guid", "recovery_fork_guid")):
+        raise ValueError("DB3 database identity is unavailable; active extraction cannot continue")
+    if str(rows[0]["database_name"]).strip().casefold() != str(cfg.db_name).strip().casefold():
+        raise ValueError("DB3 connection database differs from company configuration")
+    identity = {
+        "company_id": cfg.company_id,
+        "configured_server": str(cfg.db_server).strip().casefold(),
+        "configured_port": str(cfg.db_port),
+        "configured_database": str(cfg.db_name).strip().casefold(),
+        "actual_server": str(rows[0]["server_name"]).strip().casefold(),
+        "database_guid": str(rows[0]["database_guid"]).strip().casefold(),
+        "recovery_fork_guid": str(rows[0]["recovery_fork_guid"]).strip().casefold(),
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _product_drift(frozen: tuple[dict[str, Any], ...], current: list[dict[str, Any]]) -> dict[str, Any]:
+    old = {row["Rd04_Physic_Cd"].strip(): row for row in frozen}
+    now = {row["Rd04_Physic_Cd"].strip(): json.loads(json.dumps(row, default=str)) for row in current}
+    if len(now) != len(current):
+        raise ValueError("duplicate R040 active product code")
+    added = set(now) - set(old)
+    removed = set(old) - set(now)
+    changed = {code for code in set(old) & set(now) if old[code] != now[code]}
+    affected = sorted(added | removed | changed)
+    def digest(codes: set[str] | list[str]) -> str:
+        return hashlib.sha256(json.dumps(sorted(codes), ensure_ascii=False,
+                                         separators=(",", ":")).encode()).hexdigest()
+    return {
+        "new_active": len(added), "no_longer_active": len(removed),
+        "master_changed": len(changed), "affected_codes_sha256": digest(affected),
+        "new_active_codes_sha256": digest(added),
+        "no_longer_active_codes_sha256": digest(removed),
+        "master_changed_codes_sha256": digest(changed),
+    }
+
+
 def run(*, dataset_version: str, date_from: date, date_to: date,
         group_size: int, product_limit: int | None, include_dataset_version: str | None,
         resume: bool, max_batches: int | None, inventory_only: bool = False,
         fixed_cohort_version: str | None = None,
         fixed_cohort_manifest_sha256: str | None = None,
+        active_only: bool = False,
         monitor_db3: bool = False, monitor_interval_s: int = 60,
         monitor_max_samples: int = 120,
         monitor_approval_reference: str | None = None,
+        stop_requested: Callable[[], bool] | None = None,
         progress: ProgressCallback | None = None) -> dict[str, Any]:
     if not dataset_version.startswith("db3-bulk-") or not dataset_version.replace("-", "").isalnum():
         raise ValueError("invalid DB3 bulk version")
@@ -324,6 +392,9 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
         raise ValueError("DB3 monitoring requires an explicit approval reference")
     if fixed_cohort_version and (product_limit is not None or include_dataset_version or inventory_only):
         raise ValueError("fixed cohort cannot be combined with pilot selection or inventory mode")
+    if active_only and (fixed_cohort_version or product_limit is not None
+                        or include_dataset_version or inventory_only):
+        raise ValueError("active-only extraction cannot be combined with pilot or inventory selection")
     fixed_codes, fixed_manifest = (
         _fixed_cohort(root, fixed_cohort_version, fixed_cohort_manifest_sha256)
         if fixed_cohort_version and fixed_cohort_manifest_sha256 else ((), None)
@@ -349,6 +420,7 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
     with pyodbc.connect(connection_string, timeout=10, autocommit=True) as connection, ExitStack() as monitor_stack:
         connection.timeout = 120
         source = Db3Source(connection, progress=progress)
+        source_identity = _source_identity_sha256(source, cfg) if active_only else None
         if monitor_db3:
             if not 60 <= monitor_interval_s <= 600 or not 1 <= monitor_max_samples <= 120:
                 raise ValueError("DB3 monitor interval or sample cap out of bounds")
@@ -390,6 +462,11 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
                     "elapsed_ms": int((perf_counter() - started) * 1000)}
         if fixed_manifest is not None:
             selected = _select_fixed_products(all_products, fixed_codes)
+        elif active_only:
+            selected = (load_frozen_active_master(root / "datasets" / dataset_version)
+                        if resume else active)
+            if resume and progress is not None:
+                progress("product_drift", _product_drift(selected, active))
         elif product_limit is not None:
             if not 1 <= product_limit <= 300:
                 raise ValueError("pilot is limited to at most 300 products")
@@ -407,6 +484,8 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
             saved_io_codes=profile.profile.get("io_gu_list") or (), profile_fingerprint=fingerprint,
             calendar_version="UNAVAILABLE_ASOF_EXTRACTION", date_from=date_from, date_to=date_to,
             group_size=group_size, resume=resume, max_batches=max_batches,
+            active_only=active_only, source_identity_sha256=source_identity,
+            stop_requested=stop_requested,
             progress=progress,
         )
         return {**summary, "all_master_products": len(all_products), "all_active_products": len(active),
@@ -421,7 +500,9 @@ def main() -> None:
     parser.add_argument("--dataset-version", default="db3-bulk-" + datetime.now().strftime("%Y%m%d%H%M%S"))
     parser.add_argument("--date-from", default="2018-01-01")
     parser.add_argument("--date-to", default="2026-08-30")
-    parser.add_argument("--group-size", type=int, default=100)
+    parser.add_argument("--group-size", type=int)
+    parser.add_argument("--active-only", action="store_true",
+                        help="freeze all currently active R040 products in a new dataset")
     parser.add_argument("--product-limit", type=int)
     parser.add_argument("--include-dataset-version")
     parser.add_argument("--fixed-cohort-version")
@@ -443,19 +524,35 @@ def main() -> None:
     if args.monitor_db3 and (not 60 <= args.monitor_interval_s <= 600
                              or not 1 <= args.monitor_max_samples <= 120):
         parser.error("DB3 monitoring requires interval 60..600s and max samples 1..120")
-    with ProgressReporter() as reporter:
-        result = run(
+    with ProgressReporter(interval=600.0 if args.active_only else 10.0,
+                          concise=args.active_only) as reporter:
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        if args.active_only:
+            def request_stop(_signum: int, _frame: Any) -> None:
+                if reporter.halt.is_set():
+                    raise KeyboardInterrupt
+                reporter.halt.set()
+                print("[DB3] STOP_REQUESTED after_current_batch=1", file=sys.stderr, flush=True)
+            signal.signal(signal.SIGINT, request_stop)
+        try:
+            result = run(
             dataset_version=args.dataset_version, date_from=date.fromisoformat(args.date_from),
-            date_to=date.fromisoformat(args.date_to), group_size=args.group_size,
+            date_to=date.fromisoformat(args.date_to),
+            group_size=args.group_size if args.group_size is not None else (300 if args.active_only else 100),
             product_limit=args.product_limit, include_dataset_version=args.include_dataset_version,
             resume=args.resume, max_batches=args.max_batches, inventory_only=args.inventory_only,
             fixed_cohort_version=args.fixed_cohort_version,
             fixed_cohort_manifest_sha256=args.fixed_cohort_manifest_sha256,
+            active_only=args.active_only,
             monitor_db3=args.monitor_db3, monitor_interval_s=args.monitor_interval_s,
             monitor_max_samples=args.monitor_max_samples,
             monitor_approval_reference=args.monitor_approval_reference,
+            stop_requested=reporter.halt.is_set if args.active_only else None,
             progress=reporter.update,
-        )
+            )
+        finally:
+            if args.active_only:
+                signal.signal(signal.SIGINT, previous_sigint)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 
