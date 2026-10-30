@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pandas as pd
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -22,7 +24,9 @@ from app.services.snapshot_operation_history import (  # noqa: E402
 from app.services.sql_server_monthly_io_repository import (  # noqa: E402
     MonthlyIoMaterialization, SqlServerMonthlyIoRepository,
 )
-from tools.approve_monthly_io_company import inspect_or_approve_month  # noqa: E402
+from tools.approve_monthly_io_company import (  # noqa: E402
+    inspect_or_approve_initial_months, inspect_or_approve_month,
+)
 from tools.check_company_month_end_readiness import (  # noqa: E402
     KNOWN_COMPANY_IDS, build_inventory, classify_readiness, inspect_company,
 )
@@ -264,6 +268,167 @@ def test_repository_transaction() -> None:
     assert connection.rolled_back and not connection.committed
 
 
+def test_full_initial_draft_only() -> None:
+    from tools import build_monthly_io_company as builder
+
+    scope, _ = _fixture()
+    direct = pd.DataFrame({"product_code": ["00001"]})
+    saves: dict[str, SimpleNamespace] = {}
+
+    class Repository:
+        def read_current(self, _item):
+            raise LookupError("no approved month")
+
+        def read_pending_exact(self, item):
+            return saves.get(item.basis_month)
+
+        def save_draft(self, item, *, created_by):
+            assert created_by == "operator"
+            stored = SimpleNamespace(manifest_id=len(saves) + 1, generation_no=1,
+                                     materialization=item)
+            saves[item.basis_month] = stored
+            return stored
+
+        def read_generation(self, item, generation):
+            stored = saves[item.basis_month]
+            assert generation == stored.generation_no and stored.materialization == item
+            return stored
+
+        def approve_checked(self, *_args, **_kwargs):
+            raise AssertionError("full build approved a Draft")
+
+    frames = [direct, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()]
+
+    def source(_company_id, _sql, _binds, _timeout):
+        return frames.pop(0)
+
+    def stream(_chunks, *, projection_result, **_kwargs):
+        projection_result["result"] = ([], [], [], [], [], {})
+        return []
+
+    with patch.object(builder, "resolve_dashboard_profile_stock_scope", return_value=scope), \
+         patch.object(builder, "_query_decimal", side_effect=source), \
+         patch.object(builder, "product_lifecycle_sql", return_value=("SELECT", {})), \
+         patch.object(builder, "r110_monthly_base_sql", return_value=("SELECT", {})), \
+         patch.object(builder, "r110_monthly_price_sql", return_value=("SELECT", {})), \
+         patch.object(builder, "r110_historical_tail_sql", return_value=("SELECT", {})), \
+         patch.object(builder, "product_statistics_raw_event_stream_sql", return_value=("SELECT", {})), \
+         patch.object(builder, "_query_company_chunks", return_value=iter(())), \
+         patch.object(builder, "r120_facts_from_raw_chunks", side_effect=stream), \
+         patch.object(builder, "r110_facts", return_value=[]), \
+         patch.object(builder, "reconstruct_purchase_prices", return_value={}), \
+         patch.object(builder, "_assert_exact_prices", return_value={"price_mismatch_count": 0}), \
+         patch.object(builder, "_assert_exact_r120", return_value={
+             "normal_monthly_mismatch_count": 0, "return_product_mismatch_count": 0,
+         }), \
+         patch.object(builder, "SqlServerMonthlyIoRepository", return_value=Repository()):
+        for attempt in range(2):
+            frames[:] = [direct, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()]
+            report = builder.run(3, "202610", apply=True, timeout=120, created_by="operator")
+            assert tuple(report["monthly"]) == tuple(f"2026{month:02d}" for month in range(3, 10))
+            assert len(saves) == 7 and all(
+                row["status"] == "draft_pending_manual_approval"
+                and row["resumed_draft"] is bool(attempt)
+                for row in report["monthly"].values()
+            )
+
+
+def test_initial_batch_approval() -> None:
+    scope, item = _fixture()
+    older = replace(item, basis_month="202608", facts=tuple(
+        replace(fact, basis_month="202608") for fact in item.facts
+    ))
+    older.validate()
+    items = (older, item)
+    pins = [{"basis_month": material.basis_month, "manifest_id": number,
+             "generation_no": 1, "checksum": material.checksum}
+            for number, material in enumerate(items, start=51)]
+
+    class Repository:
+        def __init__(self):
+            self.states = {material.basis_month: "draft" for material in items}
+            self.approvals = []
+            self.fail_month = None
+
+        def read_generation(self, material, generation):
+            number = 51 if material.basis_month == "202608" else 52
+            if generation != 1:
+                raise ValueError("generation missing")
+            state = self.states[material.basis_month]
+            return SimpleNamespace(manifest_id=number, generation_no=1, status=state,
+                                   approval_status="pending" if state == "draft" else "approved",
+                                   materialization=material)
+
+        def approve_checked(self, material, generation, **kwargs):
+            if material.basis_month == self.fail_month:
+                raise RuntimeError("approval transaction failed")
+            assert generation == 1 and self.states[material.basis_month] == "draft"
+            assert kwargs["exact_confirmed"] and kwargs["expected_checksum"] == material.checksum
+            assert kwargs["approval_event"].basis_month == material.basis_month
+            _validated_values(kwargs["approval_event"], kwargs["target_hash"])
+            self.states[material.basis_month] = "published"
+            self.approvals.append(material.basis_month)
+            return SimpleNamespace(manifest_id=51 if material.basis_month == "202608" else 52,
+                                   generation_no=1, status="published", approval_status="approved")
+
+        def read_current(self, material):
+            assert self.states[material.basis_month] == "published"
+            return self.read_generation(material, 1)
+
+    repo = Repository()
+    calls = []
+
+    def evidence_builder(company_id, evaluation_month, *, apply, timeout, created_by,
+                         evidence_callback):
+        assert (company_id, evaluation_month, apply, timeout) == (3, "202610", False, 120)
+        calls.append("full_source")
+        for material in items:
+            evidence_callback(material)
+        return {"erp_select_count": 5, "price_exact": {"price_mismatch_count": 0},
+                "r120_exact": {"normal_monthly_mismatch_count": 0,
+                               "return_product_mismatch_count": 0}}
+
+    kwargs = dict(company_id=3, evaluation_month="202610", drafts=pins,
+                  approved_by="operator", approval_reason="independent Exact", repository=repo,
+                  evidence_builder=evidence_builder, scope_loader=lambda *, company_id: scope,
+                  target_hasher=lambda company_id: "f" * 64)
+    checked = inspect_or_approve_initial_months(**kwargs)
+    assert [row["status"] for row in checked["months"]] == ["inspected_draft"] * 2
+    assert not repo.approvals and calls == ["full_source"]
+    _fails(lambda: inspect_or_approve_initial_months(
+        **{**kwargs, "drafts": pins[:1], "approve": True}), "month coverage")
+    _fails(lambda: inspect_or_approve_initial_months(
+        **{**kwargs, "drafts": [{**pins[0], "checksum": "0" * 64}, pins[1]],
+           "approve": True}), "fresh source evidence")
+    _fails(lambda: inspect_or_approve_initial_months(
+        **{**kwargs, "drafts": [{**pins[0], "generation_no": 2}, pins[1]],
+           "approve": True}), "generation")
+    _fails(lambda: inspect_or_approve_initial_months(
+        **{**kwargs, "drafts": [{**pins[0], "manifest_id": 99}, pins[1]],
+           "approve": True}), "stored initial Draft identity")
+    _fails(lambda: inspect_or_approve_initial_months(
+        **{**kwargs, "drafts": [pins[0], pins[0]], "approve": True}), "duplicate")
+    assert not repo.approvals
+    changed_scope = SimpleNamespace(**{**vars(scope), "stock_codes": ("00002",)})
+    scopes = iter((scope, changed_scope))
+    _fails(lambda: inspect_or_approve_initial_months(
+        **{**kwargs, "scope_loader": lambda *, company_id: next(scopes),
+           "approve": True}), "profile changed")
+    assert not repo.approvals
+    repo.fail_month = "202609"
+    _fails(lambda: inspect_or_approve_initial_months(**kwargs, approve=True), "transaction failed")
+    assert repo.approvals == ["202608"]
+    repo.fail_month = None
+    before = len(calls)
+    approved = inspect_or_approve_initial_months(**kwargs, approve=True)
+    assert len(calls) == before + 1, "one batch queried the full source more than once"
+    assert [row["status"] for row in approved["months"]] == ["already_approved", "published_approved"]
+    assert repo.approvals == ["202608", "202609"]
+    again = inspect_or_approve_initial_months(**kwargs, approve=True)
+    assert all(row["status"] == "already_approved" for row in again["months"])
+    assert repo.approvals == ["202608", "202609"]
+
+
 def test_readiness() -> None:
     assert classify_readiness(approved_months=()) == "C"
     assert classify_readiness(approved_months=("202609",), missing_months=("202610",),
@@ -306,9 +471,12 @@ def test_readiness() -> None:
 
 
 def main() -> None:
-    test_approval()
-    test_repository_transaction()
-    test_readiness()
+    with patch("pyodbc.connect", side_effect=AssertionError("DB access in DB-free gate")):
+        test_approval()
+        test_repository_transaction()
+        test_full_initial_draft_only()
+        test_initial_batch_approval()
+        test_readiness()
     print("PASS monthly IO approval/readiness DB-free gate")
 
 

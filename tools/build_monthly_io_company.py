@@ -158,7 +158,8 @@ def _assert_exact_r120(facts: tuple[MonthlyIoFact, ...], projection: tuple[Any, 
 
 
 def run(company_id: int, evaluation_month: str, *, apply: bool, timeout: int,
-        created_by: str, event_callback: Callable[..., None] | None = None) -> dict[str, Any]:
+        created_by: str, event_callback: Callable[..., None] | None = None,
+        evidence_callback: Callable[[MonthlyIoMaterialization], None] | None = None) -> dict[str, Any]:
     def progress(stage: str) -> None:
         print(json.dumps({"stage": stage, "elapsed_ms": round((time.perf_counter() - started) * 1000, 3)}), flush=True)
 
@@ -268,25 +269,36 @@ def run(company_id: int, evaluation_month: str, *, apply: bool, timeout: int,
         raise AssertionError("monthly I/O projection differs from direct calculation")
     progress("exact_pass")
 
+    repository = None
     if apply:
         repository = SqlServerMonthlyIoRepository(
             lambda: connect_company_analytics_db(company_id, "reader", timeout=timeout),
             lambda: connect_company_analytics_db(company_id, "writer", timeout=timeout),
         )
-        by_month: dict[str, list[MonthlyIoFact]] = defaultdict(list)
-        for fact in all_facts:
-            by_month[fact.basis_month].append(fact)
-        first_index = int(first_six[:4]) * 12 + int(first_six[4:]) - 1
-        required_months = {
-            f"{index // 12:04d}{index % 12 + 1:02d}"
-            for index in range(first_index, first_index + 6)
+    by_month: dict[str, list[MonthlyIoFact]] = defaultdict(list)
+    for fact in all_facts:
+        by_month[fact.basis_month].append(fact)
+    first_index = int(first_six[:4]) * 12 + int(first_six[4:]) - 1
+    required_months = {
+        f"{index // 12:04d}{index % 12 + 1:02d}"
+        for index in range(first_index, first_index + 6)
+    }
+    months = sorted(set(by_month) | required_months | {historical_month})
+    if apply:
+        _require_closed_source_months(tuple(months), today=date.today())
+    for month in months:
+        item = MonthlyIoMaterialization(
+            company_id, month, plan.profile_fingerprint, scope_key,
+            product_codes, plan.stock_codes, tuple(by_month.get(month, ())),
+        )
+        item.validate()
+        if evidence_callback is not None:
+            evidence_callback(item)
+        metrics["monthly"][month] = {
+            "status": "component_validated_draft_ready", "fact_count": len(item.facts),
+            "checksum": item.checksum, "saved": False,
         }
-        months = sorted(set(by_month) | required_months | {historical_month})
-        for month in months:
-            item = MonthlyIoMaterialization(
-                company_id, month, plan.profile_fingerprint, scope_key,
-                product_codes, plan.stock_codes, tuple(by_month.get(month, ())),
-            )
+        if repository is not None:
             try:
                 existing = repository.read_current(item)
             except LookupError:
@@ -294,27 +306,19 @@ def run(company_id: int, evaluation_month: str, *, apply: bool, timeout: int,
             if existing is not None:
                 if existing.materialization.checksum != item.checksum:
                     raise AssertionError("approved monthly evidence changed; explicit regeneration review required")
-                metrics["monthly"][month] = {"status": "reused_unchecked", "manifest_id": existing.manifest_id,
-                                              "generation": existing.generation_no,
-                                              "source_verified_at": str(existing.source_verified_at)}
+                metrics["monthly"][month].update({
+                    "status": "reused_source_checked", "saved": True,
+                    "manifest_id": existing.manifest_id,
+                    "generation_no": existing.generation_no,
+                    "source_verified_at": str(existing.source_verified_at),
+                })
                 continue
-            saved = repository.read_pending_exact(item)
-            resumed = saved is not None
-            if saved is None:
-                saved = repository.save_draft(item, created_by=created_by)
-            approved = repository.approve_checked(
-                item, saved.generation_no, expected_checksum=item.checksum,
-                approved_by=created_by, approval_reason="company-scoped full direct Exact 202610 seed",
-                exact_confirmed=True,
-            )
-            metrics["monthly"][month] = {"status": approved.status, "manifest_id": approved.manifest_id,
-                                          "generation": approved.generation_no, "fact_count": len(item.facts),
-                                          "resumed_draft": resumed,
-                                          "source_verified_at": str(approved.source_verified_at)}
+            saved = _save_or_resume_monthly_draft(repository, item, created_by=created_by)
+            metrics["monthly"][month].update(saved)
             if event_callback:
-                event_callback(month, approved.manifest_id, approved.generation_no,
-                               item.checksum, len(item.facts), "approved")
-            progress(f"monthly_{month}_approved")
+                event_callback(month, saved["manifest_id"], saved["generation_no"],
+                               item.checksum, len(item.facts), "pending")
+            progress(f"monthly_{month}_draft_saved")
     metrics["fact_count"] = len(all_facts)
     metrics["total_ms"] = round((time.perf_counter() - started) * 1000, 3)
     return metrics

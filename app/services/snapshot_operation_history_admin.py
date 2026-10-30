@@ -13,6 +13,7 @@ from app.services.ssai_analytics_target_resolver import (
     connect_company_analytics_db,
     normalize_sql_server_identity,
 )
+from app.services.ssai_analytics_snapshot_migration import MIGRATIONS
 from app.services.ssai_company_admin_service import list_companies
 
 
@@ -115,6 +116,30 @@ def _rows(cursor: Any, sql: str, *parameters: Any) -> list[dict[str, Any]]:
     return [dict(zip(names, record)) for record in records]
 
 
+def _migration_status_rows(server: HistoryServer, selected_ids: tuple[int, ...],
+                           stored: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    by_id = {str(row["migration_id"]): row for row in stored or ()}
+    if stored is not None and len(by_id) != len(stored):
+        raise RuntimeError("duplicate Migration ID in schema ledger")
+    result = []
+    for migration in MIGRATIONS:
+        row = by_id.get(migration.migration_id)
+        status = ("history_unavailable" if stored is None else
+                  "not_recorded" if row is None else
+                  "applied" if str(row["migration_checksum"]) == migration.checksum else
+                  "checksum_mismatch")
+        result.append({
+            "server_key": server.key, "server_label": server.label,
+            "selected_company_ids": selected_ids, "shared_company_ids": server.company_ids,
+            "migration_id": migration.migration_id, "status": status,
+            "applied_at": row["applied_at"] if row else None,
+            "applied_by": row["applied_by"] if row else None,
+            "stored_checksum": str(row["migration_checksum"]) if row else None,
+            "code_checksum": migration.checksum,
+        })
+    return result
+
+
 def query_admin_history(
     actor: Any, catalog: HistoryCatalog, *, server_keys: tuple[str, ...],
     company_ids: tuple[int, ...] | None, from_date: date, to_date: date,
@@ -141,6 +166,7 @@ def query_admin_history(
     events: list[dict[str, Any]] = []
     snapshots: list[dict[str, Any]] = []
     monthly: list[dict[str, Any]] = []
+    migrations: list[dict[str, Any]] = []
     server_results: list[dict[str, Any]] = []
     for key in server_keys:
         server = valid_servers[key]
@@ -157,6 +183,19 @@ def query_admin_history(
         try:
             connection = connect_company_analytics_db(server.anchor_company_id, "reader", timeout=10)
             cursor = connection.cursor()
+            ledger_exists = cursor.execute(
+                "SELECT OBJECT_ID(N'snapshot.schema_migrations',N'U')"
+            ).fetchval() is not None
+            ledger_rows = None
+            if ledger_exists:
+                marks = ",".join("?" for _ in MIGRATIONS)
+                ledger_rows = _rows(
+                    cursor,
+                    f"SELECT migration_id,migration_checksum,applied_at,applied_by "
+                    f"FROM snapshot.schema_migrations WHERE migration_id IN ({marks})",
+                    *(migration.migration_id for migration in MIGRATIONS),
+                )
+            migrations.extend(_migration_status_rows(server, selected_ids, ledger_rows))
             if cursor.execute("SELECT OBJECT_ID(N'snapshot.operation_event',N'U')").fetchval() is None:
                 server_results.append({"server": server.label, "status": "migration_011_missing",
                                        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
@@ -220,4 +259,5 @@ def query_admin_history(
                 connection.close()
     events.sort(key=lambda row: (row["event_at"], int(row["event_id"])), reverse=True)
     return {"events": events, "snapshots": snapshots, "monthly": monthly,
-            "servers": server_results, "company_names": catalog.company_names}
+            "migrations": migrations, "servers": server_results,
+            "company_names": catalog.company_names}

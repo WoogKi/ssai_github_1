@@ -259,6 +259,76 @@ def check_multi_server_contract() -> None:
     assert connect.call_args.args[0] == 3, "inactive company was used as connection anchor"
 
 
+def check_migration_ledger_contract() -> None:
+    from types import SimpleNamespace
+    from app.services import snapshot_operation_history_admin as admin
+
+    actor = SimpleNamespace(user_type="SSART_ADMIN", user_grade="SUPER")
+    registered = [
+        {"company_id": 3, "company_name": "시험", "db_server": "server-a",
+         "db_port": None, "is_active": True},
+        {"company_id": 6, "company_name": "공유", "db_server": "server-a",
+         "db_port": None, "is_active": False},
+        {"company_id": 40, "company_name": "별도", "db_server": "server-b",
+         "db_port": None, "is_active": True},
+    ]
+    with patch.object(admin, "list_companies", return_value=registered):
+        catalog = admin.build_history_catalog(actor)
+    server = next(value for value in catalog.servers if 3 in value.company_ids)
+    applied_at = datetime(2026, 10, 30, 15)
+    stored = [{"migration_id": MIGRATIONS[-2].migration_id,
+               "migration_checksum": MIGRATIONS[-2].checksum,
+               "applied_at": applied_at, "applied_by": "operator"},
+              {"migration_id": MIGRATIONS[-1].migration_id,
+               "migration_checksum": "0" * 64,
+               "applied_at": applied_at, "applied_by": "operator"}]
+    rows = admin._migration_status_rows(server, (3, 6), stored)
+    assert len(rows) == len(MIGRATIONS)
+    assert rows[-2]["status"] == "applied" and rows[-1]["status"] == "checksum_mismatch"
+    assert rows[0]["status"] == "not_recorded"
+    assert rows[-2]["shared_company_ids"] == (3, 6)
+    assert admin.to_kst(rows[-2]["applied_at"]).startswith("2026-10-31 00:00")
+    assert all(row["status"] == "history_unavailable"
+               for row in admin._migration_status_rows(server, (3,), None))
+
+    conn = MagicMock()
+    conn.cursor.return_value.execute.return_value.fetchval.side_effect = [1, None]
+    with patch.object(admin, "connect_company_analytics_db", return_value=conn) as connect, \
+         patch.object(admin, "_rows", return_value=stored) as query:
+        result = admin.query_admin_history(actor, catalog, server_keys=(server.key,),
+                                           company_ids=(3, 6), from_date=date(2026, 10, 30),
+                                           to_date=date(2026, 10, 31))
+    assert connect.call_count == 1 and query.call_count == 1
+    assert len(result["migrations"]) == len(MIGRATIONS)
+    assert result["servers"][0]["status"] == "migration_011_missing"
+    assert result["migrations"][-1]["status"] == "checksum_mismatch"
+
+    conn = MagicMock()
+    conn.cursor.return_value.execute.return_value.fetchval.side_effect = [None, None]
+    with patch.object(admin, "connect_company_analytics_db", return_value=conn), \
+         patch.object(admin, "_rows") as query:
+        missing = admin.query_admin_history(actor, catalog, server_keys=(server.key,),
+                                            company_ids=(3,), from_date=date(2026, 10, 30),
+                                            to_date=date(2026, 10, 31))
+    query.assert_not_called()
+    assert all(row["status"] == "history_unavailable" for row in missing["migrations"])
+
+    with patch.object(admin, "connect_company_analytics_db", side_effect=ConnectionError("offline")):
+        failed = admin.query_admin_history(actor, catalog, server_keys=(server.key,),
+                                           company_ids=(3,), from_date=date(2026, 10, 30),
+                                           to_date=date(2026, 10, 31))
+    assert failed["servers"][0]["status"] == "connection_or_query_failed"
+    assert failed["migrations"] == []
+    try:
+        admin.query_admin_history(SimpleNamespace(user_type="USER", user_grade="NORMAL"), catalog,
+                                  server_keys=(server.key,), company_ids=(3,),
+                                  from_date=date(2026, 10, 30), to_date=date(2026, 10, 31))
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError("unauthorized Migration history query was allowed")
+
+
 def check_admin_render() -> None:
     from app.ui import snapshot_operation_history as view
     from app.services.snapshot_operation_history_admin import HistoryCatalog, HistoryServer
@@ -296,6 +366,11 @@ def check_admin_render() -> None:
         {"company_id": "40", "manifest_id": 2, "generation_no": 1}],
         "monthly": [], "servers": [{"server": "ERP 서버 1", "status": "ready",
                                      "elapsed_ms": 10, "event_count": 1}],
+        "migrations": [{"server_label": "ERP 서버 1", "selected_company_ids": (3,),
+                         "shared_company_ids": (3, 40), "migration_id": MIGRATIONS[-1].migration_id,
+                         "status": "applied", "applied_at": datetime(2026, 10, 30, 15),
+                         "applied_by": "operator", "stored_checksum": MIGRATIONS[-1].checksum,
+                         "code_checksum": MIGRATIONS[-1].checksum}],
         "company_names": catalog.company_names}
     with patch.object(view, "st", mock_st), \
          patch.object(view, "require_history_admin"), \
@@ -309,6 +384,11 @@ def check_admin_render() -> None:
     assert query.call_args.kwargs["company_ids"] is None
     frames = [call.args[0] for call in mock_st.dataframe.call_args_list]
     assert any("24/1" in frame.to_string() and "2/1" in frame.to_string() for frame in frames)
+    migration_frames = [frame for frame in frames if "Migration ID" in frame.columns]
+    assert len(migration_frames) == 1
+    assert migration_frames[0]["적용 상태"].iloc[0] == "적용·코드 일치"
+    assert migration_frames[0]["서버 공유 회사"].iloc[0] == "3, 40"
+    assert migration_frames[0]["적용 일시 (KST)"].iloc[0].startswith("2026-10-31 00:00")
     mock_st.json.assert_called_once()
     denied_st = MagicMock()
     with patch.object(view, "st", denied_st), patch.object(view, "get_current_user", return_value=None), \
@@ -435,15 +515,25 @@ def main() -> None:
     parser.add_argument("--live-admin", action="store_true")
     parser.add_argument("--live-all-admin", action="store_true")
     args = parser.parse_args()
-    check_event_contract()
-    check_record_transaction()
-    check_schema_and_ui()
-    check_cleanup_atomicity()
-    check_published_cleanup_guard()
-    check_multi_server_contract()
-    check_admin_render()
-    check_detail_rerun_contract()
-    print("snapshot_operation_history: 8/8 PASS")
+    if not (args.live_company or args.live_admin or args.live_all_admin):
+        connection_guard = patch("pyodbc.connect", side_effect=AssertionError("DB access in DB-free gate"))
+        connection_guard.start()
+    else:
+        connection_guard = None
+    try:
+        check_event_contract()
+        check_record_transaction()
+        check_schema_and_ui()
+        check_cleanup_atomicity()
+        check_published_cleanup_guard()
+        check_multi_server_contract()
+        check_migration_ledger_contract()
+        check_admin_render()
+        check_detail_rerun_contract()
+    finally:
+        if connection_guard is not None:
+            connection_guard.stop()
+    print("snapshot_operation_history: 9/9 PASS")
     if args.live_all_admin:
         from types import SimpleNamespace
         from app.services import snapshot_operation_history_admin as admin

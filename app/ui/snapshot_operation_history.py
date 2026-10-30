@@ -38,6 +38,11 @@ _STAGES = {"cleanup_committed": "삭제 완료", "draft_committed": "초안 저�
 _SERVER_STATUSES = {"ready": "정상", "migration_011_missing": "이력 Migration 011 미적용",
                     "no_active_anchor": "연결 가능한 활성 회사 없음",
                     "connection_or_query_failed": "연결 또는 조회 실패"}
+_MIGRATION_STATUSES = {
+    "applied": "적용·코드 일치", "not_recorded": "원장 미기록·적용 미확인",
+    "checksum_mismatch": "저장·코드 Checksum 불일치",
+    "history_unavailable": "Migration 원장 없음·확인 불가",
+}
 _TIMING_LABELS = {
     "pre_approval_inspect_generation": "승인 전 Snapshot 검사",
     "pre_approval_verification": "승인 전 Exact 검증",
@@ -288,6 +293,23 @@ def render_snapshot_operation_history_page() -> None:
         st.dataframe(pd.DataFrame(server_rows), width="stretch", hide_index=True)
         for warning in catalog.warnings:
             st.warning(warning)
+    migrations = result.get("migrations", [])
+    if migrations:
+        st.subheader("Migration 적용 현황")
+        st.dataframe(pd.DataFrame([{
+            "ERP 서버": row["server_label"],
+            "적용 범위": "서버 공용 SSAI_ANALYTICS",
+            "조회 회사": ", ".join(str(cid) for cid in row["selected_company_ids"]),
+            "서버 공유 회사": ", ".join(str(cid) for cid in row["shared_company_ids"]),
+            "실행 당시 대표 회사": "원장에 기록 없음",
+            "Migration ID": row["migration_id"],
+            "적용 상태": _MIGRATION_STATUSES.get(row["status"], "확인 불가"),
+            "적용 일시 (KST)": to_kst(row["applied_at"]),
+            "적용자": _present(row["applied_by"]),
+            "저장 Checksum": _present(row["stored_checksum"]),
+            "현재 코드 Checksum": row["code_checksum"],
+        } for row in migrations]), width="stretch", hide_index=True)
+        st.caption("Migration은 서버의 Analytics DB에 한 번 적용됩니다. 원장에는 실행 당시 대표 회사나 실패 이력이 기록되지 않습니다.")
     events = result["events"]
     metrics = st.columns(3)
     metrics[0].metric("조회된 작업", f"{len(events):,}건")
