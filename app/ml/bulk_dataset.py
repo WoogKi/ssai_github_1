@@ -21,6 +21,7 @@ MAX_BATCH_BYTES = 32 * 1024 * 1024
 MAX_GROUP_PRODUCTS = 300
 FIRST_DAY = date(2018, 1, 1)
 LAST_DAY = date(2026, 8, 30)
+ProgressCallback = Callable[[str, dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -77,7 +78,8 @@ def _load_master(rows: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...
 
 
 def _write_rows(path: Path, rows: Iterable[Mapping[str, Any]], *, company_id: int,
-                row_cap: int = MAX_BATCH_ROWS) -> tuple[int, Decimal, Decimal]:
+                row_cap: int = MAX_BATCH_ROWS,
+                row_progress: Callable[[int], None] | None = None) -> tuple[int, Decimal, Decimal]:
     count = 0
     size = 0
     quantity = bonus = Decimal(0)
@@ -98,7 +100,16 @@ def _write_rows(path: Path, rows: Iterable[Mapping[str, Any]], *, company_id: in
             if size > MAX_BATCH_BYTES:
                 raise ValueError("batch exceeds file-size cap; use a smaller group")
             stream.write(line)
+            if row_progress is not None and count % 500 == 0:
+                row_progress(500)
+    if row_progress is not None and count % 500:
+        row_progress(count % 500)
     return count, quantity, bonus
+
+
+def _emit(progress: ProgressCallback | None, event: str, **details: Any) -> None:
+    if progress is not None:
+        progress(event, details)
 
 
 def _read_rows(path: Path) -> list[dict[str, Any]]:
@@ -186,6 +197,7 @@ def verify_batch(root: Path, batch: Batch) -> dict[str, Any]:
 def _save_batch(
     root: Path, batch: Batch, source: Any, masters: Mapping[str, Mapping[str, Any]],
     saved_io_codes: tuple[str, ...],
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     folder = _batch_dir(root, batch)
     if folder.exists():
@@ -194,20 +206,28 @@ def _save_batch(
     started = perf_counter()
     stage = "source_totals"
     try:
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         expected = source.totals(batch)
         if int(expected["row_count"]) > MAX_BATCH_ROWS:
             raise ValueError("R120 batch exceeds row cap; use a smaller group")
         stage = "r120_fetch"
-        count, qty, bonus = _write_rows(folder / "r120.jsonl", source.outbound_rows(batch), company_id=3)
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
+        count, qty, bonus = _write_rows(
+            folder / "r120.jsonl", source.outbound_rows(batch), company_id=3,
+            row_progress=(lambda count: _emit(progress, "rows", count=count)) if progress else None,
+        )
         stage = "r130_fetch"
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         headers, _, _ = _write_rows(folder / "r130.jsonl", source.document_rows(batch), company_id=3)
         stage = "independent_exact"
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         if (count != int(expected["row_count"]) or qty != Decimal(str(expected["quantity"]))
                 or bonus != Decimal(str(expected["bonus_quantity"]))):
             raise ValueError("R120 batch differs from independent SQL totals")
         outbound = _read_rows(folder / "r120.jsonl")
         docs = _read_rows(folder / "r130.jsonl")
         stage = "prepare_sources"
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         prepared = prepare_sources(
             company_id=3, outbound_rows=outbound, document_rows=docs, vendor_rows=(),
             product_rows=(masters[code] for code in batch.product_codes), standard_rows=(),
@@ -229,6 +249,7 @@ def _save_batch(
         }
         (folder / "manifest.json").write_text(_json(manifest), encoding="utf-8")
         stage = "readback"
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         verify_batch(root, batch)
         return manifest
     except Exception as exc:
@@ -245,6 +266,7 @@ def build_bulk_dataset(
     saved_io_codes: Iterable[str], profile_fingerprint: str, calendar_version: str,
     date_from: date = FIRST_DAY, date_to: date = LAST_DAY, group_size: int = 100,
     resume: bool = False, max_batches: int | None = None,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     if not dataset_version.startswith("db3-bulk-") or not dataset_version.replace("-", "").isalnum():
         raise ValueError("invalid DB3 bulk dataset version")
@@ -278,6 +300,10 @@ def build_bulk_dataset(
         (target / "plan.json").write_text(_json(specification), encoding="utf-8")
         _write_rows(target / "products.jsonl", masters, company_id=3, row_cap=100000)
         (target / "products.sha256").write_text(_sha(target / "products.jsonl") + "\n", encoding="ascii")
+    existing_candidates = sum(
+        (_batch_dir(target, batch) / "manifest.json").is_file() for batch in batches
+    ) if resume else 0
+    _emit(progress, "plan", planned_batches=len(batches), existing_candidates=existing_candidates)
     master_index = {row["Rd04_Physic_Cd"].strip(): row for row in masters}
     complete = skipped = 0
     for batch in batches:
@@ -296,11 +322,16 @@ def build_bulk_dataset(
                 folder.rename(failed)
                 folder = _batch_dir(target, batch)
             else:
-                verify_batch(target, batch)
+                verified = verify_batch(target, batch)
                 skipped += 1
+                _emit(progress, "batch_reused", batch_id=batch.batch_id, rows=verified["r120_rows"])
                 continue
-        _save_batch(target, batch, source, master_index, scope.all_codes)
+        _emit(progress, "batch_start", batch_id=batch.batch_id)
+        saved = _save_batch(target, batch, source, master_index, scope.all_codes, progress)
         complete += 1
+        _emit(progress, "batch_complete", batch_id=batch.batch_id, rows=saved["r120_rows"],
+              elapsed_ms=saved["elapsed_ms"])
+    _emit(progress, "stage", stage="dataset_verify")
     result = verify_bulk_dataset(target, require_complete=False)
     finished = result["verified_batches"] == len(batches)
     if finished and result["verified_batches"] == len(batches):
@@ -317,8 +348,11 @@ def build_bulk_dataset(
                 raise ValueError("existing complete manifest differs")
         if not manifest_path.exists():
             manifest_path.write_text(_json(manifest), encoding="utf-8")
-    return {**result, "new_batches": complete, "reused_batches": skipped,
-            "planned_batches": len(batches), "dataset_status": "RESEARCH_POSTHOC" if finished else "BUILDING"}
+    summary = {**result, "new_batches": complete, "reused_batches": skipped,
+               "planned_batches": len(batches), "dataset_status": "RESEARCH_POSTHOC" if finished else "BUILDING"}
+    _emit(progress, "complete", verified_batches=result["verified_batches"],
+          verified_rows=result["source_rows"], dataset_status=summary["dataset_status"])
+    return summary
 
 
 def verify_bulk_dataset(target: Path, *, require_complete: bool = True) -> dict[str, Any]:

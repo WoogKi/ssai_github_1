@@ -5,41 +5,203 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
+from contextlib import ExitStack
 from datetime import date, datetime
 from pathlib import Path
-from time import perf_counter
-from typing import Any, Iterator
+from threading import Event, Lock, Thread
+from time import perf_counter, process_time
+from typing import Any, Iterator, TextIO
 
 import pyodbc
 
-from app.ml.bulk_dataset import Batch, build_bulk_dataset
+from app.ml.bulk_dataset import Batch, ProgressCallback, build_bulk_dataset
 from app.ml.integration import ml_storage_root
 from app.ml.db3_probe import SAMPLE_R120, SAMPLE_R130
 from app.services.ssai_analysis_profile_service import load_dashboard_profile_checked
 from app.services.ssai_auth_service import build_company_conn_str, get_company_db_config
+from app.services.sql_server_workload_monitor import SqlServerWorkloadMonitor, worker_process_metrics
+
+
+class ProgressReporter:
+    def __init__(self, *, interval: float = 10.0, stream: TextIO | None = None) -> None:
+        self.interval = interval
+        self.stream = stream if stream is not None else sys.stderr
+        self.started = perf_counter()
+        self.started_cpu = process_time()
+        self.lock = Lock()
+        self.stop = Event()
+        self.thread = Thread(target=self._heartbeat, daemon=True)
+        self.stage = "setup"
+        self.batch = "-"
+        self.planned: int | None = None
+        self.existing_candidates = 0
+        self.reused = 0
+        self.completed = 0
+        self.fetched = 0
+        self.verified = 0
+        self.source_select_count = 0
+        self.source_client_sql_ms = 0
+        self.batch_elapsed_total_ms = 0
+        self.batch_elapsed_max_ms = 0
+        self.monitor_select_setup_count = 0
+        self.monitor_summary: dict[str, Any] | None = None
+        self.final_state: str | None = None
+
+    def __enter__(self) -> ProgressReporter:
+        with self.lock:
+            self._emit("RUNNING")
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type: type[BaseException] | None, _exc: BaseException | None,
+                 _tb: Any) -> None:
+        try:
+            if exc_type is not None:
+                with self.lock:
+                    self._emit("FAILED", error=exc_type.__name__)
+        finally:
+            self.stop.set()
+            self.thread.join()
+            with self.lock:
+                monitor_selects = self.monitor_select_setup_count + (
+                    self.monitor_summary or {}).get("monitor_select_attempts", 0)
+                summary = {
+                    "scope": "DB3_EXTRACTION_RUN",
+                    "state": "FAILED" if exc_type else (self.final_state or "FINISHED"),
+                    "source_select_attempts": self.source_select_count,
+                    "monitor_select_attempts": monitor_selects,
+                    "total_db_select_attempts": self.source_select_count + monitor_selects,
+                    "source_cursor_execute_fetch_ms": self.source_client_sql_ms,
+                    "fetched_rows": self.fetched, "verified_rows": self.verified,
+                    "new_batches": self.completed,
+                    "new_batch_avg_ms": round(self.batch_elapsed_total_ms / self.completed) if self.completed else None,
+                    "new_batch_max_ms": self.batch_elapsed_max_ms if self.completed else None,
+                    "elapsed_ms": round((perf_counter() - self.started) * 1000),
+                    "blocking_observed_in_samples": (self.monitor_summary or {}).get("blocking_observed"),
+                    "error_count": int(exc_type is not None),
+                    "db3_monitor": self.monitor_summary or {"state": "DISABLED"},
+                    "worker_process": worker_process_metrics(self.started_cpu),
+                }
+                print("[DB3] PERF_SUMMARY " + json.dumps(summary, ensure_ascii=False, sort_keys=True),
+                      file=self.stream, flush=True)
+
+    def _emit(self, event: str, **extra: Any) -> None:
+        fields = {
+            "state": "RUNNING" if event not in ("DONE", "PARTIAL", "FAILED") else event,
+            "stage": self.stage, "batch": self.batch,
+            "planned_batches": self.planned if self.planned is not None else "unknown",
+            "existing_candidates": self.existing_candidates,
+            "reused_verified": self.reused, "new_completed": self.completed,
+            "fetched_rows": self.fetched, "verified_rows": self.verified,
+            "elapsed_s": f"{perf_counter() - self.started:.1f}",
+        }
+        fields.update(extra)
+        print("[DB3] " + event + " " + " ".join(f"{key}={value}" for key, value in fields.items()),
+              file=self.stream, flush=True)
+
+    def _heartbeat(self) -> None:
+        while not self.stop.wait(self.interval):
+            with self.lock:
+                print(f"[DB3] HEARTBEAT RUNNING elapsed_s={perf_counter() - self.started:.1f} "
+                      f"last_confirmed_rows={self.fetched}", file=self.stream, flush=True)
+
+    def update(self, event: str, details: dict[str, Any]) -> None:
+        with self.lock:
+            if event == "stage":
+                self.stage = str(details["stage"])
+                if "batch_id" in details or self.stage == "dataset_verify":
+                    self.batch = str(details.get("batch_id", "-"))
+            elif event == "plan":
+                self.planned = int(details["planned_batches"])
+                self.existing_candidates = int(details["existing_candidates"])
+                self._emit("PLAN")
+            elif event == "batch_start":
+                self.batch = str(details["batch_id"])
+                self.stage = "source_totals"
+                self._emit("BATCH_START")
+            elif event == "rows":
+                previous = self.fetched
+                self.fetched += int(details["count"])
+                for boundary in range(previous // 10000 + 1, self.fetched // 10000 + 1):
+                    self._emit("FETCH_10000", boundary_rows=boundary * 10000)
+            elif event == "batch_reused":
+                self.batch = str(details["batch_id"])
+                self.stage = "reused_verify"
+                self.reused += 1
+                self.verified += int(details["rows"])
+                if self.reused % 10 == 0 or self.reused == self.existing_candidates:
+                    self._emit("REUSED")
+            elif event == "batch_complete":
+                self.completed += 1
+                self.verified += int(details["rows"])
+                elapsed = int(details.get("elapsed_ms", 0))
+                self.batch_elapsed_total_ms += elapsed
+                self.batch_elapsed_max_ms = max(self.batch_elapsed_max_ms, elapsed)
+                self._emit("BATCH_DONE", batch_rows=details["rows"])
+            elif event == "source_select":
+                self.source_select_count += 1
+            elif event == "source_sql_elapsed":
+                self.source_client_sql_ms += int(details["elapsed_ms"])
+            elif event == "monitor_setup_select":
+                self.monitor_select_setup_count += 1
+            elif event == "db_monitor_sample":
+                self._emit("DB_MONITOR", samples=details["sample_count"],
+                           request_active=details["request_active"], blocking=details["blocking"],
+                           session_cpu_ms=details["session_cpu_ms"],
+                           logical_reads=details["session_logical_reads"],
+                           reads=details["session_reads"],
+                           request_elapsed_ms=details["request_elapsed_ms"],
+                           request_wait_ms=details["request_wait_ms"],
+                           tempdb_net_kb=details["tempdb_net_kb"],
+                           server_available_memory_kb=details["server_available_memory_kb"],
+                           unavailable=",".join(f"{name}:{reason}" for name, reason in details["unavailable"].items()))
+            elif event == "monitor_summary":
+                self.monitor_summary = details
+            elif event == "complete":
+                self.stage = "complete"
+                self.batch = "-"
+                self.verified = int(details["verified_rows"])
+                self.final_state = "DONE" if details["dataset_status"] == "RESEARCH_POSTHOC" else "PARTIAL"
+                self._emit(self.final_state, verified_batches=details["verified_batches"])
 
 
 class Db3Source:
-    def __init__(self, connection: pyodbc.Connection) -> None:
+    def __init__(self, connection: pyodbc.Connection, progress: ProgressCallback | None = None) -> None:
         self.connection = connection
+        self.progress = progress
         self.query_count = 0
 
     def rows(self, sql: str, params: tuple[Any, ...]) -> Iterator[dict[str, Any]]:
         if not sql.lstrip().upper().startswith("SELECT"):
             raise ValueError("DB3 source is read-only")
         self.query_count += 1
+        cursor_wait_ms = 0.0
+        if self.progress is not None:
+            self.progress("source_select", {})
         cursor = self.connection.cursor()
         try:
-            cursor.execute(sql, *params)
+            started = perf_counter()
+            try:
+                cursor.execute(sql, *params)
+            finally:
+                cursor_wait_ms += (perf_counter() - started) * 1000
             names = [item[0] for item in cursor.description]
             while True:
-                chunk = cursor.fetchmany(500)
+                started = perf_counter()
+                try:
+                    chunk = cursor.fetchmany(500)
+                finally:
+                    cursor_wait_ms += (perf_counter() - started) * 1000
                 if not chunk:
                     break
                 for item in chunk:
                     yield dict(zip(names, item))
         finally:
             cursor.close()
+            if self.progress is not None:
+                self.progress("source_sql_elapsed", {"elapsed_ms": round(cursor_wait_ms)})
+
 
     def product_rows(self) -> Iterator[dict[str, Any]]:
         for row in self.rows(
@@ -79,6 +241,12 @@ WHERE Rd12_Out_YyMmDd >= ? AND Rd12_Out_YyMmDd < ?
             SAMPLE_R130.format(product_marks=marks, row_limit=10001),
             (batch.date_from, batch.date_to_exclusive, *batch.product_codes),
         )
+
+
+def _stop_monitor(monitor: SqlServerWorkloadMonitor, progress: ProgressCallback | None) -> None:
+    monitor.stop()
+    if progress is not None:
+        progress("monitor_summary", monitor.summary())
 
 
 def _prior_codes(root: Path, version: str) -> set[str]:
@@ -141,19 +309,27 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
         group_size: int, product_limit: int | None, include_dataset_version: str | None,
         resume: bool, max_batches: int | None, inventory_only: bool = False,
         fixed_cohort_version: str | None = None,
-        fixed_cohort_manifest_sha256: str | None = None) -> dict[str, Any]:
+        fixed_cohort_manifest_sha256: str | None = None,
+        monitor_db3: bool = False, monitor_interval_s: int = 60,
+        monitor_max_samples: int = 120,
+        monitor_approval_reference: str | None = None,
+        progress: ProgressCallback | None = None) -> dict[str, Any]:
     if not dataset_version.startswith("db3-bulk-") or not dataset_version.replace("-", "").isalnum():
         raise ValueError("invalid DB3 bulk version")
     root = ml_storage_root()
     started = perf_counter()
     if bool(fixed_cohort_version) != bool(fixed_cohort_manifest_sha256):
         raise ValueError("fixed cohort version and trusted checksum must be supplied together")
+    if monitor_db3 and not monitor_approval_reference:
+        raise ValueError("DB3 monitoring requires an explicit approval reference")
     if fixed_cohort_version and (product_limit is not None or include_dataset_version or inventory_only):
         raise ValueError("fixed cohort cannot be combined with pilot selection or inventory mode")
     fixed_codes, fixed_manifest = (
         _fixed_cohort(root, fixed_cohort_version, fixed_cohort_manifest_sha256)
         if fixed_cohort_version and fixed_cohort_manifest_sha256 else ((), None)
     )
+    if progress is not None:
+        progress("stage", {"stage": "profile_load"})
     profile = load_dashboard_profile_checked(company_id=3)
     if profile.status != "ready" or not profile.profile:
         raise ValueError("company 3 saved Dashboard profile unavailable")
@@ -162,12 +338,43 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
     ).encode("utf-8")).hexdigest()
     if fixed_manifest is not None and fixed_manifest.get("profile_fingerprint") != fingerprint:
         raise ValueError("saved Dashboard profile differs from the fixed cohort")
+    if progress is not None:
+        progress("stage", {"stage": "company_config"})
     cfg = get_company_db_config(3)
     if cfg.company_id != 3:
         raise ValueError("ERP connection is not company 3")
-    with pyodbc.connect(build_company_conn_str(cfg), timeout=10, autocommit=True) as connection:
+    if progress is not None:
+        progress("stage", {"stage": "erp_connect"})
+    connection_string = build_company_conn_str(cfg)
+    with pyodbc.connect(connection_string, timeout=10, autocommit=True) as connection, ExitStack() as monitor_stack:
         connection.timeout = 120
-        source = Db3Source(connection)
+        source = Db3Source(connection, progress=progress)
+        if monitor_db3:
+            if not 60 <= monitor_interval_s <= 600 or not 1 <= monitor_max_samples <= 120:
+                raise ValueError("DB3 monitor interval or sample cap out of bounds")
+            if progress is not None:
+                progress("monitor_setup_select", {})
+            try:
+                cursor = connection.cursor()
+                try:
+                    cursor.execute("SELECT @@SPID")
+                    session_id = int(cursor.fetchone()[0])
+                finally:
+                    cursor.close()
+                monitor = SqlServerWorkloadMonitor(
+                    lambda: pyodbc.connect(connection_string, timeout=10, autocommit=True),
+                    session_id=session_id, interval_s=monitor_interval_s,
+                    max_samples=monitor_max_samples,
+                    on_sample=(lambda sample: progress("db_monitor_sample", sample)) if progress else None,
+                )
+                monitor.start()
+                monitor_stack.callback(_stop_monitor, monitor, progress)
+            except Exception as exc:
+                if progress is not None:
+                    progress("monitor_summary", {"state": "UNAVAILABLE", "monitor_select_attempts": 0,
+                                                 "unavailable": {"setup": type(exc).__name__}})
+        if progress is not None:
+            progress("stage", {"stage": "product_master"})
         all_products = list(source.product_rows())
         active = [row for row in all_products if str(row.get("Rd04_Use_Gu") or "").strip() == "0"]
         if inventory_only:
@@ -200,6 +407,7 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
             saved_io_codes=profile.profile.get("io_gu_list") or (), profile_fingerprint=fingerprint,
             calendar_version="UNAVAILABLE_ASOF_EXTRACTION", date_from=date_from, date_to=date_to,
             group_size=group_size, resume=resume, max_batches=max_batches,
+            progress=progress,
         )
         return {**summary, "all_master_products": len(all_products), "all_active_products": len(active),
                 "all_stopped_products": len(all_products) - len(active), "erp_select_count": source.query_count,
@@ -221,17 +429,33 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--max-batches", type=int)
     parser.add_argument("--inventory-only", action="store_true")
+    parser.add_argument("--monitor-db3", action="store_true",
+                        help="opt-in bounded read-only DMV sampling for the DB3 extraction session")
+    parser.add_argument("--monitor-approval-reference",
+                        help="required approval reference for live DB3 DMV sampling")
+    parser.add_argument("--monitor-interval-s", type=int, default=60)
+    parser.add_argument("--monitor-max-samples", type=int, default=120)
     args = parser.parse_args()
     if not args.live_read_only or args.company_id != 3:
         parser.error("explicit company 3 read-only scope required")
-    result = run(
-        dataset_version=args.dataset_version, date_from=date.fromisoformat(args.date_from),
-        date_to=date.fromisoformat(args.date_to), group_size=args.group_size,
-        product_limit=args.product_limit, include_dataset_version=args.include_dataset_version,
-        resume=args.resume, max_batches=args.max_batches, inventory_only=args.inventory_only,
-        fixed_cohort_version=args.fixed_cohort_version,
-        fixed_cohort_manifest_sha256=args.fixed_cohort_manifest_sha256,
-    )
+    if args.monitor_db3 and not args.monitor_approval_reference:
+        parser.error("DB3 monitoring requires an explicit approval reference")
+    if args.monitor_db3 and (not 60 <= args.monitor_interval_s <= 600
+                             or not 1 <= args.monitor_max_samples <= 120):
+        parser.error("DB3 monitoring requires interval 60..600s and max samples 1..120")
+    with ProgressReporter() as reporter:
+        result = run(
+            dataset_version=args.dataset_version, date_from=date.fromisoformat(args.date_from),
+            date_to=date.fromisoformat(args.date_to), group_size=args.group_size,
+            product_limit=args.product_limit, include_dataset_version=args.include_dataset_version,
+            resume=args.resume, max_batches=args.max_batches, inventory_only=args.inventory_only,
+            fixed_cohort_version=args.fixed_cohort_version,
+            fixed_cohort_manifest_sha256=args.fixed_cohort_manifest_sha256,
+            monitor_db3=args.monitor_db3, monitor_interval_s=args.monitor_interval_s,
+            monitor_max_samples=args.monitor_max_samples,
+            monitor_approval_reference=args.monitor_approval_reference,
+            progress=reporter.update,
+        )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 

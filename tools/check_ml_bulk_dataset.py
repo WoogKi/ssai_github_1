@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.ml.bulk_dataset import build_bulk_dataset, materialize_research_cohort, verify_bulk_dataset
-from tools.extract_ml_bulk_db3 import _fixed_cohort, _select_fixed_products, run as extract_run
+from app.ml.bulk_dataset import _write_rows, build_bulk_dataset, materialize_research_cohort, verify_bulk_dataset
+from tools.extract_ml_bulk_db3 import ProgressReporter, _fixed_cohort, _select_fixed_products, main as extract_main, run as extract_run
 from tools.check_ml_phase1_foundation import outbound
 from tools.run_ml_phase1_offline import run_fixture
 
@@ -54,16 +57,92 @@ class FakeSource:
 
 
 def run(root: Path, source: FakeSource, *, resume=False, max_batches=None,
-        start=date(2026, 5, 1), end=date(2026, 6, 30)):
+        start=date(2026, 5, 1), end=date(2026, 6, 30), progress=None):
     return build_bulk_dataset(
         root, dataset_version="db3-bulk-fixture", source=source, master_rows=MASTER,
         saved_io_codes=("501", "601"), profile_fingerprint="fixture", calendar_version="fixture",
         date_from=start, date_to=end, group_size=2,
-        resume=resume, max_batches=max_batches,
+        resume=resume, max_batches=max_batches, progress=progress,
     )
 
 
 class BulkDatasetGate(unittest.TestCase):
+    def test_live_progress_and_resume_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first_output = io.StringIO()
+            with ProgressReporter(stream=first_output) as reporter:
+                first = run(root, FakeSource(), max_batches=1, progress=reporter.update)
+            self.assertEqual(first["verified_batches"], 1)
+            self.assertIn("PLAN", first_output.getvalue())
+            self.assertIn("BATCH_DONE", first_output.getvalue())
+            self.assertIn("fetched_rows=2", first_output.getvalue())
+            self.assertIn("verified_rows=2", first_output.getvalue())
+            self.assertIn("PARTIAL", first_output.getvalue())
+            resumed_output = io.StringIO()
+            with ProgressReporter(stream=resumed_output) as reporter:
+                resumed = run(root, FakeSource(), resume=True, progress=reporter.update)
+            self.assertEqual(resumed["verified_batches"], 4)
+            self.assertIn("existing_candidates=1", resumed_output.getvalue())
+            self.assertIn("reused_verified=1", resumed_output.getvalue())
+            self.assertIn("verified_rows=6", resumed_output.getvalue())
+            self.assertIn("DONE", resumed_output.getvalue())
+
+    def test_row_threshold_below_and_above_ten_thousand(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            with ProgressReporter(stream=output) as reporter:
+                progress = lambda count: reporter.update("rows", {"count": count})
+                _write_rows(Path(tmp) / "first.jsonl",
+                            ({"Rd12_Quantity": "1"} for _ in range(6000)),
+                            company_id=3, row_progress=progress)
+                self.assertNotIn("FETCH_10000", output.getvalue())
+                _write_rows(Path(tmp) / "second.jsonl",
+                            ({"Rd12_Quantity": "1"} for _ in range(4500)),
+                            company_id=3, row_progress=progress)
+            self.assertEqual(output.getvalue().count("FETCH_10000"), 1)
+            self.assertIn("boundary_rows=10000", output.getvalue())
+            self.assertEqual(reporter.fetched, 10500)
+
+    def test_heartbeat_during_source_wait_and_stdout_json(self):
+        output = io.StringIO()
+        class SlowSource(FakeSource):
+            def totals(self, batch):
+                Event().wait(0.07)
+                return super().totals(batch)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with ProgressReporter(interval=0.02, stream=output) as reporter:
+                run(Path(tmp), SlowSource(), max_batches=1, progress=reporter.update)
+        heartbeats = [line for line in output.getvalue().splitlines() if "HEARTBEAT" in line]
+        self.assertTrue(heartbeats)
+        for line in heartbeats:
+            self.assertRegex(line, r"^\[DB3\] HEARTBEAT RUNNING elapsed_s=\d+\.\d last_confirmed_rows=\d+$")
+        self.assertTrue(any(line.endswith("last_confirmed_rows=0") for line in heartbeats))
+        self.assertFalse(reporter.thread.is_alive())
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (patch("sys.argv", ["extract_ml_bulk_db3.py", "--live-read-only", "--company-id", "3"]),
+              patch("tools.extract_ml_bulk_db3.run", return_value={"dataset_status": "BUILDING"}),
+              redirect_stdout(stdout), redirect_stderr(stderr)):
+            extract_main()
+        self.assertEqual(json.loads(stdout.getvalue()), {"dataset_status": "BUILDING"})
+        self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+        self.assertIn("[DB3] RUNNING", stderr.getvalue())
+
+    def test_progress_failure_stops_without_final_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = io.StringIO()
+            source = FakeSource()
+            source.failed = "202605-g0000"
+            with self.assertRaisesRegex(RuntimeError, "synthetic"):
+                with ProgressReporter(stream=output) as reporter:
+                    run(Path(tmp), source, progress=reporter.update)
+            self.assertIn("FAILED", output.getvalue())
+            self.assertIn("stage=source_totals", output.getvalue())
+            self.assertFalse(reporter.thread.is_alive())
+            self.assertTrue((Path(tmp) / "datasets" / "db3-bulk-fixture" / "batches" /
+                             "202605-g0000" / "error.json").exists())
+
     def test_fixed_pilot_cohort_preserves_exact_product_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
