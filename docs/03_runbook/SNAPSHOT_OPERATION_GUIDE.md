@@ -4,6 +4,12 @@
 
 이 문서는 회사별 Snapshot 생성, 검증, 승인, 게시 및 화면 Smoke의 표준 운영 절차다. Snapshot은 profile scope와 평가월을 기준으로 immutable relational row로 저장하며, operating reader는 승인·게시된 generation만 사용한다.
 
+## SSAI_ANALYTICS 백업·복구 책임
+
+이 정책은 전체 활성 회사에 공통 적용한다. `SSAI_ANALYTICS`의 정기 백업은 DBA가 전담하고 별도 장비에 보관한다. DB 장애 발생 시 복구도 DBA가 담당한다. SIMS AI 작업자는 별도 DB 백업·복원 프로그램을 운영하거나 Migration 전에 로컬 백업·`RESTORE VERIFYONLY`·복원 시험을 필수 Gate로 수행하지 않는다. 백업 카탈로그가 조회되지 않는다는 이유만으로 Migration을 HOLD하지 않는다. 이 분리는 백업의 실제 복구 가능성을 SIMS AI가 검증했다는 뜻이 아니다. 필요 시 Snapshot과 월별 Fact는 ERP 원천에서 현행 Exact·승인 절차를 거쳐 재생성한다.
+
+Migration 전에는 대상 Analytics DB와 공유 서버의 신원, 기존 Migration ID/Checksum, 적용 권한, 작업 창과 잠금·부하, 현재 Reader·승인 Snapshot 및 월별 Fact 보존 상태를 확인한다. 적용 후에는 Schema/Checksum·기존 승인본·Reader와 관리자 작업 이력을 검증한다. 실패 시 트랜잭션 Rollback 및 ledger/객체/Reader 상태를 확인하고, 결과를 모른 채 중복 적용하거나 임의 복구 SQL을 실행하지 않는다. 실제 DB 복구가 필요하면 DBA에 이관한다. 백업 책임 분리와 무관하게 이 기술적 Gate는 계속 필수다.
+
 ## 생성 전 확인
 
 1. Dashboard profile의 재고코드, 제품그룹/구분/분류, stock mode, IO 구분을 확인한다.
