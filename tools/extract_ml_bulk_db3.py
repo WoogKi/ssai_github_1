@@ -9,6 +9,7 @@ import signal
 import sys
 from contextlib import ExitStack
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from threading import Event, Lock, Thread
 from time import perf_counter, process_time
@@ -16,7 +17,8 @@ from typing import Any, Callable, Iterator, TextIO
 
 import pyodbc
 
-from app.ml.bulk_dataset import Batch, ProgressCallback, build_bulk_dataset, load_frozen_active_master
+from app.ml.bulk_dataset import (Batch, BatchLimitError, MAX_BATCH_BYTES, ProgressCallback,
+                                 _json, build_bulk_dataset, load_frozen_active_master)
 from app.ml.integration import ml_storage_root
 from app.ml.db3_probe import SAMPLE_R120, SAMPLE_R130
 from app.services.ssai_analysis_profile_service import load_dashboard_profile_checked
@@ -263,6 +265,164 @@ WHERE Rd12_Out_YyMmDd >= ? AND Rd12_Out_YyMmDd < ?
             (batch.date_from, batch.date_to_exclusive, *batch.product_codes),
         )
 
+    def prefetch_batches(self, batches: tuple[Batch, ...]) -> dict[str, PrefetchedBatchSource]:
+        if (not 2 <= len(batches) <= 3 or sum(len(batch.product_codes) for batch in batches) > 300
+                or len({(batch.date_from, batch.date_to_exclusive) for batch in batches}) != 1):
+            raise ValueError("coalesced DB3 scope must be 2..3 same-month batches and at most 300 products")
+        owners = {code: batch.batch_id for batch in batches for code in batch.product_codes}
+        if len(owners) != sum(len(batch.product_codes) for batch in batches):
+            raise ValueError("coalesced product scopes overlap")
+        codes = tuple(owners)
+        start, stop = batches[0].date_from, batches[0].date_to_exclusive
+        marks = ", ".join("?" for _ in codes)
+        totals = {batch.batch_id: {"row_count": 0, "quantity": Decimal(0),
+                                   "bonus_quantity": Decimal(0)} for batch in batches}
+        product_totals: dict[str, dict[str, Any]] = {}
+        seen_products = set()
+        for row in self.rows(
+            "SELECT Rd12_Physic_Cd AS product_code, COUNT_BIG(*) AS row_count, "
+            "SUM(CAST(ISNULL(Rd12_Quantity, 0) AS decimal(38,4))) AS quantity, "
+            "SUM(CAST(ISNULL(Rd12_Oquantity, 0) AS decimal(38,4))) AS bonus_quantity "
+            "FROM dbo.Rddbc120 WHERE Rd12_Out_YyMmDd >= ? AND Rd12_Out_YyMmDd < ? "
+            f"AND Rd12_Physic_Cd IN ({marks}) "
+            "AND (Rd12_Io_Gu LIKE '5%' OR Rd12_Io_Gu LIKE '6%') "
+            "GROUP BY Rd12_Physic_Cd", (start, stop, *codes),
+        ):
+            code = str(row["product_code"]).strip()
+            if code not in owners or code in seen_products:
+                raise ValueError("coalesced R120 product totals are duplicate or out of scope")
+            seen_products.add(code)
+            product_totals[code] = {
+                "row_count": int(row["row_count"]),
+                "quantity": Decimal(str(row["quantity"] or 0)),
+                "bonus_quantity": Decimal(str(row["bonus_quantity"] or 0)),
+            }
+            item = totals[owners[code]]
+            for name in ("row_count", "quantity", "bonus_quantity"):
+                item[name] += product_totals[code][name]
+        selected = []
+        selected_rows = 0
+        for batch in batches:
+            count = totals[batch.batch_id]["row_count"]
+            if count <= 10000 and selected_rows + count <= 18000:
+                selected.append(batch)
+                selected_rows += count
+        buffered: dict[str, list[dict[str, Any]]] = {batch.batch_id: [] for batch in selected}
+        documents: dict[str, list[dict[str, Any]]] = {batch.batch_id: [] for batch in selected}
+        oversized: set[str] = set()
+        if selected_rows:
+            selected_codes = tuple(code for batch in selected for code in batch.product_codes)
+            selected_owners = {code: batch.batch_id for batch in selected for code in batch.product_codes}
+            selected_marks = ", ".join("?" for _ in selected_codes)
+            amounts = {batch.batch_id: (Decimal(0), Decimal(0)) for batch in selected}
+            fetched_products = {code: {"row_count": 0, "quantity": Decimal(0),
+                                      "bonus_quantity": Decimal(0)} for code in selected_codes}
+            byte_counts = {batch.batch_id: 0 for batch in selected}
+            references: dict[tuple[str, ...], set[str]] = {}
+            source_keys = set()
+            for row in self.rows(
+                SAMPLE_R120.format(product_marks=selected_marks, row_limit=selected_rows + 1),
+                (start, stop, *selected_codes),
+            ):
+                code = str(row["Rd12_Physic_Cd"]).strip()
+                if code not in selected_owners or not start <= str(row["Rd12_Out_YyMmDd"]) < stop:
+                    raise ValueError("coalesced R120 row is outside the frozen batch scope")
+                batch_id = selected_owners[code]
+                key = (row["Rd12_Out_YyMmDd"], row["Rd12_Ven_Cd"], row["Rd12_Out_Seq"])
+                if key in source_keys:
+                    raise ValueError("duplicate R120 source PK across coalesced batches")
+                source_keys.add(key)
+                buffered[batch_id].append(row)
+                byte_counts[batch_id] += len(_json({**row, "company_id": 3}).encode("utf-8"))
+                if len(buffered[batch_id]) > 10000 or byte_counts[batch_id] > MAX_BATCH_BYTES:
+                    oversized.add(batch_id)
+                qty, bonus = amounts[batch_id]
+                row_qty = Decimal(str(row["Rd12_Quantity"]))
+                row_bonus = Decimal(str(row.get("Rd12_Oquantity") or 0))
+                amounts[batch_id] = (qty + row_qty, bonus + row_bonus)
+                fetched_products[code]["row_count"] += 1
+                fetched_products[code]["quantity"] += row_qty
+                fetched_products[code]["bonus_quantity"] += row_bonus
+                if str(row.get("Rd12_Trans_Di") or "").strip() == "3":
+                    document_key = tuple(str(row[field]).strip() for field in (
+                        "Rd12_Trans_Di", "Rd12_Trans_YyMmDd", "Rd12_Ven_Cd", "Rd12_Trans_Seq"))
+                    references.setdefault(document_key, set()).add(batch_id)
+            for batch in selected:
+                item = totals[batch.batch_id]
+                if (len(buffered[batch.batch_id]) != item["row_count"]
+                        or amounts[batch.batch_id] != (item["quantity"], item["bonus_quantity"])):
+                    raise ValueError("coalesced R120 rows differ from independent product totals")
+            for code, actual in fetched_products.items():
+                expected = product_totals.get(code, {"row_count": 0, "quantity": Decimal(0),
+                                                     "bonus_quantity": Decimal(0)})
+                if actual != expected:
+                    raise ValueError("coalesced R120 product differs from independent source totals")
+            header_bytes = {batch.batch_id: 0 for batch in selected}
+            seen_headers = set()
+            for row in self.rows(
+                SAMPLE_R130.format(product_marks=selected_marks, row_limit=selected_rows + 1),
+                (start, stop, *selected_codes),
+            ):
+                key = tuple(str(row[field]).strip() for field in (
+                    "Rd13_Trans_Di", "Rd13_Trans_YyMmDd", "Rd13_Ven_Cd", "Rd13_Trans_Seq"))
+                if key in seen_headers or key not in references or int(row["header_count"]) != 1:
+                    raise ValueError("coalesced R130 document is duplicate or outside R120 scope")
+                seen_headers.add(key)
+                size = len(_json({**row, "company_id": 3}).encode("utf-8"))
+                for batch_id in references[key]:
+                    documents[batch_id].append(row)
+                    header_bytes[batch_id] += size
+                    if len(documents[batch_id]) > 10000 or header_bytes[batch_id] > MAX_BATCH_BYTES:
+                        oversized.add(batch_id)
+        return {
+            batch.batch_id: PrefetchedBatchSource(
+                self, batch, totals[batch.batch_id],
+                buffered.get(batch.batch_id), documents.get(batch.batch_id),
+                batch.batch_id in oversized,
+                {code: product_totals.get(code, {"row_count": 0, "quantity": Decimal(0),
+                                                 "bonus_quantity": Decimal(0)})
+                 for code in batch.product_codes},
+            ) for batch in batches
+        }
+
+
+class PrefetchedBatchSource:
+    def __init__(self, source: Db3Source, batch: Batch, totals: dict[str, Any],
+                 outbound: list[dict[str, Any]] | None, documents: list[dict[str, Any]] | None,
+                 oversized: bool, product_totals: dict[str, dict[str, Any]]) -> None:
+        self.source = source
+        self.batch = batch
+        self.expected = totals
+        self.outbound = outbound
+        self.documents = documents
+        self.oversized = oversized
+        self.product_totals = product_totals
+
+    def totals(self, batch: Batch) -> dict[str, Any]:
+        if batch == self.batch:
+            return self.expected
+        if (batch.date_from == self.batch.date_from
+                and batch.date_to_exclusive == self.batch.date_to_exclusive
+                and set(batch.product_codes).issubset(self.product_totals)):
+            return {name: sum((item[name] for code, item in self.product_totals.items()
+                               if code in batch.product_codes), Decimal(0) if name != "row_count" else 0)
+                    for name in ("row_count", "quantity", "bonus_quantity")}
+        return self.source.totals(batch)
+
+    def outbound_rows(self, batch: Batch) -> Iterator[dict[str, Any]]:
+        if batch == self.batch and self.oversized:
+            raise BatchLimitError("coalesced batch exceeds physical file cap")
+        if batch == self.batch and self.outbound is not None:
+            yield from self.outbound
+        else:
+            yield from self.source.outbound_rows(batch)
+
+    def document_rows(self, batch: Batch) -> Iterator[dict[str, Any]]:
+        if batch == self.batch and self.documents is not None:
+            yield from self.documents
+        else:
+            yield from self.source.document_rows(batch)
+
 
 def _stop_monitor(monitor: SqlServerWorkloadMonitor, progress: ProgressCallback | None) -> None:
     monitor.stop()
@@ -381,9 +541,13 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
         monitor_max_samples: int = 120,
         monitor_approval_reference: str | None = None,
         stop_requested: Callable[[], bool] | None = None,
-        progress: ProgressCallback | None = None) -> dict[str, Any]:
+        progress: ProgressCallback | None = None,
+        coalesce_groups: int = 1) -> dict[str, Any]:
     if not dataset_version.startswith("db3-bulk-") or not dataset_version.replace("-", "").isalnum():
         raise ValueError("invalid DB3 bulk version")
+    if coalesce_groups not in (1, 3) or (coalesce_groups == 3 and
+            (not active_only or not resume or group_size != 100)):
+        raise ValueError("three-group lookup requires active-only resume with frozen 100-product batches")
     root = ml_storage_root()
     started = perf_counter()
     if bool(fixed_cohort_version) != bool(fixed_cohort_manifest_sha256):
@@ -487,6 +651,7 @@ def run(*, dataset_version: str, date_from: date, date_to: date,
             active_only=active_only, source_identity_sha256=source_identity,
             stop_requested=stop_requested,
             progress=progress,
+            coalesce_groups=coalesce_groups,
         )
         return {**summary, "all_master_products": len(all_products), "all_active_products": len(active),
                 "all_stopped_products": len(all_products) - len(active), "erp_select_count": source.query_count,
@@ -508,6 +673,8 @@ def main() -> None:
     parser.add_argument("--fixed-cohort-version")
     parser.add_argument("--fixed-cohort-manifest-sha256")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--coalesce-groups", type=int, choices=(1, 3), default=1,
+                        help="opt-in shared SELECT for up to three pending 100-product batches")
     parser.add_argument("--max-batches", type=int)
     parser.add_argument("--inventory-only", action="store_true")
     parser.add_argument("--monitor-db3", action="store_true",
@@ -549,6 +716,7 @@ def main() -> None:
             monitor_approval_reference=args.monitor_approval_reference,
             stop_requested=reporter.halt.is_set if args.active_only else None,
             progress=reporter.update,
+            coalesce_groups=args.coalesce_groups,
             )
         finally:
             if args.active_only:

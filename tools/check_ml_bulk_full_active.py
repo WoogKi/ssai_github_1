@@ -58,6 +58,20 @@ def build(root: Path, source: EmptySource, products: list[dict[str, str | int]],
 
 
 class FullActiveGate(unittest.TestCase):
+    def test_coalesced_cli_requires_existing_active_100_plan(self) -> None:
+        with patch("tools.extract_ml_bulk_db3.ml_storage_root",
+                   side_effect=AssertionError("storage and DB must not be touched")):
+            with self.assertRaisesRegex(ValueError, "active-only resume"):
+                extract_run(dataset_version="db3-bulk-invalid-coalesced", date_from=date(2018, 1, 1),
+                            date_to=date(2026, 8, 30), group_size=100, product_limit=None,
+                            include_dataset_version=None, resume=False, max_batches=1,
+                            active_only=True, coalesce_groups=3)
+            with self.assertRaisesRegex(ValueError, "active-only resume"):
+                extract_run(dataset_version="db3-bulk-invalid-coalesced", date_from=date(2018, 1, 1),
+                            date_to=date(2026, 8, 30), group_size=300, product_limit=None,
+                            include_dataset_version=None, resume=True, max_batches=1,
+                            active_only=True, coalesce_groups=3)
+
     def test_full_25500_plan_checksum_zero_rows_and_resume(self) -> None:
         products = master(25_500)
         tracemalloc.start()
@@ -155,7 +169,7 @@ class FullActiveGate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = OverflowSource()
-            with self.assertRaisesRegex(ValueError, "row cap"):
+            with self.assertRaisesRegex(ValueError, "single-product single-day"):
                 build_bulk_dataset(
                     root, dataset_version="db3-bulk-active-fixture", source=source,
                     master_rows=master(301), saved_io_codes=("501", "601"),

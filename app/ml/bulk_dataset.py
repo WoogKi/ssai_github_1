@@ -32,6 +32,13 @@ class Batch:
     product_codes: tuple[str, ...]
 
 
+class BatchLimitError(ValueError):
+    """A source partition needs a smaller, still exact scope."""
+
+    source_totals: Mapping[str, Any] | None = None
+    source_query_count: int = 0
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")) + "\n"
 
@@ -109,14 +116,14 @@ def _write_rows(path: Path, rows: Iterable[Mapping[str, Any]], *, company_id: in
             row["company_id"] = company_id
             count += 1
             if count > row_cap:
-                raise ValueError("R120/R130 batch exceeds row cap; use a smaller group")
+                raise BatchLimitError("R120/R130 batch exceeds row cap")
             if "Rd12_Quantity" in row:
                 quantity += Decimal(str(row["Rd12_Quantity"]))
                 bonus += Decimal(str(row.get("Rd12_Oquantity") or 0))
             line = _json(row)
             size += len(line.encode("utf-8"))
             if size > MAX_BATCH_BYTES:
-                raise ValueError("batch exceeds file-size cap; use a smaller group")
+                raise BatchLimitError("R120/R130 batch exceeds file-size cap")
             stream.write(line)
             if row_progress is not None and count % 500 == 0:
                 row_progress(500)
@@ -135,8 +142,59 @@ def _read_rows(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in stream]
 
 
+def _iter_rows(path: Path) -> Iterable[dict[str, Any]]:
+    with path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            yield json.loads(line)
+
+
 def _batch_dir(root: Path, batch: Batch) -> Path:
     return root / "batches" / batch.batch_id
+
+
+def _split_batch(batch: Batch) -> tuple[str, tuple[Batch, Batch]]:
+    if len(batch.product_codes) > 1:
+        middle = len(batch.product_codes) // 2
+        return "product", (
+            Batch(f"{batch.batch_id}/p0", batch.date_from, batch.date_to_exclusive,
+                  batch.product_codes[:middle]),
+            Batch(f"{batch.batch_id}/p1", batch.date_from, batch.date_to_exclusive,
+                  batch.product_codes[middle:]),
+        )
+    start = date.fromisoformat(f"{batch.date_from[:4]}-{batch.date_from[4:6]}-{batch.date_from[6:]}")
+    stop = date.fromisoformat(
+        f"{batch.date_to_exclusive[:4]}-{batch.date_to_exclusive[4:6]}-{batch.date_to_exclusive[6:]}"
+    )
+    if (stop - start).days <= 1:
+        raise BatchLimitError("single-product single-day R120/R130 scope exceeds batch cap")
+    middle = start + timedelta(days=(stop - start).days // 2)
+    boundary = middle.strftime("%Y%m%d")
+    return "date", (
+        Batch(f"{batch.batch_id}/d0", batch.date_from, boundary, batch.product_codes),
+        Batch(f"{batch.batch_id}/d1", boundary, batch.date_to_exclusive, batch.product_codes),
+    )
+
+
+def _children(root: Path, batch: Batch, manifest: Mapping[str, Any]) -> tuple[Batch, Batch]:
+    axis, children = _split_batch(batch)
+    if (manifest.get("split_axis") != axis
+            or manifest.get("child_ids") != [child.batch_id for child in children]
+            or set(manifest.get("child_manifest_sha256", {})) != {child.batch_id for child in children}):
+        raise ValueError("split batch scope or child checksum contract differs")
+    parts = _batch_dir(root, batch)
+    if {entry.name for entry in parts.iterdir() if entry.is_dir()} != {
+            child.batch_id.rsplit("/", 1)[1] for child in children}:
+        raise ValueError("split batch has missing or unexpected child data")
+    return children
+
+
+def _leaf_batches(root: Path, batch: Batch) -> Iterable[Batch]:
+    manifest = json.loads((_batch_dir(root, batch) / "manifest.json").read_text(encoding="utf-8"))
+    if "split_axis" in manifest:
+        for child in _children(root, batch, manifest):
+            yield from _leaf_batches(root, child)
+    else:
+        yield batch
 
 
 def _whole_digest(root: Path, batches: Iterable[Batch]) -> str:
@@ -173,14 +231,57 @@ def verify_batch(root: Path, batch: Batch,
                  saved_io_codes: Iterable[str] | None = None) -> dict[str, Any]:
     folder = _batch_dir(root, batch)
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    if (folder / "error.json").exists() or manifest.get("company_id") != 3:
+        raise ValueError("batch has unresolved error or company mismatch")
     if (manifest.get("batch_id") != batch.batch_id or manifest.get("status") != "VERIFIED"
             or manifest.get("date_from") != batch.date_from
             or manifest.get("date_to_exclusive") != batch.date_to_exclusive
             or manifest.get("product_count") != len(batch.product_codes)):
         raise ValueError("batch identity or status mismatch")
+    if "split_axis" in manifest:
+        children = _children(root, batch, manifest)
+        child_meta = []
+        for child in children:
+            child_path = _batch_dir(root, child) / "manifest.json"
+            if _sha(child_path) != manifest["child_manifest_sha256"][child.batch_id]:
+                raise ValueError("split child manifest checksum mismatch")
+            child_meta.append(verify_batch(root, child, saved_io_codes))
+        rows = sum(meta["r120_rows"] for meta in child_meta)
+        quantity = sum((Decimal(meta["r120_quantity"]) for meta in child_meta), Decimal(0))
+        bonus = sum((Decimal(meta["r120_bonus"]) for meta in child_meta), Decimal(0))
+        if (rows != manifest.get("r120_rows")
+                or quantity != Decimal(manifest["r120_quantity"])
+                or bonus != Decimal(manifest["r120_bonus"])
+                or sum(meta["r130_headers"] for meta in child_meta) != manifest.get("r130_headers")
+                or _sum_role_totals(child_meta) != manifest.get("role_totals")):
+            raise ValueError("split batch totals differ from verified children")
+        matches: dict[str, int] = {}
+        for meta in child_meta:
+            for key, count in meta["document_match_counts"].items():
+                matches[key] = matches.get(key, 0) + count
+        if matches != manifest.get("document_match_counts"):
+            raise ValueError("split batch document matches differ from verified children")
+        source_keys: set[tuple[Any, ...]] = set()
+        documents: dict[tuple[str, ...], dict[str, Any]] = {}
+        for leaf in _leaf_batches(root, batch):
+            leaf_dir = _batch_dir(root, leaf)
+            for row in _iter_rows(leaf_dir / "r120.jsonl"):
+                key = (row["Rd12_Out_YyMmDd"], row["Rd12_Ven_Cd"], row["Rd12_Out_Seq"])
+                if key in source_keys:
+                    raise ValueError("duplicate R120 source PK across split children")
+                source_keys.add(key)
+            for row in _iter_rows(leaf_dir / "r130.jsonl"):
+                key = tuple(str(row[field]).strip() for field in (
+                    "Rd13_Trans_Di", "Rd13_Trans_YyMmDd", "Rd13_Ven_Cd", "Rd13_Trans_Seq"))
+                previous = documents.setdefault(key, row)
+                if previous != row:
+                    raise ValueError("R130 document changed across split children")
+        return manifest
     for name in ("r120.jsonl", "r130.jsonl"):
         if _sha(folder / name) != manifest["sha256_by_file"][name]:
             raise ValueError("batch file checksum mismatch")
+        if (folder / name).stat().st_size > MAX_BATCH_BYTES:
+            raise ValueError("batch file exceeds size cap")
     count = 0
     qty = bonus = Decimal(0)
     source_keys = set()
@@ -200,6 +301,11 @@ def verify_batch(root: Path, batch: Batch,
         qty += Decimal(str(row["Rd12_Quantity"]))
         bonus += Decimal(str(row.get("Rd12_Oquantity") or 0))
     headers = _read_rows(folder / "r130.jsonl")
+    if count > MAX_BATCH_ROWS or len(headers) > MAX_BATCH_ROWS:
+        raise ValueError("batch row cap exceeded")
+    outbound_documents = {tuple(str(row[field]).strip() for field in (
+        "Rd12_Trans_Di", "Rd12_Trans_YyMmDd", "Rd12_Ven_Cd", "Rd12_Trans_Seq"))
+        for row in outbound if str(row.get("Rd12_Trans_Di") or "").strip() == "3"}
     header_keys = set()
     for row in headers:
         if int(row["company_id"]) != 3 or int(row["header_count"]) != 1 or row["Rd13_Trans_Di"] != "3":
@@ -208,6 +314,8 @@ def verify_batch(root: Path, batch: Batch,
             "Rd13_Trans_Di", "Rd13_Trans_YyMmDd", "Rd13_Ven_Cd", "Rd13_Trans_Seq"))
         if key in header_keys:
             raise ValueError("duplicate R130 document key")
+        if key not in outbound_documents:
+            raise ValueError("R130 document is outside R120 batch scope")
         header_keys.add(key)
     if (count != manifest["r120_rows"] or str(qty) != manifest["r120_quantity"]
             or str(bonus) != manifest["r120_bonus"] or len(headers) != manifest["r130_headers"]):
@@ -221,7 +329,7 @@ def verify_batch(root: Path, batch: Batch,
     return manifest
 
 
-def _save_batch(
+def _save_leaf_batch(
     root: Path, batch: Batch, source: Any, masters: Mapping[str, Mapping[str, Any]],
     saved_io_codes: tuple[str, ...],
     progress: ProgressCallback | None = None,
@@ -232,12 +340,13 @@ def _save_batch(
     folder.mkdir(parents=True, exist_ok=False)
     started = perf_counter()
     stage = "source_totals"
+    expected: Mapping[str, Any] | None = None
     try:
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         expected = source.totals(batch)
         expected_rows = int(expected["row_count"])
         if expected_rows < 0 or expected_rows > MAX_BATCH_ROWS:
-            raise ValueError("R120 batch exceeds row cap; use a smaller group")
+            raise BatchLimitError("R120 batch exceeds row cap")
         empty = expected_rows == 0
         stage = "r120_fetch"
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
@@ -283,12 +392,112 @@ def _save_batch(
         verify_batch(root, batch, saved_io_codes)
         return manifest
     except Exception as exc:
+        if isinstance(exc, BatchLimitError):
+            exc.source_totals = expected
+            exc.source_query_count = {
+                "source_totals": 1, "r120_fetch": 2, "r130_fetch": 3,
+            }.get(stage, 3)
         (folder / "error.json").write_text(_json({
             "batch_id": batch.batch_id, "status": "FAILED", "failed_stage": stage,
             "error_type": type(exc).__name__,
             "reason": str(exc)[:160] if isinstance(exc, ValueError) else "inspect local execution log",
         }), encoding="utf-8")
         raise
+
+
+def _quarantine_failed_batch(root: Path, batch: Batch) -> None:
+    folder = _batch_dir(root, batch)
+    failed_root = root / "failed"
+    failed_root.mkdir(exist_ok=True)
+    name = batch.batch_id.replace("/", "__")
+    failed = failed_root / name
+    attempt = 1
+    while failed.exists():
+        attempt += 1
+        failed = failed_root / f"{name}-attempt{attempt}"
+    folder.rename(failed)
+
+
+def _sum_role_totals(children: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for role in ("normal", "return", "other"):
+        result[f"{role}_rows"] = sum(child["role_totals"][f"{role}_rows"] for child in children)
+        result[f"{role}_quantity"] = str(sum(
+            (Decimal(child["role_totals"][f"{role}_quantity"]) for child in children), Decimal(0)))
+    result["negative_normal_rows"] = sum(child["role_totals"]["negative_normal_rows"] for child in children)
+    return result
+
+
+def _save_split_batch(
+    root: Path, batch: Batch, axis: str, children: tuple[Batch, Batch], source: Any,
+    masters: Mapping[str, Mapping[str, Any]], saved_io_codes: tuple[str, ...],
+    progress: ProgressCallback | None, expected: Mapping[str, Any], prior_selects: int,
+) -> dict[str, Any]:
+    folder = _batch_dir(root, batch)
+    folder.mkdir(parents=True, exist_ok=False)
+    started = perf_counter()
+    stage = "split_children"
+    try:
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
+        saved = [_save_batch(root, child, source, masters, saved_io_codes, progress)
+                 for child in children]
+        rows = sum(item["r120_rows"] for item in saved)
+        quantity = sum((Decimal(item["r120_quantity"]) for item in saved), Decimal(0))
+        bonus = sum((Decimal(item["r120_bonus"]) for item in saved), Decimal(0))
+        stage = "independent_exact"
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
+        if (rows != int(expected["row_count"])
+                or quantity != Decimal(str(expected["quantity"]))
+                or bonus != Decimal(str(expected["bonus_quantity"]))):
+            raise ValueError("split children differ from independent R120 source totals")
+        matches: dict[str, int] = {}
+        for item in saved:
+            for key, count in item["document_match_counts"].items():
+                matches[key] = matches.get(key, 0) + count
+        manifest = {
+            "batch_id": batch.batch_id, "status": "VERIFIED", "company_id": 3,
+            "date_from": batch.date_from, "date_to_exclusive": batch.date_to_exclusive,
+            "product_count": len(batch.product_codes), "split_axis": axis,
+            "child_ids": [child.batch_id for child in children],
+            "child_manifest_sha256": {
+                child.batch_id: _sha(_batch_dir(root, child) / "manifest.json") for child in children},
+            "r120_rows": rows, "r120_quantity": str(quantity), "r120_bonus": str(bonus),
+            "r130_headers": sum(item["r130_headers"] for item in saved),
+            "role_totals": _sum_role_totals(saved), "document_match_counts": matches,
+            "source_query_count": prior_selects + sum(item["source_query_count"] for item in saved),
+            "row_cap": MAX_BATCH_ROWS, "file_cap_bytes": MAX_BATCH_BYTES,
+            "verified_at_kst": datetime.now(KST).isoformat(),
+            "elapsed_ms": int((perf_counter() - started) * 1000),
+        }
+        (folder / "manifest.json").write_text(_json(manifest), encoding="utf-8")
+        stage = "readback"
+        _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
+        verify_batch(root, batch, saved_io_codes)
+        return manifest
+    except Exception as exc:
+        (folder / "error.json").write_text(_json({
+            "batch_id": batch.batch_id, "status": "FAILED", "failed_stage": stage,
+            "error_type": type(exc).__name__,
+            "reason": str(exc)[:160] if isinstance(exc, ValueError) else "inspect local execution log",
+        }), encoding="utf-8")
+        raise
+
+
+def _save_batch(
+    root: Path, batch: Batch, source: Any, masters: Mapping[str, Mapping[str, Any]],
+    saved_io_codes: tuple[str, ...], progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    try:
+        return _save_leaf_batch(root, batch, source, masters, saved_io_codes, progress)
+    except BatchLimitError as exc:
+        axis, children = _split_batch(batch)
+        if exc.source_totals is None:
+            raise ValueError("split requires independent parent R120 source totals") from exc
+        _quarantine_failed_batch(root, batch)
+        return _save_split_batch(
+            root, batch, axis, children, source, masters, saved_io_codes, progress,
+            exc.source_totals, exc.source_query_count,
+        )
 
 
 def build_bulk_dataset(
@@ -300,11 +509,15 @@ def build_bulk_dataset(
     source_identity_sha256: str | None = None,
     stop_requested: Callable[[], bool] | None = None,
     progress: ProgressCallback | None = None,
+    coalesce_groups: int = 1,
 ) -> dict[str, Any]:
     if not dataset_version.startswith("db3-bulk-") or not dataset_version.replace("-", "").isalnum():
         raise ValueError("invalid DB3 bulk dataset version")
     if not profile_fingerprint or not calendar_version or (max_batches is not None and max_batches < 1):
         raise ValueError("missing DB3 profile/Calendar or invalid batch limit")
+    if (coalesce_groups not in (1, 3) or group_size * coalesce_groups > MAX_GROUP_PRODUCTS
+            or (coalesce_groups > 1 and not callable(getattr(source, "prefetch_batches", None)))):
+        raise ValueError("coalesced lookup requires at most 300 products and a capable source")
     scope = resolve_saved_io_scope(saved_io_codes, confirmed_trade_roles=True)
     masters = _load_master(master_rows)
     if active_only and any(str(row.get("Rd04_Use_Gu") or "").strip() != "0" for row in masters):
@@ -354,29 +567,40 @@ def build_bulk_dataset(
           product_master_sha256=master_sha)
     master_index = {row["Rd04_Physic_Cd"].strip(): row for row in masters}
     complete = skipped = 0
-    for batch in batches:
+    prefetched: dict[str, Any] = {}
+    for position, batch in enumerate(batches):
         if (max_batches is not None and complete >= max_batches) or (
                 stop_requested is not None and stop_requested()):
             break
         folder = _batch_dir(target, batch)
         if folder.exists():
             if resume and ((folder / "error.json").exists() or not (folder / "manifest.json").exists()):
-                failed_root = target / "failed"
-                failed_root.mkdir(exist_ok=True)
-                attempt = 1
-                failed = failed_root / batch.batch_id
-                while failed.exists():
-                    attempt += 1
-                    failed = failed_root / f"{batch.batch_id}-attempt{attempt}"
-                folder.rename(failed)
+                _quarantine_failed_batch(target, batch)
                 folder = _batch_dir(target, batch)
             else:
                 verified = verify_batch(target, batch, scope.all_codes)
                 skipped += 1
                 _emit(progress, "batch_reused", batch_id=batch.batch_id, rows=verified["r120_rows"])
                 continue
+        if coalesce_groups > 1 and batch.batch_id not in prefetched:
+            pending = [batch]
+            remaining = coalesce_groups if max_batches is None else min(coalesce_groups, max_batches - complete)
+            for next_batch in batches[position + 1:position + remaining]:
+                next_folder = _batch_dir(target, next_batch)
+                if (next_batch.date_from != batch.date_from
+                        or (next_folder / "manifest.json").is_file()
+                        and not (next_folder / "error.json").exists()):
+                    break
+                pending.append(next_batch)
+            if len(pending) > 1:
+                _emit(progress, "stage", batch_id=batch.batch_id, stage="coalesced_source")
+                found = source.prefetch_batches(tuple(pending))
+                if set(found) != {item.batch_id for item in pending}:
+                    raise ValueError("coalesced source returned incomplete batch scopes")
+                prefetched.update(found)
         _emit(progress, "batch_start", batch_id=batch.batch_id)
-        saved = _save_batch(target, batch, source, master_index, scope.all_codes, progress)
+        saved = _save_batch(target, batch, prefetched.pop(batch.batch_id, source),
+                            master_index, scope.all_codes, progress)
         complete += 1
         _emit(progress, "batch_complete", batch_id=batch.batch_id, rows=saved["r120_rows"],
               elapsed_ms=saved["elapsed_ms"])
@@ -484,23 +708,26 @@ def materialize_research_cohort(
     for batch in batches:
         if not selected.intersection(batch.product_codes):
             continue
-        folder = _batch_dir(bulk_dataset, batch)
-        for row in _read_rows(folder / "r120.jsonl"):
-            if row["Rd12_Physic_Cd"].strip() not in selected:
+        for leaf in _leaf_batches(bulk_dataset, batch):
+            if not selected.intersection(leaf.product_codes):
                 continue
-            key = (row["Rd12_Out_YyMmDd"], row["Rd12_Ven_Cd"], row["Rd12_Out_Seq"])
-            if key in seen:
-                raise ValueError("R120 source PK duplicated across verified shards")
-            seen.add(key)
-            outbound.append(row)
-            if len(outbound) > 30000:
-                raise ValueError("bounded research adapter exceeds legacy row cap")
-        for row in _read_rows(folder / "r130.jsonl"):
-            key = tuple(str(row[field]).strip() for field in (
-                "Rd13_Trans_Di", "Rd13_Trans_YyMmDd", "Rd13_Ven_Cd", "Rd13_Trans_Seq"))
-            previous = documents.setdefault(key, row)
-            if previous != row:
-                raise ValueError("R130 document changed between shards")
+            folder = _batch_dir(bulk_dataset, leaf)
+            for row in _iter_rows(folder / "r120.jsonl"):
+                if row["Rd12_Physic_Cd"].strip() not in selected:
+                    continue
+                key = (row["Rd12_Out_YyMmDd"], row["Rd12_Ven_Cd"], row["Rd12_Out_Seq"])
+                if key in seen:
+                    raise ValueError("R120 source PK duplicated across verified shards")
+                seen.add(key)
+                outbound.append(row)
+                if len(outbound) > 30000:
+                    raise ValueError("bounded research adapter exceeds legacy row cap")
+            for row in _iter_rows(folder / "r130.jsonl"):
+                key = tuple(str(row[field]).strip() for field in (
+                    "Rd13_Trans_Di", "Rd13_Trans_YyMmDd", "Rd13_Ven_Cd", "Rd13_Trans_Seq"))
+                previous = documents.setdefault(key, row)
+                if previous != row:
+                    raise ValueError("R130 document changed between shards")
     prepared = prepare_sources(
         company_id=3, outbound_rows=outbound, document_rows=documents.values(), vendor_rows=(),
         product_rows=(masters[code] for code in product_codes), standard_rows=(), code_rows=(),
