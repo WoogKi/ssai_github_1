@@ -122,7 +122,9 @@ WHERE I.Rd11_Io_Gu_Gcode = '0012' AND {io_clause}
   AND {dimensions_sql}"""
 
 
-def monthly_product_universe_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict[str, Any]]:
+def monthly_product_universe_sql(
+    plan: FrequencySnapshotPlan, *, include_add_date: bool = False,
+) -> tuple[str, dict[str, Any]]:
     """Read only the stored-profile product authority needed for an incremental month."""
     binds: dict[str, Any] = {}
     _, dimensions = _product_dimension_scope_sql(plan, binds, product_alias="P")
@@ -132,7 +134,8 @@ def monthly_product_universe_sql(plan: FrequencySnapshotPlan) -> tuple[str, dict
         product_di_code_expression="P.Rd04_Physic_Di",
     )
     where = "\n  AND " + "\n  AND ".join(filters) if filters else ""
-    sql = f"""SELECT DISTINCT LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code
+    add_date = ", LTRIM(RTRIM(P.Rd04_Add_Date)) AS product_add_date" if include_add_date else ""
+    sql = f"""SELECT DISTINCT LTRIM(RTRIM(P.Rd04_Physic_Cd)) AS product_code{add_date}
 FROM dbo.Rddbc040 AS P
 WHERE P.Rd04_Physic_Cd <> ''{where}
 ORDER BY product_code"""

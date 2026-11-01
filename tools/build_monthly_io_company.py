@@ -8,7 +8,7 @@ import getpass
 import json
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from collections import defaultdict
 from dataclasses import replace
 from decimal import Decimal
@@ -43,6 +43,146 @@ from app.services.ssai_analytics_target_resolver import connect_company_analytic
 def _require_closed_source_months(months: tuple[str, ...], *, today: date) -> None:
     if any(month >= today.strftime("%Y%m") for month in months):
         raise ValueError("a new monthly draft requires a fully closed source month")
+
+
+def _verified_kst_day(value: Any) -> str:
+    if isinstance(value, datetime):
+        verified = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            verified = datetime.fromisoformat(value.strip())
+        except ValueError as exc:
+            raise ValueError("approved product source verification time is invalid") from exc
+    else:
+        raise ValueError("approved product source verification time is missing")
+    if verified.tzinfo is None:
+        verified = verified.replace(tzinfo=timezone.utc)
+    return verified.astimezone(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+
+
+def _verify_approved_universe_reuse(
+    *, company_id: int, current_rows: pd.DataFrame, existing: dict[str, dict[str, Any]],
+    profile_fingerprint: str, scope_fingerprint: str, stock_codes: tuple[str, ...],
+    source_first_dates: Callable[
+        [tuple[str, ...], str, str], dict[str, dict[tuple[str, str], str | None]]
+    ],
+) -> dict[str, Any]:
+    """Prove add-only monthly scope changes without touching approved generations."""
+    registration: dict[str, str] = {}
+    for row in current_rows.itertuples(index=False):
+        code = "" if pd.isna(row.product_code) else str(row.product_code).strip()
+        added = "" if pd.isna(row.product_add_date) else str(row.product_add_date).strip()
+        if not code or (code in registration and registration[code] != added):
+            raise ValueError("current product authority contains duplicate or empty codes")
+        registration[code] = added
+    if not registration:
+        raise ValueError("stored profile product universe is empty")
+    current_codes = tuple(sorted(registration))
+    proof: dict[str, Any] = {"changed_months": [], "new_product_count": 0,
+                             "historical_source_select_count": 0, "month_proofs": {}}
+    candidates: set[str] = set()
+    excluded_by_month: dict[str, set[str]] = {}
+    for month, stored in sorted(existing.items()):
+        fingerprint = MonthlyIoMaterialization(
+            company_id, month, profile_fingerprint, scope_fingerprint,
+            current_codes, stock_codes, (),
+        ).product_universe_fingerprint
+        if (fingerprint == stored["product_universe_fingerprint"]
+                and len(current_codes) == stored["product_count"]):
+            proof["month_proofs"][month] = {
+                "stored_product_count": stored["product_count"],
+                "reconstructed_product_count": len(current_codes),
+                "stored_fingerprint": stored["product_universe_fingerprint"],
+                "reconstructed_fingerprint": fingerprint,
+                "fingerprint_match": True, "post_verification_candidate_count": 0,
+            }
+            continue
+        verified_day = _verified_kst_day(stored.get("source_verified_at"))
+        late_codes = {
+            code for code, added in registration.items()
+            if len(added) == 8 and added.isdigit() and added > verified_day
+            and _valid_yyyymmdd(added)
+        }
+        earlier_codes = tuple(sorted(set(current_codes) - late_codes))
+        earlier_fingerprint = MonthlyIoMaterialization(
+            company_id, month, profile_fingerprint, scope_fingerprint,
+            earlier_codes, stock_codes, (),
+        ).product_universe_fingerprint
+        if (len(earlier_codes) != stored["product_count"]
+                or earlier_fingerprint != stored["product_universe_fingerprint"]):
+            raise ValueError("product universe changed beyond proven new registrations; explicit rebuild required")
+        candidates.update(late_codes)
+        excluded_by_month[month] = late_codes
+        proof["changed_months"].append(month)
+        proof["month_proofs"][month] = {
+            "source_verified_kst_date": verified_day,
+            "stored_product_count": stored["product_count"],
+            "reconstructed_product_count": len(earlier_codes),
+            "stored_fingerprint": stored["product_universe_fingerprint"],
+            "reconstructed_fingerprint": earlier_fingerprint,
+            "fingerprint_match": True,
+            "post_verification_candidate_count": len(late_codes),
+        }
+    if candidates:
+        proof["new_product_count"] = len(candidates)
+        first_day = f"{min(excluded_by_month)}01"
+        latest_month = max(excluded_by_month)
+        next_index = int(latest_month[:4]) * 12 + int(latest_month[4:])
+        cutoff = f"{next_index // 12:04d}{next_index % 12 + 1:02d}01"
+        first_dates = source_first_dates(tuple(sorted(candidates)), first_day, cutoff)
+        if set(first_dates) != {"R110", "R120"}:
+            raise ValueError("new product source evidence is incomplete")
+        for source in ("R110", "R120"):
+            for (code, month), first_date in first_dates[source].items():
+                if (code not in candidates or not isinstance(month, str)
+                        or not isinstance(first_date, str) or len(first_date) != 8
+                        or not _valid_yyyymmdd(first_date) or first_date[:6] != month
+                        or not first_day <= first_date < cutoff):
+                    raise ValueError("new product source evidence is invalid")
+                if code in excluded_by_month.get(month, set()):
+                    raise ValueError("new product has historical source rows; explicit rebuild required")
+    return proof
+
+
+def _valid_yyyymmdd(value: str) -> bool:
+    try:
+        date.fromisoformat(f"{value[:4]}-{value[4:6]}-{value[6:]}")
+    except ValueError:
+        return False
+    return True
+
+
+def _new_product_source_first_dates(
+    company_id: int, codes: tuple[str, ...], first_day: str, cutoff: str, timeout: int,
+) -> tuple[dict[str, dict[tuple[str, str], str | None]], int]:
+    result: dict[str, dict[tuple[str, str], str | None]] = {"R110": {}, "R120": {}}
+    selects = 0
+    for start in range(0, len(codes), 200):
+        batch = codes[start:start + 200]
+        binds: dict[str, Any] = {f"product_{index}": code for index, code in enumerate(batch)}
+        binds["first_day"] = first_day
+        binds["cutoff"] = cutoff
+        names = ",".join(f":product_{index}" for index in range(len(batch)))
+        for source, table, product, day in (
+            ("R110", "Rddbc110", "Rd11_Physic_Cd", "Rd11_In_YyMmDd"),
+            ("R120", "Rddbc120", "Rd12_Physic_Cd", "Rd12_Out_YyMmDd"),
+        ):
+            rows = _query_decimal(
+                company_id,
+                f"SELECT LTRIM(RTRIM({product})) AS product_code, "
+                f"LEFT({day},6) AS basis_month, MIN({day}) AS first_date "
+                f"FROM dbo.{table} WHERE LTRIM(RTRIM({product})) IN ({names}) "
+                f"AND {day} >= :first_day AND {day} < :cutoff "
+                f"GROUP BY LTRIM(RTRIM({product})), LEFT({day},6)",
+                binds, timeout,
+            )
+            selects += 1
+            for row in rows.itertuples(index=False):
+                key = (str(row.product_code).strip(), str(row.basis_month).strip())
+                if key in result[source]:
+                    raise ValueError("duplicate new product source evidence")
+                result[source][key] = str(row.first_date).strip()
+    return result, selects
 
 
 def _save_or_resume_monthly_draft(repository: SqlServerMonthlyIoRepository,
@@ -376,10 +516,8 @@ def run_incremental(company_id: int, evaluation_month: str, *, apply: bool, plan
             )
         except LookupError:
             missing.append(month)
-    fingerprints = {item["product_universe_fingerprint"] for item in existing.values()}
-    counts = {item["product_count"] for item in existing.values()}
-    if len(fingerprints) != 1 or len(counts) != 1:
-        raise ValueError("approved monthly product universes differ")
+    if not existing:
+        raise ValueError("approved monthly product universe evidence is missing")
     result: dict[str, Any] = {
         "company_id": company_id, "evaluation_month": evaluation_month,
         "reused_months": tuple(existing), "missing_months": tuple(missing),
@@ -395,18 +533,32 @@ def run_incremental(company_id: int, evaluation_month: str, *, apply: bool, plan
         raise ValueError("historical seed must be explicitly rebuilt and Exact checked")
     if apply:
         _require_closed_source_months(tuple(missing), today=date.today())
-    product_sql, product_binds = monthly_product_universe_sql(plan)
+    product_sql, product_binds = monthly_product_universe_sql(plan, include_add_date=True)
     master = _query_decimal(company_id, product_sql, product_binds, timeout)
     result["erp_select_count"] += 1
     product_codes = tuple(sorted({str(value).strip() for value in master.product_code if str(value).strip()}))
     if not product_codes:
         raise ValueError("stored profile product universe is empty")
-    probe = MonthlyIoMaterialization(
-        company_id, missing[0], plan.profile_fingerprint, scope_key,
-        product_codes, plan.stock_codes, (),
+    source_selects = 0
+
+    def first_dates(
+        codes: tuple[str, ...], first_day: str, cutoff: str,
+    ) -> dict[str, dict[tuple[str, str], str | None]]:
+        nonlocal source_selects
+        found, selects = _new_product_source_first_dates(company_id, codes, first_day, cutoff, timeout)
+        source_selects += selects
+        return found
+
+    universe_proof = _verify_approved_universe_reuse(
+        company_id=company_id, current_rows=master, existing=existing,
+        profile_fingerprint=plan.profile_fingerprint, scope_fingerprint=scope_key,
+        stock_codes=plan.stock_codes, source_first_dates=first_dates,
     )
-    if probe.product_universe_fingerprint not in fingerprints or len(product_codes) not in counts:
-        raise ValueError("product universe changed; approved month reuse requires an explicit rebuild")
+    universe_proof["historical_source_select_count"] = source_selects
+    result["erp_select_count"] += source_selects
+    result["product_universe_reuse_proof"] = universe_proof
+    if universe_proof["changed_months"]:
+        result["reuse_status"] = "approved_with_new_product_source_absence_verified"
     for month in missing:
         month_end = f"{month}{calendar.monthrange(int(month[:4]), int(month[4:]))[1]:02d}"
         month_plan = replace(plan, basis_from=f"{month}01", basis_to=month_end,
