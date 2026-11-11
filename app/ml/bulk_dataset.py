@@ -682,11 +682,13 @@ def materialize_research_cohort(
     date_from: date | None = None, date_to: date | None = None,
 ) -> Path:
     """Feed the unchanged small-fixture engines from verified shards, within their old cap."""
-    verify_bulk_dataset(bulk_dataset)
     if not dataset_version.startswith("db3-research-") or not dataset_version.replace("-", "").isalnum():
         raise ValueError("invalid bounded research version")
     if not 1 <= len(product_codes) <= 12 or len(set(product_codes)) != len(product_codes):
         raise ValueError("bounded training adapter accepts 1..12 unique products")
+    target = target_root / "datasets" / dataset_version
+    if target.exists() or target.is_symlink():
+        raise FileExistsError("output dataset already exists")
     plan = json.loads((bulk_dataset / "plan.json").read_text(encoding="utf-8"))
     start = date_from or date.fromisoformat(plan["date_from"])
     end = date_to or date.fromisoformat(plan["date_to"])
@@ -695,16 +697,20 @@ def materialize_research_cohort(
             or calendar["end_date"] < end.isoformat()):
         raise ValueError("offline Calendar does not cover requested source period")
     cutoffs = tuple(date.fromisoformat(value) for value in as_of_dates)
-    if any(day - timedelta(days=89) < start or day + timedelta(days=30) > end for day in cutoffs):
+    if (not cutoffs or len(set(cutoffs)) != len(cutoffs)
+            or any(day - timedelta(days=89) < start or day + timedelta(days=30) > end for day in cutoffs)):
         raise ValueError("research as-of range is outside verified shards")
-    masters = {row["Rd04_Physic_Cd"].strip(): row for row in _read_rows(bulk_dataset / "products.jsonl")}
+    masters = {row["Rd04_Physic_Cd"].strip(): row
+               for row in _load_master(_iter_rows(bulk_dataset / "products.jsonl"))}
     if not set(product_codes).issubset(masters):
         raise ValueError("cohort product is absent from R040 master")
     batches = _month_batches(tuple(sorted(masters)), start, end, int(plan["group_size"]))
+    verify_bulk_dataset(bulk_dataset)
     selected = set(product_codes)
     outbound = []
     documents: dict[tuple[str, ...], dict[str, Any]] = {}
     seen = set()
+    retained_bytes = 0
     for batch in batches:
         if not selected.intersection(batch.product_codes):
             continue
@@ -712,6 +718,7 @@ def materialize_research_cohort(
             if not selected.intersection(leaf.product_codes):
                 continue
             folder = _batch_dir(bulk_dataset, leaf)
+            linked_documents = set()
             for row in _iter_rows(folder / "r120.jsonl"):
                 if row["Rd12_Physic_Cd"].strip() not in selected:
                     continue
@@ -719,12 +726,24 @@ def materialize_research_cohort(
                 if key in seen:
                     raise ValueError("R120 source PK duplicated across verified shards")
                 seen.add(key)
+                retained_bytes += len(_json(row).encode("utf-8"))
+                if retained_bytes > MAX_BATCH_BYTES:
+                    raise ValueError("bounded research adapter exceeds retained byte cap")
                 outbound.append(row)
+                if str(row.get("Rd12_Trans_Di") or "").strip() == "3":
+                    linked_documents.add(tuple(str(row.get(field) or "").strip() for field in (
+                        "Rd12_Trans_Di", "Rd12_Trans_YyMmDd", "Rd12_Ven_Cd", "Rd12_Trans_Seq")))
                 if len(outbound) > 30000:
                     raise ValueError("bounded research adapter exceeds legacy row cap")
             for row in _iter_rows(folder / "r130.jsonl"):
                 key = tuple(str(row[field]).strip() for field in (
                     "Rd13_Trans_Di", "Rd13_Trans_YyMmDd", "Rd13_Ven_Cd", "Rd13_Trans_Seq"))
+                if key not in linked_documents:
+                    continue
+                if key not in documents:
+                    retained_bytes += len(_json(row).encode("utf-8"))
+                    if retained_bytes > MAX_BATCH_BYTES:
+                        raise ValueError("bounded research adapter exceeds retained byte cap")
                 previous = documents.setdefault(key, row)
                 if previous != row:
                     raise ValueError("R130 document changed between shards")
@@ -747,10 +766,11 @@ def materialize_research_cohort(
         "calendar": {key: calendar[key] for key in (
             "start_date", "end_date", "holiday_dates", "known_as_of", "version")},
     }
-    target = target_root / "datasets" / dataset_version
+    raw = _json(payload).encode("utf-8")
+    if len(raw) > MAX_BATCH_BYTES:
+        raise ValueError("bounded research fixture exceeds byte cap")
     target.parent.mkdir(parents=True, exist_ok=True)
     target.mkdir(parents=True, exist_ok=False)
-    raw = _json(payload).encode("utf-8")
     (target / "fixture.json").write_bytes(raw)
     (target / "manifest.json").write_text(_json({
         "company_id": 3, "dataset_version": dataset_version, "dataset_status": "RESEARCH_POSTHOC",
