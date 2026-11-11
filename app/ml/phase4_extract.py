@@ -79,13 +79,26 @@ def select_products(high: list[dict], low: list[dict], standard_codes: set[str])
 
 def extract_research_fixture(
     query: Query, *, company_id: int, saved_io_codes: list[str], calendar: dict[str, Any],
-    profile_fingerprint: str,
+    profile_fingerprint: str, date_from: str = START, date_to_exclusive: str = END_EXCLUSIVE,
+    product_codes: tuple[str, ...] | None = None, as_of_dates: tuple[str, ...] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     if company_id != 3 or calendar.get("status") != "ready" or not profile_fingerprint:
         raise ValueError("DB3, saved profile and common Calendar are required")
     scope = resolve_saved_io_scope(saved_io_codes, confirmed_trade_roles=True)
     if not scope.outbound_codes:
         raise ValueError("no saved normal-outbound codes")
+    first = datetime.strptime(date_from, "%Y%m%d").date()
+    end = datetime.strptime(date_to_exclusive, "%Y%m%d").date()
+    if first.strftime("%Y%m%d") != date_from or end.strftime("%Y%m%d") != date_to_exclusive:
+        raise ValueError("research dates must use YYYYMMDD")
+    if first >= end or calendar["start_date"] > first.isoformat() or calendar["end_date"] < (end - timedelta(days=1)).isoformat():
+        raise ValueError("invalid research period or Calendar coverage")
+    cutoffs = ("2026-06-30", "2026-07-31") if as_of_dates is None else as_of_dates
+    if not cutoffs or len(set(cutoffs)) != len(cutoffs):
+        raise ValueError("research as-of dates must be nonempty and unique")
+    if any(date.fromisoformat(value) - timedelta(days=89) < first or
+           date.fromisoformat(value) + timedelta(days=30) >= end for value in cutoffs):
+        raise ValueError("research as-of window falls outside extracted source")
     calls = 0
     durations = []
 
@@ -102,20 +115,30 @@ def extract_research_fixture(
         return rows
 
     io_marks = ", ".join("?" for _ in scope.outbound_codes)
-    high = limited(CANDIDATES.format(io_marks=io_marks, order_direction="DESC"),
-                   (START, END_EXCLUSIVE, *scope.outbound_codes, 30, 800), 200)
-    low = limited(CANDIDATES.format(io_marks=io_marks, order_direction="ASC"),
-                  (START, END_EXCLUSIVE, *scope.outbound_codes, 3, 29), 200)
-    candidate_codes = tuple(sorted({str(row["product_code"]).strip() for row in (*high, *low)}))
+    if product_codes is None:
+        high = limited(CANDIDATES.format(io_marks=io_marks, order_direction="DESC"),
+                       (date_from, date_to_exclusive, *scope.outbound_codes, 30, 800), 200)
+        low = limited(CANDIDATES.format(io_marks=io_marks, order_direction="ASC"),
+                      (date_from, date_to_exclusive, *scope.outbound_codes, 3, 29), 200)
+        candidate_codes = tuple(sorted({str(row["product_code"]).strip() for row in (*high, *low)}))
+    else:
+        if (not 6 <= len(product_codes) <= 12
+                or any(not isinstance(code, str) or not code or code != code.strip() for code in product_codes)
+                or len(set(product_codes)) != len(product_codes)):
+            raise ValueError("research cohort must contain 6..12 unique nonempty product code strings")
+        candidate_codes = tuple(sorted(product_codes))
     candidate_marks = ", ".join("?" for _ in candidate_codes)
     standard_rows = limited(
         f"SELECT Rd046_Physic_Cd, Rd046_Standard_Cd FROM dbo.Rddbc046 WHERE Rd046_Physic_Cd IN ({candidate_marks})",
         candidate_codes, 2000,
     )
     standard_codes = {str(row["Rd046_Physic_Cd"]).strip() for row in standard_rows if row.get("Rd046_Standard_Cd")}
-    products, categories = select_products(high, low, standard_codes)
+    if product_codes is None:
+        products, categories = select_products(high, low, standard_codes)
+    else:
+        products, categories = candidate_codes, {"prior_cohort": list(candidate_codes)}
     marks = ", ".join("?" for _ in products)
-    totals = limited(SOURCE_TOTALS.format(product_marks=marks), (START, END_EXCLUSIVE, *products), len(products))
+    totals = limited(SOURCE_TOTALS.format(product_marks=marks), (date_from, date_to_exclusive, *products), len(products))
     source_count = sum(int(row["row_count"]) for row in totals)
     source_quantity = sum((Decimal(str(row["quantity"])) for row in totals), Decimal(0))
     source_bonus = sum((Decimal(str(row["bonus_quantity"])) for row in totals), Decimal(0))
@@ -127,12 +150,12 @@ def extract_research_fixture(
         batch = products[offset:offset + 3]
         batch_marks = ", ".join("?" for _ in batch)
         rows = limited(SAMPLE_R120.format(product_marks=batch_marks, row_limit=PER_BATCH_CAP + 1),
-                       (START, END_EXCLUSIVE, *batch), PER_BATCH_CAP + 1)
+                       (date_from, date_to_exclusive, *batch), PER_BATCH_CAP + 1)
         if len(rows) > PER_BATCH_CAP:
             raise ValueError("R120 product batch is truncated")
         outbound.extend(rows)
         headers = limited(SAMPLE_R130.format(product_marks=batch_marks, row_limit=PER_BATCH_CAP + 1),
-                          (START, END_EXCLUSIVE, *batch), PER_BATCH_CAP + 1)
+                          (date_from, date_to_exclusive, *batch), PER_BATCH_CAP + 1)
         if len(headers) > PER_BATCH_CAP:
             raise ValueError("R130 product batch is truncated")
         for row in headers:
@@ -172,14 +195,14 @@ def extract_research_fixture(
     if prepared.source_row_count != source_count or prepared.source_quantity != source_quantity or prepared.source_bonus_quantity != source_bonus:
         raise ValueError("prepared source differs from SQL aggregate")
     version = "db3-research-" + datetime.now(KST).strftime("%Y%m%d%H%M%S")
-    dates = [(date(2026, 4, 1) + timedelta(days=offset)).isoformat() for offset in range(152)]
+    dates = [(first + timedelta(days=offset)).isoformat() for offset in range((end - first).days)]
     fixture = {
         "schema_version": "ml_phase1_fixture_v1", "dataset_version": version, "company_id": 3,
-        "date_from": "2026-04-01", "date_to": "2026-08-30", "outbound_rows": outbound,
+        "date_from": first.isoformat(), "date_to": (end - timedelta(days=1)).isoformat(), "outbound_rows": outbound,
         "document_rows": list(documents.values()), "vendor_rows": vendors,
         "product_rows": product_rows, "standard_rows": selected_standard_rows, "code_rows": code_rows,
         "saved_io_codes": list(scope.all_codes), "complete_dates": dates,
-        "as_of_dates": ["2026-06-30", "2026-07-31"], "timestamp_policy_confirmed": True,
+        "as_of_dates": list(cutoffs), "timestamp_policy_confirmed": True,
         "calendar_asof_required": False,
         "calendar": {key: calendar[key] for key in ("start_date", "end_date", "holiday_dates", "known_as_of", "version")},
     }
@@ -191,11 +214,16 @@ def extract_research_fixture(
         "document_match_counts": dict(prepared.document_match_counts),
         "negative_normal_rows": sum(row.source.quantity < 0 and row.source.io_code in prepared.normal_codes for row in prepared.rows),
         "calendar_known_as_of": calendar["known_as_of"], "profile_fingerprint": profile_fingerprint,
+        "source_window": [date_from, (end - timedelta(days=1)).strftime("%Y%m%d")],
     }
     return fixture, metrics
 
 
 def save_research_dataset(root: Path, fixture: dict[str, Any], metrics: dict[str, Any]) -> Path:
+    source_window = [date.fromisoformat(fixture[key]).strftime("%Y%m%d") for key in ("date_from", "date_to")]
+    if (fixture.get("company_id") != 3 or source_window[0] > source_window[1]
+            or metrics.get("source_window") != source_window):
+        raise ValueError("research fixture and source_window mismatch")
     target = root / "datasets" / fixture["dataset_version"]
     target.mkdir(parents=True, exist_ok=False)
     payload = (json.dumps(fixture, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")) + "\n").encode("utf-8")
@@ -203,7 +231,7 @@ def save_research_dataset(root: Path, fixture: dict[str, Any], metrics: dict[str
     manifest = {
         "schema_version": "ml_db3_research_v1", "dataset_version": fixture["dataset_version"],
         "company_id": 3, "source_db_alias": "DB3", "dataset_status": "RESEARCH_POSTHOC",
-        "evaluation_grade": "research_posthoc", "source_window": [START, "20260830"],
+        "evaluation_grade": "research_posthoc", "source_window": metrics["source_window"],
         "research_assumption": "selected-product missing dates are zero in the clone; independent completeness not certified",
         "last_complete_date": None, "sha256_by_file": {"fixture.json": hashlib.sha256(payload).hexdigest()},
         "metrics": metrics,
