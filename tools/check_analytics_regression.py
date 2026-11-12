@@ -316,6 +316,64 @@ def _append_date_variants(text: str) -> str:
 # ---------------------------------------------------------------------
 # Basic checks
 # ---------------------------------------------------------------------
+def run_sims_llm_prompt_checks() -> list[CheckResult]:
+    """Check response policy without running the full Analytics/NLQ suite."""
+    from app.ui import sims_analysis_profiles as profile_mod
+
+    evidence_rules = (
+        "결과의 규모와 확인된 지표",
+        "조회조건, 전체 집계, 실제 항목의 차이와 집중도",
+        "참고 행과 전체 집계를 혼동하거나 데이터에 없는 원인을 단정하지 마세요",
+        "존재하지 않는 제품·금액·비율·원인을 만들어내지 마세요",
+    )
+    analysis_rules = ("고정 목차나 문장 수를 강제하지 말고", "중요한 특징을 골라 충분히 해석하세요")
+    summary_rules = ("핵심 사실을 간결하게 답하고 불필요한 의견은 덧붙이지 마세요",)
+    current_table_rules = (
+        "일반 SIMS 답변의 짧게 정리/고정 섹션 지침보다 이 지침을 우선하세요",
+        "사용자의 질문에 직접 답하고, 전체 표 분석자료",
+        "요약 요청은 간결하게",
+        "자료의 복잡도에 맞게 충분히 설명하세요",
+        "고정 줄수, 수치 개수, 의견 문장수, 필수 섹션은 없습니다",
+        "실제 그룹·항목·수치를 근거로 제시",
+        "집계 방식과 단위를 구분하고 평균을 합계처럼 해석하지 마세요",
+        "전체 통계와 일부 참고 행을 구분",
+        "생략된 그룹의 순위를 추정하지 마세요",
+        "음수·결측·큰 값은 확인 항목이지 오류나 원인의 확정이 아닙니다",
+        "데이터에 없는 사실·원인은 추측하지 마세요",
+        "판단 기준 컬럼이 있어야 합니다",
+        "원인은 이 표로 판단할 수 없다고 명시하세요",
+    )
+    cases = (
+        ("general analysis", "현재표 분석해줘", False, evidence_rules + analysis_rules),
+        ("general summary", "현재표 요약해줘", False, evidence_rules + summary_rules),
+        ("summary with analysis", "요약하고 문제점도 분석해줘", False, evidence_rules + analysis_rules),
+        ("current-table analysis", "현재표 자세히 분석해줘", True, current_table_rules),
+        ("current-table summary", "현재표 요약해줘", True, current_table_rules),
+    )
+    results: list[CheckResult] = []
+    for label, query, current_table, required in cases:
+        name = f"SIMS LLM prompt policy: {label}"
+        try:
+            rule = profile_mod.build_response_format_instruction(query, current_table_analysis=current_table)
+            missing = [text for text in required if text not in rule]
+            results.append(_fail(name, f"missing_policy={missing!r}") if missing else _ok(name))
+        except Exception as exc:
+            results.append(_fail(name, f"{type(exc).__name__}: {exc}"))
+
+    main_src = (PROJECT_ROOT / "app" / "Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
+    required_hooks = (
+        "build_response_format_instruction(",
+        'analysis_ctx_override.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1"',
+        "current_table_analysis=bool(",
+        "[SIMS_ANALYSIS_RULE]",
+        '{response_format_instruction}',
+    )
+    missing_hooks = [token for token in required_hooks if token not in main_src]
+    name = "SIMS LLM prompt integration hooks"
+    results.append(_fail(name, f"missing_hooks={missing_hooks!r}") if missing_hooks else _ok(name))
+    return results
+
+
 def run_basic_checks() -> list[CheckResult]:
     results: list[CheckResult] = []
 
@@ -8133,22 +8191,7 @@ def run_basic_checks() -> list[CheckResult]:
         else:
             results.append(_ok("SIMS LLM sanitizer and context", f"kept_cols={list(sanitized.columns)} profile={ctx.get('analysis_profile_id')}"))
 
-        rule_full = profile_mod.build_response_format_instruction("현재표 분석해줘")
-        rule_summary = profile_mod.build_response_format_instruction("현재표 요약해줘")
-        prompt_errors = []
-        if "조회 이해" not in rule_full or "LLM 의견" not in rule_full or "8~12줄" not in rule_full:
-            prompt_errors.append("full_analysis_rule_missing_sections")
-        if "2~3문장" not in rule_full or "근거가 부족하면 길이를 늘리지 말고" not in rule_full:
-            prompt_errors.append("llm_opinion_length_policy_missing")
-        if "두 부분만" not in rule_summary or "LLM 의견은 강제하지 마세요" not in rule_summary:
-            prompt_errors.append("summary_rule_forces_opinion")
-        main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
-        if "build_response_format_instruction(" not in main_src or "analysis_ctx_override.get(\"kind\") == \"SIMS_ANALYSIS_CONTEXT_V1\"" not in main_src:
-            prompt_errors.append("main_prompt_or_override_guard_missing")
-        if prompt_errors:
-            results.append(_fail("SIMS LLM prompt shape", "; ".join(prompt_errors)))
-        else:
-            results.append(_ok("SIMS LLM prompt shape", "analysis vs summary response instructions verified"))
+        results.extend(run_sims_llm_prompt_checks())
 
         class _FakeSt:
             def __init__(self):
