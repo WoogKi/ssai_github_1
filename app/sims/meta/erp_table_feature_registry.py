@@ -290,7 +290,23 @@ ORDER_CALCULATION = ErpTableFeatureSpec(
     ),), menu_business_group="재고관리", menu_target="발주 계산",
 )
 
-ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230, RDDBC170_RDDBC180, ORDER_CALCULATION)
+HOSPITAL_ORDER_CALCULATION = ErpTableFeatureSpec(
+    table_key="hospital_order_calculation", source_table="snapshot.frequency_product",
+    category="병원발주계산", required_permission="IO_READ",
+    primary_key=(*ORDER_CALCULATION.primary_key, "allocation_stock_apply_cd"),
+    filters=ORDER_CALCULATION.filters + (
+        ErpFilterSpec("allocation_stock_apply_codes", "배분 재고적용처", "Rddbc030.Rd03_Stock_Apply_Cd", "multiselect"),
+    ),
+    actions=(ErpTableActionSpec(
+        action="병원발주계산", aliases=("병원 발주 계산", "병원별발주계산", "병원별 발주 계산"), mode="hospital_calculation",
+        service_function="app.services.hospital_order_calculation_service.get_hospital_order_calculation_result",
+        export_function="app.services.hospital_order_calculation_service.get_hospital_order_calculation_export_df",
+        view_function="app.sims.views.order_calculation_view.view_hospital_order_calculation",
+        payload_key="__io_hospital_order_calculation_last_payload", nlq_period_policy="explicit_only",
+    ),), menu_business_group="재고관리", menu_target="병원발주계산",
+)
+
+ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230, RDDBC170_RDDBC180, ORDER_CALCULATION, HOSPITAL_ORDER_CALCULATION)
 
 
 def iter_action_specs() -> tuple[tuple[ErpTableFeatureSpec, ErpTableActionSpec], ...]:
@@ -389,7 +405,8 @@ def registry_completeness_errors() -> list[str]:
             errors.append(f"duplicate action: {action.action}")
         seen_actions.add(action.action)
         if not feature.source_table.startswith("dbo.Rddbc") and not (
-            feature.table_key == "order_calculation" and feature.source_table == "snapshot.frequency_product"
+            feature.table_key in {"order_calculation", "hospital_order_calculation"}
+            and feature.source_table == "snapshot.frequency_product"
         ):
             errors.append(f"invalid source table: {feature.source_table}")
         if not feature.primary_key:

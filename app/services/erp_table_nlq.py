@@ -513,12 +513,14 @@ _ORDER_CALCULATION_QUERY_MODE = re.compile(
 _ORDER_CALCULATION_DAY_FILTERS = (
     ("safety_days", r"안전\s*재고(?:일수)?"),
     ("target_days", r"적정\s*재고(?:일수)?"),
-    ("closing_day", r"(?:결제|마감)\s*일(?:자)?"),
+    ("closing_day", r"(?:결제|결재|마감)\s*일(?:자)?"),
 )
 
 
 def is_order_calculation_request(text: str) -> bool:
     """Explicit calculation intent must never execute the existing order inquiry."""
+    if re.search(r"병원(?:별)?\s*발주\s*계산", _clean(text)):
+        return False
     return bool(_ORDER_CALCULATION_INTENT.search(_clean(text)))
 
 
@@ -558,11 +560,98 @@ def _unconsumed_calculation_action_tail(text: str) -> str:
     return tail
 
 
+def _resolve_hospital_calculation_nlq(text: str, *, today: date | None) -> dict[str, Any]:
+    """Split allocation selectors before delegating all parent conditions."""
+    from app.sims.meta.erp_table_feature_registry import ORDER_CALCULATION, HOSPITAL_ORDER_CALCULATION
+
+    raw = _clean(text)
+    # This is syntactic location labelling only; the saved-location resolver owns identity.
+    raw = re.sub(r"(?<!\S)([^\s,]+창고)\s+기준(?=\s|$)", r"재고위치 \1", raw)
+    # A parent selector is explicit; an unqualified stock application is allocation-only.
+    raw = re.sub(r"부모\s*(?:발주\s*계산\s*)?재고적용처", "PARENT_STOCK_APPLY", raw)
+    labels = {label for spec in ORDER_CALCULATION.filters for label in (spec.label, *spec.aliases)}
+    values = []
+    action_match = re.search(r"병원(?:별)?\s*발주\s*계산", raw)
+    prefix = raw[:action_match.start()].strip()
+    if prefix and not any(label in prefix for label in labels) and not re.search(
+        r"PARENT_STOCK_APPLY|안전재고|적정재고|결제|결재|마감|조회|\d", prefix
+    ):
+        values.append(prefix)
+        raw = raw[action_match.start():]
+    stops = "|".join(re.escape(label) for label in sorted(labels, key=len, reverse=True))
+    boundary = (rf"(?:^|\s+)(?=(?:{stops}|PARENT_STOCK_APPLY(?:코드|명)?|병원(?:별)?\s*발주\s*계산|"
+                r"부모|배분|병원별|조회구분|조회조건|안전재고|적정재고|결제일|결재일|마감일|"
+                r"해\s*줘|해\s*주세요|조회|검색)(?:\s|[:=]|$))")
+    selector = re.compile(r"(?<![가-힣A-Za-z])(?:(?:병원별\s*)?배분\s*)?재고적용처(?:코드|명)?\s*[:=]?\s*")
+    while (match := selector.search(raw)) is not None:
+        tail = raw[match.end():]
+        end = re.search(boundary, tail)
+        value = tail[:end.start()] if end else tail
+        value = re.sub(r"\s+(?:해\s*줘(?:요)?|해\s*주세요|조회|검색)\s*$", "", value).strip()
+        values.append(value)
+        raw = raw[:match.start()] + " " + (tail[end.start():] if end else "")
+    raw = raw.replace("PARENT_STOCK_APPLY", "재고적용처")
+    raw = re.sub(r"병원(?:별)?\s*발주\s*계산", "발주 계산", raw)
+    resolved = resolve_registered_erp_table_nlq(raw, today=today)
+    params = dict(resolved["params"])
+    residual = params.pop("_registered_unlabeled_entity", "")
+    if residual:
+        values.append(residual)
+    codes, names = [], []
+    error = ""
+    for value in values:
+        parts = [part.strip() for part in re.split(r"\s*[,/+]\s*", value)]
+        if not all(parts):
+            error = "배분 재고적용처 코드 또는 정확한 명칭을 지정하세요."
+        for part in parts:
+            if part == "전체":
+                if len(values) != 1 or len(parts) != 1:
+                    error = "전체와 개별 배분 재고적용처를 함께 지정할 수 없습니다."
+                continue
+            (codes if re.fullmatch(r"\d{1,6}", part) else names).append(part)
+    # Prove consumption against the parent's parsed values, not just a recognized first label.
+    remaining = _ORDER_CALCULATION_INTENT.sub(" ", raw)
+    remaining = _ORDER_CALCULATION_QUERY_MODE.sub(" ", remaining)
+    for _, label in _ORDER_CALCULATION_DAY_FILTERS:
+        remaining = re.sub(label + r"\s*[:=]?\s*\d+\s*(?:영업일|일)?", " ", remaining)
+    for spec in ORDER_CALCULATION.filters:
+        value = params.get(spec.key)
+        if not isinstance(value, (str, int)) or value == "":
+            continue
+        value_labels = (spec.label, *spec.aliases)
+        if spec.key in {'order_vendor_cd', 'cost_apply_cd', 'stock_apply_cd'}:
+            value_labels += filter_labels(ORDER_CALCULATION, spec.key[:-3] + '_nm')
+        for label in sorted(value_labels, key=len, reverse=True):
+            remaining = re.sub(
+                rf"(?<![가-힣A-Za-z0-9]){re.escape(label)}\s*[:=]?\s*{re.escape(str(value))}(?=\s|$)",
+                " ", remaining,
+            )
+    stock_values = params.get('stock_cd_list', []) + params.get('stock_nm_list', [])
+    if stock_values:
+        stock_pattern = r"\s*[,/+]\s*".join(re.escape(v) for v in stock_values)
+        remaining = re.sub(r"재고위치(?:코드|명)?\s*[:=]?\s*" + stock_pattern + r"(?=\s|$)", " ", remaining)
+    remaining = re.sub(r"(?:^|\s)(?:로|해\s*줘(?:요)?|해\s*주세요|조회|검색)(?=\s|$)", " ", remaining)
+    if remaining.strip(" ,?!.:"):
+        error = "지원되지 않거나 해석되지 않은 조건이 있습니다. 조건명을 명시하거나 병원발주계산 조건 화면을 사용하세요."
+    if params.get('_unconsumed_order_condition') or params.get('_ambiguous_staff_role'):
+        error = "해석되지 않은 조건이 있습니다. 조건명을 명시하고 담당자는 발주담당자·제약담당자로 구분하세요."
+    if params.get('date_from') or params.get('date_to'):
+        error = "병원발주계산의 기간 조건은 조건 화면의 발주일자로 지정하세요. 기간을 무시하고 실행하지 않았습니다."
+    params.update(allocation_stock_apply_codes=list(dict.fromkeys(codes)),
+                  _allocation_stock_apply_names=list(dict.fromkeys(names)),
+                  _hospital_nlq_error=error)
+    action = HOSPITAL_ORDER_CALCULATION.actions[0].action
+    return {"action": action, "table": HOSPITAL_ORDER_CALCULATION.table_key, "params": params}
+
+
 def resolve_registered_erp_table_nlq(
     text: str,
     *,
     today: date | None = None,
 ) -> Optional[dict[str, Any]]:
+    registered_action = match_action_in_text(text)
+    if registered_action and registered_action[0].table_key == "hospital_order_calculation":
+        return _resolve_hospital_calculation_nlq(text, today=today)
     semantic_conflict = has_product_prescription_semantic_conflict(text)
 
     def finalize(result: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:

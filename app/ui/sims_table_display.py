@@ -394,6 +394,7 @@ def _is_numeric_display_name(col: Any) -> bool:
     # payload가 JSON/records에서 복원되어 object 문자열이 되어도
     # 화면 렌더 전에 숫자형으로 복구한다.
     explicit_numeric_cols = {
+        "가용예정재고",
         "추정단위손익", "추정손익률",
         "완료월총매출",
         "월평균매출",
@@ -664,6 +665,7 @@ def _is_numeric_display_col(df: pd.DataFrame, col: Any) -> bool:
         return True
 
     explicit_numeric_cols = {
+        "가용예정재고",
         "추정단위손익", "추정손익률",
         "완료월총매출",
         "월평균매출",

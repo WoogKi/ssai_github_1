@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 import os
 import io, json, hashlib, logging
 import math
+from html import escape
 import uuid
 import streamlit as st
 import pandas as pd
@@ -1334,14 +1335,17 @@ def _chat_header_num(value: Any, unit: str = "", *, decimals: int | None = None)
 # 분석 결과 헤더를 렌더링하는 함수
 # - meta에서 분석 유형(analysis_type)과 관련 통계를 읽어서, 적절한 제목과 주요 지표들을 화면 상단에 렌더링한다.
 # - 이 함수는 채팅 답변의 본문을 렌더링하기 전에 호출하는 것을 권장한다.
-def _chat_metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee", decimals: int | None = None) -> None:
+def _chat_metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc", border: str = "#dbe4ee", decimals: int | None = None, text_only: bool = False) -> None:
     """
     채팅창 SIMS 분석/KPI 요약 카드.
 
     패널에서 쓰던 상세 요약 카드 UX를 채팅창으로 옮긴 버전이다.
     패널은 입력 전용으로 두고, 결과 요약은 채팅 메시지 안에서만 렌더한다.
     """
-    value_text = _chat_header_num(value, unit, decimals=decimals)
+    value_text = (str(value).strip() if value is not None else "") if text_only else _chat_header_num(value, unit, decimals=decimals)
+    value_text = value_text or "-"
+    if text_only:
+        value_text = escape(value_text)
 
     html = (
         f'<div style="background:{bg}; border:1px solid {border}; border-radius:10px; '
@@ -1349,7 +1353,8 @@ def _chat_metric_card(label: str, value: Any, unit: str = "", bg: str = "#f8fafc
         f'justify-content:space-between; gap:10px; margin-bottom:6px;">'
         f'<span style="font-size:13px; color:#64748b; font-weight:600; white-space:nowrap;">{label}</span>'
         f'<span style="font-size:16px; font-weight:750; color:#1f2937; line-height:1.2; '
-        f'text-align:right; white-space:nowrap;">{value_text}</span>'
+        f'text-align:right; white-space:nowrap;'
+        f'{"overflow:hidden;text-overflow:ellipsis;min-width:0;" if text_only else ""}">{value_text}</span>'
         f'</div>'
     )
     st.markdown(html, unsafe_allow_html=True)
@@ -4674,6 +4679,7 @@ def _write_supplier_stock_shortage_excel_if_any(writer: Any, df: pd.DataFrame) -
 
 
 def _make_table_downloads(df: pd.DataFrame) -> Tuple[io.BytesIO, io.BytesIO]:
+    from app.ui.hospital_order_calculation_display import write_hospital_excel_if_any
     csv_buf = io.BytesIO()
     xlsx_buf = io.BytesIO()
 
@@ -4683,7 +4689,10 @@ def _make_table_downloads(df: pd.DataFrame) -> Tuple[io.BytesIO, io.BytesIO]:
     csv_buf.seek(0)
 
     with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
-        if not _write_supplier_stock_shortage_excel_if_any(writer, df):
+        if not write_hospital_excel_if_any(
+            writer, df, sanitize=_sanitize_dataframe_for_excel,
+            format_sheet=_apply_sims_excel_number_formats,
+        ) and not _write_supplier_stock_shortage_excel_if_any(writer, df):
             df.to_excel(writer, index=False, sheet_name="SIMS")
             _apply_sims_excel_number_formats(writer, df, "SIMS")
     xlsx_buf.seek(0)
@@ -6255,6 +6264,8 @@ def _render_sims_result_actions_lazy(
                 except Exception:
                     pass
                 ss[ready_key] = True
+                log.info('[chat.download.prepare] requested rows=%s expected_rows=%s cols=%s',
+                         row_count, expected_rows_int, col_count)
                 st.rerun()
 
         with c2:
@@ -6304,9 +6315,11 @@ def _render_sims_result_actions_lazy(
         )
     else:
         t0 = time.perf_counter()
+        log.info('[chat.download.prepare] start rows=%s cols=%s', row_count, col_count)
 
         try:
-            csv_download_df = _sanitize_dataframe_for_excel(download_df)
+            # CSV has no sheet metadata; retain it only on the original Excel source.
+            csv_download_df = _sanitize_dataframe_for_excel(pd.DataFrame(download_df, copy=False))
             csv_bytes = csv_download_df.to_csv(index=False).encode("utf-8-sig")
         except Exception:
             log.exception(
@@ -6318,21 +6331,29 @@ def _render_sims_result_actions_lazy(
             csv_bytes = download_df.to_csv(index=False).encode("utf-8-sig")
 
         excel_bytes: bytes | None = None
+        excel_started = time.perf_counter()
         try:
-            excel_download_df = _sanitize_dataframe_for_excel(download_df)
+            from app.ui.hospital_order_calculation_display import write_hospital_excel_if_any
             bio = io.BytesIO()
             with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-                if not _write_supplier_stock_shortage_excel_if_any(writer, download_df):
+                if not write_hospital_excel_if_any(
+                    writer, download_df, sanitize=_sanitize_dataframe_for_excel,
+                    format_sheet=_apply_sims_excel_number_formats,
+                ) and not _write_supplier_stock_shortage_excel_if_any(writer, download_df):
+                    excel_download_df = _sanitize_dataframe_for_excel(download_df)
                     excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
                     _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
             excel_bytes = bio.getvalue()
+            log.info('[chat.download.excel] complete rows=%s bytes=%s seconds=%.3f',
+                     row_count, len(excel_bytes), time.perf_counter() - excel_started)
         except Exception as exc:
             log.warning(
-                "[chat] Excel download bytes failed key=%s rows=%s cols=%s error=%s",
+                "[chat] Excel download bytes failed key=%s rows=%s cols=%s error=%s seconds=%.3f",
                 key_suffix,
                 row_count,
                 col_count,
                 type(exc).__name__,
+                time.perf_counter() - excel_started,
             )
 
         ss[bytes_key] = {
@@ -9762,7 +9783,8 @@ def _build_sims_result_header_view(
     compact_lines = []
     order_cards = []
     order_condition_cards = []
-    if safe_meta.get("order_calculation_editable"):
+    if safe_meta.get("order_calculation_editable") or safe_meta.get("hospital_order_calculation"):
+        hospital = bool(safe_meta.get("hospital_order_calculation"))
         line1 = ""
         line2 = ""
         elapsed = safe_meta.get("elapsed_ms")
@@ -9775,23 +9797,36 @@ def _build_sims_result_header_view(
             ("적정재고", metrics.get("target_days"), "일", None),
             ("결제일", "현금/당일결제" if metrics.get("closing_day") == 0 else metrics.get("closing_day"), "" if metrics.get("closing_day") == 0 else "일", None),
         ]
+        if hospital:
+            order_condition_cards.insert(1, ("유효 발주일", metrics.get("effective_business_date"), "", None))
         count_label = "발주대상" if mode == "발주해당자료만" else "확인 필요" if mode == "확인 필요" else "조회대상"
-        order_cards = [
-            (count_label, full_rows, "건", None),
-            ("화면", display_rows, "건", None),
-            ("적용 필요", metrics.get("needed_days"), "영업일", None),
-            ("입고예정", f"최근 {metrics['inbound_business_days']}" if metrics.get("inbound_business_days") else None, "영업일", None),
-            ("처리시간", float(elapsed) / 1000 if isinstance(elapsed, (int, float)) else None, "초", 1),
-        ]
-        compact_lines = [
-            "",
-            "안내 | 수량은 추천이며 ERP에 등록되지 않습니다.",
-        ]
-        spike_count = int((safe_meta.get("order_filter_diagnostics") or {}).get("non_order_spike_confirmation_rows") or 0)
-        if mode == "발주해당자료만" and spike_count:
-            compact_lines.append(
-                f"발주대상 외 당월 출고 급증 확인 {spike_count:,}건은 제외됐습니다. 조회구분 '확인 필요'에서 확인하세요."
-            )
+        if hospital:
+            display = safe_meta.get("order_display_conditions") or {}
+            order_cards = [
+                (count_label, safe_meta.get("parent_product_count"), "건", None),
+                ("재고위치", display.get("stock_location"), "", None),
+                ("단가적용처", display.get("cost_application"), "", None),
+                ("재고적용처", display.get("stock_application"), "", None),
+                ("처리시간", float(elapsed) / 1000 if isinstance(elapsed, (int, float)) else None, "초", 1),
+            ]
+            compact_lines = [""]
+        else:
+            order_cards = [
+                (count_label, full_rows, "건", None),
+                ("화면", display_rows, "건", None),
+                ("적용 필요", metrics.get("needed_days"), "영업일", None),
+                ("입고예정", f"최근 {metrics['inbound_business_days']}" if metrics.get("inbound_business_days") else None, "영업일", None),
+                ("처리시간", float(elapsed) / 1000 if isinstance(elapsed, (int, float)) else None, "초", 1),
+            ]
+            compact_lines = [
+                "",
+                "안내 | 수량은 추천이며 ERP에 등록되지 않습니다.",
+            ]
+            spike_count = int((safe_meta.get("order_filter_diagnostics") or {}).get("non_order_spike_confirmation_rows") or 0)
+            if mode == "발주해당자료만" and spike_count:
+                compact_lines.append(
+                    f"발주대상 외 당월 출고 급증 확인 {spike_count:,}건은 제외됐습니다. 조회구분 '확인 필요'에서 확인하세요."
+                )
 
     result_time_text = _sims_result_datetime_text(item, safe_meta)
     nlq_query = str(
@@ -9810,6 +9845,10 @@ def _build_sims_result_header_view(
     _sims_detail_add(details, "조회시각", result_time_text)
     _sims_detail_add(details, "응답완료", response_timing)
     _sims_detail_add(details, "전체 조회조건", full_condition)
+    if safe_meta.get("hospital_order_calculation"):
+        _sims_detail_add(details, "적용 재고위치코드", (safe_meta.get("order_display_conditions") or {}).get("stock_location_codes"))
+        _sims_detail_add(details, "적용 재고위치", (safe_meta.get("order_display_conditions") or {}).get("stock_location_details"))
+        _sims_detail_add(details, "배분 재고적용처", (safe_meta.get("order_display_conditions") or {}).get("stock_application_details") or "전체")
     if safe_meta.get("order_calculation_editable"):
         _sims_detail_add(details, "계산기준", safe_meta.get("calculation_basis"))
     _sims_detail_add(details, "NLQ 원문", nlq_query)
@@ -9846,6 +9885,7 @@ def _build_sims_result_header_view(
         "display_rows": display_rows,
         "download_rows": download_rows,
         "followup_available": followup_available,
+        "hospital_order_calculation": bool(safe_meta.get("hospital_order_calculation")),
     }
 
 
@@ -9863,7 +9903,9 @@ def _render_sims_result_header_view(view: Dict[str, Any]) -> None:
             with st.container(horizontal=True, gap="small"):
                 for label, value, unit, decimals in view["order_cards"]:
                     with st.container(width=190, border=False):
-                        _chat_metric_card(label, value, unit, decimals=decimals)
+                        _chat_metric_card(label, value, unit, decimals=decimals,
+                                          text_only=bool(view.get("hospital_order_calculation") and
+                                                         label in {"재고위치", "단가적용처", "재고적용처"}))
         for line in lines[1:]:
             st.caption(line)
     line1 = str((view or {}).get("line1") or "").strip()
@@ -10333,11 +10375,8 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                 unsafe_allow_html=True,
             )
         elif non_query_notice:
-            notice_text = _safe_user_facing_payload_text(item.get("message"))
-            if not notice_text:
-                notice_text = _safe_user_facing_payload_text(item.get("data"))
-            if notice_text:
-                st.markdown(notice_text)
+            # The tableless fallback below owns the one user-facing notice.
+            pass
         elif is_product_flow and not non_query_notice:
             product_info_text = _build_product_flow_info_caption(meta)
             if product_info_text:
@@ -10579,7 +10618,10 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             # CSV / Excel / LLM 분석 버튼은 후보표에는 붙이지 않는다.
             from app.ui.order_calculation_editor import render_actual_quantity_editor
             order_editor_rendered = False
-            if bool(meta.get("order_calculation_editable")) and render_actual_quantity_editor(item, meta, download_uid=uid2):
+            if bool(meta.get("hospital_order_calculation")):
+                from app.ui.hospital_order_calculation_display import render_hospital_order_table
+                order_editor_rendered = render_hospital_order_table(item, meta, download_uid=uid2)
+            elif bool(meta.get("order_calculation_editable")) and render_actual_quantity_editor(item, meta, download_uid=uid2):
                 order_editor_rendered = True
             elif bool(meta.get("candidate_table")):
                 try:

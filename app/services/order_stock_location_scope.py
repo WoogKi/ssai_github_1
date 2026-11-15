@@ -25,6 +25,7 @@ def extract_order_stock_terms(text: str) -> tuple[list[str], list[str]] | None:
     raw = re.split(
         r"\s+(?=(?:제품(?:코드|명)?|품목(?:코드|명)?|제조사|제약사|발주처|"
         r"단가적용처|재고적용처|발주담당자|발주\s*(?:조회|계산|내역|현황)|"
+        r"안전\s*재고(?:일수)?|적정\s*재고(?:일수)?|(?:결제|결재|마감)\s*일(?:자)?|"
         r"입고\s*예정|조회|검색|보여줘|오늘|어제|이번|지난)\b)",
         match.group(1), maxsplit=1,
     )[0].strip()
@@ -84,6 +85,10 @@ def resolve_order_stock_scope(
     if saved_only:
         out["_order_saved_stock_cd_list"] = list(dict.fromkeys(_values(default_codes)))
     out["_order_stock_scope_resolved"] = True
+    if registered_names:
+        out["_order_stock_display_names"] = {
+            code: registered_names[code] for code in selected if registered_names.get(code)
+        }
     return out, "", []
 
 

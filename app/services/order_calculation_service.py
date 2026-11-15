@@ -685,6 +685,15 @@ def build_contract_price_params(params: dict) -> dict:
     return query
 
 
+def load_application_names(codes: list[str]) -> pd.DataFrame:
+    """Read exact application identities using the current company connection."""
+    if not codes:
+        return pd.DataFrame(columns=['code', 'name'])
+    return query_to_df(
+        "SELECT RTRIM(Rd03_Ven_Cd) AS code, RTRIM(Rd03_Ven_Nm) AS name FROM dbo.Rddbc030 WHERE Rd03_Ven_Cd IN ("
+        + ','.join('?' for _ in codes) + ')', tuple(codes))
+
+
 def load_sources(params: dict) -> dict:
     from app.services.snapshot_product_information_service import get_snapshot_product_information_result
     from app.services.dashboard_inventory_frequency_snapshot_service import resolve_dashboard_profile_stock_scope
@@ -751,8 +760,7 @@ def load_sources(params: dict) -> dict:
         return value
     codes = [params.get(field + "_cd") for field in ("cost_apply", "stock_apply") if params.get(field + "_cd")]
     if codes:
-        applications = call('application_codes', query_to_df,
-            "SELECT RTRIM(Rd03_Ven_Cd) AS code, RTRIM(Rd03_Ven_Nm) AS name FROM dbo.Rddbc030 WHERE Rd03_Ven_Cd IN (" + ','.join('?' for _ in codes) + ')', tuple(codes), input_rows=len(codes))
+        applications = call('application_codes', load_application_names, codes, input_rows=len(codes))
         names = dict(zip(applications['code'], applications['name']))
         for field in ("cost_apply", "stock_apply"):
             code = params.get(field + "_cd")

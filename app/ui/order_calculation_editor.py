@@ -41,6 +41,20 @@ _ORDER_STOCK_COLOR = "#f5f3e8"
 _ORDER_STOCK_COLUMNS = ("입고예정수량", "재고수량", "당월 정상출고수량")
 
 
+def _select_order_page(row_count: int, page_key: str) -> tuple[int, int]:
+    page_count = max(1, (row_count + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    state = st.session_state
+    state[page_key] = min(max(int(state.get(page_key, 1)), 1), page_count)
+    if page_count > 1:
+        page = st.selectbox(
+            "페이지", range(1, page_count + 1), key=page_key,
+            format_func=lambda number: f"{number} / {page_count}",
+            width=120,
+        )
+        return page, page_count
+    return 1, page_count
+
+
 def _order_table_display_config(source: pd.DataFrame, *, editing: bool) -> tuple[pd.DataFrame, dict, int]:
     view = prepare_sims_table_display_df(source, action_name="발주 계산")
     if "발주단위" in view:
@@ -183,17 +197,8 @@ def render_actual_quantity_editor(item: dict, meta: dict, *, download_uid: str):
         return
     if not full["회사"].eq(get_current_company_id()).all():
         return
-    page_count = (len(full) + _PAGE_SIZE - 1) // _PAGE_SIZE
     page_key = f"order_page::{key}"
-    ss[page_key] = min(max(int(ss.get(page_key, 1)), 1), page_count)
-    if page_count > 1:
-        page = st.selectbox(
-            "페이지", range(1, page_count + 1), key=page_key,
-            format_func=lambda number: f"{number} / {page_count}",
-            width=120,
-        )
-    else:
-        page = 1
+    page, page_count = _select_order_page(len(full), page_key)
     visible = full.iloc[(page - 1) * _PAGE_SIZE:page * _PAGE_SIZE].copy()
     existing_display = ss.get("sims_tables", {}).get(key)
     display_columns = list(existing_display.columns) if isinstance(existing_display, pd.DataFrame) else list(full.columns)

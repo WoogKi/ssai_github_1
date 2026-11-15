@@ -1,6 +1,7 @@
 """DB-free Arrow and edit regression for restored order-calculation tables."""
 
 from pathlib import Path
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import patch
 import sys
@@ -27,6 +28,30 @@ def test_display_types():
             assert view["발주단위"].iloc[0] not in (None, "")
             assert view["발주단위"].iloc[1] not in (None, "")
         pd.testing.assert_frame_equal(source, saved)
+
+
+def test_nullable_stock_numeric_contract():
+    source = pd.DataFrame({
+        '가용예정재고': [Decimal('10'), None, Decimal('-2'), ''],
+        '재고수량': [Decimal('10'), None, Decimal('-2'), ''],
+        '입고예정수량': [0, None, 1, ''],
+        '제품코드': ['00001', '00002', '00003', '00004'],
+        '발주일자': ['20261115', None, '20261115', None],
+    })
+    saved = source.copy(deep=True)
+    for editing in (True, False):
+        view, config, _ = editor._order_table_display_config(source, editing=editing)
+        pa.Table.from_pandas(view, preserve_index=False)
+        assert config['가용예정재고']['alignment'] == 'right'
+        assert view['제품코드'].tolist() == source['제품코드'].tolist()
+        assert view['발주일자'].iloc[0] == '2026-11-15'
+        if editing:
+            assert pd.api.types.is_numeric_dtype(view['가용예정재고'])
+            assert view['가용예정재고'].isna().sum() == 2
+        else:
+            assert view['가용예정재고'].iloc[1] == ''
+        assert 'color:#dc2626;' in editor._order_readonly_styles(view, editing=editing).loc[2, '가용예정재고']
+    pd.testing.assert_frame_equal(source, saved)
 
 
 def test_restored_table_and_edit():
@@ -76,5 +101,6 @@ def test_restored_table_and_edit():
 
 if __name__ == "__main__":
     test_display_types()
+    test_nullable_stock_numeric_contract()
     test_restored_table_and_edit()
     print("ORDER_ARROW_DISPLAY_PASS")
