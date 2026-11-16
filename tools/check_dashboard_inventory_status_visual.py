@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from copy import deepcopy
+from io import BytesIO
 import sys
 
+import openpyxl
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -11,12 +14,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.services.dashboard_lite_facts import INVENTORY_STATUS_ORDER
+from app.services.dashboard_risk_detail_export import build_dashboard_inventory_detail_excel_bytes
+from app.ui.sims_table_display import build_sims_table_display_config
 from app.sims.views.dashboard_lite import (
     _INVENTORY_DETAIL_COLUMNS,
     _INVENTORY_STATUS_COLORS,
     _integrated_inventory_detail_display_frame,
     _inventory_detail_numeric_styles,
     _inventory_detail_column_config,
+    _risk_detail_display_column_config,
     _inventory_detail_status_cell_style,
     _style_inventory_detail,
     _dashboard_inline_icon,
@@ -28,6 +34,75 @@ from app.sims.views.dashboard_lite import (
     _inventory_status_minor_html,
     build_dashboard_lite_chat_snapshot,
 )
+
+
+def check_inventory_detail_frozen_columns() -> None:
+    pinned = ["재고상태", "제품코드", "제품명", "규격"]
+    leading = pinned + ["월간 소진상태", "위험 품목 여부", "위험 유형", "위험사유"]
+    # Keep the input/export order deliberately different from the screen order.
+    frame = pd.DataFrame({column: ["", ""] for column in reversed(_INVENTORY_DETAIL_COLUMNS)})
+    frame["제품코드"] = ["00002", "00001"]
+    frame["현재재고수량"] = [-1.25, 20.5]
+    frame["재고상태"] = ["긴급 부족", "적정 재고"]
+    frame["최근 정상 입고일"] = ["20261101", "20261102"]
+    frame.index = [8, 3]
+    original = frame.copy(deep=True)
+    risk_before = deepcopy(_risk_detail_display_column_config())
+    before_excel, _ = build_dashboard_inventory_detail_excel_bytes(frame, [])
+
+    shown = _integrated_inventory_detail_display_frame(frame, 2)
+    assert list(shown.columns[:8]) == leading
+    assert len(shown.columns) == len(set(shown.columns)) == len(frame.columns)
+    assert set(shown.columns) == set(frame.columns)
+    assert list(shown.columns[8:]) == [c for c in _INVENTORY_DETAIL_COLUMNS if c not in leading]
+    assert shown.index.tolist() == [8, 3]
+    assert shown["제품코드"].tolist() == ["00002", "00001"]
+    assert shown["현재재고수량"].tolist() == [-1.25, 20.5]
+    view, common, _, _ = build_sims_table_display_config(
+        shown, action_name="Dashboard 재고 현황 상세", add_row_no=False, enable_pinning=False,
+    )
+    # Even an inherited/common pin must not expand the inventory pin budget.
+    common["위험사유"]["pinned"] = True
+    common["현재재고수량"]["pinned"] = True
+    common_before = deepcopy(common)
+    config = _inventory_detail_column_config(view, common)
+    assert list(config) == list(view.columns)
+    assert [c for c, options in config.items() if options["pinned"]] == pinned
+    assert [config[c]["width"] for c in pinned] == [110, 90, 230, 100]
+    assert all(config[c]["pinned"] is False for c in view.columns if c not in pinned)
+    width = sum(config[c]["width"] for c in pinned)
+    assert width == 530
+    assert width > 883 * 0.6 and width <= 884 * 0.6
+    assert width <= 883.5 * 0.6  # Fractional CSS widths can pass below 884.
+    assert common == common_before
+    for column in ("현재재고수량", "최근 정상 입고일"):
+        expected = risk_before[column] if column == "최근 정상 입고일" else common[column]
+        assert {k: v for k, v in config[column].items() if k != "pinned"} == {
+            k: v for k, v in expected.items() if k != "pinned"
+        }
+    assert _risk_detail_display_column_config() == risk_before
+    assert [c for c, options in risk_before.items() if options.get("pinned")] == [
+        "순번", "위험상태", "위험사유", "제품코드", "제품명", "규격",
+    ]
+    pd.testing.assert_frame_equal(frame, original)
+    after_excel, _ = build_dashboard_inventory_detail_excel_bytes(frame, [])
+    workbooks = [openpyxl.load_workbook(BytesIO(payload), read_only=True) for payload in (before_excel, after_excel)]
+    try:
+        before, after = [list(wb["재고현황상세"].values) for wb in workbooks]
+        assert before == after
+        assert list(after[0]) == list(original.columns)
+        assert after[1][list(original.columns).index("제품코드")] == "00002"
+        assert after[2][list(original.columns).index("제품코드")] == "00001"
+    finally:
+        for wb in workbooks:
+            wb.close()
+    partial = frame.drop(columns=["규격", "위험사유"])
+    partial_view = _integrated_inventory_detail_display_frame(partial, 1)
+    partial_config = _inventory_detail_column_config(partial_view, {})
+    assert [c for c, options in partial_config.items() if options["pinned"]] == pinned[:3]
+    assert set(partial_view.columns) == set(partial.columns)
+    pd.testing.assert_frame_equal(_integrated_inventory_detail_display_frame(frame, 0), frame.head(0))
+    print("dashboard inventory frozen columns: PASS (4 pins / 530px / export preserved)")
 
 
 def main() -> None:
@@ -200,6 +275,7 @@ def main() -> None:
     assert len(_integrated_inventory_detail_display_frame(pd.concat([detail] * 151, ignore_index=True), 300)) == 300
     complete = pd.DataFrame({column: [""] for column in _INVENTORY_DETAIL_COLUMNS})
     assert list(_integrated_inventory_detail_display_frame(complete, 1).columns) == list(_INVENTORY_DETAIL_COLUMNS)
+    check_inventory_detail_frozen_columns()
     print("dashboard inventory visual: PASS")
 
 

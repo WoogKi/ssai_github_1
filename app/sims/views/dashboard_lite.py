@@ -2653,12 +2653,16 @@ def _render_inventory_cover_days(facts: dict[str, Any]) -> None:
     st.caption("재고 커버일은 현재고 ÷ 일평균 잔여 예상수요입니다.")
 
 
+_INVENTORY_DETAIL_PINNED_COLUMNS = ("재고상태", "제품코드", "제품명", "규격")
+# Screen order only; Excel keeps the original filtered frame and column order.
 _INVENTORY_DETAIL_COLUMNS = (
-    "재고상태", "월간 소진상태", "월간 소진상태 사유", "위험 품목 여부", "위험 유형", "출고빈도등급", "품목손익등급", "품목기여등급", "3개월 출고발생수",
-    "제품코드", "제품명", "규격", "제조사명", "제품그룹명", "제품구분명", "제품분류명",
+    *_INVENTORY_DETAIL_PINNED_COLUMNS,
+    "월간 소진상태", "위험 품목 여부", "위험 유형", "위험사유",
+    "월간 소진상태 사유", "출고빈도등급", "품목손익등급", "품목기여등급", "3개월 출고발생수",
+    "제조사명", "제품그룹명", "제품구분명", "제품분류명",
     "주요매입처명", "현재재고수량", "현재재고금액", "재고평가단가", "당월현재출고수량", "당월기준예상출고수량", "월예상 달성률", "월잔여예상수요",
     "입고예정수량", "입고예정 반영 가용재고", "평가월", "판단기준일", "평가월 예상수요", "재고보유영업일", "입고예정 포함 재고상태", "재고 커버일",
-    "위험사유", "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액",
+    "위험보정잔여예상수요", "위험보정부족예상수량", "위험보정부족예상금액",
     "위험보정재고준비율", "재고커버 자료상태", "수요급증상위분류", "수요급증세부분류", "수요급증세부분류사유", "최근 정상 입고일",
     "입고 경과일", "정상 입고 거래일수", "평균 입고간격일", "입고 자료상태", "입고 지연후보",
     "최근입고 대표매입처코드", "최근입고 대표매입처명", "최근입고 대표매입처출처",
@@ -2767,10 +2771,10 @@ def _inventory_detail_column_config(display: pd.DataFrame, common_column_config:
     config = {
         **common_column_config,
         **risk_text_column_config,
-        "재고상태": st.column_config.TextColumn("재고 상태", width=110, pinned=True, alignment="center"),
-        "월간 소진상태": st.column_config.TextColumn("월간 소진상태", width=150, pinned=True, alignment="center"),
-        "위험 품목 여부": st.column_config.TextColumn("위험 품목", width=100, pinned=True, alignment="center"),
-        "위험 유형": st.column_config.TextColumn("위험 유형", width=100, pinned=True, alignment="center"),
+        "재고상태": st.column_config.TextColumn("재고 상태", width=110, alignment="center"),
+        "월간 소진상태": st.column_config.TextColumn("월간 소진상태", width=150, alignment="center"),
+        "위험 품목 여부": st.column_config.TextColumn("위험 품목", width=100, alignment="center"),
+        "위험 유형": st.column_config.TextColumn("위험 유형", width=100, alignment="center"),
         "출고빈도등급": st.column_config.TextColumn("출고빈도", width=90, alignment="center"),
         "품목손익등급": st.column_config.TextColumn("손익등급", width=90, alignment="center"),
         "품목기여등급": st.column_config.TextColumn("기여등급", width=90, alignment="center"),
@@ -2778,7 +2782,11 @@ def _inventory_detail_column_config(display: pd.DataFrame, common_column_config:
     for column, width in {"제품명": 230, "규격": 100}.items():
         if column in config:
             config[column]["width"] = width
-    return config
+    # Override inherited pins without mutating the shared/risk-detail configuration.
+    return {
+        column: {**config.get(column, {}), "pinned": column in _INVENTORY_DETAIL_PINNED_COLUMNS}
+        for column in display.columns
+    }
 
 
 def _build_integrated_inventory_detail_frame(inventory: Mapping[str, Any]) -> pd.DataFrame:
