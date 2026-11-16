@@ -226,11 +226,11 @@ def _sales_cte(params: Dict[str, Any]) -> tuple[str, Dict[str, Any], dict[str, A
 )""",
         f"""NumericSales AS (
     SELECT 기준월, {_trim('제품코드')} AS 제품코드, {_trim('매입처코드')} AS 매입처코드,
-           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * COALESCE({p}_Out_Quantity, 0) ELSE COALESCE({p}_Out_Quantity, 0) END AS 출고수량,
-           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * COALESCE({p}_Out_Oquantity, 0) ELSE COALESCE({p}_Out_Oquantity, 0) END AS 출고할증수량,
-           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * COALESCE({p}_Out_Supply_Price, 0) ELSE COALESCE({p}_Out_Supply_Price, 0) END AS 매출공급가액,
-           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * COALESCE({p}_Out_Tax_Price, 0) ELSE COALESCE({p}_Out_Tax_Price, 0) END AS 매출세액,
-           CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN -1 * (COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0)) ELSE COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0) END AS 매출합계,
+           COALESCE({p}_Out_Quantity, 0) AS 출고수량,
+           COALESCE({p}_Out_Oquantity, 0) AS 출고할증수량,
+           COALESCE({p}_Out_Supply_Price, 0) AS 매출공급가액,
+           COALESCE({p}_Out_Tax_Price, 0) AS 매출세액,
+           COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0) AS 매출합계,
            CASE WHEN LEFT({p}_Io_Gu, 1) = '6' THEN ABS(COALESCE({p}_Out_Supply_Price, 0) + COALESCE({p}_Out_Tax_Price, 0)) ELSE 0 END AS 매출반품금액
     FROM SalesRows
 )""",
