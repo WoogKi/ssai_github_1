@@ -27,6 +27,7 @@
 - **ML 개발계획**: [30일 출고수요·과거월 백테스트·발주 Shadow](02_design/SIMS_AI_ML_DEVELOPMENT_PLAN_202611.md)
 - **ERP 업무 개발계획**: [매입·매출·입출금·거래처 장부·잔액관리](02_design/SIMS_AI_ERP_LEDGER_BALANCE_PLAN_202611.md)
 - **KPIS MCP 개발계획**: [의약품정보센터 OpenAPI·회사별 인증키 관리](02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md)
+- **최신 실행 상태**: [TOP3 체크리스트](00_roadmap/SIMS_AI_PLATFORM_TOP3_EXECUTION_CHECKLIST_v1.1_20261102.md) · [통합 일정](00_roadmap/SIMS_AI_PLATFORM_TOP3_INTEGRATED_SCHEDULE_v1.0_20261027.md) (과거 절과 최신 절을 구분)
 - 계획 변경 이력: [v2.4→v2.5 공식 비교](00_roadmap/SIMS_AI_PLATFORM_ROADMAP_V24_V25_COMPARISON_v1_20261027.md) · [과거→v2.4 비교](00_roadmap/SIMS_AI_PLATFORM_ROADMAP_COMPARISON_v1_20261027.md) · [Phase 대응](00_roadmap/SIMS_AI_PLATFORM_PHASE_MAPPING_v1_20261027.md) · [88개 추적 항목](00_roadmap/SIMS_AI_PLATFORM_TRACEABILITY_v1_20261027.csv)
 - 이전 공식 기준선: [v2.4 로드맵](00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.4_20261027.md) · [v1.3 일정](00_roadmap/SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.3_20261027.md)
 - LM Studio Tool/MCP 계획: [MCP 현황·다음 단계](02_design/SIMS_AI_MCP_CURRENT_STATE_AND_NEXT_PHASE_20261027.md)
@@ -37,6 +38,14 @@
 - Dashboard Lite 설계: [Dashboard Lite v0.1 설계](02_design/DASHBOARD_LITE_V01_DESIGN.md)
 - NLQ·현재고·현재표 계약: [SIMS NLQ·현재고·현재표 공식 계약](02_design/SIMS_NLQ_CURRENT_STOCK_CURRENT_TABLE_CONTRACT.md)
 - 공식 테스트 결과: [6c83962 NLQ·Dashboard·현재고 테스트 결과](04_test_results/TEST_RESULT_6C83962_NLQ_DASHBOARD_STOCK_20260809.md)
+
+## 2026-11-16 개발 기준선
+
+최신 SIMS AI Git 기준은 `883f50f1bed2f14f8a69a333a27c8a4ddd272553`이다. 운영자가 확인한 1호기 Commit/Push·GitHub 동기화·2호기 Pull/동일 Commit, 2호기 `SIMS_AI_2HO_Streamlit` Running·HTTP `200 / ok`·clean 상태를 **배포 확인**으로 기록한다. 이는 개별 업무 기능의 2호기 Smoke 또는 현업 승인이 아니다. 특히 Dashboard 현재매출의 동일 시점 ERP 원천 독립 검산은 미완료다.
+
+확정 개발 순서: **SSAI_ML 회사 4·7·8 동일 조건 평가 → MCP 마무리 → 입출고·잔액 ERP 연결 → RAG·Agent 후속**. 회사 13 Saved IO 및 관련 검증은 종료 과제로서 재추진하지 않으며 기존 문서·미추적 도구는 보존한다. [Master v2.5](00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)는 Phase 3~8/88 ID의 상위 기준이고, TOP3 최신 절이 현재 실행 상태를 관리한다. 역사적 목표일과 당시 판정은 새 완료 근거가 아니다.
+
+ML의 연구 규칙·학습/평가 authority는 별도 `SSAI_ML/docs/SIMS_AI_ML_BUSINESS_RULES_MASTER_v0.5.md`, `SIMS_AI_ML_PROGRAM_DETAILED_DESIGN_v0.4.md`, `ML_EXPERIMENT_REGISTER.md`에 있다. 이 저장소의 미추적 ML 초안 2개는 P3 결정에 따라 과거 원본으로 보존하며 병렬 공식 규칙집으로 등록하지 않는다. SIMS AI는 ERP 원천 공급·회사/권한·운영 적용을 맡는다. 연구 결과, Git 반영, 2호기 배포, 현업 승인을 서로 다른 단계로 기록한다.
 
 발주 1차의 운영 기준선은 `feat/dashboard-stock-extension-20260727` 브랜치의
 `7283865dcf8709ec9673404b0321adfe208c65be` 커밋이다. 다른 기능의 날짜별 완료 기록은

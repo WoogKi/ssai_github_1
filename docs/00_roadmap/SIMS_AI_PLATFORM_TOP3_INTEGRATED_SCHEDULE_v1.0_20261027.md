@@ -1,8 +1,21 @@
 # SIMS AI 3대 핵심 개발 통합 일정표 v1.0
 
+## 확정 후속 순서와 상태 경계: 2026-11-16
+
+현재 개발 순서는 **1. SSAI_ML 회사 4·7·8 동일 조건 평가 → 2. MCP 실제 연결/운영 마무리 → 3. 입출고·잔액 ERP 연결 → 4. RAG·Agent 후속**이다. 이 순서는 아래 10/27 목표일과 11/13 조건부 일정의 과거 문구보다 최신 사용자 결정이며, 새 납기를 확정하지 않는다. [최신 체크리스트](SIMS_AI_PLATFORM_TOP3_EXECUTION_CHECKLIST_v1.1_20261102.md)의 6단계 상태를 적용한다.
+
+| 순서 | 착수에 필요한 근거 | 완료로 표시하지 않을 경계 |
+| --- | --- | --- |
+| 1 ML 회사 4·7·8 | 회사별 ML 예측·확정 출고·현행 SIMS 예측을 동일 회사/제품/기간/Label/as-of로 맞추고 품질 임계값·권한 승인 | Phase 4E RF40 연구 마감이나 2호기 Git 배포만으로 세 회사 운영 적합성/현업 승인 아님. 추가 DB 2개 V3는 대상·접근 범위 별도 결정 |
+| 2 MCP | 공식 [P1 계획](../02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md)의 D1~D4 결정, Native/Registered/KPIS 각각 실제 허용·거부/회수 검증 | 합성 PoC는 실제 Tool/KPIS 성공이나 운영 비밀 관리가 아님 |
+| 3 ERP | [L1~L4 계획](../02_design/SIMS_AI_ERP_LEDGER_BALANCE_PLAN_202611.md)의 입출고·입금/출금/장부/잔액 원천·연결키·이월/상계·권한 계약 | 기존 조회 서비스는 거래처 잔액 Exact 구현 아님 |
+| 4 RAG·Agent | Knowledge corpus 소유자·승인·freshness, Agent 안전/평가/권한 Gate | 과거 2호기 Smoke를 현재 현업 승인으로 자동 승격하지 않음 |
+
+회사 13 Saved IO 및 관련 검증은 사용자 결정으로 **종료**했다. 아래 S6-2 보류/조건부 검토는 11/13 당시 기록이며 미래 실행 계획에서 제외한다. WIP/보존본은 원위치 유지한다. SIMS HEAD `883f50f`의 GitHub 동기화와 2호기 동일 Commit Pull·clean, Scheduled Task Running·HTTP `200 / ok`는 **2026-11-16 운영자 확인 배포 완료**로 기록한다. 병원발주 `a492167`, Dashboard `78aeff0`·`883f50f`의 2호기 개별 업무 Smoke 및 Dashboard 매출액 동일 시점 ERP 독립 검산은 별도다. 월마감 안전 Gate는 우선순위와 무관하게 유지한다.
+
 ## 최신 진행 상태와 조건부 후속 일정: 2026-11-13 P2
 
-이 절이 최신 실행 상태다. 아래 **과거 기록 원문**의 10/27 목표일·상태는 삭제하지 않았으며 현재 완료·승인으로 해석하지 않는다. [Master v2.5](SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)·[Expected Schedule v1.4](SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.4_20261027.md)는 변경하지 않는다. MCP 단일 기준은 [P1 공식 계획](../02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md), 단계별 체크·근거는 [최신 TOP3 체크리스트 절](SIMS_AI_PLATFORM_TOP3_EXECUTION_CHECKLIST_v1.1_20261102.md)이다. 확인 HEAD `15468d2`; 두 TOP3 문서는 착수 시 미추적이며 이번 작성은 Git 반영/운영 승인과 별개다.
+이 절은 2026-11-13 당시의 최신 실행 상태다. 아래 **과거 기록 원문**의 10/27 목표일·상태는 삭제하지 않았으며 현재 완료·승인으로 해석하지 않는다. [Master v2.5](SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)·[Expected Schedule v1.4](SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.4_20261027.md)는 당시 변경하지 않았다. MCP 단일 기준은 [P1 공식 계획](../02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md), 단계별 체크·근거는 [TOP3 체크리스트](SIMS_AI_PLATFORM_TOP3_EXECUTION_CHECKLIST_v1.1_20261102.md)이다. 확인 HEAD `15468d2`; 두 TOP3 문서는 당시 착수 시 미추적이며 그때의 작성은 Git 반영/운영 승인과 별개였다.
 
 | 상태 ID | 분야 | 2026-11-13 확인 상태 | 완료와 구분할 잔여 범위 |
 | --- | --- | --- | --- |

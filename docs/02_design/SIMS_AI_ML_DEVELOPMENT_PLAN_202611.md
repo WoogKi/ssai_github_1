@@ -2,6 +2,12 @@
 
 **지위:** [공식 로드맵 v2.5](../00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)의 Phase 5 공식 개발계획. 본 계획 승인은 학습 데이터 접근·모델 운영 채택·배포 승인이 아니다. 기존 [발주계산 1차 업무 계약](ORDER_CALCULATION_PHASE1_BUSINESS_CONTRACT.md)은 변경하지 않는다. 기존 규칙 예측·발주 구현과 학습형 ML 미구현을 구분한다.
 
+## 최신 연구·운영 경계와 다음 평가 (2026-11-16)
+
+위 `학습형 ML 미구현`은 10/27 작성 당시의 SIMS 운영 경계다. 이후 SIMS 공급 S1 `c0b1932`·소규모 Adapter S2 `fb4c2e6`은 구현/DB-free 검증됐고, 별도 SSAI_ML의 Phase 4E는 Direct502+RF40+Demand40+Frequency Mix를 **연구 기준**으로 마감했다(`RESEARCH_POSTHOC`, SSAI_ML `ML_EXPERIMENT_REGISTER.md` 11/11 절). 연구·모델 재현과 SIMS 운영 연결/현업 승인은 다르다. SIMS는 ERP 원천·Saved IO·Calendar·as-of·Manifest·회사/권한 공급과 발주 결과 소비를, SSAI_ML은 독립 연구·학습·평가를 맡는다. 업무규칙은 SSAI_ML `SIMS_AI_ML_BUSINESS_RULES_MASTER_v0.5.md`, 독립 설계는 `SIMS_AI_ML_PROGRAM_DETAILED_DESIGN_v0.4.md`를 참조하며 이 저장소의 과거 ML 초안을 병렬 공식 문서로 올리지 않는다.
+
+확정 1순위는 **회사 4·7·8별 ML 예측수량 / 같은 기간 확정 정상 출고수량 / 기존 SIMS 예측수량**의 동일 회사·제품·단위·코호트·기준일 비교다. 기존 SIMS 산식/버전과 실제 출고 Label·기간을 먼저 고정하고 회사별 WAPE·MAE·Bias, 과소/과대·0수요·적용률과 운영 가능성을 별도 평가한다. 평가셋/독립 Holdout·합격 임계값/데이터 사용 범위가 미승인이면 PASS나 운영 채택으로 쓰지 않는다. 추가 DB 2개 적합성 V3는 대상·권한/기간이 미확정인 별도 계획이며 세 회사와 자동 동일시하지 않는다. `883f50f` 2호기 배포 확인은 ML 모델 운영 적용의 증거가 아니다. 회사 13 Saved IO 검증 과제는 종료·보존하며 재추진 일정에 넣지 않는다. 아래 원래 11~12월 일정은 역사적 목표일로 유지한다.
+
 ## 1. 첫 목표와 자료 계약 (P5-01~04, P45-08)
 
 - 첫 타깃은 **제품·회사·예측 기준일별 향후 30일 정상 출고수량**이다. 출고반품, 취소·중복, 미결·장부 거래의 포함 여부는 현재 saved-I/O 및 원천 정책을 대조해 명시한다. **매출금액은 별도 타깃**으로 계산하고 금액 예측을 수량 대용으로 사용하지 않는다.

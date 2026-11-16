@@ -1,8 +1,24 @@
 # SIMS AI 업무진행 체크리스트 v1.1
 
+## 최신 실행 상태: 2026-11-16 (기존 11/13·11/02 절은 당시 기록)
+
+상위 [Master v2.5](SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)의 Phase 3~8/88 ID를 유지한다. 현재 SIMS AI HEAD `883f50f`, SSAI_ML `main` HEAD `5ba7b7d`. 확정 순서: **① SSAI_ML 회사 4·7·8 평가 ② MCP 마무리 ③ 입출고·잔액 ERP 연결 ④ RAG·Agent 후속**. 아래 11/13 절의 `ERP→KPIS` 자원 조정 순서는 당시 제안이며 현재 개발 우선순위는 이 절을 따른다. 과거 체크와 목표일은 변경하지 않는다.
+
+| 체크 | 영역 | 설계 / 구현 / 자동검증 | 1호기 확인 / 2호기 배포 / 현업 승인 및 다음 Gate |
+| --- | --- | --- | --- |
+| [ ] | ML 회사 4·7·8 | SIMS S1 `c0b1932`·S2 `fb4c2e6` 공급/Adapter 코드·DB-free Gate, SSAI_ML Phase 4E RF40 연구 기준(`RESEARCH_POSTHOC`) | 세 회사의 동일 원천·기간·제품/Label·as-of·Calendar·Manifest에서 ML 예측/실제 출고/현행 SIMS 예측 비교 미완료. 1호기 소비·2호기 운영·현업 채택 아님. V1/V2/V4와 합격 임계값/권한 결정 선행; 추가 DB 2개 V3 대상·범위 별도 승인 |
+| [ ] | MCP | Mock/STDIO 및 S3 `d5744fe`·S4 `eaebfe1` 합성 인가/거부 자동 Gate | Native 실제 Tool Call, Registered 실제 연결, KPIS 실제 읽기, 회사/사용자 인증·회수·감사 미검증. [공식 계획](../02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md)의 D1~D4 승인과 별도 실호출 Gate 필요 |
+| [ ] | ERP 입출고·잔액 | 기존 입출고/발주/매출 조회 구현과 L1~L4 계획은 별개 | 입금·출금·수금·지급·거래처 잔액의 원천/연결키·이월/상계·취소/반품·권한 Exact 미완료. L1 계약 승인 뒤 L2 명세→L3 장부→L4 잔액 분석 |
+| [ ] | RAG·Agent 후속 | Knowledge 권한/조회 일부 구현 및 당시 검증 | 현행 corpus 최신성·회사 격리, Agent 안전/평가·운영 승인 별도. 4순위로 보존 |
+| [x] | 회사 13 Saved IO | 기존 S6-1 Git 반영·과거 S6-2 도구/기록 보존 | **사용자 결정으로 과제 종료**. 재추진·미완료 일정·실행 후보 아님. 미추적 도구 삭제/이동/실행하지 않음 |
+| [x] | 배포 기준선 | 병원발주 `a492167`, Dashboard 고정 `78aeff0`, 반품 부호 `883f50f` Git 반영·기존 자동검증 기록 | **운영자 확인 2026-11-16:** 1호기 Commit/Push·GitHub 동기화, 2호기 동일 Commit Pull/clean, Scheduled Task Running, HTTP `200 / ok`. 개별 2호기 업무 Smoke·현업 승인과 Dashboard 동일 시점 ERP 매출 Exact는 미확인 |
+| [ ] | Snapshot 202611 | 11/01 대상 11/11 게시·승인 기록 | 생성/Exact/승인/게시와 전 회사 Reader Smoke·Runbook 증빙을 분리. 회사 13 Saved IO 종료가 기존 승인본 삭제를 뜻하지 않음 |
+
+다음 착수 자료: ML은 회사별 예측·실적·SIMS 기준선의 동일 시점/기간/코호트와 데이터 사용 권한, MCP는 D1~D4와 실연결 승인, ERP는 L1 원천 소유자/연결키·잔액 업무 규칙이다. 이 표의 `[ ]`는 정책을 임의로 승인하거나 실제 DB·학습·MCP 연결을 시작했다는 뜻이 아니다. 역사적 11/13 상태와 이번 운영자 확인을 혼합하지 않는다.
+
 ## 최신 진행 상태: 2026-11-13 P2
 
-이 절이 최신 실행 상태다. 아래 **과거 기록 원문**의 날짜·체크·당시 판단은 이력으로 보존하며 현재 완료/승인 근거로 재사용하지 않는다. 상위 기준은 [Master v2.5](SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)와 [Expected Schedule v1.4](SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.4_20261027.md), MCP 상세 단일 기준은 [P1 공식 계획](../02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md)이다. [TOP3 일정](SIMS_AI_PLATFORM_TOP3_INTEGRATED_SCHEDULE_v1.0_20261027.md)의 같은 상태 ID·Gate를 따른다. 상위 문서 자체는 이번에 수정하지 않았다.
+이 절은 2026-11-13 당시의 최신 실행 상태다. 아래 **과거 기록 원문**의 날짜·체크·당시 판단은 이력으로 보존하며 현재 완료/승인 근거로 재사용하지 않는다. 상위 기준은 [Master v2.5](SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)와 [Expected Schedule v1.4](SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.4_20261027.md), MCP 상세 단일 기준은 [P1 공식 계획](../02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md)이다. [TOP3 일정](SIMS_AI_PLATFORM_TOP3_INTEGRATED_SCHEDULE_v1.0_20261027.md)의 같은 상태 ID·Gate를 따른다. 상위 문서 자체는 당시 수정하지 않았다.
 
 확인 HEAD `15468d2`, 브랜치 `feat/dashboard-stock-extension-20260727`. 두 TOP3 파일은 착수 시 미추적 WIP이며 본 정리만으로 Git 반영/배포 완료가 되지 않는다. 아래 테스트 수치는 기존 결과 인용이며 이번에 DB·LM Studio·2호기·회귀를 실행하지 않았다.
 

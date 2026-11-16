@@ -4,6 +4,8 @@
 
 **지위:** [공식 로드맵 v2.5](../00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)의 Phase 4.x 독립 Tool/MCP 공식 개발계획(PX-10, P6-08, S03-07). 실제 외부 API 접근·인증정보 저장·DB Migration·배포 승인은 별개다. [기존 MCP 현황](SIMS_AI_MCP_CURRENT_STATE_AND_NEXT_PHASE_20261027.md)의 Mock/로컬 STDIO PoC를 재사용한다. 외부 KPIS 연결·LM Studio Native MCP·운영 권한 배포는 아직 완료 근거가 없다.
 
+**2026-11-16 현재 상태:** [Master](../00_roadmap/SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.5_20261027.md)·[TOP3 최신 절](../00_roadmap/SIMS_AI_PLATFORM_TOP3_EXECUTION_CHECKLIST_v1.1_20261102.md)의 확정 개발 순서에서 MCP는 **회사 4·7·8 ML 비교 다음 2순위**다. S3/S4 합성 PoC 구현·자동검증은 유지한다. SIMS Git `883f50f`의 2호기 동일 Commit/서비스 health는 운영자 확인 **코드 배포**일 뿐 Native/Registered 실제 Tool Call·KPIS API 연결·운영 인증/회수·현업 승인 증거가 아니다. 아래 11/13 상태와 K1~K6 이력은 보존한다. D1 범위/API 순서, D2 Native/Registered 지위, D3 단계/일정, D4 운영 인증·회수는 계속 **미결정**이다. 이 문서만으로 비밀 저장·DB Migration·외부 호출을 승인하지 않는다.
+
 **가이드 근거:** 로컬 `OpenAPISample_new.zip`의 `OpenAPISample_new/3.OpenAPI개발가이드_통합.pdf`(표지 2026-03-30, 57쪽)를 읽기 전용 확인했다. PDF SHA256은 `055287f8ad4cd996a91ed3032d97dba02f97f9804ce66726f67e0d789eec3d79`이다. 4쪽 서비스 목록과 5/14/16/20/22/47쪽의 MA101/MA102/MA110/MA109/MA117/MA116 상세 명세를 대조했다. 서비스 존재·명칭·가이드상 인증은 확인했지만 프로젝트 범위 승인·현재 이용권·실제 연결 성공의 근거는 아니다. 시험 인증키/JWT 예시는 이 문서/소스/로그에 복사하지 않는다. 실제 endpoint·약관·인증방식·응답 필드/호출 제한은 개발 착수 때 공식 최신 사양을 재확인한다.
 
 ## 현재 구현과 검증 상태 (2026-11-13 근거 검토)

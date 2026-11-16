@@ -2,6 +2,14 @@
 
 **기준:** 2026-10-27, 코드 조사 기준 HEAD `94408a1fc567048a05a5306efee81f1e66fd06c4`. 사용자 승인에 따라 본 v2.5와 [예상 일정 v1.4](SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.4_20261027.md)를 공식 개발계획 기준으로 채택한다. [이전 v2.4](SIMS_AI_PLATFORM_MASTER_ROADMAP_v2.4_20261027.md) 및 [이전 일정 v1.3](SIMS_AI_PLATFORM_EXPECTED_SCHEDULE_v1.3_20261027.md)은 과거 기준으로 보존한다. 계획 승인과 Git 반영·기능 구현·운영 승인·2호기 배포는 별개다.
 
+## 최신 실행 기준 (2026-11-16, 원래 10/27 상태·목표일 보존)
+
+Phase 3~8과 88개 추적 ID는 유지한다. 현재 작업 순서는 **① SSAI_ML 회사 4·7·8 예측 대 실제 출고 및 기존 SIMS 예측의 동일 조건 비교 ② MCP 실제 연결/운영 Gate 마무리 ③ 기존 입출고 조회를 재사용한 수금·지급·잔액 ERP 연결 ④ RAG·Agent 후속 고도화**로 확정한다. 월마감 정확성·회사 격리·운영 안전 Gate는 순위와 무관하게 선행한다. 10/27 일정은 당시 목표이며 새 순서의 확정 납기나 DB/학습/연결 승인이 아니다. 세부 상태·보류 결정은 [TOP3 체크리스트](SIMS_AI_PLATFORM_TOP3_EXECUTION_CHECKLIST_v1.1_20261102.md)와 [통합 일정](SIMS_AI_PLATFORM_TOP3_INTEGRATED_SCHEDULE_v1.0_20261027.md)을 따른다.
+
+회사 13 Saved IO 및 관련 검증은 **종료**되었고 향후 일정·미완료 Gate·재추진 후보에서 제외한다. 기존 WIP 실행기와 과거 검증 기록은 원위치 보존한다. SIMS AI HEAD `883f50f`에는 병원발주 `a492167`, Dashboard 고정 열 `78aeff0`, 월집계 반품 부호 `883f50f`가 포함된다. 운영자 확인으로 1호기 Push·GitHub 동기화·2호기 동일 Commit Pull, Scheduled Task Running, HTTP `200 / ok`, 2호기 clean까지 **2026-11-16 배포 완료**로 기록한다. 본 문서가 2호기에 개별 기능 Smoke·현업 승인을 부여하는 것은 아니며 Dashboard 매출의 동일 시점 ERP 독립 검산도 미완료다.
+
+완료 표기는 `설계 / 구현 / 자동검증 / 1호기 확인 / 2호기 배포 / 현업 승인`으로 구분한다. SSAI_ML Phase 4E RF40은 연구 기준(`RESEARCH_POSTHOC`)이고 회사 4·7·8 운영 성능 합격은 아니다. MCP S3/S4는 합성 PoC이며 Native/Registered/KPIS 실제 연결은 미검증이다. 기존 입출고 조회의 구현은 거래처 장부·잔액 L1~L4 완료가 아니다. Snapshot의 생성·Exact·승인·게시·Reader 검증도 별도 판정한다. 각 공식 [ML](../02_design/SIMS_AI_ML_DEVELOPMENT_PLAN_202611.md)·[MCP](../02_design/SIMS_AI_KPIS_MCP_INTEGRATION_PLAN_202611.md)·[ERP](../02_design/SIMS_AI_ERP_LEDGER_BALANCE_PLAN_202611.md) 계획의 미승인 정책을 이 순서만으로 확정하지 않는다.
+
 ## 개발 기준
 
 - Phase 3~8과 [기존 88개 추적 ID](SIMS_AI_PLATFORM_TRACEABILITY_v1_20261027.csv)를 유지한다. 이번 세부 과제는 기존 ID의 하위 항목이며 신규 완료 판정이 아니다.
