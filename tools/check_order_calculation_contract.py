@@ -67,10 +67,10 @@ def test_monthly_allocation():
 
 def test_quantities():
     for raw, increasing, expected in (
-        ("0", False, 0), ("0.7", False, 10), ("4", False, 10),
+        ("0", False, 0), ("0.42", False, 0), ("0.7", False, 0), ("4", False, 0), ("5", False, 0),
         ("9.9", False, 10), ("10", False, 10), ("10.1", False, 10),
         ("14", False, 10), ("53.04", False, 50), ("60", False, 60),
-        ("66", False, 60), ("0.7", True, 10), ("10", True, 10),
+        ("66", False, 60), ("0.7", True, 0), ("10", True, 10),
         ("10.1", True, 20), ("53.04", True, 60), ("66", True, 70),
     ):
         assert recommend_quantity(D(raw), None, increasing=increasing) == expected
@@ -78,11 +78,11 @@ def test_quantities():
         assert recommend_quantity(D("53.04"), D(unit), increasing=True) == (
             ((D("53.04") / D(unit)).to_integral_value(rounding="ROUND_CEILING")) * D(unit)
         )
-    assert recommend_quantity(D("0.25"), None, increasing=False) == 10
+    assert recommend_quantity(D("0.25"), None, increasing=False) == 0
     assert recommend_quantity(D("0.25"), None, increasing=False,
                               default_unit_allowed=False) == 0
     assert calculate_quantities(stock=D(1), pending=D(0), safety_demand=D(1),
-                                horizon_demand=D(5))["추천 발주수량"] == 10
+                                horizon_demand=D(5))["추천 발주수량"] == 0
     result = calculate_quantities(stock=D(-2), pending=D(10), safety_demand=D(3), horizon_demand=D(50))
     assert result["계산 발주수량"] == 42 and result["추천 발주수량"] == 40
     assert recommend_quantity(D(43), D(10), increasing=True) == 50
@@ -94,7 +94,7 @@ def test_quantities():
     assert recommend_quantity(D(26), D(10), increasing=True) == 30
     assert calculate_quantities(stock=D(100), pending=D(0), safety_demand=D(3), horizon_demand=D(150), unit=D(100))['추천 발주수량'] == 0
     assert recommend_quantity(D(3), D(10), increasing=True) == 10
-    for raw, expected_up, expected_down in (("12.4", 20, 10), ("0.7", 10, 10)):
+    for raw, expected_up, expected_down in (("12.4", 20, 10), ("0.7", 0, 0)):
         assert recommend_quantity(D(raw), None, increasing=True) == expected_up
         assert recommend_quantity(D(raw), None, increasing=False) == expected_down
     try:
@@ -218,8 +218,8 @@ def test_full_month_forecast_and_blank_pending():
         total, missing = demand_for_dates(calendar, reference_date=date(2026, 8, 31),
                                          business_dates=calendar, monthly_forecast={"202609": plan})
         assert total == plan and not missing
-        assert recommend_quantity(total, None, increasing=True) == (D(10) if plan <= 10 else D(50))
-        assert recommend_quantity(total, None, increasing=False) == (D(10) if plan <= 10 else D(40))
+        assert recommend_quantity(total, None, increasing=True) == (D(0) if plan <= 5 else D(10) if plan <= 10 else D(50))
+        assert recommend_quantity(total, None, increasing=False) == (D(0) if plan <= 5 else D(10) if plan <= 10 else D(40))
 
 
 def fixture():
@@ -310,7 +310,9 @@ def test_closing_boundary_business_day_policy():
         assert row["horizon 예정수량"] is not None
         assert row["계산 발주수량"] == row["horizon 예정수량"] - D(20) - D(10)
         assert row["추천 발주수량"] is not None
-        assert row["계산상태"] != "수요/재고 사용자확인"
+        if row["계산상태"] == "수요/재고 사용자확인":
+            assert row["수량조정정책"] == "미확정 소량 발주 보류"
+            assert row["추천 발주수량"] == 0
 
     params, sources = fixture()
     params["order_date"] = "2026-09-26"
@@ -1526,7 +1528,7 @@ if __name__ == "__main__":
             all_rows = get_order_calculation_result({**params, 'query_mode': '전체'}, source_loader=lambda q: no_demand)
             confirm_rows = get_order_calculation_result({**params, 'query_mode': '확인 필요'}, source_loader=lambda q: no_demand)
             needed_rows = get_order_calculation_result({**params, 'query_mode': '발주해당자료만'}, source_loader=lambda q: no_demand)
-        assert (len(all_rows['df']), len(confirm_rows['df']), len(needed_rows['df'])) == (1, 1, 0)
+        assert (len(all_rows['df']), len(confirm_rows['df']), len(needed_rows['df'])) == (1, 1, 1)
         assert result['df_display']['규격'].iloc[0] == ''
         for required_column in ('제품명', '제약사', '출고빈도등급'):
             broken = {**sources, 'base': sources['base'].drop(columns=required_column, errors='ignore').copy()}

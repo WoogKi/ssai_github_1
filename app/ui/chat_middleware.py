@@ -2223,7 +2223,7 @@ def _normalize_result_for_chat(result: Any) -> Dict[str, Any]:
             else:
                 df_disp = _restore_display_fields_from_full_df(
                     df_disp,
-                    df_full,
+                    pd.DataFrame(df_full, copy=False) if str(payload.get("action") or title).strip() == "병원발주계산" else df_full,
                     action=payload.get("action") or title,
                     stage="normalize_result",
                 )
@@ -3679,6 +3679,8 @@ def _build_sims_analysis_context_from_df(
         return {}
 
     action = str(action_name or meta.get("action") or result.get("title") or "").strip()
+    if action == "병원발주계산":
+        base_df = pd.DataFrame(base_df, copy=False)
     analysis_type = str(meta.get("analysis_type") or "").strip()
     profile = build_sims_analysis_profile(
         action,
@@ -4306,6 +4308,12 @@ def _build_sims_context_from_result(
     세션 상태에 '최신 1개 컨텍스트'를 저장한다.
     """
     ss = st.session_state
+    hospital_started = time.perf_counter() if action_name == "병원발주계산" else None
+
+    def log_hospital_context(stage: str, rows: int) -> None:
+        if hospital_started is not None:
+            log.info("[hospital.context_perf] stage=%s elapsed_ms=%.1f rows=%s",
+                     stage, (time.perf_counter() - hospital_started) * 1000, rows)
 
     # 0) 기본 값
     cols = [str(c) for c in df_llm.columns]
@@ -4377,6 +4385,9 @@ def _build_sims_context_from_result(
     base_df = result.get("df")
     if not isinstance(base_df, pd.DataFrame):
         base_df = df_llm
+    if action_name == "병원발주계산" and isinstance(base_df, pd.DataFrame):
+        # pandas propagates/deep-copies large edit/reference attrs on every analysis slice.
+        base_df = pd.DataFrame(base_df, copy=False)
 
     # 🔴 total_rows 를 '전체 DF' 기준으로 계산 (df_llm 길이 X)
     if isinstance(base_df, pd.DataFrame):
@@ -4442,6 +4453,7 @@ def _build_sims_context_from_result(
         "records": df_llm.to_dict(orient="records"),
         "meta": meta,   # 🔴 위에서 만든 meta 그대로 사용
     }
+    log_hospital_context("sample_ready", len(df_llm))
 
     # 🔹 (선택) 거래처/영업사원 등 추가 집계도 JSON 안에 넣어둔다.
     #     - records는 샘플일 수 있으므로, "전체 집계"가 필요한 질문은 여기 aggregations를 우선 사용하도록 유도
@@ -4491,6 +4503,7 @@ def _build_sims_context_from_result(
 
     except Exception:
         log.exception("[sims.ctx] build aggregations failed")
+    log_hospital_context("aggregations_ready", int(total_rows))
 
     #     - LLM 에게는 "records 는 샘플, aggregations.by_department.rows 는 전체 집계" 라고 안내할 예정
     if include_dept_summary and dept_counts_df is not None and dept_col:
@@ -4555,6 +4568,7 @@ def _build_sims_context_from_result(
             params=params,
             meta=meta,
         )
+        log_hospital_context("analysis_ready", int(total_rows))
     
 
         if analysis_ctx:
@@ -4653,6 +4667,8 @@ def _build_sims_context_from_result(
         )
     except Exception:
         pass
+
+    log_hospital_context("context_complete", int(total_rows))
 
     return ctx_pack
 
@@ -7519,6 +7535,7 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     SIMS 최종 결과를 채팅 히스토리로 1회 푸시하고,
     LLM용 SIMS 컨텍스트(JSON)도 동시에 갱신한다.
     """
+    push_started = time.perf_counter()
     wire_chat_context()
     ss = st.session_state
 
@@ -7536,6 +7553,9 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     except Exception as exc:
         log.warning("[chat.sims.push] normalize result failed error_type=%s", type(exc).__name__)
         return None
+    if str(action or payload.get('action') or '').strip() == '병원발주계산':
+        log.info('[hospital.delivery_perf] stage=payload_normalized elapsed_ms=%.1f',
+                 (time.perf_counter() - push_started) * 1000)
 
     # 2) 액션명/타이틀 보강
     meta = dict(payload.get("meta") or {})
@@ -7614,11 +7634,14 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
 
     def _log_io_delivery_stage(stage: str) -> None:
         order_action = str(action_name or '').strip() == '발주 계산'
-        if not io_detail_action and not order_action:
+        hospital_action = str(action_name or '').strip() == '병원발주계산'
+        if not io_detail_action and not order_action and not hospital_action:
             return
         current_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         log.info(
-            ("[order_calculation.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s"
+            ("[hospital.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s"
+             if hospital_action else
+             "[order_calculation.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s"
              if order_action else "[io.detail.delivery_perf] action=%s request_id=%s stage=%s elapsed_ms=%s source_call_count=%s"),
             action_name,
             str(current_meta.get("nlq_trace_request_id") or "")[:64],
@@ -7683,7 +7706,9 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
             # meta as params duplicates detail summaries in the model context.
             params = _analysis_query_params_from_payload(payload)
 
-            df_llm = _shrink_df_for_llm(df_display)
+            df_llm = _shrink_df_for_llm(
+                pd.DataFrame(df_display, copy=False) if action_name == "병원발주계산" else df_display
+            )
 
             _build_sims_context_from_result(
                 payload,      # 정규화된 payload 기준
@@ -7834,7 +7859,7 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
                 if isinstance(df_full_for_export, pd.DataFrame):
                     df_display_for_ui = _restore_display_fields_from_full_df(
                         df_display_for_ui,
-                        df_full_for_export,
+                        pd.DataFrame(df_full_for_export, copy=False) if action_name == "병원발주계산" else df_full_for_export,
                         action=action_name,
                         stage="chat.stash",
                     )

@@ -298,6 +298,31 @@ class HospitalTests(unittest.TestCase):
         self.assertEqual(result['meta']['result_status'], 'no_data')
         self.assertNotIn('df', result)
 
+    def test_full_scope_keeps_unconfirmed_parent_without_allocating_it(self):
+        from unittest.mock import Mock
+        original = parents()
+        original.loc[0, '실제 발주수량'] = None
+        original.loc[0, '계산상태'] = '수요/재고 사용자확인'
+        payload = {'df': original, 'meta': {'result_status': 'success',
+            'order_header_metrics': {'effective_business_date': '2026-11-16'},
+            'query_summary': 'fixture'}}
+        allocation = Mock(return_value=sources())
+        with patch.object(h, 'get_current_company_id', return_value=3), \
+             patch.object(h, 'load_master', return_value=master()), \
+             patch.object(h, 'validate_parent_stock_application', side_effect=lambda q: q), \
+             patch.object(h.base, 'get_order_calculation_result', return_value=payload) as parent:
+            result = h.get_hospital_order_calculation_result(
+                {'company_id': 3, '_display_context': 'panel', 'query_mode': '전체'},
+                allocation_loader=allocation)
+        parent.assert_called_once()
+        allocation.assert_called_once()
+        self.assertEqual(result['meta']['result_status'], 'success')
+        self.assertEqual(result['meta']['parent_review_count'], 1)
+        self.assertEqual(result['df']['실제 발주수량'].sum(), D(2060))
+        self.assertFalse(result['df']['제품코드'].eq('P1').any())
+        self.assertEqual(len(result['df'].attrs[h.REFERENCE_ATTR]), 3)
+        self.assertIn('사용자 확인 제품 1개', result['meta']['summary_md'])
+
     def test_allocation_edit_full_and_selected_guards(self):
         from app.ui.hospital_order_calculation_display import apply_allocation_edits
 
@@ -519,12 +544,94 @@ class HospitalTests(unittest.TestCase):
     def test_zero_none_and_invalid_numbers(self):
         zero = parents(); zero['실제 발주수량'] = D(0)
         result = self.run_allocation(parents=zero)
-        self.assertEqual(len(result), 3)
-        self.assertEqual(result['실제 발주수량'].sum(), 0)
-        for invalid in (None, D('NaN'), D('Infinity'), D('-1'), D('1.5')):
+        self.assertTrue(result.empty)
+        for invalid, reason in ((None, 'missing'), (D('NaN'), 'non_finite'),
+                                (D('Infinity'), 'non_finite'), (D('-1'), 'negative'),
+                                (D('1.5'), 'fractional'), ('abc', 'not_numeric')):
             p = parents(); p.loc[0, '실제 발주수량'] = invalid
-            with self.assertRaises(h.AllocationError):
+            with self.assertRaises(h.SourceContractError) as error:
                 self.run_allocation(parents=p)
+            self.assertEqual(error.exception.reason, f'parent_quantity_{reason}')
+        review = parents()
+        review.loc[0, '실제 발주수량'] = None
+        review.loc[0, '계산상태'] = '수요/재고 사용자확인'
+        result = self.run_allocation(parents=review)
+        self.assertEqual(result.loc[result['제품코드'].eq('P1')].shape[0], 0)
+        self.assertEqual(result['실제 발주수량'].sum(), D(2060))
+        reference = build_display(review, result, max_rows=30, include_review=True)
+        self.assertEqual(reference.loc[reference['제품코드'].eq('P1'), '계산상태'].iloc[0], '수요/재고 사용자확인')
+        from app.ui import chat_middleware as chat
+        result.attrs[h.REFERENCE_ATTR] = review.to_dict('records')
+        with patch.object(h, 'get_current_company_id', return_value=3):
+            csv, excel = chat._make_table_downloads(result)
+        self.assertEqual(pd.read_csv(csv)['실제 발주수량'].sum(), 2060)
+        reference_sheet = pd.read_excel(excel, sheet_name='참고표_합계제외')
+        self.assertEqual(reference_sheet.loc[reference_sheet['제품코드'].eq('P1'), '실제 발주수량'].iloc[0],
+                         '참고: 사용자 확인')
+        review.loc[0, '실제 발주수량'] = D(0)
+        self.assertFalse(self.run_allocation(parents=review)['제품코드'].eq('P1').any())
+        review.loc[0, '실제 발주수량'] = D('NaN')
+        with self.assertRaises(h.SourceContractError):
+            self.run_allocation(parents=review)
+
+    def test_zero_order_reference_and_manual_positive_order(self):
+        from app.ui import chat_middleware as chat
+        original = parents()
+        original.loc[0, '계산 발주수량'] = D('-0.42')
+        original.loc[0, '추천 발주수량'] = D(0)
+        original.loc[0, '실제 발주수량'] = D(0)
+        original.loc[1, '계산 발주수량'] = D('-1')
+        original.loc[1, '실제 발주수량'] = D(460)
+        frame = self.run_allocation(parents=original)
+        self.assertFalse(frame['제품코드'].eq('P1').any())
+        self.assertTrue(frame['제품코드'].eq('P2').any())
+        self.assertEqual(frame['실제 발주수량'].sum(), D(2060))
+        frame.attrs[h.REFERENCE_ATTR] = original.to_dict('records')
+        reference = build_display(original, frame, max_rows=20, include_unallocated=True)
+        self.assertEqual(reference.loc[reference['제품코드'].eq('P1'), '실제 발주수량'].iloc[0], D(0))
+        with patch.object(h, 'get_current_company_id', return_value=3):
+            csv, excel = chat._make_table_downloads(frame)
+        actual = pd.read_excel(excel, sheet_name='실제배분')
+        reference_sheet = pd.read_excel(excel, sheet_name='참고표_합계제외')
+        self.assertEqual(pd.read_csv(csv)['실제 발주수량'].sum(), 2060)
+        self.assertFalse(actual['제품코드'].eq('P1').any())
+        self.assertEqual(reference_sheet.loc[reference_sheet['제품코드'].eq('P1'), '실제 발주수량'].iloc[0], '참고: 0')
+        self.assertEqual(actual['발주금액(부가세포함)'].sum(), sum(frame['발주금액(부가세포함)']))
+
+    def test_hospital_analysis_does_not_copy_reference_attrs(self):
+        from copy import deepcopy
+        from app.ui import chat_middleware as chat
+
+        class CountCopies(list):
+            copies = 0
+
+            def __deepcopy__(self, memo):
+                type(self).copies += 1
+                return deepcopy(list(self), memo)
+
+        frame = self.run_allocation()
+        references = CountCopies(parents().to_dict('records'))
+        frame.attrs[h.REFERENCE_ATTR] = references
+        profile = chat._build_sims_analysis_context_from_df(
+            frame, result={'meta': {}}, action_name=h.ACTION, params={}, meta={})
+        self.assertEqual(profile['row_count'], len(frame))
+        self.assertEqual(CountCopies.copies, 0)
+        self.assertIs(frame.attrs[h.REFERENCE_ATTR], references)
+
+    def test_hospital_analysis_12000_rows_keeps_verified_full_totals(self):
+        from app.ui import chat_middleware as chat
+        seed = self.run_allocation()
+        frame = pd.concat([seed] * 1500, ignore_index=True)
+        references = parents().to_dict('records') * 4000
+        frame.attrs[h.REFERENCE_ATTR] = references
+        frame.attrs[h.ORIGINAL_ATTR] = frame.to_dict('records')
+        context = chat._build_sims_analysis_context_from_df(
+            frame, result={'meta': {}}, action_name=h.ACTION, params={}, meta={})
+        self.assertEqual(context['row_count'], 12000)
+        self.assertEqual(context['whole_table_facts']['row_count'], 12000)
+        quantity = context['whole_table_facts']['numeric_metrics']['실제 발주수량']
+        self.assertEqual(quantity['sum'], float(seed['실제 발주수량'].sum() * 1500))
+        self.assertIs(frame.attrs[h.REFERENCE_ATTR], references)
 
     def test_mapping_duplicates_company_period_and_missing_aggregates(self):
         broken = parents(); broken.loc[0, '회사'] = 4
@@ -617,6 +724,29 @@ class HospitalTests(unittest.TestCase):
             self.assertEqual(call.args[0]['as_of'], '20261116')
             self.assertTrue(call.args[0]['_order_contract_projection_only'])
         with self.assertRaises(h.AllocationError): self.run_allocation(limit=2)
+
+    def test_zero_order_products_still_validate_sources_without_price_lookup(self):
+        data = sources()
+        params = {'company_id': 3, 'stock_cd_list': ['00001'], 'io_gu_list': ['501']}
+        original = parents()
+        original.loc[0, '실제 발주수량'] = D(0)
+        with patch.object(h, 'get_current_company_id', return_value=3), \
+             patch.object(h, 'query_to_df', side_effect=[data['sales'], data['orders']]) as source, \
+             patch('app.services.rddbc070_service.get_rddbc070_current_df', return_value=pd.DataFrame()) as price:
+            loaded = h.load_allocation_sources(params, original, date(2026, 11, 16), [], master=master())
+        self.assertEqual(source.call_count, 2)
+        self.assertEqual(price.call_count, 2)
+        for call in price.call_args_list:
+            self.assertEqual(set(call.args[0]['order_product_code_list']), {'P2', 'P3'})
+            self.assertNotIn('P1', call.args[0]['order_product_code_list'])
+        self.assertEqual(loaded['audit']['sales_quantity'], '1650')
+        original['실제 발주수량'] = D(0)
+        with patch.object(h, 'get_current_company_id', return_value=3), \
+             patch.object(h, 'query_to_df', side_effect=[data['sales'], data['orders']]) as source, \
+             patch('app.services.rddbc070_service.get_rddbc070_current_df', side_effect=AssertionError('zero order price query')) as price:
+            h.load_allocation_sources(params, original, date(2026, 11, 16), [], master=master())
+        self.assertEqual(source.call_count, 2)
+        price.assert_not_called()
 
     def test_existing_parent_engine_called_once_and_unchanged(self):
         from tools.check_order_calculation_contract import fixture
@@ -820,7 +950,10 @@ class HospitalTests(unittest.TestCase):
         self.assertIsNone(unresolved.iloc[0]['추천 발주수량'])
         self.assertIsNone(unresolved.iloc[0]['실제 발주수량'])
         needed = h.base.apply_application_defaults({**params,'query_mode':'발주해당자료만'})
-        self.assertTrue(h.base.assemble_result(needed,data).empty)
+        review = h.base.assemble_result(needed,data)
+        self.assertEqual(len(review), 1)
+        self.assertEqual(review.iloc[0]['계산상태'], '수요/재고 사용자확인')
+        self.assertIsNone(review.iloc[0]['실제 발주수량'])
 
     def test_exact_application_lookup_contract(self):
         with patch.object(h.base,'query_to_df',return_value=pd.DataFrame()) as query:

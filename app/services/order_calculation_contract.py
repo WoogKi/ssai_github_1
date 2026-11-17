@@ -85,6 +85,8 @@ def quantity_adjustment(raw: Decimal, unit: Decimal | None, *, increasing: bool,
         return unused
     if unit is not None and (not unit.is_finite() or unit <= 0 or unit != unit.to_integral_value()):
         raise ValueError("발주단위는 양의 정수여야 합니다.")
+    if unit is None and raw <= Decimal(5):
+        return {**unused, "수량조정정책": "미확정 소량 발주 보류"}
     high_price = (default_unit_allowed and price is not None and price.is_finite()
                   and price >= Decimal(1000000))
     if high_price:

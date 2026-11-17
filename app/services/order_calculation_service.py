@@ -1529,8 +1529,12 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         row["추천대비수정수량"] = Decimal(0) if quantity["추천 발주수량"] is not None else None
         actual = quantity["실제 발주수량"]
         row.update(amounts(actual if actual is not None else Decimal(0), price) if actual is not None else amounts(Decimal(0), None))
-        row["계산상태"] = "수요/재고 사용자확인" if actual is None else (
+        small_unit_review = quantity["수량조정정책"] == "미확정 소량 발주 보류" and (
+            stock is not None and (stock <= 0 or quantity["발주trigger"] is True))
+        row["계산상태"] = "수요/재고 사용자확인" if actual is None or small_unit_review else (
             "발주해당" if actual > 0 else "발주 필요 없음")
+        if small_unit_review:
+            row["조달주의"] += " / 미확정 단위 소량 발주 보류·재고위험 사용자확인"
         row["발주사유/계산근거"] = _order_reason(row, len(horizon))
         if quantity['수량조정정책'] == '확정 이력단위' and quantity['최소수량 적용']:
             row['조달주의'] = '최소 발주단위 1회분 적용/원 필요수량보다 큰 추천수량 확인'
@@ -1583,7 +1587,7 @@ def assemble_result(params: Mapping[str, Any], sources: dict) -> pd.DataFrame:
         ).sum()) if "계산상태" in result else 0,
     }
     if params.get("only_needed") and not result.empty:
-        result = result.loc[result["계산상태"].eq("발주해당")].copy()
+        result = result.loc[result["계산상태"].isin(("발주해당", "수요/재고 사용자확인"))].copy()
     if params.get("query_mode") == "확인 필요" and not result.empty:
         result = result.loc[result["계산상태"].str.contains("확인") | result["발주단가"].isna() | result["발주처코드"].eq("") | spike_warning].copy()
     timings['only_needed_filter'] = (time.perf_counter() - filter_started) * 1000

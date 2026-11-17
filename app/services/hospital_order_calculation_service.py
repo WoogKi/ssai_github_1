@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 import logging
 import time
 from typing import Any
@@ -66,6 +66,24 @@ def _quantity(value: Any, *, nonnegative: bool = False) -> Decimal:
         raise AllocationError("수량이 누락되었거나 유한한 정수가 아닙니다.")
     if nonnegative and number < 0:
         raise AllocationError("실제 발주수량은 음수일 수 없습니다.")
+    return number
+
+
+def _parent_quantity(value: Any, row_number: int) -> Decimal:
+    if value is None or value is pd.NA or isinstance(value, str) and not value.strip():
+        reason = 'missing'
+    else:
+        try:
+            number = Decimal(str(value))
+            reason = ('non_finite' if not number.is_finite() else
+                      'fractional' if number != number.to_integral_value() else
+                      'negative' if number < 0 else '')
+        except (InvalidOperation, ValueError, TypeError):
+            reason = 'not_numeric'
+    if reason:
+        raise SourceContractError(f'parent_quantity_{reason}', 'parent',
+                                  f'원계산 결과 {row_number}행의 실제 발주수량이 유효하지 않습니다 ({reason}). '
+                                  '해당 행의 계산상태와 수량 원천을 확인하세요.')
     return number
 
 
@@ -208,19 +226,33 @@ def allocate(parents: pd.DataFrame, *, company: int, master: pd.DataFrame,
     for code in reference_only:
         groups[code] = {"name": identities.at[code, 'name'], "cost_apply": "",
                         "selected": False, "historical": True}
+    active_by_product: dict[str, set[str]] = {}
+    for product, code in previous.keys() | placed.keys():
+        active_by_product.setdefault(product, set()).add(code)
     result = []
     unallocated = {}
     residual_templates = {}
-    for parent in parents.to_dict("records"):
+    for row_number, parent in enumerate(parents.to_dict("records"), start=1):
         product = _text(parent["제품코드"])
         if product not in eligible:
             continue
-        total = _quantity(parent["실제 발주수량"], nonnegative=True)
+        if parent.get("계산상태") == "수요/재고 사용자확인":
+            review_value = parent["실제 발주수량"]
+            if review_value is None or review_value is pd.NA or _parent_quantity(review_value, row_number) == 0:
+                continue
+            raise AllocationError("사용자 확인 제품에 확정되지 않은 양수 발주수량이 있습니다.")
+        total = _parent_quantity(parent["실제 발주수량"], row_number)
+        if total == 0:
+            if selected:
+                unallocated[product] = Decimal(0)
+            continue
         fallback = base.decimal_or_none(parent["발주단가"])
         if fallback is not None and (not fallback.is_finite() or fallback < 0):
             raise AllocationError("원계산 발주단가가 유효하지 않습니다.")
         details = {}
-        for code, group in groups.items():
+        active_codes = (active_by_product.get(product, set()) & groups.keys()) | {residual}
+        for code in sorted(active_codes):
+            group = groups[code]
             price = None if group.get('historical') else contracts.get((product, group["cost_apply"]))
             if price is not None:
                 price = base.decimal_or_none(price)
@@ -232,7 +264,7 @@ def allocate(parents: pd.DataFrame, *, company: int, master: pd.DataFrame,
                              "contract": price, "price": None if group.get('historical') else
                              (price if price is not None else fallback),
                              "allocated": Decimal(0), "residual": Decimal(0)}
-        priority = sorted((c for c, g in groups.items() if g["selected"] and (selected or c != residual)),
+        priority = sorted((c for c in details if groups[c]["selected"] and (selected or c != residual)),
                           key=lambda c: ("재고적용" in groups[c]["name"],
                                          details[c]["contract"] is None,
                                          details[c]["contract"] or Decimal(0), c))
@@ -246,7 +278,7 @@ def allocate(parents: pd.DataFrame, *, company: int, master: pd.DataFrame,
         else:
             details[residual]["allocated"] += remaining
             details[residual]["residual"] = remaining
-        display_order = priority + ([] if selected or residual in priority else [residual]) + sorted(reference_only)
+        display_order = priority + ([] if selected or residual in priority else [residual]) + sorted(reference_only & details.keys())
         start = len(result)
         for code in display_order:
             detail = details[code]
@@ -423,14 +455,18 @@ def load_allocation_sources(params: dict, parents: pd.DataFrame, reference: date
                             *, master: pd.DataFrame | None = None) -> dict:
     from app.services.rddbc070_service import get_rddbc070_current_df
     company = _company(params.get("company_id"))
+    started = time.perf_counter()
     master = load_master(company) if master is None else master
     products = sorted(set(parents["제품코드"].map(_text)))
     limits = registered_query_limits(params)
     frames = []
+    query_ms = 0.0
     with read_only_request(timeout_seconds=120):
         for sql, values in build_aggregate_queries(params, products, reference, limits.source_top):
             _company(company)
+            query_started = time.perf_counter()
             frame = query_to_df(sql, tuple(values))
+            query_ms += (time.perf_counter() - query_started) * 1000
             if len(frame) > limits.source_top:
                 raise AllocationError("당월/전월 집계가 안전 한도를 초과해 부분 계산하지 않았습니다.")
             frame = frame.loc[frame['product'].map(_text).isin(products)].copy()
@@ -438,16 +474,29 @@ def load_allocation_sources(params: dict, parents: pd.DataFrame, reference: date
         previous = _totals(frames[0], set(products), master, source='sales', company=company)
         placed = _totals(frames[1], set(products), master, source='orders', company=company)
         groups, residual, _, historical = _allocation_groups(master, selected, previous, placed)
+        validated_ms = (time.perf_counter() - started) * 1000
         unused_orphans = (set(master.stock_apply) - {""}) - set(master.code)
         if unused_orphans:
             logging.getLogger('ssai').warning(
                 '[hospital.master.unused_orphans] company_id=%s codes=%s', company, len(unused_orphans))
-        by_cost: dict[str, set[str]] = {}
-        for group, detail in groups.items():
-            needed = {p for p in products if (group == residual or
-                      previous.get((p, group), 0) - placed.get((p, group), 0) > 0)}
-            if needed:
-                by_cost.setdefault(detail['cost_apply'], set()).update(needed)
+        orderable_products = set()
+        for row_number, parent in enumerate(parents.to_dict('records'), start=1):
+            value = parent['실제 발주수량']
+            if parent.get('계산상태') == '수요/재고 사용자확인' and (value is None or value is pd.NA):
+                continue
+            quantity = _parent_quantity(value, row_number)
+            if parent.get('계산상태') == '수요/재고 사용자확인':
+                if quantity > 0:
+                    raise AllocationError('사용자 확인 제품에 확정되지 않은 양수 발주수량이 있습니다.')
+                continue
+            if quantity > 0:
+                orderable_products.add(_text(parent['제품코드']))
+        by_cost: dict[str, set[str]] = (
+            {groups[residual]['cost_apply']: set(orderable_products)} if orderable_products else {})
+        for product, group in previous.keys() | placed.keys():
+            if (product in orderable_products and group in groups and
+                    previous.get((product, group), 0) - placed.get((product, group), 0) > 0):
+                by_cost.setdefault(groups[group]['cost_apply'], set()).add(product)
         contracts = {}
         contract_rows = 0
         for cost, codes in sorted(by_cost.items()):
@@ -463,6 +512,11 @@ def load_allocation_sources(params: dict, parents: pd.DataFrame, reference: date
             if frame.duplicated(["단가적용거래처", "제품코드"]).any():
                 raise AllocationError("제품별 유효 계약단가가 중복되었습니다.")
             contracts.update(base._contract_purchase_price_map(frame))
+    logging.getLogger('ssai').info(
+        '[hospital.perf] company_id=%s stage=source_load sql_ms=%.1f validation_ms=%.1f total_ms=%.1f '
+        'parent_products=%s orderable_products=%s cost_groups=%s contract_rows=%s',
+        company, query_ms, validated_ms - query_ms, (time.perf_counter() - started) * 1000,
+        len(products), len(orderable_products), len(by_cost), contract_rows)
     _company(company)
     return {"master": master, "sales": frames[0], "orders": frames[1], "contracts": contracts,
             "audit": {"sales_rows": int(frames[0].source_rows.sum()),
@@ -589,6 +643,9 @@ def get_hospital_order_calculation_result(params=None, *, source_loader=base.loa
         return sources
 
     parent_payload = base.get_order_calculation_result(q, source_loader=capture)
+    logging.getLogger('ssai').info('[hospital.perf] company_id=%s stage=parent elapsed_ms=%.1f parent_status=%s',
+                                  company, (time.perf_counter() - started) * 1000,
+                                  parent_payload.get('meta', {}).get('result_status'))
     if parent_payload.get('meta', {}).get('result_status') != 'success':
         return {**parent_payload, 'action': ACTION, 'title': ACTION, 'table': TABLE,
                 'meta': {**parent_payload.get('meta', {}), 'order_calculation_editable': False}}
@@ -607,9 +664,12 @@ def get_hospital_order_calculation_result(params=None, *, source_loader=base.loa
         else:
             sources = allocation_loader(captured, parents, reference, selected)
         stage = 'allocation'
+        allocation_started = time.perf_counter()
         frame = allocate(parents, company=company, selected=selected,
                          limit=registered_query_limits(q).export_limit_rows,
                          **{k: sources[k] for k in ('master', 'sales', 'orders', 'contracts')})
+        logging.getLogger('ssai').info('[hospital.perf] company_id=%s stage=allocation parent_rows=%s allocation_rows=%s elapsed_ms=%.1f',
+                                      company, len(parents), len(frame), (time.perf_counter() - allocation_started) * 1000)
     except AllocationError as exc:
         result = _notice({**q, SELECTION: list(selected)}, str(exc))
         reason = getattr(exc, 'reason', 'allocation_validation_failed')
@@ -620,31 +680,47 @@ def get_hospital_order_calculation_result(params=None, *, source_loader=base.loa
             result['meta'].update(source_contract_source=exc.source, source_contract_reason=exc.reason)
         return result
     _company(company)
+    assembly_started = time.perf_counter()
+    parent_rows = parents.to_dict('records')
+    review_products = {_text(row['제품코드']) for row in parent_rows
+                       if row.get('계산상태') == '수요/재고 사용자확인'}
     if selected and (frame.empty or not frame['실제 발주수량'].gt(0).any()):
+        review_count = len(review_products & frame.attrs.get('hospital_eligible_products', set()))
         result = _notice({**q, SELECTION: list(selected)},
-                         "선택한 재고적용처의 전월 매출 제품 중 추가 발주 대상이 없습니다.")
-        result['meta']['result_status'] = 'no_data'
+                         (f"선택 범위의 사용자 확인 제품 {review_count}개는 수량 미확정으로 신규 배분하지 않았습니다."
+                          if review_count else "선택한 재고적용처의 전월 매출 제품 중 추가 발주 대상이 없습니다."))
+        result['meta']['result_status'] = 'input_required' if review_count else 'no_data'
         return result
+    if frame.empty:
+        return _notice({**q, SELECTION: list(selected)},
+                       f"사용자 확인 제품 {len(review_products)}개의 발주수량이 미확정이라 배분하지 않았습니다.")
     # Session-cached frame metadata, not chat history or current-table quantities.
     unallocated = frame.attrs.get(UNALLOCATED_ATTR, {})
     selected_products = frame.attrs.get('hospital_eligible_products', set())
-    parent_records = [row for row in parents.to_dict('records')
+    parent_records = [row for row in parent_rows
                       if not selected or _text(row['제품코드']) in selected_products]
+    review_count = sum(row.get('계산상태') == '수요/재고 사용자확인' for row in parent_records)
+    no_order_count = sum(row.get('계산상태') != '수요/재고 사용자확인' and
+                         row.get('실제 발주수량') == 0 for row in parent_records)
     if selected:
         for row in parent_records:
-            row['미배분수량'] = unallocated.get(_text(row['제품코드']), Decimal(0))
+            row['미배분수량'] = (None if row.get('계산상태') == '수요/재고 사용자확인'
+                              else unallocated.get(_text(row['제품코드']), Decimal(0)))
     frame.attrs[REFERENCE_ATTR] = parent_records
     frame.attrs[ORIGINAL_ATTR] = frame.to_dict('records')
-    display = frame.head(300).copy()
+    display = pd.DataFrame(frame, copy=False).head(300).copy()
     total = sum(frame['실제 발주수량'], Decimal(0))
     selected_display = (preflight_groups[selected[0]]['name'] if len(selected) == 1 else
                         f'{len(selected)}개 선택' if selected else '전체')
     selected_details = ', '.join(f"{code} {preflight_groups[code]['name']}" for code in selected)
     residual_display = f"{preflight_groups[residual]['name']} ({residual})"
     unallocated_total = sum(unallocated.values(), Decimal(0))
-    summary = (f"병원발주계산: 재고적용처 {selected_display} / 전월 매출 제품 {len(parent_records):,}개 / "
+    scope_label = '전월 매출 제품' if selected else '원계산 제품'
+    summary = (f"병원발주계산: 재고적용처 {selected_display} / {scope_label} {len(parent_records):,}개 / "
                f"실제 배분 {len(frame):,}행 / 전체 배분수량 {total:,}. "
                + ("" if selected else f"잔여 배정처 {residual_display}. ")
+               + (f"사용자 확인 제품 {review_count:,}개는 배분하지 않고 참고표에 보존했습니다. " if review_count else "")
+               + (f"발주 불필요 제품 {no_order_count:,}개는 참고표에 보존했습니다. " if no_order_count else "")
                + (f"미배분수량 {unallocated_total:,}. " if selected else "") +
                "제품 첫 행은 참고용이며 실제 합계·현재표·CSV는 배분행 기준입니다. "
                "Excel은 실제배분과 참고표 시트를 분리합니다. ERP에 등록되지 않습니다.")
@@ -669,6 +745,8 @@ def get_hospital_order_calculation_result(params=None, *, source_loader=base.loa
             "allocation_policy": SCOPED_POLICY if selected else POLICY,
             "allocation_selected": bool(selected), "unallocated_quantity": str(unallocated_total),
             "allocation_quantity": str(total), "allocation_audit": sources.get('audit', {}),
+            "parent_review_count": review_count,
+            "parent_no_order_count": no_order_count,
             "parent_product_count": len(parent_records), "summary_md": summary, "llm_summary_md": summary,
             "order_header_metrics": dict(parent_payload['meta'].get('order_header_metrics') or {}),
             "order_display_conditions": {
@@ -684,6 +762,9 @@ def get_hospital_order_calculation_result(params=None, *, source_loader=base.loa
                 " | 배분 재고적용처 " + (','.join(selected) or '전체') +
                 (" | 선택 범위만 배분, 나머지 미배분" if selected else " | 선택외 기본 잔여처 배정 허용"),
             "company_id": company}
+    logging.getLogger('ssai').info('[hospital.perf] company_id=%s stage=result_assembly elapsed_ms=%.1f total_ms=%.1f parent_rows=%s review_rows=%s allocation_rows=%s',
+                                  company, (time.perf_counter() - assembly_started) * 1000,
+                                  (time.perf_counter() - started) * 1000, len(parents), review_count, len(frame))
     return {"action": ACTION, "title": ACTION, "table": TABLE, "params": {**q, SELECTION: list(selected)},
             "df": frame, "df_display": display, "records": display.to_dict('records'),
             "columns": list(display), "data": summary, "message": summary, "meta": meta, "final": True}

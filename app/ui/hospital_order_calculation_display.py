@@ -13,7 +13,7 @@ from app.ui.order_calculation_editor import _PAGE_SIZE, _order_table_display_con
 
 
 def build_display(parents: pd.DataFrame, allocations: pd.DataFrame, *, max_rows=300,
-                  with_mapping=False):
+                  with_mapping=False, include_review=False, include_unallocated=False):
     # Group operations propagate attrs. The full parent reference must not be
     # deep-copied once per product; this local, read-only view contains values only.
     allocations = pd.DataFrame(allocations, copy=False)
@@ -29,6 +29,9 @@ def build_display(parents: pd.DataFrame, allocations: pd.DataFrame, *, max_rows=
     for parent in parents.to_dict('records'):
         key = tuple(parent[k] for k in ROW_KEY)
         if key not in children:
+            if include_unallocated or (include_review and parent.get('계산상태') == '수요/재고 사용자확인'):
+                rows.append({**parent, '원계산 재고적용처': parent.get('재고적용처')})
+                row_keys.append(None)
             continue
         row = {**parent, '원계산 재고적용처': parent.get('재고적용처')}
         rows.append(row)
@@ -57,7 +60,8 @@ def apply_allocation_edits(full: pd.DataFrame, row_keys: list, changes: dict, *,
     if work.duplicated(list(service.ALLOCATION_KEY)).any():
         raise ValueError('병원 배분행 식별키가 중복되었습니다.')
     parents = {service._text(row['제품코드']): service._quantity(row['실제 발주수량'], nonnegative=True)
-               for row in full.attrs.get(service.REFERENCE_ATTR, [])}
+               for row in full.attrs.get(service.REFERENCE_ATTR, [])
+               if row['실제 발주수량'] is not None}
     if not parents:
         raise ValueError('부모 발주수량 원본을 확인할 수 없습니다.')
     pending = []
@@ -247,6 +251,21 @@ def render_hospital_order_table(item: dict, meta: dict, *, download_uid: str = '
                f"미배분 {meta.get('unallocated_quantity', '0')} / "
                f"전체 배분 {len(full):,}행 / 현재 배분 {len(visible):,}행 / "
                f"참고 포함 화면 {len(view):,}행. Excel 실제배분·CSV·현재표는 전체 배분행 기준.")
+    review = parents.loc[parents['계산상태'].eq('수요/재고 사용자확인')] if '계산상태' in parents else parents.iloc[:0]
+    if not review.empty:
+        with st.expander(f"사용자 확인 제품 {len(review):,}개 · 신규 배분 없음"):
+            columns = [column for column in ('제품코드', '제품명', '계산상태', '조달주의',
+                                             '계산 발주수량', '추천 발주수량', '실제 발주수량') if column in review]
+            st.dataframe(review.loc[:, columns], hide_index=True, width='stretch')
+    no_order = parents.loc[parents['실제 발주수량'].eq(0) &
+                           ~parents['계산상태'].eq('수요/재고 사용자확인')] if '계산상태' in parents else parents.iloc[:0]
+    if not no_order.empty:
+        with st.expander(f"발주 불필요 제품 {len(no_order):,}개 · 신규 배분 없음"):
+            columns = [column for column in ('제품코드', '제품명', '계산상태',
+                                             '계산 발주수량', '추천 발주수량', '실제 발주수량') if column in no_order]
+            st.dataframe(no_order.loc[:, columns].head(_PAGE_SIZE), hide_index=True, width='stretch')
+            if len(no_order) > _PAGE_SIZE:
+                st.caption('전체 참고자료는 Excel 참고표_합계제외 시트에서 확인할 수 있습니다.')
     return True
 
 
@@ -264,10 +283,12 @@ def write_hospital_excel_if_any(writer, frame, *, sanitize, format_sheet) -> boo
             not frame['배분정책'].isin((service.POLICY, service.SCOPED_POLICY)).all()):
         raise service.AllocationError('병원발주계산 Excel 회사/정책을 확인해야 합니다.')
     parents = project_product_information_frame_for_viewer(parents)
-    reference = build_display(parents, frame, max_rows=len(parents) + len(frame))
+    reference = build_display(parents, frame, max_rows=len(parents) + len(frame),
+                              include_review=True, include_unallocated=True)
     parent_rows = reference['제품코드'].notna()
     # Reference totals must not double SUM(actual quantity) in the sample layout.
-    reference.loc[parent_rows, '실제 발주수량'] = reference.loc[parent_rows, '실제 발주수량'].map(lambda value: f'참고: {value:,}')
+    reference.loc[parent_rows, '실제 발주수량'] = reference.loc[parent_rows, '실제 발주수량'].map(
+        lambda value: '참고: 사용자 확인' if value is None or pd.isna(value) else f'참고: {value:,}')
     for name, source in (('실제배분', frame), ('참고표_합계제외', reference)):
         exported = sanitize(source)
         exported.to_excel(writer, index=False, sheet_name=name)
