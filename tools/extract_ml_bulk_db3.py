@@ -190,10 +190,12 @@ class ProgressReporter:
 
 
 class Db3Source:
-    def __init__(self, connection: pyodbc.Connection, progress: ProgressCallback | None = None) -> None:
+    def __init__(self, connection: pyodbc.Connection, progress: ProgressCallback | None = None,
+                 *, company_id: int = 3) -> None:
         self.connection = connection
         self.progress = progress
         self.query_count = 0
+        self.company_id = company_id
 
     def rows(self, sql: str, params: tuple[Any, ...]) -> Iterator[dict[str, Any]]:
         if not sql.lstrip().upper().startswith("SELECT"):
@@ -231,7 +233,16 @@ class Db3Source:
             "SELECT Rd04_Physic_Cd, Rd04_Use_Gu, Rd04_Add_Date "
             "FROM dbo.Rddbc040 ORDER BY Rd04_Physic_Cd", (),
         ):
-            yield {**row, "company_id": 3}
+            yield {**row, "company_id": self.company_id}
+
+    def active_product_rows(self) -> Iterator[dict[str, Any]]:
+        """Bounded RF40 cohort identity and product features; v1 product_rows stays unchanged."""
+        for row in self.rows(
+            "SELECT TOP (100001) Rd04_Physic_Cd, Rd04_Use_Gu, Rd04_Add_Date, "
+            "Rd04_Physic_Gu_Gcode, Rd04_Physic_Gu "
+            "FROM dbo.Rddbc040 WHERE Rd04_Use_Gu = '0' ORDER BY Rd04_Physic_Cd", (),
+        ):
+            yield {**row, "company_id": self.company_id}
 
     def totals(self, batch: Batch) -> dict[str, Any]:
         marks = ", ".join("?" for _ in batch.product_codes)
@@ -333,7 +344,7 @@ WHERE Rd12_Out_YyMmDd >= ? AND Rd12_Out_YyMmDd < ?
                     raise ValueError("duplicate R120 source PK across coalesced batches")
                 source_keys.add(key)
                 buffered[batch_id].append(row)
-                byte_counts[batch_id] += len(_json({**row, "company_id": 3}).encode("utf-8"))
+                byte_counts[batch_id] += len(_json({**row, "company_id": getattr(self, "company_id", 3)}).encode("utf-8"))
                 if len(buffered[batch_id]) > 10000 or byte_counts[batch_id] > MAX_BATCH_BYTES:
                     oversized.add(batch_id)
                 qty, bonus = amounts[batch_id]
@@ -368,7 +379,7 @@ WHERE Rd12_Out_YyMmDd >= ? AND Rd12_Out_YyMmDd < ?
                 if key in seen_headers or key not in references or int(row["header_count"]) != 1:
                     raise ValueError("coalesced R130 document is duplicate or outside R120 scope")
                 seen_headers.add(key)
-                size = len(_json({**row, "company_id": 3}).encode("utf-8"))
+                size = len(_json({**row, "company_id": getattr(self, "company_id", 3)}).encode("utf-8"))
                 for batch_id in references[key]:
                     documents[batch_id].append(row)
                     header_bytes[batch_id] += size
