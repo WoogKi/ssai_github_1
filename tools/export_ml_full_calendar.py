@@ -17,15 +17,18 @@ START = date(2018, 1, 1)
 END = date(2026, 8, 30)
 
 
-def calendar_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+def calendar_payload(
+    snapshot: dict[str, Any], *, start_date: date = START, end_date: date = END,
+) -> dict[str, Any]:
     if (snapshot.get("status") != "ready"
-            or snapshot.get("start_date") != START.isoformat()
-            or snapshot.get("end_date") != END.isoformat()
+            or start_date > end_date
+            or snapshot.get("start_date") != start_date.isoformat()
+            or snapshot.get("end_date") != end_date.isoformat()
             or not snapshot.get("version")
             or not snapshot.get("known_as_of")):
         raise ValueError("shared Calendar coverage or persisted load evidence is incomplete")
     known = date.fromisoformat(snapshot["known_as_of"])
-    if known < START:
+    if known < start_date:
         raise ValueError("shared Calendar load date is outside the source period")
     holidays = snapshot.get("holiday_dates")
     if not isinstance(holidays, list) or holidays != sorted(set(holidays)):
@@ -34,21 +37,25 @@ def calendar_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, str) or not re.fullmatch(r"[0-9]{8}", value):
             raise ValueError("shared Calendar has an invalid holiday date")
         parsed = date.fromisoformat(f"{value[:4]}-{value[4:6]}-{value[6:]}")
-        if not START <= parsed <= END:
+        if not start_date <= parsed <= end_date:
             raise ValueError("shared Calendar holiday is outside the requested range")
     return {key: snapshot[key] for key in (
         "start_date", "end_date", "holiday_dates", "known_as_of", "version")}
 
 
-def export(*, dataset_name: str) -> dict[str, Any]:
-    if not re.fullmatch(r"calendar-db3-full-[A-Za-z0-9_-]{1,40}", dataset_name):
+def export(
+    *, dataset_name: str, start_date: date = START, end_date: date = END,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"calendar-(?:db3-full|company-rf40)-[A-Za-z0-9_-]{1,40}", dataset_name):
         raise ValueError("invalid Calendar dataset name")
+    if dataset_name.startswith("calendar-db3-full-") and (start_date, end_date) != (START, END):
+        raise ValueError("existing DB3 Calendar export range must not change")
     root = ml_storage_root()
     target_dir = root / "datasets" / dataset_name
     if target_dir.exists() or target_dir.is_symlink():
         raise FileExistsError("Calendar dataset already exists")
-    snapshot = official_calendar_snapshot(start_date=START, end_date=END)
-    payload = calendar_payload(snapshot)
+    snapshot = official_calendar_snapshot(start_date=start_date, end_date=end_date)
+    payload = calendar_payload(snapshot, start_date=start_date, end_date=end_date)
     raw = (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     target_dir.mkdir(parents=True, exist_ok=False)
     path = target_dir / "calendar.json"
@@ -66,8 +73,10 @@ def export(*, dataset_name: str) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-name", required=True)
+    parser.add_argument("--start-date", type=date.fromisoformat, default=START)
+    parser.add_argument("--end-date", type=date.fromisoformat, default=END)
     args = parser.parse_args()
-    result = export(dataset_name=args.dataset_name)
+    result = export(dataset_name=args.dataset_name, start_date=args.start_date, end_date=args.end_date)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
 

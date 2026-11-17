@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from app.ml.db3_probe import run_db3_probe
 from app.ml.integration import add_calendar_dataset, migrate_probe_dataset, ml_storage_root, official_calendar_snapshot
 from app.services.ssai_business_calendar_repository import CalendarAuthorityRead
 from tools.check_ml_phase2_db3 import fake_query
+from tools.export_ml_full_calendar import calendar_payload, export
 from tools.diagnose_ml_db3_dates import summarize
 from tools.run_ml_phase1_offline import run_fixture
 
@@ -40,6 +42,48 @@ class FakeConnection:
 
 
 class IntegrationGate(unittest.TestCase):
+    def test_company_calendar_snapshot_reuses_common_authority(self):
+        start, end = date(2024, 11, 1), date(2026, 11, 30)
+        authority = CalendarAuthorityRead(status="ready", holiday_dates=frozenset({"20250505", "20261103"}))
+
+        class ThreeYearConnection(FakeConnection):
+            def fetchall(self):
+                return [(year, "fixture-v1", f"{year}checksum", datetime(2026, 11, 17, 8, 0))
+                        for year in (2024, 2025, 2026)]
+
+        snapshot = official_calendar_snapshot(
+            start_date=start, end_date=end, authority_loader=lambda **_kwargs: authority,
+            connection_factory=ThreeYearConnection,
+        )
+        class MissingYearConnection(ThreeYearConnection):
+            def fetchall(self):
+                return super().fetchall()[:2]
+
+        missing = official_calendar_snapshot(
+            start_date=start, end_date=end, authority_loader=lambda **_kwargs: authority,
+            connection_factory=MissingYearConnection,
+        )
+        self.assertEqual(missing["reason"], "calendar_load_metadata_incomplete")
+        payload = calendar_payload(snapshot, start_date=start, end_date=end)
+        self.assertEqual(payload["holiday_dates"], ["20250505", "20261103"])
+        self.assertEqual(payload["known_as_of"], "2026-11-17")
+        with self.assertRaisesRegex(ValueError, "coverage"):
+            calendar_payload(snapshot, start_date=start, end_date=date(2026, 12, 31))
+        with self.assertRaisesRegex(ValueError, "DB3 Calendar export range"):
+            export(dataset_name="calendar-db3-full-fixture-v1", start_date=start, end_date=end)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("tools.export_ml_full_calendar.ml_storage_root", return_value=root), patch(
+                "tools.export_ml_full_calendar.official_calendar_snapshot", return_value=snapshot
+            ) as read_calendar:
+                result = export(dataset_name="calendar-company-rf40-fixture-v1", start_date=start, end_date=end)
+                read_calendar.assert_called_once_with(start_date=start, end_date=end)
+                calendar_path = Path(result["calendar_path"])
+                self.assertEqual(hashlib.sha256(calendar_path.read_bytes()).hexdigest(), result["sha256"])
+                self.assertEqual(json.loads(calendar_path.read_text(encoding="utf-8")), payload)
+                with self.assertRaises(FileExistsError):
+                    export(dataset_name="calendar-company-rf40-fixture-v1", start_date=start, end_date=end)
+
     def test_environment_storage_root_and_repo_boundary(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("app.ml.integration.PROJECT_ROOT", Path(tmp) / "other_repo"), patch(
