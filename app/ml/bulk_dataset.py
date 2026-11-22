@@ -30,6 +30,35 @@ class Batch:
     date_from: str
     date_to_exclusive: str
     product_codes: tuple[str, ...]
+    pk_after: tuple[str, str, int] | None = None
+    pk_through: tuple[str, str, int] | None = None
+
+
+def _pk(value) -> tuple[str, str, int]:
+    if (not isinstance(value, (list, tuple)) or len(value) != 3
+            or any(not isinstance(v, str) or not v.strip() for v in value[:2])
+            or isinstance(value[2], bool)):
+        raise ValueError("invalid R120 PK boundary")
+    text = str(value[2]).strip()
+    if not text.lstrip("-").isascii() or not text.lstrip("-").isdigit():
+        raise ValueError("invalid R120 PK sequence")
+    number = int(text)
+    if not -(2**31) <= number < 2**31:
+        raise ValueError("invalid R120 PK sequence")
+    return value[0].strip(), value[1].strip(), number
+
+
+def _in_pk_scope(row, batch):
+    key = _pk([row[name] for name in ("Rd12_Out_YyMmDd", "Rd12_Ven_Cd", "Rd12_Out_Seq")])
+    return ((batch.pk_after is None or key > batch.pk_after)
+            and (batch.pk_through is None or key <= batch.pk_through))
+
+
+def _pk_metadata(batch):
+    if batch.pk_after is None and batch.pk_through is None:
+        return {}
+    return {"pk_range": {"after": batch.pk_after, "through": batch.pk_through},
+            "totals_basis": "partition_of_independent_parent"}
 
 
 class BatchLimitError(ValueError):
@@ -153,7 +182,21 @@ def _batch_dir(root: Path, batch: Batch) -> Path:
     return root / "batches" / batch.batch_id
 
 
-def _split_batch(batch: Batch) -> tuple[str, tuple[Batch, Batch]]:
+def _split_batch(batch: Batch, pk_boundary=None) -> tuple[str, tuple[Batch, Batch]]:
+    if pk_boundary is not None:
+        start = datetime.strptime(batch.date_from, "%Y%m%d").date()
+        stop = datetime.strptime(batch.date_to_exclusive, "%Y%m%d").date()
+        key = _pk(pk_boundary)
+        if (len(batch.product_codes) != 1 or (stop-start).days != 1 or key[0] != batch.date_from
+                or (batch.pk_after is not None and key <= batch.pk_after)
+                or (batch.pk_through is not None and key >= batch.pk_through)):
+            raise ValueError("invalid terminal PK split scope")
+        return "pk", (
+            Batch(batch.batch_id + "/k0", batch.date_from, batch.date_to_exclusive,
+                  batch.product_codes, batch.pk_after, key),
+            Batch(batch.batch_id + "/k1", batch.date_from, batch.date_to_exclusive,
+                  batch.product_codes, key, batch.pk_through),
+        )
     if len(batch.product_codes) > 1:
         middle = len(batch.product_codes) // 2
         return "product", (
@@ -177,7 +220,7 @@ def _split_batch(batch: Batch) -> tuple[str, tuple[Batch, Batch]]:
 
 
 def _children(root: Path, batch: Batch, manifest: Mapping[str, Any]) -> tuple[Batch, Batch]:
-    axis, children = _split_batch(batch)
+    axis, children = _split_batch(batch, manifest.get("pk_boundary"))
     if (manifest.get("split_axis") != axis
             or manifest.get("child_ids") != [child.batch_id for child in children]
             or set(manifest.get("child_manifest_sha256", {})) != {child.batch_id for child in children}):
@@ -232,6 +275,13 @@ def verify_batch(root: Path, batch: Batch,
                  saved_io_codes: Iterable[str] | None = None, *, company_id: int = 3) -> dict[str, Any]:
     folder = _batch_dir(root, batch)
     manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("pk_range") != json.loads(_json(_pk_metadata(batch))).get("pk_range"):
+        raise ValueError("batch PK range mismatch")
+    if (batch.pk_after is not None or batch.pk_through is not None):
+        if manifest.get("totals_basis") != "partition_of_independent_parent":
+            raise ValueError("PK partition cannot claim independent SQL totals")
+    elif manifest.get("split_axis") == "pk" and manifest.get("totals_basis") != "independent_sql":
+        raise ValueError("terminal PK parent requires independent SQL totals")
     if (folder / "error.json").exists() or manifest.get("company_id") != company_id:
         raise ValueError("batch has unresolved error or company mismatch")
     if (manifest.get("batch_id") != batch.batch_id or manifest.get("status") != "VERIFIED"
@@ -327,6 +377,10 @@ def verify_batch(root: Path, batch: Batch,
             codes = json.loads((root / "plan.json").read_text(encoding="utf-8"))["saved_io_codes"]
         if manifest["role_totals"] != _role_totals(outbound, codes):
             raise ValueError("batch saved I/O role totals differ")
+    if batch.pk_after is not None or batch.pk_through is not None:
+        for row in outbound:
+            if not _in_pk_scope(row, batch):
+                raise ValueError("R120 row outside PK partition")
     return manifest
 
 
@@ -342,11 +396,14 @@ def _save_leaf_batch(
     started = perf_counter()
     stage = "source_totals"
     expected: Mapping[str, Any] | None = None
+    expected_rows = None
     try:
         _emit(progress, "stage", batch_id=batch.batch_id, stage=stage)
         expected = source.totals(batch)
         expected_rows = int(expected["row_count"])
-        if expected_rows < 0 or expected_rows > MAX_BATCH_ROWS:
+        if expected_rows < 0:
+            raise ValueError("independent R120 row count is negative")
+        if expected_rows > MAX_BATCH_ROWS:
             raise BatchLimitError("R120 batch exceeds row cap")
         empty = expected_rows == 0
         stage = "r120_fetch"
@@ -375,6 +432,7 @@ def _save_leaf_batch(
         if prepared.source_row_count != count or prepared.source_quantity != qty or prepared.source_bonus_quantity != bonus:
             raise ValueError("prepared batch differs from original R120")
         manifest = {
+            **_pk_metadata(batch),
             "batch_id": batch.batch_id, "status": "VERIFIED", "company_id": company_id,
             "date_from": batch.date_from, "date_to_exclusive": batch.date_to_exclusive,
             "product_count": len(batch.product_codes), "r120_rows": count,
@@ -401,6 +459,7 @@ def _save_leaf_batch(
         (folder / "error.json").write_text(_json({
             "batch_id": batch.batch_id, "status": "FAILED", "failed_stage": stage,
             "error_type": type(exc).__name__,
+            "expected_rows": expected_rows, "row_cap": MAX_BATCH_ROWS,
             "reason": str(exc)[:160] if isinstance(exc, ValueError) else "inspect local execution log",
         }), encoding="utf-8")
         raise
@@ -433,9 +492,10 @@ def _save_split_batch(
     root: Path, batch: Batch, axis: str, children: tuple[Batch, Batch], source: Any,
     masters: Mapping[str, Mapping[str, Any]], saved_io_codes: tuple[str, ...], company_id: int,
     progress: ProgressCallback | None, expected: Mapping[str, Any], prior_selects: int,
+    *, resuming: bool = False,
 ) -> dict[str, Any]:
     folder = _batch_dir(root, batch)
-    folder.mkdir(parents=True, exist_ok=False)
+    folder.mkdir(parents=True, exist_ok=resuming)
     started = perf_counter()
     stage = "split_children"
     try:
@@ -456,6 +516,10 @@ def _save_split_batch(
             for key, count in item["document_match_counts"].items():
                 matches[key] = matches.get(key, 0) + count
         manifest = {
+            **_pk_metadata(batch),
+            **({"pk_boundary": children[0].pk_through,
+                "totals_basis": "partition_of_independent_parent" if batch.pk_after or batch.pk_through
+                else "independent_sql"} if axis == "pk" else {}),
             "batch_id": batch.batch_id, "status": "VERIFIED", "company_id": company_id,
             "date_from": batch.date_from, "date_to_exclusive": batch.date_to_exclusive,
             "product_count": len(batch.product_codes), "split_axis": axis,
@@ -488,10 +552,37 @@ def _save_batch(
     root: Path, batch: Batch, source: Any, masters: Mapping[str, Mapping[str, Any]],
     saved_io_codes: tuple[str, ...], progress: ProgressCallback | None = None, *, company_id: int = 3,
 ) -> dict[str, Any]:
+    folder = _batch_dir(root, batch)
+    if folder.exists() and getattr(source, "resume_partial_batches", False):
+        if (folder / "manifest.json").exists() and not (folder / "error.json").exists():
+            return verify_batch(root, batch, saved_io_codes, company_id=company_id)
+        error = folder / "error.json"
+        if error.exists() and json.loads(error.read_text(encoding="utf-8")).get("failed_stage") == "split_children":
+            try:
+                axis, children = _split_batch(batch)
+            except BatchLimitError:
+                axis, children = _split_batch(batch, source.split_pk(batch))
+            expected = source.totals(batch)
+            # Preserve the original diagnostic while retaining verified descendants.
+            archive = root / "failed" / (batch.batch_id.replace("/", "__") + "-split-errors")
+            archive.mkdir(parents=True, exist_ok=True)
+            index = 0
+            while (archive / f"error-{index:06d}.json").exists():
+                index += 1
+            error.rename(archive / f"error-{index:06d}.json")
+            return _save_split_batch(root, batch, axis, children, source, masters, saved_io_codes,
+                                     company_id, progress, expected, 0, resuming=True)
+        _quarantine_failed_batch(root, batch)
     try:
         return _save_leaf_batch(root, batch, source, masters, saved_io_codes, company_id, progress)
     except BatchLimitError as exc:
-        axis, children = _split_batch(batch)
+        try:
+            axis, children = _split_batch(batch)
+        except BatchLimitError:
+            splitter = getattr(source, "split_pk", None)
+            if splitter is None:
+                raise
+            axis, children = _split_batch(batch, splitter(batch))
         if exc.source_totals is None:
             raise ValueError("split requires independent parent R120 source totals") from exc
         _quarantine_failed_batch(root, batch)
@@ -601,7 +692,8 @@ def build_bulk_dataset(
         folder = _batch_dir(target, batch)
         if folder.exists():
             if resume and ((folder / "error.json").exists() or not (folder / "manifest.json").exists()):
-                _quarantine_failed_batch(target, batch)
+                if not getattr(source, "resume_partial_batches", False):
+                    _quarantine_failed_batch(target, batch)
                 folder = _batch_dir(target, batch)
             else:
                 verified = verify_batch(target, batch, scope.all_codes, company_id=company_id)
@@ -631,7 +723,8 @@ def build_bulk_dataset(
         _emit(progress, "batch_complete", batch_id=batch.batch_id, rows=saved["r120_rows"],
               elapsed_ms=saved["elapsed_ms"])
     _emit(progress, "stage", stage="dataset_verify")
-    result = verify_bulk_dataset(target, require_complete=False)
+    result = verify_bulk_dataset(target, require_complete=False,
+        stop_requested=stop_requested if getattr(source, "stop_during_verification", False) else None)
     finished = result["verified_batches"] == len(batches)
     if finished and result["verified_batches"] == len(batches):
         manifest = {**specification, "dataset_status": "RESEARCH_POSTHOC",
@@ -655,7 +748,8 @@ def build_bulk_dataset(
     return summary
 
 
-def verify_bulk_dataset(target: Path, *, require_complete: bool = True) -> dict[str, Any]:
+def verify_bulk_dataset(target: Path, *, require_complete: bool = True,
+                        stop_requested: Callable[[], bool] | None = None) -> dict[str, Any]:
     plan = json.loads((target / "plan.json").read_text(encoding="utf-8"))
     company_id = plan.get("company_id")
     source_company_id = plan.get("source_company_id", 3)
@@ -684,6 +778,8 @@ def verify_bulk_dataset(target: Path, *, require_complete: bool = True) -> dict[
     qty = bonus = Decimal(0)
     verified = 0
     for batch in batches:
+        if stop_requested is not None and stop_requested():
+            raise InterruptedError("dataset verification stopped")
         folder = _batch_dir(target, batch)
         if folder.exists():
             meta = verify_batch(target, batch, plan["saved_io_codes"], company_id=company_id)
