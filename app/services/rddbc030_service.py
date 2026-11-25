@@ -271,6 +271,63 @@ def _run_df(action: str, sql: str, params: tuple):
         raise
 
 
+def _vendor_identity_filters(scope, ven_cd, ven_nm_kw, only_active):
+    where, params = [], []
+    if only_active:
+        where.append(_active_clause("V"))
+    clause = _scope_clause(scope, "V")
+    if clause:
+        where.append(clause)
+    code = _clean_text(ven_cd)
+    if code:
+        where.append(f"{_trim(f'V.{COL_VEN_CD}')} = ?")
+        params.append(code)
+    name = _like(ven_nm_kw)
+    if name:
+        where.append(f"{_trim(f'V.{COL_VEN_NM}')} LIKE ?")
+        params.append(name)
+    return where, params
+
+
+def search_vendor_candidates(company_id: int, *, scope="", ven_cd="", ven_nm_kw=""):
+    """Company-bound, uncached projection of the existing vendor search contract."""
+    import pandas as pd
+    from app.services.ssai_auth_service import connect_company_db
+
+    ven_cd, ven_nm_kw, scope = _clean_text(ven_cd), _clean_text(ven_nm_kw), _clean_text(scope).lower()
+    if (type(company_id) is not int or company_id <= 0
+            or bool(ven_cd) == bool(ven_nm_kw) or len(ven_cd) > 5 or len(ven_nm_kw) > 100
+            or any(ord(c) < 32 for c in ven_cd + ven_nm_kw)
+            or (ven_nm_kw and not any(c.isalnum() for c in ven_nm_kw))
+            or (scope and not _scope_clause(scope))):
+        raise ValueError("invalid_vendor_search")
+    where, params = _vendor_identity_filters(scope, ven_cd, ven_nm_kw, True)
+    columns = ["ERP 거래처코드", "ERP 거래처명", "사업자번호"]
+    fields = [COL_VEN_CD, COL_VEN_NM, COL_BIZ_NO]
+    projection = ", ".join(f"{_trim('V.' + c)} AS [{label}]" for c, label in zip(fields, columns))
+    sql = f"""SELECT TOP (201) {projection}
+FROM {T} AS V
+WHERE {' AND '.join(where)}
+ORDER BY V.{COL_VEN_CD}, V.{COL_VEN_NM}, V.{COL_BIZ_NO}"""
+    conn, cursor = None, None
+    try:
+        conn = connect_company_db(company_id)
+        conn.timeout = 10
+        cursor = conn.cursor()
+        cursor.execute(sql, *params)
+        rows = cursor.fetchmany(201)
+        frame = pd.DataFrame.from_records([tuple(row) for row in rows[:200]], columns=columns)
+        frame.attrs["kpis_candidates_partial"] = len(rows) > 200
+        return frame
+    finally:
+        try:
+            if cursor is not None:
+                cursor.close()
+        finally:
+            if conn is not None:
+                conn.close()
+
+
 def _code_join(alias_name: str, g_expr: str, t_expr: str) -> str:
     return f"""
     LEFT JOIN {T010} AS {alias_name} WITH (NOLOCK)
@@ -480,25 +537,7 @@ def search_rows(
     
     top = _normalize_top(top, default=200)
 
-    where = []
-    params = []
-
-    if only_active:
-        where.append(_active_clause("V"))
-
-    scope_clause = _scope_clause(scope, "V")
-    if scope_clause:
-        where.append(scope_clause)
-
-    ven_cd = _clean_text(ven_cd)
-    if ven_cd:
-        where.append(f"{_trim(f'V.{COL_VEN_CD}')} = ?")
-        params.append(ven_cd)
-
-    kw_ven_nm = _like(ven_nm_kw)
-    if kw_ven_nm:
-        where.append(f"{_trim(f'V.{COL_VEN_NM}')} LIKE ?")
-        params.append(kw_ven_nm)
+    where, params = _vendor_identity_filters(scope, ven_cd, ven_nm_kw, only_active)
 
     kw_owner = _like(owner_nm_kw)
     if kw_owner:

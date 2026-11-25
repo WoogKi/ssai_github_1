@@ -61,6 +61,7 @@ def _can_use_admin_page() -> bool:
         or has_permission("USER_MANAGE_COMPANY")
         or has_permission("COMPANY_MANAGE")
         or has_permission("SIMS_DB_MANAGE")
+        or has_permission("EXTERNAL_API_VIEW")
     )
 
 def _can_manage_all_companies() -> bool:
@@ -154,7 +155,9 @@ def render_ssai_admin_sidebar() -> None:
             else "회원사 사용자 관리"
         )
 
-        if st.button(admin_user_menu_label, width="stretch", key="__ssai_admin_user_approval_btn"):
+        if (_can_approve_signup_users() or _can_manage_company_users()) and st.button(
+            admin_user_menu_label, width="stretch", key="__ssai_admin_user_approval_btn"
+        ):
             st.session_state[SESSION_ADMIN_PAGE] = "user_approval"
 
             if not _can_approve_signup_users():
@@ -174,6 +177,11 @@ def render_ssai_admin_sidebar() -> None:
         if _can_view_audit_logs():
             if st.button("감사 로그 조회", width="stretch", key="__ssai_admin_audit_logs_btn"):
                 st.session_state[SESSION_ADMIN_PAGE] = "audit_logs"
+                st.rerun()
+
+        if has_permission("EXTERNAL_API_VIEW"):
+            if st.button("외부 API 관리", width="stretch", key="__ssai_external_api_btn"):
+                st.session_state[SESSION_ADMIN_PAGE] = "external_api"
                 st.rerun()
 
         if _is_super_admin_user(get_current_user()):
@@ -1960,6 +1968,17 @@ def render_ssai_admin_page() -> bool:
     if not page:
         return False
 
+    if page == "external_api":
+        from app.ui.external_api_admin import render_external_api_admin
+
+        render_external_api_admin()
+        return True
+
+    if page == "kpis_erp":
+        # Retire a previously selected admin route without rendering it twice.
+        st.session_state.pop(SESSION_ADMIN_PAGE, None)
+        return False
+
     if page == "snapshot_operation_history":
         if not _is_super_admin_user(get_current_user()):
             st.error("관리자 권한이 필요합니다.")
@@ -1970,6 +1989,9 @@ def render_ssai_admin_page() -> bool:
         return True
 
     if page == "user_approval":
+        if not (_can_approve_signup_users() or _can_manage_company_users()):
+            st.error("사용자 관리 권한이 필요합니다.")
+            return True
         render_user_approval_page()
         render_user_lookup_debug()
         return True

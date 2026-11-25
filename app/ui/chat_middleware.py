@@ -11251,6 +11251,13 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
             except Exception:
                 log.exception("[chat] download buttons render failed")
 
+            if (meta.get("source") == "KPIS" and meta.get("service") == "MA117"
+                    and str(meta.get("_ssai_company_id") or "") == _chat_current_company_sig()[0]
+                    and bool(_chat_current_company_sig()[0])
+                    and _chat_payload_matches_current_company(item)):
+                from app.ui.kpis_result_display import render_notice_detail
+                render_notice_detail(data, key=str(meta.get("_ssai_company_id")) + "_" + str(uid2))
+
             return
 
         # 안내/빈결과 메시지는 type 값보다 message 존재 여부를 우선해서 렌더한다.

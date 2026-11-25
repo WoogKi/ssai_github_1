@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -529,7 +530,7 @@ def authenticate_wholesale_sims_password(login_id: str, sims_password: str) -> A
     """
     return authenticate_wholesale_user(login_id, sims_password)
 
-def get_active_companies_for_user(user: AuthUser) -> list[dict[str, Any]]:
+def get_active_companies_for_user(user: AuthUser, *, conn=None) -> list[dict[str, Any]]:
     """
     로그인 사용자가 선택 가능한 활성 ERP DB 목록을 반환한다.
 
@@ -544,7 +545,7 @@ def get_active_companies_for_user(user: AuthUser) -> list[dict[str, Any]]:
 
     3. 기존 SSART_ADMIN 전체 접근은 호환성 차원에서 유지한다.
     """
-    with connect_ssai_db() as conn:
+    with (nullcontext(conn) if conn is not None else connect_ssai_db()) as conn:
         permissions = get_user_permissions(
             conn,
             user_id=user.user_id,

@@ -1197,10 +1197,12 @@ from app.ui.sims_table_display import (
 )
 
 from app.ui.ssai_login import require_permission
+from app.ui.kpis_erp_query import render_kpis_erp_query, KPIS_VIEWS
 
 
 # 카테고리/액션 레지스트리
 _CATEGORIES: Dict[str, Dict[str, Any]] = {
+    "KPIS": {"actions": {**KPIS_VIEWS, "KPIS 조회": render_kpis_erp_query}},
     "사용자": {
         "actions": {
             "사용자목록 + 부서명": users.render_user_list_with_dept,
@@ -2775,6 +2777,8 @@ def render_sims_main(selected: Optional[Dict[str, str]]) -> None:
         return
 
     submission_id = consume_panel_submission(ss, action) or submission_id
+    if isinstance(payload, dict) and payload.get("type") == "form_only":
+        return
     # payload 점검
     if not isinstance(payload, dict):
         st.info("결과가 없습니다.")

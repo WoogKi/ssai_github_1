@@ -11,6 +11,8 @@ import time
 
 import streamlit as st
 
+from app.services.external_api_session import invalidate as invalidate_external_api_session
+
 from app.services.ssai_auth_service import (
     AuthUser,
     authenticate_ssai_password,
@@ -28,6 +30,8 @@ from app.services.ssai_user_admin_service import (
 
 from app.services.ssai_login_profile_service import (
     build_login_profile,
+    ERP_IDENTITY_KEY,
+    ErpOwnIdentity,
 )
 
 from app.services.ssai_storage_service import (
@@ -146,6 +150,7 @@ def _clear_company_dependent_state() -> None:
     - rddbc060_service 등 여러 서비스가 st.cache_data를 사용한다.
     - 회사 DB가 바뀌어도 함수 인자가 같으면 이전 회사 결과가 재사용될 수 있다.
     """
+    st.session_state.pop(ERP_IDENTITY_KEY, None)
     try:
         st.cache_data.clear()
     except Exception:
@@ -368,6 +373,7 @@ def _complete_login(result) -> bool:
         st.error(f"로그인 실패: {result.fail_reason}")
         return False
 
+    invalidate_external_api_session(st.session_state)
     st.session_state[SESSION_AUTH_USER] = result.user
     st.session_state[SESSION_AUTH_PERMISSIONS] = result.permissions or []
 
@@ -485,6 +491,7 @@ def _refresh_selected_company_permissions(
     except (TypeError, ValueError):
         company_id = 0
     if user is None or company_id <= 0:
+        invalidate_external_api_session(st.session_state)
         st.session_state[SESSION_AUTH_PERMISSIONS] = []
         return False
 
@@ -496,6 +503,7 @@ def _refresh_selected_company_permissions(
                 company_id=company_id,
             )
     except Exception as exc:
+        invalidate_external_api_session(st.session_state)
         st.session_state[SESSION_AUTH_PERMISSIONS] = []
         log.warning(
             "[auth.permission] refresh failed user_id=%s company_id=%s error_type=%s",
@@ -505,6 +513,8 @@ def _refresh_selected_company_permissions(
         )
         return False
 
+    if set(st.session_state.get(SESSION_AUTH_PERMISSIONS, [])) != set(permissions or []):
+        invalidate_external_api_session(st.session_state)
     st.session_state[SESSION_AUTH_PERMISSIONS] = list(permissions or [])
     return True
 
@@ -527,7 +537,10 @@ def _after_company_selected(
     started = time.perf_counter()
     user = get_current_user()
 
+    invalidate_external_api_session(st.session_state)
     st.session_state[SESSION_COMPANY] = company
+    st.session_state.pop(ERP_IDENTITY_KEY, None)
+    st.session_state.pop(SESSION_LOGIN_PROFILE, None)
     permission_started = time.perf_counter()
     permissions_refreshed = _refresh_selected_company_permissions(user, company)
     permission_refresh_ms = int((time.perf_counter() - permission_started) * 1000)
@@ -549,8 +562,17 @@ def _after_company_selected(
                 user=user,
                 company=company,
             )
+            # Keep ERP identity out of greeting/LLM/profile display payloads.
+            identity = profile.pop(ERP_IDENTITY_KEY, None)
+            if identity is not None:
+                st.session_state[ERP_IDENTITY_KEY] = identity
+            log.info("[kpis.identity] stage=session_store present=%s binding_matches=%s",
+                     isinstance(identity, ErpOwnIdentity),
+                     isinstance(identity, ErpOwnIdentity) and identity.company_id == company_id
+                     and identity.user_id == str(user.user_id))
             st.session_state[SESSION_LOGIN_PROFILE] = profile
         except Exception as e:
+            log.warning("[kpis.identity] stage=profile_fallback reason=build_error error_type=%s", type(e).__name__)
             st.session_state[SESSION_LOGIN_PROFILE] = {
                 "company_id": company.get("company_id"),
                 "company_name": company.get("company_name"),
@@ -561,7 +583,7 @@ def _after_company_selected(
                 "user_grade": user.user_grade,
                 "sims_user_id": user.sims_user_id,
                 "profile_source": "ERROR",
-                "profile_error": f"{type(e).__name__}: {e}",
+                "profile_error": f"{type(e).__name__}: ERP_PROFILE_UNAVAILABLE",
             }
 
     # 회사/프로필이 바뀌면 화면 인사말은 다시 생성한다.
@@ -662,6 +684,7 @@ def _auto_select_company_if_needed() -> bool:
 
 def logout() -> None:
     log.info("[auth.logout] %s", _login_log_kv())
+    invalidate_external_api_session(st.session_state)
 
     for key in [
         SESSION_AUTH_USER,
@@ -670,6 +693,7 @@ def logout() -> None:
         SESSION_COMPANY_PICK_MODE,
         SESSION_PENDING_WHOLESALE_AUTH,
         SESSION_LOGIN_PROFILE,
+        ERP_IDENTITY_KEY,
         SESSION_LOGIN_GREETING,
         SESSION_LOGIN_GREETING_SIG,
         SESSION_COMPANY_CHANGE_NOTICE,

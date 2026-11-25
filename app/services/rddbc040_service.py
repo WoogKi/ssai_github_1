@@ -25,6 +25,108 @@ from app.services.product_master_filter_contract import append_product_master_fi
 log = logging.getLogger("ssai")
 
 
+def _standard_product_join():
+    table, cols = _get_table_and_cols()
+    vendors, vendor_cols = _get_table_and_cols_030()
+    code, name = _al(cols, "physic_cd", "Rd04_Physic_Cd"), _al(cols, "physic_nm", "Rd04_Physic_Nm")
+    standard = _al(cols, "standard", "Rd04_Standard")
+    maker = _al(cols, "ven_cd", "Rd04_Ven_Cd")
+    vendor_code, vendor_name = _al(vendor_cols, "ven_cd", "Rd03_Ven_Cd"), _al(vendor_cols, "ven_nm", "Rd03_Ven_Nm")
+    fields = (f"RTRIM(P.{code})", f"RTRIM(P.{name})", f"RTRIM(S.Rd046_Standard_Cd)",
+              f"RTRIM(P.{standard})", f"RTRIM(V.{vendor_name})")
+    joins = f"""FROM {table} AS P
+LEFT JOIN dbo.Rddbc046 AS S ON P.{code} = S.Rd046_Physic_Cd
+LEFT JOIN {vendors} AS V ON P.{maker} = V.{vendor_code}"""
+    return code, name, fields, joins
+
+
+STANDARD_PRODUCT_COLUMNS = ["제품코드", "제품명", "표준코드", "규격", "제약사명"]
+
+
+def search_standard_code_candidates(company_id: int, *, keyword: str = "", physic_cd: str = "") -> pd.DataFrame:
+    """명시적 KPIS 검색용 제한 조회. 회사별 연결과 기존 제품 필터를 재사용한다."""
+    from app.services.ssai_auth_service import connect_company_db
+
+    keyword, physic_cd = keyword.strip(), physic_cd.strip()
+    if (type(company_id) is not int or company_id <= 0 or bool(keyword) == bool(physic_cd)
+            or len(keyword) > 100 or len(physic_cd) > 5
+            or any(ord(c) < 32 for c in keyword + physic_cd)
+            or (keyword and not any(c.isalnum() for c in keyword))):
+        raise ValueError("invalid_product_search")
+    code, name, fields, joins = _standard_product_join()
+    where, params = [], []
+    append_product_master_filter_clauses(
+        where, params, {"physic_cd": physic_cd, "product_keyword": keyword},
+        expressions={"physic_cd": f"P.{code}", "keyword": (f"P.{name}",)},
+    )
+    sql = f"""
+SELECT DISTINCT TOP (201) {', '.join(f'{expr} AS [{label}]' for expr, label in zip(fields, STANDARD_PRODUCT_COLUMNS))}
+{joins}
+WHERE {" AND ".join(where)}
+ORDER BY [제품코드], [표준코드], [제품명], [규격], [제약사명]
+"""
+    conn, cursor = None, None
+    try:
+        conn = connect_company_db(company_id)
+        conn.timeout = 10
+        cursor = conn.cursor()
+        cursor.execute(sql, *params)
+        rows = cursor.fetchmany(201)
+        frame = pd.DataFrame.from_records([tuple(row) for row in rows[:200]], columns=STANDARD_PRODUCT_COLUMNS)
+        frame.attrs["kpis_candidates_partial"] = len(rows) > 200
+        return frame
+    finally:
+        try:
+            if cursor is not None:
+                cursor.close()
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def lookup_standard_code_products(company_id: int, standard_codes, *, check_scope) -> pd.DataFrame:
+    """Batch lookup, preserving distinct products and counting R046 history duplicates."""
+    from app.services.ssai_auth_service import connect_company_db
+
+    codes = sorted(set(standard_codes))
+    if (type(company_id) is not int or company_id <= 0 or len(codes) > 5000
+            or any(not isinstance(v, str) or len(v) != 13 or not v.isascii() or not v.isdigit() for v in codes)):
+        raise ValueError("invalid_standard_mapping")
+    columns = STANDARD_PRODUCT_COLUMNS + ["연결원천건수"]
+    if not codes:
+        return pd.DataFrame(columns=columns)
+    _, _, fields, joins = _standard_product_join()
+    conn, cursor, rows = None, None, []
+    try:
+        check_scope()
+        conn = connect_company_db(company_id)
+        conn.timeout = 10
+        cursor = conn.cursor()
+        # 500 parameters stays below SQL Server's parameter limit; no per-result-row calls.
+        for offset in range(0, len(codes), 500):
+            check_scope()
+            batch = codes[offset:offset + 500]
+            remaining = 20001 - len(rows)
+            sql = f"""SELECT TOP ({remaining}) {', '.join(fields)}, COUNT_BIG(*)
+{joins}
+WHERE S.Rd046_Standard_Cd IN ({','.join('?' for _ in batch)})
+GROUP BY {', '.join(fields)}
+ORDER BY {fields[2]}, {fields[0]}"""
+            cursor.execute(sql, *batch)
+            rows.extend(tuple(row) for row in cursor.fetchmany(remaining))
+            check_scope()
+            if len(rows) > 20000:
+                raise ValueError("standard_mapping_limit")
+        return pd.DataFrame.from_records(rows, columns=columns)
+    finally:
+        try:
+            if cursor is not None:
+                cursor.close()
+        finally:
+            if conn is not None:
+                conn.close()
+
+
 def _cache_data(ttl: int = 60, show_spinner: bool = False):
     if st is not None and hasattr(st, "cache_data"):
         return st.cache_data(ttl=ttl, show_spinner=show_spinner)

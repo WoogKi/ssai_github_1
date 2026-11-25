@@ -7627,6 +7627,10 @@ def _is_empty_auto_room(room: dict[str, Any] | None) -> bool:
     return bool(
         isinstance(room, dict)
         and room.get("auto_created") is True
+        # Lazy-loaded storage metadata is not an unsaved input placeholder.
+        and room.get("__messages_loaded") is not False
+        and not room.get("relative_path")
+        and "message_count" not in room
         and not _room_has_any_messages(room)
     )
 
@@ -8286,6 +8290,38 @@ def _sync_room_meta(
             st.session_state["__chat_room_pending_to_persisted_room_id"] = str(room.get("id") or "")
 
     room["updated_at"] = make_ts()
+
+def _render_sims_with_chat_persistence(*, selected, room):
+    """Persist newly delivered KPIS results before their early Streamlit rerun."""
+    def delivered_ids():
+        return {
+            item["id"]
+            for item in room.get("messages", [])
+            if isinstance(item, dict) and item.get("id")
+            and isinstance(item.get("meta"), dict)
+            and item["meta"].get("source") == "KPIS"
+            and item["meta"].get("result_status") == "success"
+        }
+
+    before = delivered_ids()
+    user_id = getattr(get_current_user(), "user_id", None)
+    company_id = _selected_chat_company_id()
+    try:
+        return render_sims_main(selected=selected)
+    finally:
+        # KPIS publishes through wssz/drain, then reruns before Panel's final gate.
+        # Do not push again or save on passive reruns / failed API calls.
+        if (
+            delivered_ids() - before
+            and user_id is not None
+            and getattr(get_current_user(), "user_id", None) == user_id
+            and _selected_chat_company_id() == company_id
+            and _room_matches_company(room, company_id)
+            and str(st.session_state.get("current_room") or "") == str(room.get("id") or "")
+        ):
+            _sync_room_meta(room, materialize=True)
+            save_chat_rooms()
+
 
 def _message_meta(message_type: str = "chat") -> dict[str, Any]:
     meta = _current_chat_meta()
@@ -14269,8 +14305,8 @@ with chat_history_container:
                         st.session_state["__sims_inner_submit"] = False
                         st.stop()
 
-                    render_sims_main(
-                        selected=selected_for_render
+                    _render_sims_with_chat_persistence(
+                        selected=selected_for_render, room=current_room
                     )
 
                     if _flush_pending_dashboard_chat_persistence():
@@ -14483,8 +14519,8 @@ with chat_history_container:
                         st.session_state["__sims_rendered"] = True
                         st.stop()
 
-                    render_sims_main(
-                        selected=selected_for_render
+                    _render_sims_with_chat_persistence(
+                        selected=selected_for_render, room=current_room
                     )                    
                     log.info("[app.main] after render_sims_main() Hub(B)")
                     if _flush_pending_dashboard_chat_persistence():

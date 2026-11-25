@@ -8,8 +8,47 @@
 from __future__ import annotations
 
 from typing import Any
+from dataclasses import dataclass, field
+import logging
+import re
 
 from app.services.ssai_auth_service import connect_company_db
+
+
+ERP_IDENTITY_KEY = "__ssai_erp_own_identity"
+log = logging.getLogger(__name__)
+IDENTITY_STATUSES = frozenset({"verified", "unavailable", "query_failed", "contract_invalid",
+                               "missing", "ambiguous", "vendor_missing", "vendor_ambiguous", "invalid_number"})
+
+
+@dataclass(frozen=True)
+class ErpOwnIdentity:
+    company_id: int
+    user_id: str
+    status: str
+    applicant: str = field(default="", repr=False)
+
+
+def own_identity(company_id, user_id, row):
+    """Accept one ERP self-vendor only; never select a representative duplicate."""
+    count = row.get("own_company_rows")
+    if type(count) is not int or count < 0:
+        return ErpOwnIdentity(company_id, str(user_id), "contract_invalid")
+    if count != 1:
+        return ErpOwnIdentity(company_id, str(user_id), "missing" if count == 0 else "ambiguous")
+    vendors = row.get("own_vendor_rows")
+    if type(vendors) is not int or vendors < 0:
+        return ErpOwnIdentity(company_id, str(user_id), "contract_invalid")
+    if vendors != 1:
+        return ErpOwnIdentity(company_id, str(user_id), "vendor_missing" if vendors == 0 else "vendor_ambiguous")
+    raw = row.get("own_company_number")
+    value = raw.strip() if isinstance(raw, str) else ""
+    if not re.fullmatch(r"[0-9]{10}|[0-9]{3}-[0-9]{2}-[0-9]{5}", value):
+        return ErpOwnIdentity(company_id, str(user_id), "invalid_number")
+    value = value.replace("-", "")
+    if value == "0" * 10:
+        return ErpOwnIdentity(company_id, str(user_id), "invalid_number")
+    return ErpOwnIdentity(company_id, str(user_id), "verified", value)
 
 
 def _clean(value: Any) -> str:
@@ -27,13 +66,13 @@ def get_sims_login_profile(
     기준:
     - Rddbc060.Rd06_User_ID 또는 Rd06_User_Cd
     - 직책/부서/지역/재고위치는 Rddbc010 코드명 조인
+    - ERP 사용자 미연결/미존재여도 자사정보는 같은 SELECT에서 별도로 반환
     """
     sims_user_id = _clean(sims_user_id)
-    if not sims_user_id:
-        return None
 
     sql = """
     SELECT TOP 1
+        CASE WHEN U.Rd06_User_Cd IS NULL THEN 0 ELSE 1 END AS sims_profile_found,
         RTRIM(LTRIM(U.Rd06_User_Cd)) AS sims_user_cd,
         RTRIM(LTRIM(U.Rd06_User_ID)) AS sims_user_id,
         RTRIM(LTRIM(U.Rd06_User_Nm)) AS sims_user_name,
@@ -54,8 +93,21 @@ def get_sims_login_profile(
         RTRIM(LTRIM(U.Rd06_Stock_Cd)) AS stock_code,
         RTRIM(LTRIM(ISNULL(Stock.Rd01_Hnm, U.Rd06_Stock_Cd))) AS stock_name,
 
-        RTRIM(LTRIM(U.Rd06_Del_Flag)) AS sims_del_flag
-    FROM dbo.Rddbc060 U
+        RTRIM(LTRIM(U.Rd06_Del_Flag)) AS sims_del_flag,
+        OwnSetting.own_company_rows,
+        OwnCompany.own_vendor_rows,
+        OwnCompany.own_company_number
+    FROM (SELECT 1 AS login_scope) LoginScope
+    OUTER APPLY (
+        SELECT TOP 1
+            Rd06_User_Cd, Rd06_User_ID, Rd06_User_Nm,
+            Rd06_Department_Gcode, Rd06_Department, Rd06_Duty_Gcode, Rd06_Duty,
+            Rd06_District_Gcode, Rd06_District, Rd06_Stock_Cd_Gcode, Rd06_Stock_Cd,
+            Rd06_Del_Flag
+        FROM dbo.Rddbc060
+        WHERE ? <> '' AND (RTRIM(LTRIM(Rd06_User_ID)) = ?
+                            OR RTRIM(LTRIM(Rd06_User_Cd)) = ?)
+    ) U
     LEFT JOIN dbo.Rddbc010 Dept
         ON Dept.Rd01_Gcode = U.Rd06_Department_Gcode
        AND Dept.Rd01_Tcode = U.Rd06_Department
@@ -68,13 +120,24 @@ def get_sims_login_profile(
     LEFT JOIN dbo.Rddbc010 Stock
         ON Stock.Rd01_Gcode = U.Rd06_Stock_Cd_Gcode
        AND Stock.Rd01_Tcode = U.Rd06_Stock_Cd
-    WHERE RTRIM(LTRIM(U.Rd06_User_ID)) = ?
-       OR RTRIM(LTRIM(U.Rd06_User_Cd)) = ?
+    OUTER APPLY (
+        SELECT COUNT_BIG(*) AS own_company_rows,
+               MIN(C.Rd0A_Value) AS own_vendor_code
+        FROM dbo.Rddbc0A0 C
+        WHERE C.Rd0A_Gcode = '0003' AND C.Rd0A_Tcode = '000001'
+    ) OwnSetting
+    OUTER APPLY (
+        SELECT COUNT_BIG(*) AS own_vendor_rows,
+               MIN(LTRIM(RTRIM(V.Rd03_Ven_Num))) AS own_company_number
+        FROM dbo.Rddbc030 V
+        WHERE OwnSetting.own_company_rows = 1
+          AND V.Rd03_Ven_Cd = OwnSetting.own_vendor_code
+    ) OwnCompany
     """
 
     with connect_company_db(int(company_id)) as conn:
         cur = conn.cursor()
-        row = cur.execute(sql, sims_user_id, sims_user_id).fetchone()
+        row = cur.execute(sql, sims_user_id, sims_user_id, sims_user_id).fetchone()
 
         if not row:
             return None
@@ -121,9 +184,11 @@ def build_login_profile(
         "district_name": "",
         "stock_name": "",
         "profile_source": "SSAI_FALLBACK",
+        ERP_IDENTITY_KEY: ErpOwnIdentity(company_id, str(getattr(user, "user_id", "")), "unavailable"),
     }
 
-    if not company_id or not sims_user_id:
+    if not company_id:
+        log.warning("[kpis.identity] stage=profile reason=company_missing")
         return profile
 
     try:
@@ -132,11 +197,24 @@ def build_login_profile(
             sims_user_id=sims_user_id,
         )
     except Exception as e:
-        profile["profile_error"] = f"{type(e).__name__}: {e}"
+        profile["profile_error"] = f"{type(e).__name__}: ERP_PROFILE_UNAVAILABLE"
+        profile[ERP_IDENTITY_KEY] = ErpOwnIdentity(company_id, str(getattr(user, "user_id", "")), "query_failed")
+        log.warning("[kpis.identity] stage=profile_query reason=query_failed error_type=%s", type(e).__name__)
         return profile
 
     if not sims_profile:
         profile["profile_error"] = "SIMS_USER_PROFILE_NOT_FOUND"
+        log.warning("[kpis.identity] stage=profile_query reason=result_missing")
+        return profile
+
+    identity = own_identity(company_id, getattr(user, "user_id", ""), sims_profile)
+    profile[ERP_IDENTITY_KEY] = identity
+    log.info("[kpis.identity] stage=identity_build reason=%s", identity.status)
+    # Company identity must not depend on the optional ERP employee profile.
+    if sims_profile.get("sims_profile_found") != 1:
+        profile["profile_error"] = "SIMS_USER_PROFILE_NOT_FOUND"
+        log.info("[kpis.identity] stage=profile reason=%s",
+                 "sims_user_missing" if sims_user_id else "sims_user_unbound")
         return profile
 
     profile.update(

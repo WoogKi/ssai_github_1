@@ -10,6 +10,7 @@ import streamlit as st
 from app.sims.config import DEFAULT_MODE
 # 실행(메인 패널)은 패널 모듈의 단일 소스만 사용
 from app.ui.sims_panel import render_sims_main
+from app.ui.kpis_erp_query import KPIS_ACTIONS
 # Hub(집중 뷰) 메인은 허브 모듈에서
 from app.ui.sims_hub import render_sims_hub as _hub_main
 
@@ -68,6 +69,7 @@ def _panel_sidebar() -> Dict[str, str]:
         "재고관리",
         "입출고/명세서/재고",
         "분석/KPI",
+        "KPIS",
     ]
 
     master_target_options = [
@@ -231,6 +233,8 @@ def _panel_sidebar() -> Dict[str, str]:
             return "입출고/명세서/재고"
         if cat == "분석/KPI":
             return "분석/KPI"
+        if cat == "KPIS":
+            return "KPIS"
 
         # action만 남아 있는 경우 보정
         for actions in io_action_group_map.values():
@@ -364,6 +368,10 @@ def _panel_sidebar() -> Dict[str, str]:
                 action_options,
                 key=action_key,
             )
+
+        elif business_group == "KPIS":
+            category = "KPIS"
+            action = st.selectbox("작업선택", list(KPIS_ACTIONS), key="__sims_action_kpis_v2")
 
         else:
             category = "분석/KPI"
