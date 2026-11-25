@@ -8329,6 +8329,34 @@ def _message_meta(message_type: str = "chat") -> dict[str, Any]:
     return meta
 
 
+def _try_handle_kpis_chat(text, room, event_id):
+    from app.services.kpis_nlq import is_explicit_kpis
+    if not is_explicit_kpis(text):
+        return False
+    from app.ui.kpis_nlq_chat import try_handle_kpis_chat
+
+    # The existing composer has already atomically consumed this submit.
+    # Legacy text/STT submissions may have no callback event id.
+    event_id = event_id or str(uuid.uuid4())
+
+    user_id = getattr(get_current_user(), "user_id", None)
+    company_id = _selected_chat_company_id()
+
+    def is_current():
+        return (user_id is not None and company_id is not None
+                and getattr(get_current_user(), "user_id", None) == user_id
+                and _selected_chat_company_id() == company_id
+                and _room_matches_company(room, company_id))
+
+    def message(role, content):
+        return {"id": str(uuid.uuid4()), "role": role, "content": content,
+                "time": make_ts(), "seq": _next_seq(), **_message_meta("kpis_nlq")}
+
+    return try_handle_kpis_chat(text, room, event_id=event_id, make_message=message,
+        materialize=lambda target: _sync_room_meta(target, materialize=True), save=save_chat_rooms,
+        is_current=is_current)
+
+
 def _knowledge_request_context_for_room(room: dict[str, Any], *, technical_detail_mode: bool):
     """Capture selected-company identity once for one explicit Knowledge request."""
     user = get_current_user()
@@ -12809,6 +12837,10 @@ user_input = auto_user_input or typed_user_input
 
 if user_input and user_input.strip():
     user_input = user_input.strip()
+
+    # Explicit KPIS owns this submit, including validation failures; never fall through.
+    if _try_handle_kpis_chat(user_input, current_room, pending_text_event_id):
+        st.rerun()
 
     st.session_state.pop("__sims_flash", None)
     # Knowledge-owned requests keep their query bytes. The normal Korean/English

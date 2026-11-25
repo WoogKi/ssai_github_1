@@ -115,7 +115,7 @@ def _display_query_value(name, value):
     return value
 
 
-def publish_result(result, query, expected, *, load_session=None, push=None):
+def publish_result(result, query, expected, *, load_session=None, push=None, summary_note=""):
     current = (load_session or load_current_api_session)()
     if (current is None or (current.company_id, current.user_id, current.epoch) != expected
             or not future(current.expires_at)
@@ -149,7 +149,7 @@ def publish_result(result, query, expected, *, load_session=None, push=None):
     payload = dict(type="table", action=title, title=title, df=frame,
                    params=dict(query), meta={"_ssai_company_id": current.company_id,
                        "source": "KPIS", "service": service, "result_status": "success",
-                       "query_summary": ("전체 변경 이력 / " if service == "MA101" else "") + " / ".join(f"{LABELS.get(k, k)}: {_display_query_value(k, v)}" for k, v in query.items()),
+                       "query_summary": ("전체 변경 이력 / " if service == "MA101" else "") + " / ".join(f"{LABELS.get(k, k)}: {_display_query_value(k, v)}" for k, v in query.items()) + (" / " + summary_note if summary_note else ""),
                        "physical_call_count": result["physical_call_count"],
                        "kpis_history_scope": "전체 변경 이력" if service == "MA101" else "",
                        "retrieved_at": result["retrieved_at"]})
@@ -337,7 +337,7 @@ def _vendor_candidate(scope, key, service):
     return number, missing_link or dirty
 
 
-def _call_selected(service, queries, scope):
+def _call_selected(service, queries, scope, *, check_scope=None, on_result=None):
     # 입력을 먼저 전부 확인하고, 실패 시 나머지 요청 및 부분 결과 게시를 중단한다.
     if not 1 <= len(queries) <= 20:
         raise ApiManagementError("invalid_query_count")
@@ -345,7 +345,13 @@ def _call_selected(service, queries, scope):
     results = []
     for query in checked:
         _fresh_actor(scope, service)
+        if check_scope is not None:
+            check_scope()
         result = configured_direct_client().call(Request(service, "PRODUCTION", *scope), query, explicit=True)
+        if on_result is not None:
+            on_result(query, result)
+        if check_scope is not None:
+            check_scope()
         if result["status"] != "SUCCESS":
             return result
         results.append(result)
@@ -369,6 +375,8 @@ def _call_selected(service, queries, scope):
             combined["erp_mapping_status"] = "unavailable"
             logging.getLogger("ssai.kpis").warning("[kpis.erp_mapping] status=unavailable")
         _fresh_actor(scope, service)
+        if check_scope is not None:
+            check_scope()
     return combined
 
 
