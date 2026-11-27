@@ -366,6 +366,8 @@ def _base_from() -> str:
 @_cache_data(ttl=60, show_spinner=False)
 def search_rows(
     *,
+    company_id: int | None = None,
+    session_epoch: int = 0,
     user_cd: str = "",
     user_id: str = "",
     sabun: str = "",
@@ -500,6 +502,9 @@ def search_rows(
     WHERE {" AND ".join(where)}
     ORDER BY U.{COL_USER_CD}
     """
+    if company_id is not None:
+        from app.services.erp_table_query_service import execute_bound_select
+        return drop_sensitive_user_columns(execute_bound_select(sql, params, company_id=company_id))
     return _run_df("search_rows", sql, tuple(params))
 
 

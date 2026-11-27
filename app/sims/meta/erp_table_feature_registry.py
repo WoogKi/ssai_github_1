@@ -47,6 +47,8 @@ class ErpTableFeatureSpec:
     menu_target: str = ""
     limit_policy: str = "common_display_export_safety"
     source_limit_env: str = "SIMS_IO_QUERY_MAX_ROWS"
+    nlq_enabled: bool = True
+    scope_bound: bool = False
 
 
 RDDBC070 = ErpTableFeatureSpec(
@@ -306,13 +308,36 @@ HOSPITAL_ORDER_CALCULATION = ErpTableFeatureSpec(
     ),), menu_business_group="재고관리", menu_target="병원발주계산",
 )
 
-ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230, RDDBC170_RDDBC180, ORDER_CALCULATION, HOSPITAL_ORDER_CALCULATION)
+def _payment_features():
+    from app.sims.meta.rddbc_payment_meta import PRIMARY_KEYS, TITLES, detail_spec
+
+    def filters(table):
+        spec = detail_spec(table, "")
+        return tuple(ErpFilterSpec(key, spec["filter_labels"][key], column, kind)
+                     for key, (column, kind) in spec["filter_sources"].items())
+
+    return tuple(ErpTableFeatureSpec(
+        table_key="rddbc" + table, source_table="dbo.Rddbc" + table,
+        category="입출금", required_permission="IO_READ", primary_key=PRIMARY_KEYS[table],
+        filters=filters(table),
+        actions=(ErpTableActionSpec(
+            action=TITLES[table], aliases=(), mode="basic",
+            service_function=f"app.services.rddbc{table}_service.get_rddbc{table}_result",
+            export_function=f"app.services.rddbc{table}_service.get_rddbc{table}_export_df",
+            view_function=f"app.sims.views.rddbc_payment_views.view_rddbc{table}",
+            payload_key=f"__io{table}_last_payload", nlq_period_policy="explicit_only",
+        ),), menu_business_group="입출금 관리", menu_target="입출금", nlq_enabled=False, scope_bound=True,
+    ) for table in TITLES)
 
 
-def iter_action_specs() -> tuple[tuple[ErpTableFeatureSpec, ErpTableActionSpec], ...]:
+ERP_TABLE_FEATURES: tuple[ErpTableFeatureSpec, ...] = (RDDBC070, RDDBC230, RDDBC170_RDDBC180, ORDER_CALCULATION, HOSPITAL_ORDER_CALCULATION) + _payment_features()
+
+
+def iter_action_specs(*, nlq_only=False) -> tuple[tuple[ErpTableFeatureSpec, ErpTableActionSpec], ...]:
     return tuple(
         (feature, action)
         for feature in ERP_TABLE_FEATURES
+        if not nlq_only or feature.nlq_enabled
         for action in feature.actions
     )
 
@@ -362,7 +387,7 @@ def match_action_in_text(text: Any) -> tuple[ErpTableFeatureSpec, ErpTableAction
     if not compact:
         return None
     candidates: list[tuple[int, ErpTableFeatureSpec, ErpTableActionSpec]] = []
-    for feature, action_spec in iter_action_specs():
+    for feature, action_spec in iter_action_specs(nlq_only=True):
         for label in (action_spec.action, *action_spec.aliases):
             label_compact = re.sub(r"\s+", "", label)
             if label_compact == "발주":

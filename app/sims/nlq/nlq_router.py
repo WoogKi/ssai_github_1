@@ -7414,7 +7414,7 @@ def _try_handle_io_nlq(
 
     from app.sims.meta.erp_table_feature_registry import iter_action_specs
 
-    for _feature, _action_spec in iter_action_specs():
+    for _feature, _action_spec in iter_action_specs(nlq_only=True):
         _module_name, _function_name = _action_spec.service_function.rsplit(".", 1)
         service_specs[_action_spec.action] = (_module_name, [_function_name])
 

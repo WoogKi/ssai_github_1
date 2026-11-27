@@ -161,6 +161,11 @@ def _fixed_char_join_eq(left: str, right: str) -> str:
     return f"{left} = {right}"
 
 
+def vendor_staff_key_match(vendor_alias: str, staff_alias: str) -> str:
+    """Current owner of the transaction vendor, independent of payment direction."""
+    return _fixed_char_join_eq(f"{staff_alias}.{COL060_USERCD}", f"{vendor_alias}.{COL_SALES_MAN}")
+
+
 def _clean_text(value: Optional[str]) -> str:
     return str(value or "").strip()
 
@@ -466,7 +471,7 @@ def _base_from() -> str:
     LEFT JOIN {T060} AS ModU WITH (NOLOCK)
            ON {_fixed_char_join_eq(f'ModU.{COL060_USERCD}', f'V.{COL_MODCD}')}
     LEFT JOIN {T060} AS SalesMan WITH (NOLOCK)
-           ON {_fixed_char_join_eq(f'SalesMan.{COL060_USERCD}', f'V.{COL_SALES_MAN}')}
+           ON {vendor_staff_key_match('V', 'SalesMan')}
 
     LEFT JOIN {T021} AS Road1 WITH (NOLOCK)
            ON {_fixed_char_join_eq(f'Road1.{COL021_ROAD_CD}', f'V.{COL_ROAD_CD}')}

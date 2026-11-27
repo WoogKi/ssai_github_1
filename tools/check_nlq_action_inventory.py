@@ -71,7 +71,7 @@ def _literal_categories() -> dict[str, list[str]]:
                 _fail(f"{category_key.value}: action label이 문자열 literal이 아닙니다.")
             labels.append(action_key.value)
         categories[category_key.value] = labels
-    for feature, action in iter_action_specs():
+    for feature, action in iter_action_specs(nlq_only=True):
         categories.setdefault(feature.category, []).append(action.action)
     return categories
 
@@ -89,7 +89,7 @@ def _check_panel_inventory() -> None:
     panel_labels = [label for labels in panel_categories.values() for label in labels]
     inventory_labels = list(all_panel_labels())
 
-    registered_count = len(iter_action_specs())
+    registered_count = len(iter_action_specs(nlq_only=True))
     if len(panel_labels) != 40 + registered_count:
         _fail(f"panel label 수가 예상과 다릅니다: {len(panel_labels)} != {40 + registered_count}")
     if len(CANONICAL_ACTIONS) != 36 + registered_count:
@@ -128,7 +128,10 @@ def _check_statuses() -> None:
         for spec in CANONICAL_ACTIONS
         if spec.implementation_status not in {IMPLEMENTED, DASHBOARD_ONLY}
     ]
-    expected_implemented = 35 + len(iter_action_specs())
+    panel_only = {action.action for feature, action in iter_action_specs() if not feature.nlq_enabled}
+    if panel_only.intersection(spec.canonical_action for spec in CANONICAL_ACTIONS):
+        _fail("패널 전용 업무가 원천 NLQ 목록에 등록됐습니다.")
+    expected_implemented = 35 + len(iter_action_specs(nlq_only=True))
     if len(implemented) != expected_implemented or len(dashboard_only) != 1 or other:
         _fail(
             "implementation status count 불일치: "

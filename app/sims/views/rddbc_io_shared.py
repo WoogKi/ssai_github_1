@@ -189,12 +189,14 @@ def _render_io_date_range(
     date_to_label: str = "종료일자",
     default_from: Optional[Any] = None,
     default_to: Optional[Any] = None,
+    *,
+    columns=None,
 ) -> Dict[str, Any]:
     today = dt.date.today()
     from_date = _as_date(default_from, today - dt.timedelta(days=30))
     to_date = _as_date(default_to, today)
 
-    c1, c2 = st.columns(2)
+    c1, c2 = columns if columns is not None else st.columns(2)
     with c1:
         date_from = _render_date_input_with_week(
             f"{prefix}_date_from",

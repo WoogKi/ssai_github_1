@@ -68,6 +68,7 @@ def _panel_sidebar() -> Dict[str, str]:
         "마스터관리",
         "재고관리",
         "입출고/명세서/재고",
+        "입출금 관리",
         "분석/KPI",
         "KPIS",
     ]
@@ -235,6 +236,8 @@ def _panel_sidebar() -> Dict[str, str]:
             return "분석/KPI"
         if cat == "KPIS":
             return "KPIS"
+        if cat == "입출금":
+            return "입출금 관리"
 
         # action만 남아 있는 경우 보정
         for actions in io_action_group_map.values():
@@ -368,6 +371,11 @@ def _panel_sidebar() -> Dict[str, str]:
                 action_options,
                 key=action_key,
             )
+
+        elif business_group == "입출금 관리":
+            category = "입출금"
+            action = st.selectbox("작업선택", list(menu_actions(
+                business_group="입출금 관리", target="입출금")), key="__sims_action_payment")
 
         elif business_group == "KPIS":
             category = "KPIS"

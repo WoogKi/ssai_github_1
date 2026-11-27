@@ -1761,10 +1761,13 @@ def _render_panel_chat_only_done(payload: Dict[str, Any], action: str) -> None:
                 or 0
             )
 
-        display_rows_raw = meta.get("display_row_count")
-        if display_rows_raw is None and isinstance(payload.get("df_display"), pd.DataFrame):
-            display_rows_raw = len(payload.get("df_display"))
-        display_rows = int(display_rows_raw or 0)
+        from app.ui.chat_middleware import chat_display_row_count
+        display = payload.get("df_display")
+        source_rows = len(display) if isinstance(display, pd.DataFrame) and not display.empty else loaded_rows
+        if isinstance(df_full, pd.DataFrame) or isinstance(display, pd.DataFrame):
+            display_rows = chat_display_row_count(source_rows)
+        else:
+            display_rows = int(meta.get("display_row_count") or 0)
 
     except Exception:
         db_total_rows = 0
@@ -3339,6 +3342,11 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
     """payload를 화면에 표시하고, 필요 시 채팅 브리지로 전달 (다운로드 버튼은 폼 밖에서)"""
 
     final = bool(payload.get("final"))
+    from app.services.erp_table_query_service import allow_result, scoped_action
+    bound = scoped_action(action)
+    if final and not allow_result(action, payload.get("meta")):
+        st.warning("조회 권한 또는 회사·세션이 변경되었습니다. 다시 조회해 주세요.")
+        return
 
     # 회사 변경 직후 이전 회사 payload가 rerun/compact 경로로 다시 올라오는 것을 차단한다.
     if final and not _panel_payload_matches_current_company(payload):
@@ -3379,6 +3387,7 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
         if _panel_result_target_chat_enabled():
             _render_panel_chat_only_done(payload, action)
         return
+
 
     # Dashboard is a chat-history result, not a panel result. Keep the panel
     # focused on its conditions while preserving every completed Dashboard as
@@ -3692,7 +3701,7 @@ def _render_payload(payload: Dict[str, Any], action: str, *, submission_id: str 
     # ------------------------------------------------------------
     if (
         final
-        and _panel_result_target_chat_enabled()
+        and (bound or _panel_result_target_chat_enabled())
         and (
             isinstance(df_disp, pd.DataFrame)
             or isinstance(df_full, pd.DataFrame)

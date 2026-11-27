@@ -1516,6 +1516,26 @@ def ensure_row_no(df: pd.DataFrame, *, col_name: str = "순번") -> pd.DataFrame
     return out
 
 
+def prepare_exact_table_cells(df: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    """Normalize presentation cells only; keep exact numeric values for export."""
+    out = df.copy()
+    exact = set(meta.get("exact_columns", ()))
+    integers = set(meta.get("integer_columns", ()))
+    dates = set(meta.get("date_columns", ()))
+    for col in out:
+        if col in integers:
+            out[col] = pd.Series((None if pd.isna(v) else int(v) for v in out[col]), index=out.index, dtype=object)
+            continue
+        if col in exact:
+            continue
+        values = ("" if _is_display_missing_token(v) else v for v in out[col])
+        if col in dates:
+            values = (f"{v[:4]}-{v[4:6]}-{v[6:]}" if isinstance(v, str) and len(v) == 8 and v.isdigit()
+                      else v for v in values)
+        out[col] = pd.Series(values, index=out.index, dtype=object)
+    return out
+
+
 def build_sims_table_display_config(
     df: pd.DataFrame,
     *,
@@ -1545,7 +1565,7 @@ def build_sims_table_display_config(
     # Current-stock already arrives as a display copy.  The generic IO
     # normalizer fills numeric nulls with zero, which is incorrect for its
     # repeated-location and subtotal rows.
-    view_df = df.copy() if bool(meta.get("current_stock_query")) else prepare_sims_table_display_df(df, action_name=action_name)
+    view_df = df.copy() if bool(meta.get("current_stock_query") or meta.get("exact_columns")) else prepare_sims_table_display_df(df, action_name=action_name)
 
     if add_row_no:
         view_df = ensure_row_no(view_df, col_name=row_no_name)
@@ -1566,10 +1586,18 @@ def build_sims_table_display_config(
         view_df = _normalize_current_stock_numeric_nulls(view_df)
         view_df, current_stock_text_columns = _prepare_current_stock_number_cells(view_df)
 
-    final_view_df, formatted_numeric_columns = _format_numeric_null_columns_for_display(
-        view_df,
-        preserve_numeric_nulls=bool(meta.get("current_stock_query")) or native_numeric_cells,
-    )
+    if meta.get("exact_columns"):
+        final_view_df = prepare_exact_table_cells(view_df, meta)
+        formatted_numeric_columns = set(meta["exact_columns"]) | set(meta.get("integer_columns", ()))
+        for col in formatted_numeric_columns.intersection(final_view_df.columns):
+            final_view_df[col] = ["" if pd.isna(v) else format(int(v), ",d") for v in final_view_df[col]]
+        if enable_pinning:
+            pinned_cols = set(meta.get("pinned_columns", ())) | {row_no_name}
+    else:
+        final_view_df, formatted_numeric_columns = _format_numeric_null_columns_for_display(
+            view_df,
+            preserve_numeric_nulls=bool(meta.get("current_stock_query")) or native_numeric_cells,
+        )
     column_config: Dict[str, Any] = {}
     total_width = 60
 
@@ -1578,6 +1606,12 @@ def build_sims_table_display_config(
         total_width += width
 
         try:
+            if meta.get("exact_columns") and col in formatted_numeric_columns:
+                kwargs = {"label": _clean_text(col), "width": width, "alignment": "right"}
+                if _supports_pinned():
+                    kwargs["pinned"] = _clean_text(col) in pinned_cols
+                column_config[col] = st.column_config.TextColumn(**kwargs)
+                continue
             column_config[col] = _make_column_config(
                 final_view_df,
                 col,

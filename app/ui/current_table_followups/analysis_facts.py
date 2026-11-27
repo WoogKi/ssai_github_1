@@ -160,8 +160,50 @@ def _build_operational_findings(safe: pd.DataFrame, action: str) -> dict:
     return findings
 
 
+def _exact_source_facts(frame, roles):
+    """Compute from validated integers, without pandas/NumPy float or int64 reductions."""
+    metrics = roles.get("amounts") or [roles["amount"]]
+    if len(metrics) > 1:
+        parts = [_exact_source_facts(frame, {**roles, "amount": metric, "amounts": [metric]})
+                 for metric in metrics]
+        return {**parts[0], "numeric_metrics": {k: v for part in parts for k, v in part["numeric_metrics"].items()},
+                "group_metrics": {}}
+    metric = metrics[0]
+    values = [None if pd.isna(v) else int(v) for v in frame[metric]]
+    valid = [v for v in values if v is not None]
+    stats = dict(valid_count=len(valid), missing_or_invalid_count=len(values)-len(valid),
+                 sum=sum(valid) if valid else None, min=min(valid, default=None), max=max(valid, default=None),
+                 zero_count=valid.count(0), negative_count=sum(v < 0 for v in valid), aggregation="sum")
+    breakdown = {}
+    for role in ("date", "category", "vendor"):
+        col = roles[role]
+        if col not in frame:
+            continue
+        keys = frame[col].tolist()
+        if role == "vendor" and "거래처코드" in frame:
+            keys = [f"{cd} / {name}" for cd, name in zip(frame["거래처코드"], keys)]
+        totals = {}
+        for key, amount in zip(keys, values):
+            name = sanitize_llm_text(str(key), label=col) if pd.notna(key) else "미지정"
+            item = totals.setdefault(name, [0, 0, 0])
+            item[0] += 1
+            if amount is not None:
+                item[1] += 1
+                item[2] += amount
+        ranked = sorted(totals.items(), key=lambda x: (-bool(x[1][1]), -x[1][2], x[0]))
+        breakdown[col] = {"group_count": len(totals), "rows_total": sum(v[0] for v in totals.values()),
+                          "top_groups": [{"group": k, "rows": n, "sum": total if cnt else None}
+                                         for k, (n, cnt, total) in ranked[:20]]}
+    return {"row_count": len(frame), "date_column": roles["date"], "numeric_metrics": {metric: stats},
+            "exact_integer_metrics": True,
+            "group_metrics": breakdown, "analysis_scope": "full_source",
+            "interpretation_limits": ["원본 행의 금액이며 실제 현금흐름, 잔액, 유효상태, 보유 어음액이 아닙니다."]}
+
+
 def build_whole_table_facts(df: pd.DataFrame, *, action: str, query: str,
-                            group_column: str = "", complete_groups: bool = False) -> dict:
+                            group_column: str = "", complete_groups: bool = False, exact_roles=None) -> dict:
+    if exact_roles:
+        return _exact_source_facts(df, exact_roles)
     profile = build_sims_analysis_profile(action, columns=list(df.columns))
     safe = sanitize_sims_llm_dataframe(df, profile)
     safe = safe.loc[:, ~safe.columns.duplicated()]
@@ -417,7 +459,7 @@ def build_verified_whole_table(facts: dict, *, scope: str = "", display_rows: in
         if (stats.get("aggregation") != "sum" or value is None
                 or stats.get("group_sum_matches_total") is False):
             continue
-        shown = f"{float(value):,.0f}" if float(value).is_integer() else f"{float(value):,.2f}"
+        shown = format(value, ",d") if type(value) is int else (f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}")
         lines.append(f"| {str(name).replace('|', '\\|')} | {shown} |")
         if len(lines) >= 12:
             break
@@ -490,8 +532,9 @@ def _verified_interpretation_sentence(sentence: str, facts: dict | None) -> bool
     if (re.search(r"(?:Top|상위)\s*\d+", sentence, flags=re.IGNORECASE)
             and not re.search(r"\d[\d,]*(?:\.\d+)?\s*(?:건|개|원|%)", sentence)):
         return False
+    exact = bool((facts or {}).get("exact_integer_metrics"))
     claims = list(re.finditer(
-        r"(?<!\d)(\d[\d,]*(?:\.\d+)?)\s*(%|퍼센트|건|명|개(?!월|년)|억\s*원|만\s*원|원)",
+        r"(?<!\d)(-?\d[\d,]*(?:\.\d+)?)\s*(%|퍼센트|건|명|개(?!월|년)|억\s*원|만\s*원|원)",
         sentence,
     ))
     leader_claim = any(term in sentence for term in ("가장 높", "가장 많", "최대", "최고", "1위"))
@@ -627,7 +670,13 @@ def _verified_interpretation_sentence(sentence: str, facts: dict | None) -> bool
         if value is None or total is None or (unit in {"%", "퍼센트"} and not total):
             return False
         is_percent = unit in {"%", "퍼센트"}
-        expected = float(value) / float(total) * 100 if is_percent else float(value)
+        if exact:
+            from decimal import Decimal
+            expected = Decimal(int(value))
+            if is_percent:
+                expected = expected * 100 / Decimal(int(total))
+        else:
+            expected = float(value) / float(total) * 100 if is_percent else float(value)
         if unit.replace(" ", "") == "만원":
             expected /= 10000
         elif unit.replace(" ", "") == "억원":
@@ -715,6 +764,14 @@ def build_structured_analysis_options(facts: dict | None) -> list[dict]:
             check_id: str, check: str) -> None:
         options.append({"evidence_id": evidence_id, "topic": topic,
                         "statement": statement, "check_id": check_id, "check": check})
+
+    for i, (label, group) in enumerate((facts.get("group_metrics") or {}).items()):
+        top = group["top_groups"][:3]
+        entries = ", ".join(f"{v['group']} ({v['rows']:,}건, 원본 금액 {v['sum']:,})"
+                            for v in top if v["sum"] is not None)
+        if entries:
+            add(f"source_groups_{i}", label + "별 원본 금액", f"{label}별 원본 금액 상위: {entries}.",
+                f"verify_groups_{i}", "원본 행의 합계이며 현금흐름·잔액·유효상태를 뜻하지 않습니다.")
 
     if "pending_quantity" in findings:
         pending = findings.get("pending_quantity")
@@ -833,7 +890,7 @@ def compose_structured_analysis_output(table: str, model_text: str,
             if (value is None or stats.get("aggregation") != "sum"
                     or stats.get("group_sum_matches_total") is False):
                 continue
-            shown = f"{float(value):,.0f}" if float(value).is_integer() else f"{float(value):,.2f}"
+            shown = f"{value:,d}" if isinstance(value, int) else f"{float(value):,.0f}" if float(value).is_integer() else f"{float(value):,.2f}"
             suffix = "원" if re.search(r"금액|매출액|세액|원가|공급가액", name) else "개"
             totals.append(f"{name} {shown}{suffix}")
             if len(totals) == 4:
@@ -1005,7 +1062,7 @@ def compose_verified_analysis_output(table: str, interpretation: str,
                 continue
             if table and float(value) == 0:
                 continue
-            shown = f"{float(value):,.0f}" if float(value).is_integer() else f"{float(value):,.2f}"
+            shown = f"{value:,d}" if isinstance(value, int) else f"{float(value):,.0f}" if float(value).is_integer() else f"{float(value):,.2f}"
             if re.search(re.escape(str(name)) + r"[^\n]{0,40}" + re.escape(shown), prose):
                 continue
             suffix = "원" if re.search(r"금액|매출액|세액|원가|공급가액", name) else ""
@@ -1035,6 +1092,8 @@ def compose_verified_analysis_output(table: str, interpretation: str,
 def fit_analysis_context(context: dict, limit: int, *, question: str = "",
                          diagnostics: dict | None = None) -> dict:
     """Fit model evidence without changing the cached source or reconciled totals."""
+    if "query_scope" in context:
+        context = {k: v for k, v in context.items() if k != "query_scope"}
     size = lambda value: len(json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":")))
     if diagnostics is not None:
         diagnostics["original_chars"] = size(context)

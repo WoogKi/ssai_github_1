@@ -145,7 +145,7 @@ def _registered_erp_table_actions() -> tuple[CanonicalAction, ...]:
             handler_kind="erp_table",
             handler_target=action_spec.service_function,
         )
-        for feature, action_spec in iter_action_specs()
+        for feature, action_spec in iter_action_specs(nlq_only=True)
     )
 
 
@@ -170,7 +170,7 @@ IO_VIEW_FALLBACK_TARGETS = {
 
 from app.sims.meta.erp_table_feature_registry import iter_action_specs
 
-for _feature, _action in iter_action_specs():
+for _feature, _action in iter_action_specs(nlq_only=True):
     IO_VIEW_FALLBACK_TARGETS[_action.action] = _action.view_function.rsplit(".", 1)[-1]
 
 

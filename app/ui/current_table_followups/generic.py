@@ -1079,6 +1079,25 @@ def _strip_group_words(value: str) -> str:
     return out
 
 
+def _parse_named_group_clause(body, terms):
+    """Match only a complete dimension clause, never a substring of a search value."""
+    clause = re.fullmatch(r"(.+?)(?:집계|합계)[?？]?", _normalize_common_group_query(body))
+    if not clause or not terms:
+        return ()
+    labels = "|".join(map(re.escape, sorted(terms, key=len, reverse=True)))
+    token = re.compile(rf"({labels})(별|기준)?")
+    remaining, matches = clause[1], []
+    while remaining:
+        match = token.match(remaining)
+        if not match:
+            return ()
+        matches.append((match[1], match[2]))
+        remaining = remaining[match.end():]
+    if len(matches) > 1 and not all(marker for _, marker in matches[1:]):
+        return ()
+    return tuple(label for label, _ in matches)
+
+
 def _find_common_group_column(df: pd.DataFrame, query: str, source_action: str = "") -> str:
     if not isinstance(df, pd.DataFrame) or df.empty or not _has_common_group_intent(query):
         return ""
@@ -1106,6 +1125,16 @@ def _find_common_group_column(df: pd.DataFrame, query: str, source_action: str =
         else:
             columns = ("제품명", "품목명", "상품명")
         return next((column for column in columns if column in df.columns), "")
+    # A fully named single dimension outranks substring heuristics. Ambiguous
+    # aliases and older ERP-specific requests keep their existing resolution.
+    group_terms = {}
+    for col in map(str, df.columns):
+        if col not in _COMMON_FILTER_SKIP_COLUMNS:
+            for term in {*_group_aliases(col), _compact(col)}:
+                group_terms.setdefault(term, set()).add(col)
+    parsed = _parse_named_group_clause(body, group_terms)
+    if len(parsed) == 1 and len(group_terms[parsed[0]]) == 1:
+        return next(iter(group_terms[parsed[0]]))
     candidates: list[tuple[int, int, int, str]] = []
 
     for col in [str(c) for c in df.columns]:
@@ -1218,6 +1247,10 @@ def _build_common_group_summary(
     group_code_col: str = "",
     include_numeric_sums: bool = True,
     source_action: str = "",
+    exact_amount: str = "",
+    dimensions: tuple[str, ...] = (),
+    split: str = "",
+    split_values: tuple[str, ...] = (),
 ) -> pd.DataFrame:
     work = df.copy()
     if _norm_col_name(group_col) in {"출고빈도", "출고빈도등급"}:
@@ -1231,7 +1264,26 @@ def _build_common_group_summary(
     if group_col == "추세판정":
         work[group_col] = work[group_col].replace({"(미지정)": "자료부족", "": "자료부족"})
 
-    g = work.groupby(group_cols, dropna=False)
+    group_cols.extend(c for c in dimensions if c not in group_cols)
+    g = work.groupby(group_cols, dropna=False, sort=True)
+    if exact_amount:
+        # Building from object rows avoids inference to float64 for nullable, large totals.
+        groups = list(split_values) if split else [""]
+        if split and not work[split].isin(groups).all():
+            groups.append("미분류")
+        columns = [*group_cols, *(label + suffix for label in groups for suffix in ("건수", "금액"))]
+        records = []
+        for keys, part in g:
+            row = list(keys if isinstance(keys, tuple) else (keys,))
+            for label in groups:
+                selected = part
+                if split:
+                    mask = ~part[split].isin(split_values) if label == "미분류" else part[split].eq(label)
+                    selected = part.loc[mask]
+                nums = [int(v) for v in selected[exact_amount].dropna()]
+                row.extend((len(selected), sum(nums) if nums else None if len(selected) else 0))
+            records.append(row)
+        return pd.DataFrame(records, columns=columns, dtype=object)
     out = g.size().reset_index(name="행수")
 
     distinct_col, distinct_label = _distinct_label_for_group(work, group_col=group_col)
@@ -1440,6 +1492,213 @@ def _common_rank_limit(query: str, top_n: int) -> tuple[bool, int]:
     return bool(direction), limit
 
 
+def _apply_role_predicates(df, body, roles, aliases):
+    """Consume explicit predicates, leaving group/rank tokens for the same source."""
+    from datetime import datetime
+    from decimal import Decimal
+    from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
+
+    work = df
+    codes = set(roles.get("codes", ())).intersection(df.columns)
+    fields = {**aliases, **{_compact(c): c for c in codes}}
+    fields.update({c: c for c in fields.values()})
+    labels = "|".join(map(re.escape, sorted(fields, key=len, reverse=True)))
+    filtered = False
+
+    def text_value(m):
+        nonlocal work, filtered
+        col, raw = fields[m[1]], m[3]
+        quoted = raw.startswith(("'", '"'))
+        value = raw[1:-1] if quoted else raw
+        if not quoted and not m[2].strip() and value.endswith("만") and len(value) > 1:
+            if not _series_compact_for_filter(work[col]).str.contains(_norm_col_name(value), regex=False).any():
+                value = value[:-1]
+        if not value or (not quoted and value.upper() in
+                {"별","조회","조히","검색","집계","합계","순위","목록","상세","TOP","LOW","금액","상위","하위"}):
+            raise ValueError("검색할 컬럼과 값을 함께 입력해 주세요.")
+        if m[2].strip() or col in codes or col == roles.get("split"):
+            mask = work[col].astype("string").str.strip().eq(value).fillna(False)
+        else:
+            needle = _norm_col_name(value)
+            if not needle:
+                raise ValueError("검색할 명칭을 확인해 주세요.")
+            mask = _series_compact_for_filter(work[col]).str.contains(needle, regex=False, na=False)
+        work = work.loc[mask]
+        filtered = True
+        return " "
+
+    # Quoted values may contain spaces; ordinary name and exact code predicates
+    # consume one value, not the following predicate or group.
+    body = re.sub(rf"(?<!\S)({labels})(\s*[:=]\s*|\s+)('[^']+'|\"[^\"]+\"|[^\s,]+)", text_value, body)
+    ops = {"이상": ">=", "이하": "<=", "초과": ">", "미만": "<", "동일": "=="}
+    operator = "|".join(ops)
+    metric, day = roles["amount"], roles["date"]
+    unit_scale = {"": 1, "원": 1, "천원": 1000, "만": 10000, "만원": 10000,
+                  "십만원": 100000, "백만원": 1000000, "천만원": 10000000, "억": 100000000, "억원": 100000000}
+    number = r"-?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?"
+    unit = "|".join(sorted(unit_scale, key=len, reverse=True))
+    money = rf"{number}\s*(?:{unit})"
+    day_token = r"(?:[0-9]{8}|[0-9]{4}-[0-9]{2}-[0-9]{2})"
+
+    def threshold(s):
+        m = re.fullmatch(rf"({number})\s*({unit})", s.strip())
+        digits = m[1].replace(",", "")
+        if len(digits) > 20:
+            raise ValueError("금액 조건의 자릿수를 확인해 주세요.")
+        return Decimal(digits) * unit_scale[m[2]]
+
+    def apply_bounds(m, *, is_date):
+        nonlocal work, filtered
+        def bound(raw):
+            if is_date:
+                return datetime.strptime(raw.replace("-", ""), "%Y%m%d").strftime("%Y%m%d")
+            return threshold(raw)
+        low = bound(m["low"])
+        values = derive_current_table_time_grouping(work[day], "ymd") if is_date else work[metric]
+        valid = values.ne("") if is_date else values.notna()
+        if m["high"]:
+            high = bound(m["high"])
+            if low > high:
+                raise ValueError("범위 시작값이 종료값보다 큽니다.")
+            mask = values.between(low, high)
+        else:
+            mask = _apply_numeric_mask(values, ops.get(m["op"], "=="), low)
+        work = work.loc[valid & mask]
+        filtered = True
+        return " "
+
+    for label, token, is_date in ((re.escape(metric), money, False),
+                                  ("(?:"+"|".join(map(re.escape, (day, "일자", "날짜", "기준일")))+")", day_token, True)):
+        # A money value requires an operator or range; dates also support equality.
+        end = "?" if is_date else ""
+        pattern = (rf"{label}\s*(?P<low>{token})\s*(?:\s*(?:~|부터)\s*(?P<high>{token})(?:까지)?"
+                   rf"|\s*(?P<op>{operator})){end}(?=\s|$)")
+        body = re.sub(pattern, lambda m: apply_bounds(m, is_date=is_date), body)
+
+    split = roles.get("split")
+    for value in roles.get("split_values", ()):
+        # Leave a scoped ranking metric (e.g. 출금 금액 TOP) for metric resolution.
+        pat = rf"(?<!\S){re.escape(value)}(?:만|인\s*자료)?(?!\s*{re.escape(metric)})(?=\s|$)"
+        body, count = re.subn(pat, " ", body)
+        if count:
+            work = work.loc[work[split].eq(value)]
+            filtered = True
+    if filtered:
+        body = re.sub(r"(?<!\S)(?:및|그리고)(?!\S)", " ", body)
+    return work, body, filtered
+
+
+def _exact_role_result(df, query, top_n, roles):
+    """Resolve only fully understood operations on a verified additive source."""
+    from decimal import Decimal
+    from numbers import Integral
+    from app.ui.current_table_followups.time_grouping import derive_current_table_time_grouping
+
+    metric, date = roles["amount"], roles["date"]
+    dims = [c for c in roles["dimensions"] if c in df.columns]
+    split, split_values = roles.get("split", ""), tuple(roles.get("split_values", ()))
+    if not {metric, date}.issubset(df.columns) or (split and split not in dims):
+        raise ValueError("기준일·금액·구분 역할을 확인할 수 없습니다.")
+    if not all(isinstance(v, (Integral, Decimal)) and not isinstance(v, bool)
+               and (not isinstance(v, Decimal) or v.is_finite()) and v == int(v)
+               for v in df[metric].dropna()):
+        raise ValueError("원본 금액의 정수 정밀도를 확인할 수 없습니다.")
+
+    body = re.sub(r"^(현재\s*표|현재\s*조회\s*결과|현재\s*결과)", "", _normalize_common_filter_query(query)).strip()
+    body = re.sub(r"^에서\s*", "", body)
+    if re.search(r"현재\s*표", body):
+        raise ValueError("두 현재표 질문은 각각 입력해 주세요. 두 기준을 함께 보려면 '현재표 월별 거래처별 집계'처럼 입력하세요.")
+    work = df
+    aliases = {alias: col for col in dims for alias in _group_aliases(col)}
+    aliases.update({alias: col for alias, col in roles.get("aliases", {}).items() if col in dims})
+    aliases.update({_compact(c): c for c in dims})
+    if roles.get("category") in dims:
+        aliases["업무구분"] = roles["category"]
+    if split:
+        aliases[_compact(split).removesuffix("구분")] = split
+    time_terms = {"일자": ("day","일자"), "날짜": ("day","일자"), "일": ("day","일자"),
+                  "월": ("month","월"), "요일": ("weekday","요일"), "연도": ("year","연도"),
+                  "년도": ("year","연도"), "년": ("year","연도")}
+    time_terms[_compact(date)] = ("day", "일자")
+    group_terms = set(time_terms) | set(aliases)
+    named_groups = _parse_named_group_clause(body, group_terms)
+    if named_groups:
+        body, filtered = "", False
+    else:
+        work, body, filtered = _apply_role_predicates(work, body, roles, aliases)
+    metric_re = re.escape(metric)
+    selected_metric = ""
+    if split:
+        metric_names = "|".join(map(re.escape, split_values))
+        pattern = rf"(?<![가-힣])({metric_names})\s*{metric_re}"
+        requested = set(re.findall(pattern, body))
+        if len(requested) > 1:
+            raise ValueError("입금금액 또는 출금금액 중 한 가지 기준을 지정해 주세요.")
+        if requested:
+            selected_metric = requested.pop()
+            work = work.loc[work[split].eq(selected_metric)]
+            body = re.sub(pattern, metric, body)
+    direction, limit = parse_current_table_rank_request(body, default_limit=top_n)
+    if not direction and "순위" in body:
+        direction, limit = "desc", top_n
+    body = re.sub(r"(?:TOP|LOW|상위|하위)\s*\d{0,3}(?:건|개)?(?!\d)", " ", body, flags=re.I)
+    compact = _compact(body)
+    group_pattern = re.compile("(" + "|".join(map(re.escape, sorted(
+        group_terms, key=len, reverse=True))) + ")(?:별|기준)")
+    group_keys = []
+    for token in named_groups or tuple(m[1] for m in group_pattern.finditer(compact)):
+        if token in time_terms:
+            period, col = time_terms[token]
+            work = work.assign(**{col: derive_current_table_time_grouping(work[date], period)})
+        else:
+            col = aliases[token]
+        if col == roles.get("vendor") and "거래처코드" in work:
+            group_keys.append("거래처코드")
+        if col == roles.get("staff") and "거래처 담당자코드" in work:
+            group_keys.append("거래처 담당자코드")
+        group_keys.append(col)
+    compact = group_pattern.sub("", compact)
+    aggregate = bool(group_keys or (selected_metric and not direction) or any(w in compact for w in ("합계","집계","건수","행수","총액","요약")))
+    if filtered:
+        compact = re.sub(r"(?:조회|검색|조히)$", "", compact)
+    detail = any(w in compact for w in ("목록","상세","내역","보여","필터"))
+    remaining = re.sub(r"보여주세요|보여줘|해주세요|해줘|합계|집계|건수|행수|총액|요약|목록|상세|내역|전체|필터|금액|순위|그리고|[?,·]", "", compact)
+    for term, column in roles.get("distinct_terms", {}).items():
+        if term in remaining:
+            raise ValueError(f"이 표의 집계 기준은 {term}이 아닙니다. '현재표 {column}별 집계'로 확인해 주세요.")
+    if remaining or not (aggregate or direction or filtered or detail):
+        raise ValueError("지원하는 기준(기간·거래처·업무구분), 금액 또는 필터 조건을 확인해 주세요.")
+    if not aggregate:
+        out = work
+        if direction:
+            out = out.dropna(subset=[metric]).sort_values(metric, ascending=direction=="asc", kind="stable").head(limit)
+        return out, dict(roles), [metric]
+    keys = list(dict.fromkeys(group_keys))
+    if not keys:
+        work = work.assign(전체="전체")
+        keys = ["전체"]
+    use_split = bool(split and not selected_metric and not direction and split not in keys and
+                     any(c in {"일자", "월", roles.get("vendor"), roles.get("staff")} for c in keys))
+    out = _build_common_group_summary(work, keys[0], dimensions=tuple(keys[1:]),
+                                      exact_amount=metric, split=split if use_split else "", split_values=split_values)
+    if selected_metric:
+        out = out.rename(columns={c: selected_metric + c for c in ("건수", "금액")})
+    amounts = [c for c in out if c.endswith("금액")]
+    if "일자" in keys and "요일" not in keys:
+        out.insert(out.columns.get_loc("일자")+1, "요일", derive_current_table_time_grouping(out["일자"], "weekday"))
+    if direction and not out.empty:
+        rank = out[amounts[0]].tolist()
+        if "건수" in compact or "행수" in compact:
+            if metric in compact:
+                raise ValueError("금액 또는 건수 중 순위 기준 하나를 지정해 주세요.")
+            rank = [sum(row) for row in out[[c for c in out if c.endswith("건수")]].itertuples(index=False, name=None)]
+        out = out.assign(_rank=pd.Series(rank, index=out.index, dtype=object)).dropna(subset=["_rank"])
+        out = out.sort_values("_rank", ascending=direction=="asc", kind="stable").head(limit).drop(columns="_rank")
+    result_roles = dict(date=next((c for c in keys if c in ("일자","월","연도","요일")), ""),
+                        category=keys[-1], vendor=roles.get("vendor",""), amount=amounts[0], amounts=amounts)
+    return out, result_roles, amounts
+
+
 def handle_common_column_group_followup(
     *,
     df: pd.DataFrame,
@@ -1454,6 +1713,19 @@ def handle_common_column_group_followup(
         return False
 
     t = str(query or "").strip()
+    if helpers.get("_exact_roles"):
+        out, roles, amounts = _exact_role_result(df, t, top_n, helpers["_exact_roles"])
+        source = helpers.get("_source_display", {})
+        amounts = list(dict.fromkeys([*amounts, *(c for c in source.get("exact_columns", ()) if c in out)]))
+        display = {k: [c for c in source.get(k, ()) if c in out]
+                   for k in ("date_columns", "integer_columns", "pinned_columns")}
+        display["integer_columns"].extend(c for c in out if c.endswith("건수") and c not in df)
+        if "일자" in out and "일자" not in display["date_columns"]:
+            display["date_columns"].append("일자")
+        return bool(helpers["push_table"](title=t, action=source_action, df=out,
+                    query_summary=t, source_query=t, source_rows=len(df), source_table_key=table_key,
+                    extra_meta={**display, "analysis_roles": roles, "exact_columns": amounts,
+                                "query_scope": helpers["_query_scope"], "source_call_count": 0}))
     group_col = str(helpers.get("_requested_group_column") or "") or _find_common_group_column(df, t, source_action)
     if group_col and group_col not in df.columns:
         return False

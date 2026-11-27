@@ -272,6 +272,8 @@ def list_group_kinds(top: int = 500, only_active: bool = True):
 @_cache_data(ttl=60, show_spinner=False)
 def search_rows(
     *,
+    company_id: int | None = None,
+    session_epoch: int = 0,
     gcode: str = "",
     tcode: str = "",
     keyword: str = "",
@@ -413,6 +415,9 @@ def search_rows(
     WHERE {" AND ".join(where)}
     ORDER BY Cd.{COL_GCODE}, Cd.{COL_TCODE}
     """
+    if company_id is not None:
+        from app.services.erp_table_query_service import execute_bound_select
+        return execute_bound_select(sql, params, company_id=company_id)
     return _run_df("search_rows", sql, tuple(params))
 
 

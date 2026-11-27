@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from typing import Any, Sequence
+from contextlib import nullcontext
 import datetime as dt
 
 import pandas as pd
@@ -55,6 +56,7 @@ def render_master_audit_filter(
     prefix: str,
     ns: str,
     expanded: bool = False,
+    embedded: bool = False,
     add_user_label: str = "등록자",
     add_date_from_label: str = "등록일자 시작",
     add_date_to_label: str = "등록일자 종료",
@@ -75,7 +77,7 @@ def render_master_audit_filter(
 
     날짜는 YYYYMMDD 문자열로 반환한다.
     """
-    with st.expander("고급조회", expanded=expanded):
+    with nullcontext() if embedded else st.expander("고급조회", expanded=expanded):
         a1, a2, a3 = st.columns(3)
         with a1:
             add_user_nm = st.text_input(

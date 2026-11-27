@@ -1,5 +1,6 @@
 # app/db/schema_map.py
 from app.sims.meta.rddbc_io_meta import IO_COLS, IO_TABLES
+from app.sims.meta.rddbc_payment_meta import COLS as PAYMENT_COLS, TABLES as PAYMENT_TABLES
 
 SCHEMA = {
     'tables': {
@@ -15,6 +16,7 @@ SCHEMA = {
         'rddbc040': 'dbo.Rddbc040',
         # 🔹 입출고/명세서/세금계산서/월집계
         **IO_TABLES,
+        **PAYMENT_TABLES,
     },
     'cols': {
         # 🔹 Rddbc010: 업무코드
@@ -171,5 +173,6 @@ SCHEMA = {
             'mod_cd':  'Rd04_Mod_Cd',
         },
         **IO_COLS,
+        **PAYMENT_COLS,
     },
 }

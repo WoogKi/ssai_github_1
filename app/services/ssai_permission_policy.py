@@ -29,6 +29,7 @@ from typing import Any
 
 
 CATEGORY_PERMISSION_MAP: dict[str, str] = {
+    "입출금": "IO_READ",
     # 마스터 / 기준정보
     "업무코드": "MASTER_READ",
     "코드": "MASTER_READ",

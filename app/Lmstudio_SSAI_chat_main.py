@@ -4350,9 +4350,9 @@ def _normalize_current_table_followup_input(text: str) -> str:
 
     t = re.sub(r"현\s*제\s*표", "현재표", t)
     t = re.sub(r"현재\s*표", "현재표", t)
-    t = re.sub(r"명\s+별", "명별", t)
-    t = re.sub(r"코드\s+별", "코드별", t)
-    t = re.sub(r"\s+별", "별", t)
+    # Only join the grouping particle, not a name such as '별빛약국'.
+    t = re.sub(r"""("[^"]*"|'[^']*')|\s+별(?=$|\s|집계|합계|분석|현황|요약|순위)""",
+               lambda m: m[1] if m[1] is not None else "별", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
@@ -4441,6 +4441,11 @@ def _current_table_get_latest_df() -> tuple[pd.DataFrame | None, str]:
         last_table_key = str(ss.get("__sims_last_table_key") or "").strip()
 
         def _best_df_for_key(key: str) -> pd.DataFrame | None:
+            from app.services.erp_table_query_service import allow_result
+            meta = (ss.get("__sims_export_table_provenance_by_key") or {}).get(key) or {}
+            action = meta.get("action") or ss.get("__sims_current_table_source_action")
+            if not allow_result(action, meta):
+                return None
             best_df = None
             best_rows = -1
 
@@ -4464,6 +4469,8 @@ def _current_table_get_latest_df() -> tuple[pd.DataFrame | None, str]:
                     source_table_key,
                     last_table_key,
                 )
+                if meta.get("query_scope") and len(best_df) != meta.get("row_count_total"):
+                    return None
                 return best_df.copy()
 
             return None
@@ -4983,7 +4990,8 @@ def _current_table_push_table(
     # 2) None/nan 표시값 정리
     if isinstance(df, pd.DataFrame) and not df.empty:
         df = _current_table_fill_alias_values(df)
-        df = _current_table_clean_none_for_display(df)
+        if not (extra_meta or {}).get("exact_columns"):
+            df = _current_table_clean_none_for_display(df)
         try:
             from app.ui.chat_middleware import _preserve_product_flow_table_dtypes
 
@@ -5498,20 +5506,20 @@ def _try_handle_current_table_dataframe_followup(
     ):
         return False
 
+    source_action_current = str(
+        st.session_state.get("__sims_current_table_source_action")
+        or st.session_state.get("__sims_last_table_action")
+        or ""
+    ).strip()
+    from app.services.erp_table_query_service import scoped_action
     intent = classify_current_table_followup_intent(t)
-    if intent != "dataframe_table":
+    if intent != "dataframe_table" and not scoped_action(source_action_current):
         log.info(
             "[current_table.route] intent=%s stage=pandas_handler_skip capability_check=true query=%r",
             intent,
             str(t or "")[:120],
         )
         return False
-    
-    source_action_current = str(
-        st.session_state.get("__sims_current_table_source_action")
-        or st.session_state.get("__sims_last_table_action")
-        or ""
-    ).strip()
 
     # "현재 거래명세서 ..." is deliberately narrower than a generic current-table
     # request.  It may use the in-memory transaction-document handler only when
@@ -6454,6 +6462,11 @@ def build_messages_with_system(
         sims_data = None
         sims_ctx = None
 
+    # Bound results may reach the model only as permission-checked, verified facts.
+    from app.services.erp_table_query_service import scoped_action
+    if isinstance(sims_data, dict) and scoped_action(sims_data.get("action")):
+        sims_data, sims_ctx = None, None
+
     # 2) ✅ SIMS 관련 질문일 때만 SIMS JSON/CONTEXT를 주입
     analysis_ctx = (
         analysis_ctx_override
@@ -6556,6 +6569,9 @@ def build_messages_with_system(
         log.exception("[chat] source analysis ctx selection failed")
 
     if attach_sims and isinstance(analysis_ctx, dict) and analysis_ctx.get("kind") == "SIMS_ANALYSIS_CONTEXT_V1":
+        from app.services.erp_table_query_service import allow_result
+        if not allow_result(analysis_ctx.get("action"), analysis_ctx):
+            raise PermissionError("분석 당시의 회사·사용자 권한을 확인할 수 없습니다.")
         st.session_state.pop("__sims_analysis_attach_error", None)
         SIMS_JSON_CHAR_LIMIT = 0
         fit_diagnostics = {}
@@ -8120,16 +8136,9 @@ def _push_panel_result_to_current_chat(
 
 
 
-    # 표시용 df 제한
-    try:
-        display_cap = int(os.getenv("SIMS_CHAT_DISPLAY_MAX_ROWS", "2000"))
-    except Exception:
-        display_cap = 2000
-
-    if not isinstance(df_display, pd.DataFrame) or df_display.empty:
-        df_display = df_full.head(min(display_cap, len(df_full))).copy()
-    elif display_cap > 0 and len(df_display) > display_cap:
-        df_display = df_display.head(display_cap).copy()
+    from app.ui.chat_middleware import _limit_chat_display_df
+    display_source = df_display if isinstance(df_display, pd.DataFrame) and not df_display.empty else df_full
+    df_display = _limit_chat_display_df(display_source)
 
     sig = f"{run_seq or ss.get('__sims_run_seq') or 0}::{panel_source_sig}::{action}::{len(df_full)}"
     if ss.get("__sims_panel_chat_push_sig") == sig or (
@@ -9481,6 +9490,12 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
             value = _clip_partition_text(value, _CHAT_PARTITION_TEXT_LIMIT)
         elif key == "meta" and isinstance(value, dict):
             meta_out: dict[str, Any] = {}
+            # Preserve the original binding, never reconstruct it from the viewer's session.
+            scope = value.get("query_scope")
+            if isinstance(scope, dict) and scope.keys() == {"company_id", "user_id", "epoch"}:
+                meta_out["query_scope"] = dict(scope)
+                if value.get("render_as_text") is True:
+                    meta_out["render_as_text"] = True
             is_dashboard = str(message.get("type") or "").strip().lower() == "dashboard_lite"
             for mk in _CHAT_PARTITION_META_ALLOW_KEYS:
                 if mk in value:
@@ -12800,6 +12815,8 @@ chat_immediate_user_slot = st.empty()
 # The current-turn answer must stay after the immediate user bubble, rather
 # than inside the earlier history container.
 chat_pending_area_slot = st.empty()
+# Keep panel widgets after the live answer as well as after persisted history.
+sims_panel_container = st.container()
 immediate_echo_message_id = ""
 
 # =========================
@@ -14237,7 +14254,7 @@ with chat_history_container:
         log.exception("[ui] scrollIntoView failed")
 
     # (D) SIMS 섹션. The native composer remains pinned below this panel.
-    with st.container():
+    with sims_panel_container:
         # SIMS 토글/쿼리 기본값 방어 (첫 렌더 대비)
         st.session_state.setdefault("__sims_open", False)
         st.session_state.setdefault("__sims_q", "")

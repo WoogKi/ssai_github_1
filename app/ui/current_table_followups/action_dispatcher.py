@@ -2076,6 +2076,35 @@ def handle_current_table_followup_by_action(
     - handler가 False를 반환하거나 예외가 나도 사용자에게 notice를 표시해서
       질문에 답 없이 끝나는 일을 막는다.
     """
+    from app.services.erp_table_query_service import scoped_action, allow_result
+    if scoped_action(source_action):
+        meta = source_meta or {}
+        authorized = (allow_result(source_action, meta) and len(df) == meta.get("row_count_total")
+                      and meta.get("action", source_action) == source_action
+                      and meta.get("table_key", table_key) == table_key)
+        status = "unsupported"
+        if not authorized:
+            message, status = "전체 조회자료 또는 조회 당시 권한을 확인할 수 없습니다.", "source_unavailable"
+        elif re.fullmatch(r"(?:현재\s*표\s*)?(?:전체\s*)?(?:건수|행수|몇\s*건)[?\s]*", query.strip()):
+            message, status = f"현재표의 전체 행수는 {len(df):,}건입니다.", "success"
+        elif meta.get("full_source_verified") is True and (meta.get("analysis_roles") or {}).get("dimensions"):
+            try:
+                handle_common_column_group_followup(
+                    df=df, query=query, top_n=top_n, table_key=table_key, source_action=source_action,
+                    helpers={**helpers, "_exact_roles": meta["analysis_roles"], "_query_scope": meta["query_scope"],
+                             "_source_display": meta},
+                    log=log)
+                return True
+            except (ValueError, ArithmeticError) as exc:
+                message = str(exc)
+        else:
+            message = "원본 조회의 분석 기준을 확인할 수 없습니다. 다시 조회해 주세요."
+        helpers["push_notice"](title="현재표", action=source_action if authorized else "현재표",
+            message=message, query_summary="현재표 조회 범위", source_query=query, source_table_key=table_key,
+            source_rows=len(df) if authorized else 0, extra_meta={"source_call_count": 0, "table_created": False,
+                "result_status": status, "execution_status": status,
+                **({"query_scope": meta["query_scope"]} if authorized else {})})
+        return True
     followup_intent = classify_current_table_followup_intent(query)
     kind = detect_current_table_kind(source_action)
     if str(source_action or "").strip() == "제품정보 조회":

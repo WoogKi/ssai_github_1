@@ -79,6 +79,7 @@ Company isolation is mandatory:
 
 ## Development rules
 
+- Before adding or extending an ERP feature, follow the [ERP feature development standard](docs/02_design/SIMS_AI_ERP_FEATURE_DEVELOPMENT_STANDARD.md).
 - For NLQ changes, follow [SIMS NLQ development policy](docs/02_design/SIMS_NLQ_DEVELOPMENT_POLICY.md).
 - Prefer small, reviewable patches.
 - Avoid broad common-module changes unless impact is clear.

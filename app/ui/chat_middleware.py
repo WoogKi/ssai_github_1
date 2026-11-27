@@ -1859,14 +1859,16 @@ def _chat_display_max_rows(default: int = 200) -> int:
     return max(0, _get_int_env("SIMS_CHAT_DISPLAY_MAX_ROWS", default))
 
 
+def chat_display_row_count(rows: int, *, limit: int | None = None) -> int:
+    cap = _chat_display_max_rows() if limit is None else int(limit or 0)
+    return min(rows, cap) if cap > 0 else rows
+
+
 def _limit_chat_display_df(df: pd.DataFrame, *, limit: int | None = None) -> pd.DataFrame:
     if not isinstance(df, pd.DataFrame):
         return df
 
-    row_limit = _chat_display_max_rows() if limit is None else int(limit or 0)
-    if row_limit > 0 and len(df) > row_limit:
-        return df.head(row_limit).copy()
-    return df.copy()
+    return df.head(chat_display_row_count(len(df), limit=limit)).copy()
 
 
 _STOCK_DISPLAY_VALUE_COLS = (
@@ -3688,6 +3690,20 @@ def _build_sims_analysis_context_from_df(
         meta=meta,
         columns=list(base_df.columns),
     )
+    if meta.get("analysis_roles"):
+        if len(base_df) != meta.get("row_count_total"):
+            return {}
+        from app.ui.current_table_followups.analysis_facts import build_whole_table_facts
+        facts = build_whole_table_facts(base_df, action=action, query="", exact_roles=meta["analysis_roles"])
+        return {"kind": "SIMS_ANALYSIS_CONTEXT_V1", "action": action, "analysis_key": str(uuid.uuid4()),
+                "query_scope": meta.get("query_scope"), "analysis_profile_id": profile["profile_id"],
+                "row_count": len(base_df), "display_row_count": meta.get("row_count_display"),
+                "analysis_scope": "full_source", "whole_table_facts": facts,
+                "query_scope_summary": (str(meta.get("query_summary") or "현재표 후속 결과")
+                                        if meta.get("current_table_followup") else
+                                        f"{facts['date_column']}: {params.get('date_from', '')} ~ {params.get('date_to', '')}"),
+                "sample_records": [],
+                "analysis_text": str(facts), "llm_rules": facts["interpretation_limits"]}
     safe_sample_df = sanitize_sims_llm_dataframe(base_df, profile)
     if action == "발주 계산":
         order_sample_columns = (
@@ -4243,6 +4259,10 @@ def _run_clicked_sims_llm_analysis(
     context_source: str = "",
 ) -> None:
     """Run LLM analysis for the table that owns the clicked button."""
+    from app.services.erp_table_query_service import allow_result
+    if not allow_result(action, analysis_ctx):
+        st.warning("조회 당시 회사·권한이 변경되었습니다.")
+        return
     runner = st.session_state.get("__sims_llm_analysis_runner")
     selected_table_key = str((analysis_ctx or {}).get("table_key") or (analysis_ctx or {}).get("source_table_key") or "").strip()
     selected_action = str((analysis_ctx or {}).get("action") or "").strip()
@@ -4900,6 +4920,13 @@ def _download_source_context(
         "table_key": _first(table_key, meta.get("download_table_key"), meta.get("table_key"), item.get("table_key")),
         "event_id": _first(meta.get("dashboard_event_id"), item.get("id")),
     }
+    if meta.get("query_scope"):
+        context["query_scope"] = dict(meta["query_scope"])
+        context["row_count_total"] = meta.get("row_count_total")
+        context["analysis_roles"] = dict(meta.get("analysis_roles") or {})
+        for key in ("date_columns", "integer_columns", "pinned_columns", "exact_columns"):
+            context[key] = list(meta.get(key) or ())
+        context["full_source_verified"] = meta.get("full_source_verified") is True
     for key in ("result_metric", "result_grain", "filter_column", "filter_value"):
         value = str(meta.get(key) or "").strip()
         if value:
@@ -5858,6 +5885,7 @@ def _render_sims_result_actions_fragment(
     analysis_ctx: Optional[Dict[str, Any]] = None,
     context_source: str = "",
     download_label_prefix: str = "",
+    clicked_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     SIMS 결과 하단 액션 영역.
@@ -5867,6 +5895,10 @@ def _render_sims_result_actions_fragment(
     - LLM 분석 결과는 버튼 아래 전체 폭으로 표시
     - fragment 내부에서만 rerun되어 기존 표 화면은 건드리지 않음
     """
+    from app.services.erp_table_query_service import allow_result
+    if not allow_result(clicked_action, clicked_meta, export=True):
+        st.caption("현재 권한으로 다운로드할 수 없습니다.")
+        return
     c1, c2, c3 = st.columns(3)
 
     with c1:
@@ -6175,6 +6207,23 @@ def _render_sims_result_actions_lazy(
     - 큰 표: 처음에는 [Excel 다운로드 준비] + [LLM 분석]만 표시
     - [Excel 다운로드 준비]를 누른 뒤에만 CSV/XLSX bytes 생성
     """
+    from app.services.erp_table_query_service import allow_result, scoped_action
+    if not allow_result(clicked_action, clicked_meta):
+        st.caption("조회 당시의 회사·권한을 확인해 주세요.")
+        return
+    if scoped_action(clicked_action):
+        if not isinstance(download_df, pd.DataFrame) or len(download_df) != (clicked_meta or {}).get("row_count_total"):
+            st.caption("전체 조회자료가 만료되었습니다. 다시 조회해 주세요.")
+            return
+        if not allow_result(clicked_action, clicked_meta, export=True):
+            st.caption("다운로드에는 EXPORT_EXCEL 권한이 필요합니다.")
+            if st.button("LLM 분석", key="sims_analysis_only_"+key_suffix):
+                ctx, source = _select_sims_analysis_ctx_for_table(table_key=table_key, action=clicked_action,
+                                                                   meta=clicked_meta, download_df=download_df)
+                _run_clicked_sims_llm_analysis(prompt=prompt, key_suffix=key_suffix, table_key=table_key,
+                                               action=clicked_action, message_id=clicked_message_id,
+                                               analysis_ctx=ctx, context_source=source)
+            return
     if str(clicked_action or "").strip() == "제품정보 조회" and isinstance(download_df, pd.DataFrame):
         from app.services.snapshot_product_information_service import (
             project_product_information_frame_for_viewer,
@@ -6216,7 +6265,8 @@ def _render_sims_result_actions_lazy(
 
         return
 
-    download_df = apply_sims_export_projection(download_df)
+    if not (clicked_meta or {}).get("exact_columns"):
+        download_df = apply_sims_export_projection(download_df)
     threshold_rows = _get_sims_download_lazy_threshold_rows()
     row_count = int(len(download_df))
     col_count = int(len(download_df.columns))
@@ -6333,9 +6383,13 @@ def _render_sims_result_actions_lazy(
         t0 = time.perf_counter()
         log.info('[chat.download.prepare] start rows=%s cols=%s', row_count, col_count)
 
+        if (clicked_meta or {}).get("exact_columns"):
+            from app.ui.sims_table_display import prepare_exact_table_cells
+            download_df = prepare_exact_table_cells(_drop_sensitive_columns(download_df), clicked_meta)
         try:
             # CSV has no sheet metadata; retain it only on the original Excel source.
-            csv_download_df = _sanitize_dataframe_for_excel(pd.DataFrame(download_df, copy=False))
+            csv_download_df = (download_df if (clicked_meta or {}).get("exact_columns")
+                               else _sanitize_dataframe_for_excel(pd.DataFrame(download_df, copy=False)))
             csv_bytes = csv_download_df.to_csv(index=False).encode("utf-8-sig")
         except Exception:
             log.exception(
@@ -6357,8 +6411,18 @@ def _render_sims_result_actions_lazy(
                     format_sheet=_apply_sims_excel_number_formats,
                 ) and not _write_supplier_stock_shortage_excel_if_any(writer, download_df):
                     excel_download_df = _sanitize_dataframe_for_excel(download_df)
+                    for col in (clicked_meta or {}).get("exact_columns", ()):
+                        if col in download_df:
+                            excel_download_df[col] = pd.Series([
+                                None if pd.isna(v) else str(int(v)) if abs(int(v)) >= 10**15 else int(v)
+                                for v in download_df[col]], index=download_df.index, dtype=object)
                     excel_download_df.to_excel(writer, index=False, sheet_name="SIMS")
                     _apply_sims_excel_number_formats(writer, excel_download_df, "SIMS")
+                    if (clicked_meta or {}).get("exact_columns"):
+                        for row in writer.sheets["SIMS"]:
+                            for cell in row:
+                                if cell.data_type == "f":
+                                    cell.data_type = "s"
             excel_bytes = bio.getvalue()
             log.info('[chat.download.excel] complete rows=%s bytes=%s seconds=%.3f',
                      row_count, len(excel_bytes), time.perf_counter() - excel_started)
@@ -6402,6 +6466,7 @@ def _render_sims_result_actions_lazy(
         clicked_message_id=clicked_message_id,
         analysis_ctx=analysis_ctx,
         context_source=analysis_ctx_source,
+        clicked_meta=clicked_meta,
         download_label_prefix=download_label_prefix,
     )
 
@@ -6426,6 +6491,9 @@ def _render_sims_result_actions_plain(
     SIMS 결과 하단 액션 버튼 직접 렌더링.
     fragment 렌더 이슈를 피하기 위한 안정판.
     """
+    from app.services.erp_table_query_service import allow_result
+    if not allow_result(clicked_action, clicked_meta, export=True):
+        return
     _chat_log_info_once(
         f"render_action_buttons::{key_suffix}",
         "[chat] render action buttons key=%s csv=%s xlsx=%s",
@@ -7570,6 +7638,9 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
         )
     payload["action"] = action_name
     meta["action"] = action_name
+    from app.services.erp_table_query_service import allow_result
+    if not allow_result(action_name, meta):
+        return None
     meta.setdefault("table_role", _sims_table_role_from_action(action_name, meta))
     payload["meta"] = meta
 
@@ -9800,7 +9871,11 @@ def _build_sims_result_header_view(
     elif expired:
         line2_parts.append("저장된 조회정보만 표시합니다.")
     if followup_available:
-        line2_parts.append("현재표 후속질문 가능")
+        if safe_meta.get("query_scope"):
+            roles = safe_meta.get("analysis_roles") or {}
+            line2_parts.append("현재표 건수·금액·기간별 집계 가능" if roles.get("dimensions") else "현재표 전체 건수 확인 가능")
+        else:
+            line2_parts.append("현재표 후속질문 가능")
     response_timing = _sims_response_timing_text(safe_meta)
     if response_timing:
         line2_parts.append(response_timing)
@@ -9889,7 +9964,10 @@ def _build_sims_result_header_view(
         _sims_detail_add(details, "표시 행수", f"{display_rows:,}건")
     if download_rows:
         _sims_detail_add(details, "다운로드 행수", f"{download_rows:,}건")
-    _sims_detail_add(details, "현재표 후속질문", "가능" if followup_available else "")
+    followup_label = "가능"
+    if safe_meta.get("query_scope"):
+        followup_label = ("건수·금액·기간·거래처·업무구분" if (safe_meta.get("analysis_roles") or {}).get("dimensions") else "전체 건수")
+    _sims_detail_add(details, "현재표 후속질문", followup_label if followup_available else "")
     _sims_detail_add(details, "action", action_name)
     _sims_detail_add(details, "source", source)
     _sims_detail_add(details, "source_action", source_action)
@@ -10133,6 +10211,11 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
     title = item.get("title") or ""
     meta = item.get("meta") or {}
     data = item.get("data")
+
+    from app.services.erp_table_query_service import allow_result
+    if not allow_result(item.get("action") or meta.get("action") or title, meta):
+        st.caption("금융 조회 권한 또는 조회 당시 회사·세션이 다릅니다. 다시 조회해 주세요.")
+        return
 
     if t == "dashboard_lite":
         cache = meta.get("dashboard_cache") if isinstance(meta, dict) else None
@@ -10571,7 +10654,7 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
                     display_df=data,
                 )
                 raw_download_df = download_source_result.get("df")
-                if not isinstance(raw_download_df, pd.DataFrame):
+                if not isinstance(raw_download_df, pd.DataFrame) and not meta.get("query_scope"):
                     raw_download_df = _get_full_download_df_for_sims_item(item, meta, data)
                     recovered_rows = int(len(raw_download_df)) if isinstance(raw_download_df, pd.DataFrame) else 0
                     download_source_result["df"] = raw_download_df
@@ -10757,6 +10840,9 @@ def _render_chat_item_body(item: Dict[str, Any]) -> None:
 
             if order_editor_rendered:
                 pass
+            elif meta.get("exact_columns"):
+                from app.ui.sims_table_display import render_sims_table
+                render_sims_table(data, action_name=action_name, meta=meta)
             elif is_io_table:
                 try:
                     if (is_nlq_table or is_stock_io_table) and _chat_is_large_table_for_fast_render(data, meta):

@@ -6785,7 +6785,10 @@ def run_basic_checks() -> list[CheckResult]:
                 # The root composer follows chat rendering so the STT slot can
                 # occupy the single region immediately above it.
                 and main_src.index('composer_submission = st.chat_input(')
-                > main_src.index('with st.container():')
+                > main_src.index('with sims_panel_container:')
+                > main_src.index('sims_panel_container = st.container()')
+                > main_src.index('chat_pending_area_slot = st.empty()')
+                > main_src.index('chat_history_container = st.container()')
             )
             has_chronological_render_merge = (
                 "def _build_room_render_messages" in main_src

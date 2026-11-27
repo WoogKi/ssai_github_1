@@ -1,5 +1,6 @@
 # app/db/labels_map.py
 from app.sims.meta.rddbc_io_meta import IO_LABELS
+from app.sims.meta.rddbc_payment_meta import LABELS as PAYMENT_LABELS
 
 LABELS = {
     'rddbc010': {
@@ -155,4 +156,5 @@ LABELS = {
         'mod_user_nm': '수정자명',
     },
     **IO_LABELS,
+    **PAYMENT_LABELS,
 }

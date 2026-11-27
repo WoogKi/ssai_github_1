@@ -947,7 +947,10 @@ def test_production_editor_render_boundary():
     assert len(branches) == 1
     branch = branches[0]
     assert len(branch.body) == 1 and isinstance(branch.body[0], ast.Pass)
-    assert isinstance(branch.orelse[0], ast.If) and branch.orelse[0].test.id == "is_io_table"
+    exact = branch.orelse[0]
+    assert isinstance(exact, ast.If) and ast.unparse(exact.test) == "meta.get('exact_columns')"
+    assert any(isinstance(n, ast.Call) and ast.unparse(n.func) == "render_sims_table" for n in ast.walk(exact.body[-1]))
+    assert isinstance(exact.orelse[0], ast.If) and ast.unparse(exact.orelse[0].test) == "is_io_table"
     code = compile(ast.Module(body=[branch], type_ignores=[]), "render-boundary", "exec")
     # Evaluate the real production branch: an editor-owned result cannot reach either general renderer.
     exec(code, {"order_editor_rendered": True})

@@ -25,6 +25,8 @@ def derive_current_table_time_grouping(values: pd.Series, grouping: str) -> pd.S
         .str.slice(0, 8)
     )
     dates = pd.to_datetime(normalized, format="%Y%m%d", errors="coerce")
+    if grouping == "year":
+        return dates.dt.strftime("%Y").astype("string").fillna("")
     if grouping == "month":
         return dates.dt.strftime("%Y-%m").astype("string").fillna("")
     if grouping == "weekday":
