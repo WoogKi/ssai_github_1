@@ -696,12 +696,14 @@ def _primary_failure(categories: list[str]) -> str:
     return next((category for category in order if category in categories), "")
 
 
-def audit(input_path: Path) -> list[dict[str, Any]]:
+def audit(input_path: Path, *, last_id: int | None = None) -> list[dict[str, Any]]:
     fixture = _fixture_df()
     canonical_actions = {item.canonical_action for item in implemented_actions()}
     results: list[dict[str, Any]] = []
     for source in _read_rows(input_path):
         row_no = int(float(source["순번"]))
+        if last_id is not None and row_no > last_id:
+            continue
         preceding = source.get("선행질문 ", source.get("선행질문", ""))
         question = source["질문"]
         expected_action = source["기준 기능 (action)"]

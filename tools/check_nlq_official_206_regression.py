@@ -82,8 +82,8 @@ def _approved_params() -> dict[str, tuple[str, dict[str, Any]]]:
     }
 
 
-def run(casebook: Path) -> dict[str, Any]:
-    audited = audit(casebook)
+def run(casebook: Path, *, last_id: int | None = None) -> dict[str, Any]:
+    audited = audit(casebook, last_id=last_id)
     if not audited:
         raise AssertionError("official casebook has no executable rows")
 

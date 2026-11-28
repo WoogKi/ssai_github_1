@@ -2300,13 +2300,20 @@ def run_unlabeled_io_entity_resolution_checks() -> list[CheckResult]:
     )
 
     router_source = inspect.getsource(nlq_router._try_handle_io_nlq)
+    with patch.object(logging.getLogger("offline.io.trace"), "info") as sink:
+        trace = nlq_router._make_nlq_trace(logging.getLogger("offline.io.trace"), "조회", "test")
+        trace("error", trace_action="출고명세 조회",
+              trace_params={"ven_cd": "private-fixture", "date_from": "20261001"},
+              error=RuntimeError("SQL Server (1205) private-driver-detail"), source_call_count=1)
+        fmt, *values = sink.call_args.args
+        trace_line = fmt % tuple(values)
     results.append(
         CheckResult(
             "NLQ trace classifies SQL Server deadlock 1205 without exposing service parameters",
-            "[nlq.trace." in router_source
-            and "sql_error_number" in router_source
-            and "1205" in router_source
-            and "_trace_safe_params" in router_source,
+            "_make_nlq_trace(" in router_source
+            and all(token in trace_line for token in
+                    ("[nlq.trace.error]", "sql_error_number=1205", "source_call_count=1", "date_from=20261001"))
+            and "private-" not in trace_line,
             "request-scoped safe NLQ trace contract",
         )
     )

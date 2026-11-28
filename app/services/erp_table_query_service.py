@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from calendar import monthrange
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import re
@@ -16,7 +17,36 @@ import pandas as pd
 from app.services.rddbc_io_common import build_result_payload, like_value, normalize_top
 
 
-def execute_bound_select(sql: str, params: Iterable[Any], *, company_id=None) -> pd.DataFrame:
+_detail_stage = ContextVar("detail_query_stage", default=None)
+
+
+@contextmanager
+def observe_detail_query(observer):
+    token = _detail_stage.set(observer)
+    try:
+        yield
+    finally:
+        _detail_stage.reset(token)
+
+
+def _stage(name):
+    if callback := _detail_stage.get():
+        callback(name)
+
+
+class BoundSelectError(RuntimeError):
+    """Public message and allowlisted driver diagnostics; never retain SQL or bindings in logs."""
+
+    def __init__(self, exc):
+        super().__init__("ERP 조회 연결 또는 응답을 확인해 주세요.")
+        self.error_class = type(exc).__name__
+        args = getattr(exc, "args", ())
+        self.sqlstate = str(args[0]) if args and re.fullmatch(r"[A-Z0-9]{5}", str(args[0])) else ""
+        number = re.search(r"\((-?\d{1,10})\)\s*(?=\(SQL|;|$)", str(args[1])) if self.sqlstate and len(args) > 1 else None
+        self.sql_error_number = number[1] if number else ""
+
+
+def execute_bound_select(sql: str, params: Iterable[Any], *, company_id=None, prepare=None) -> pd.DataFrame:
     """Execute a SELECT with driver-bound values.
 
     SQL identifiers are owned by feature code. Only values are accepted here.
@@ -27,11 +57,20 @@ def execute_bound_select(sql: str, params: Iterable[Any], *, company_id=None) ->
             with closing(connect_company_db(company_id)) as db:
                 db.timeout = 10
                 with closing(db.cursor()) as cursor:
+                    missing = ()
+                    if prepare is not None:
+                        _stage("source_schema")
+                        sql, missing = prepare(cursor)
+                    _stage("execute")
                     cursor.execute(sql, *tuple(params))
-                    return pd.DataFrame([tuple(row) for row in cursor.fetchall()],
-                                        columns=[c[0] for c in cursor.description], dtype=object)
-        except Exception:
-            raise RuntimeError("ERP 조회 연결 또는 응답을 확인해 주세요.") from None
+                    _stage("fetch")
+                    frame = pd.DataFrame([tuple(row) for row in cursor.fetchall()],
+                                         columns=[c[0] for c in cursor.description], dtype=object)
+                    if missing:
+                        frame.attrs["unavailable_columns"] = missing
+                    return frame
+        except Exception as exc:
+            raise BoundSelectError(exc) from None
     from app.db.mssql_client import query_to_df
 
     return query_to_df(str(sql), tuple(params))
@@ -191,6 +230,20 @@ def query_scope(permission, *, expected=None, export=False, fresh=True):
     return scope
 
 
+def scoped_vendor_options(text, scope):
+    if not text.strip():
+        return []
+    from app.services.rddbc030_service import search_vendor_candidates
+    query_scope("IO_READ", expected=scope)
+    try:
+        frame = search_vendor_candidates(scope["company_id"], ven_nm_kw=text.strip())
+    except Exception:
+        raise RuntimeError("거래처 후보를 조회할 수 없습니다. 입력과 연결 상태를 확인해 주세요.") from None
+    query_scope("IO_READ", expected=scope)
+    return [(str(c).strip(), str(n).strip()) for c, n in
+            frame[["ERP 거래처코드", "ERP 거래처명"]].itertuples(index=False, name=None)]
+
+
 def scoped_action(action):
     from app.sims.meta.erp_table_feature_registry import get_action_spec
     spec = get_action_spec(action)
@@ -204,6 +257,10 @@ def allow_result(action, meta, *, export=False):
     scope = (meta or {}).get("query_scope")
     if not scope:
         return False
+    if meta.get("source_room_id"):
+        from app.ui import ssai_login as login
+        if str(login.st.session_state.get("current_room") or "") != meta["source_room_id"]:
+            return False
     try:
         query_scope(permission, expected=scope, export=export)
     except Exception:
@@ -278,7 +335,7 @@ def normalize_detail_params(spec, raw, *, today=None):
             "direction": direction, "filters": values}
 
 
-def build_detail_select(spec, params):
+def build_detail_select(spec, params, *, missing=()):
     from app.db.schema_map import SCHEMA
     limits = registered_query_limits(params)
     limit = min(limits.source_top, limits.export_limit_rows)
@@ -301,11 +358,34 @@ def build_detail_select(spec, params):
     if params["direction"] != "all":
         clauses.append(spec["direction_sql"] + (" < ?" if params["direction"] == "receipt" else " >= ?"))
         args.append(spec["direction_boundary"])
-    columns = [f"S.[{f.column}]" for f in spec["fields"]] + list(spec["extra_select"])
+    columns = [f"CAST(NULL AS {f.kind}) AS [{f.column}]" if f.column in missing
+               else f"S.[{f.column}]" for f in spec["fields"]] + list(spec["extra_select"])
     order = ", ".join(f"S.[{k}]" for k in spec["pk"])
     sql = (f"SELECT TOP ({limit+1}) " + ", ".join(columns) + " FROM " + SCHEMA["tables"][spec["table"]]
            + " S " + " ".join(spec["joins"]) + " WHERE " + " AND ".join(clauses) + " ORDER BY " + order)
     return sql, tuple(args), limit, limits.display_top
+
+
+@dataclass(frozen=True)
+class _DetailProjection:
+    spec: dict
+    params: dict
+    sql: str
+
+    def __call__(self, cursor):
+        from app.db.schema_map import SCHEMA
+
+        required = self.spec["pk"][0]
+        optional = self.spec["optional_output"]
+        names = (required, *optional)
+        cursor.execute("SELECT name FROM sys.columns WHERE object_id=OBJECT_ID(?) AND name IN ("
+                       + ",".join("?" for _ in names) + ")", SCHEMA["tables"][self.spec["table"]], *names)
+        present = {str(row[0]).casefold() for row in cursor.fetchall()}
+        if required.casefold() not in present:
+            raise ValueError("원본 테이블 구조를 확인할 수 없습니다.")
+        missing = tuple(name for name in optional if name.casefold() not in present)
+        sql = build_detail_select(self.spec, self.params, missing=missing)[0] if missing else self.sql
+        return sql, missing
 
 
 def read_detail_result(spec, params, *, export=False, expected_scope=None):
@@ -317,20 +397,29 @@ def read_detail_result(spec, params, *, export=False, expected_scope=None):
     if not permission:
         raise PermissionError("등록된 조회 권한이 없습니다.")
     scope = query_scope(permission, expected=expected_scope, export=export)
-    frame = execute_bound_select(sql, args, company_id=scope["company_id"])
+    options = {}
+    if spec.get("optional_output"):
+        options["prepare"] = _DetailProjection(spec, params, sql)
+    _stage("connect")
+    frame = execute_bound_select(sql, args, company_id=scope["company_id"], **options)
+    _stage("post_read_scope")
     query_scope(permission, expected=scope, export=export)
+    _stage("row_limit")
     if len(frame) > limit:
         raise ValueError(f"조회 상한 {limit:,}건을 초과했습니다. 조회조건을 좁혀 주세요.")
+    _stage("source_keys")
     if (not set(f.column for f in spec["fields"]).issubset(frame.columns)
             or not frame.columns.is_unique or frame[list(spec["pk"])].isna().any().any()
             or frame.duplicated(list(spec["pk"])).any()):
         raise ValueError("원본 필드 또는 원본 키를 확인해 주세요.")
+    _stage("exact_amounts")
     for f in spec["fields"]:
         if f.kind == "decimal":
             for v in frame[f.column]:
                 if v is not None and (type(v) not in (Decimal, int) or not Decimal(v).is_finite()
                                       or v != int(v) or abs(v) >= 10**18):
                     raise ValueError("금액 정밀도를 확인할 수 없습니다.")
+    _stage("payload")
     labels = LABELS[spec["table"]]
     full = apply_labels(frame, spec["table"])
     if full.empty:
@@ -343,6 +432,8 @@ def read_detail_result(spec, params, *, export=False, expected_scope=None):
     if params["direction"] != "all":
         criteria.append("입금" if params["direction"] == "receipt" else "출금")
     criteria.extend(f"{spec['filter_labels'][k]}: {v}" for k, v in params["filters"].items())
+    if missing := frame.attrs.get("unavailable_columns"):
+        criteria.append("회사 ERP 미제공 열: " + ", ".join(labels[k] for k in missing))
     summary = " / ".join(criteria)
     shown = full.head(display).copy()
     out = build_feature_result(table=spec["table"], title=spec["title"], params=params, df=shown, summary_md=summary)
@@ -355,6 +446,8 @@ def read_detail_result(spec, params, *, export=False, expected_scope=None):
                                 "category": spec["category_label"],
                                 "staff": spec["filter_labels"].get("vendor_staff_name", ""),
                                 "aliases": spec.get("group_aliases", {}),
+                                "code_aliases": spec.get("code_aliases", {}),
+                                "staff_keys": spec.get("staff_keys", {}),
                                 "codes": [spec["filter_labels"][key] for key, (_, kind, _) in spec["filters"].items()
                                           if kind == "code" and spec["filter_labels"][key] in full],
                                 "distinct_terms": spec.get("distinct_terms", {}),

@@ -171,6 +171,17 @@ def _canonical_conditions(params: Mapping[str, Any], *, action: str = "") -> dic
             result[output_key] = values
         else:
             result[output_key] = values[0]
+    if action in {"입출금 조회", "어음 조회", "담보 조회"}:
+        from app.sims.meta.rddbc_payment_meta import TITLES, detail_spec
+        table = next(t for t, name in TITLES.items() if name == action)
+        spec = detail_spec(table, "")
+        if params.get("date_role") in spec["dates"]:
+            result["date_role"] = params["date_role"]
+        if params.get("direction") in {"all", "receipt", "payment"}:
+            result["direction"] = params["direction"]
+        # Audit the applied roles without retaining financial values in the case log.
+        if isinstance(params.get("filters"), Mapping):
+            result["filter_roles"] = sorted(spec["filters"].keys() & params["filters"].keys())
     return result
 
 

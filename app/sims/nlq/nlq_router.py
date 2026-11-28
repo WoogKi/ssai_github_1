@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Callable, Any, Dict
+from typing import Callable, Any, Dict, Optional
 import logging
 import re
 import uuid
@@ -1380,7 +1380,393 @@ def _is_explicit_codes_master_intent(txt: str) -> bool:
     return bool(normalized) and any(word in normalized for word in _CODES_MASTER_INTENT_WORDS)
 
 
-def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
+def _registered_detail_request(text, state, room):
+    from app.services.payment_nlq import is_detail_edit, match_payment, revision
+    from app.sims.meta.rddbc_payment_meta import TITLES
+
+    pending = (state or {}).get("__sims_registered_pick")
+    if pending and (
+        re.fullmatch(r"[1-9]\d{0,3}\s*번(?:\s*(?:선택|조회))?", text)
+        or _is_pending_pick_cancel_text(text)
+    ):
+        return pending["table"], text, {"pick": pending}
+    update = revision(text)
+    if update is not None and state is not None:
+        key = state.get("__sims_current_table_source_key")
+        previous = (state.get("__sims_export_table_provenance_by_key") or {}).get(
+            key, {}
+        )
+        explicit = match_payment(text)
+        if (
+            key
+            and previous.get("revision_params") is not None
+            and previous.get("query_scope")
+            and room
+            and str(room.get("id") or "")
+            == str(state.get("current_room") or "")
+            == previous.get("room_id")
+            and previous.get("action")
+            == state.get("__sims_current_table_source_action")
+            and previous.get("action") == state.get("__sims_last_table_action")
+            and key in (state.get("__sims_export_tables_by_key") or {})
+        ):
+            for table, title in TITLES.items():
+                if previous.get("action") == title and (
+                    not explicit or explicit == table
+                ):
+                    return (
+                        (table, update, previous)
+                        if explicit or is_detail_edit(table, update)
+                        else None
+                    )
+        # A condition edit must not silently become an unfiltered new query.
+        return (explicit, "", {}) if explicit else None
+    table = match_payment(text)
+    return (table, text, {}) if table else None
+
+
+def _make_nlq_trace(logger, txt, trace_request_id, *, private=False):
+    trace_started = time.perf_counter()
+
+    def _trace_safe_params(trace_params: Dict[str, Any]) -> Dict[str, Any]:
+        """Keep trace diagnostics useful without serializing raw entity values."""
+        safe: Dict[str, Any] = {}
+        for key in ("date_from", "date_to", "month_from", "month_to", "top_n", "stock_mode", "source_mode", "io_gu_list"):
+            value = trace_params.get(key)
+            if isinstance(value, (list, tuple, set)):
+                safe[f"{key}_count"] = len(value)
+            elif value not in (None, ""):
+                safe[key] = value
+        if private and trace_params.get("date_role"):
+            safe["date_role"] = trace_params["date_role"]
+        return safe
+
+    def _trace(
+        stage: str,
+        *,
+        trace_action: str = "",
+        trace_params: Dict[str, Any] | None = None,
+        result_status: str = "",
+        rows: int | None = None,
+        error: BaseException | None = None,
+        source_stage: str = "",
+        source_call_count: int | None = None,
+    ) -> None:
+        current_params = trace_params if isinstance(trace_params, dict) else {}
+        extracted_name = str(current_params.get("nlq_unlabeled_name") or "").strip()
+        search_fields = sorted(current_params.get("filters", {})) if private else _io_nlq_log_search_fields(trace_action, current_params)
+        error_text = "" if private else str(error or "")
+        error_number_match = re.search(r"\b(1205|[A-Z]{2,5}\d{3,5})\b", error_text)
+        safe_error_number = getattr(error, "sql_error_number", "") or (error_number_match.group(1) if error_number_match else "")
+        logger.info(
+            "[nlq.trace.%s] request_id=%s question=%r action=%r extracted_name=%r "
+            "search_mode=%s search_fields=%s date_from=%s date_to=%s safe_params=%s "
+            "stage=%s rows=%s result_status=%s error_class=%s sql_error_number=%s "
+            "source_call_count=%s elapsed_ms=%s total_elapsed_ms=%s sqlstate=%s",
+            stage, trace_request_id, txt, trace_action, extracted_name,
+            "unlabeled_or" if extracted_name else "labeled_or_none", search_fields,
+            current_params.get("date_from") or "", current_params.get("date_to") or "",
+            _trace_safe_params(current_params), source_stage, rows, result_status,
+            getattr(error, "error_class", type(error).__name__) if error is not None else "",
+            safe_error_number,
+            source_call_count,
+            int((time.perf_counter() - trace_started) * 1000),
+            int((time.perf_counter() - trace_started) * 1000),
+            getattr(error, "sqlstate", ""),
+        )
+    return _trace
+
+
+def _run_registered_detail(request, room, state):
+    from app.services.datetime_tool import operating_now
+    from app.services.erp_table_query_service import observe_detail_query, query_scope, scoped_vendor_options
+    from app.services.erp_table_nlq import resolve_registered_erp_table_nlq
+    from app.sims.meta.erp_table_feature_registry import (
+        get_action_spec,
+        resolve_dotted_callable,
+    )
+    from app.ui.chat_middleware import push_sims_result_to_chat
+    from app.ui.current_table_followups.generic import _exact_role_result
+
+    table, phrase, previous = request
+    from app.sims.meta.rddbc_payment_meta import TITLES
+    calls, params, phase = 0, {}, "ownership"
+    condition_hint = ""
+    trace_id = uuid.uuid4().hex
+    emit = _make_nlq_trace(logging.getLogger("ssai"), "", trace_id, private=True)
+
+    def trace(event, **kw):
+        emit(event, trace_action=TITLES[table], trace_params=params,
+             source_stage=phase, source_call_count=calls, **kw)
+
+    def observe(stage):
+        nonlocal calls, phase
+        phase = stage
+        if stage == "execute":
+            calls += 1
+            trace("query")
+
+    trace("start")
+    room_id = str(room.get("id") or "")
+    picked = state.pop("__sims_registered_pick", None)
+    try:
+        if not room_id or room_id != str(state.get("current_room") or ""):
+            raise PermissionError
+        feature, action = get_action_spec(TITLES[table])
+        if previous.get("pick"):
+            last_assistant = next(
+                (
+                    msg
+                    for msg in reversed(room.get("messages") or [])
+                    if msg.get("role") == "assistant"
+                ),
+                {},
+            )
+            if (
+                not picked
+                or picked is not previous["pick"]
+                or picked["room_id"] != room_id
+                or state.get("__sims_last_msg_id") != picked["message_id"]
+                or last_assistant.get("id") != picked["message_id"]
+                or picked["source_key"] != state.get("__sims_current_table_source_key")
+            ):
+                raise PermissionError
+            scope = query_scope(
+                feature.required_permission, expected=picked["query_scope"]
+            )
+            if _is_pending_pick_cancel_text(phrase):
+                trace("finish", result_status="cancelled")
+                push_sims_result_to_chat(
+                    dict(
+                        action="조회 안내",
+                        final=True,
+                        type="text",
+                        data="거래처 선택을 취소했습니다.",
+                        meta={
+                            "result_status": "input_required",
+                            "source_call_count": 0,
+                        },
+                    ),
+                    "조회 안내",
+                )
+                return True
+            index = _extract_pending_product_choice_index(phrase)
+            if not index or index > len(picked["codes"]):
+                raise ValueError("후보 번호를 확인해 주세요.")
+            plan = picked["plan"]
+            filters = dict(plan["params"]["filters"])
+            filters.pop("vendor_name")
+            filters["vendor_cd"] = picked["codes"][index - 1]
+            plan = dict(plan, params=dict(plan["params"], filters=filters))
+        else:
+            phase = "parse"
+            want_pick = bool(re.search(r"\s거래처\s*후보선택$", phrase))
+            if want_pick:
+                phrase = re.sub(r"\s거래처\s*후보선택$", "", phrase)
+            plan = resolve_registered_erp_table_nlq(
+                phrase,
+                today=operating_now().date(),
+                detail_table=table,
+                previous_params=previous.get("revision_params"),
+            )
+            if not plan or "params" not in plan:
+                condition_hint = (plan or {}).get("condition_hint", "")
+                raise ValueError("조건을 확인해 주세요.")
+            params = plan["params"]
+            trace("parsed")
+            phase = "authorization"
+            scope = query_scope(
+                feature.required_permission, expected=previous.get("query_scope")
+            )
+            _clear_pending_product_pick(state)
+            if want_pick:
+                phase = "candidate"
+                filters = plan["params"]["filters"]
+                if not filters.get("vendor_name") or filters.get("vendor_cd"):
+                    raise ValueError("거래처명을 지정해 주세요.")
+                options = scoped_vendor_options(filters["vendor_name"], scope)
+                msg = (
+                    "거래처 후보 번호를 선택해 주세요.\n"
+                    + "\n".join(
+                        f"{i}번: {c} {n}" for i, (c, n) in enumerate(options, 1)
+                    )
+                    if options
+                    else "일치하는 거래처 후보가 없습니다."
+                )
+                receipt = push_sims_result_to_chat(
+                    dict(
+                        action=action.action,
+                        title=action.action,
+                        type="text",
+                        final=True,
+                        data=msg,
+                        message=msg,
+                        meta={
+                            "query_scope": scope,
+                            "source_room_id": room_id,
+                            "result_status": "candidate_required"
+                            if options
+                            else "not_found",
+                            "nlq": True,
+                            "source_call_count": 0,
+                            "candidate_call_count": 1,
+                            "_force_push": True,
+                        },
+                    ),
+                    action.action,
+                )
+                if options and receipt and state.get("__sims_last_msg_id"):
+                    state["__sims_registered_pick"] = dict(
+                        table=table,
+                        plan=plan,
+                        query_scope=scope,
+                        room_id=room_id,
+                        message_id=state["__sims_last_msg_id"],
+                        codes=[c for c, _ in options],
+                        source_key=state.get("__sims_current_table_source_key"),
+                    )
+                trace("finish", result_status="candidate_required" if options else "not_found")
+                return True
+        params = plan["params"]
+        phase = "service"
+        with observe_detail_query(observe):
+            source = resolve_dotted_callable(action.service_function)(
+                params, expected_scope=scope
+            )
+        phase = "verify_source"
+        meta = source["meta"]
+        if (
+            meta.get("query_scope") != scope
+            or meta.get("full_source_verified") is not True
+        ):
+            raise PermissionError
+        full = source["df"]
+        if len(full) != meta["row_count_total"]:
+            raise ValueError("전체 원본 건수를 확인할 수 없습니다.")
+        meta.update(
+            nlq=True,
+            route="io",
+            canonical_action=action.action,
+            parsed_action=action.action,
+            source_call_count=calls,
+            nlq_trace_request_id=trace_id,
+            period_policy=plan["period_policy"],
+            room_id=room_id,
+            source_room_id=room_id,
+            _force_push=True,
+            table_key="sims_" + uuid.uuid4().hex,
+        )
+        result = source
+        op = plan["operation"]
+        if op and len(full):
+            phase = "aggregate"
+            stats = {}
+            frame, roles, amounts = _exact_role_result(
+                full,
+                op,
+                10,
+                meta["analysis_roles"],
+                statistics=stats,
+                separate_directions=plan["params"]["direction"] == "all",
+            )
+            n = len(frame)
+            shown = frame.head(len(source["df_display"])).copy()
+            summary = (
+                f"{meta['query_summary']} / 원본 {len(full):,}건 / {op}: {stats['before_rank']:,}건 중 {n:,}건"
+                " / 다운로드·분석: 집계 결과, 현재표: 상세 원본"
+            )
+            derived = dict(
+                meta,
+                table_key="sims_" + uuid.uuid4().hex,
+                source_table_key=meta["table_key"],
+                source_aggregate=True,
+                analysis_roles=roles,
+                exact_columns=amounts,
+                row_count=n,
+                row_count_total=n,
+                export_row_count=n,
+                displayed_rows=len(shown),
+                row_count_display=len(shown),
+                source_row_count=len(full),
+                summary_md=summary,
+                query_summary=summary,
+                result_status="success" if n else "no_data",
+            )
+            for field in ("integer_columns", "pinned_columns", "date_columns"):
+                derived[field] = [col for col in meta[field] if col in frame]
+            derived["integer_columns"] += [col for col in frame if col.endswith("건수")]
+            result = dict(
+                action=action.action,
+                title=action.action,
+                final=True,
+                params=plan["params"],
+                df=frame,
+                df_display=shown,
+                columns=list(frame),
+                records=shown.to_dict("records"),
+                message=summary,
+                meta=derived,
+            )
+        phase = "delivery"
+        query_scope(feature.required_permission, expected=scope)
+        if room_id != str(state.get("current_room") or ""):
+            raise PermissionError
+        if (
+            push_sims_result_to_chat(result, action.action, detail_source=source)
+            is None
+        ):
+            raise PermissionError
+        trace("finish", rows=len(result["df"]), result_status="success" if len(full) else "no_data")
+    except (ValueError, PermissionError) as exc:
+        status = ("permission_denied" if isinstance(exc, PermissionError) else
+                  "input_required" if phase in {"ownership", "parse", "candidate"} else "query_error")
+        trace("error", error=exc, result_status=status)
+        msg = (
+            "권한 또는 조회 세션을 확인해 주세요."
+            if isinstance(exc, PermissionError)
+            else condition_hint or "업무·조회조건·집계 기준 또는 조회 범위를 확인해 주세요."
+        )
+        push_sims_result_to_chat(
+            dict(
+                action="조회 안내",
+                type="text",
+                final=True,
+                data=msg,
+                message=msg,
+                meta={
+                    "nlq": True,
+                    "_force_push": True,
+                    "result_status": status,
+                    "nlq_trace_request_id": trace_id,
+                    "source_call_count": calls,
+                },
+            ),
+            "조회 안내",
+        )
+    except Exception as exc:
+        trace("error", error=exc, result_status="error")
+        push_sims_result_to_chat(
+            dict(
+                action="조회 안내",
+                type="text",
+                final=True,
+                data="조회 처리 중 오류가 발생했습니다.",
+                meta={
+                    "nlq": True,
+                    "_force_push": True,
+                    "result_status": "error",
+                    "nlq_trace_request_id": trace_id,
+                    "error_class": getattr(exc, "error_class", type(exc).__name__),
+                    "sql_error_number": getattr(exc, "sql_error_number", None),
+                    "source_call_count": calls,
+                },
+            ),
+            "조회 안내",
+        )
+    return True
+
+
+def resolve_new_sims_nlq_candidate(txt: str, *, session_state=None, room=None) -> Dict[str, str] | None:
     """Resolve a new SIMS action without executing a service or DB query.
 
     The chat entrypoint uses this only to distinguish a fresh SIMS/NLQ request
@@ -1401,6 +1787,10 @@ def resolve_new_sims_nlq_candidate(txt: str) -> Dict[str, str] | None:
         return None
     if _is_general_explanation_request(normalized):
         return None
+    registered = _registered_detail_request(normalized, session_state, room)
+    if registered:
+        from app.sims.meta.rddbc_payment_meta import TITLES
+        return {"route": "io", "action": TITLES[registered[0]]}
 
     # Mirror the deterministic codes-first boundary used at execution time.
     # The final code action is chosen only by the handler; this candidate is
@@ -6547,51 +6937,7 @@ def _try_handle_io_nlq(
     - 결과를 채팅 pending 큐로 push
     """
     trace_request_id = uuid.uuid4().hex
-    trace_started = time.perf_counter()
-
-    def _trace_safe_params(trace_params: Dict[str, Any]) -> Dict[str, Any]:
-        """Keep trace diagnostics useful without serializing raw entity values."""
-        safe: Dict[str, Any] = {}
-        for key in ("date_from", "date_to", "month_from", "month_to", "top_n", "stock_mode", "source_mode", "io_gu_list"):
-            value = trace_params.get(key)
-            if isinstance(value, (list, tuple, set)):
-                safe[f"{key}_count"] = len(value)
-            elif value not in (None, ""):
-                safe[key] = value
-        return safe
-
-    def _trace(
-        stage: str,
-        *,
-        trace_action: str = "",
-        trace_params: Dict[str, Any] | None = None,
-        result_status: str = "",
-        rows: int | None = None,
-        error: BaseException | None = None,
-        source_stage: str = "",
-        source_call_count: int | None = None,
-    ) -> None:
-        current_params = trace_params if isinstance(trace_params, dict) else {}
-        extracted_name = str(current_params.get("nlq_unlabeled_name") or "").strip()
-        search_fields = _io_nlq_log_search_fields(trace_action, current_params)
-        error_text = str(error or "")
-        error_number_match = re.search(r"\b(1205|[A-Z]{2,5}\d{3,5})\b", error_text)
-        safe_error_number = error_number_match.group(1) if error_number_match else ""
-        logger.info(
-            "[nlq.trace.%s] request_id=%s question=%r action=%r extracted_name=%r "
-            "search_mode=%s search_fields=%s date_from=%s date_to=%s safe_params=%s "
-            "stage=%s rows=%s result_status=%s error_class=%s sql_error_number=%s "
-            "source_call_count=%s elapsed_ms=%s total_elapsed_ms=%s",
-            stage, trace_request_id, txt, trace_action, extracted_name,
-            "unlabeled_or" if extracted_name else "labeled_or_none", search_fields,
-            current_params.get("date_from") or "", current_params.get("date_to") or "",
-            _trace_safe_params(current_params), source_stage, rows, result_status,
-            type(error).__name__ if error is not None else "",
-            safe_error_number,
-            source_call_count,
-            int((time.perf_counter() - trace_started) * 1000),
-            int((time.perf_counter() - trace_started) * 1000),
-        )
+    _trace = _make_nlq_trace(logger, txt, trace_request_id)
 
     _trace("start")
 
@@ -6725,10 +7071,16 @@ def _try_handle_io_nlq(
     params = dict(parsed.get("params") or {})
     if not action:
         return False
-    unsupported_order_conditions = params.pop("_unsupported_order_conditions", [])
-    if action == "발주조회" and unsupported_order_conditions:
+    if parsed.get("scope_bound"):
+        # Never run a scoped plan through the generic service/view retry path.
+        owned = _registered_detail_request(txt, session_state, room)
+        return _run_registered_detail(owned, room, session_state) if owned else False
+    unsupported_conditions = params.pop("_unsupported_order_conditions", []) if action == "발주조회" else []
+    if params.pop("_unsupported_period_role", False):
+        unsupported_conditions.append("날짜 역할 또는 기간 범위")
+    if unsupported_conditions:
         message = (
-            f"발주조회는 다음 조건을 지원하지 않습니다: {', '.join(unsupported_order_conditions)}. "
+            f"{action}는 다음 조건을 지원하지 않습니다: {', '.join(unsupported_conditions)}. "
             "해당 조건을 제외한 전체 조회는 실행하지 않았습니다. "
             "지원되는 조건으로 다시 질문해 주세요."
         )
@@ -6736,7 +7088,7 @@ def _try_handle_io_nlq(
             "final": True, "type": "text", "title": "SIMS 조회조건 확인",
             "action": action, "params": params, "data": message, "message": message,
             "meta": {"nlq": True, "nlq_query": txt, "result_status": "input_required",
-                     "execution_status": "input_required", "unsupported_conditions": unsupported_order_conditions,
+                     "execution_status": "input_required", "unsupported_conditions": unsupported_conditions,
                      "service_call_skipped": True, "source_call_count": 0,
                      "row_count": 0, "row_count_total": 0, "_force_push": True,
                      "_nlq_nonce": str(uuid.uuid4())},
@@ -8034,6 +8386,11 @@ def try_handle_nlq(
     # 1) 키보드 보정
     txt = keyboard_fix(raw)
 
+    registered = _registered_detail_request(txt, session_state, room)
+    if registered:
+        return _run_registered_detail(registered, room, session_state)
+
+    session_state.pop("__sims_registered_pick", None)
     txt_io = _normalize_io_action_spacing(txt)
     if txt_io != txt:
         logger.debug("[nlq.router] io-action-spacing-fix: %r -> %r", txt, txt_io)

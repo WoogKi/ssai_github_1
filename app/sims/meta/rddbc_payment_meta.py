@@ -1,6 +1,15 @@
 """Source columns from the supplied ERP DDL; no runtime schema probing."""
 from dataclasses import dataclass
 
+STAFF_TERMS = {
+    "vendor_staff_name": ("담당자", "담당자명", "거래처 담당자", "거래처 담당자명", "현재 담당자", "현재 담당자명"),
+    "vendor_staff_cd": ("담당자코드", "거래처 담당자코드", "현재 담당자코드"),
+    "sales_user_name": ("담당영업사원", "담당영업사원명", "당시 담당자", "당시 담당자명", "당시 담당영업사원",
+                        "당시 담당영업사원명", "원본 담당영업사원", "원본 담당영업사원명", "원본 영업사원명"),
+    "sales_user_cd": ("담당영업사원코드", "당시 담당자코드", "당시 담당영업사원코드", "원본 영업사원코드"),
+}
+STAFF_HELP = "거래처 담당자는 거래처 마스터의 현재 영업사원이고, 원본 담당영업사원은 입출금 당시 기록된 영업사원입니다."
+
 
 @dataclass(frozen=True)
 class PaymentField:
@@ -221,6 +230,9 @@ def detail_spec(table, category_label, *, direction_sql=None):
             specs["vendor_staff_name"] = (f"OwnerStaff.{COL060_USERNM}", "name", 100)
             sources["vendor_staff_name"] = (COL060_USERNM, "text")
             labels["vendor_staff_name"] = "거래처 담당자명"
+            specs["vendor_staff_cd"] = (f"{alias}.{COL_SALES_MAN}", "code", 5)
+            sources["vendor_staff_cd"] = (COL_SALES_MAN, "char")
+            labels["vendor_staff_cd"] = "거래처 담당자코드"
         label = field.label.removesuffix("코드") + "명"
         extra.append(f"{alias}.{name} AS [{label}]")
         if suffix in name_ids:
@@ -250,14 +262,21 @@ def detail_spec(table, category_label, *, direction_sql=None):
     if direction_sql:
         extra.append(f"CASE WHEN {direction_sql} < '{direction_boundary}' THEN N'입금' "
                      f"WHEN {direction_sql} >= '{direction_boundary}' THEN N'출금' END AS [입금/출금 구분]")
+    staff_aliases = {
+        spelling: labels[key] for key, terms in STAFF_TERMS.items() if key in labels for term in terms
+        for spelling in ((term, "입출금 " + term) if term.startswith("당시 ") else (term,))
+    }
     return dict(table="rddbc"+table, title=TITLES[table], fields=fields, pk=PRIMARY_KEYS[table],
                 filters=specs, filter_labels=labels, filter_sources=sources, dates=dates,
                 date_columns={s: prefix+s for s in dates},
                 leading=LEADING[table], direction_sql=direction_sql, direction_boundary=direction_boundary,
                 joins=joins, extra_select=extra,
-                group_aliases={"입출금": "입금/출금 구분", "입출금부분명": "입출금구분명", "담당영업사원명": "원본 담당영업사원명",
-                               "담당자": "거래처 담당자명", "담당자명": "거래처 담당자명",
-                               "거래처담당자": "거래처 담당자명"} if table == "310" else {},
+                filter_aliases=STAFF_TERMS if table == "310" else {},
+                group_aliases={"입출금": "입금/출금 구분", "입출금부분명": "입출금구분명",
+                               **{term: col for term, col in staff_aliases.items() if col.endswith("명")}} if table == "310" else {},
+                code_aliases={term: col for term, col in staff_aliases.items() if col.endswith("코드")},
+                staff_keys={labels[k]: labels[cd] for k, cd in
+                            (("vendor_staff_name", "vendor_staff_cd"), ("sales_user_name", "sales_user_cd")) if k in labels},
                 distinct_terms={"입출고구분": "입출금구분명"} if table == "310" else {},
                 category_label=category_label, amount_label="금액")
 

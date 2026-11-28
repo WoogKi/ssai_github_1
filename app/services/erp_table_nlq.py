@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import re
 from typing import Any, Mapping, Optional
 
@@ -11,7 +11,9 @@ from app.services.business_calendar_service import kst_today
 from app.services.io_nlq import (
     extract_labeled_product_code,
     extract_nlq_natural_period,
+    iter_nlq_period_clauses,
     nlq_period_to_date_range,
+    resolve_nlq_period_clause,
     strip_nlq_period_tokens_for_entity_residual,
 )
 from app.services.product_master_filter_contract import (
@@ -181,6 +183,52 @@ def _extract_explicit_contract_period(
         year = year_only.group(1)
         return f"{year}0101", f"{year}1231"
     return "", ""
+
+
+def _price_period_params(text, feature, mode, today):
+    """Consume periods only for registered price roles; stock-by-cost has none."""
+    fields = {item.key: item for item in feature.filters}
+    bound = {}
+    slots = []
+    for span in iter_nlq_period_clauses(text):
+        before = text[:span.start()]
+        owner, label_start = next(((item, label_match.start()) for item in fields.values()
+                                  for label in (item.label, *item.aliases)
+                                  if (label_match := re.search(rf"(?<!\w){re.escape(label)}\s*[:=]?\s*$", before))),
+                                 (None, span.start()))
+        key = owner.key if owner else ""
+        if owner and owner.kind not in ("date", "date_range", "as_of"):
+            continue
+        if contract := re.search(r"(?<!\w)계약시작일(?:자)?\s*[:=]?\s*$", before):
+            key, label_start = "date_from", contract.start()
+        if not span["relative"] and not key:
+            continue  # Unqualified codes and legacy absolute-year history keep their grammar.
+        if not key and mode == "history":
+            key = "date_from"
+        if key not in fields:
+            return text, {"_unsupported_period_role": True}
+        try:
+            start, end = resolve_nlq_period_clause(span, today=today)
+        except ValueError:
+            return text, {"_unsupported_period_role": True}
+        if key == "as_of":
+            values = {key: start} if start == end else {}
+        elif key == "product_final_price_date":
+            values = {key: start if start == end else f"{start}~{end}"}
+        elif owner and key.endswith(("_from", "_to")):
+            values = {key: start if key.endswith("_from") else end}
+        elif key.endswith(("_from", "_to")):
+            prefix = key.rsplit("_", 1)[0]
+            values = {prefix+"_from": start, prefix+"_to": end}
+        else:
+            values = {}
+        if not values or bound.keys() & values.keys():
+            return text, {"_unsupported_period_role": True}
+        bound.update(values)
+        slots.append((label_start, span.end()))
+    for start, end in reversed(slots):
+        text = text[:start] + " " + text[end:]
+    return text, bound
 
 
 def _extract_numeric_filter(text: str, labels: tuple[str, ...]) -> str:
@@ -455,18 +503,18 @@ def _resolve_order_nlq(
         params["has_outstanding"] = True
 
     if action_spec.mode == "order":
-        if "이번주" in raw:
-            params["date_from"] = (today - timedelta(days=today.weekday())).strftime("%Y%m%d")
-            params["date_to"] = today.strftime("%Y%m%d")
+        explicit_from, explicit_to = _extract_date_range(raw, filter_labels(feature, "date_from"))
+        if explicit_from:
+            params["date_from"], params["date_to"] = explicit_from, explicit_to
         else:
-            explicit_from, explicit_to = _extract_date_range(raw, filter_labels(feature, "date_from"))
-            if explicit_from:
-                params["date_from"], params["date_to"] = explicit_from, explicit_to
-            else:
-                period_raw = raw
-                for labels in staff_labels:
-                    period_raw = _strip_labeled_values_for_period(period_raw, labels)
-                params.update(nlq_period_to_date_range(extract_nlq_natural_period(period_raw, today=today)))
+            period_raw = raw
+            for labels in staff_labels:
+                period_raw = _strip_labeled_values_for_period(period_raw, labels)
+            period = nlq_period_to_date_range(extract_nlq_natural_period(period_raw, today=today))
+            # Current-week order lookups historically expose just the two bounds.
+            if period.get("_nlq_period_kind") == "current_week_to_date":
+                period.pop("_nlq_period_kind")
+            params.update(period)
     else:
         # Expected inbound keeps the Business Calendar default for ordinary
         # questions. A user-written calendar month or absolute range replaces it.
@@ -648,7 +696,21 @@ def resolve_registered_erp_table_nlq(
     text: str,
     *,
     today: date | None = None,
+    detail_table: str | None = None,
+    previous_params: dict[str, Any] | None = None,
 ) -> Optional[dict[str, Any]]:
+    from app.services.payment_nlq import match_payment, parse_payment
+    table = detail_table or match_payment(text)
+    if table:
+        from app.sims.meta.rddbc_payment_meta import TITLES
+        try:
+            plan = parse_payment(text, table, today=today or kst_today(), previous=previous_params)
+        except ValueError as exc:
+            from app.services.payment_nlq import ConditionHint
+            return {"action": TITLES[table], "scope_bound": True, "result_status": "input_required",
+                    "condition_hint": str(exc) if isinstance(exc, ConditionHint) else
+                    "조회기간·조건 범위 또는 집계 기준을 확인해 주세요. 예: 지난달, 거래처별 집계."}
+        return {**plan, "scope_bound": True}
     registered_action = match_action_in_text(text)
     if registered_action and registered_action[0].table_key == "hospital_order_calculation":
         return _resolve_hospital_calculation_nlq(text, today=today)
@@ -703,6 +765,11 @@ def resolve_registered_erp_table_nlq(
         return None
     feature, action_spec = matched
     raw = re.sub(r"\s+", " ", _clean(text))
+    bound_period = {}
+    if feature.table_key in ("rddbc070", "rddbc230"):
+        raw, bound_period = _price_period_params(raw, feature, action_spec.mode, today or kst_today())
+        if bound_period.get("_unsupported_period_role"):
+            return {"action": action_spec.action, "params": bound_period}
     if feature.table_key == "rddbc230":
         return finalize(_resolve_rddbc230_nlq(raw, feature, action_spec))
     if feature.table_key == "rddbc170_rddbc180":
@@ -815,4 +882,5 @@ def resolve_registered_erp_table_nlq(
     if top_match:
         params["display_top"] = int(top_match.group(1))
 
+    params.update(bound_period)
     return finalize({"action": action_spec.action, "params": params})

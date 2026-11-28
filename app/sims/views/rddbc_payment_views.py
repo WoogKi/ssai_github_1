@@ -4,25 +4,11 @@ import streamlit as st
 from app.db.labels_map import LABELS
 from app.sims.views.master_advanced_filters import render_master_audit_filter
 from app.services import rddbc310_service, rddbc320_service, rddbc330_service
-from app.services.erp_table_query_service import calendar_month_period, query_scope
+from app.services.erp_table_query_service import calendar_month_period, query_scope, scoped_vendor_options as _vendor_candidates
 from app.sims.views.rddbc_io_shared import (
     _apply_vendor_pick, _needs_vendor_pick, _render_io_date_range,
     _render_vendor_candidate_row, _trigger_panel_run,
 )
-
-
-def _vendor_candidates(text, scope):
-    if not text.strip():
-        return []
-    from app.services.rddbc030_service import search_vendor_candidates
-    query_scope("IO_READ", expected=scope)
-    try:
-        frame = search_vendor_candidates(scope["company_id"], ven_nm_kw=text.strip())
-    except Exception:
-        raise RuntimeError("거래처 후보를 조회할 수 없습니다. 입력과 연결 상태를 확인해 주세요.") from None
-    query_scope("IO_READ", expected=scope)
-    code, name = "ERP 거래처코드", "ERP 거래처명"
-    return [(str(c).strip(), str(n).strip()) for c, n in frame[[code, name]].itertuples(index=False, name=None)]
 
 
 def _view(spec, run):
@@ -61,7 +47,8 @@ def _view(spec, run):
             options = {"all": "전체", "receipt": "입금", "payment": "출금"}
             direction = family.selectbox("입금/출금 구분", list(options), format_func=options.get, key=prefix+"_family")
             filters["flow_code"] = code.text_input(spec["filter_labels"]["flow_code"], key=prefix+"_group_code")
-            filters["vendor_staff_name"] = staff.text_input(spec["filter_labels"]["vendor_staff_name"], key=prefix+"_staff")
+            from app.sims.meta.rddbc_payment_meta import STAFF_HELP
+            filters["vendor_staff_name"] = staff.text_input(spec["filter_labels"]["vendor_staff_name"], key=prefix+"_staff", help=STAFF_HELP)
         else:
             input_row("note_no", "note_seq", "note_type_name" if table == "rddbc320" else "collateral_kind_name")
         with st.expander("추가 조회조건"):

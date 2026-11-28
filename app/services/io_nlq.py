@@ -134,8 +134,11 @@ def has_transaction_query_signal(text: str) -> bool:
 
 def _split_compact_relative_day_action(text: str) -> str:
     """Separate a relative day from an existing IO action in the same token."""
+    if _QUOTED_VALUE.search(text):
+        return "".join(part if i % 2 else _split_compact_relative_day_action(part)
+                       for i, part in enumerate(_QUOTED_VALUE.split(text)))
     return re.sub(
-        r"(?<![가-힣A-Za-z0-9])(오늘|어제|그저께|당일)((?:입고|출고|매입|매출)(?:현황|조회)?)(?=\s|$)",
+        rf"(?<!\w)({_RELATIVE_PERIOD})((?:입고|출고|매입|매출)(?:현황|조회|명세)?|거래명세서|세금계산서)(?=\s|$)",
         r"\1 \2",
         text,
     )
@@ -217,6 +220,12 @@ def _valid_compact_date_range(text: str) -> re.Match[str] | None:
     return None
 
 
+_SQL_YEAR = r"((?:19|20)\d{2})"
+_SEPARATED_PART = r"\s*[-./]\s*(\d{1,2})"
+_KR_MONTH = r"\s*년\s*(\d{1,2})\s*월"
+_KR_DAY = r"\s*(\d{1,2})\s*일?"
+
+
 def _extract_date_range(text: str) -> Dict[str, str]:
     """
     일자 조건 추출.
@@ -237,7 +246,7 @@ def _extract_date_range(text: str) -> Dict[str, str]:
         return f"{str(y).zfill(4)}{str(m).zfill(2)}{str(d).zfill(2)}"
 
     # YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD 범위
-    date_pat = r"((?:19|20)\d{2})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})"
+    date_pat = _SQL_YEAR + _SEPARATED_PART * 2
     m = re.search(
         rf"{date_pat}\s*(?:~|부터|에서|to)\s*{date_pat}",
         t,
@@ -249,7 +258,7 @@ def _extract_date_range(text: str) -> Dict[str, str]:
         return out
 
     # YYYY년 MM월 DD일 범위
-    kor_date_pat = r"((?:19|20)\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일?"
+    kor_date_pat = _SQL_YEAR + _KR_MONTH + _KR_DAY
     m = re.search(
         rf"{kor_date_pat}\s*(?:~|부터|에서|to)\s*{kor_date_pat}",
         t,
@@ -332,7 +341,7 @@ def _extract_month_range(text: str) -> Dict[str, str]:
         return f"{str(y).zfill(4)}{str(m).zfill(2)}"
 
     # YYYY-MM / YYYY.MM / YYYY/MM 범위
-    month_pat = r"((?:19|20)\d{2})\s*[-./]\s*(\d{1,2})"
+    month_pat = _SQL_YEAR + _SEPARATED_PART
     m = re.search(
         rf"{month_pat}\s*(?:~|부터|에서|to)\s*{month_pat}",
         t,
@@ -344,7 +353,7 @@ def _extract_month_range(text: str) -> Dict[str, str]:
         return out
 
     # YYYY년 MM월 범위
-    kor_month_pat = r"((?:19|20)\d{2})\s*년\s*(\d{1,2})\s*월"
+    kor_month_pat = _SQL_YEAR + _KR_MONTH
     m = re.search(
         rf"{kor_month_pat}\s*(?:~|부터|에서|to)\s*{kor_month_pat}",
         t,
@@ -412,6 +421,7 @@ def _extract_month_range(text: str) -> Dict[str, str]:
     return out
 
 def _extract_year_range_as_months(text: str) -> Dict[str, str]:
+    text = _QUOTED_VALUE.sub(" _literal_ ", text)
     out: Dict[str, str] = {}
 
     # 1900~2026, 2023~2026, 2023년부터 2026년까지
@@ -462,6 +472,142 @@ def _last_day_from_yyyymm(yyyymm: str) -> str:
 
 _NLQ_PERIOD_KIND_KEY = "_nlq_period_kind"
 
+# The same relative vocabulary is used by free-text queries and by consumers
+# which must account for every token (a substring match is not sufficient).
+_DAY_WORD = r"오늘|어제|그저께|당일|하루|최근\s*1\s*일"
+_WEEK_WORD = r"(?:이번|지난)\s*주(?:간)?"
+_PAST_WEEKDAY = r"지난\s*(?:주\s*)?[월화수목금토일]요일"
+_MONTH_WORD = r"이달|(?:이번|지난)\s*(?:달|월)"
+_ROLLING_MONTH = r"(?:최근\s*)?(?:한\s*달|1\s*개월)"
+_RELATIVE_PERIOD = rf"(?:{_PAST_WEEKDAY}|{_DAY_WORD}|{_WEEK_WORD}|{_MONTH_WORD}|{_ROLLING_MONTH}(?:간)?|최근\s*30\s*일(?:간)?|다음\s*(?:달|월))"
+_QUOTED_VALUE = re.compile(r"""("[^"\n]*"|'[^'\n]*'|“[^”\n]*”|‘[^’\n]*’)""")
+_ENTITY_VALUE = re.compile(
+    r"(?<!\w)(?:거래처|매입처|매출처|실납처|발주처|제조사|제약사|제품|품목|상품|"
+    r"(?:영업|발주|제약)?담당자|영업사원|등록자|수정자)(?:명|코드)?(?:\s*[:：=]\s*|\s+)\S+"
+)
+
+
+def _period_search_text(text: str) -> str:
+    """Mask literal slots without moving offsets used by the residual parser."""
+    masked = _QUOTED_VALUE.sub(lambda m: "_" * len(m[0]), text)
+    return _ENTITY_VALUE.sub(lambda m: "_" * len(m[0]), masked)
+
+
+def iter_nlq_period_clauses(text: str):
+    # Offsets must also be valid in the original text used for name extraction.
+    masked = _period_search_text(text)
+    for match in _PERIOD_SPAN.finditer(masked):
+        # A future forecast horizon is not a filter on historical source rows.
+        if (match["relative"] and re.fullmatch(r"다음\s*(?:달|월)", match["relative"])
+                and re.match(r"\s*(?:(?:매출|매입|수요|판매)(?:량|액)?\s*)?(?:예상|예측|전망)", masked[match.end():])):
+            continue
+        yield match
+
+
+def _without_relative_periods(text: str) -> str:
+    for match in reversed(list(iter_nlq_period_clauses(text))):
+        if match["relative"]:
+            text = text[:match.start()] + " " + text[match.end():]
+    return text
+
+
+_ABS_YEAR = r"[0-9]{4}"
+_ABS_MONTH = rf"(?:{_ABS_YEAR}(?:{_SEPARATED_PART}|{_KR_MONTH}|\s*\d{{1,2}}\s*월|\d{{2}})|\d{{1,2}}\s*월)"
+_ABS_DAY = rf"{_ABS_YEAR}(?:{_SEPARATED_PART * 2}|{_KR_MONTH + _KR_DAY}|\d{{4}})"
+_ABS_POINT = rf"(?:{_ABS_DAY}|{_ABS_MONTH}|{_SQL_YEAR}(?:\s*년)?)"
+NLQ_PERIOD_CLAUSE = (
+    rf"(?:(?P<first>{_ABS_POINT})(?:\s*(?:~|-|부터|에서|to)\s*(?P<last>{_ABS_POINT})(?:\s*까지)?"
+    rf"|\s*(?P<open>이후|부터))?|(?P<relative>{_RELATIVE_PERIOD}))(?:만)?"
+)
+_PERIOD_PREFIX = re.compile(NLQ_PERIOD_CLAUSE + r"(?=\s|$)", re.I)
+_PERIOD_SPAN = re.compile(r"(?<!\w)" + NLQ_PERIOD_CLAUSE + r"(?=\s|$|[,?])", re.I)
+
+
+def match_nlq_period_prefix(text: str):
+    """Match a complete leading period clause; never search past other conditions."""
+    return _PERIOD_PREFIX.match(text)
+
+
+def _calendar_endpoint(token: str, today: date):
+    """Return grain and inclusive bounds of one lexically validated endpoint."""
+    parts = [int(p) for p in re.findall(r"\d+", token)]
+    if re.fullmatch(_ABS_DAY, token):
+        if len(parts) == 1:
+            value = _date_from_yyyymmdd(token)
+            if value is None:
+                raise ValueError("유효하지 않은 날짜입니다.")
+        else:
+            value = date(*parts)
+        return "day", value, value
+    if re.fullmatch(_ABS_MONTH, token):
+        compact = token.removesuffix("월").strip()
+        if compact.isdigit() and len(compact) == 6:
+            parts = [int(compact[:4]), int(compact[4:])]
+        elif len(parts) == 1:
+            parts.insert(0, today.year)
+        y, m = parts
+        first = date(y, m, 1)
+        end = _last_day_from_yyyymm(f"{y:04d}{m:02d}")
+        return "month", first, date(y, m, int(end[-2:]))
+    year = parts[0]
+    return "year", date(year, 1, 1), date(year, 12, 31)
+
+
+def resolve_nlq_period_clause(match, *, today: date, rolling_month_start: date | None = None):
+    """Resolve just the matched span. A caller may opt into its calendar-month contract."""
+    if match["first"]:
+        grain, start, end = _calendar_endpoint(match["first"].strip(), today)
+        if match["last"]:
+            other, _, end = _calendar_endpoint(match["last"].strip(), today)
+            if grain != other:
+                raise ValueError("같은 단위로 기간을 지정해 주세요.")
+        elif match["open"]:
+            if grain != "day":
+                raise ValueError("시작일을 지정해 주세요.")
+            end = today
+        if start > end:
+            raise ValueError("기간 순서를 확인해 주세요.")
+        return start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    period = _resolve_relative_period(match["relative"], today)
+    if rolling_month_start is not None and period.get(_NLQ_PERIOD_KIND_KEY) == "rolling_1month":
+        period["date_from"] = rolling_month_start.strftime("%Y%m%d")
+    dates = nlq_period_to_date_range(period)
+    return dates["date_from"], dates["date_to"]
+
+
+def _resolve_relative_period(token: str, today: date) -> Dict[str, str]:
+    from app.services.datetime_tool import month_range, week_range
+
+    raw = re.sub(r"\s+", "", token).removesuffix("만")
+    start = end = today
+    kind = "explicit_period"
+    if re.fullmatch(_PAST_WEEKDAY, raw):
+        weekday = "월화수목금토일".index(raw[-3])
+        if raw.startswith("지난주"):
+            day = week_range(today, offset_weeks=-1).start + timedelta(days=weekday)
+        else:
+            day = today - timedelta(days=(today.weekday() - weekday) % 7 or 7)
+        start = end = day
+    elif re.fullmatch(_DAY_WORD, raw):
+        start = end = today - timedelta(days={"어제": 1, "그저께": 2}.get(raw, 0))
+        kind = {"어제": "yesterday", "그저께": "two_days_ago"}.get(raw, "today")
+    elif re.fullmatch(_WEEK_WORD, raw):
+        previous = raw.startswith("지난")
+        week = week_range(today, offset_weeks=-1 if previous else 0)
+        start, end = week.start, week.end if previous else today
+        kind = "previous_calendar_week" if previous else "current_week_to_date"
+    elif re.fullmatch(_ROLLING_MONTH, raw.removesuffix("간")):
+        start, kind = today - timedelta(days=30), "rolling_1month"
+    elif raw.removesuffix("간") == "최근30일":
+        start = today - timedelta(days=29)
+    elif re.fullmatch(_MONTH_WORD, raw) or raw in ("다음달", "다음월"):
+        offset = -1 if raw.startswith("지난") else int(raw.startswith("다음"))
+        month = month_range(today, offset_months=offset).start.strftime("%Y%m")
+        return {"month_from": month, "month_to": month, _NLQ_PERIOD_KIND_KEY: "calendar_month"}
+    else:
+        raise ValueError("조회기간을 확인해 주세요.")
+    return {"date_from": start.strftime("%Y%m%d"), "date_to": end.strftime("%Y%m%d"), _NLQ_PERIOD_KIND_KEY: kind}
+
 
 def extract_nlq_natural_period(
     text: str,
@@ -472,7 +618,7 @@ def extract_nlq_natural_period(
 
     Policy source: docs/02_design/SIMS_AI_NLQ_기간정책_공식기준.md
     """
-    raw = _split_compact_relative_day_action(_norm(text))
+    raw = _period_search_text(_split_compact_relative_day_action(_norm(text)))
     if not raw:
         return {}
     if today is None:
@@ -481,6 +627,18 @@ def extract_nlq_natural_period(
         current_day = operating_now().date()
     else:
         current_day = today
+
+    spans = list(iter_nlq_period_clauses(raw))
+    for span in spans:
+        if span["last"] or span["open"]:
+            try:
+                start, end = resolve_nlq_period_clause(span, today=current_day)
+                grain = _calendar_endpoint(span["first"].strip(), current_day)[0]
+            except ValueError:
+                continue  # Legacy detail validation reports malformed/reversed ranges.
+            if grain != "day":
+                return {"month_from": start[:6], "month_to": end[:6], _NLQ_PERIOD_KIND_KEY: "explicit_period"}
+            return {"date_from": start, "date_to": end, _NLQ_PERIOD_KIND_KEY: "explicit_period"}
 
     # A user-written absolute date range must win over list-detail defaults.
     # Keep the open-ended candidate for a single date such as "20260101 이후",
@@ -540,65 +698,9 @@ def extract_nlq_natural_period(
             _NLQ_PERIOD_KIND_KEY: "explicit_period",
         }
 
-    if re.search(r"(?:최근\s*)?(?:한\s*달|1\s*개월)", raw):
-        return {
-            "date_from": (current_day - timedelta(days=30)).strftime("%Y%m%d"),
-            "date_to": current_day.strftime("%Y%m%d"),
-            _NLQ_PERIOD_KIND_KEY: "rolling_1month",
-        }
-
-    relative_day = re.search(
-        r"(?:^|\s)(오늘|어제|그저께|당일|하루|최근\s*1\s*일)"
-        r"(?=\s|$|(?:거래명세서|입고현황|출고현황|입고명세|출고명세|세금계산서))",
-        raw,
-    )
-    if relative_day:
-        token = relative_day.group(1)
-        offset_days = {"어제": 1, "그저께": 2}.get(token, 0)
-        target_day = current_day - timedelta(days=offset_days)
-        value = target_day.strftime("%Y%m%d")
-        return {
-            "date_from": value,
-            "date_to": value,
-            _NLQ_PERIOD_KIND_KEY: {
-                "어제": "yesterday",
-                "그저께": "two_days_ago",
-            }.get(token, "today"),
-        }
-
-    relative_week = re.search(r"(이번|지난)\s*주(?:간)?", raw)
-    if relative_week:
-        current_week_start = current_day - timedelta(days=current_day.weekday())
-        if relative_week.group(1) == "지난":
-            week_start = current_week_start - timedelta(days=7)
-            week_end = week_start + timedelta(days=6)
-            period_kind = "previous_calendar_week"
-        else:
-            week_start = current_week_start
-            # This week remains an elapsed-to-date query; the prior week is a
-            # completed Monday-through-Sunday calendar period.
-            week_end = current_day
-            period_kind = "current_week_to_date"
-        return {
-            "date_from": week_start.strftime("%Y%m%d"),
-            "date_to": week_end.strftime("%Y%m%d"),
-            _NLQ_PERIOD_KIND_KEY: period_kind,
-        }
-
-    relative_month = re.search(r"(?<![가-힣A-Za-z0-9])(이달|(?:이번|지난)\s*(?:달|월))(?![가-힣A-Za-z0-9])", raw)
-    if relative_month:
-        from app.services.datetime_tool import month_range
-
-        period = month_range(
-            current_day,
-            offset_months=-1 if relative_month.group(1).startswith("지난") else 0,
-        )
-        yyyymm = period.start.strftime("%Y%m")
-        return {
-            "month_from": yyyymm,
-            "month_to": yyyymm,
-            _NLQ_PERIOD_KIND_KEY: "calendar_month",
-        }
+    relative = next((span for span in spans if span["relative"]), None)
+    if relative:
+        return _resolve_relative_period(relative[0], current_day)
 
     month_match = re.search(r"(?<![\d년])(?:^|\s)(1[0-2]|0?[1-9])\s*월(?=\s|$)", raw)
     if month_match:
@@ -646,7 +748,7 @@ def _classify_parsed_period(params: Dict[str, Any]) -> str:
 
 def strip_nlq_period_expressions(text: str) -> str:
     """Remove period syntax before extracting an unlabeled business entity."""
-    out = str(text or "")
+    out = _without_relative_periods(str(text or ""))
     compact_date = _valid_compact_date_range(out)
     if compact_date:
         out = out[:compact_date.start()] + " " + out[compact_date.end():]
@@ -654,10 +756,6 @@ def strip_nlq_period_expressions(text: str) -> str:
     patterns = (
         r"(?<![가-힣A-Za-z0-9])(?:19|20)\d{6}(?:\s*[~-]\s*(?:19|20)\d{6})?(?![가-힣A-Za-z0-9])",
         r"(?<![가-힣A-Za-z0-9])(?:19|20)\d{2}[-./]\d{1,2}[-./]\d{1,2}(?:\s*[~-]\s*(?:19|20)\d{2}[-./]\d{1,2}[-./]\d{1,2})?(?![가-힣A-Za-z0-9])",
-        r"(?:최근\s*)?(?:한\s*달|1\s*개월)",
-        r"(?:오늘|어제|그저께|당일|하루|최근\s*1\s*일)",
-        r"(?:이번|지난)\s*주(?:간)?",
-        r"(?<![가-힣A-Za-z0-9])(?:이달|(?:이번|지난)\s*(?:달|월))(?![가-힣A-Za-z0-9])",
         r"(?<!\d)(?:19|20)\d{4}(?!\d)",
         r"(?:19|20)\d{2}\s*년\s*\d{1,2}\s*월(?:\s*\d{1,2}\s*일)?",
         r"(?<!\d)(?:19|20)\d{2}\s*년?(?!\d)",
@@ -682,11 +780,17 @@ def strip_nlq_period_tokens_for_entity_residual(text: str) -> str:
     This preserves multi-token natural periods such as ``최근 한달``.
     """
     text = _split_compact_relative_day_action(str(text or ""))
-    text = re.sub(
-        r"^(오늘|어제|그저께|당일)(?=(?:거래명세서|입고현황|출고현황|입고명세|출고명세|세금계산서))",
-        r"\1 ",
-        str(text or ""),
-    )
+    if _QUOTED_VALUE.search(text):
+        return " ".join(part if i % 2 else strip_nlq_period_tokens_for_entity_residual(part)
+                       for i, part in enumerate(_QUOTED_VALUE.split(text)))
+    for match in reversed(list(iter_nlq_period_clauses(text))):
+        if match["first"]:
+            try:
+                # Do not consume malformed/reversed ranges before the residual guard.
+                resolve_nlq_period_clause(match, today=date.max)
+            except (ValueError, OverflowError):
+                continue
+        text = text[:match.start()] + " " + text[match.end():]
     compact_date = _valid_compact_date_range(text)
     if compact_date:
         text = text[:compact_date.start()] + " " + text[compact_date.end():]
@@ -1104,6 +1208,9 @@ def sanitize_io_named_condition_values(
     for key in _NAMED_CONDITION_VALUE_KEYS:
         raw_value = clean_text(out.get(key))
         if not raw_value:
+            continue
+        if _QUOTED_VALUE.fullmatch(raw_value):
+            out[key] = raw_value[1:-1]
             continue
 
         value = raw_value
@@ -1536,6 +1643,8 @@ def _looks_like_date_token(value: str) -> bool:
     ):
         return True
 
+    if re.search(r"[A-Za-z가-힣]", re.sub(r"년|월|일|부터|까지|에서|to", "", raw)):
+        return False
     s = re.sub(r"[^0-9]", "", raw)
     if not s:
         return False
@@ -1566,6 +1675,9 @@ def _trim_named_value(value: str) -> str:
     v = _norm(value)
     if not v:
         return ""
+    literal = _QUOTED_VALUE.match(v)
+    if literal:
+        return literal[0]
 
     # 날짜 범위 제거 후 남는 "~", "-", "/" 같은 기호가
     # 제품명/거래처명 앞뒤에 붙지 않도록 정리한다.
@@ -2148,6 +2260,9 @@ def _consume_io_action_text(text: str, action: str) -> str:
     not become an OR-LIKE entity predicate.
     """
     source = _norm(text)
+    if _QUOTED_VALUE.search(source):
+        return " ".join(part if i % 2 else _consume_io_action_text(part, action)
+                        for i, part in enumerate(_QUOTED_VALUE.split(source))).strip()
     if not source:
         return ""
 
@@ -2385,6 +2500,8 @@ def has_unconsumed_detail_condition(text: str, action: str, params: Dict[str, An
         action,
     )
     if has_bound_name:
+        # Quoted text was deliberately kept intact until periods/actions were consumed.
+        residual = _QUOTED_VALUE.sub(lambda m: m[0][1:-1], residual)
         # A detail label is consumed only when the existing parser bound its
         # value. Keep unsupported labels in the residual so they still block.
         product_code = clean_text(params.get("physic_cd"))
@@ -3125,13 +3242,16 @@ def extract_params(text: str, *, today: date | None = None) -> Dict[str, Any]:
     text = _norm(text)
     params: Dict[str, Any] = {}
 
-    params.update(_extract_date_range(text))
-    params.update({k: v for k, v in _extract_month_range(text).items() if k not in params})
+    period_text = _period_search_text(text)
+    params.update(_extract_date_range(period_text))
+    params.update({k: v for k, v in _extract_month_range(period_text).items() if k not in params})
     parsed_period_kind = _classify_parsed_period(params)
-    if not parsed_period_kind:
+    if not parsed_period_kind or any(m["last"] or m["open"] for m in iter_nlq_period_clauses(period_text)):
         params.update(_extract_natural_period(text, today=today))
     else:
         params[_NLQ_PERIOD_KIND_KEY] = parsed_period_kind
+
+    text = _without_relative_periods(text)
 
     ven_cd = _extract_code(text, "거래처", 5) or _extract_code(text, "거래처코드", 5)
     ven_nm = _extract_named_text(text, ("거래처명", "거래처"))

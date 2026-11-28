@@ -6,6 +6,8 @@ SPEC = detail_spec("310", "입출금구분명", direction_sql=(
     "CASE WHEN S.Rd31_Receive_Di_Gcode='0023' THEN "
     "NULLIF(LTRIM(RTRIM(S.Rd31_Receive_Di)), '') END"
 ))
+# Accounting-system export fields are not installed in every ERP schema.
+SPEC["optional_output"] = ("Rd31_Move_Seq", "Rd31_Move_Date", "Rd31_IN_SQ")
 
 
 def normalize_rddbc310_params(params=None, *, today=None):

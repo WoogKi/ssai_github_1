@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import json
 import os
 import re
@@ -149,6 +149,9 @@ def parse_web_search_request(text: object, *, now: datetime | None = None) -> We
         return None
     if any(marker in compact.lower() for marker in _INTERNAL_OR_ERP_MARKERS):
         return None
+    from app.services.payment_nlq import match_payment
+    if match_payment(query):
+        return None
     reference_at = operating_now(now=now)
     return WebSearchRoute(
         query=query,
@@ -215,6 +218,9 @@ def parse_web_search_followup_request(
     direct_reference = any(marker.replace(" ", "") in compact for marker in _FOLLOWUP_REFERENCE_MARKERS)
     overlap_count = sum(token in context_text for token in _meaningful_followup_tokens(query))
     if not direct_reference and overlap_count < 2:
+        return None
+    from app.services.payment_nlq import match_payment
+    if match_payment(query):
         return None
     reference_at = operating_now(now=now)
     return WebSearchRoute(

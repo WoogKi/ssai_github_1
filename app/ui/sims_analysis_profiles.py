@@ -406,7 +406,8 @@ def build_sims_analysis_profile(
         focus = ["시도·시군구·도로명 범위", "후보 건수", "검색 조건과 결과의 적합성", "상세주소·연락처·사업자번호 분석 금지"]
 
     if meta.get("analysis_roles") and action_name == "입출금 조회":
-        focus = [*focus, "입금/출금 구분과 부호 있는 원본 금액; 실제 현금 이동이나 잔액으로 해석하지 않음"]
+        from app.sims.meta.rddbc_payment_meta import STAFF_HELP
+        focus = [*focus, STAFF_HELP, "입금/출금 구분과 부호 있는 원본 금액; 실제 현금 이동이나 잔액으로 해석하지 않음"]
 
     return {
         "profile_id": profile_id,

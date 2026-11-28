@@ -325,8 +325,8 @@ def _payment_features():
             service_function=f"app.services.rddbc{table}_service.get_rddbc{table}_result",
             export_function=f"app.services.rddbc{table}_service.get_rddbc{table}_export_df",
             view_function=f"app.sims.views.rddbc_payment_views.view_rddbc{table}",
-            payload_key=f"__io{table}_last_payload", nlq_period_policy="explicit_only",
-        ),), menu_business_group="입출금 관리", menu_target="입출금", nlq_enabled=False, scope_bound=True,
+            payload_key=f"__io{table}_last_payload", nlq_period_policy="calendar_month",
+        ),), menu_business_group="입출금 관리", menu_target="입출금", scope_bound=True,
     ) for table in TITLES)
 
 
@@ -388,6 +388,9 @@ def match_action_in_text(text: Any) -> tuple[ErpTableFeatureSpec, ErpTableAction
         return None
     candidates: list[tuple[int, ErpTableFeatureSpec, ErpTableActionSpec]] = []
     for feature, action_spec in iter_action_specs(nlq_only=True):
+        if feature.scope_bound:
+            # These actions require a whole business token, not a substring.
+            continue
         for label in (action_spec.action, *action_spec.aliases):
             label_compact = re.sub(r"\s+", "", label)
             if label_compact == "발주":
@@ -451,6 +454,8 @@ def registry_completeness_errors() -> list[str]:
                 errors.append(f"missing {name}: {action.action}")
         if not action.payload_key:
             errors.append(f"missing payload key: {action.action}")
-        if action.nlq_period_policy not in {"list_detail", "explicit_only"}:
+        if action.nlq_period_policy not in {"list_detail", "explicit_only"} and not (
+            feature.scope_bound and action.nlq_period_policy == "calendar_month"
+        ):
             errors.append(f"unsupported NLQ period policy: {action.action}")
     return errors

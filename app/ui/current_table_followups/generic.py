@@ -1081,7 +1081,7 @@ def _strip_group_words(value: str) -> str:
 
 def _parse_named_group_clause(body, terms):
     """Match only a complete dimension clause, never a substring of a search value."""
-    clause = re.fullmatch(r"(.+?)(?:집계|합계)[?？]?", _normalize_common_group_query(body))
+    clause = re.fullmatch(r"(.+?)(집계|합계|조회)[?？]?", _normalize_common_group_query(body))
     if not clause or not terms:
         return ()
     labels = "|".join(map(re.escape, sorted(terms, key=len, reverse=True)))
@@ -1093,6 +1093,8 @@ def _parse_named_group_clause(body, terms):
             return ()
         matches.append((match[1], match[2]))
         remaining = remaining[match.end():]
+    if clause[2] == "조회" and not all(marker for _, marker in matches):
+        return ()
     if len(matches) > 1 and not all(marker for _, marker in matches[1:]):
         return ()
     return tuple(label for label, _ in matches)
@@ -1501,13 +1503,15 @@ def _apply_role_predicates(df, body, roles, aliases):
     work = df
     codes = set(roles.get("codes", ())).intersection(df.columns)
     fields = {**aliases, **{_compact(c): c for c in codes}}
+    fields.update({k: v for k, v in roles.get("code_aliases", {}).items() if v in codes})
     fields.update({c: c for c in fields.values()})
-    labels = "|".join(map(re.escape, sorted(fields, key=len, reverse=True)))
+    fields = {_compact(k): v for k, v in fields.items()}
+    labels = "|".join(r"\s*".join(map(re.escape, k)) for k in sorted(fields, key=len, reverse=True))
     filtered = False
 
     def text_value(m):
         nonlocal work, filtered
-        col, raw = fields[m[1]], m[3]
+        col, raw = fields[_compact(m[1])], m[3]
         quoted = raw.startswith(("'", '"'))
         value = raw[1:-1] if quoted else raw
         if not quoted and not m[2].strip() and value.endswith("만") and len(value) > 1:
@@ -1529,7 +1533,11 @@ def _apply_role_predicates(df, body, roles, aliases):
 
     # Quoted values may contain spaces; ordinary name and exact code predicates
     # consume one value, not the following predicate or group.
-    body = re.sub(rf"(?<!\S)({labels})(\s*[:=]\s*|\s+)('[^']+'|\"[^\"]+\"|[^\s,]+)", text_value, body)
+    # Consume a complete grouped label first: a shorter alias (거래처) must
+    # not take the rest of 거래처 담당자명별 as a literal search value.
+    body = re.sub(rf"(?<!\S)(?:(?:{labels})\s*(?:별|기준)(?=\s|$)|"
+                  rf"({labels})(\s*[:=]\s*|\s+)('[^']+'|\"[^\"]+\"|[^\s,]+))",
+                  lambda m: text_value(m) if m[1] else m[0], body)
     ops = {"이상": ">=", "이하": "<=", "초과": ">", "미만": "<", "동일": "=="}
     operator = "|".join(ops)
     metric, day = roles["amount"], roles["date"]
@@ -1588,7 +1596,7 @@ def _apply_role_predicates(df, body, roles, aliases):
     return work, body, filtered
 
 
-def _exact_role_result(df, query, top_n, roles):
+def _exact_role_result(df, query, top_n, roles, *, statistics=None, separate_directions=False):
     """Resolve only fully understood operations on a verified additive source."""
     from decimal import Decimal
     from numbers import Integral
@@ -1610,7 +1618,7 @@ def _exact_role_result(df, query, top_n, roles):
         raise ValueError("두 현재표 질문은 각각 입력해 주세요. 두 기준을 함께 보려면 '현재표 월별 거래처별 집계'처럼 입력하세요.")
     work = df
     aliases = {alias: col for col in dims for alias in _group_aliases(col)}
-    aliases.update({alias: col for alias, col in roles.get("aliases", {}).items() if col in dims})
+    aliases.update({_compact(alias): col for alias, col in roles.get("aliases", {}).items() if col in dims})
     aliases.update({_compact(c): c for c in dims})
     if roles.get("category") in dims:
         aliases["업무구분"] = roles["category"]
@@ -1654,8 +1662,9 @@ def _exact_role_result(df, query, top_n, roles):
             col = aliases[token]
         if col == roles.get("vendor") and "거래처코드" in work:
             group_keys.append("거래처코드")
-        if col == roles.get("staff") and "거래처 담당자코드" in work:
-            group_keys.append("거래처 담당자코드")
+        staff_code = roles.get("staff_keys", {roles.get("staff"): "거래처 담당자코드"}).get(col)
+        if staff_code and staff_code in work:
+            group_keys.append(staff_code)
         group_keys.append(col)
     compact = group_pattern.sub("", compact)
     aggregate = bool(group_keys or (selected_metric and not direction) or any(w in compact for w in ("합계","집계","건수","행수","총액","요약")))
@@ -1670,6 +1679,8 @@ def _exact_role_result(df, query, top_n, roles):
         raise ValueError("지원하는 기준(기간·거래처·업무구분), 금액 또는 필터 조건을 확인해 주세요.")
     if not aggregate:
         out = work
+        if statistics is not None:
+            statistics["before_rank"] = len(work)
         if direction:
             out = out.dropna(subset=[metric]).sort_values(metric, ascending=direction=="asc", kind="stable").head(limit)
         return out, dict(roles), [metric]
@@ -1677,8 +1688,9 @@ def _exact_role_result(df, query, top_n, roles):
     if not keys:
         work = work.assign(전체="전체")
         keys = ["전체"]
-    use_split = bool(split and not selected_metric and not direction and split not in keys and
-                     any(c in {"일자", "월", roles.get("vendor"), roles.get("staff")} for c in keys))
+    use_split = bool(split and not selected_metric and split not in keys and
+                     (separate_directions or (not direction and
+                      any(c in {"일자", "월", roles.get("vendor"), roles.get("staff")} for c in keys))))
     out = _build_common_group_summary(work, keys[0], dimensions=tuple(keys[1:]),
                                       exact_amount=metric, split=split if use_split else "", split_values=split_values)
     if selected_metric:
@@ -1687,6 +1699,8 @@ def _exact_role_result(df, query, top_n, roles):
     if "일자" in keys and "요일" not in keys:
         out.insert(out.columns.get_loc("일자")+1, "요일", derive_current_table_time_grouping(out["일자"], "weekday"))
     if direction and not out.empty:
+        if statistics is not None:
+            statistics["before_rank"] = len(out)
         rank = out[amounts[0]].tolist()
         if "건수" in compact or "행수" in compact:
             if metric in compact:
@@ -1694,6 +1708,8 @@ def _exact_role_result(df, query, top_n, roles):
             rank = [sum(row) for row in out[[c for c in out if c.endswith("건수")]].itertuples(index=False, name=None)]
         out = out.assign(_rank=pd.Series(rank, index=out.index, dtype=object)).dropna(subset=["_rank"])
         out = out.sort_values("_rank", ascending=direction=="asc", kind="stable").head(limit).drop(columns="_rank")
+    if statistics is not None:
+        statistics.setdefault("before_rank", len(out))
     result_roles = dict(date=next((c for c in keys if c in ("일자","월","연도","요일")), ""),
                         category=keys[-1], vendor=roles.get("vendor",""), amount=amounts[0], amounts=amounts)
     return out, result_roles, amounts
@@ -1725,6 +1741,7 @@ def handle_common_column_group_followup(
         return bool(helpers["push_table"](title=t, action=source_action, df=out,
                     query_summary=t, source_query=t, source_rows=len(df), source_table_key=table_key,
                     extra_meta={**display, "analysis_roles": roles, "exact_columns": amounts,
+                                **({"source_room_id": source["source_room_id"]} if source.get("source_room_id") else {}),
                                 "query_scope": helpers["_query_scope"], "source_call_count": 0}))
     group_col = str(helpers.get("_requested_group_column") or "") or _find_common_group_column(df, t, source_action)
     if group_col and group_col not in df.columns:

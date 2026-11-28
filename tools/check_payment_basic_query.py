@@ -54,7 +54,8 @@ class Contracts(unittest.TestCase):
                 common, "execute_bound_select", return_value=fixture(table) if frame is None else frame) as reader:
             out = getattr(SERVICES[table], f"get_rddbc{table}_result")(params)
         self.assertEqual(reader.call_count, 1)
-        self.assertEqual(reader.call_args.kwargs, {"company_id": 8})
+        self.assertEqual(reader.call_args.kwargs["company_id"], 8)
+        self.assertEqual(callable(reader.call_args.kwargs.get("prepare")), table == "310")
         self.assertEqual(auth.call_args.kwargs["expected"], SCOPE)
         return out
 
@@ -74,10 +75,10 @@ class Contracts(unittest.TestCase):
                 self.assertEqual(LABELS[key][field.column], field.label)
             self.assertTrue(all("["+k+"]" in ddl.split("PRIMARY KEY",1)[1].split(")",1)[0] for k in PRIMARY_KEYS[table]))
 
-    def test_registry_panel_only(self):
+    def test_registry_panel_and_registered_detail_actions(self):
         actions = registry.menu_actions(business_group="입출금 관리", target="입출금")
         self.assertEqual(list(actions), list(TITLES.values()))
-        self.assertFalse(set(actions) & {a.action for _,a in registry.iter_action_specs(nlq_only=True)})
+        self.assertEqual(set(actions), {a.action for f,a in registry.iter_action_specs(nlq_only=True) if f.scope_bound})
         self.assertFalse(registry.registry_completeness_errors())
         for title in actions:
             feature, action = registry.get_action_spec(title)
@@ -406,6 +407,8 @@ class Contracts(unittest.TestCase):
                     self.assertEqual(cols, ["입금금액","출금금액"])
                     self.assertEqual(sum(out["입금건수"])+sum(out["출금건수"]),320)
                 if period=="일자":
+                    by_date, _ = ask(r, "일자별 조회")
+                    pd.testing.assert_frame_equal(out, by_date)
                     self.assertEqual(set(out["일자"]), {"2025-10-01","2026-11-27"})
                     ctx=chat._build_sims_analysis_context_from_df(out, result={}, action_name=r["action"], params={},
                         meta={**meta,"row_count_total":len(out)})
@@ -486,6 +489,31 @@ class Contracts(unittest.TestCase):
             where = " WHERE " + spec["filters"]["vendor_staff_name"][0] + " LIKE ?"
             self.assertEqual(len(db.execute(sql+where,("%동%",)).fetchall()), 2)
             self.assertEqual(db.execute(sql+where,("%없는명칭%",)).fetchall(), [])
+            for key, op, value, expected in (
+                ("vendor_staff_cd", "=", "01", [1]), ("sales_user_cd", "=", "03", [1, 3]),
+                ("vendor_staff_name", "LIKE", "%이전%", []), ("sales_user_name", "LIKE", "%이전%", [1, 3]),
+            ):
+                expr = spec["filters"][key][0]
+                self.assertEqual([r[0] for r in db.execute(f"{sql} WHERE {expr} {op} ? ORDER BY S.seq", (value,))], expected)
+
+    def test_staff_followup_filters(self):
+        from app.ui.current_table_followups.generic import _exact_role_result
+        from app.ui.sims_analysis_profiles import build_sims_analysis_profile
+        from app.sims.meta.rddbc_payment_meta import STAFF_HELP
+        frame = fixture()
+        frame["거래처 담당자명"] = ["갑", "을", "을"]
+        frame["원본 담당영업사원명"] = ["을", "갑", None]
+        frame["거래처 담당자코드"] = ["00001", "00002", "00002"]
+        frame["Rd31_Real_Sales_Man"] = ["00002", "00001", None]
+        result = self.result(frame=frame)
+        for term, value, ids in (("현재 담당자", "갑", [0]), ("거래처담당자", "을", [1, 2]),
+                                 ("입출금 당시 담당자", "을", [0]), ("당시 담당영업사원", "갑", [1]),
+                                 ("현재 담당자 코드", "00001", [0]), ("원본 영업사원코드", "00001", [1]),
+                                 ("입출금 당시 담당자코드", "00001", [1]), ("당시 담당자코드", "1", [])):
+            out, _, _ = _exact_role_result(result["df"], f"현재표 {term} {value} 조회", 10, result["meta"]["analysis_roles"])
+            self.assertEqual(out["입출금순번"].tolist(), ids, term)
+        profile = build_sims_analysis_profile(result["action"], meta=result["meta"])
+        self.assertIn(STAFF_HELP, profile["analysis_focus"])
 
     def test_role_search_and_composition(self):
         from app.ui.current_table_followups.action_dispatcher import handle_current_table_followup_by_action
@@ -573,7 +601,7 @@ class Contracts(unittest.TestCase):
             df["금액"] = pd.Series(values, dtype=object)
             for c in dims:
                 df[c] = [c+"A", c+"B", c+"A", c+"B"]
-            for code in ("거래처코드", "거래처 담당자코드"):
+            for code in ("거래처코드", "거래처 담당자코드", "원본 담당영업사원코드"):
                 if code in df:
                     df[code] = ["01","01","02","02"]
             if split:
@@ -592,6 +620,8 @@ class Contracts(unittest.TestCase):
                     codes.append("거래처코드")
                 if col == roles.get("staff"):
                     codes.append("거래처 담당자코드")
+                if col == "원본 담당영업사원명":
+                    codes.append("원본 담당영업사원코드")
                 expected = {}
                 for i, value in enumerate(times[col] if col in times else df[col]):
                     key = tuple(df[c].iat[i] for c in codes) + (value,)

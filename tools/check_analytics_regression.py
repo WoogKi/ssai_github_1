@@ -1343,8 +1343,17 @@ def run_basic_checks() -> list[CheckResult]:
 
             main_src = Path("app/Lmstudio_SSAI_chat_main.py").read_text(encoding="utf-8")
             route_checks = []
+            candidate_calls = [
+                node for guard in ast.walk(ast.parse(main_src))
+                if isinstance(guard, ast.If) and ast.unparse(guard.test) == "not has_explicit_current_table_reference"
+                for stmt in guard.body for node in ast.walk(stmt)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == "resolve_new_sims_nlq_candidate"
+            ]
+            if not any([ast.unparse(arg) for arg in call.args] == ["user_input"]
+                       and {kw.arg: ast.unparse(kw.value) for kw in call.keywords}
+                       == {"session_state": "st.session_state", "room": "current_room"} for call in candidate_calls):
+                route_checks.append("missing scoped candidate call under explicit Current Table exclusion")
             for required in (
-                "resolve_new_sims_nlq_candidate(user_input)",
                 "not is_new_sims_nlq",
                 "[chat.route.candidate] route=%s candidate_action=%s",
                 "reason=executed_handler resolved_action=%s",

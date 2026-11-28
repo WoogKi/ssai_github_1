@@ -153,6 +153,7 @@ docs/90_archive/**
 docs/**/*.docx
 docs/**/*.pdf
 docs/**/*.xlsx
+!/docs/NLQ 정리 20261128.xlsx
 docs/**/*.xls
 docs/**/*.csv
 docs/**/*.png

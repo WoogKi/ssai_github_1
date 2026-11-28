@@ -3696,11 +3696,12 @@ def _build_sims_analysis_context_from_df(
         from app.ui.current_table_followups.analysis_facts import build_whole_table_facts
         facts = build_whole_table_facts(base_df, action=action, query="", exact_roles=meta["analysis_roles"])
         return {"kind": "SIMS_ANALYSIS_CONTEXT_V1", "action": action, "analysis_key": str(uuid.uuid4()),
-                "query_scope": meta.get("query_scope"), "analysis_profile_id": profile["profile_id"],
+                "query_scope": meta.get("query_scope"), "source_room_id": meta.get("source_room_id"),
+                "analysis_profile_id": profile["profile_id"],
                 "row_count": len(base_df), "display_row_count": meta.get("row_count_display"),
                 "analysis_scope": "full_source", "whole_table_facts": facts,
                 "query_scope_summary": (str(meta.get("query_summary") or "현재표 후속 결과")
-                                        if meta.get("current_table_followup") else
+                                        if meta.get("current_table_followup") or meta.get("source_room_id") else
                                         f"{facts['date_column']}: {params.get('date_from', '')} ~ {params.get('date_to', '')}"),
                 "sample_records": [],
                 "analysis_text": str(facts), "llm_rules": facts["interpretation_limits"]}
@@ -4922,6 +4923,8 @@ def _download_source_context(
     }
     if meta.get("query_scope"):
         context["query_scope"] = dict(meta["query_scope"])
+        if meta.get("source_room_id"):
+            context["source_room_id"] = meta["source_room_id"]
         context["row_count_total"] = meta.get("row_count_total")
         context["analysis_roles"] = dict(meta.get("analysis_roles") or {})
         for key in ("date_columns", "integer_columns", "pinned_columns", "exact_columns"):
@@ -7598,7 +7601,7 @@ def render_pending_chat_items(area, room: Optional[Dict[str, Any]] = None) -> No
                 else:
                     ss["__sims_table_render_path"] = previous_render_path
 
-def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
+def wssz(result: Any, action: Optional[str] = None, *, detail_source=None) -> Dict[str, Any] | None:
     """
     SIMS 최종 결과를 채팅 히스토리로 1회 푸시하고,
     LLM용 SIMS 컨텍스트(JSON)도 동시에 갱신한다.
@@ -7641,6 +7644,15 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     from app.services.erp_table_query_service import allow_result
     if not allow_result(action_name, meta):
         return None
+    if detail_source is not None:
+        origin = detail_source["meta"]
+        if (not meta.get("query_scope") or meta["query_scope"] != origin.get("query_scope")
+                or action_name != detail_source["action"] or not origin.get("room_id")
+                or str(ss.get("current_room") or "") != origin["room_id"]
+                or origin.get("full_source_verified") is not True
+                or not isinstance(detail_source.get("df"), pd.DataFrame)
+                or origin.get("row_count_total") != len(detail_source["df"])):
+            return None
     meta.setdefault("table_role", _sims_table_role_from_action(action_name, meta))
     payload["meta"] = meta
 
@@ -8260,6 +8272,29 @@ def wssz(result: Any, action: Optional[str] = None) -> Dict[str, Any] | None:
     except Exception as exc:
         # The optional presentation must never prevent deterministic chat delivery.
         log.warning("[structured.presentation_poc] trace_skipped error_type=%s", type(exc).__name__)
+    if detail_source is not None:
+        source_meta = detail_source["meta"]
+        if (str(ss.get("current_room") or "") != source_meta["room_id"]
+                or not allow_result(action_name, source_meta)):
+            return None
+    if detail_source is not None and not detail_source["df"].empty:
+        source_key = detail_source["meta"]["table_key"]
+        source_frame = detail_source["df"]
+        # R is the sole visible/exportable card. S owns the next Current Table operation.
+        for store_name in ("sims_export_tables", "__sims_export_tables_by_key"):
+            ss.setdefault(store_name, {})[source_key] = source_frame
+        _stash_sims_export_provenance(source_key, source_frame, detail_source, source_meta)
+        provenance = ss["__sims_export_table_provenance_by_key"][source_key]
+        provenance["revision_params"] = dict(detail_source["params"])
+        if payload["meta"].get("source_aggregate"):
+            ctx = _build_sims_analysis_context_from_df(source_frame, result={}, action_name=action_name,
+                        params=detail_source["params"], meta=source_meta)
+            if ctx:
+                ctx["table_key"] = source_key
+                _cache_sims_analysis_ctx_by_table_key(ctx)
+                ss["__sims_current_table_source_analysis_ctx"] = ctx
+        ss["__sims_current_table_source_key"] = source_key
+        ss["__sims_current_table_source_action"] = action_name
     ss.setdefault("__chat_inbox", [])
     ss["__chat_inbox"].append(payload)
     drain_inbox_to_chat()

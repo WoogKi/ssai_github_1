@@ -769,6 +769,7 @@ def _clear_sims_runtime_for_company_change(reason: str = "company_change") -> No
 
         # 1) 현재표/컨텍스트/마지막 결과/다운로드 관련 volatile key 제거
         explicit_keys = [
+            "__sims_registered_pick",
             "__sims_result",
             "__sims_context",
             "__sims_context_text",
@@ -1242,6 +1243,7 @@ def _clear_current_table_source_for_room_change() -> None:
     try:
         ss = st.session_state
         keys = [
+            "__sims_registered_pick",
             "__sims_current_table_source_key",
             "__sims_current_table_source_action",
             "__sims_current_table_source_analysis_ctx",
@@ -1421,6 +1423,8 @@ def _find_latest_source_table_in_room(room: dict) -> tuple[str, str]:
         if bool(meta.get("current_table_followup")):
             continue
         table_key = str(meta.get("table_key") or item.get("table_key") or "").strip()
+        if meta.get("source_aggregate"):
+            table_key = str(meta.get("source_table_key") or "").strip()
         if not table_key:
             continue
         action = str(
@@ -9494,6 +9498,11 @@ def _partition_message_payload(message: dict[str, Any]) -> dict[str, Any]:
             scope = value.get("query_scope")
             if isinstance(scope, dict) and scope.keys() == {"company_id", "user_id", "epoch"}:
                 meta_out["query_scope"] = dict(scope)
+                if value.get("source_room_id"):
+                    meta_out["source_room_id"] = str(value["source_room_id"])
+                if value.get("source_aggregate"):
+                    meta_out["source_aggregate"] = True
+                    meta_out["source_table_key"] = str(value.get("source_table_key") or "")
                 if value.get("render_as_text") is True:
                     meta_out["render_as_text"] = True
             is_dashboard = str(message.get("type") or "").strip().lower() == "dashboard_lite"
@@ -13221,7 +13230,7 @@ if user_input and user_input.strip():
     new_sims_candidate = None
     if not has_explicit_current_table_reference:
         try:
-            new_sims_candidate = resolve_new_sims_nlq_candidate(user_input)
+            new_sims_candidate = resolve_new_sims_nlq_candidate(user_input, session_state=st.session_state, room=current_room)
         except Exception:
             log.exception("[chat.route.decision] route_candidate_error")
     new_sims_action = str((new_sims_candidate or {}).get("action") or "").strip()
